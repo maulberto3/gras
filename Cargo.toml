@@ -1,0 +1,29 @@
+[package]
+name = "gras"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+cuda = ["flodl/cuda"]
+
+[dependencies]
+flodl = "0.7.0"
+
+# Development profile: Optimized for fast build times and debugging.
+proptest = "1.11.0"
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+# Release profile: Optimized for maximum runtime performance.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[dev-dependencies]
+proptest = "1.11.0"
