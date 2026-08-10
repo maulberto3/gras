@@ -3,7 +3,7 @@ name = "gras"
 version = "0.1.0"
 edition = "2024"
 description = "A Genetic Programming framework for Neural Architecture Search in Rust"
-license = "MIT License"
+license = "MIT"
 homepage = "https://github.com/maulberto3/gras"
 
 [features]
