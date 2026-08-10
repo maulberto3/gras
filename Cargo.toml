@@ -35,5 +35,5 @@ proptest = "1.11.0"
 [package.metadata.release]
 pre-release-commit-message = "chore(release): bump version to {{version}}"
 tag-message = "v{{version}}"
-sign-tag = true
+sign-tag = false
 push = true
