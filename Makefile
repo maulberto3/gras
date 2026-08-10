@@ -63,5 +63,8 @@ samp:
 	# echo '1' | sudo tee /proc/sys/kernel/perf_event_paranoid
 	clear && samply record cargo run --release --bin ask_tell
 
-publ:
+dry_publ:
 	cargo release
+	
+publ:
+	cargo release --execute
