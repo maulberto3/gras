@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🧬 GRAS
+# 🧬 GRAS 🧬
 ### *Genetic Programming & Neural Architecture Search in Rust*
 
 [![Crates.io](https://img.shields.io/crates/v/gras.svg)](https://crates.io/crates/gras)

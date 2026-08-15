@@ -1,20 +1,14 @@
+SHELL := /bin/bash
+.SHELLFLAGS := -e -o pipefail -c
+
 ################################################################################
 # 📊 Development & Analysis
 ################################################################################
 dev-size:
-	clear && du ./target/debug/libharu_cmaes.rlib -h
+	clear && du ./target_cpu/debug/libgras.rlib -h 2>/dev/null || du ./target/debug/libgras.rlib -h
 
 prod-size:
-	clear && du ./target/release/libharu_cmaes.rlib -h
-
-tree:
-	cargo tree
-
-graph-dep:
-	cargo depgraph --dedup-transitive-deps | dot -Tpng > dependencies_graph_of_current_cargo_toml.png
-
-deps: tree graph-dep
-	@echo "✓ Dependency analysis complete"
+	clear && du ./target_cpu/release/libgras.rlib -h 2>/dev/null || du ./target/release/libgras.rlib -h
 
 ################################################################################
 # 🧹 Quality & Testing (CI)
@@ -23,28 +17,25 @@ clean:
 	cargo cache --autoclean && cargo clean
 
 lint:
-	cargo fmt && cargo clippy -- -D warnings
+	source env_setup.sh && cargo fmt && cargo clippy -- -D warnings
 
 test:
-	cargo test
+	source env_setup.sh && cargo test
 
 cove:
-	cargo tarpaulin --out Html
+	source env_setup.sh && cargo tarpaulin --out Html
 
 ################################################################################
 # 🔨 Build & Documentation
 ################################################################################
 prep:
-	cargo build --all-targets 
+	source env_setup.sh && cargo build
 	# Compiles lib + bins + examples + benches + tests
 
 docu:
-	cargo doc
+	source env_setup.sh && cargo doc
 
-exam:
-	cargo run --release --bin express_use
-
-all: clean lint test prep exam docu
+all: clean lint test cove prep docu
 
 build:
 	clear && make all
@@ -53,18 +44,18 @@ build:
 # ⚡ Performance & Profiling
 ################################################################################
 benc:
-	clear && cargo bench --bench mine
+	clear && source env_setup.sh && cargo bench --bench mine
 
 prof:
-	clear && cargo run --release --example flamegraph
+	clear && source env_setup.sh && cargo run --release --example flamegraph
 
 samp:
 	# To grant temporary access before using samply
 	# echo '1' | sudo tee /proc/sys/kernel/perf_event_paranoid
-	clear && samply record cargo run --release --bin ask_tell
+	clear && source env_setup.sh && samply record cargo run --release --bin ask_tell
 
 dry_publ:
-	cargo release
+	source env_setup.sh && cargo release
 	
 publ:
-	cargo release --execute
+	source env_setup.sh && cargo release --execute

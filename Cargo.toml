@@ -11,14 +11,15 @@ default = []
 cuda = ["flodl/cuda"]
 
 [dependencies]
+fastrand = "2.5.0"
 flodl = "0.7.0"
 
 # Development profile: Optimized for fast build times and debugging.
-proptest = "1.11.0"
 [profile.dev]
 opt-level = 0
 debug = true
 incremental = true
+codegen-units = 256
 
 # Release profile: Optimized for maximum runtime performance.
 [profile.release]

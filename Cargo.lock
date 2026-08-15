@@ -1073,6 +1073,7 @@ dependencies = [
 name = "gras"
 version = "0.1.2"
 dependencies = [
+ "fastrand",
  "flodl",
  "git-cliff",
  "proptest",
