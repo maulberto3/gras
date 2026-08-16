@@ -2,26 +2,24 @@
 //!
 //! A [`Node`] is **pure metadata** (port counts, kind, optional dim/activation
 //! override) — it holds no tensors. Execution only happens once the graph is
-//! compiled into a [`GrasGraph`](crate::graph::GrasGraph); see the full
-//! pipeline in [`crate::graph`]. This file is step 2 of it:
+//! compiled into a [`Network`](crate::network::Network); see the
+//! full pipeline in [`crate::topology`]. This file is step 2 of it:
 //!
 //! ```text
-//!   1. Graph::new            empty blueprint + options
+//!   1. Topology::new            empty blueprint + options
 //!   2. Node::new_* (here)    define the compute boxes (ids stay contiguous)
-//!   3. set_graph_topology    one label per port (rendering)
-//!   4. set_graph_network     wire ports (see crate::graph::Port)
+//!   3. set_topology    one label per port (rendering)
+//!   4. set_network     scaffold Input/Output, wire ports + auto-de-orphan
 //!   5. validate              check wiring is executable
-//!   6. GrasGraph::build      one Linear per node + input projection
+//!   6. Network::build      one Linear per node + input projection
 //!   7. forward               per node: gather → combine → linear → activation
 //! ```
 //!
 //! The two **NAS evolution knobs** live on [`Node`] too: [`Node::hidden_dim`]
 //! (per-node channel width) and [`Node::activation`] (which activation runs
-//! after the linear). [`crate::graph::Graph::validate`] enforces the
+//! after the linear). [`crate::topology::Topology::validate`] enforces the
 //! invariants that keep execution simple (contiguous ids, forward-only 1:1
 //! wiring, consistent dims).
-
-use std::fmt::Display;
 
 use flodl::Variable;
 use serde::{Deserialize, Serialize};
@@ -72,35 +70,21 @@ impl Activation {
     }
 }
 
-impl Display for Activation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            Activation::Identity => "identity",
-            Activation::ReLU => "relu",
-            Activation::GeLU => "gelu",
-            Activation::SiLU => "silu",
-            Activation::SELU => "selu",
-            Activation::Tanh => "tanh",
-            Activation::Sigmoid => "sigmoid",
-            Activation::Mish => "mish",
-        };
-        write!(f, "{name}")
-    }
-}
-
 /// A node in the computational graph — a tiny "compute box" 🧮.
 ///
 /// It receives `num_inputs` tensors, combines them, transforms them with its
 /// layer, applies its activation, and exposes `num_outputs` tensors for other
 /// nodes to consume.
 ///
-/// **Invariants** (enforced by [`crate::graph::Graph::validate`]):
+/// **Invariants** (enforced by [`crate::topology::Topology::validate`]):
 ///   - `id` is both identity AND execution order: ids are contiguous `0..n`
-///     and double as array indices into `GrasGraph.layers`
+///     and double as array indices into `Network.layers`
 ///   - `num_inputs == 0` for input nodes — they are fed the network input
 ///   - `hidden_dim` optionally overrides the graph's default channel count
 ///     for this node's layer output
 ///   - `activation` runs after the node's linear transform
+///   - each input port may hold **several wires** (de-orphaning stacks extra
+///     sources); all incoming tensors are combined with Add/Mean
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub id: usize,          // 🏷️ unique id; also execution order (0 runs first)
@@ -120,7 +104,7 @@ pub struct Node {
 pub enum NodeKind {
     Input,  // 📥 start of the network: no inputs, feeds the rest
     Hidden, // 🕶️ middle of the network: combine -> transform -> pass on
-    Output, // 📤 end of the network: its output becomes the graph output
+    Output, // 📤 end of the network: its output becomes the network output
 }
 
 impl Node {
@@ -151,7 +135,7 @@ impl Node {
     }
 
     /// 📤 Create an output node: `num_inputs` inputs (its result becomes the
-    /// graph output) and `num_outputs` outputs.
+    /// network output) and `num_outputs` outputs.
     pub fn new_output(id: usize, num_inputs: usize, num_outputs: usize) -> Self {
         Node {
             id,
@@ -162,21 +146,49 @@ impl Node {
             activation: Activation::Identity,
         }
     }
-}
 
-impl Display for Node {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Node {{ id: {}, num_inputs: {}, num_outputs: {}, kind: {:?}, hidden_dim: {:?}, activation: {} }}",
-            self.id, self.num_inputs, self.num_outputs, self.kind, self.hidden_dim, self.activation
-        )
+    /// Set the activation for hand-built graphs (builder style). 🧠
+    ///
+    /// The constructors default to [`Activation::Identity`]; NAS evolution
+    /// mutates `activation` in place, while hand-written graphs can chain
+    /// this instead:
+    /// `Node::new_hidden(1, 3, 2).with_activation(Activation::GeLU)`.
+    pub fn with_activation(mut self, activation: Activation) -> Self {
+        self.activation = activation;
+        self
+    }
+
+    /// Set the per-node channel-width override for hand-built graphs
+    /// (builder style). `None` inherits the graph's `hidden_dim`.
+    pub fn with_hidden_dim(mut self, hidden_dim: usize) -> Self {
+        self.hidden_dim = Some(hidden_dim);
+        self
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::topology::{Topology, TopologyOptions};
+    use proptest::prelude::*;
+
+    /// Arbitrary valid node metadata (port counts, kind, id).
+    fn node_strategy() -> impl Strategy<Value = Node> {
+        (0usize..100, 0usize..8, 0usize..8, 0usize..3).prop_map(
+            |(id, num_inputs, num_outputs, kind)| Node {
+                id,
+                num_inputs,
+                num_outputs,
+                kind: match kind {
+                    0 => NodeKind::Input,
+                    1 => NodeKind::Hidden,
+                    _ => NodeKind::Output,
+                },
+                hidden_dim: None,
+                activation: Activation::Identity,
+            },
+        )
+    }
 
     #[test]
     fn test_new_node_inputs() {
@@ -196,6 +208,25 @@ mod tests {
     }
 
     #[test]
+    fn test_node_builders() {
+        let node = Node::new_hidden(1, 3, 2)
+            .with_activation(Activation::GeLU)
+            .with_hidden_dim(32);
+        assert_eq!(node.activation, Activation::GeLU);
+        assert_eq!(node.hidden_dim, Some(32));
+        // Chaining doesn't disturb the port counts / kind
+        assert_eq!(node.num_inputs, 3);
+        assert_eq!(node.num_outputs, 2);
+        assert_eq!(node.kind, NodeKind::Hidden);
+        // Order-independent: with_hidden_dim before with_activation
+        let wide = Node::new_hidden(1, 3, 2)
+            .with_hidden_dim(16)
+            .with_activation(Activation::ReLU);
+        assert_eq!(wide.hidden_dim, Some(16));
+        assert_eq!(wide.activation, Activation::ReLU);
+    }
+
+    #[test]
     fn test_new_node_outputs() {
         let node: Node = Node::new_output(1, 3, 2);
         assert_eq!(node.num_inputs, 3);
@@ -209,5 +240,76 @@ mod tests {
         assert_eq!(Activation::ReLU.to_string(), "relu");
         assert_eq!(Activation::GeLU.to_string(), "gelu");
         assert_eq!(Activation::SELU.to_string(), "selu");
+    }
+
+    // ── property tests (proptest) ───────────────────────────────────────────
+
+    proptest! {
+        /// The builder methods only touch their target field: id, kind and
+        /// port counts must survive chaining, in either order.
+        #[test]
+        fn prop_node_builders_preserve_identity(
+            node in node_strategy(),
+            hidden_dim in 1usize..128,
+            relu in any::<bool>(),
+        ) {
+            let activation = if relu { Activation::ReLU } else { Activation::GeLU };
+            let built = node
+                .clone()
+                .with_hidden_dim(hidden_dim)
+                .with_activation(activation);
+            prop_assert_eq!(built.id, node.id);
+            prop_assert_eq!(built.kind, node.kind);
+            prop_assert_eq!(built.num_inputs, node.num_inputs);
+            prop_assert_eq!(built.num_outputs, node.num_outputs);
+            prop_assert_eq!(built.activation, activation);
+            prop_assert_eq!(built.hidden_dim, Some(hidden_dim));
+            // With hidden_dim 0 the graph rejects the node at validate() time.
+            let bad = node.with_hidden_dim(0);
+            prop_assert_eq!(bad.hidden_dim, Some(0));
+        }
+
+        /// A random hidden node's port counts always land inside the options
+        /// ranges, and its id/kind follow the "append" contract.
+        #[test]
+        fn prop_random_hidden_node_respects_port_ranges(
+            min_inputs in 1usize..5,
+            min_outputs in 1usize..5,
+            span_in in 0usize..4,
+            span_out in 0usize..4,
+        ) {
+            let opts = TopologyOptions {
+                seed: 16,
+                min_num_nodes: 2,
+                max_num_nodes: 5,
+                min_inputs_per_node: min_inputs,
+                max_inputs_per_node: min_inputs + span_in,
+                min_outputs_per_node: min_outputs,
+                max_outputs_per_node: min_outputs + span_out,
+                num_outputs_net: 1,
+                input_dim: 1,
+                hidden_dim: 8,
+                combine_op: crate::topology::CombineOp::Add,
+            };
+            let mut graph = Topology::new(0, Some(opts));
+            graph.create_random_hidden_node();
+            let node = &graph.nodes[0];
+            prop_assert!(node.id == 0);
+            prop_assert!(node.kind == NodeKind::Hidden);
+            prop_assert!(
+                node.num_inputs >= min_inputs && node.num_inputs <= min_inputs + span_in,
+                "num_inputs {} outside [{}, {}]",
+                node.num_inputs,
+                min_inputs,
+                min_inputs + span_in
+            );
+            prop_assert!(
+                node.num_outputs >= min_outputs && node.num_outputs <= min_outputs + span_out,
+                "num_outputs {} outside [{}, {}]",
+                node.num_outputs,
+                min_outputs,
+                min_outputs + span_out
+            );
+        }
     }
 }
