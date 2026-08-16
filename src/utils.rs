@@ -1,15 +1,14 @@
 //! ASCII pretty-printing helpers 🎨 for graphs and flodl nets.
 //!
 //! Rendering is a presentation concern, so it lives outside the core graph
-//! types: [`graph_ascii_topology`] draws a [`Graph`] and
-//! [`gras_graph_ascii_net`] draws a [`GrasGraph`], both via the shared
-//! Manhattan-wiring diagram [`render_manhattan`]. The types only keep their
-//! `Display` impls, which delegate here.
+//! types: `graph_ascii_topology` draws a [`Graph`] and `gras_graph_ascii_net`
+//! draws a [`GrasGraph`], both via the shared Manhattan-wiring diagram
+//! `render_manhattan`. The types only keep their `Display` impls, which
+//! delegate here.
 
 use flodl::nn::Module;
 
-use crate::graph::{Connection, Graph, Port};
-use crate::graph_module::GrasGraph;
+use crate::graph::{Connection, Graph, GrasGraph, Port};
 use crate::node::NodeKind;
 
 /// Per-node description consumed by [`render_manhattan`].
@@ -211,9 +210,7 @@ pub(crate) fn graph_ascii_topology(graph: &Graph) -> String {
         .collect();
     out.push_str(&render_manhattan(&nodes, &graph.connections));
 
-    out.push_str(
-        "\n▶ output port · ◀ input port · * orphaned input (fed by network input)\n",
-    );
+    out.push_str("\n▶ output port · ◀ input port · * orphaned input (fed by network input)\n");
     out
 }
 
@@ -258,11 +255,12 @@ pub(crate) fn gras_graph_ascii_net(g: &GrasGraph) -> String {
             ""
         };
         out.push_str(&format!(
-            "   🧮 n{} {:<7} : Linear({} → {}) · in:{} out:{}{}\n",
+            "   🧮 n{} {:<7} : Linear({} → {}) · act: {} · in:{} out:{}{}\n",
             node_id,
             kind,
-            g.hidden_dim,
-            g.hidden_dim,
+            info.in_dim,
+            info.out_dim,
+            info.activation,
             info.num_inputs,
             info.num_outputs,
             marker
@@ -274,8 +272,7 @@ pub(crate) fn gras_graph_ascii_net(g: &GrasGraph) -> String {
 #[cfg(test)]
 mod tests {
     use super::{graph_ascii_topology, gras_graph_ascii_net};
-    use crate::graph::Graph;
-    use crate::graph_module::GrasGraph;
+    use crate::graph::{Graph, GrasGraph};
     use crate::node::Node;
     use flodl::Device;
 
