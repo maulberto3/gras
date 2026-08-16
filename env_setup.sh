@@ -3,7 +3,9 @@
 #   source env_setup.sh        → CPU
 #   source env_setup.sh cuda   → CUDA (cu128)
 
-FLODL_BASE=/home/maulb/.flodl/libtorch/precompiled
+# libtorch lives in fdl's GLOBAL location (~/.flodl/libtorch) so every project
+# shares the same CPU/CUDA variants instead of each holding its own copy.
+FLODL_BASE="$HOME/.flodl/libtorch/precompiled"
 
 if [ "${1}" = "cuda" ]; then
     export LIBTORCH_PATH="${FLODL_BASE}/cu128"
