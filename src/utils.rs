@@ -1,15 +1,16 @@
 //! ASCII pretty-printing helpers 🎨 for graphs and flodl nets.
 //!
 //! Rendering is a presentation concern, so it lives outside the core graph
-//! types: `graph_ascii_topology` draws a [`Graph`] and `gras_graph_ascii_net`
-//! draws a [`GrasGraph`], both via the shared Manhattan-wiring diagram
+//! types: `topology_ascii` draws a [`Topology`] and `network_ascii`
+//! draws a [`Network`], both via the shared Manhattan-wiring diagram
 //! `render_manhattan`. The types only keep their `Display` impls, which
 //! delegate here.
 
 use flodl::nn::Module;
 
-use crate::graph::{Connection, Graph, GrasGraph, Port};
+use crate::network::Network;
 use crate::node::NodeKind;
+use crate::topology::{Connection, Port, Topology};
 
 /// Per-node description consumed by [`render_manhattan`].
 #[derive(Clone, Copy)]
@@ -83,9 +84,68 @@ pub(crate) fn render_manhattan(nodes: &[AsciiNode], connections: &[Connection]) 
     let in_col = |q: usize| in_x0 + q * in_step; // column of the "i{q}" marker
     let out_col = |p: usize| out_x0 + p * out_step; // column of the "o{p}" marker
 
-    // ── canvas ──
-    let rows_per_node = 4;
-    let n_rows = nodes.len() * rows_per_node + 1;
+    // ── row layout: node blocks + per-wire track rows ──
+    // Each node block is 4 rows (label / inputs / outputs / blank). Between
+    // consecutive blocks sits a track zone whose height is the number of
+    // horizontal runs that must live there: wires leaving the upper node
+    // (one source-track row each) plus wires entering the lower node (one
+    // target-track row each). Every horizontal run gets its own row, so two
+    // paths never overlap horizontally — you can always trace which ▶ feeds
+    // which ┐ (dedicated rows ⇒ taller diagram, never ambiguous).
+    let valid: Vec<bool> = connections
+        .iter()
+        .map(|c| c.from.node < c.to.node && c.to.node < nodes.len() && c.to.node > 0)
+        .collect();
+    let out_deg = |i: usize| {
+        connections
+            .iter()
+            .zip(&valid)
+            .filter(|(c, ok)| **ok && c.from.node == i)
+            .count()
+    };
+    let in_deg = |i: usize| {
+        connections
+            .iter()
+            .zip(&valid)
+            .filter(|(c, ok)| **ok && c.to.node == i)
+            .count()
+    };
+
+    let rows_per_node = 4usize;
+    let mut block_row = vec![0usize; nodes.len()]; // label row of each block
+    let mut gap_row = vec![0usize; nodes.len().saturating_sub(1)]; // first track row after block i
+    let mut row = 0usize;
+    for i in 0..nodes.len() {
+        block_row[i] = row;
+        row += rows_per_node;
+        if i + 1 < nodes.len() {
+            gap_row[i] = row;
+            row += out_deg(i) + in_deg(i + 1);
+        }
+    }
+    let n_rows = row + 1;
+
+    // Per-wire horizontal track rows: the source track sits in the gap below
+    // the source node (wires leaving it, in order), the target track in the
+    // gap above the target node (wires entering it, in order).
+    let mut src_rank = vec![0usize; nodes.len()];
+    let mut tgt_rank = vec![0usize; nodes.len()];
+    let mut src_track = vec![0usize; connections.len()];
+    let mut tgt_track = vec![0usize; connections.len()];
+    for (j, c) in connections.iter().enumerate() {
+        if !valid[j] {
+            continue; // invalid wire — not drawable (see debug_assert below)
+        }
+        let s = src_rank[c.from.node];
+        src_rank[c.from.node] += 1;
+        src_track[j] = gap_row[c.from.node] + s;
+
+        let t = tgt_rank[c.to.node];
+        tgt_rank[c.to.node] += 1;
+        let gap = c.to.node - 1; // the gap above the target node
+        tgt_track[j] = gap_row[gap] + out_deg(gap) + t;
+    }
+
     let mut canvas = vec![vec![' '; width]; n_rows];
 
     // Only write into empty cells, so arrows "pass behind" labels instead of
@@ -98,7 +158,7 @@ pub(crate) fn render_manhattan(nodes: &[AsciiNode], connections: &[Connection]) 
 
     // node rows: label / inputs / outputs / blank
     for (i, node) in nodes.iter().enumerate() {
-        let r0 = i * rows_per_node;
+        let r0 = block_row[i];
         for (k, ch) in labels[i].chars().enumerate() {
             canvas[r0][indent + k] = ch;
         }
@@ -114,9 +174,17 @@ pub(crate) fn render_manhattan(nodes: &[AsciiNode], connections: &[Connection]) 
         }
     }
 
-    // orphan markers: '*' next to input ports with no incoming wire
+    // orphan markers: '*' on input ports with no wire (fed by net_input) and
+    // on output ports with no wire — except the graph-output node's own
+    // output ports, which are the graph's answer, not orphans.
+    let output_node = nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Output)
+        .map(|n| n.id)
+        .max()
+        .or_else(|| nodes.iter().map(|n| n.id).max());
     for (i, node) in nodes.iter().enumerate() {
-        let r1 = i * rows_per_node + 1;
+        let r1 = block_row[i] + 1;
         for q in 0..node.num_inputs {
             let target = Port {
                 node: node.id,
@@ -126,49 +194,86 @@ pub(crate) fn render_manhattan(nodes: &[AsciiNode], connections: &[Connection]) 
                 put(&mut canvas, r1, in_col(q) + 2, '*');
             }
         }
+        if Some(node.id) != output_node {
+            let r2 = block_row[i] + 2;
+            for p in 0..node.num_outputs {
+                let source = Port {
+                    node: node.id,
+                    index: p,
+                };
+                if !connections.iter().any(|c| c.from == source) {
+                    put(&mut canvas, r2, out_col(p) + 2, '*');
+                }
+            }
+        }
     }
 
     // ── wires: draw in 3 phases so later strokes never erase earlier ones ──
     // (arrowheads first, then corners + verticals, then horizontals).
 
     // phase 1: arrowheads ▶ at each source, ◀ at each target
-    for conn in connections {
+    for (j, conn) in connections.iter().enumerate() {
+        if !valid[j] {
+            continue;
+        }
         // Edges are strictly forward (from.node < to.node), so the source is
         // always above the target and arrows point DOWN — no backward edges.
         debug_assert!(
             conn.from.node < conn.to.node,
             "render_manhattan assumes forward-only edges, got: {conn}"
         );
-        let src_row = conn.from.node * rows_per_node + 2;
-        let tgt_row = conn.to.node * rows_per_node + 1;
+        let src_row = block_row[conn.from.node] + 2;
+        let tgt_row = block_row[conn.to.node] + 1;
         put(&mut canvas, src_row, out_col(conn.from.index) + 2, '▶');
         put(&mut canvas, tgt_row, in_col(conn.to.index) - 1, '◀');
     }
 
-    // phase 2: one vertical lane per wire, with ┐/┘ corners at its ends
+    // phase 2: corners + verticals — the ▶ drops to its source track row,
+    // runs to its lane, down the lane to the target track row, then drops to
+    // the ◀. Each wire owns its rows, so nothing overlaps.
     for (j, conn) in connections.iter().enumerate() {
-        let src_row = conn.from.node * rows_per_node + 2;
-        let tgt_row = conn.to.node * rows_per_node + 1;
+        if !valid[j] {
+            continue;
+        }
+        let src_row = block_row[conn.from.node] + 2;
+        let tgt_row = block_row[conn.to.node] + 1;
+        let src = out_col(conn.from.index) + 2;
+        let tgt = in_col(conn.to.index) - 1;
         let lane = lane_x0 + j * lane_step;
-        put(&mut canvas, src_row, lane, '┐');
-        for r in src_row + 1..tgt_row {
+        let st = src_track[j];
+        let tt = tgt_track[j];
+
+        // source: drop from ▶ down to the source track row, then east
+        for r in src_row + 1..st {
+            put(&mut canvas, r, src, '│');
+        }
+        put(&mut canvas, st, src, '└'); // turn east onto the track
+        put(&mut canvas, st, lane, '┐'); // turn south into the lane
+        // lane: straight down to the target track row
+        for r in st + 1..tt {
             put(&mut canvas, r, lane, '│');
         }
-        put(&mut canvas, tgt_row, lane, '┘');
+        put(&mut canvas, tt, lane, '┘'); // turn west off the lane
+        // target: run west on the target track row, then drop to the ◀
+        put(&mut canvas, tt, tgt, '┌'); // turn south to the port
+        for r in tt + 1..tgt_row {
+            put(&mut canvas, r, tgt, '│');
+        }
     }
 
-    // phase 3: horizontal runs from source ▶ to lane, and lane to target ◀
+    // phase 3: horizontal runs on each wire's own track rows
     for (j, conn) in connections.iter().enumerate() {
-        let src_row = conn.from.node * rows_per_node + 2;
-        let tgt_row = conn.to.node * rows_per_node + 1;
+        if !valid[j] {
+            continue;
+        }
         let src = out_col(conn.from.index) + 2;
-        let tgt = in_col(conn.to.index);
+        let tgt = in_col(conn.to.index) - 1;
         let lane = lane_x0 + j * lane_step;
         for c in src + 1..lane {
-            put(&mut canvas, src_row, c, '─');
+            put(&mut canvas, src_track[j], c, '─');
         }
         for c in (tgt + 1..lane).rev() {
-            put(&mut canvas, tgt_row, c, '─');
+            put(&mut canvas, tgt_track[j], c, '─');
         }
     }
 
@@ -180,11 +285,11 @@ pub(crate) fn render_manhattan(nodes: &[AsciiNode], connections: &[Connection]) 
     out
 }
 
-/// ASCII topology view of a [`Graph`] 🎨: a header box plus the Manhattan-wired
+/// ASCII topology view of a [`Topology`] 🎨: a header box plus the Manhattan-wired
 /// node diagram.
-pub(crate) fn graph_ascii_topology(graph: &Graph) -> String {
+pub(crate) fn topology_ascii(graph: &Topology) -> String {
     let header = format!(
-        "🌐 Graph #{} · {} nodes · {} input ports · {} output ports · {} wires · combine: {:?}",
+        "🌐 Topology #{} · {} nodes · {} input ports · {} output ports · {} wires · combine: {:?}",
         graph.id,
         graph.nodes.len(),
         graph.graph_inputs.len(),
@@ -210,16 +315,18 @@ pub(crate) fn graph_ascii_topology(graph: &Graph) -> String {
         .collect();
     out.push_str(&render_manhattan(&nodes, &graph.connections));
 
-    out.push_str("\n▶ output port · ◀ input port · * orphaned input (fed by network input)\n");
+    out.push_str(
+        "\n▶ output port · ◀ input port · * orphaned port (input: fed by network input · output: unused)\n",
+    );
     out
 }
 
-/// ASCII net view of a [`GrasGraph`] 🧠: the Manhattan-wired diagram plus the
+/// ASCII net view of a [`Network`] 🧠: the Manhattan-wired diagram plus the
 /// input projection and one Linear per node.
-pub(crate) fn gras_graph_ascii_net(g: &GrasGraph) -> String {
+pub(crate) fn network_ascii(g: &Network) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "🧠 flodl net (GrasGraph) · {} nodes · {} wires · {} params\n\n",
+        "🧠 flodl net (Network) · {} nodes · {} wires · {} param tensors (weight+bias per layer)\n\n",
         g.layers.len(),
         g.connections.len(),
         g.parameters().len(),
@@ -250,7 +357,7 @@ pub(crate) fn gras_graph_ascii_net(g: &GrasGraph) -> String {
             NodeKind::Output => "output",
         };
         let marker = if node_id == g.output_node {
-            "   ← 🏁 graph output"
+            "   ← 🏁 network output"
         } else {
             ""
         };
@@ -271,22 +378,23 @@ pub(crate) fn gras_graph_ascii_net(g: &GrasGraph) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{graph_ascii_topology, gras_graph_ascii_net};
-    use crate::graph::{Graph, GrasGraph};
+    use super::{network_ascii, topology_ascii};
+    use crate::network::Network;
     use crate::node::Node;
+    use crate::topology::Topology;
     use flodl::Device;
 
     #[test]
     fn test_render_graph_topology() {
-        let mut graph = Graph::new(1, None);
+        let mut graph = Topology::new(1, None);
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_hidden(1, 3, 1));
-        graph.set_graph_topology();
-        graph.set_graph_network();
+        graph.set_topology();
+        graph.set_network();
 
-        let s = graph_ascii_topology(&graph);
+        let s = topology_ascii(&graph);
         // Header box with the graph summary
-        assert!(s.contains("Graph #1"));
+        assert!(s.contains("Topology #1"));
         // One label per node with its port counts
         assert!(s.contains("n0 input (in 0 · out 2)"));
         assert!(s.contains("n1 hidden (in 3 · out 1)"));
@@ -303,14 +411,14 @@ mod tests {
     }
 
     #[test]
-    fn test_render_gras_graph_net() {
-        let mut graph = Graph::new(0, None);
+    fn test_render_network_net() {
+        let mut graph = Topology::new(0, None);
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_output(1, 2, 1));
-        graph.set_graph_network();
+        graph.set_network();
 
-        let module = GrasGraph::build(&graph, Device::CPU).unwrap();
-        let s = gras_graph_ascii_net(&module);
+        let module = Network::build(&graph, Device::CPU).unwrap();
+        let s = network_ascii(&module);
 
         // Manhattan diagram: node labels + one arrowhead per wire end
         assert!(s.contains("n0 input (in 0 · out 2)"));
@@ -321,7 +429,7 @@ mod tests {
         assert!(s.contains("input_proj : Linear(1 → 8)"));
         assert!(s.contains("Linear(8 → 8)"));
         // Output node is marked 🏁
-        assert!(s.contains("🏁 graph output"));
+        assert!(s.contains("🏁 network output"));
         // Display impl delegates to the utils function
         assert_eq!(format!("{module}"), s);
     }
