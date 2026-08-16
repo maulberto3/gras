@@ -34,6 +34,7 @@ debug = false
 [dev-dependencies]
 git-cliff = "2.13.1"
 proptest = "1.11.0"
+ureq = "3"
 
 [package.metadata.release]
 pre-release-commit-message = "chore(release): bump version to {{version}}"
