@@ -1,6 +1,8 @@
 /target
 /target_cpu
 /target_cuda
+/libtorch
+/saved
 
 .vscode
 

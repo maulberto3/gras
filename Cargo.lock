@@ -1077,6 +1077,8 @@ dependencies = [
  "flodl",
  "git-cliff",
  "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
