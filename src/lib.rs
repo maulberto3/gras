@@ -2,6 +2,7 @@ pub mod data;
 pub mod display;
 pub mod engine;
 pub mod error;
+pub mod fitness;
 pub mod network;
 pub mod node;
 pub mod spec;
