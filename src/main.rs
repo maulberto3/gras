@@ -1,7 +1,7 @@
 //! 🧬 The minimal gras pipeline — the tight loop the engine will run for
 //! every individual in a population: random graph → wire → validate → build →
 //! forward. For the full API tour (hand-built graphs, custom options, wiring
-//! introspection, JSON persistence), see `examples/full_guide.rs`.
+//! introspection, JSON persistence), see `examples/topology_guide.rs`.
 //!
 //! Run with: `source env_setup.sh && cargo run`
 
