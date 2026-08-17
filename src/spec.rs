@@ -159,16 +159,10 @@ mod tests {
         let reloaded_graph = Topology::from_json(&json).unwrap();
         let rebuilt = Network::build(&reloaded_graph, Device::CPU).unwrap();
 
-        // Same output node, same per-node dims/activations, same param count.
+        // Same output node, same nodes + derived dims, same param count.
         assert_eq!(rebuilt.output_node, module.output_node);
-        for (a, b) in rebuilt.node_info.iter().zip(module.node_info.iter()) {
-            assert_eq!(a.kind, b.kind);
-            assert_eq!(a.num_inputs, b.num_inputs);
-            assert_eq!(a.num_outputs, b.num_outputs);
-            assert_eq!(a.in_dim, b.in_dim);
-            assert_eq!(a.out_dim, b.out_dim);
-            assert_eq!(a.activation, b.activation);
-        }
+        assert_eq!(rebuilt.nodes, module.nodes);
+        assert_eq!(rebuilt.node_dims, module.node_dims);
         assert_eq!(rebuilt.parameters().len(), module.parameters().len());
         let input = rand_input(2, graph.options.input_dim);
         assert_eq!(
