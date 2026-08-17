@@ -15,14 +15,12 @@ use crate::topology::{Connection, Topology};
 
 impl Display for Topology {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The rendering logic lives in utils (presentation concern, not core).
         write!(f, "{}", crate::utils::topology_ascii(self))
     }
 }
 
 impl Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The rendering logic lives in utils (presentation concern, not core).
         write!(f, "{}", crate::utils::network_ascii(self))
     }
 }
