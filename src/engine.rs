@@ -24,64 +24,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use flodl::nn::Module;
-use flodl::nn::loss::mse_loss;
-use flodl::tensor::{Result, TensorError};
+use flodl::tensor::Result;
 use flodl::{Device, Variable};
 use serde::Serialize;
 
 use crate::data::Dataset;
+use crate::error::EngineError;
+pub use crate::fitness::{Fitness, FitnessKind};
 use crate::network::Network;
 use crate::node::Activation;
 use crate::topology::{CombineOp, Topology, TopologyOptions};
-
-/// Built-in scoring strategies — the "use this path, go for 'mse'" path.
-/// Serializable, so the run's `engine.json` records which one was used.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-pub enum FitnessKind {
-    /// Mean squared error between prediction and target (lower = better).
-    #[default]
-    Mse,
-}
-
-/// A user-supplied scorer: `(net, inputs, targets) -> score`, evaluated
-/// identically for every individual, every generation.
-pub type FitnessFn = Box<dyn Fn(&Network, &Variable, &Variable) -> Result<f64>>;
-
-/// The scorer the engine actually runs: a built-in, or your drop-in closure.
-///
-/// - [`Fitness::mse`] — the one-liner built-in.
-/// - [`Fitness::custom`] — "use this path, but I want THIS fitness
-///   function": a closure `(&Network, &Variable, &Variable) -> Result<f64>`
-///   evaluated identically for every individual, every generation.
-pub enum Fitness {
-    Builtin(FitnessKind),
-    Custom(FitnessFn),
-}
-
-impl Fitness {
-    /// Built-in mean-squared-error scoring (lower = better).
-    pub fn mse() -> Self {
-        Fitness::Builtin(FitnessKind::Mse)
-    }
-
-    /// Drop in your own scorer. `f(net, inputs, targets) -> score`; the
-    /// engine tracks the **minimum** as the current best.
-    pub fn custom<F>(f: F) -> Self
-    where
-        F: Fn(&Network, &Variable, &Variable) -> Result<f64> + 'static,
-    {
-        Fitness::Custom(Box::new(f))
-    }
-
-    /// Score one network on the loaded data.
-    fn evaluate(&self, net: &Network, x: &Variable, y: &Variable) -> Result<f64> {
-        match self {
-            Fitness::Builtin(FitnessKind::Mse) => mse_loss(&net.forward(x)?, y)?.item(),
-            Fitness::Custom(f) => f(net, x, y),
-        }
-    }
-}
 
 /// Knobs for one engine run. Serialized by [`Engine::to_json`] into the run
 /// folder's `engine.json`, so an experiment is fully reproducible.
@@ -152,8 +104,8 @@ pub struct Best {
     pub topology: Topology,
 }
 
-/// A running NAS experiment. Build it with [`Engine::new`], run it with
-/// [`Engine::run`].
+/// A running NAS experiment. Build it with [`Engine::new`] (or
+/// [`Engine::new_seeded`]), run it with [`Engine::run`].
 pub struct Engine {
     pub options: EngineOptions,
     /// Unix timestamp identifying this run (also the checkpoint folder name).
@@ -162,6 +114,9 @@ pub struct Engine {
     pub run_dir: PathBuf,
     /// The population of blueprints (evolved in place by future genetics).
     pub pop: Vec<Topology>,
+    /// Saved topologies the run was seeded from (`new_seeded`) — recorded
+    /// in `engine.json` so a seeded experiment is fully replicable.
+    pub seeds: Vec<Topology>,
     /// The scorer (built-in or user closure).
     pub fitness: Fitness,
     /// The dataset loaded from the user-provided path.
@@ -182,25 +137,57 @@ pub struct Engine {
 impl Engine {
     /// Start an experiment: load the dataset from `data_path`, create the
     /// per-run checkpoint folder `results/<ts>/`, and seed a population of
-    /// `options.pop_size` random graphs.
+    /// `options.pop_size` random graphs. Equivalent to
+    /// [`Engine::new_seeded`] with no seeds.
     ///
     /// Fails if the dataset's input dim doesn't match `options.input_dim`.
     pub fn new(options: EngineOptions, data_path: &Path, fitness: Fitness) -> Result<Self> {
+        Self::new_seeded(options, data_path, fitness, &[])
+    }
+
+    /// Start an experiment seeded from saved topologies — the "continue from
+    /// best" path. `seeds` are topology JSON strings, i.e. anything
+    /// [`Topology::to_json`] produced: a `saved/` blueprint, an
+    /// `improvements/*.json` entry, or `engine.json`'s `best_topology`.
+    ///
+    /// Each seed is parsed, validated (and its `input_dim` checked against
+    /// the dataset), then becomes one of the **first** population entries, in
+    /// order; the remaining `pop_size - seeds.len()` slots are filled with
+    /// random graphs as usual. A seed is never re-wired — a saved file
+    /// already went through `set_network` — so a seeded run replicates the
+    /// saved architecture exactly, then evolves from it.
+    ///
+    /// Fails if a seed isn't valid JSON, fails validation, has a different
+    /// `input_dim`, or there are more seeds than `pop_size`.
+    pub fn new_seeded(
+        options: EngineOptions,
+        data_path: &Path,
+        fitness: Fitness,
+        seeds: &[&str],
+    ) -> Result<Self> {
         if options.pop_size == 0 {
-            return Err(TensorError::new("engine: pop_size must be > 0"));
+            return Err(EngineError::InvalidOptions("pop_size must be > 0".into()).into());
+        }
+        if seeds.len() > options.pop_size {
+            return Err(EngineError::InvalidOptions(format!(
+                "{} seed topologies but pop_size is {}",
+                seeds.len(),
+                options.pop_size
+            ))
+            .into());
         }
 
         // Data contract: tensors on disk, loaded once.
         let data = crate::data::load_dataset(data_path)?;
-        let data_in =
-            data.inputs.shape().get(1).copied().ok_or_else(|| {
-                TensorError::new("engine: dataset inputs must be 2-D [n, input_dim]")
-            })?;
+        let data_in = data.inputs.shape().get(1).copied().ok_or_else(|| {
+            EngineError::DataMismatch("dataset inputs must be 2-D [n, input_dim]".into())
+        })?;
         if data_in != options.input_dim as i64 {
-            return Err(TensorError::new(&format!(
-                "engine: dataset input_dim is {data_in} but options.input_dim is {}",
+            return Err(EngineError::DataMismatch(format!(
+                "dataset input_dim is {data_in} but options.input_dim is {}",
                 options.input_dim
-            )));
+            ))
+            .into());
         }
 
         // Per-run checkpoint folder: results/<unix ts>/
@@ -212,15 +199,35 @@ impl Engine {
             .unwrap_or(0)
             .to_string();
         let run_dir = options.results_dir.join(&run_id);
-        fs::create_dir_all(&run_dir).map_err(|e| {
-            TensorError::new(&format!("engine: cannot create {}: {e}", run_dir.display()))
+        fs::create_dir_all(&run_dir).map_err(|source| EngineError::Io {
+            path: run_dir.display().to_string(),
+            source,
         })?;
 
-        // Seed the population: pop_size random graphs through the standard
-        // pipeline (scaffold + wire + auto-de-orphan).
+        // Saved seeds: parse + validate each one, untouched (no re-wiring).
+        let mut seeds_parsed = Vec::with_capacity(seeds.len());
+        for s in seeds {
+            let g = Topology::from_json(s)
+                .map_err(|e| EngineError::Json(format!("seeded topology: {e}")))?;
+            g.validate()
+                .map_err(|e| EngineError::InvalidOptions(format!("seeded topology: {e}")))?;
+            if g.options.input_dim != options.input_dim {
+                return Err(EngineError::DataMismatch(format!(
+                    "seeded topology input_dim is {} but options.input_dim is {}",
+                    g.options.input_dim, options.input_dim
+                ))
+                .into());
+            }
+            seeds_parsed.push(g);
+        }
+
+        // Population: saved seeds first, then random graphs through the
+        // standard pipeline (scaffold + wire + auto-de-orphan).
         let mut rng = fastrand::Rng::with_seed(options.seed);
         let mut pop = Vec::with_capacity(options.pop_size);
-        for i in 0..options.pop_size {
+        pop.extend(seeds_parsed.iter().cloned());
+        let n_random = options.pop_size - seeds_parsed.len();
+        for i in 0..n_random {
             let n_hidden = rng.usize(2..=6);
             let mut graph =
                 Topology::new(i, Some(options.topology_options(options.seed as usize + i)));
@@ -235,6 +242,7 @@ impl Engine {
             run_id,
             run_dir,
             pop,
+            seeds: seeds_parsed,
             fitness,
             data,
             data_path: data_path.to_path_buf(),
@@ -247,8 +255,12 @@ impl Engine {
         // Initial experiment envelope (no best yet); the final one is
         // written at the end of `run()`.
         let initial = engine.to_json()?;
-        fs::write(engine.run_dir.join("engine.json"), initial)
-            .map_err(|e| TensorError::new(&format!("engine: cannot write engine.json: {e}")))?;
+        fs::write(engine.run_dir.join("engine.json"), initial).map_err(|source| {
+            EngineError::Io {
+                path: engine.run_dir.join("engine.json").display().to_string(),
+                source,
+            }
+        })?;
         Ok(engine)
     }
 
@@ -263,8 +275,10 @@ impl Engine {
             self.next_generation();
         }
         let json = self.to_json()?;
-        fs::write(self.run_dir.join("engine.json"), json)
-            .map_err(|e| TensorError::new(&format!("engine: cannot write engine.json: {e}")))?;
+        fs::write(self.run_dir.join("engine.json"), json).map_err(|source| EngineError::Io {
+            path: self.run_dir.join("engine.json").display().to_string(),
+            source,
+        })?;
         Ok(())
     }
 
@@ -314,19 +328,23 @@ impl Engine {
     fn record_improvement(&mut self) -> Result<()> {
         let Some(b) = &self.best else { return Ok(()) };
         let dir = self.run_dir.join("improvements");
-        fs::create_dir_all(&dir).map_err(|e| {
-            TensorError::new(&format!("engine: cannot create {}: {e}", dir.display()))
+        fs::create_dir_all(&dir).map_err(|source| EngineError::Io {
+            path: dir.display().to_string(),
+            source,
         })?;
         let json = b
             .topology
             .to_json()
-            .map_err(|e| TensorError::new(&format!("engine: improvement json: {e}")))?;
+            .map_err(|e| EngineError::Json(format!("improvement json: {e}")))?;
         let name = format!(
             "{:04}_gen{:02}_fitness{:.4}.json",
             self.improvements, self.generation, b.fitness
         );
-        fs::write(dir.join(name), json)
-            .map_err(|e| TensorError::new(&format!("engine: cannot write improvement: {e}")))?;
+        let path = dir.join(&name);
+        fs::write(&path, json).map_err(|source| EngineError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
         self.improvements += 1;
         Ok(())
     }
@@ -348,8 +366,12 @@ impl Engine {
         let mut log = fs::read_to_string(self.run_dir.join("log.txt")).unwrap_or_default();
         log.push_str(&line);
         log.push('\n');
-        fs::write(self.run_dir.join("log.txt"), log)
-            .map_err(|e| TensorError::new(&format!("engine: cannot write log.txt: {e}")))
+        let path = self.run_dir.join("log.txt");
+        fs::write(&path, log).map_err(|source| EngineError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        Ok(())
     }
 
     /// Advance one generation: crossover → mutate → generation += 1.
@@ -386,10 +408,17 @@ impl Engine {
             Some(b) => Some(
                 b.topology
                     .to_json()
-                    .map_err(|e| TensorError::new(&format!("engine: best topology: {e}")))?,
+                    .map_err(|e| EngineError::Json(format!("best topology: {e}")))?,
             ),
             None => None,
         };
+        let mut seed_topologies = Vec::with_capacity(self.seeds.len());
+        for t in &self.seeds {
+            seed_topologies.push(
+                t.to_json()
+                    .map_err(|e| EngineError::Json(format!("seed topology: {e}")))?,
+            );
+        }
         let spec = serde_json::json!({
             "run_id": self.run_id,
             "data_path": self.data_path.display().to_string(),
@@ -398,21 +427,24 @@ impl Engine {
             "options": &self.options,
             "best_fitness": self.best.as_ref().map(|b| b.fitness),
             "best_topology": best_topology,
+            "seed_topologies": seed_topologies,
         });
         serde_json::to_string_pretty(&spec)
-            .map_err(|e| TensorError::new(&format!("engine: to_json: {e}")))
+            .map_err(|e| EngineError::Json(format!("to_json: {e}")).into())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flodl::nn::Module;
+    use flodl::nn::loss::mse_loss;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn temp_data_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gras_engine_test_{}", fastrand::u64(..)));
-        let ds = crate::data::synthetic_x_squared(64, 42, Device::CPU).unwrap();
+        let ds = crate::fitness::synthetic_x_squared(64, 42, Device::CPU).unwrap();
         crate::data::save_dataset(&dir, &ds).unwrap();
         dir
     }
@@ -519,6 +551,114 @@ mod tests {
             ..test_options()
         };
         assert!(Engine::new(opts, &data_dir, Fitness::mse()).is_err());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn test_engine_seeds_from_saved_topology() {
+        // A `saved/`-style blueprint (`Topology::to_json`) must be
+        // consumable by the engine: it becomes population entry 0, untouched,
+        // and the run proceeds normally.
+        let data_dir = temp_data_dir();
+        let mut seed = Topology::new(9, None);
+        seed.create_random_hidden_nodes(3);
+        seed.set_topology();
+        seed.set_network();
+        seed.validate().unwrap();
+        let seed_json = seed.to_json().unwrap();
+
+        let opts = test_options();
+        let mut engine =
+            Engine::new_seeded(opts.clone(), &data_dir, Fitness::mse(), &[&seed_json]).unwrap();
+
+        // The seed is population entry 0, the exact same blueprint.
+        assert_eq!(engine.pop.len(), opts.pop_size);
+        assert_eq!(
+            crate::spec::Spec::from(&engine.pop[0]),
+            crate::spec::Spec::from(&seed)
+        );
+        assert_eq!(engine.seeds.len(), 1);
+
+        engine.run().unwrap();
+
+        // The envelope records the seeds for replication.
+        let v: serde_json::Value = serde_json::from_str(&engine.to_json().unwrap()).unwrap();
+        let seeds = v["seed_topologies"].as_array().unwrap();
+        assert_eq!(seeds.len(), 1);
+        let reloaded = Topology::from_json(seeds[0].as_str().unwrap()).unwrap();
+        assert_eq!(
+            crate::spec::Spec::from(&reloaded),
+            crate::spec::Spec::from(&seed)
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&opts.results_dir);
+    }
+
+    #[test]
+    fn test_saved_and_improvements_share_format() {
+        // The two JSON outputs — a `saved/` file and an `improvements/*.json`
+        // entry — are the same Spec serialization, so anything one side
+        // writes can seed the other: feed the run's best improvement back in.
+        let data_dir = temp_data_dir();
+        let opts = test_options();
+        let mut engine = Engine::new(opts.clone(), &data_dir, Fitness::mse()).unwrap();
+        engine.run().unwrap();
+
+        // The latest improvement entry is the current best blueprint.
+        let imp_dir = engine.run_dir.join("improvements");
+        let mut files: Vec<_> = std::fs::read_dir(&imp_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        let best_json = std::fs::read_to_string(imp_dir.join(files.last().unwrap())).unwrap();
+
+        // A fresh run seeded from it replicates that blueprint exactly.
+        let mut seeded =
+            Engine::new_seeded(opts.clone(), &data_dir, Fitness::mse(), &[&best_json]).unwrap();
+        assert_eq!(
+            crate::spec::Spec::from(&seeded.pop[0]),
+            crate::spec::Spec::from(&engine.best.as_ref().unwrap().topology)
+        );
+        seeded.run().unwrap();
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&opts.results_dir);
+    }
+
+    #[test]
+    fn test_engine_rejects_bad_seeds() {
+        let data_dir = temp_data_dir();
+        let opts = test_options();
+
+        // Not JSON at all.
+        assert!(
+            Engine::new_seeded(opts.clone(), &data_dir, Fitness::mse(), &["not json"]).is_err()
+        );
+
+        // Valid JSON but an invalid (empty) topology.
+        let empty = Topology::new(0, None).to_json().unwrap();
+        assert!(Engine::new_seeded(opts.clone(), &data_dir, Fitness::mse(), &[&empty]).is_err());
+
+        // Valid topology but the wrong input_dim for the dataset.
+        let mut wide = Topology::new(0, None);
+        wide.options.input_dim = 2;
+        wide.nodes.push(crate::node::Node::new_input(0, 1));
+        wide.nodes.push(crate::node::Node::new_output(1, 1, 1));
+        wide.set_network();
+        let wide_json = wide.to_json().unwrap();
+        assert!(
+            Engine::new_seeded(opts.clone(), &data_dir, Fitness::mse(), &[&wide_json]).is_err()
+        );
+
+        // More seeds than pop_size.
+        let mut g = Topology::new(0, None);
+        g.create_random_hidden_nodes(2);
+        g.set_network();
+        let j = g.to_json().unwrap();
+        let seeds: Vec<String> = (0..opts.pop_size + 1).map(|_| j.clone()).collect();
+        let refs: Vec<&str> = seeds.iter().map(|s| s.as_str()).collect();
+        assert!(Engine::new_seeded(opts, &data_dir, Fitness::mse(), &refs).is_err());
+
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
