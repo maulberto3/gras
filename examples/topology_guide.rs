@@ -1,13 +1,17 @@
 //! 🧬 The full gras guide — every API, one walkthrough.
 //!
-//! Run with: `source env_setup.sh && cargo run --example full_guide`
+//! Run with: `source env_setup.sh && cargo run --example topology_guide`
 //!
 //! Sections:
 //!   1. The minimal pipeline      — the exact path the engine will run per individual
 //!   2. Hand-built graphs         — full manual control (builders, activations, dims)
 //!   3. Random graphs             — automatic generation from options + ranges
+//!
+//!   3b. Scaffolding              — auto Input/Output, multi-output merge
 //!   4. Custom options            — seed, dims, port ranges, CombineOp
 //!   5. The wiring, up close      — connection_pairs, orphan_counts, de-orphan
+//!
+//!   5b. Per-node insights        — per-port sources/orphans, degrees, dims
 //!   6. Compile & run             — Network::build + forward + parameters
 //!   7. Persistence               — to_json / from_json (architecture only, no weights)
 
@@ -51,6 +55,74 @@ fn build_and_run(name: &str, graph: &Topology, batch: i64) {
     );
 }
 
+/// Per-node wiring insights: for every node, its kind / ports / output dim /
+/// activation / in-out degrees, then **every input port's sources** (or `*`
+/// = orphaned → fed `net_input`) and **every output port's sinks** (or `*` =
+/// unused). Everything below uses only the public topology API.
+fn log_insights(name: &str, graph: &Topology) {
+    let hidden_dim = graph.options.hidden_dim;
+    println!("  ── {name} insights ──");
+    for node in &graph.nodes {
+        let out_dim = node.hidden_dim.unwrap_or(hidden_dim);
+        let in_deg = graph
+            .connections
+            .iter()
+            .filter(|c| c.to.node == node.id)
+            .count();
+        let out_deg = graph
+            .connections
+            .iter()
+            .filter(|c| c.from.node == node.id)
+            .count();
+        println!(
+            "  n{} {:<7} ports in:{:<2} out:{:<2} · out_dim:{:<3} · act:{:<8} · indeg:{:<2} outdeg:{}",
+            node.id,
+            format!("{:?}", node.kind).to_lowercase(),
+            node.num_inputs,
+            node.num_outputs,
+            out_dim,
+            node.activation,
+            in_deg,
+            out_deg,
+        );
+        for i in 0..node.num_inputs {
+            let port = Port {
+                node: node.id,
+                index: i,
+            };
+            let sources: Vec<String> = graph
+                .connections
+                .iter()
+                .filter(|c| c.to == port)
+                .map(|c| c.from_label())
+                .collect();
+            if sources.is_empty() {
+                println!("      i{i} * orphaned → net_input");
+            } else {
+                println!("      i{i} ← {}", sources.join(", "));
+            }
+        }
+        for o in 0..node.num_outputs {
+            let port = Port {
+                node: node.id,
+                index: o,
+            };
+            let sinks: Vec<String> = graph
+                .connections
+                .iter()
+                .filter(|c| c.from == port)
+                .map(|c| c.to_label())
+                .collect();
+            if sinks.is_empty() {
+                println!("      o{o} * unused");
+            } else {
+                println!("      o{o} → {}", sinks.join(", "));
+            }
+        }
+    }
+    println!();
+}
+
 fn main() {
     // ═══════════════════════════════════════════════════════════════════════
     // 1. The minimal pipeline — what the engine will do per individual
@@ -81,6 +153,7 @@ fn main() {
     manual.set_topology();
     manual.set_network();
     build_and_run("manual graph", &manual, 3);
+    log_insights("manual graph", &manual);
 
     // ═══════════════════════════════════════════════════════════════════════
     // 3. Random graphs — the NAS bread-and-butter
@@ -106,6 +179,57 @@ fn main() {
         random.nodes.len()
     );
     build_and_run("random graph", &random, 2);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 3b. Scaffolding — the canonical Input → … → Output skeleton
+    // ═══════════════════════════════════════════════════════════════════════
+    println!("═ 3b. Scaffolding (auto Input/Output) ═");
+    // Random graphs only create hidden nodes; set_network scaffolds the
+    // skeleton. ensure_scaffold is public for manual use and idempotent.
+    let mut bare = Topology::new(5, None);
+    bare.create_random_hidden_nodes(2);
+    println!(
+        "  hidden-only graph: {} nodes, no Input/Output yet",
+        bare.nodes.len()
+    );
+    bare.ensure_scaffold();
+    println!(
+        "  after ensure_scaffold: {} nodes — n0 is {:?}, last is {:?}",
+        bare.nodes.len(),
+        bare.nodes[0].kind,
+        bare.nodes.last().unwrap().kind
+    );
+    let before = bare.nodes.clone();
+    bare.ensure_scaffold();
+    assert_eq!(bare.nodes, before, "ensure_scaffold must be idempotent");
+    println!("  calling ensure_scaffold again is a no-op ✓");
+    bare.set_topology();
+    bare.set_network();
+    build_and_run("scaffolded graph", &bare, 2);
+
+    // More than one Output node → de_multi_outputs stacks them into a single
+    // projection node (the output projection, counterpart of input_proj).
+    println!("  multi-output merge (de_multi_outputs):");
+    let mut multi = Topology::new(6, None);
+    multi.nodes.push(Node::new_input(0, 1));
+    multi.nodes.push(Node::new_hidden(1, 1, 1));
+    multi.nodes.push(Node::new_output(2, 1, 1));
+    multi.nodes.push(Node::new_output(3, 1, 1)); // second output node
+    let n_out_before = multi
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Output)
+        .count();
+    println!("  {n_out_before} output nodes before set_network →");
+    multi.set_network();
+    let n_out = multi
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Output)
+        .count();
+    assert_eq!(n_out, 1);
+    println!("  after set_network: exactly {n_out} output node (the stacked projection)");
+    build_and_run("multi-output merged graph", &multi, 2);
 
     // ═══════════════════════════════════════════════════════════════════════
     // 4. Custom options — full control over generation & execution
@@ -169,6 +293,40 @@ fn main() {
     println!("{wired}");
     build_and_run("wired graph", &wired, 2);
 
+    // de-orphan, up close: wire most ports by hand, leave one output
+    // orphaned, then watch de_orphan_outputs rewire it into a later node.
+    println!("  de-orphan, up close (de_orphan_outputs):");
+    let mut messy = Topology::new(7, None);
+    messy.nodes.push(Node::new_input(0, 2));
+    messy.nodes.push(Node::new_hidden(1, 3, 2));
+    messy.nodes.push(Node::new_hidden(2, 2, 1));
+    messy.nodes.push(Node::new_output(3, 1, 1));
+    messy.connections.push(Connection {
+        from: Port { node: 0, index: 0 },
+        to: Port { node: 1, index: 2 },
+    });
+    messy.connections.push(Connection {
+        from: Port { node: 0, index: 1 },
+        to: Port { node: 2, index: 0 },
+    });
+    messy.connections.push(Connection {
+        from: Port { node: 1, index: 0 },
+        to: Port { node: 2, index: 1 },
+    });
+    messy.connections.push(Connection {
+        from: Port { node: 1, index: 1 },
+        to: Port { node: 3, index: 0 },
+    });
+    messy.validate().unwrap();
+    let (oi, oo) = messy.orphan_counts();
+    println!("  before de-orphan: {oi} orphaned inputs (fed net_input), {oo} orphaned outputs");
+    let added = messy.de_orphan_outputs();
+    println!("  de_orphan_outputs() wired {added} orphaned output(s) into later nodes");
+    let (oi, oo) = messy.orphan_counts();
+    println!("  after: {oi} orphaned inputs, {oo} orphaned outputs");
+    build_and_run("de-orphaned graph", &messy, 2);
+    log_insights("de-orphaned graph", &messy);
+
     // ═══════════════════════════════════════════════════════════════════════
     // 6. Persistence — architecture only, never weights
     // ═══════════════════════════════════════════════════════════════════════
@@ -187,5 +345,5 @@ fn main() {
     assert_eq!(Spec::from(&reloaded), Spec::from(&custom));
     build_and_run("reloaded graph", &reloaded, 5);
 
-    println!("  ✅ full guide complete — every section ran");
+    println!("  ✅ topology guide complete — every section ran");
 }

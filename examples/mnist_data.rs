@@ -9,6 +9,13 @@
 //!
 //! Run with: `source env_setup.sh && cargo run --example mnist_data`
 //!
+//! Already-downloaded assets are reused, never re-fetched:
+//!   - if the four `.gz` files exist, the download step is skipped
+//!   - if `train/` + `test/` datasets already exist, the parse step is
+//!     skipped too (idempotent — re-running is a no-op)
+//!
+//! Add `--force` to ignore what's on disk and redo both.
+//!
 //! Output: `data/mnist/train/` and `data/mnist/test/` (inputs.bin +
 //! targets.bin + meta.json each) — pass `data/mnist/train` to
 //! `Engine::new` as the data path.
@@ -43,17 +50,24 @@ const MNIST_FILES: [(&str, &str); 4] = [
     ),
 ];
 
-/// Download the four MNIST files into `dir` if they're missing (idempotent).
-fn ensure_mnist_downloaded(dir: &Path) -> Result<()> {
+/// Download the four MNIST files into `dir` — reusing already-downloaded
+/// assets unless `force` is set (then each file is fetched again, overwriting
+/// what's on disk).
+fn ensure_mnist_downloaded(dir: &Path, force: bool) -> Result<()> {
     fs::create_dir_all(dir).map_err(|e| {
         TensorError::new(&format!("mnist_data: cannot create {}: {e}", dir.display()))
     })?;
     for (name, url) in MNIST_FILES {
         let path = dir.join(name);
-        if path.exists() {
+        if !force && path.exists() {
+            println!("  ✓ reusing already-downloaded {name}");
             continue;
         }
-        println!("  ↓ downloading {name} …");
+        if force && path.exists() {
+            println!("  ↓ re-downloading {name} (--force) …");
+        } else {
+            println!("  ↓ downloading {name} …");
+        }
         let body = ureq::get(url)
             .call()
             .map_err(|e| TensorError::new(&format!("mnist_data: failed to download {url}: {e}")))?
@@ -78,10 +92,28 @@ fn to_dataset(mnist: Mnist) -> Result<Dataset> {
 }
 
 fn main() -> Result<()> {
+    let force = std::env::args().any(|a| a == "--force");
     let download_dir = Path::new("data/mnist/gz");
     let out_dir = Path::new("data/mnist");
+    let train_dir = out_dir.join("train");
+    let test_dir = out_dir.join("test");
 
-    ensure_mnist_downloaded(download_dir)?;
+    // 0. Already-parsed datasets on disk? Reuse them unless --force.
+    let train_ready = train_dir.join("inputs.bin").exists();
+    let test_ready = test_dir.join("inputs.bin").exists();
+    if !force && train_ready && test_ready {
+        println!(
+            "  ✅ datasets already exist — reusing {}/ and {}/ (add --force to regenerate)",
+            train_dir.display(),
+            test_dir.display()
+        );
+        return Ok(());
+    }
+    if force {
+        println!("  ⚠️ --force: re-downloading assets + re-parsing datasets");
+    }
+
+    ensure_mnist_downloaded(download_dir, force)?;
     let read_gz = |name: &str| -> Result<Vec<u8>> {
         fs::read(download_dir.join(name))
             .map_err(|e| TensorError::new(&format!("mnist_data: cannot read {}: {e}", name)))

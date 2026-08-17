@@ -11,13 +11,14 @@ use flodl::{Device, Variable};
 
 use gras::data;
 use gras::engine::{Engine, EngineOptions, Fitness};
+use gras::fitness;
 use gras::network::Network;
 
 fn main() {
     // ── 1. Data — synthetic y = x², saved via the path contract ──────────
     let data_dir = std::path::Path::new("data/x2");
     if std::fs::read_dir(data_dir).is_err() {
-        let ds = data::synthetic_x_squared(256, 42, Device::CPU).unwrap();
+        let ds = fitness::synthetic_x_squared(256, 42, Device::CPU).unwrap();
         data::save_dataset(data_dir, &ds).unwrap();
         println!(
             "saved synthetic dataset → {}/ (inputs.bin + targets.bin)",
