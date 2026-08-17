@@ -321,56 +321,87 @@ pub(crate) fn topology_ascii(graph: &Topology) -> String {
     out
 }
 
-/// ASCII net view of a [`Network`] 🧠: the Manhattan-wired diagram plus the
-/// input projection and one Linear per node.
+/// Compact net view of a [`Network`] 🧠 — derived from the blueprint,
+/// focused on what execution actually cares about:
+///
+/// ```text
+///  🧠 flodl net (Network) · 7 nodes · 12 wires · 16 param tensors (weight+bias per layer) · combine: Add
+///     🚪 input_proj : Linear(1 → 8)
+///     🧮 n0 input   : Linear(8 → 8) · act: identity · out 1
+///     🧮 n1 hidden  : Linear(8 → 8) · act: gelu     · in 3 · i0←n0_o0 · i1←n0_o1 · i2←n2_o0
+///     🧮 n2 hidden  : Linear(8 → 8) · act: identity · in 2 · i0←n1_o1 · i1←n1_o2
+///     🧮 n3 output  : Linear(8 → 8) · act: identity · in 1 · i0←n1_o0   ← 🏁 network output
+/// ```
+///
+/// Per node: layer dims (`in → out`, i.e. the hidden dims), activation, and
+/// the **incoming-input operations** — one entry per input port listing its
+/// source(s), or `i{k}*` when orphaned (fed `net_input`). The wire *diagram*
+/// lives in the topology view; this table is the dense summary.
 pub(crate) fn network_ascii(g: &Network) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "🧠 flodl net (Network) · {} nodes · {} wires · {} param tensors (weight+bias per layer)\n\n",
+        "🧠 flodl net (Network) · {} nodes · {} wires · {} param tensors (weight+bias per layer) · combine: {:?}\n",
         g.layers.len(),
         g.connections.len(),
         g.parameters().len(),
+        g.combine_op,
     ));
-
-    // ── Manhattan-wired diagram of the nodes ──
-    let nodes: Vec<AsciiNode> = (0..g.layers.len())
-        .map(|id| AsciiNode {
-            id,
-            kind: g.node_info[id].kind,
-            num_inputs: g.node_info[id].num_inputs,
-            num_outputs: g.node_info[id].num_outputs,
-        })
-        .collect();
-    out.push_str(&render_manhattan(&nodes, &g.connections));
-
-    // ── layer table 🧮 ──
-    out.push('\n');
     out.push_str(&format!(
         "   🚪 input_proj : Linear({} → {})\n",
         g.input_dim, g.hidden_dim
     ));
+
+    let kind_name = |kind: NodeKind| match kind {
+        NodeKind::Input => "input",
+        NodeKind::Hidden => "hidden",
+        NodeKind::Output => "output",
+    };
+
     for node_id in 0..g.layers.len() {
-        let info = g.node_info[node_id];
-        let kind = match info.kind {
-            NodeKind::Input => "input",
-            NodeKind::Hidden => "hidden",
-            NodeKind::Output => "output",
-        };
+        let node = &g.nodes[node_id];
+        let (in_dim, out_dim) = g.node_dims[node_id];
         let marker = if node_id == g.output_node {
             "   ← 🏁 network output"
         } else {
             ""
         };
+
+        // Incoming ops: one entry per input port — its sources (`i0←n1_o0`),
+        // or `*` when orphaned (fed net_input). Nodes with no input ports
+        // (input nodes) show their output count instead.
+        let mut ports: Vec<String> = Vec::new();
+        for i in 0..node.num_inputs {
+            let target = Port {
+                node: node_id,
+                index: i,
+            };
+            let sources: Vec<String> = g
+                .connections
+                .iter()
+                .filter(|c| c.to == target)
+                .map(|c| c.from_label())
+                .collect();
+            ports.push(if sources.is_empty() {
+                format!("i{i}*")
+            } else {
+                format!("i{i}←{}", sources.join("+"))
+            });
+        }
+        let port_str = if ports.is_empty() {
+            format!("out {}", node.num_outputs)
+        } else {
+            format!("in {} · {}", node.num_inputs, ports.join(" · "))
+        };
+
         out.push_str(&format!(
-            "   🧮 n{} {:<7} : Linear({} → {}) · act: {} · in:{} out:{}{}\n",
+            "   🧮 n{} {:<7} : Linear({} → {}) · act: {:<8} · {}{}\n",
             node_id,
-            kind,
-            info.in_dim,
-            info.out_dim,
-            info.activation,
-            info.num_inputs,
-            info.num_outputs,
-            marker
+            kind_name(node.kind),
+            in_dim,
+            out_dim,
+            node.activation,
+            port_str,
+            marker,
         ));
     }
     out
@@ -420,17 +451,35 @@ mod tests {
         let module = Network::build(&graph, Device::CPU).unwrap();
         let s = network_ascii(&module);
 
-        // Manhattan diagram: node labels + one arrowhead per wire end
-        assert!(s.contains("n0 input (in 0 · out 2)"));
-        assert!(s.contains("n1 output (in 2 · out 1)"));
-        assert_eq!(s.matches('▶').count(), module.connections.len());
-        assert_eq!(s.matches('◀').count(), module.connections.len());
-        // Input projection + one Linear per node, with dims
+        // Compact table, no Manhattan diagram in the net view
+        assert!(s.contains("combine: Add"));
+        assert!(!s.contains('▶'));
+        assert!(!s.contains('┌'));
+        // Input projection + one Linear per node, with dims + activation
         assert!(s.contains("input_proj : Linear(1 → 8)"));
         assert!(s.contains("Linear(8 → 8)"));
+        assert!(s.contains("act: identity"));
+        // Incoming-input ops: per-port source labels
+        assert!(s.contains("n0 input"));
+        assert!(s.contains("i0←n0_o0"));
+        assert!(s.contains("i1←n0_o1"));
         // Output node is marked 🏁
         assert!(s.contains("🏁 network output"));
         // Display impl delegates to the utils function
         assert_eq!(format!("{module}"), s);
+    }
+
+    #[test]
+    fn test_render_network_orphan_marker() {
+        // n1 has 2 input ports but only 1 source → the second is orphaned
+        // and must show `i1*` (fed by net_input).
+        let mut graph = Topology::new(0, None);
+        graph.nodes.push(Node::new_input(0, 1));
+        graph.nodes.push(Node::new_output(1, 2, 1));
+        graph.set_network();
+
+        let module = Network::build(&graph, Device::CPU).unwrap();
+        let s = network_ascii(&module);
+        assert!(s.contains("i1*"), "orphaned port must be marked: {s}");
     }
 }
