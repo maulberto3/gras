@@ -91,7 +91,7 @@ impl Display for EngineOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "pop {} · {} gens · seed {:?} · budget {}ep × {}bt of {} · {} threads · fitness {:?} · GP pools: hidden {:?} · combine {:?} · activations {:?} · results {}/",
+            "pop {} · {} gens · seed {:?} · budget {}ep × {}bt of {} · {} threads · log every {} gens · fitness {:?} · GP pools: hidden {:?} · combine {:?} · activations {:?} · results {}/",
             self.pop_size,
             self.num_generations,
             self.seed,
@@ -99,6 +99,7 @@ impl Display for EngineOptions {
             self.num_batches,
             self.batch_size,
             self.num_threads,
+            self.log_every_gens,
             self.fitness,
             self.hidden_dim_pool,
             self.combine_op_pool,
