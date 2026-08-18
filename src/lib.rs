@@ -8,4 +8,5 @@ pub mod network;
 pub mod node;
 pub mod spec;
 pub mod topology;
+pub mod trainer;
 pub mod utils;
