@@ -1,19 +1,12 @@
-//! 🧬 The full gras guide — every API, one walkthrough.
+//! 🧬 The topology guide — the *blueprint* side of gras: nodes, wires,
+//! scaffolds, orphans, JSON round-trip. **Execution** (compile → forward →
+//! dims → combine ops) → `examples/network_guide.rs`; the node type →
+//! `examples/node_guide.rs`.
 //!
 //! Run with: `source env_setup.sh && cargo run --example topology_guide`
-//!
-//! Sections:
-//!   1. The minimal pipeline      — the exact path the engine will run per individual
-//!   2. Hand-built graphs         — full manual control (builders, activations, dims)
-//!   3. Random graphs             — automatic generation from options + ranges
-//!
-//!   3b. Scaffolding              — auto Input/Output, multi-output merge
-//!   4. Custom options            — seed, dims, port ranges, CombineOp
-//!   5. The wiring, up close      — connection_pairs, orphan_counts, de-orphan
-//!
-//!   5b. Per-node insights        — per-port sources/orphans, degrees, dims
-//!   6. Compile & run             — Network::build + forward + parameters
-//!   7. Persistence               — to_json / from_json (architecture only, no weights)
+//! Sections: 1 minimal pipeline · 2 hand-built · 3 random graphs (+ activations)
+//!           3b scaffolding · 4 custom options · 5 wiring + de-orphan
+//!           5b per-node insights · 6 persistence
 
 use flodl::nn::Module;
 use flodl::{DType, Device, Tensor, TensorOptions, Variable};
@@ -25,7 +18,7 @@ use gras::topology::{CombineOp, Connection, Port, Topology, TopologyOptions};
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-/// A random [batch, input_dim] input tensor, ready to run through a module.
+/// A random [batch, input_dim] input tensor.
 fn rand_input(batch: i64, input_dim: usize) -> Variable {
     let opts = TensorOptions {
         dtype: DType::Float32,
@@ -37,51 +30,38 @@ fn rand_input(batch: i64, input_dim: usize) -> Variable {
     )
 }
 
-/// Compile, run, and summarize — the payoff of every graph in this guide.
-fn build_and_run(name: &str, graph: &Topology, batch: i64) {
+/// Topology-level summary: nodes, ports, wires, orphans, validity.
+fn summarize(name: &str, graph: &Topology) {
     graph.validate().expect("graph must be valid");
-    let model = Network::build(graph, Device::CPU).unwrap();
-
-    println!("  {name}:");
-    println!("{model}");
-    let input = rand_input(batch, graph.options.input_dim);
-    let output = model.forward(&input).unwrap();
-    // parameters() counts *parameter tensors*: each Linear = weight + bias.
+    let (oi, oo) = graph.orphan_counts();
+    let ports_in: usize = graph.nodes.iter().map(|n| n.num_inputs).sum();
+    let ports_out: usize = graph.nodes.iter().map(|n| n.num_outputs).sum();
     println!(
-        "  forward {:?} -> {:?}  ({} param tensors = weight+bias per layer)\n",
-        input.shape(),
-        output.shape(),
-        model.parameters().len()
+        "  {name}: {} nodes · {ports_in} in-ports · {ports_out} out-ports · {} wires · {oi} orphaned-in / {oo} orphaned-out · valid ✓\n",
+        graph.nodes.len(),
+        graph.connections.len(),
     );
 }
 
-/// Per-node wiring insights: for every node, its kind / ports / output dim /
-/// activation / in-out degrees, then **every input port's sources** (or `*`
-/// = orphaned → fed `net_input`) and **every output port's sinks** (or `*` =
-/// unused). Everything below uses only the public topology API.
+/// Per-node wiring: kind/ports/dim/activation/degrees/depth, then every input
+/// port's sources (or `*` = orphaned → fed `net_input`) and output port's
+/// sinks. Public topology API only.
 fn log_insights(name: &str, graph: &Topology) {
     let hidden_dim = graph.options.hidden_dim;
+    let depths = graph.depths();
+    let degrees = graph.degrees();
     println!("  ── {name} insights ──");
     for node in &graph.nodes {
-        let out_dim = node.hidden_dim.unwrap_or(hidden_dim);
-        let in_deg = graph
-            .connections
-            .iter()
-            .filter(|c| c.to.node == node.id)
-            .count();
-        let out_deg = graph
-            .connections
-            .iter()
-            .filter(|c| c.from.node == node.id)
-            .count();
+        let (in_deg, out_deg) = degrees[node.id];
         println!(
-            "  n{} {:<7} ports in:{:<2} out:{:<2} · out_dim:{:<3} · act:{:<8} · indeg:{:<2} outdeg:{}",
+            "  n{} {:<7} in:{:<2} out:{:<2} · out_dim:{:<3} · act:{:<8} · depth:{} · indeg:{:<2} outdeg:{}",
             node.id,
             format!("{:?}", node.kind).to_lowercase(),
             node.num_inputs,
             node.num_outputs,
-            out_dim,
+            node.hidden_dim.unwrap_or(hidden_dim),
             node.activation,
+            depths[node.id],
             in_deg,
             out_deg,
         );
@@ -124,25 +104,29 @@ fn log_insights(name: &str, graph: &Topology) {
 }
 
 fn main() {
-    // ═══════════════════════════════════════════════════════════════════════
-    // 1. The minimal pipeline — what the engine will do per individual
-    // ═══════════════════════════════════════════════════════════════════════
+    // ── 1. Minimal pipeline (engine-style) ──────────────────────────────────
     println!("═ 1. Minimal pipeline (engine-style) ═");
-    // Topology::new(id, None) → default options (seed 16, hidden_dim 8, ...).
     let mut graph = Topology::new(0, None);
     graph.create_random_hidden_nodes(5); // 🎲 random port counts from the ranges
-    graph.set_topology(); //      📇 mint one label per port (rendering)
-    graph.set_network(); //       🔗 auto-scaffold Input/Output + wire + auto-de-orphan
-    graph.validate().unwrap(); //       🛡️ check it's executable
-    build_and_run("random graph", &graph, 2);
+    graph.refresh_labels(); //      📇 one label per port (rendering)
+    graph.finalize(); //       🔗 auto-scaffold Input/Output + wire + auto-de-orphan
+    graph.validate().unwrap(); //       🛡️ executable?
+    summarize("random graph", &graph);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 2. Hand-built graphs — full manual control
-    // ═══════════════════════════════════════════════════════════════════════
+    let model = Network::build(&graph, Device::CPU).unwrap();
+    let input = rand_input(2, graph.options.input_dim);
+    let output = model.forward(&input).unwrap();
+    println!(
+        "  handoff → forward: {:?} -> {:?} ({} param tensors = weight+bias per layer)\n",
+        input.shape(),
+        output.shape(),
+        model.parameters().len()
+    );
+
+    // ── 2. Hand-built graphs ────────────────────────────────────────────────
     println!("═ 2. Hand-built graph (explicit nodes + builders) ═");
     let mut manual = Topology::new(1, None);
     manual.nodes.push(Node::new_input(0, 2)); // 📥 feeds layers 1 and 2
-    // 🧠 Builder style: activation / per-node dim chained at construction.
     manual
         .nodes
         .push(Node::new_hidden(1, 3, 2).with_activation(Activation::GeLU));
@@ -150,42 +134,43 @@ fn main() {
         .nodes
         .push(Node::new_hidden(2, 2, 1).with_hidden_dim(32)); // 🕶️ wider channel
     manual.nodes.push(Node::new_output(3, 1, 1)); // 📤 network output
-    manual.set_topology();
-    manual.set_network();
-    build_and_run("manual graph", &manual, 3);
+    manual.refresh_labels();
+    manual.finalize();
+    manual.validate().unwrap();
+    summarize("manual graph", &manual);
     log_insights("manual graph", &manual);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 3. Random graphs — the NAS bread-and-butter
-    // ═══════════════════════════════════════════════════════════════════════
-    println!("═ 3. Random generation ═");
+    // ── 3. Random graphs + activations ──────────────────────────────────────
+    println!("═ 3. Random generation + activation pool ═");
     let mut random = Topology::new(2, None);
-    // One node at a time, or a batch — ids stay contiguous 0..n either way.
     random.create_random_hidden_node();
     random.create_random_hidden_nodes(3);
-    println!(
-        "  created {} nodes ({} hidden)",
-        random.nodes.len(),
-        random
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Hidden)
-            .count()
-    );
-    random.set_topology();
-    random.set_network();
-    println!(
-        "  after set_network: {} nodes — auto-scaffolded into Input → hidden → Output",
-        random.nodes.len()
-    );
-    build_and_run("random graph", &random, 2);
+    random.refresh_labels();
+    random.finalize();
+    random.validate().unwrap();
+    summarize("random graph", &random);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 3b. Scaffolding — the canonical Input → … → Output skeleton
-    // ═══════════════════════════════════════════════════════════════════════
+    // The GP hook: assign every hidden node a random activation from a pool.
+    // The engine does exactly this per individual, seeded from its seed chain.
+    let mut rng = fastrand::Rng::with_seed(7);
+    random.randomize_activations(
+        &[Activation::ReLU, Activation::GeLU, Activation::SELU],
+        &mut rng,
+    );
+    let acts: Vec<String> = random
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Hidden)
+        .map(|n| n.activation.to_string())
+        .collect();
+    println!(
+        "  randomize_activations(pool) → hidden acts: [{}]",
+        acts.join(", ")
+    );
+    println!();
+
+    // ── 3b. Scaffolding ─────────────────────────────────────────────────────
     println!("═ 3b. Scaffolding (auto Input/Output) ═");
-    // Random graphs only create hidden nodes; set_network scaffolds the
-    // skeleton. ensure_scaffold is public for manual use and idempotent.
     let mut bare = Topology::new(5, None);
     bare.create_random_hidden_nodes(2);
     println!(
@@ -193,47 +178,37 @@ fn main() {
         bare.nodes.len()
     );
     bare.ensure_scaffold();
-    println!(
-        "  after ensure_scaffold: {} nodes — n0 is {:?}, last is {:?}",
-        bare.nodes.len(),
-        bare.nodes[0].kind,
-        bare.nodes.last().unwrap().kind
-    );
     let before = bare.nodes.clone();
     bare.ensure_scaffold();
     assert_eq!(bare.nodes, before, "ensure_scaffold must be idempotent");
-    println!("  calling ensure_scaffold again is a no-op ✓");
-    bare.set_topology();
-    bare.set_network();
-    build_and_run("scaffolded graph", &bare, 2);
+    println!(
+        "  ensure_scaffold → n0 is {:?}, last is {:?}; calling it again is a no-op ✓",
+        bare.nodes[0].kind,
+        bare.nodes.last().unwrap().kind
+    );
+    bare.refresh_labels();
+    bare.finalize();
+    summarize("scaffolded graph", &bare);
 
-    // More than one Output node → de_multi_outputs stacks them into a single
-    // projection node (the output projection, counterpart of input_proj).
-    println!("  multi-output merge (de_multi_outputs):");
+    // More than one Output node → merge_multi_outputs stacks them into one
+    // projection node (the counterpart of input_proj).
+    println!("  multi-output merge (merge_multi_outputs):");
     let mut multi = Topology::new(6, None);
     multi.nodes.push(Node::new_input(0, 1));
     multi.nodes.push(Node::new_hidden(1, 1, 1));
     multi.nodes.push(Node::new_output(2, 1, 1));
     multi.nodes.push(Node::new_output(3, 1, 1)); // second output node
-    let n_out_before = multi
-        .nodes
-        .iter()
-        .filter(|n| n.kind == NodeKind::Output)
-        .count();
-    println!("  {n_out_before} output nodes before set_network →");
-    multi.set_network();
+    multi.finalize();
     let n_out = multi
         .nodes
         .iter()
         .filter(|n| n.kind == NodeKind::Output)
         .count();
     assert_eq!(n_out, 1);
-    println!("  after set_network: exactly {n_out} output node (the stacked projection)");
-    build_and_run("multi-output merged graph", &multi, 2);
+    println!("  2 output nodes before → exactly {n_out} after finalize");
+    summarize("multi-output merged graph", &multi);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 4. Custom options — full control over generation & execution
-    // ═══════════════════════════════════════════════════════════════════════
+    // ── 4. Custom options ───────────────────────────────────────────────────
     println!("═ 4. Custom options ═");
     let opts = TopologyOptions {
         seed: 42,         // 🎲 same seed → same random graph
@@ -250,25 +225,19 @@ fn main() {
     };
     let mut custom = Topology::new(3, Some(opts));
     custom.create_random_hidden_nodes(4);
-    custom.set_topology();
-    custom.set_network();
-    build_and_run("custom graph", &custom, 5);
+    custom.refresh_labels();
+    custom.finalize();
+    summarize("custom graph", &custom);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 5. The wiring, up close
-    // ═══════════════════════════════════════════════════════════════════════
+    // ── 5. Wiring, up close ─────────────────────────────────────────────────
     println!("═ 5. Wiring introspection ═");
-    // Human-readable wire list.
-    for (from, to) in manual.connection_pairs() {
+    for (from, to) in manual.connection_labels() {
         println!("  {from} -> {to}");
     }
-    // (orphaned_inputs, orphaned_outputs) — orphaned *inputs* are fed the
-    // network input at runtime (legal); orphaned *outputs* are rewired into
-    // later nodes automatically by set_network, so this should be 0.
     let (oi, oo) = manual.orphan_counts();
     println!("  manual graph orphans: {oi} inputs (fed net_input), {oo} outputs");
 
-    // Manual wiring — you can build connections by hand instead of randomly.
+    // Manual wiring: push connections by hand instead of randomly.
     println!("  manual wiring (push connections yourself):");
     let mut wired = Topology::new(4, None);
     wired.nodes.push(Node::new_input(0, 2));
@@ -276,7 +245,7 @@ fn main() {
         .nodes
         .push(Node::new_hidden(1, 2, 1).with_activation(Activation::SELU));
     wired.nodes.push(Node::new_output(2, 1, 1));
-    wired.set_topology(); // mints the labels below; wiring is separate
+    wired.refresh_labels();
     wired.connections.push(Connection {
         from: Port { node: 0, index: 0 },
         to: Port { node: 1, index: 0 },
@@ -291,11 +260,10 @@ fn main() {
     });
     wired.validate().unwrap();
     println!("{wired}");
-    build_and_run("wired graph", &wired, 2);
+    summarize("wired graph", &wired);
 
-    // de-orphan, up close: wire most ports by hand, leave one output
-    // orphaned, then watch de_orphan_outputs rewire it into a later node.
-    println!("  de-orphan, up close (de_orphan_outputs):");
+    // de-orphan, up close: leave one output orphaned, then watch it rewired.
+    println!("  de-orphan, up close (rewire_orphaned_outputs):");
     let mut messy = Topology::new(7, None);
     messy.nodes.push(Node::new_input(0, 2));
     messy.nodes.push(Node::new_hidden(1, 3, 2));
@@ -319,17 +287,15 @@ fn main() {
     });
     messy.validate().unwrap();
     let (oi, oo) = messy.orphan_counts();
-    println!("  before de-orphan: {oi} orphaned inputs (fed net_input), {oo} orphaned outputs");
-    let added = messy.de_orphan_outputs();
-    println!("  de_orphan_outputs() wired {added} orphaned output(s) into later nodes");
+    println!("  before: {oi} orphaned inputs (fed net_input), {oo} orphaned outputs");
+    let added = messy.rewire_orphaned_outputs();
+    println!("  rewire_orphaned_outputs() wired {added} orphaned output(s) into later nodes");
     let (oi, oo) = messy.orphan_counts();
     println!("  after: {oi} orphaned inputs, {oo} orphaned outputs");
-    build_and_run("de-orphaned graph", &messy, 2);
+    summarize("de-orphaned graph", &messy);
     log_insights("de-orphaned graph", &messy);
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // 6. Persistence — architecture only, never weights
-    // ═══════════════════════════════════════════════════════════════════════
+    // ── 6. Persistence ──────────────────────────────────────────────────────
     println!("═ 6. JSON round-trip ═");
     let json = custom.to_json().unwrap();
     std::fs::create_dir_all("saved").unwrap();
@@ -338,12 +304,9 @@ fn main() {
         "  saved blueprint → saved/topology.json ({} bytes)",
         json.len()
     );
-
-    // Reload: the RNG is re-seeded from options.seed, so the loaded graph
-    // regenerates wiring identically to a fresh graph with the same options.
     let reloaded = Topology::from_json(&json).unwrap();
     assert_eq!(Spec::from(&reloaded), Spec::from(&custom));
-    build_and_run("reloaded graph", &reloaded, 5);
+    summarize("reloaded graph", &reloaded);
 
     println!("  ✅ topology guide complete — every section ran");
 }
