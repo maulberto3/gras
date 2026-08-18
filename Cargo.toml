@@ -13,6 +13,8 @@ cuda = ["flodl/cuda"]
 [dependencies]
 fastrand = "2.5.0"
 flodl = "0.7.0"
+log = "0.4"
+rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -32,6 +34,7 @@ panic = "abort"
 debug = false
 
 [dev-dependencies]
+env_logger = "0.11"
 git-cliff = "2.13.1"
 proptest = "1.11.0"
 ureq = "3"
