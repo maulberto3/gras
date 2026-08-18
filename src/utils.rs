@@ -3,7 +3,7 @@
 //! Rendering is a presentation concern, so it lives outside the core graph
 //! types: `topology_ascii` draws a [`Topology`] and `network_ascii`
 //! draws a [`Network`], both via the shared Manhattan-wiring diagram
-//! `render_manhattan`. The types only keep their `Display` impls, which
+//! `render_wire_diagram`. The types only keep their `Display` impls, which
 //! delegate here.
 
 use flodl::nn::Module;
@@ -12,7 +12,7 @@ use crate::network::Network;
 use crate::node::NodeKind;
 use crate::topology::{Connection, Port, Topology};
 
-/// Per-node description consumed by [`render_manhattan`].
+/// Per-node description consumed by [`render_wire_diagram`].
 #[derive(Clone, Copy)]
 pub(crate) struct AsciiNode {
     pub id: usize,
@@ -44,7 +44,7 @@ pub(crate) struct AsciiNode {
 /// from GP papers, but WITHOUT the backward edges that figure shows. So the
 /// source is always above the target and every arrow points DOWN ⬇; long
 /// jumps are fine, backward jumps are not.
-pub(crate) fn render_manhattan(nodes: &[AsciiNode], connections: &[Connection]) -> String {
+pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection]) -> String {
     if nodes.is_empty() {
         return "(empty graph)".to_string();
     }
@@ -220,7 +220,7 @@ pub(crate) fn render_manhattan(nodes: &[AsciiNode], connections: &[Connection]) 
         // always above the target and arrows point DOWN — no backward edges.
         debug_assert!(
             conn.from.node < conn.to.node,
-            "render_manhattan assumes forward-only edges, got: {conn}"
+            "render_wire_diagram assumes forward-only edges, got: {conn}"
         );
         let src_row = block_row[conn.from.node] + 2;
         let tgt_row = block_row[conn.to.node] + 1;
@@ -313,7 +313,7 @@ pub(crate) fn topology_ascii(graph: &Topology) -> String {
             num_outputs: n.num_outputs,
         })
         .collect();
-    out.push_str(&render_manhattan(&nodes, &graph.connections));
+    out.push_str(&render_wire_diagram(&nodes, &graph.connections));
 
     out.push_str(
         "\n▶ output port · ◀ input port · * orphaned port (input: fed by network input · output: unused)\n",
@@ -420,8 +420,8 @@ mod tests {
         let mut graph = Topology::new(1, None);
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_hidden(1, 3, 1));
-        graph.set_topology();
-        graph.set_network();
+        graph.refresh_labels();
+        graph.finalize();
 
         let s = topology_ascii(&graph);
         // Header box with the graph summary
@@ -446,7 +446,7 @@ mod tests {
         let mut graph = Topology::new(0, None);
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_output(1, 2, 1));
-        graph.set_network();
+        graph.finalize();
 
         let module = Network::build(&graph, Device::CPU).unwrap();
         let s = network_ascii(&module);
@@ -476,7 +476,7 @@ mod tests {
         let mut graph = Topology::new(0, None);
         graph.nodes.push(Node::new_input(0, 1));
         graph.nodes.push(Node::new_output(1, 2, 1));
-        graph.set_network();
+        graph.finalize();
 
         let module = Network::build(&graph, Device::CPU).unwrap();
         let s = network_ascii(&module);

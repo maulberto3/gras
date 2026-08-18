@@ -33,6 +33,26 @@ pub struct Dataset {
     pub targets: Tensor,
 }
 
+impl Dataset {
+    /// Cast both tensors to `Float32` if they aren't already — flodl's
+    /// native workhorse dtype and this crate's default precision. The
+    /// engine calls this on load, so a dataset written in another dtype
+    /// (e.g. Float64) is normalized once, up front.
+    pub fn to_f32(&self) -> Result<Dataset> {
+        let cast = |t: &Tensor| -> Result<Tensor> {
+            if t.dtype() == DType::Float32 {
+                Ok(t.clone())
+            } else {
+                t.to_dtype(DType::Float32)
+            }
+        };
+        Ok(Dataset {
+            inputs: cast(&self.inputs)?,
+            targets: cast(&self.targets)?,
+        })
+    }
+}
+
 // ── the binary tensor format ─────────────────────────────────────────────
 
 /// Magic bytes at the start of every tensor file written by this module.
@@ -161,9 +181,9 @@ pub fn load_dataset(dir: &Path) -> Result<Dataset> {
     Ok(Dataset { inputs, targets })
 }
 
-// Canonical synthetic datasets live next to their scorers in
-// `crate::fitness` (e.g. `fitness::synthetic_x_squared`, the data for the
-// MSE built-in) — the tensor I/O contract itself stays here.
+// Canonical synthetic datasets live next to their scorers in `crate::fitness`
+// (e.g. `fitness::synthetic_sine`, the data for the regression built-ins) —
+// the tensor I/O contract itself stays here.
 
 #[cfg(test)]
 mod tests {

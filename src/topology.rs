@@ -23,8 +23,8 @@
 //! ```text
 //!   1. Topology::new                  empty graph + options (dims, RNG seed)
 //!   2. graph.nodes.push(Node::…)   add input / hidden / output nodes
-//!   3. set_topology()        one string label per port (rendering)
-//!   4. set_network()         scaffold Input/Output, wire ports (random)
+//!   3. refresh_labels()      one string label per port (rendering)
+//!   4. finalize()            scaffold Input/Output, wire ports (random)
 //!                                 + auto-de-orphan orphaned outputs
 //!   5. validate()                  check the wiring is executable
 //!   6. Network::build()          one flodl Linear per node + input proj
@@ -62,16 +62,18 @@
 //!
 //! # Suggested reading order 👀
 //!
-//! [`Port`] + [`Connection`] → [`Topology`] → [`Topology::set_network`] →
+//! [`Port`] + [`Connection`] → [`Topology`] → [`Topology::finalize`] →
 //! [`Topology::validate`] →
 //! [`Network::build`](crate::network::Network::build) →
 //! [`Network::forward`](crate::network::Network).
+
+use std::collections::HashMap;
 
 use fastrand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::error::TopologyError;
-use crate::node::{Node, NodeKind};
+use crate::node::{Activation, Node, NodeKind};
 
 /// How multiple incoming tensors into a node are combined before the node
 /// transforms them.
@@ -87,8 +89,16 @@ pub enum CombineOp {
     Mean,
 }
 
-/// Knobs for building a graph 🎛️. Mostly used by the random-generation
-/// methods (`create_random_hidden_node`, `set_network`); `input_dim`,
+/// Node counts by kind — the return type of [`Topology::kind_counts`]:
+/// no more guessing the order of a bare `(usize, usize, usize)` tuple.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KindCounts {
+    pub input: usize,
+    pub hidden: usize,
+    pub output: usize,
+}
+
+/// Knobs for building a graph 🎛️. Mostly used by the random-generation    /// methods (`create_random_hidden_node`, `finalize`); `input_dim`,
 /// `hidden_dim` and `combine_op` are what execution actually cares about.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TopologyOptions {
@@ -108,8 +118,8 @@ pub struct TopologyOptions {
     pub combine_op: CombineOp,
 }
 
-impl TopologyOptions {
-    fn new() -> Self {
+impl Default for TopologyOptions {
+    fn default() -> Self {
         TopologyOptions {
             seed: 55,
             min_num_nodes: 2,
@@ -161,6 +171,148 @@ impl Connection {
     }
 }
 
+/// Precompute the wiring table: for each node (by id), one entry per input
+/// port — a *list* of source ports feeding it (empty = orphaned, fed by
+/// net_input). A port can hold several wires because de-orphaning stacks
+/// extra sources into already-wired ports; the node combines them all.
+///
+/// Built once at compile/build time so the forward pass resolves each port
+/// in O(1) instead of scanning the connection list — and so the blueprint
+/// diagnostics ([`Topology::node_dims`], [`Topology::param_estimate`]) share
+/// the exact table the engine uses.
+pub(crate) fn build_node_sources(
+    connections: &[Connection],
+    num_inputs: &[usize],
+) -> Vec<Vec<Vec<Port>>> {
+    // (to → [from, ...]) lookup table
+    let mut input_map: HashMap<Port, Vec<Port>> = HashMap::new();
+
+    // Build the reverse map: for each input port, which source ports feed it.
+    for c in connections {
+        input_map.entry(c.to).or_default().push(c.from);
+    }
+
+    // For each node, for each input port, look up the list of sources (or
+    // empty if orphaned). In simpler words, "for each node, for each input port, which source ports feed it?"
+    num_inputs
+        .iter()
+        .enumerate()
+        .map(|(node_id, &n)| {
+            (0..n)
+                .map(|i| {
+                    input_map
+                        .get(&Port {
+                            node: node_id,
+                            index: i,
+                        })
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+// ── shared derived diagnostics ───────────────────────────────────────────
+//
+// The "nutrition facts" of a graph. They live here as **free functions over
+// raw node/connection data** so both the blueprint ([`Topology`] methods
+// below) and the materialized module
+// ([`Network::to_json`](crate::network::Network::to_json)) report the *same*
+// numbers from the *same* code — no drift between what the topology says and
+// what the built net says. The `Topology` methods are thin delegations.
+
+/// Orphaned-port counts `(inputs, outputs)` over raw graph data — the same
+/// numbers [`Topology::orphan_counts`] reports. `output_node`'s own output
+/// ports are the graph's answer, never orphans.
+pub(crate) fn node_orphan_counts(
+    nodes: &[Node],
+    connections: &[Connection],
+    output_node: usize,
+) -> (usize, usize) {
+    let mut orphaned_inputs = 0usize;
+    let mut orphaned_outputs = 0usize;
+    for (id, node) in nodes.iter().enumerate() {
+        for i in 0..node.num_inputs {
+            let port = Port { node: id, index: i };
+            if !connections.iter().any(|c| c.to == port) {
+                orphaned_inputs += 1;
+            }
+        }
+        if id == output_node {
+            continue; // graph-output ports are the answer, not orphans
+        }
+        for o in 0..node.num_outputs {
+            let port = Port { node: id, index: o };
+            if !connections.iter().any(|c| c.from == port) {
+                orphaned_outputs += 1;
+            }
+        }
+    }
+    (orphaned_inputs, orphaned_outputs)
+}
+
+/// Wired degrees `(in_degree, out_degree)` per node (one count per *wire*).
+/// See [`Topology::degrees`].
+pub(crate) fn node_degrees(nodes: &[Node], connections: &[Connection]) -> Vec<(usize, usize)> {
+    let mut deg = vec![(0usize, 0usize); nodes.len()];
+    for c in connections {
+        deg[c.to.node].0 += 1;
+        deg[c.from.node].1 += 1;
+    }
+    deg
+}
+
+/// Longest path from an `Input` node per node id — a topological *level*.
+/// See [`Topology::depths`].
+pub(crate) fn node_depths(nodes: &[Node], connections: &[Connection]) -> Vec<usize> {
+    let mut depth = vec![0usize; nodes.len()];
+    for node in nodes {
+        if node.kind == NodeKind::Input {
+            continue;
+        }
+        let mut d = 0usize;
+        for i in 0..node.num_inputs {
+            let target = Port {
+                node: node.id,
+                index: i,
+            };
+            for c in connections.iter().filter(|c| c.to == target) {
+                d = d.max(depth[c.from.node] + 1);
+            }
+        }
+        depth[node.id] = d;
+    }
+    depth
+}
+
+/// Node counts by kind. See [`Topology::kind_counts`] and [`KindCounts`].
+pub(crate) fn node_kind_counts(nodes: &[Node]) -> KindCounts {
+    let mut counts = KindCounts::default();
+    for n in nodes {
+        match n.kind {
+            NodeKind::Input => counts.input += 1,
+            NodeKind::Hidden => counts.hidden += 1,
+            NodeKind::Output => counts.output += 1,
+        }
+    }
+    counts
+}
+
+/// Activation histogram across nodes: `(activation, count)` pairs. See
+/// [`Topology::activation_counts`].
+pub(crate) fn node_activation_counts(nodes: &[Node]) -> Vec<(Activation, usize)> {
+    let mut counts: Vec<(Activation, usize)> = Vec::new();
+    for n in nodes {
+        if let Some(entry) = counts.iter_mut().find(|(a, _)| *a == n.activation) {
+            entry.1 += 1;
+        } else {
+            counts.push((n.activation, 1));
+        }
+    }
+    counts
+}
+
 /// The blueprint 🧬 of a gras network: pure data, no tensors.
 ///
 /// A `Topology` answers two questions only:
@@ -179,7 +331,7 @@ impl Connection {
 ///     [`Network`](crate::network::Network)s uniquely)
 ///   - `options` — dims, RNG seed, combine op (see [`TopologyOptions`])
 ///   - `graph_inputs` / `graph_outputs` — one string label per port, minted by
-///     [`Topology::set_topology`]; for rendering/debugging only — execution
+///     [`Topology::refresh_labels`]; for rendering/debugging only — execution
 ///     reads the typed [`Port`]s in `connections`
 ///   - `rng` — the seeded RNG driving random node/wiring generation
 #[derive(Clone, Debug, PartialEq)]
@@ -199,10 +351,7 @@ impl Topology {
     /// the [`Node`] constructors + `graph.nodes.push(...)`.
     pub fn new(id: usize, options: Option<TopologyOptions>) -> Topology {
         // Create a new graph with the given id and options, or default options if None
-        let opts = match options {
-            Some(options) => options,
-            None => TopologyOptions::new(),
-        };
+        let opts = options.unwrap_or_default();
         Topology {
             id,
             nodes: Vec::new(),
@@ -242,18 +391,37 @@ impl Topology {
         }
     }
 
-    /// Set the graph topology: mint one label per port, kept only at the
-    /// graph level. These labels are the "address book" 📇 — a human-readable
-    /// view of the ports (`n1_i0`, `n2_o3`, ...) used by `Display`, the
-    /// ASCII renderer in `utils`, and `connection_pairs`. Execution itself
-    /// reads the typed [`Port`]s directly, so this step is only needed for
-    /// pretty-printing and debugging.
+    /// Assign every hidden node a **random activation** drawn from `pool`
+    /// (Input/Output nodes keep [`Activation::Identity`]). 🧠
+    ///
+    /// This is the GP hook for the activation axis: the engine calls it
+    /// after `create_random_hidden_nodes` with the individual's derived RNG,
+    /// so per-node activations vary across the population (and across runs)
+    /// while staying reproducible from the seed chain. `pool` must be
+    /// non-empty.
+    pub fn randomize_activations(&mut self, pool: &[Activation], rng: &mut fastrand::Rng) {
+        if pool.is_empty() {
+            return;
+        }
+        for node in &mut self.nodes {
+            if node.kind == NodeKind::Hidden {
+                node.activation = pool[rng.usize(0..pool.len())];
+            }
+        }
+    }
+
+    /// Refresh the port labels 📇 — one string per port (`n1_i0`, `n2_o3`,
+    /// ...) in `graph_inputs` / `graph_outputs`. These labels are the
+    /// "address book" used by `Display`, the ASCII renderer in `utils`, and
+    /// `connection_labels`. Execution itself reads the typed [`Port`]s
+    /// directly, so this step is only needed for pretty-printing and
+    /// debugging — call it after adding/changing nodes.
     ///
     /// Simple maths: a node i with `num_inputs` inputs and `num_outputs`
     /// outputs contributes exactly
     ///   num_inputs  labels to graph_inputs  -> "n{i}_i0", "n{i}_i1", ...
     ///   num_outputs labels to graph_outputs -> "n{i}_o0", "n{i}_o1", ...
-    pub fn set_topology(&mut self) {
+    pub fn refresh_labels(&mut self) {
         self.graph_inputs.clear();
         self.graph_outputs.clear();
 
@@ -267,7 +435,9 @@ impl Topology {
         }
     }
 
-    /// Wire the connections 🔗 between nodes based on the topology.
+    /// Finalize the graph 🔗: scaffold the skeleton, wire every port, and
+    /// auto-de-orphan dangling outputs — one call turns a pile of nodes
+    /// into a complete, executable graph.
     ///
     /// Simple mental model:
     ///   0. **Auto-scaffold** the canonical skeleton (Input → … → Output) —
@@ -299,14 +469,14 @@ impl Topology {
     ///   - 🕳️ orphaned input ports (no earlier output available) are fed by
     ///     the network input at execution time
     ///   - 🗑️ orphaned output ports are rewired automatically at the end by
-    ///     [`Topology::de_orphan_outputs`] — even into already-wired input ports
+    ///     [`Topology::rewire_orphaned_outputs`] — even into already-wired input ports
     ///     (the node combines them with Add/Mean) — so a single call yields a
     ///     complete graph.
     ///
     /// Simple maths: with I input ports and O output ports the random pass
     /// creates at most min(I, O) connections; the de-orphan pass may add
     /// more (one per orphaned output with a compatible later target).
-    pub fn set_network(&mut self) {
+    pub fn finalize(&mut self) {
         self.connections.clear();
 
         // 🏗️ Phase 1 — ensure the canonical skeleton: ≥ 1 Input node and
@@ -316,7 +486,7 @@ impl Topology {
         self.ensure_scaffold();
 
         // Labels must reflect any nodes the scaffold just added.
-        self.set_topology();
+        self.refresh_labels();
 
         let mut input_ports: Vec<Port> = Vec::new();
         let mut output_ports: Vec<Port> = Vec::new();
@@ -340,7 +510,7 @@ impl Topology {
         self.rng.shuffle(&mut output_ports);
 
         // Wires already laid down before this pass (e.g. by
-        // de_multi_outputs stacking the output projection) keep their
+        // merge_multi_outputs stacking the output projection) keep their
         // sources reserved: an output port stays 1:1.
         let mut used = vec![false; output_ports.len()];
         for conn in &self.connections {
@@ -370,13 +540,13 @@ impl Topology {
         // 🕳️ Automatic de-orphan: rewire output ports nobody consumed into
         // random later nodes (even occupied input ports — the node combines
         // all incoming tensors). One call ⇒ a complete graph.
-        self.de_orphan_outputs();
+        self.rewire_orphaned_outputs();
     }
 
-    /// Human-readable connection pairs, e.g. `("n0_o0", "n1_i0")` — handy for
-    /// debugging and for feeding a `layer!`-style DSL later. Just a string view
-    /// of `self.connections` (same data, no duplication).
-    pub fn connection_pairs(&self) -> Vec<(String, String)> {
+    /// Human-readable connection labels, e.g. `("n0_o0", "n1_i0")` — handy
+    /// for debugging and for feeding a `layer!`-style DSL later. Just a
+    /// string view of `self.connections` (same data, no duplication).
+    pub fn connection_labels(&self) -> Vec<(String, String)> {
         self.connections
             .iter()
             .map(|c| (c.from_label(), c.to_label()))
@@ -516,40 +686,105 @@ impl Topology {
     ///   graph-output node's own output ports are **excluded** — those are
     ///   the graph's answer, consumed by the caller, not orphans.
     pub fn orphan_counts(&self) -> (usize, usize) {
-        let output_node = self.output_node_id();
-        let mut orphaned_inputs = 0usize;
-        let mut orphaned_outputs = 0usize;
-        for node in &self.nodes {
-            for i in 0..node.num_inputs {
-                let port = Port {
-                    node: node.id,
-                    index: i,
-                };
-                if !self.connections.iter().any(|c| c.to == port) {
-                    orphaned_inputs += 1;
-                }
-            }
-            if node.id == output_node {
-                continue; // graph-output ports are the answer, not orphans
-            }
-            for o in 0..node.num_outputs {
-                let port = Port {
-                    node: node.id,
-                    index: o,
-                };
-                if !self.connections.iter().any(|c| c.from == port) {
-                    orphaned_outputs += 1;
-                }
+        node_orphan_counts(&self.nodes, &self.connections, self.output_node_id())
+    }
+
+    // ── derived diagnostics (the "missing data" catalog) ───────────────────
+
+    /// Derived per-node feature dims `(in_dim, out_dim)`, indexed by node id
+    /// — the same derivation [`Network::build`](crate::network::Network::build)
+    /// uses.
+    ///
+    /// `in_dim` = the (validated-identical) dim of the node's wired sources —
+    /// the output dim of each source node, all guaranteed equal by
+    /// [`Topology::validate`] — or `hidden_dim` when the node has no sources /
+    /// any orphaned port (orphans read `net_input`, which is `hidden_dim`
+    /// wide). `out_dim` = the node's `hidden_dim` override, or the graph's.
+    pub fn node_dims(&self) -> Vec<(usize, usize)> {
+        let hidden_dim = self.options.hidden_dim;
+        let out_dim = |n: &Node| n.hidden_dim.unwrap_or(hidden_dim);
+        let num_inputs: Vec<usize> = self.nodes.iter().map(|n| n.num_inputs).collect();
+        let sources = build_node_sources(&self.connections, &num_inputs);
+        self.nodes
+            .iter()
+            .map(|node| {
+                let in_dim = sources[node.id]
+                    .iter()
+                    .flatten()
+                    .map(|p| out_dim(&self.nodes[p.node]))
+                    .max()
+                    .unwrap_or(hidden_dim);
+                (in_dim, out_dim(node))
+            })
+            .collect()
+    }
+
+    /// Orphaned ports of one node: `(orphaned input indices, orphaned output
+    /// indices)`. An orphaned input is fed `net_input` at execution; an
+    /// orphaned output is computed but unused (the graph-output node's own
+    /// ports are the answer, not orphans).
+    pub fn orphan_ports(&self, node: usize) -> (Vec<usize>, Vec<usize>) {
+        let mut ins = Vec::new();
+        let mut outs = Vec::new();
+        for i in 0..self.nodes[node].num_inputs {
+            let port = Port { node, index: i };
+            if !self.connections.iter().any(|c| c.to == port) {
+                ins.push(i);
             }
         }
-        (orphaned_inputs, orphaned_outputs)
+        for o in 0..self.nodes[node].num_outputs {
+            let port = Port { node, index: o };
+            if !self.connections.iter().any(|c| c.from == port) {
+                outs.push(o);
+            }
+        }
+        (ins, outs)
+    }
+
+    /// Wired degrees `(in_degree, out_degree)` per node, indexed by node id
+    /// — one count per *wire* (a port with several wires counts several).
+    pub fn degrees(&self) -> Vec<(usize, usize)> {
+        node_degrees(&self.nodes, &self.connections)
+    }
+
+    /// Longest path from an `Input` node per node id — a topological *level*.
+    /// Input nodes sit at level 0; every other node is `1 + max` over its
+    /// wired sources' levels. Orphaned ports read `net_input` (level 0), so
+    /// they don't add depth. Useful for depth-biased NAS and level-based
+    /// rendering. Edges are forward-only, so ascending ids are a valid order
+    /// for this DP.
+    pub fn depths(&self) -> Vec<usize> {
+        node_depths(&self.nodes, &self.connections)
+    }
+
+    /// Estimated total learnable elements (weights + biases), without
+    /// building: the input projection plus every node's `in·out + out`.
+    /// Matches the real count of a built [`Network`](crate::network::Network).
+    pub fn param_estimate(&self) -> usize {
+        let dims = self.node_dims();
+        let mut total = self.options.input_dim * self.options.hidden_dim + self.options.hidden_dim;
+        for &(in_dim, out_dim) in &dims {
+            total += in_dim * out_dim + out_dim;
+        }
+        total
+    }
+
+    /// Node counts by kind — [`KindCounts`] (no more guessing the tuple
+    /// order).
+    pub fn kind_counts(&self) -> KindCounts {
+        node_kind_counts(&self.nodes)
+    }
+
+    /// Activation histogram across nodes: `(activation, count)` pairs.
+    pub fn activation_counts(&self) -> Vec<(Activation, usize)> {
+        node_activation_counts(&self.nodes)
     }
 
     /// Ensure the canonical skeleton 🏗️: at least one `Input` node and
     /// exactly one `Output` node. Idempotent — safe to call any number of
     /// times.
     ///
-    /// Called automatically as phase 1 of [`Topology::set_network`]; public
+    /// Called automatically as phase 1 of [`Topology::finalize`]; public
     /// for manual use after a topology mutation (e.g. NAS evolution).
     ///
     ///   - **No `Input` node** → prepend `Node::new_input(0, 1)`: a single
@@ -559,7 +794,7 @@ impl Topology {
     ///   - **Zero `Output` nodes** → append the output projection
     ///     (`new_output(last + 1, 1, 1)`): the network output reads this
     ///     node.
-    ///   - **More than one `Output` node** → [`Topology::de_multi_outputs`]:
+    ///   - **More than one `Output` node** → [`Topology::merge_multi_outputs`]:
     ///     stack a new `Output` node with one input per old output node and
     ///     a single output, wire each old output into it, and demote the old
     ///     ones to `Hidden`. The stacked node (highest id) becomes the new
@@ -568,8 +803,8 @@ impl Topology {
     ///     `input_proj`.
     ///
     /// Prepending the Input node shifts every existing node id by +1; any
-    /// connections are re-mapped to match (`set_network` re-mints the port
-    /// labels afterwards; call [`Topology::set_topology`] yourself when
+    /// connections are re-mapped to match (`finalize` re-mints the port
+    /// labels afterwards; call [`Topology::refresh_labels`] yourself when
     /// calling this standalone).
     pub fn ensure_scaffold(&mut self) {
         // 1. At least one Input node (single output port; net_input feeds
@@ -597,13 +832,13 @@ impl Topology {
             }
             1 => {}
             _ => {
-                self.de_multi_outputs();
+                self.merge_multi_outputs();
             }
         }
     }
 
     /// Merge multiple `Output` nodes into a single stacked one 🎯 (the
-    /// "de-multi-output" rule, mirroring [`Topology::de_orphan_outputs`]).
+    /// "de-multi-output" rule, mirroring [`Topology::rewire_orphaned_outputs`]).
     ///
     /// If more than one node has `kind == Output`, append
     /// `Node::new_output(n, count, 1)` — one input port per old output node,
@@ -620,7 +855,7 @@ impl Topology {
     /// Old output nodes with `num_outputs == 0` are demoted but not wired
     /// (they emit nothing); remaining unused ports of the old output nodes
     /// are picked up by the subsequent de-orphan pass.
-    pub fn de_multi_outputs(&mut self) -> usize {
+    pub fn merge_multi_outputs(&mut self) -> usize {
         let outputs: Vec<usize> = self
             .nodes
             .iter()
@@ -659,7 +894,7 @@ impl Topology {
 
     /// Re-wire orphaned output ports into random *later* nodes — the
     /// de-orphaning rule 🕳️→🔗. Called automatically at the end of
-    /// [`Topology::set_network`], so the normal pipeline never needs to
+    /// [`Topology::finalize`], so the normal pipeline never needs to
     /// call it by hand; it's public for manual rewiring (e.g. after a
     /// topology mutation).
     ///
@@ -676,7 +911,7 @@ impl Topology {
     /// Returns the number of wires added. Graphs where a source has no
     /// compatible later target (e.g. its output dim doesn't match any later
     /// node) keep that output orphaned.
-    pub fn de_orphan_outputs(&mut self) -> usize {
+    pub fn rewire_orphaned_outputs(&mut self) -> usize {
         let hidden_dim = self.options.hidden_dim;
         let out_dim = |n: &Node| n.hidden_dim.unwrap_or(hidden_dim);
 
@@ -789,7 +1024,7 @@ impl Topology {
     /// Deserialize a blueprint from JSON (see [`Topology::to_json`]).
     ///
     /// The RNG is **re-seeded from `options.seed`**, so any regeneration after
-    /// loading (e.g. `set_network`) is deterministic — a loaded graph
+    /// loading (e.g. `finalize`) is deterministic — a loaded graph
     /// wires identically to a freshly created graph with the same options.
     ///
     /// The executable module is rebuilt from the loaded blueprint with
@@ -841,8 +1076,8 @@ pub(crate) mod test_strategies {
     }
 
     /// A random graph: input node + 0..5 hidden nodes + output node, fully
-    /// wired through the standard pipeline (`set_topology` +
-    /// `set_network`, which auto-de-orphans). Port counts vary per
+    /// wired through the standard pipeline (`refresh_labels` +
+    /// `finalize`, which auto-de-orphans). Port counts vary per
     /// node within the options ranges.
     pub(crate) fn topology_strategy() -> impl Strategy<Value = Topology> {
         (topology_options_strategy(), 0usize..6).prop_map(|(opts, n_hidden)| {
@@ -856,8 +1091,8 @@ pub(crate) mod test_strategies {
                 graph.nodes.push(Node::new_hidden(i + 1, ins, outs));
             }
             graph.nodes.push(Node::new_output(n_hidden + 1, 1, 1));
-            graph.set_topology();
-            graph.set_network();
+            graph.refresh_labels();
+            graph.finalize();
             graph
         })
     }
@@ -928,12 +1163,12 @@ mod tests {
     }
 
     #[test]
-    fn test_set_topology() {
+    fn test_refresh_labels() {
         let mut graph = Topology::new(1, None);
         graph.create_random_hidden_node();
         graph.create_random_hidden_node();
         graph.create_random_hidden_node();
-        graph.set_topology();
+        graph.refresh_labels();
 
         // One label per port, matching each node's declared inputs/outputs
         let total_inputs: usize = graph.nodes.iter().map(|n| n.num_inputs).sum();
@@ -943,12 +1178,12 @@ mod tests {
     }
 
     #[test]
-    fn test_set_topology_labels() {
+    fn test_refresh_labels_mints_port_labels() {
         let mut graph = Topology::new(1, None);
         // Fixed nodes: input with 2 outputs, hidden with 3 inputs / 2 outputs
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_hidden(1, 3, 2));
-        graph.set_topology();
+        graph.refresh_labels();
 
         assert_eq!(graph.graph_inputs, vec!["n1_i0", "n1_i1", "n1_i2"]);
         assert_eq!(
@@ -958,17 +1193,17 @@ mod tests {
     }
 
     #[test]
-    fn test_set_network() {
+    fn test_finalize() {
         let mut graph = Topology::new(1, None);
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_hidden(1, 3, 2));
         graph.nodes.push(Node::new_hidden(2, 2, 1));
-        graph.set_network();
+        graph.finalize();
 
         let num_output_ports: usize = graph.nodes.iter().map(|n| n.num_outputs).sum();
 
         // Output ports stay 1:1 (each feeds at most one input); input ports
-        // may hold several wires because set_network auto-de-orphans
+        // may hold several wires because finalize auto-de-orphans
         // (stacks extra sources into later nodes, even occupied ports). So
         // the wire count can exceed the input-port count but never the
         // output-port count.
@@ -989,7 +1224,7 @@ mod tests {
         assert!(!graph.connections.is_empty());
 
         // String pairs match the typed connections
-        assert_eq!(graph.connections.len(), graph.connection_pairs().len());
+        assert_eq!(graph.connections.len(), graph.connection_labels().len());
     }
 
     // ── validation ──────────────────────────────────────────────────────────
@@ -998,8 +1233,8 @@ mod tests {
     fn test_validate_ok_on_generated_graph() {
         let mut graph = Topology::new(1, None);
         graph.create_random_hidden_nodes(5);
-        graph.set_topology();
-        graph.set_network();
+        graph.refresh_labels();
+        graph.finalize();
         assert_eq!(graph.validate(), Ok(()));
     }
 
@@ -1137,8 +1372,87 @@ mod tests {
         assert_eq!(graph.orphan_counts(), (2, 1));
     }
 
+    // ── derived diagnostics ────────────────────────────────────────────────
+
     #[test]
-    fn test_de_orphan_outputs() {
+    fn test_derived_diagnostics() {
+        // n0 input (2 outs) → n1 hidden (3 in, 2 out) → n2 hidden (2 in, 1
+        // out) → n3 output (1 in). Wired sparsely on purpose so orphaned
+        // ports stay orphaned for the checks.
+        let mut g = Topology::new(1, None);
+        g.nodes.push(Node::new_input(0, 2));
+        g.nodes.push(Node::new_hidden(1, 3, 2));
+        g.nodes.push(Node::new_hidden(2, 2, 1));
+        g.nodes.push(Node::new_output(3, 1, 1));
+        g.connections.push(Connection {
+            from: Port { node: 0, index: 0 },
+            to: Port { node: 1, index: 0 },
+        });
+        g.connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 0 },
+        });
+        g.connections.push(Connection {
+            from: Port { node: 2, index: 0 },
+            to: Port { node: 3, index: 0 },
+        });
+
+        // Per-node orphaned port indices (raw — the output node's own port
+        // is counted here, unlike orphan_counts which excludes it).
+        assert_eq!(g.orphan_ports(0), (vec![], vec![1]));
+        assert_eq!(g.orphan_ports(1), (vec![1, 2], vec![1]));
+        assert_eq!(g.orphan_ports(2), (vec![1], vec![]));
+        assert_eq!(g.orphan_ports(3), (vec![], vec![0]));
+
+        // Wired degrees (one count per wire).
+        assert_eq!(g.degrees(), vec![(0, 1), (1, 1), (1, 1), (1, 0)]);
+
+        // Topological levels (longest path from the input).
+        assert_eq!(g.depths(), vec![0, 1, 2, 3]);
+
+        // Derived dims: default hidden_dim 8 everywhere on this chain.
+        assert_eq!(g.node_dims(), vec![(8, 8), (8, 8), (8, 8), (8, 8)]);
+
+        // Counts by kind.
+        assert_eq!(
+            g.kind_counts(),
+            KindCounts {
+                input: 1,
+                hidden: 2,
+                output: 1
+            }
+        );
+
+        // Param estimate: input_proj (1·8+8) + 4 nodes × (8·8+8).
+        assert_eq!(g.param_estimate(), 16 + 4 * 72);
+
+        // Activation histogram.
+        assert_eq!(g.activation_counts(), vec![(Activation::Identity, 4)]);
+    }
+
+    #[test]
+    fn test_node_dims_with_override() {
+        // Chain with a widened middle node: n1 emits 32, so n2's in_dim
+        // must re-derive to 32 while n0 stays 8.
+        let mut g = Topology::new(1, None);
+        g.nodes.push(Node::new_input(0, 1));
+        let mut wide = Node::new_hidden(1, 1, 1);
+        wide.hidden_dim = Some(32);
+        g.nodes.push(wide);
+        g.nodes.push(Node::new_output(2, 1, 1));
+        g.connections.push(Connection {
+            from: Port { node: 0, index: 0 },
+            to: Port { node: 1, index: 0 },
+        });
+        g.connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 0 },
+        });
+        assert_eq!(g.node_dims(), vec![(8, 8), (8, 32), (32, 8)]);
+    }
+
+    #[test]
+    fn test_rewire_orphaned_outputs() {
         // Same graph as the demo: n2_o0 is orphaned. De-orphaning must wire
         // it into a random later node — n3 is the only later node, and its
         // input port is already wired, which is fine (tensors are summed).
@@ -1165,7 +1479,7 @@ mod tests {
         });
 
         assert_eq!(graph.orphan_counts(), (2, 1));
-        let added = graph.de_orphan_outputs();
+        let added = graph.rewire_orphaned_outputs();
         assert_eq!(added, 1);
         // n2_o0 now feeds n3_i0 (stacking onto n1_o1) — no more orphaned
         // outputs; n1's two orphaned inputs remain (they're fed net_input).
@@ -1180,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn test_de_orphan_outputs_skips_incompatible_dims() {
+    fn test_rewire_orphaned_outputs_skips_incompatible_dims() {
         // n1 widens 8 → 32; its output is orphaned, but the only later node
         // (n2) has an orphaned input pinning it to hidden_dim (8). No wire
         // can be added without breaking dim consistency → stays orphaned.
@@ -1196,13 +1510,13 @@ mod tests {
         });
         // n2_i0 is orphaned → n2's input dim is pinned to hidden_dim (8).
         assert_eq!(graph.orphan_counts(), (1, 1));
-        assert_eq!(graph.de_orphan_outputs(), 0);
+        assert_eq!(graph.rewire_orphaned_outputs(), 0);
         assert_eq!(graph.orphan_counts(), (1, 1));
     }
 
     #[test]
-    fn test_de_orphan_outputs_deterministic_per_seed() {
-        // set_network auto-de-orphans; same seed ⇒ same de-orphaned
+    fn test_rewire_orphaned_outputs_deterministic_per_seed() {
+        // finalize auto-de-orphans; same seed ⇒ same de-orphaned
         // graph (targets drawn from graph.rng), always valid.
         let build = |seed: usize| {
             let mut graph = Topology::new(0, None);
@@ -1211,7 +1525,7 @@ mod tests {
             graph.nodes.push(Node::new_hidden(1, 2, 2));
             graph.nodes.push(Node::new_hidden(2, 2, 2));
             graph.nodes.push(Node::new_output(3, 2, 1));
-            graph.set_network();
+            graph.finalize();
             assert_eq!(graph.validate(), Ok(()));
             graph.connections.clone()
         };
@@ -1224,8 +1538,8 @@ mod tests {
     }
 
     #[test]
-    fn test_set_network_auto_de_orphans() {
-        // set_network alone must leave zero orphaned *outputs* (the
+    fn test_finalize_auto_de_orphans() {
+        // finalize alone must leave zero orphaned *outputs* (the
         // graph-output node's own ports are the answer, not orphans) and
         // always validate.
         let mut graph = Topology::new(0, None);
@@ -1233,7 +1547,7 @@ mod tests {
         graph.nodes.push(Node::new_hidden(1, 3, 2));
         graph.nodes.push(Node::new_hidden(2, 2, 1));
         graph.nodes.push(Node::new_output(3, 1, 1));
-        graph.set_network();
+        graph.finalize();
         assert_eq!(graph.validate(), Ok(()));
         let (_, orphaned_outputs) = graph.orphan_counts();
         assert_eq!(orphaned_outputs, 0);
@@ -1310,12 +1624,12 @@ mod tests {
     }
 
     #[test]
-    fn test_set_network_scaffolds_hidden_only_graph() {
+    fn test_finalize_scaffolds_hidden_only_graph() {
         // The pipeline alone must turn 5 random hidden nodes into a complete
         // Input → … → Output graph, still valid.
         let mut graph = Topology::new(0, None);
         graph.create_random_hidden_nodes(5);
-        graph.set_network();
+        graph.finalize();
         let n_in = graph
             .nodes
             .iter()
@@ -1332,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn test_de_multi_outputs_merges_extra_outputs() {
+    fn test_merge_multi_outputs_merges_extra_outputs() {
         // Two Output nodes → stacked into one new Output node (the output
         // projection), old ones demoted to Hidden, graph stays executable.
         let mut graph = Topology::new(0, None);
@@ -1340,7 +1654,7 @@ mod tests {
         graph.nodes.push(Node::new_hidden(1, 1, 1));
         graph.nodes.push(Node::new_output(2, 1, 1));
         graph.nodes.push(Node::new_output(3, 1, 1)); // second output node
-        graph.set_network();
+        graph.finalize();
         let outputs: Vec<usize> = graph
             .nodes
             .iter()
@@ -1360,14 +1674,14 @@ mod tests {
     }
 
     #[test]
-    fn test_de_multi_outputs_idempotent_and_reports_count() {
+    fn test_merge_multi_outputs_idempotent_and_reports_count() {
         let mut graph = Topology::new(0, None);
         graph.nodes.push(Node::new_input(0, 1));
         graph.nodes.push(Node::new_output(1, 1, 1));
         graph.nodes.push(Node::new_output(2, 1, 1));
         graph.nodes.push(Node::new_output(3, 1, 1));
         // 3 output nodes → 3 wires into one stacked node, old ones demoted
-        assert_eq!(graph.de_multi_outputs(), 3);
+        assert_eq!(graph.merge_multi_outputs(), 3);
         assert_eq!(
             graph
                 .nodes
@@ -1377,7 +1691,7 @@ mod tests {
             1
         );
         // Already merged → no-op
-        assert_eq!(graph.de_multi_outputs(), 0);
+        assert_eq!(graph.merge_multi_outputs(), 0);
     }
 
     // ── property tests (proptest) ───────────────────────────────────────────
@@ -1394,7 +1708,7 @@ mod tests {
             );
         }
 
-        /// set_network auto-de-orphans: no orphaned *outputs* remain
+        /// finalize auto-de-orphans: no orphaned *outputs* remain
         /// (the graph-output node's own ports are the answer, not orphans).
         #[test]
         fn prop_network_auto_de_orphans_outputs(graph in topology_strategy()) {
@@ -1427,17 +1741,49 @@ mod tests {
             prop_assert_eq!(out.shape(), &[2, graph.options.hidden_dim as i64]);
         }
 
+        /// The blueprint's derived diagnostics match the built engine
+        /// exactly: node dims agree, param_estimate equals the real parameter
+        /// element count, degrees balance, and every wire strictly increases
+        /// depth.
+        #[test]
+        fn prop_diagnostics_match_built_network(graph in topology_strategy()) {
+            let module = Network::build(&graph, Device::CPU).unwrap();
+            let dims = graph.node_dims();
+            prop_assert_eq!(&dims, &module.node_dims);
+            let real_params: i64 = module
+                .parameters()
+                .iter()
+                .map(|p| p.variable.data().numel())
+                .sum();
+            prop_assert_eq!(graph.param_estimate() as i64, real_params);
+
+            let degrees = graph.degrees();
+            let in_sum: usize = degrees.iter().map(|d| d.0).sum();
+            let out_sum: usize = degrees.iter().map(|d| d.1).sum();
+            prop_assert_eq!(in_sum, graph.connections.len());
+            prop_assert_eq!(out_sum, graph.connections.len());
+
+            let depths = graph.depths();
+            for c in &graph.connections {
+                prop_assert!(
+                    depths[c.to.node] > depths[c.from.node],
+                    "wire {c} must strictly increase depth: {:?}",
+                    depths
+                );
+            }
+        }
+
         /// The standard pipeline scaffolds any graph into the canonical
         /// skeleton: ≥ 1 Input node, exactly 1 Output node, still valid —
         /// even for hidden-only (or empty) random graphs.
         #[test]
-        fn prop_set_network_scaffolds_skeleton(
+        fn prop_finalize_scaffolds_skeleton(
             opts in topology_options_strategy(),
             n_hidden in 0usize..6,
         ) {
             let mut graph = Topology::new(0, Some(opts));
             graph.create_random_hidden_nodes(n_hidden);
-            graph.set_network();
+            graph.finalize();
             let n_in = graph
                 .nodes
                 .iter()

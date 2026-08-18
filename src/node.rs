@@ -8,21 +8,25 @@
 //! ```text
 //!   1. Topology::new            empty blueprint + options
 //!   2. Node::new_* (here)    define the compute boxes (ids stay contiguous)
-//!   3. set_topology    one label per port (rendering)
-//!   4. set_network     scaffold Input/Output, wire ports + auto-de-orphan
+//!   3. refresh_labels  one label per port (rendering)
+//!   4. finalize        scaffold Input/Output, wire ports + auto-de-orphan
 //!   5. validate              check wiring is executable
 //!   6. Network::build      one Linear per node + input projection
 //!   7. forward               per node: gather → combine → linear → activation
 //! ```
 //!
-//! The two **NAS evolution knobs** live on [`Node`] too: [`Node::hidden_dim`]
-//! (per-node channel width) and [`Node::activation`] (which activation runs
-//! after the linear). [`crate::topology::Topology::validate`] enforces the
+//! The **NAS evolution knobs** live on [`Node`] too: [`Node::hidden_dim`]
+//! (per-node channel width), [`Node::activation`] (which activation runs
+//! after the linear) and [`Node::combine_op`] (how this node merges its
+//! incoming tensors, overriding the graph default).
+//! [`crate::topology::Topology::validate`] enforces the
 //! invariants that keep execution simple (contiguous ids, forward-only 1:1
 //! wiring, consistent dims).
 
 use flodl::Variable;
 use serde::{Deserialize, Serialize};
+
+use crate::topology::CombineOp;
 
 /// Activation function applied after a node's linear transform. 🧠
 ///
@@ -98,6 +102,11 @@ pub struct Node {
     pub hidden_dim: Option<usize>,
     /// Activation applied after this node's linear transform.
     pub activation: Activation,
+    /// Per-node combine override: how this node merges its incoming tensors
+    /// (`None` = inherit the graph's `combine_op`). `#[serde(default)]` keeps
+    /// older topology JSON (no field) loadable.
+    #[serde(default)]
+    pub combine_op: Option<CombineOp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -118,6 +127,7 @@ impl Node {
             kind: NodeKind::Input,
             hidden_dim: None,
             activation: Activation::Identity,
+            combine_op: None,
         }
     }
 
@@ -131,6 +141,7 @@ impl Node {
             kind: NodeKind::Hidden,
             hidden_dim: None,
             activation: Activation::Identity,
+            combine_op: None,
         }
     }
 
@@ -144,6 +155,7 @@ impl Node {
             kind: NodeKind::Output,
             hidden_dim: None,
             activation: Activation::Identity,
+            combine_op: None,
         }
     }
 
@@ -155,6 +167,14 @@ impl Node {
     /// `Node::new_hidden(1, 3, 2).with_activation(Activation::GeLU)`.
     pub fn with_activation(mut self, activation: Activation) -> Self {
         self.activation = activation;
+        self
+    }
+
+    /// Set the combine-op override for hand-built graphs (builder style):
+    /// `Node::new_hidden(1, 2, 2).with_combine_op(CombineOp::Mean)` merges
+    /// this node's incoming tensors with Mean instead of the graph default.
+    pub fn with_combine_op(mut self, combine_op: CombineOp) -> Self {
+        self.combine_op = Some(combine_op);
         self
     }
 
@@ -186,6 +206,7 @@ mod tests {
                 },
                 hidden_dim: None,
                 activation: Activation::Identity,
+                combine_op: None,
             },
         )
     }

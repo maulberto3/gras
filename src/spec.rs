@@ -107,8 +107,8 @@ mod tests {
     fn test_topology_json_roundtrip() {
         let mut graph = Topology::new(7, None);
         graph.create_random_hidden_nodes(4);
-        graph.set_topology();
-        graph.set_network();
+        graph.refresh_labels();
+        graph.finalize();
         let json = graph.to_json().unwrap();
         let loaded: Topology = Topology::from_json(&json).unwrap();
         assert_eq!(loaded.id, graph.id);
@@ -133,9 +133,9 @@ mod tests {
         let mut fresh = Topology::new(3, None);
         fresh.nodes = original.nodes.clone();
 
-        original.set_network();
-        loaded.set_network();
-        fresh.set_network();
+        original.finalize();
+        loaded.finalize();
+        fresh.finalize();
         assert_eq!(loaded.connections, fresh.connections);
         assert_eq!(loaded.connections, original.connections);
     }
@@ -152,7 +152,7 @@ mod tests {
         wide.activation = Activation::GeLU;
         graph.nodes.push(wide);
         graph.nodes.push(Node::new_output(2, 2, 1));
-        graph.set_network();
+        graph.finalize();
 
         let module = Network::build(&graph, Device::CPU).unwrap();
         let json = graph.to_json().unwrap();
@@ -189,8 +189,8 @@ mod tests {
             let mut fresh = graph;
             loaded.rng = fastrand::Rng::with_seed(loaded.options.seed as u64);
             fresh.rng = fastrand::Rng::with_seed(fresh.options.seed as u64);
-            loaded.set_network();
-            fresh.set_network();
+            loaded.finalize();
+            fresh.finalize();
             prop_assert_eq!(loaded.connections, fresh.connections);
         }
     }

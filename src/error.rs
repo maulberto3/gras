@@ -139,6 +139,8 @@ pub enum NetworkError {
     InvalidTopology(TopologyError),
     /// A build-time inconsistency not covered by validation.
     Build(String),
+    /// The materialized-net facts failed to serialize.
+    Json(String),
 }
 
 impl Display for NetworkError {
@@ -146,6 +148,7 @@ impl Display for NetworkError {
         match self {
             NetworkError::InvalidTopology(e) => write!(f, "invalid graph: {e}"),
             NetworkError::Build(msg) => write!(f, "cannot build network: {msg}"),
+            NetworkError::Json(msg) => write!(f, "network: JSON: {msg}"),
         }
     }
 }
@@ -164,6 +167,8 @@ pub enum EngineError {
     Io { path: String, source: io::Error },
     /// A JSON document failed to serialize or parse.
     Json(String),
+    /// The rayon thread pool used for parallel evaluation failed to build.
+    Rayon(String),
 }
 
 impl Display for EngineError {
@@ -175,6 +180,7 @@ impl Display for EngineError {
                 write!(f, "engine: cannot access {path}: {source}")
             }
             EngineError::Json(msg) => write!(f, "engine: JSON: {msg}"),
+            EngineError::Rayon(msg) => write!(f, "engine: parallel evaluation pool: {msg}"),
         }
     }
 }

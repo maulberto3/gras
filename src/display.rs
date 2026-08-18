@@ -9,9 +9,10 @@
 
 use std::fmt::Display;
 
-use crate::network::Network;
+use crate::engine::EngineOptions;
+use crate::network::{Network, NetworkOptions};
 use crate::node::{Activation, Node};
-use crate::topology::{Connection, Topology};
+use crate::topology::{Connection, Topology, TopologyOptions};
 
 impl Display for Topology {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -54,5 +55,55 @@ impl Display for Activation {
 impl Display for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} -> {}", self.from_label(), self.to_label())
+    }
+}
+
+impl Display for TopologyOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "input {} → hidden {} · combine {:?} · nodes {}..={} · in-ports {}..={} · out-ports {}..={} · seed {}",
+            self.input_dim,
+            self.hidden_dim,
+            self.combine_op,
+            self.min_num_nodes,
+            self.max_num_nodes,
+            self.min_inputs_per_node,
+            self.max_inputs_per_node,
+            self.min_outputs_per_node,
+            self.max_outputs_per_node,
+            self.seed
+        )
+    }
+}
+
+impl Display for NetworkOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "device {:?} · dtype {:?} · init_seed {:?}",
+            self.device, self.dtype, self.seed
+        )
+    }
+}
+
+impl Display for EngineOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pop {} · {} gens · seed {:?} · budget {}ep × {}bt of {} · {} threads · fitness {:?} · GP pools: hidden {:?} · combine {:?} · activations {:?} · results {}/",
+            self.pop_size,
+            self.num_generations,
+            self.seed,
+            self.num_epochs,
+            self.num_batches,
+            self.batch_size,
+            self.num_threads,
+            self.fitness,
+            self.hidden_dim_pool,
+            self.combine_op_pool,
+            self.activation_pool,
+            self.results_dir.display()
+        )
     }
 }
