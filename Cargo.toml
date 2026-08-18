@@ -11,6 +11,7 @@ default = []
 cuda = ["flodl/cuda"]
 
 [dependencies]
+env_logger = "0.11"
 fastrand = "2.5.0"
 flodl = "0.7.0"
 log = "0.4"
