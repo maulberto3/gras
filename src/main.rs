@@ -41,210 +41,85 @@
 //!                               path is untested end to end
 //! • data loaders              — tensors only (the flodl-native contract)
 
+use std::io::Write;
+
 use flodl::Device;
-use flodl::nn::Module;
 
 use gras::data;
-use gras::engine::{Direction, Engine, EngineOptions, Fitness};
-use gras::fitness;
-use gras::network::Network;
-use gras::node::{Activation, NodeKind};
+use gras::engine::{Engine, EngineOptions, Fitness};
+use gras::node::Activation;
 use gras::topology::CombineOp;
 
 fn main() {
-    // 1. Data — the engine's contract is a path to tensors written by
-    //    `data::save_dataset` (inputs.bin + targets.bin + meta.json).
-    let data_dir = std::path::Path::new("data/sine");
-    if std::fs::read_dir(data_dir).is_err() {
-        let ds = fitness::synthetic_sine(128, 42, Device::CPU).unwrap();
+    // Initialize the logger — message only, no prefix (the engine owns the narrative).
+    // Set RUST_LOG=info for lifecycle, debug for per-individual scores.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format(|buf, record| writeln!(buf, "{}", record.args()))
+        .init();
+
+    // 1. Data — the engine's contract is a path to tensors (inputs.bin +
+    //    targets.bin + meta.json). Try MNIST first; fall back to a
+    //    synthetic dataset with the same shape for quick testing.
+    let data_dir = std::path::Path::new("data/mnist/train");
+    if !data_dir.exists() {
+        println!("  data/mnist/train not found — generating synthetic MNIST-shaped data");
+        println!("  (run `cargo run --example mnist_data` for real MNIST)");
+        let ds = data::synthetic_classification(256, 784, 10, 42, Device::CPU).unwrap();
         data::save_dataset(data_dir, &ds).unwrap();
-        println!("  saved synthetic sine dataset → {}/", data_dir.display());
-    } else {
-        println!("  found existing dataset → {}/", data_dir.display());
     }
 
     // 2. Options — the flat builder. Each set_* routes into the right layer:
-    //    engine knobs, the topology template, the GP pools (sampled per
-    //    individual), or the network options.
+    //    engine knobs, the topology template, the GP pools, or the network.
     let opts = EngineOptions::builder()
-        .set_pop_size(8)
-        .set_num_generations(1)
-        .set_seed(Some(42)) // fixed → every run reproduces the same population
-        .set_input_dim(1) // must match the dataset's [n, input_dim]
-        .set_hidden_dim_pool(8..=16) // 🎛️ GP: per-individual hidden dim
-        .set_combine_op_pool(vec![CombineOp::Add, CombineOp::Mean]) // 🎛️ GP
+        // ── Engine ────────────────────────────────────────────────────
+        .set_seed(Some(16))
+        .set_log_every_gens(1)
+        .set_num_threads(3)
+        .set_results_dir("results")
+        // ── GP pools (per-individual randomization) ───────────────────
+        .set_pop_size(10)
+        .set_num_generations(3)
+        .set_hidden_dim_pool(8..=16)
+        .set_combine_op_pool(vec![CombineOp::Add, CombineOp::Mean])
         .set_activation_pool(vec![
             Activation::Identity,
             Activation::ReLU,
             Activation::GeLU,
             Activation::SELU,
-        ]) // 🎛️ GP: per-node activations
-        .set_num_threads(3) // ⚡ parallel population evaluation
-        // Budget — how much of the dataset each fitness evaluation sees:
-        // 1 epoch × 4 batches of 64 rows (of the 128-row sine set). Batching
-        // keeps memory bounded and makes each score a sampled estimate.
-        .set_num_epochs(1)
-        .set_num_batches(4)
-        .set_batch_size(64)
+        ])
+        // ── Topology (blueprint) ──────────────────────────────────────
+        .set_min_num_nodes(2)
+        .set_max_num_nodes(5)
+        .set_min_inputs_per_node(2)
+        .set_max_inputs_per_node(5)
+        .set_min_outputs_per_node(2)
+        .set_max_outputs_per_node(5)
+        // ── Fitness / scoring ─────────────────────────────────────────
+        .set_fitness(gras::fitness::FitnessKind::CrossEntropy)
+        // ── Evaluation budget ─────────────────────────────────────────
+        .set_num_batches(16) // 16 random batches per gen
+        .set_batch_size(32) // 32 rows each → 512 rows total per gen
+        .set_num_epochs(3) // 3 passes over the batches per individual
+        // ── Training ──────────────────────────────────────────────────
+        .set_learning_rate(1e-3)
+        .set_optimizer(gras::trainer::OptimizerKind::Adam)
+        .set_grad_clip(1.0)
+        // ── Build ─────────────────────────────────────────────────────
         .build()
         .unwrap();
 
-    // 3. The engine — the options cascade. `EngineOptions` embeds BOTH the
-    //    topology template and the network options; each flows inward:
-    //    every individual clones the template (overriding only its derived
-    //    seed), and every network is built with the network options.
-    println!("   engine options — the full cascade:");
-    let (topo, net) = (opts.topology, opts.network);
-    println!("   ┌ engine   {opts}");
-    println!("   ├─ topology {topo}");
-    println!("   └─ network  {net}");
-
-    // 4. Engine::new — a population of random blueprints, one per individual.
-    let mut engine = Engine::new(opts, data_dir, Fitness::mse()).unwrap();
-    println!("🧬 run {} → {}/", engine.run_id, engine.run_dir.display());
-    println!("   population of {} random blueprints:", engine.pop.len());
-    for (i, g) in engine.pop.iter().enumerate() {
-        println!(
-            "     pop[{i}] id {} · {} nodes · {} wires · {} in-ports",
-            g.id,
-            g.nodes.len(),
-            g.connections.len(),
-            g.graph_inputs.len()
-        );
-    }
-
-    // 5. The flow, made visible: every individual is a (topology, network)
-    // pair sampled from the pools — a derived seed, a GP-chosen hidden dim
-    // (per-INDIVIDUAL: per-node dims would break fan-in merging, so they
-    // stay uniform within a graph), and PER-NODE combine ops + activations
-    // (each hidden node draws its own; the individual's base is the
-    // fallback for combines).
-    println!("   flow check — GP-sampled per individual/node:");
-    for (i, g) in engine.pop.iter().enumerate() {
-        let combines: Vec<String> = g
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Hidden)
-            .map(|n| format!("{:?}", n.combine_op.unwrap_or(g.options.combine_op)))
-            .collect();
-        let acts: Vec<String> = g
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Hidden)
-            .map(|n| n.activation.to_string())
-            .collect();
-        println!(
-            "     pop[{i}] seed {} · hidden {} · combines [{}] · acts [{}]",
-            g.options.seed,
-            g.options.hidden_dim,
-            combines.join(", "),
-            acts.join(", ")
-        );
-    }
-    println!(
-        "   every network is built on device {:?} (the network options)",
-        engine.options.network.device
-    );
-
-    // 6. Run — 1 generation of fitness evaluation. Each individual is
-    //    scored on the budget set above: 1 epoch × 4 batches of 64 rows,
-    //    the same sampled batches reused across the population so scores
-    //    are comparable (num_batches = 0 would mean one full pass instead).
+    // 3. Run — Engine::new seeds the population, engine.run() evaluates it.
+    //    All output (options cascade, pop summary, fitness ranking, artifacts)
+    //    is logged by the engine — this file is intentionally minimal.
+    // Cross-entropy is the canonical MNIST loss — for 10 classes,
+    // random guessing starts at ≈ 2.3 (ln 10).
+    //
+    // Equivalent custom fitness (same result as the built-in):
+    // use gras::fitness::Direction;
+    // let fitness = Fitness::loss_directed(
+    //     |pred, target| flodl::cross_entropy_loss(pred, target),
+    //     Direction::Minimize,
+    // );
+    let mut engine = Engine::new(opts, data_dir, Fitness::cross_entropy()).unwrap();
     engine.run().unwrap();
-
-    // 7. Every score, made legible — the whole population ranked by fitness.
-    //    Mse is a LOSS (minimize direction), so the best is the LOWEST
-    //    score; `engine.best` picks it direction-aware, we just show why.
-    let dir = engine.fitness.direction();
-    let better = if dir == Direction::Minimize {
-        "lowest"
-    } else {
-        "highest"
-    };
-    let mut ranked: Vec<(usize, f64)> = engine.scores().iter().copied().enumerate().collect();
-    ranked.sort_by(|a, b| {
-        if dir == Direction::Minimize {
-            a.1.total_cmp(&b.1)
-        } else {
-            b.1.total_cmp(&a.1)
-        }
-    });
-    let best_idx = ranked[0].0;
-    println!(
-        "   population fitness — fitness {:?} ({better} = better):",
-        engine.options.fitness
-    );
-    for (rank, (i, s)) in ranked.iter().enumerate() {
-        let marker = if *i == best_idx { "  ← best" } else { "" };
-        println!("     #{rank} pop[{i}]  {s:.4}{marker}");
-    }
-
-    // 8. What we got — the direction-aware best, its compact log line, the
-    //    rebuildable blueprint, and the checkpointed artifacts.
-    let best = engine.best.as_ref().unwrap();
-    println!(
-        "   best = pop[{best_idx}] · fitness {:.4} ({} = better) after {} gen(s)",
-        best.fitness, better, engine.generation
-    );
-    for line in std::fs::read_to_string(engine.run_dir.join("log.txt"))
-        .unwrap()
-        .lines()
-    {
-        println!("     {line}");
-    }
-    let net = Network::build(&best.topology, Device::CPU).unwrap();
-    println!(
-        "   best blueprint: {} nodes · {} wires · {} param tensors (recipe → Network::build)",
-        best.topology.nodes.len(),
-        best.topology.connections.len(),
-        net.parameters().len()
-    );
-    // 8b. The artifacts, annotated — each file's role in the experiment.
-    println!("   artifacts → {}/", engine.run_dir.display());
-    let mut entries: Vec<String> = std::fs::read_dir(engine.run_dir.clone())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
-    entries.sort();
-    for e in entries {
-        // Inline notes per artifact: what lives inside, and how to use it.
-        let note = match e.as_str() {
-            "engine.json" => {
-                "  # whole experiment: options + run_seed + best → from_json replicates the run"
-            }
-            "log.txt" => "  # compact per-gen log (best / mean / worst)",
-            "improvements" => "  # one pair per best-improvement (annotated below)",
-            _ => "",
-        };
-        println!("     {e}{note}");
-    }
-    if let Ok(files) = std::fs::read_dir(engine.run_dir.join("improvements")) {
-        let mut names: Vec<String> = files
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        for n in names {
-            // The pair: `.json` = the winning blueprint recipe, `.net.json` =
-            // the built network's nutrition facts (dims, degrees, orphans…).
-            let note = if n.ends_with(".net.json") {
-                "  # built-network facts → Network::from_json"
-            } else if n.ends_with(".json") {
-                "  # best-topology recipe → Topology::from_json"
-            } else {
-                ""
-            };
-            println!("     improvements/{n}{note}");
-        }
-    }
-
-    // 9. What the crate does NOT offer yet — the evolution roadmap.
-    println!();
-    println!("⏳ pending in the crate:");
-    println!("   • crossover() / mutate() — documented no-op stubs");
-    println!("   • select() — implemented, not yet wired into next_generation()");
-    println!("   • stop criteria — only max generations (TargetFitness / NoImprovement TODO)");
-    println!("   • population checkpoints — weights are never stored (fitness is a random-init");
-    println!("     forward pass), so runs restart from the seed chain, not from saved state");
-    println!("   • GPU (CUDA) device — engine builds on any Device; CUDA untested end to end");
-    println!("   • data loaders — tensors only (the flodl-native contract)");
 }
