@@ -62,17 +62,13 @@ impl Display for TopologyOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "input {} → hidden {} · combine {:?} · nodes {}..={} · in-ports {}..={} · out-ports {}..={} · seed {}",
+            "input {} → hidden {} → output {} · combine {:?} · nodes {}..={}",
             self.input_dim,
             self.hidden_dim,
+            self.output_dim,
             self.combine_op,
             self.min_num_nodes,
             self.max_num_nodes,
-            self.min_inputs_per_node,
-            self.max_inputs_per_node,
-            self.min_outputs_per_node,
-            self.max_outputs_per_node,
-            self.seed
         )
     }
 }
@@ -91,19 +87,14 @@ impl Display for EngineOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "pop {} · {} gens · seed {:?} · budget {}ep × {}bt of {} · {} threads · log every {} gens · fitness {:?} · GP pools: hidden {:?} · combine {:?} · activations {:?} · results {}/",
+            "pop {} · {} gens · seed {:?} · budget {}bt of {} · {} threads · fitness {:?} · results {}/",
             self.pop_size,
             self.num_generations,
             self.seed,
-            self.num_epochs,
             self.num_batches,
             self.batch_size,
             self.num_threads,
-            self.log_every_gens,
             self.fitness,
-            self.hidden_dim_pool,
-            self.combine_op_pool,
-            self.activation_pool,
             self.results_dir.display()
         )
     }
