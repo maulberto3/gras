@@ -307,9 +307,9 @@ mod tests {
                 max_inputs_per_node: min_inputs + span_in,
                 min_outputs_per_node: min_outputs,
                 max_outputs_per_node: min_outputs + span_out,
-                num_outputs_net: 1,
                 input_dim: 1,
                 hidden_dim: 8,
+                output_dim: 1,
                 combine_op: crate::topology::CombineOp::Add,
             };
             let mut graph = Topology::new(0, Some(opts));
