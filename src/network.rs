@@ -1,24 +1,8 @@
-//! Execution engine of a gras graph — the flodl [`Module`]. 🏭
+//! Materialization of a gras graph — the flodl [`Module`]. 🏭
 //!
 //! The blueprint lives in [`crate::topology`] (pure data, no tensors); this
 //! file compiles it into real flodl layers ([`Network::build`]) and
-//! executes it ([`Network::forward`]).
-//!
-//! # Why the forward pass is a loop, not generated code
-//!
-//! Every node is a linear layer over its combined inputs, so a runtime loop
-//! *is* the "unrolling" — a compile-time `layers!` macro could only follow
-//! connections written literally in source, never a graph the RNG produced at
-//! runtime (that would be like `println!` printing a random string). The loop
-//! stays readable because [`Network::build`] precomputes the wiring once
-//! (per input port: which sources feed it, or "orphan") and `forward` just
-//! walks that table.
-//!
-//! # Why execution stays simple
-//!
-//! Everything that makes the forward pass trivial is an **invariant the code
-//! enforces rather than computes** (all checked by
-//! [`Topology::validate`](crate::topology::Topology::validate)):
+//! executes it ([`Network::forward`]) and more.
 //!
 //! - node ids are contiguous `0..n` and double as array indices into
 //!   `Network.layers`
@@ -216,7 +200,8 @@ impl Network {
 
         // 🏁 Topology output: the highest-id Output node if any, otherwise the
         // last node overall.
-        let output_node = graph.output_node_id();
+        // The Output node is always the last one (created by ensure_scaffold).
+        let output_node = graph.nodes.len() - 1;
 
         Ok(Network {
             input_proj,
