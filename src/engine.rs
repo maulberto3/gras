@@ -93,6 +93,11 @@ pub struct EngineOptions {
     /// every gen). The final results summary and improvement announcements
     /// are always logged regardless of this setting.
     pub log_every_gens: usize,
+    /// Probability that an individual's **activation** is mutated each
+    /// generation (0.0 = no activation mutation, the default). Each
+    /// mutation picks one random hidden node and swaps its activation
+    /// to a different one from `activation_pool`.
+    pub mutate_activ_prob: f64,
     /// Training hyperparameters applied to every individual before scoring.
     /// `train_epochs = 0` (the default) skips training entirely — a
     /// random-init forward pass, the pre-training behavior.
@@ -120,6 +125,7 @@ impl Default for EngineOptions {
             num_threads: 3,
             results_dir: PathBuf::from("results"),
             log_every_gens: 1,
+            mutate_activ_prob: 0.0,
             training: crate::trainer::TrainingConfig::default(),
             network: NetworkOptions::default(),
         }
@@ -243,10 +249,6 @@ impl EngineOptionsBuilder {
         self.inner.batch_size = batch_size;
         self
     }
-    pub fn set_fitness(mut self, kind: FitnessKind) -> Self {
-        self.inner.fitness = kind;
-        self
-    }
     pub fn set_num_threads(mut self, n: usize) -> Self {
         self.inner.num_threads = n;
         self
@@ -257,6 +259,12 @@ impl EngineOptionsBuilder {
     }
     pub fn set_log_every_gens(mut self, n: usize) -> Self {
         self.inner.log_every_gens = n.max(1);
+        self
+    }
+    /// Probability each individual's activation is mutated per generation
+    /// (0.0 = no activation mutation, 1.0 = mutate every individual).
+    pub fn set_mutate_activ_prob(mut self, p: f64) -> Self {
+        self.inner.mutate_activ_prob = p.clamp(0.0, 1.0);
         self
     }
 
@@ -555,9 +563,10 @@ impl Engine {
             options.num_threads
         );
         log::info!(
-            "  engine  fitness {:?} · log every {} gens",
+            "  engine  fitness {:?} · log every {} gens · mut_act {:.0}%",
             options.fitness,
-            options.log_every_gens
+            options.log_every_gens,
+            options.mutate_activ_prob * 100.0
         );
         log::info!(
             "  engine  GP pools: hidden {:?} · combine {:?}",
@@ -1007,17 +1016,21 @@ impl Engine {
         Ok(())
     }
 
-    /// Advance one generation: crossover → mutate → generation += 1.
-    ///
-    /// Crossover and mutation are still documented no-op stubs.
-    /// [`crate::genetics::select`] (elitism + tournament) is implemented and
-    /// tested in `src/genetics.rs` but **not yet wired into the loop** —
-    /// pending design review. Wiring it back is one line:
-    /// `self.pop = genetics::select(&self.scores, dir, &mut rng, 3).into_iter().map(|i| self.pop[i].clone()).collect();`
+    /// Advance one generation: select → crossover → mutate → generation += 1.
     fn next_generation(&mut self) {
+        self.select();
         self.crossover();
         self.mutate();
         self.generation += 1;
+    }
+
+    /// 🧬 Selection placeholder — elitism + tournament.
+    ///
+    /// Future: `self.pop = genetics::select(&self.scores, dir, &mut rng, 3)
+    /// .into_iter().map(|i| self.pop[i].clone()).collect();`
+    /// **Not implemented yet** — a no-op.
+    pub fn select(&mut self) {
+        // TODO(engine): topology-level selection.
     }
 
     /// 🧬 Crossover placeholder — the first genetic operator (planned).
@@ -1030,16 +1043,44 @@ impl Engine {
         // TODO(engine): topology-level crossover.
     }
 
-    /// 🎲 Mutation placeholder — the second genetic operator (planned).
+    /// 🎲 Uniform mutation — swap one random hidden node's activation.
     ///
-    /// Future: randomly tweak individuals — rewire, add/remove nodes, swap
-    /// activations from `options.activation_pool`, swap combine ops, adjust the
-    /// individual's `hidden_dim`. (Per-node `hidden_dim` stays out: a node
-    /// merging sources of different widths is an invalid graph — see the
-    /// fan-in note in `Engine::new`.) **Not implemented yet** — a no-op, so
-    /// the population stays static.
+    /// For each individual: with probability `mutate_prob`, pick a random
+    /// hidden node and swap its activation to a *different* one from
+    /// `activation_pool`. Input and Output nodes are never mutated.
     pub fn mutate(&mut self) {
-        // TODO(engine): topology-level mutation.
+        if self.options.mutate_activ_prob <= 0.0 || self.options.activation_pool.len() < 2 {
+            return;
+        }
+        let mut rng = fastrand::Rng::with_seed(self.run_seed + self.generation as u64 + 0xBEEF);
+        for graph in &mut self.pop {
+            if rng.f64() >= self.options.mutate_activ_prob {
+                continue;
+            }
+            // Collect hidden node indices.
+            let hiddens: Vec<usize> = graph
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.kind == crate::node::NodeKind::Hidden)
+                .map(|(i, _)| i)
+                .collect();
+            if hiddens.is_empty() {
+                continue;
+            }
+            let idx = hiddens[rng.usize(0..hiddens.len())];
+            let cur = graph.nodes[idx].activation;
+            // Pick a different activation from the pool.
+            let pool = &self.options.activation_pool;
+            let new_act = loop {
+                let pick = pool[rng.usize(0..pool.len())];
+                if pick != cur {
+                    break pick;
+                }
+            };
+            graph.nodes[idx].activation = new_act;
+            println!("  ==> A Mutation happened: graph {} node {} activation changed from {:?} to {:?}", graph.id, idx, cur, new_act);
+        }
     }
 
     /// Everything needed to replicate this experiment, as JSON: the resolved
