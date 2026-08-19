@@ -7,6 +7,7 @@ pub mod genetics;
 pub mod network;
 pub mod node;
 pub mod spec;
+pub mod synthetic;
 pub mod topology;
 pub mod trainer;
 pub mod utils;
