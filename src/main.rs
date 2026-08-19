@@ -74,11 +74,13 @@ fn main() {
         // ── Engine ────────────────────────────────────────────────────
         .set_seed(Some(16))
         .set_log_every_gens(1)
-        .set_num_threads(3)
+        .set_num_threads(2)
         .set_results_dir("results")
-        // ── GP pools (per-individual randomization) ───────────────────
+        // ── GP Algo (per-individual randomization) ───────────────────
         .set_pop_size(10)
-        .set_num_generations(3)
+        .set_num_generations(30)
+        .set_mutate_activ_prob(0.05)
+        // ── GP pools (per-individual randomization) ───────────────────
         .set_hidden_dim_pool(8..=16)
         .set_combine_op_pool(vec![CombineOp::Add, CombineOp::Mean])
         .set_activation_pool(vec![
@@ -94,8 +96,6 @@ fn main() {
         .set_max_inputs_per_node(5)
         .set_min_outputs_per_node(2)
         .set_max_outputs_per_node(5)
-        // ── Fitness / scoring ─────────────────────────────────────────
-        .set_fitness(gras::fitness::FitnessKind::CrossEntropy)
         // ── Evaluation budget ─────────────────────────────────────────
         .set_num_batches(16) // 16 random batches per gen
         .set_batch_size(32) // 32 rows each → 512 rows total per gen
