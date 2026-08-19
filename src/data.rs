@@ -181,9 +181,27 @@ pub fn load_dataset(dir: &Path) -> Result<Dataset> {
     Ok(Dataset { inputs, targets })
 }
 
-// Canonical synthetic datasets live next to their scorers in `crate::fitness`
-// (e.g. `fitness::synthetic_sine`, the data for the regression built-ins) —
-// the tensor I/O contract itself stays here.
+/// Generate a synthetic classification dataset: random inputs `[n, in_dim]`
+/// and one-hot targets `[n, out_dim]` (each row sums to 1). Quick stand-in
+/// for MNIST or any categorical task — no download needed.
+pub fn synthetic_classification(
+    n: usize,
+    in_dim: usize,
+    out_dim: usize,
+    seed: u64,
+    device: Device,
+) -> Result<Dataset> {
+    let mut rng = fastrand::Rng::with_seed(seed);
+    let inputs: Vec<f32> = (0..n * in_dim).map(|_| rng.f32()).collect();
+    let inputs = Tensor::from_f32(&inputs, &[n as i64, in_dim as i64], device)?;
+    let mut targets = vec![0.0f32; n * out_dim];
+    for row in 0..n {
+        let c = rng.usize(0..out_dim);
+        targets[row * out_dim + c] = 1.0;
+    }
+    let targets = Tensor::from_f32(&targets, &[n as i64, out_dim as i64], device)?;
+    Ok(Dataset { inputs, targets })
+}
 
 #[cfg(test)]
 mod tests {
