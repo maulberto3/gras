@@ -13,7 +13,7 @@
 //!   └─ rayon task (per individual)
 //!        ├─ Network::build_from_topology(graph)
 //!        ├─ train_network(&mut net, config, &batches)   ← this module
-//!        │     for epoch in 0..config.train_epochs:
+//!        │     for epoch in 0..config.num_epochs:
 //!        │       for (x, y) in batches:
 //!        │         forward → loss → backward → clip → step
 //!        └─ fitness.evaluate(&net.forward(x), &y)        ← back in engine
@@ -49,7 +49,7 @@ pub struct TrainingConfig {
     pub learning_rate: f64,
     /// Number of training epochs over the provided batches (0 = no training,
     /// just a random-init forward pass — the current behavior).
-    pub train_epochs: usize,
+    pub num_epochs: usize,
     /// Gradient clipping max-norm (0.0 = no clipping).
     pub grad_clip: f64,
 }
@@ -59,7 +59,7 @@ impl Default for TrainingConfig {
         TrainingConfig {
             optimizer: OptimizerKind::Adam,
             learning_rate: 1e-3,
-            train_epochs: 0,
+            num_epochs: 0,
             grad_clip: 0.0,
         }
     }
@@ -69,11 +69,11 @@ impl Default for TrainingConfig {
 
 /// Train a network on the given batches in-place.
 ///
-/// When `config.train_epochs == 0` this is a no-op (random-init forward pass,
+/// When `config.num_epochs == 0` this is a no-op (random-init forward pass,
 /// the current behavior).  Otherwise runs the standard training loop:
 ///
 /// ```text
-/// for epoch in 0..train_epochs:
+/// for epoch in 0..num_epochs:
 ///     for (x, y) in batches:
 ///         x = Variable::new(x, true)   // track gradients
 ///         pred = net.forward(&x)
@@ -92,7 +92,7 @@ pub fn train_network(
     fitness: &crate::fitness::Fitness,
     batches: &[(flodl::Tensor, flodl::Tensor)],
 ) -> Result<()> {
-    if config.train_epochs == 0 || batches.is_empty() {
+    if config.num_epochs == 0 || batches.is_empty() {
         return Ok(());
     }
 
@@ -105,7 +105,7 @@ pub fn train_network(
         OptimizerKind::Adam => Box::new(Adam::new(&params, config.learning_rate)),
     };
 
-    for _epoch in 0..config.train_epochs {
+    for _epoch in 0..config.num_epochs {
         for (xb, yb) in batches {
             // Variables with track=true so backward can accumulate grads.
             let x = Variable::new(xb.clone(), true);
