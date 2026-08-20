@@ -16,13 +16,13 @@ use crate::topology::{Connection, Topology, TopologyOptions};
 
 impl Display for Topology {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", crate::utils::topology_ascii(self))
+        write!(f, "{}", crate::ascii_utils::topology_ascii(self))
     }
 }
 
 impl Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", crate::utils::network_ascii(self))
+        write!(f, "{}", crate::ascii_utils::network_ascii(self))
     }
 }
 
