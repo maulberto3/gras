@@ -495,7 +495,7 @@ mod tests {
         let batch = 4i64;
         let input = rand_input(batch, graph.options.input_dim);
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.hidden_dim as i64]);
+        assert_eq!(output.shape(), &[batch, graph.options.output_dim as i64]);
 
         // One Linear (weight + bias) per node, plus the input projection
         assert_eq!(module.parameters().len(), (graph.nodes.len() + 1) * 2);
@@ -514,7 +514,7 @@ mod tests {
         let batch = 2i64;
         let input = rand_input(batch, graph.options.input_dim);
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.hidden_dim as i64]);
+        assert_eq!(output.shape(), &[batch, graph.options.output_dim as i64]);
     }
 
     #[test]
@@ -692,6 +692,6 @@ mod tests {
         let out = seeded(42)
             .forward(&rand_input(2, graph.options.input_dim))
             .unwrap();
-        assert_eq!(out.shape(), &[2, graph.options.hidden_dim as i64]);
+        assert_eq!(out.shape(), &[2, graph.options.output_dim as i64]);
     }
 }
