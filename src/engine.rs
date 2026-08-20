@@ -23,11 +23,12 @@
 use std::fs;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use flodl::nn::Module;
 use flodl::tensor::Result;
 use flodl::{DType, Device, Tensor, Variable};
+use log::debug;
 use rayon::prelude::*;
 use serde::Serialize;
 
@@ -36,6 +37,7 @@ use crate::error::EngineError;
 pub use crate::fitness::{Direction, Fitness, FitnessKind};
 use crate::network::{Network, NetworkOptions};
 use crate::node::{Activation, NodeKind};
+use crate::selection::SelectionMethod;
 use crate::topology::{CombineOp, Topology, TopologyOptions};
 
 /// Knobs for one engine run. Serialized by [`Engine::to_json`] into the run
@@ -70,13 +72,11 @@ pub struct EngineOptions {
     /// for the future `mutate` implementation.
     pub activation_pool: Vec<Activation>,
     /// **Evaluation budget** — how much of the data each candidate is scored
-    /// on. `num_batches == 0` means one full pass over the dataset, chunked
-    /// into `batch_size` slices (memory-bounded); otherwise each generation
-    /// samples `num_batches` random batches of `batch_size` rows.
-    ///
-    /// The sampled batches are the **same for every individual of a
-    /// generation** (seeded from `run_seed + generation`), so scores stay
-    /// comparable, and deterministic across runs with the same options.
+    /// on. Each generation picks `num_batches` non-overlapping batches of
+    /// `batch_size` rows **without replacement**. The same batches are reused
+    /// for every individual of a generation (seeded from `run_seed + generation`),
+    /// so scores stay comparable and deterministic. If the budget exceeds the
+    /// dataset, all rows are exhausted (shuffled) with no duplicates.
     pub num_batches: usize,
     /// Rows per batch (used both for sampled batches and for chunking the
     /// whole-dataset pass; default 128).
@@ -102,6 +102,9 @@ pub struct EngineOptions {
     /// `train_epochs = 0` (the default) skips training entirely — a
     /// random-init forward pass, the pre-training behavior.
     pub training: crate::trainer::TrainingConfig,
+    /// Selection strategy for picking parents for the next generation.
+    /// Default: tournament with size 3.
+    pub selection: SelectionMethod,
     /// The **network link** of the option chain (engine → topology →
     /// network): passed to `Network::build_with_options` when materializing
     /// every individual. Today it only carries the device; it's where future
@@ -119,7 +122,7 @@ impl Default for EngineOptions {
             hidden_dim_pool: 8..=8,
             combine_op_pool: vec![CombineOp::Add],
             activation_pool: vec![Activation::Identity, Activation::ReLU, Activation::GeLU],
-            num_batches: 0, // whole dataset once (chunked), original behavior
+            num_batches: 16,
             batch_size: 128,
             fitness: FitnessKind::Mse,
             num_threads: 3,
@@ -127,6 +130,7 @@ impl Default for EngineOptions {
             log_every_gens: 1,
             mutate_activ_prob: 0.0,
             training: crate::trainer::TrainingConfig::default(),
+            selection: SelectionMethod::default(),
             network: NetworkOptions::default(),
         }
     }
@@ -267,6 +271,11 @@ impl EngineOptionsBuilder {
         self.inner.mutate_activ_prob = p.clamp(0.0, 1.0);
         self
     }
+    /// Selection strategy for the genetic loop.
+    pub fn set_selection(mut self, method: SelectionMethod) -> Self {
+        self.inner.selection = method;
+        self
+    }
 
     // ── training knobs ──────────────────────────────────────────────────
     pub fn set_num_epochs(mut self, n: usize) -> Self {
@@ -366,6 +375,8 @@ impl EngineOptionsBuilder {
 #[derive(Clone, Debug)]
 pub struct BestIndividual {
     pub fitness: f64,
+    /// Index in the population (`pop[i]`) that produced this best.
+    pub pop_index: usize,
     /// The blueprint that scored best — `to_json` it to replicate the net.
     pub topology: Topology,
 }
@@ -437,9 +448,8 @@ impl Engine {
             )
             .into());
         }
-        if options.batch_size == 0 && options.num_batches == 0 {
-            // The whole-dataset chunker needs a positive slice size.
-            options.batch_size = 1;
+        if options.num_batches == 0 {
+            options.num_batches = 16;
         }
 
         // 🎲 Resolve the population base seed: the user's, or a fresh random
@@ -547,97 +557,11 @@ impl Engine {
             pop.push(graph);
         }
 
-        // ══ Log: options ══════════════════════════════════════════════
-        log::info!("");
-        log::info!("══ options ═══════════════════════════════════");
-        log::info!(
-            "  engine  pop {} · {} gens · seed {:?}",
-            options.pop_size,
-            options.num_generations,
-            options.seed
-        );
-        log::info!(
-            "  engine  budget {}bt of {} · {} threads",
-            options.num_batches,
-            options.batch_size,
-            options.num_threads
-        );
-        log::info!(
-            "  engine  fitness {:?} · log every {} gens · mut_act {:.0}%",
-            options.fitness,
-            options.log_every_gens,
-            options.mutate_activ_prob * 100.0
-        );
-        log::info!(
-            "  engine  GP pools: hidden {:?} · combine {:?}",
-            options.hidden_dim_pool,
-            options.combine_op_pool
-        );
-        log::info!(
-            "  engine  GP pool:  activations {:?}",
-            options.activation_pool
-        );
-        if options.training.num_epochs > 0 {
-            log::info!(
-                "  engine  train {} epochs · lr {} · {:?}{}",
-                options.training.num_epochs,
-                options.training.learning_rate,
-                options.training.optimizer,
-                if options.training.grad_clip > 0.0 {
-                    format!(" · clip {:.1}", options.training.grad_clip)
-                } else {
-                    String::new()
-                }
-            );
-        } else {
-            log::info!("  engine  train: off (random-init forward pass)");
-        }
-        log::info!("  engine  results {}", options.results_dir.display());
-        log::info!(
-            "  topo    input {} → hidden {} → output {} (all auto)",
-            options.topology.input_dim,
-            options.topology.hidden_dim,
-            options.topology.output_dim
-        );
-        log::info!("  topo    combine {:?}", options.topology.combine_op);
-        log::info!(
-            "  topo    nodes {}..={} · inputs/node {}..={} · outputs/node {}..={}",
-            options.topology.min_num_nodes,
-            options.topology.max_num_nodes,
-            options.topology.min_inputs_per_node,
-            options.topology.max_inputs_per_node,
-            options.topology.min_outputs_per_node,
-            options.topology.max_outputs_per_node
-        );
-        log::info!(
-            "  net     device {:?} · dtype {:?}",
-            options.network.device,
-            options.network.dtype
-        );
+        crate::log_utils::log_options(&options);
 
-        // ══ Log: dataset ══════════════════════════════════════════════
-        log::info!("");
-        log::info!("══ dataset ═══════════════════════════════════");
-        log::info!(
-            "  [{}×{}] · pop {} · seed {run_seed} · {:?}",
-            data.inputs.shape()[0],
-            data.inputs.shape().get(1).copied().unwrap_or(0),
-            pop.len(),
-            fitness.direction(),
-        );
+        crate::log_utils::log_dataset(&data, pop.len(), run_seed, fitness.direction());
 
-        // ══ Log: population ═══════════════════════════════════════════
-        log::info!("");
-        log::info!("══ population ═══════════════════════════════");
-        log::info!(
-            "  {} individuals · {}–{} nodes · hidden {} · device {:?}",
-            pop.len(),
-            pop.iter().map(|g| g.nodes.len()).min().unwrap_or(0),
-            pop.iter().map(|g| g.nodes.len()).max().unwrap_or(0),
-            options.topology.hidden_dim,
-            options.network.device,
-        );
-        log::info!("");
+        crate::log_utils::log_population(&pop, &options);
 
         let engine = Engine {
             options,
@@ -677,20 +601,7 @@ impl Engine {
             path: self.run_dir.display().to_string(),
             source,
         })?;
-        let better = match self.fitness.direction() {
-            Direction::Minimize => "lowest",
-            Direction::Maximize => "highest",
-        };
-        log::info!("══ run ══════════════════════════════════════");
-        log::info!(
-            "  {} gens · budget {}bt of {} · {} threads",
-            self.options.num_generations,
-            self.options.num_batches,
-            self.options.batch_size,
-            self.options.num_threads,
-        );
-        log::info!("  fitness {:?} ({better} = better)", self.options.fitness);
-        log::info!("  results {}", self.run_dir.display());
+        crate::log_utils::log_run_start(&self.options, &self.run_dir, self.fitness.direction());
         // Initial experiment envelope (no best yet); the final one is
         // written after the loop.
         let initial = self.to_json()?;
@@ -698,58 +609,36 @@ impl Engine {
             path: self.run_dir.join("engine.json").display().to_string(),
             source,
         })?;
+        let run_start = Instant::now();
         // TODO(engine): stop criteria beyond max generations — e.g. a
         // StopCriterion enum with TargetFitness (stop once the best crosses
         // a threshold) and NoImprovement (stop after N stagnant generations).
         for _ in 0..self.options.num_generations {
-            let improved = self.evaluate_population()?;
-            self.log_generation(improved)?;
+            let _improved = self.evaluate_population()?;
             self.next_generation();
         }
+        let run_elapsed = run_start.elapsed();
         let json = self.to_json()?;
         fs::write(self.run_dir.join("engine.json"), json).map_err(|source| EngineError::Io {
             path: self.run_dir.join("engine.json").display().to_string(),
             source,
         })?;
 
-        // ══ Log: best ═════════════════════════════════════════════════
-        log::info!("");
-        log::info!("══ best ═════════════════════════════════════");
-        if let Some(best) = &self.best {
-            log::info!(
-                "  fitness {:.4} after {} gen(s)",
-                best.fitness,
-                self.generation
-            );
-            let net = Network::build(&best.topology, Device::CPU)?;
-            log::info!(
-                "  blueprint: {} nodes · {} wires · {} param tensors",
-                best.topology.nodes.len(),
-                best.topology.connections.len(),
-                net.parameters().len()
-            );
-        } else {
-            log::info!("  no improvements");
-        }
+        crate::log_utils::log_best(&self.best, self.generation)?;
 
-        // ══ Log: artifacts ═════════════════════════════════════════════
-        log::info!("");
-        log::info!("══ artifacts ═════════════════════════════════");
-        if let Ok(entries) = std::fs::read_dir(&self.run_dir) {
-            let mut names: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
-            names.sort();
-            for e in &names {
-                let note = match e.as_str() {
-                    "engine.json" => "  # experiment envelope",
-                    "improvements" => "  # best-improvement pairs",
-                    _ => "",
-                };
-                log::info!("  {e}{note}");
-            }
-        }
+        // ══ Log: run summary ══════════════════════════════════════════
+        crate::log_utils::log_run_summary(
+            run_elapsed,
+            self.run_seed,
+            self.generation,
+            self.pop.len(),
+            &self.options,
+            &self.data_path,
+            &self.fitness,
+            self.improvements,
+            &self.best,
+            &self.run_dir,
+        ).map_err(|e| EngineError::Json(format!("run summary log: {e}")))?;
 
         Ok(())
     }
@@ -760,16 +649,10 @@ impl Engine {
         // One budget per generation: the sampled batches are reused for every
         // individual so scores are comparable (same data, same compute), and
         // re-seeded from `run_seed + generation` so each generation sees
-        // fresh data deterministically. `num_batches == 0` → one full pass
-        // over the dataset, chunked into `batch_size` slices (memory-bounded
-        // — never one giant forward).
-        let batches = if self.options.num_batches > 0 {
-            let mut rng =
-                fastrand::Rng::with_seed(self.run_seed.wrapping_add(self.generation as u64));
-            self.sample_batches(&mut rng)?
-        } else {
-            self.whole_dataset_chunks()?
-        };
+        // fresh data deterministically.
+        let mut rng =
+            fastrand::Rng::with_seed(self.run_seed.wrapping_add(self.generation as u64));
+        let batches = self.sample_batches(&mut rng)?;
 
         // ⚡ Parallel evaluation: one rayon task per individual. The batches
         // are plain `Tensor` pairs (Tensor is Send + Sync); each task wraps
@@ -789,6 +672,8 @@ impl Engine {
             } else {
                 f64::NEG_INFINITY
             }));
+        let generation = self.generation;
+        let progress_lock = std::sync::Mutex::new(());
         let scores: Vec<f64> = self.pool.install(|| {
             self.pop
                 .par_iter()
@@ -815,7 +700,7 @@ impl Engine {
                     }
                     let score = total / batches.len() as f64;
 
-                    // 📊 Progress: update best-so-far and log at milestones.
+                    // 📊 Progress: update best-so-far and print dynamic progress.
                     best_bits
                         .fetch_update(
                             std::sync::atomic::Ordering::Relaxed,
@@ -832,19 +717,23 @@ impl Engine {
                     let cur_best =
                         f64::from_bits(best_bits.load(std::sync::atomic::Ordering::Relaxed));
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    // Log every 25% or every 10, whichever is smaller.
-                    let step = (pop_size / 4).clamp(1, 10);
-                    if n == pop_size || n.is_multiple_of(step) {
-                        log::info!(
-                            "  ⏳ gen {:02} · {n:>3}/{pop_size} · best {cur_best:.4}",
-                            self.generation,
+                    // Dynamic progress: overwrite the same line with \r.
+                    {
+                        let _guard = progress_lock.lock().unwrap();
+                        use std::io::Write;
+                        print!(
+                            "\r  gen {:02} net {:>2}/{pop_size}  best {cur_best:.4}\x1b[K",
+                            generation, n,
                         );
+                        std::io::stdout().flush().unwrap();
                     }
 
                     Ok(score)
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
+        // Move past the progress line before the generation summary.
+        println!();
         self.scores = scores;
 
         let mut best_idx: Option<(usize, f64)> = None;
@@ -866,6 +755,7 @@ impl Engine {
             if improved {
                 self.best = Some(BestIndividual {
                     fitness: score,
+                    pop_index: i,
                     topology: self.pop[i].clone(),
                 });
                 log::info!(
@@ -880,80 +770,52 @@ impl Engine {
     }
 
     /// Sample the per-generation evaluation budget: `num_batches` batches
-    /// of `batch_size` random rows (with replacement) from the loaded
-    /// dataset, returned as raw `(Tensor, Tensor)` pairs. The caller
-    /// seeds `rng` from `run_seed + generation`, so a run reproduces the
-    /// same batches.
+    /// of `batch_size` rows **without replacement** from the loaded dataset,
+    /// returned as raw `(Tensor, Tensor)` pairs. The caller seeds `rng`
+    /// from `run_seed + generation`, so a run reproduces the same batches.
+    ///
+    /// - Budget ≤ dataset: randomly pick `num_batches` non-overlapping
+    ///   batches. Every individual sees the same batches.
+    /// - Budget > dataset: exhaust all rows (shuffled), produce as many
+    ///   full batches as possible, warn, and continue to the next gen.
     fn sample_batches(&self, rng: &mut fastrand::Rng) -> Result<Vec<(Tensor, Tensor)>> {
         let n = self.data.inputs.shape()[0] as usize;
+        let bs = self.options.batch_size;
         let total = self.options.num_batches;
-        let requested = total * self.options.batch_size;
+        let max_full = n / bs; // complete batches the dataset can yield
 
-        // If the budget exceeds the dataset, stop at exhaustion: draw
-        // without replacement until the data runs out, then continue
-        // to the next gen with fewer batches.
-        if requested > n {
-            // Shuffle all row indices, then slice into batch_size chunks.
-            let mut all_idx: Vec<i64> = (0..n as i64).collect();
-            // Fisher-Yates shuffle using the engine's seeded rng.
-            for i in (1..all_idx.len()).rev() {
-                let j = rng.usize(0..=i);
-                all_idx.swap(i, j);
-            }
-            let bs = self.options.batch_size;
-            let actual = n / bs; // full batches only; drop the tail
-            log::info!(
-                "  ⚠ dataset has {n} rows but budget requests \
-                 {requested} — stopped at {actual} batches \
-                 ({}) rows used, {} unused",
-                actual * bs,
-                n - actual * bs
-            );
-            let mut batches = Vec::with_capacity(actual);
-            for b in 0..actual {
-                let start = b * bs;
-                let idx: Vec<i64> = all_idx[start..start + bs].to_vec();
-                let idx_t = Tensor::from_i64(&idx, &[idx.len() as i64], Device::CPU)?;
-                let xb = self.data.inputs.index_select(0, &idx_t)?;
-                let yb = self.data.targets.index_select(0, &idx_t)?;
-                batches.push((xb, yb));
-            }
-            return Ok(batches);
+        // Shuffle all row indices once — Fisher-Yates.
+        let mut all_idx: Vec<i64> = (0..n as i64).collect();
+        for i in (1..all_idx.len()).rev() {
+            let j = rng.usize(0..=i);
+            all_idx.swap(i, j);
         }
 
-        // Normal path: budget fits the dataset — sample with replacement.
-        let mut batches = Vec::with_capacity(total);
-        for _ in 0..total {
-            let idx: Vec<i64> = (0..self.options.batch_size)
-                .map(|_| rng.usize(0..n) as i64)
-                .collect();
+        // How many batches can we actually produce?
+        let actual = if total <= max_full {
+            // Budget fits — pick `total` batches from the shuffled pool.
+            total
+        } else {
+            // Budget exceeds dataset — exhaust what we have.
+            log::info!(
+                "  ⚠ requested {total} batches × {bs} rows = {} \
+                 but dataset has only {n} rows — using {max_full} batches (no duplicates)",
+                total * bs
+            );
+            max_full.max(1) // at least 1 batch even if dataset < batch_size
+        };
+
+        let mut batches = Vec::with_capacity(actual);
+        for b in 0..actual {
+            let start = b * bs;
+            let end = (start + bs).min(n);
+            let idx: Vec<i64> = all_idx[start..end].to_vec();
             let idx_t = Tensor::from_i64(&idx, &[idx.len() as i64], Device::CPU)?;
             let xb = self.data.inputs.index_select(0, &idx_t)?;
             let yb = self.data.targets.index_select(0, &idx_t)?;
             batches.push((xb, yb));
         }
         Ok(batches)
-    }
-
-    /// The "whole dataset once" pass, split into `batch_size`-row slices so
-    /// memory stays bounded no matter how large the dataset grows. The score
-    /// is the mean over the chunk scores — same semantics as a single full
-    /// forward, without the single giant tensor.
-    fn whole_dataset_chunks(&self) -> Result<Vec<(Tensor, Tensor)>> {
-        let n = self.data.inputs.shape()[0] as usize;
-        let bs = self.options.batch_size.max(1);
-        let mut chunks = Vec::with_capacity(n.div_ceil(bs));
-        let mut start = 0usize;
-        while start < n {
-            let end = (start + bs).min(n);
-            let idx: Vec<i64> = (start as i64..end as i64).collect();
-            let idx_t = Tensor::from_i64(&idx, &[idx.len() as i64], Device::CPU)?;
-            let xb = self.data.inputs.index_select(0, &idx_t)?;
-            let yb = self.data.targets.index_select(0, &idx_t)?;
-            chunks.push((xb, yb));
-            start = end;
-        }
-        Ok(chunks)
     }
 
     /// Append the current best to `run_dir/improvements/` — the evolution
@@ -982,37 +844,19 @@ impl Engine {
             path: path.display().to_string(),
             source,
         })?;
-        self.improvements += 1;
-        Ok(())
-    }
-
-    /// One compact log line per generation.
-    /// Emitted through the `log` crate (`log::info!`), so callers control the
-    /// sink (examples init a logger; library users plug in their own).
-    fn log_generation(&self, improved: bool) -> Result<()> {
-        let scores = &self.scores;
-        let mean = scores.iter().sum::<f64>() / scores.len() as f64;
-        let min = scores.iter().cloned().fold(f64::INFINITY, f64::min);
-        let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        // "best" is direction-aware: the min for losses, the max for metrics.
-        let dir = self.fitness.direction();
-        let (best_s, worst_s) = match dir {
-            Direction::Minimize => (min, max),
-            Direction::Maximize => (max, min),
-        };
-        let flag = if improved { " 🏆" } else { "" };
-        let line = format!(
-            "g{:02} {:?} best {best_s:.4}{} mean {mean:.4} worst {worst_s:.4}{flag}",
-            self.generation,
-            self.options.fitness,
-            dir.arrow()
-        );
-        // Log every N gens, plus always on last gen + improvement.
-        let is_last = self.generation + 1 >= self.options.num_generations;
-        let on_interval = (self.generation + 1).is_multiple_of(self.options.log_every_gens);
-        if improved || is_last || on_interval {
-            log::info!("{line}");
+        // Markdown visualization: tables + wiring diagram.
+        let md_name = name.replace(".json", ".md");
+        let md_path = dir.join(&md_name);
+        let mut md = crate::ascii_utils::topology_markdown(&b.topology, Some(b.fitness));
+        if let Ok(net) = Network::build(&b.topology, Device::CPU) {
+            md.push_str("\n");
+            md.push_str(&crate::ascii_utils::network_markdown(&net));
         }
+        fs::write(&md_path, md).map_err(|source| EngineError::Io {
+            path: md_path.display().to_string(),
+            source,
+        })?;
+        self.improvements += 1;
         Ok(())
     }
 
@@ -1024,13 +868,34 @@ impl Engine {
         self.generation += 1;
     }
 
-    /// 🧬 Selection placeholder — elitism + tournament.
+    /// 🧬 Selection — elitism + tournament (or future strategies).
     ///
-    /// Future: `self.pop = genetics::select(&self.scores, dir, &mut rng, 3)
-    /// .into_iter().map(|i| self.pop[i].clone()).collect();`
-    /// **Not implemented yet** — a no-op.
+    /// Reorders `self.pop` and `self.scores` in-place so that the fittest
+    /// individuals are positioned to survive into the next generation.
     pub fn select(&mut self) {
-        // TODO(engine): topology-level selection.
+        if self.scores.is_empty() {
+            return;
+        }
+        let dir = self.fitness.direction();
+        let mut rng = fastrand::Rng::with_seed(self.run_seed + self.generation as u64 + 0xCAFE);
+        let indices = match self.options.selection {
+            crate::selection::SelectionMethod::Tournament { tournament_size } => {
+                crate::selection::select(&self.scores, dir, &mut rng, tournament_size)
+            }
+        };
+        let new_pop: Vec<Topology> = indices.iter().map(|&i| self.pop[i].clone()).collect();
+        let new_scores: Vec<f64> = indices.iter().map(|&i| self.scores[i]).collect();
+        self.pop = new_pop;
+        self.scores = new_scores;
+        // Summarize selection: who survived and who was culled.
+        let mut counts = vec![0usize; self.pop.len()];
+        for &i in &indices { counts[i] += 1; }
+        let selected: Vec<usize> = (0..counts.len()).filter(|&i| counts[i] > 0).collect();
+        let culled: Vec<usize> = (0..counts.len()).filter(|&i| counts[i] == 0).collect();
+        let highlights: Vec<String> = selected.iter()
+            .map(|&i| format!("pop[{i}]×{}", counts[i]))
+            .collect();
+        debug!("  selection  survivors: {} · culled: {:?}", highlights.join(" "), culled);
     }
 
     /// 🧬 Crossover placeholder — the first genetic operator (planned).
@@ -1079,7 +944,7 @@ impl Engine {
                 }
             };
             graph.nodes[idx].activation = new_act;
-            println!("  ==> A Mutation happened: graph {} node {} activation changed from {:?} to {:?}", graph.id, idx, cur, new_act);
+            debug!("  ==> A Mutation happened: graph {} node {} activation changed from {:?} to {:?}", graph.id, idx, cur, new_act);
         }
     }
 
@@ -1143,7 +1008,6 @@ fn derive_seed(base: u64, i: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flodl::nn::Module;
     use flodl::nn::loss::mse_loss;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1180,17 +1044,25 @@ mod tests {
         // (options.json / meta.json are deduped into engine.json).
         let imp_dir = engine.run_dir.join("improvements");
         assert!(imp_dir.exists());
-        let mut files: Vec<_> = std::fs::read_dir(&imp_dir)
+        let mut json_files: Vec<_> = std::fs::read_dir(&imp_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|f| f.ends_with(".json"))
+            .collect();
+        json_files.sort();
+        assert!(!json_files.is_empty());
+        // Each improvement writes a .json recipe + a .md visualization.
+        assert_eq!(json_files.len(), engine.improvements);
+        let mut all_files: Vec<_> = std::fs::read_dir(&imp_dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        files.sort();
-        assert!(!files.is_empty());
-        // Each improvement writes one topology recipe file.
-        assert_eq!(files.len(), engine.improvements);
+        all_files.sort();
+        // 2 files per improvement: .json + .md
+        assert_eq!(all_files.len(), engine.improvements * 2);
         // Each recipe entry is a valid topology that replicates the best at
         // that point; the latest one matches the final best blueprint.
-        let latest_json = std::fs::read_to_string(imp_dir.join(files.last().unwrap())).unwrap();
+        let latest_json = std::fs::read_to_string(imp_dir.join(json_files.last().unwrap())).unwrap();
         let latest = Topology::from_json(&latest_json).unwrap();
         let best_topo = engine.best.as_ref().unwrap().topology.clone();
         assert_eq!(
