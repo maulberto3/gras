@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a2747b7bb9ae7835145d1dd294ef20d07c3618b26ca869ca0c7c4f1cdaa307b1 # shrinks to graph = Topology { id: 0, nodes: [Node { id: 0, num_inputs: 0, num_outputs: 2, kind: Input, hidden_dim: Some(1), activation: Identity, combine_op: None }, Node { id: 1, num_inputs: 1, num_outputs: 1, kind: Output, hidden_dim: Some(2), activation: Identity, combine_op: None }], options: TopologyOptions { seed: 0, min_num_nodes: 2, max_num_nodes: 6, min_inputs_per_node: 1, max_inputs_per_node: 4, min_outputs_per_node: 1, max_outputs_per_node: 4, input_dim: 1, hidden_dim: 1, output_dim: 2, combine_op: Add }, graph_inputs: ["n1_i0"], graph_outputs: ["n0_o0", "n0_o1", "n1_o0"], connections: [Connection { from: Port { node: 0, index: 1 }, to: Port { node: 1, index: 0 } }, Connection { from: Port { node: 0, index: 0 }, to: Port { node: 1, index: 0 } }], rng: Rng(13030663262578008724) }
