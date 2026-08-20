@@ -477,6 +477,18 @@ impl Topology {
         // Input → … → Output graph.
         self.ensure_scaffold();
 
+        // Resolve per-node hidden_dim: None → graph default.
+        // This makes the topology JSON self-describing — every node shows
+        // the actual dim the network will use, not a latent "inherit" marker.
+        for node in &mut self.nodes {
+            if node.hidden_dim.is_none() {
+                node.hidden_dim = Some(match node.kind {
+                    NodeKind::Output => self.options.output_dim,
+                    _ => self.options.hidden_dim,
+                });
+            }
+        }
+
         // Labels must reflect any nodes the scaffold just added.
         self.refresh_labels();
 
@@ -1634,7 +1646,7 @@ mod tests {
             let module = Network::build(&graph, Device::CPU).unwrap();
             let input = rand_input(2, graph.options.input_dim);
             let out = module.forward(&input).unwrap();
-            prop_assert_eq!(out.shape(), &[2, graph.options.hidden_dim as i64]);
+            prop_assert_eq!(out.shape(), &[2, graph.options.output_dim as i64]);
         }
 
         /// The blueprint's derived diagnostics match the built engine
