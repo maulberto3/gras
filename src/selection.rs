@@ -10,6 +10,24 @@
 //! other topology.
 
 use crate::fitness::Direction;
+use serde::Serialize;
+
+/// Selection strategy used by the engine to pick parents for the next
+/// generation. Each variant wraps its own tuning knobs.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum SelectionMethod {
+    /// Tournament selection with elitism — the best individual always
+    /// survives, every other slot is filled by a `tournament_size`-way
+    /// random draw. Higher `tournament_size` pressures selection more
+    /// toward the fittest.
+    Tournament { tournament_size: usize },
+}
+
+impl Default for SelectionMethod {
+    fn default() -> Self {
+        SelectionMethod::Tournament { tournament_size: 3 }
+    }
+}
 
 /// Tournament selection with **elitism** — the engine's parent-picking step.
 ///
