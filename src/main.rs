@@ -27,7 +27,7 @@
 //!   engine.json experiment envelope
 //! • fitness: 4 continuous + 4 categorical built-ins, plus custom closures
 //!   and trait-based scorers
-//! • genetics::select (elitism + tournament) implemented + tested
+//! • selection::select (elitism + tournament) implemented + tested
 //!
 //! ── ⏳ still pending ───────────────────────────────────────────────────────
 //! • crossover() / mutate()    — documented no-op stubs
@@ -47,6 +47,7 @@ use flodl::Device;
 
 use gras::data;
 use gras::engine::{Engine, EngineOptions, Fitness};
+use gras::selection::SelectionMethod;
 use gras::node::Activation;
 use gras::topology::CombineOp;
 
@@ -56,6 +57,14 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
+
+    // CLI: --seed N overrides the code's default seed.
+    let cli_seed: Option<u64> = std::env::args()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|w| w[0] == "--seed")
+        .and_then(|w| w[1].parse().ok());
 
     // 1. Data — the engine's contract is a path to tensors (inputs.bin +
     //    targets.bin + meta.json). Try MNIST first; fall back to a
@@ -70,16 +79,18 @@ fn main() {
 
     // 2. Options — the flat builder. Each set_* routes into the right layer:
     //    engine knobs, the topology template, the GP pools, or the network.
+    //    Seed precedence: --seed CLI arg > .set_seed(Some(n)) > SystemTime.
     let opts = EngineOptions::builder()
         // ── Engine ────────────────────────────────────────────────────
-        .set_seed(Some(16))
+        .set_seed(cli_seed.or(Some(16)))
         .set_log_every_gens(1)
-        .set_num_threads(2)
+        .set_num_threads(5)
         .set_results_dir("results")
         // ── GP Algo (per-individual randomization) ───────────────────
         .set_pop_size(10)
-        .set_num_generations(30)
+        .set_num_generations(1)
         .set_mutate_activ_prob(0.05)
+        .set_selection(SelectionMethod::Tournament { tournament_size: 3 })
         // ── GP pools (per-individual randomization) ───────────────────
         .set_hidden_dim_pool(8..=16)
         .set_combine_op_pool(vec![CombineOp::Add, CombineOp::Mean])
@@ -120,6 +131,8 @@ fn main() {
     //     |pred, target| flodl::cross_entropy_loss(pred, target),
     //     Direction::Minimize,
     // );
-    let mut engine = Engine::new(opts, data_dir, Fitness::cross_entropy()).unwrap();
+    let mut engine = Engine::new(opts, 
+        data_dir, 
+        Fitness::cross_entropy()).unwrap();
     engine.run().unwrap();
 }

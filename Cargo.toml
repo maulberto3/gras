@@ -35,7 +35,6 @@ panic = "abort"
 debug = false
 
 [dev-dependencies]
-env_logger = "0.11"
 git-cliff = "2.13.1"
 proptest = "1.11.0"
 ureq = "3"
