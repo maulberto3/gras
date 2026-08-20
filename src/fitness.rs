@@ -14,7 +14,7 @@
 //! presented in user space), and custom scorers pick theirs at construction.
 
 use flodl::Variable;
-use flodl::nn::loss::{cross_entropy_loss, l1_loss, mse_loss};
+use flodl::nn::loss::{l1_loss, mse_loss};
 use flodl::tensor::Result;
 use serde::{Deserialize, Serialize};
 
@@ -321,7 +321,18 @@ impl Loss for FitnessKind {
             FitnessKind::Mse => mse_loss(pred, target),
             FitnessKind::Mae => l1_loss(pred, target),
             FitnessKind::Rmse => Ok(mse_loss(pred, target)?),
-            FitnessKind::CrossEntropy => cross_entropy_loss(pred, target),
+            FitnessKind::CrossEntropy => {
+                // cross_entropy_loss expects class-index targets [n],
+                // but our datasets ship one-hot [n, C]. Use the manual
+                // one-hot path: -mean(one_hot · log_softmax(pred)).
+                let ls = pred.data().log_softmax(1)?;
+                let masked = ls.mul(&target.data())?;
+                let neg = flodl::Tensor::from_f32(&[-1.0], &[1], masked.device())?;
+                let n = flodl::Tensor::from_f32(
+                    &[target.data().shape()[0] as f32], &[1], target.data().device(),
+                )?;
+                Ok(flodl::Variable::new(masked.sum()?.mul(&neg)?.div(&n)?, false))
+            }
             // R2, Accuracy, F1, Precision: differentiable approximations
             // for backward compatibility — the real scoring uses `.item()`.
             // R2, Accuracy, F1, Precision: use MSE as proxy for backward
