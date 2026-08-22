@@ -56,6 +56,18 @@ pub enum Activation {
     Sigmoid,
     /// Mish.
     Mish,
+    /// Leaky Rectified Linear Unit (negative_slope = 0.01).
+    LeakyReLU,
+    /// Exponential Linear Unit (alpha = 1.0).
+    ELU,
+    /// Tanh approximation of GeLU.
+    GeluTanh,
+    /// Smooth approximation of ReLU (beta = 1.0, threshold = 20.0).
+    Softplus,
+    /// MobileNet's hard swish: x · hard_sigmoid(x).
+    HardSwish,
+    /// Piecewise-linear sigmoid approximation.
+    HardSigmoid,
 }
 
 impl Activation {
@@ -70,6 +82,48 @@ impl Activation {
             Activation::Tanh => x.tanh(),
             Activation::Sigmoid => x.sigmoid(),
             Activation::Mish => x.mish(),
+            Activation::LeakyReLU => x.leaky_relu(0.01),
+            Activation::ELU => x.elu(1.0),
+            Activation::GeluTanh => x.gelu_tanh(),
+            Activation::Softplus => x.softplus(1.0, 20.0),
+            Activation::HardSwish => x.hardswish(),
+            Activation::HardSigmoid => x.hardsigmoid(),
+        }
+    }
+}
+
+/// Normalization applied **after** the linear layer and **before** the
+/// activation. Part of the per-node NAS evolution knobs — the engine
+/// samples from a pool and each node can have a different choice.
+////// `LayerNorm` normalizes across the feature dimension (same behavior
+/// train/eval, no running stats). `Identity` skips normalization.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StandardizeOp {
+    /// No normalization — the linear output passes straight to activation.
+    #[default]
+    Identity,
+    /// Layer normalization over the feature dimension.
+    LayerNorm,
+}
+
+impl StandardizeOp {
+    /// Apply this standardize op to a tensor.
+    ///
+    /// `LayerNorm` normalizes to zero-mean/unit-variance across the feature
+    /// dimension — no learnable parameters, pure normalization. This is a
+    /// "standardize" layer (like z-score), not a trainable `nn::LayerNorm`.
+    pub fn apply(&self, x: &Variable) -> flodl::tensor::Result<Variable> {
+        match self {
+            StandardizeOp::Identity => Ok(x.clone()),
+            StandardizeOp::LayerNorm => {
+                // z-score across feature dim: (x - mean) / sqrt(var + eps)
+                let mean = x.mean_dim(-1, true)?; // [batch, 1]
+                let centered = x.sub(&mean)?;
+                let var = centered.mul(&centered)?.mean_dim(-1, true)?; // [batch, 1]
+                let std = var.add_scalar(1e-5)?.sqrt()?; // [batch, 1]
+                let normed = centered.div(&std)?;
+                Ok(normed)
+            }
         }
     }
 }
@@ -107,6 +161,10 @@ pub struct Node {
     /// older topology JSON (no field) loadable.
     #[serde(default)]
     pub combine_op: Option<CombineOp>,
+    /// Per-node standardize op: normalization applied after linear, before
+    /// activation (`None` = inherit the graph's `standardize_op`).
+    #[serde(default)]
+    pub standardize: Option<StandardizeOp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -128,6 +186,7 @@ impl Node {
             hidden_dim: None,
             activation: Activation::Identity,
             combine_op: None,
+            standardize: None,
         }
     }
 
@@ -142,6 +201,7 @@ impl Node {
             hidden_dim: None,
             activation: Activation::Identity,
             combine_op: None,
+            standardize: None,
         }
     }
 
@@ -156,6 +216,7 @@ impl Node {
             hidden_dim: None,
             activation: Activation::Identity,
             combine_op: None,
+            standardize: None,
         }
     }
 
@@ -207,6 +268,7 @@ mod tests {
                 hidden_dim: None,
                 activation: Activation::Identity,
                 combine_op: None,
+            standardize: None,
             },
         )
     }
@@ -261,6 +323,12 @@ mod tests {
         assert_eq!(Activation::ReLU.to_string(), "relu");
         assert_eq!(Activation::GeLU.to_string(), "gelu");
         assert_eq!(Activation::SELU.to_string(), "selu");
+        assert_eq!(Activation::LeakyReLU.to_string(), "leaky_relu");
+        assert_eq!(Activation::ELU.to_string(), "elu");
+        assert_eq!(Activation::GeluTanh.to_string(), "gelu_tanh");
+        assert_eq!(Activation::Softplus.to_string(), "softplus");
+        assert_eq!(Activation::HardSwish.to_string(), "hardswish");
+        assert_eq!(Activation::HardSigmoid.to_string(), "hardsigmoid");
     }
 
     // ── property tests (proptest) ───────────────────────────────────────────
@@ -301,16 +369,15 @@ mod tests {
         ) {
             let opts = TopologyOptions {
                 seed: 16,
-                min_num_nodes: 2,
-                max_num_nodes: 5,
-                min_inputs_per_node: min_inputs,
-                max_inputs_per_node: min_inputs + span_in,
-                min_outputs_per_node: min_outputs,
-                max_outputs_per_node: min_outputs + span_out,
+                min_hidden_num_nodes: 2,
+                max_hidden_num_nodes: 5,
+                min_hidden_inputs_per_node: min_inputs,
+                max_hidden_inputs_per_node: min_inputs + span_in,
+                min_hidden_outputs_per_node: min_outputs,
+                max_hidden_outputs_per_node: min_outputs + span_out,
                 input_dim: 1,
                 hidden_dim: 8,
                 output_dim: 1,
-                combine_op: crate::topology::CombineOp::Add,
             };
             let mut graph = Topology::new(0, Some(opts));
             graph.create_random_hidden_node();
