@@ -35,11 +35,19 @@ pub(crate) fn log_options(options: &EngineOptions) {
         options.batch_size,
         options.num_threads
     );
-    log::info!(
-        "  engine  fitness {} · mut_act {:.0}%",
-        options.fitness_label,
-        options.mutate_activ_prob * 100.0
-    );
+    if options.fitness_label == options.train_metric_label {
+        log::info!(
+            "  engine  fitness {} · mut_act {:.0}%",
+            options.fitness_label,
+            options.mutate_activ_prob * 100.0
+        );
+    } else {
+        log::info!(
+            "  engine  fitness {} · train_metric {} · mut_act {:.0}%",
+            options.fitness_label, options.train_metric_label,
+            options.mutate_activ_prob * 100.0
+        );
+    }
     log::info!("  engine  GP pool:  hidden {:?}", options.hidden_dim_pool);
     log::info!("  engine  GP pool:  combine {:?}", options.combine_op_pool);
     log::info!("  engine  GP pool:  activations {:?}", options.activation_pool);
@@ -137,22 +145,32 @@ pub(crate) fn log_run_start(options: &EngineOptions, run_dir: &Path, direction: 
         options.batch_size,
         options.num_threads,
     );
-    log::info!("  fitness {} ({better} = better)", options.fitness_label);
+    if options.fitness_label == options.train_metric_label {
+        log::info!("  fitness {} ({better} = better)", options.fitness_label);
+    } else {
+        log::info!("  fitness {} (↑ rank) · train_metric {} (↓ train)", options.fitness_label, options.train_metric_label);
+    }
     log::info!("  results_dir {}", run_dir.display());
 }
 
 // ── Best ───────────────────────────────────────────────────────────────────
 
 /// Log the current best individual after the generation loop.
-pub(crate) fn log_best(best: &Option<BestIndividual>, generation: usize) -> Result<(), EngineError> {
+pub(crate) fn log_best(best: &Option<BestIndividual>, generation: usize, fitness: &crate::fitness::Fitness) -> Result<(), EngineError> {
     log::info!("");
     log::info!("══ best ═════════════════════════════════════");
     if let Some(best) = best {
-        log::info!(
-            "  fitness {:.4} after {} gen(s)",
-            best.fitness,
-            generation
-        );
+        let fl = fitness.fitness_label();
+        let ll = fitness.train_metric_label();
+        if let Some(loss) = best.loss {
+            if fl == ll {
+                log::info!("  {} {:.4} after {} gen(s)", fl, best.fitness, generation);
+            } else {
+                log::info!("  fitness ({}) {:.4}  train_metric ({}) {:.4} after {} gen(s)", fl, best.fitness, ll, loss, generation);
+            }
+        } else {
+            log::info!("  {} {:.4} after {} gen(s)", fl, best.fitness, generation);
+        }
         let net = Network::build(&best.topology, Device::CPU)
             .map_err(|e| EngineError::Json(format!("best net build: {e}")))?;
         log::info!(
@@ -194,11 +212,24 @@ pub(crate) fn log_run_summary(
     log::info!("  gens        {generation} · pop {pop_len} · budget {}bt of {} · {} threads",
         options.num_batches, options.batch_size, options.num_threads);
     log::info!("  data        {}", data_path.display());
-    log::info!("  fitness     {} ({})", options.fitness_label,
-        match fitness.direction() {
-            Direction::Minimize => "lower = better",
-            Direction::Maximize => "higher = better",
-        });
+    if options.fitness_label == options.train_metric_label {
+        log::info!("  fitness     {} ({})", options.fitness_label,
+            match fitness.direction() {
+                Direction::Minimize => "lower = better",
+                Direction::Maximize => "higher = better",
+            });
+    } else {
+        log::info!("  fitness     {} ({}) · train_metric {} ({})", options.fitness_label,
+            match fitness.direction() {
+                Direction::Minimize => "lower = better",
+                Direction::Maximize => "higher = better",
+            },
+            options.train_metric_label,
+            match fitness.train_metric_direction() {
+                Direction::Minimize => "lower = better",
+                Direction::Maximize => "higher = better",
+            });
+    }
     log::info!("  training    {} epochs · lr {} · {}{}",
         options.training.num_epochs, options.training.learning_rate,
         options.training.optimizer,
@@ -217,7 +248,7 @@ pub(crate) fn log_run_summary(
     log::info!("  improvements {improvements}");
 
     if let Some(best) = best {
-        log_winner(best)?;
+        log_winner(best, fitness)?;
     }
 
     log::info!("");
@@ -232,7 +263,7 @@ pub(crate) fn log_run_summary(
 // ── Private helpers ────────────────────────────────────────────────────────
 
 /// Log the winning individual's characteristics.
-fn log_winner(best: &BestIndividual) -> Result<(), EngineError> {
+fn log_winner(best: &BestIndividual, fitness: &crate::fitness::Fitness) -> Result<(), EngineError> {
     let t = &best.topology;
     let dims = t.node_dims();
     let kc = t.kind_counts();
@@ -242,7 +273,17 @@ fn log_winner(best: &BestIndividual) -> Result<(), EngineError> {
     let total_elements: i64 = net.parameters().iter().map(|p| p.variable.numel()).sum();
 
     log::info!("");
-    log::info!("  winner      pop[{}] fitness {:.4}", best.pop_index, best.fitness);
+    let fl = fitness.fitness_label();
+    let ll = fitness.train_metric_label();
+    if let Some(loss) = best.loss {
+        if fl == ll {
+            log::info!("  winner      pop[{}] {} {:.4}", best.pop_index, fl, best.fitness);
+        } else {
+            log::info!("  winner      pop[{}] fitness ({}) {:.4}  train_metric ({}) {:.4}", best.pop_index, fl, best.fitness, ll, loss);
+        }
+    } else {
+        log::info!("  winner      pop[{}] {} {:.4}", best.pop_index, fl, best.fitness);
+    }
     log::info!("  winner      {} nodes ({} input · {} hidden · {} output) · {} wires",
         t.nodes.len(), kc.input, kc.hidden, kc.output, t.connections.len());
     log::info!("  winner      {total_elements} param elements · {} tensors", net.parameters().len());
