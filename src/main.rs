@@ -15,8 +15,11 @@
 //!   individual (the resolved `run_seed` is recorded in engine.json, so any
 //!   run is reproducible)
 //! • GP over BOTH layers — topology structure (port ranges, node counts)
-//!   AND network values (hidden dim, combine op, per-node activations),
-//!   sampled per individual from the pools in `EngineOptions`
+//!   AND network values (hidden dim, combine op, per-node activations,
+//!   per-node standardize), sampled per individual from the pools in
+//!   `EngineOptions`
+//! • variable hidden_dim — each hidden node draws its own output width from
+//!   the pool; port projections bridge mismatched dims automatically
 //! • deterministic weight init — the base seed is baked into both the
 //!   topology (blueprint) and the network options (weights), so same options
 //!   ⇒ the exact same built model and the exact same run
@@ -46,10 +49,8 @@ use std::io::Write;
 use flodl::Device;
 
 use gras::data;
-use gras::engine::{Engine, EngineOptions, Fitness};
+use gras::engine::{Engine, EngineOptions, Direction, Fitness};
 use gras::selection::SelectionMethod;
-use gras::node::Activation;
-use gras::topology::CombineOp;
 
 fn main() {
     // Initialize the logger — message only, no prefix (the engine owns the narrative).
@@ -73,7 +74,7 @@ fn main() {
     if !data_dir.exists() {
         println!("  data/mnist/train not found — generating synthetic MNIST-shaped data");
         println!("  (run `cargo run --example mnist_data` for real MNIST)");
-        let ds = data::synthetic_classification(256, 784, 10, 42, Device::CPU).unwrap();
+        let ds = data::synthetic_classification(1024, 784, 10, 42, Device::CPU).unwrap();
         data::save_dataset(data_dir, &ds).unwrap();
     }
 
@@ -83,34 +84,31 @@ fn main() {
     let opts = EngineOptions::builder()
         // ── Engine ────────────────────────────────────────────────────
         .set_seed(cli_seed.or(Some(16)))
-        .set_log_every_gens(1)
-        .set_num_threads(5)
+        .set_num_threads(1)
         .set_results_dir("results")
         // ── GP Algo (per-individual randomization) ───────────────────
-        .set_pop_size(10)
+        .set_pop_size(1000)
         .set_num_generations(1)
-        .set_mutate_activ_prob(0.05)
-        .set_selection(SelectionMethod::Tournament { tournament_size: 3 })
-        // ── GP pools (per-individual randomization) ───────────────────
-        .set_hidden_dim_pool(8..=16)
-        .set_combine_op_pool(vec![CombineOp::Add, CombineOp::Mean])
-        .set_activation_pool(vec![
-            Activation::Identity,
-            Activation::ReLU,
-            Activation::GeLU,
-            Activation::SELU,
-        ])
+        .set_mutate_activ_prob(0.0)
+        .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
+        // ── GP pools (per-node randomization) ────────────────────────
+        .set_hidden_dim_pool(8..=16)      // variable per-node output width
+        // ── GP pools: omit to use ALL built-in ops available ────────
+        // .set_combine_op_pool(vec![CombineOp::Add, CombineOp::Mean])
+        // .set_activation_pool(vec![Activation::ReLU, Activation::GeLU])
+        // .set_standardize_op_pool(vec![StandardizeOp::LayerNorm])
         // ── Topology (blueprint) ──────────────────────────────────────
-        .set_min_num_nodes(2)
-        .set_max_num_nodes(5)
-        .set_min_inputs_per_node(2)
-        .set_max_inputs_per_node(5)
-        .set_min_outputs_per_node(2)
-        .set_max_outputs_per_node(5)
+        .set_min_hidden_num_nodes(1)
+        .set_max_hidden_num_nodes(10)
+        .set_min_hidden_inputs_per_node(1)
+        .set_max_hidden_inputs_per_node(10)
+        .set_min_hidden_outputs_per_node(1)
+        .set_max_hidden_outputs_per_node(10)
         // ── Evaluation budget ─────────────────────────────────────────
         .set_num_batches(16) // 16 random batches per gen
         .set_batch_size(32) // 32 rows each → 512 rows total per gen
-        .set_num_epochs(3) // 3 passes over the batches per individual
+        .set_num_epochs(1) // if more than 1, sends same data as before (no shuffling)
+        // num_epochs defaults to 3 (training runs by default)
         // ── Training ──────────────────────────────────────────────────
         .set_learning_rate(1e-3)
         .set_optimizer(gras::trainer::OptimizerKind::Adam)
@@ -122,17 +120,14 @@ fn main() {
     // 3. Run — Engine::new seeds the population, engine.run() evaluates it.
     //    All output (options cascade, pop summary, fitness ranking, artifacts)
     //    is logged by the engine — this file is intentionally minimal.
-    // Cross-entropy is the canonical MNIST loss — for 10 classes,
-    // random guessing starts at ≈ 2.3 (ln 10).
-    //
-    // Equivalent custom fitness (same result as the built-in):
-    // use gras::fitness::Direction;
-    // let fitness = Fitness::loss_directed(
-    //     |pred, target| flodl::cross_entropy_loss(pred, target),
-    //     Direction::Minimize,
-    // );
-    let mut engine = Engine::new(opts, 
-        data_dir, 
-        Fitness::cross_entropy()).unwrap();
+    // Accuracy for ranking (↑), cross-entropy for training (↓).
+    let mut engine = Engine::new(
+        opts, data_dir,
+        Fitness::from_loss(
+            gras::fitness::cross_entropy_onehot_loss,
+            Direction::Minimize,
+            "cross_entropy",
+        )
+    ).unwrap();
     engine.run().unwrap();
 }
