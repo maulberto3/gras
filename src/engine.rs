@@ -9,7 +9,7 @@
 //! # Data contract
 //!
 //! The engine consumes data as a **path to tensors** written by
-//! [`crate::data::save_dataset`] — flodl-native data only. The dataset is
+//! [`crate::utils::data::save_dataset`] — flodl-native data only. The dataset is
 //! loaded once at [`Engine::new`] and reused for every individual, every
 //! generation.
 //!
@@ -32,9 +32,9 @@ use log::debug;
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::data::Dataset;
-use crate::error::EngineError;
-pub use crate::fitness::{Direction, Fitness, FitnessKind};
+use crate::utils::data::Dataset;
+use crate::utils::error::EngineError;
+pub use crate::fitness::{Direction, Fitness, FitnessLabel};
 use crate::network::{Network, NetworkOptions};
 use crate::node::{Activation, NodeKind};
 use crate::selection::SelectionMethod;
@@ -43,6 +43,8 @@ use crate::topology::{CombineOp, Topology, TopologyOptions};
 /// Knobs for one engine run. Serialized by [`Engine::to_json`] into the run
 /// folder's `engine.json`, so an experiment is fully reproducible.
 #[derive(Clone, Debug, PartialEq, Serialize)]
+// ── EngineOptions — the experiment configuration ──────────────────────────
+
 pub struct EngineOptions {
     /// Number of individuals in the population.
     pub pop_size: usize,
@@ -57,7 +59,7 @@ pub struct EngineOptions {
     /// single source of truth for the topology knobs (node/port ranges,
     /// dims, combine op). Each individual clones it and overrides only the
     /// `seed` (derived from the population base seed).
-    pub topology: TopologyOptions,
+    pub topology_options: TopologyOptions,
     /// **GP search space** — the hidden-dim range sampled **per individual**
     /// at population creation (`8..=8` = every individual uses the
     /// template's `hidden_dim`, the pre-GP behavior).
@@ -66,11 +68,12 @@ pub struct EngineOptions {
     /// at population creation (default `[Add]` = the template's
     /// `combine_op`).
     pub combine_op_pool: Vec<CombineOp>,
-    /// **GP search space** — the activation pool. Used twice: per-node
-    /// random activations at population creation
-    /// ([`Topology::randomize_activations`]) and, later, as the swap source
-    /// for the future `mutate` implementation.
+    /// **GP search space** — the activation pool. Sampled per-node at
+    /// population creation and, later, as the swap source for mutation.
     pub activation_pool: Vec<Activation>,
+    /// **GP search space** — the standardize-op pool. Per-node normalization
+    /// sampled at population creation (default `[Identity]`).
+    pub standardize_op_pool: Vec<crate::node::StandardizeOp>,
     /// **Evaluation budget** — how much of the data each candidate is scored
     /// on. Each generation picks `num_batches` non-overlapping batches of
     /// `batch_size` rows **without replacement**. The same batches are reused
@@ -82,17 +85,13 @@ pub struct EngineOptions {
     /// whole-dataset pass; default 128).
     pub batch_size: usize,
     /// Built-in scoring strategy recorded for reproducibility.
-    pub fitness: FitnessKind,
+    pub fitness_label: FitnessLabel,
     /// Threads for parallel population evaluation (`0` = rayon's default,
     /// i.e. available parallelism; default 3 to stay conservative on shared
     /// machines).
     pub num_threads: usize,
     /// Parent folder for per-run checkpoint folders (`results/<ts>/`).
     pub results_dir: PathBuf,
-    /// Log a per-generation summary line every N generations (default 1 =
-    /// every gen). The final results summary and improvement announcements
-    /// are always logged regardless of this setting.
-    pub log_every_gens: usize,
     /// Probability that an individual's **activation** is mutated each
     /// generation (0.0 = no activation mutation, the default). Each
     /// mutation picks one random hidden node and swaps its activation
@@ -118,16 +117,17 @@ impl Default for EngineOptions {
             pop_size: 10,
             num_generations: 5,
             seed: None, // random per run, recorded in engine.json
-            topology: TopologyOptions::default(),
-            hidden_dim_pool: 8..=8,
-            combine_op_pool: vec![CombineOp::Add],
-            activation_pool: vec![Activation::Identity, Activation::ReLU, Activation::GeLU],
+            topology_options: TopologyOptions::default(),
+            hidden_dim_pool: 4..=8,
+            combine_op_pool: vec![],   // empty → all built-in ops at build time
+            activation_pool: vec![],   // empty → all built-in activations at build time
+            standardize_op_pool: vec![], // empty → all built-in ops at build time
             num_batches: 16,
             batch_size: 128,
-            fitness: FitnessKind::Mse,
+            fitness_label: FitnessLabel::default(),
             num_threads: 3,
             results_dir: PathBuf::from("results"),
-            log_every_gens: 1,
+
             mutate_activ_prob: 0.0,
             training: crate::trainer::TrainingConfig::default(),
             selection: SelectionMethod::default(),
@@ -137,12 +137,12 @@ impl Default for EngineOptions {
 }
 
 impl EngineOptions {
-    /// The topology knobs for one individual: the shared template with the
-    /// individual's derived seed. Each population slot gets its own seed via
-    /// the deterministic chain, so the whole population is reproducible from
-    /// the base seed alone.
-    fn individual_options(&self, seed: usize) -> TopologyOptions {
-        let mut t = self.topology;
+    /// Derive topology options for one individual: clone the shared template
+    /// and override the seed with the individual's derived seed. Each
+    /// population slot gets its own seed via the deterministic chain, so the
+    /// whole population is reproducible from the base seed alone.
+    pub(crate) fn derive_topology_options(&self, seed: usize) -> TopologyOptions {
+        let mut t = self.topology_options;
         t.seed = seed;
         t
     }
@@ -151,7 +151,7 @@ impl EngineOptions {
     /// `engine.json` so the file spells out the full option chain
     /// (engine → topology → network).
     fn topology_template(&self) -> TopologyOptions {
-        self.topology
+        self.topology_options
     }
 
     /// Start a fluent builder chain — the ergonomic way to configure a run
@@ -161,10 +161,17 @@ impl EngineOptions {
     /// use gras::engine::{EngineOptions, Fitness};
     /// use gras::node::Activation;
     ///
+    /// // Minimal — all pools default to every built-in variant:
     /// let opts = EngineOptions::builder()
     ///     .set_pop_size(15)
     ///     .set_num_generations(3)
     ///     .set_hidden_dim_pool(8..=16)
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// // Narrow a pool to specific options:
+    /// let opts = EngineOptions::builder()
+    ///     .set_pop_size(15)
     ///     .set_activation_pool(vec![Activation::ReLU, Activation::GeLU])
     ///     .build()
     ///     .unwrap();
@@ -173,6 +180,10 @@ impl EngineOptions {
     /// The `set_*` methods are **flat**: each routes into the right layer
     /// (engine knobs, topology template, GP pools, network options), so
     /// callers never touch the nested structs unless they want to.
+    ///
+    /// **Pool defaults:** empty pools are auto-filled with all built-in
+    /// variants at `build()` time. Only call `set_*_pool()` to **narrow**
+    /// the search space.
     pub fn builder() -> EngineOptionsBuilder {
         EngineOptionsBuilder {
             inner: EngineOptions::default(),
@@ -182,9 +193,10 @@ impl EngineOptions {
 
 /// Fluent builder for [`EngineOptions`] — a flat `set_*` chain over the
 /// nested option structs. Start with [`EngineOptions::builder`], finish with
-/// [`build`](EngineOptionsBuilder::build) (validated options) or
-/// [`build_engine`](EngineOptionsBuilder::build_engine) (validated options +
-/// a ready [`Engine`]).
+/// [`build`](EngineOptionsBuilder::build) (validated options), then pass
+/// to [`Engine::new`] to start the run.
+// ── EngineOptionsBuilder — fluent builder ─────────────────────────────────
+
 pub struct EngineOptionsBuilder {
     inner: EngineOptions,
 }
@@ -193,8 +205,8 @@ impl EngineOptionsBuilder {
     /// Validate the accumulated options and hand them back. Checks the same
     /// invariants `Engine::new` relies on: non-empty population, valid
     /// evaluation budget, and non-empty GP pools.
-    pub fn build(self) -> Result<EngineOptions> {
-        let o = &self.inner;
+    pub fn build(mut self) -> Result<EngineOptions> {
+        let o = &mut self.inner;
         if o.pop_size == 0 {
             return Err(EngineError::InvalidOptions("pop_size must be > 0".into()).into());
         }
@@ -210,19 +222,35 @@ impl EngineOptionsBuilder {
             )
             .into());
         }
+        // Empty pools → fill with all built-in ops (no set_* = use everything).
         if o.combine_op_pool.is_empty() {
+            o.combine_op_pool = vec![
+                CombineOp::Add, CombineOp::Mean,
+                CombineOp::Max, CombineOp::Min,
+            ];
+        }
+        if o.activation_pool.is_empty() {
+            o.activation_pool = vec![
+                Activation::Identity, Activation::ReLU, Activation::GeLU,
+                Activation::SiLU, Activation::SELU, Activation::Tanh,
+                Activation::Sigmoid, Activation::Mish, Activation::LeakyReLU,
+                Activation::ELU, Activation::GeluTanh, Activation::Softplus,
+                Activation::HardSwish, Activation::HardSigmoid,
+            ];
+        }
+        if o.standardize_op_pool.is_empty() {
+            o.standardize_op_pool = vec![
+                crate::node::StandardizeOp::Identity,
+                crate::node::StandardizeOp::LayerNorm,
+            ];
+        }
+        if o.training.num_epochs == 0 {
             return Err(EngineError::InvalidOptions(
-                "combine_op_pool must contain at least one op".to_string(),
+                "num_epochs must be > 0 (set via set_num_epochs)".to_string(),
             )
             .into());
         }
         Ok(self.inner)
-    }
-
-    /// One-shot: validate the options and start an experiment from them
-    /// (equivalent to `Engine::new(builder.build()?, data_path, fitness)`).
-    pub fn build_engine(self, data_path: &Path, fitness: Fitness) -> Result<Engine> {
-        Engine::new(self.build()?, data_path, fitness)
     }
 
     // ── engine knobs ───────────────────────────────────────────────────────
@@ -246,13 +274,6 @@ impl EngineOptionsBuilder {
         self.inner.batch_size = n;
         self
     }
-    /// Set the whole evaluation budget at once: `num_batches` batches
-    /// of `batch_size` rows (0 batches = whole dataset once).
-    pub fn set_budget(mut self, num_batches: usize, batch_size: usize) -> Self {
-        self.inner.num_batches = num_batches;
-        self.inner.batch_size = batch_size;
-        self
-    }
     pub fn set_num_threads(mut self, n: usize) -> Self {
         self.inner.num_threads = n;
         self
@@ -261,10 +282,7 @@ impl EngineOptionsBuilder {
         self.inner.results_dir = p.into();
         self
     }
-    pub fn set_log_every_gens(mut self, n: usize) -> Self {
-        self.inner.log_every_gens = n.max(1);
-        self
-    }
+
     /// Probability each individual's activation is mutated per generation
     /// (0.0 = no activation mutation, 1.0 = mutate every individual).
     pub fn set_mutate_activ_prob(mut self, p: f64) -> Self {
@@ -296,19 +314,14 @@ impl EngineOptionsBuilder {
     }
 
     // ── topology template (the blueprint's structure knobs) ────────────────
-    pub fn set_topology(mut self, t: TopologyOptions) -> Self {
-        self.inner.topology = t;
+    pub fn set_topology_options(mut self, t: TopologyOptions) -> Self {
+        self.inner.topology_options = t;
         self
     }
     pub fn set_hidden_dim(mut self, n: usize) -> Self {
-        self.inner.topology.hidden_dim = n;
+        self.inner.topology_options.hidden_dim = n;
         self
     }
-    pub fn set_combine_op(mut self, op: CombineOp) -> Self {
-        self.inner.topology.combine_op = op;
-        self
-    }
-
     // ── GP search space: the pools the engine samples per individual ──────
     pub fn set_hidden_dim_pool(mut self, r: RangeInclusive<usize>) -> Self {
         self.inner.hidden_dim_pool = r;
@@ -322,30 +335,35 @@ impl EngineOptionsBuilder {
         self.inner.activation_pool = acts;
         self
     }
+    pub fn set_standardize_op_pool(mut self, ops: Vec<crate::node::StandardizeOp>) -> Self {
+        self.inner.standardize_op_pool = ops;
+        self
+    }
+
 
     // ── topology knobs (node/wire ranges) ───────────────────────────────
-    pub fn set_min_num_nodes(mut self, n: usize) -> Self {
-        self.inner.topology.min_num_nodes = n;
+    pub fn set_min_hidden_num_nodes(mut self, n: usize) -> Self {
+        self.inner.topology_options.min_hidden_num_nodes = n;
         self
     }
-    pub fn set_max_num_nodes(mut self, n: usize) -> Self {
-        self.inner.topology.max_num_nodes = n;
+    pub fn set_max_hidden_num_nodes(mut self, n: usize) -> Self {
+        self.inner.topology_options.max_hidden_num_nodes = n;
         self
     }
-    pub fn set_min_inputs_per_node(mut self, n: usize) -> Self {
-        self.inner.topology.min_inputs_per_node = n;
+    pub fn set_min_hidden_inputs_per_node(mut self, n: usize) -> Self {
+        self.inner.topology_options.min_hidden_inputs_per_node = n;
         self
     }
-    pub fn set_max_inputs_per_node(mut self, n: usize) -> Self {
-        self.inner.topology.max_inputs_per_node = n;
+    pub fn set_max_hidden_inputs_per_node(mut self, n: usize) -> Self {
+        self.inner.topology_options.max_hidden_inputs_per_node = n;
         self
     }
-    pub fn set_min_outputs_per_node(mut self, n: usize) -> Self {
-        self.inner.topology.min_outputs_per_node = n;
+    pub fn set_min_hidden_outputs_per_node(mut self, n: usize) -> Self {
+        self.inner.topology_options.min_hidden_outputs_per_node = n;
         self
     }
-    pub fn set_max_outputs_per_node(mut self, n: usize) -> Self {
-        self.inner.topology.max_outputs_per_node = n;
+    pub fn set_max_hidden_outputs_per_node(mut self, n: usize) -> Self {
+        self.inner.topology_options.max_hidden_outputs_per_node = n;
         self
     }
 
@@ -362,33 +380,27 @@ impl EngineOptionsBuilder {
         self.inner.network.dtype = d;
         self
     }
-    /// Deterministic weight init: `Some(seed)` → every network built from
-    /// the same options gets the exact same weights (same options ⇒ same
-    /// built model); `None` (default) → flodl's RNG, fresh weights per build.
-    pub fn set_init_seed(mut self, seed: Option<u64>) -> Self {
+    /// Deterministic weight init: every network built from the same
+    /// options gets the exact same weights (same seed ⇒ same built model).
+    pub fn set_init_seed(mut self, seed: usize) -> Self {
         self.inner.network.seed = seed;
         self
     }
 }
 
-/// The best individual seen so far.
-#[derive(Clone, Debug)]
-pub struct BestIndividual {
-    pub fitness: f64,
-    /// Index in the population (`pop[i]`) that produced this best.
-    pub pop_index: usize,
-    /// The blueprint that scored best — `to_json` it to replicate the net.
-    pub topology: Topology,
-}
+/// The best individual seen so far — re-exported from [`crate::fitness`].
+pub use crate::fitness::BestIndividual;
 
 /// A running NAS experiment. Build it with [`Engine::new`], run it with
 /// [`Engine::run`].
+// ── Engine — the NAS experiment runner ────────────────────────────────────
+
 pub struct Engine {
     pub options: EngineOptions,
-    /// The resolved population base seed — `options.seed` when given,
+        /// The resolved population base seed — `options.seed` when given,
     /// otherwise a fresh random seed derived at construction. Recorded in
     /// `engine.json` so even a randomized run is re-launchable.
-    pub run_seed: u64,
+    pub seed: u64,
     /// Unix timestamp identifying this run (also the checkpoint folder name).
     pub run_id: String,
     /// `results/<run_id>/` — the checkpoint path for this run. Fixed at
@@ -400,33 +412,36 @@ pub struct Engine {
     /// The population of blueprints (evolved in place by future genetics).
     pub pop: Vec<Topology>,
     /// The scorer (built-in or user closure).
-    pub fitness: Fitness,
+    pub(crate) fitness: Fitness,
     /// The dataset loaded from the user-provided path.
-    pub data: Dataset,
+    pub(crate) data: Dataset,
     /// The path the dataset was loaded from (recorded for reproducibility).
-    pub data_path: PathBuf,
+    pub(crate) data_path: PathBuf,
     /// Current generation (0-based; incremented by `next_generation`).
     pub generation: usize,
     /// Current best individual (updated whenever a run improves it).
     pub best: Option<BestIndividual>,
     /// How many best-improvements have been recorded into `improvements/`
     /// (also the next filename counter).
-    pub improvements: usize,
+    pub(crate) improvements: usize,
     /// Last generation's scores (for compact logging).
-    scores: Vec<f64>,
+    scores: Vec<f32>,
 }
 
 impl Engine {
+    // ── Construction ────────────────────────────────────────────────────────
+
     /// Start an experiment: load the dataset from `data_path` and seed a
     /// population of `options.pop_size` random graphs — each individual
     /// derives its seed from the base via a deterministic chain (see
-    /// [`Engine::run_seed`]), so the whole population is reproducible from
+    /// [`Engine::seed`]), so the whole population is reproducible from
     /// that seed alone. The checkpoint path `results/<ts>/` is fixed here,
     /// but the folder is only created on disk by [`Engine::run`].
     ///
     /// Auto-detects `input_dim` from the dataset (the single source of
     /// truth) and propagates it into the topology template.
     pub fn new(mut options: EngineOptions, data_path: &Path, fitness: Fitness) -> Result<Self> {
+        // ── validation ──────────────────────────────────────────────────
         if options.pop_size == 0 {
             return Err(EngineError::InvalidOptions("pop_size must be > 0".into()).into());
         }
@@ -442,9 +457,31 @@ impl Engine {
             )
             .into());
         }
+        // Empty pools → fill with all built-in ops (no set_* = use everything).
         if options.combine_op_pool.is_empty() {
+            options.combine_op_pool = vec![
+                CombineOp::Add, CombineOp::Mean,
+                CombineOp::Max, CombineOp::Min,
+            ];
+        }
+        if options.activation_pool.is_empty() {
+            options.activation_pool = vec![
+                Activation::Identity, Activation::ReLU, Activation::GeLU,
+                Activation::SiLU, Activation::SELU, Activation::Tanh,
+                Activation::Sigmoid, Activation::Mish, Activation::LeakyReLU,
+                Activation::ELU, Activation::GeluTanh, Activation::Softplus,
+                Activation::HardSwish, Activation::HardSigmoid,
+            ];
+        }
+        if options.standardize_op_pool.is_empty() {
+            options.standardize_op_pool = vec![
+                crate::node::StandardizeOp::Identity,
+                crate::node::StandardizeOp::LayerNorm,
+            ];
+        }
+        if options.training.num_epochs == 0 {
             return Err(EngineError::InvalidOptions(
-                "combine_op_pool must contain at least one op".to_string(),
+                "num_epochs must be > 0 (set via set_num_epochs)".to_string(),
             )
             .into());
         }
@@ -452,59 +489,42 @@ impl Engine {
             options.num_batches = 16;
         }
 
-        // 🎲 Resolve the population base seed: the user's, or a fresh random
-        // one (entropy) recorded in engine.json so the run is re-launchable.
-        let run_seed = options.seed.unwrap_or_else(|| {
+        // ── seed resolution ─────────────────────────────────────────────
+        let seed = options.seed.unwrap_or_else(|| {
             let t = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(0);
             t ^ fastrand::u64(..)
         });
-        // Bake the base seed into the topology template (blueprint) AND the
-        // network options (weight init), so engine.json spells out the exact
-        // chain base. Per individual, the build overrides the init seed with
-        // that individual's derived seed — same options ⇒ same built model.
-        options.topology.seed = run_seed as usize;
-        options.network.seed = Some(run_seed);
+        options.topology_options.seed = seed as usize;
+        options.network.seed = seed as usize;
 
-        // Data contract: tensors on disk, loaded once, normalized to f32
-        // (this crate's default precision).
-        let data = crate::data::load_dataset(data_path)?.to_f32()?;
-        // Auto-detect input_dim from the dataset — the single source of
-        // truth. The user never specifies this; the engine reads it from
-        // the data and propagates it into the topology template.
+        // ── data loading ────────────────────────────────────────────────
+        let data = crate::utils::data::load_dataset(data_path)?.to_dtype(options.network.dtype)?;
+        debug!("Engine::new — loaded dataset from {}: inputs {:?} targets {:?}", data_path.display(), data.inputs.shape(), data.targets.shape());
         let data_in = data.inputs.shape().get(1).copied().ok_or_else(|| {
             EngineError::DataMismatch("dataset inputs must be 2-D [n, input_dim]".into())
         })?;
-        options.topology.input_dim = data_in as usize;
-
-        // Auto-detect output_dim from the dataset targets — the single
-        // source of truth for the output projection (hidden_dim → output_dim).
+        options.topology_options.input_dim = data_in as usize;
         let data_out = data.targets.shape().get(1).copied().ok_or_else(|| {
             EngineError::DataMismatch("dataset targets must be 2-D [n, output_dim]".into())
         })?;
-        options.topology.output_dim = data_out as usize;
+        options.topology_options.output_dim = data_out as usize;
+        options.fitness_label = crate::fitness::FitnessLabel(fitness.label().to_string());
+        debug!("Engine::new — input_dim={} output_dim={} seed={} fitness={}", options.topology_options.input_dim, options.topology_options.output_dim, seed, fitness.label());
 
-        // Sync the serializable fitness config with the runtime scorer.
-        if let Some(kind) = fitness.kind() {
-            options.fitness = kind;
-        }
+        debug!("Engine::new — pools: hidden {:?} combine {} acts {} std {}", options.hidden_dim_pool, options.combine_op_pool.len(), options.activation_pool.len(), options.standardize_op_pool.len());
 
-        // Per-run checkpoint folder: results/<unix ts>/
-        // Milliseconds so two runs started within the same second still get
-        // distinct folders (a seconds-resolution id would make them collide).
+        // ── checkpoint path ─────────────────────────────────────────────
         let run_id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0)
             .to_string();
-        // The checkpoint **path** is fixed here; the folder itself is created
-        // on disk by [`Engine::run`] — constructing an engine never leaves
-        // artifacts behind.
         let run_dir = options.results_dir.join(&run_id);
 
-        // Thread pool for parallel evaluation (num_threads == 0 → auto).
+        // ── thread pool ─────────────────────────────────────────────────
         let threads = if options.num_threads > 0 {
             options.num_threads
         } else {
@@ -517,55 +537,17 @@ impl Engine {
             .build()
             .map_err(|e| EngineError::Rayon(e.to_string()))?;
 
-        // Population: random graphs through the standard pipeline (scaffold
-        // + wire + auto-de-orphan). Every individual derives its seed from
-        // the base via a deterministic chain (`derive_seed`), so the whole
-        // population is reproducible from `run_seed` alone — one seed seeds
-        // child seeds.
-        let mut pop = Vec::with_capacity(options.pop_size);
-        for i in 0..options.pop_size {
-            let ind_seed = derive_seed(run_seed, i);
-            let mut rng = fastrand::Rng::with_seed(ind_seed);
-            let n_hidden =
-                rng.usize(options.topology.min_num_nodes..=options.topology.max_num_nodes);
-            let mut ind_opts = options.individual_options(ind_seed as usize);
-            // 🎛️ GP: sample the per-individual architecture values from the
-            // pools — hidden dim, combine op, then per-node activations. All
-            // draws come from the derived seed chain, so the whole population
-            // (dims included) reproduces from `run_seed` alone.
-            ind_opts.hidden_dim = rng.usize(options.hidden_dim_pool.clone());
-            ind_opts.combine_op =
-                options.combine_op_pool[rng.usize(0..options.combine_op_pool.len())];
-            let mut graph = Topology::new(i, Some(ind_opts));
-            graph.create_random_hidden_nodes(n_hidden);
-            graph.randomize_activations(&options.activation_pool, &mut rng);
-            // 🎛️ GP per-node values: every hidden node gets its OWN combine
-            // op from the pool (combining never changes tensor width, so
-            // fan-in stays consistent). Activations are per-node too.
-            // Per-node hidden DIMS would break fan-in — a node merging
-            // sources of different widths is an invalid graph (the proper
-            // fix is per-source projections in `Network::build`, a future
-            // feature) — so dims stay per-individual for now.
-            for node in &mut graph.nodes {
-                if node.kind == NodeKind::Hidden {
-                    node.combine_op =
-                        Some(options.combine_op_pool[rng.usize(0..options.combine_op_pool.len())]);
-                }
-            }
-            graph.refresh_labels();
-            graph.finalize();
-            pop.push(graph);
-        }
+        // ── population ──────────────────────────────────────────────────
+        let pop = Self::create_population(&options, seed)?;
+        debug!("Engine::new — seeded {} individuals (base seed {})", pop.len(), seed);
 
-        crate::log_utils::log_options(&options);
+        crate::utils::log_utils::log_options(&options);
+        crate::utils::log_utils::log_dataset(&data, pop.len(), seed, fitness.direction());
+        crate::utils::log_utils::log_population(&pop, &options);
 
-        crate::log_utils::log_dataset(&data, pop.len(), run_seed, fitness.direction());
-
-        crate::log_utils::log_population(&pop, &options);
-
-        let engine = Engine {
+        Ok(Engine {
             options,
-            run_seed,
+            seed,
             run_id,
             run_dir,
             pool,
@@ -577,14 +559,55 @@ impl Engine {
             best: None,
             improvements: 0,
             scores: Vec::new(),
-        };
-        Ok(engine)
+        })
+    }
+
+    /// Create a population of random topologies. Each individual derives
+    /// its seed from the base via a deterministic chain, so the whole
+    /// population is reproducible from `run_seed` alone.
+    fn create_population(
+        options: &EngineOptions,
+        seed: u64,
+    ) -> Result<Vec<Topology>> {
+        debug!("create_population — pop_size={} min_hidden={}..={} base_seed={}",
+            options.pop_size, options.topology_options.min_hidden_num_nodes,
+            options.topology_options.max_hidden_num_nodes, seed);
+        let mut pop = Vec::with_capacity(options.pop_size);
+        for i in 0..options.pop_size {
+            let ind_seed = derive_seed(seed, i);
+            let mut rng = fastrand::Rng::with_seed(ind_seed);
+            let n_hidden =
+                rng.usize(options.topology_options.min_hidden_num_nodes..=options.topology_options.max_hidden_num_nodes);
+            let ind_opts = options.derive_topology_options(ind_seed as usize);
+            let mut graph = Topology::new(i, Some(ind_opts));
+            graph.create_random_hidden_nodes(n_hidden);
+            for node in &mut graph.nodes {
+                if node.kind == NodeKind::Hidden {
+                    node.hidden_dim =
+                        Some(rng.usize(options.hidden_dim_pool.clone()));
+                    node.activation =
+                        options.activation_pool[rng.usize(0..options.activation_pool.len())];
+                    node.combine_op =
+                        Some(options.combine_op_pool[rng.usize(0..options.combine_op_pool.len())]);
+                    node.standardize =
+                        Some(options.standardize_op_pool[rng.usize(0..options.standardize_op_pool.len())]);
+                }
+            }
+            graph.refresh_labels();
+            graph.finalize();
+            debug!("  ind[{i}] seed={} n_hidden={} nodes={} wires={} in_ports={}",
+                ind_seed, n_hidden, graph.nodes.len(), graph.connections.len(), graph.graph_inputs.len());
+            pop.push(graph);
+        }
+        Ok(pop)
     }
 
     /// The last generation's fitness scores, index-aligned with `pop`
     /// (`scores[i]` belongs to `pop[i]`). Empty until the first
     /// [`Engine::run`] evaluates the population.
-    pub fn scores(&self) -> &[f64] {
+    // ── Query ───────────────────────────────────────────────────────────────
+
+    pub fn scores(&self) -> &[f32] {
         &self.scores
     }
 
@@ -596,12 +619,18 @@ impl Engine {
     /// The per-run checkpoint folder is created **here**, not at
     /// [`Engine::new`] — building an engine (or inspecting its options)
     /// leaves nothing on disk; only an actual run does.
+    // ── Run — the main loop ─────────────────────────────────────────────────
+
     pub fn run(&mut self) -> Result<()> {
         fs::create_dir_all(&self.run_dir).map_err(|source| EngineError::Io {
             path: self.run_dir.display().to_string(),
             source,
         })?;
-        crate::log_utils::log_run_start(&self.options, &self.run_dir, self.fitness.direction());
+        debug!("run — starting {} gens with pop={} fitness={:?} run_dir={}",
+            self.options.num_generations, self.pop.len(), self.fitness.direction(), self.run_dir.display());
+        
+        crate::utils::log_utils::log_run_start(&self.options, &self.run_dir, self.fitness.direction());
+        
         // Initial experiment envelope (no best yet); the final one is
         // written after the loop.
         let initial = self.to_json()?;
@@ -609,11 +638,14 @@ impl Engine {
             path: self.run_dir.join("engine.json").display().to_string(),
             source,
         })?;
+        
         let run_start = Instant::now();
+        
         // TODO(engine): stop criteria beyond max generations — e.g. a
         // StopCriterion enum with TargetFitness (stop once the best crosses
         // a threshold) and NoImprovement (stop after N stagnant generations).
-        for _ in 0..self.options.num_generations {
+        for g in 0..self.options.num_generations {
+            debug!("══ gen {:02}/{:02} ══", g, self.options.num_generations);
             let _improved = self.evaluate_population()?;
             self.next_generation();
         }
@@ -624,12 +656,12 @@ impl Engine {
             source,
         })?;
 
-        crate::log_utils::log_best(&self.best, self.generation)?;
+        crate::utils::log_utils::log_best(&self.best, self.generation)?;
 
         // ══ Log: run summary ══════════════════════════════════════════
-        crate::log_utils::log_run_summary(
+        crate::utils::log_utils::log_run_summary(
             run_elapsed,
-            self.run_seed,
+            self.seed,
             self.generation,
             self.pop.len(),
             &self.options,
@@ -651,8 +683,10 @@ impl Engine {
         // re-seeded from `run_seed + generation` so each generation sees
         // fresh data deterministically.
         let mut rng =
-            fastrand::Rng::with_seed(self.run_seed.wrapping_add(self.generation as u64));
-        let batches = self.sample_batches(&mut rng)?;
+            fastrand::Rng::with_seed(self.seed.wrapping_add(self.generation as u64));
+        let (train_batches, eval_batches) = self.sample_batches_split(&mut rng)?;
+        debug!("  evaluate_population — gen {} train={} eval={}",
+            self.generation, train_batches.len(), eval_batches.len());
 
         // ⚡ Parallel evaluation: one rayon task per individual. The batches
         // are plain `Tensor` pairs (Tensor is Send + Sync); each task wraps
@@ -667,14 +701,14 @@ impl Engine {
         let done = std::sync::atomic::AtomicUsize::new(0);
         // Best-so-far tracker (score bits, atomic for lock-free updates).
         let best_bits =
-            std::sync::atomic::AtomicU64::new(f64::to_bits(if direction == Direction::Minimize {
-                f64::INFINITY
+            std::sync::atomic::AtomicU32::new(f32::to_bits(if direction == Direction::Minimize {
+                f32::INFINITY
             } else {
-                f64::NEG_INFINITY
+                f32::NEG_INFINITY
             }));
         let generation = self.generation;
         let progress_lock = std::sync::Mutex::new(());
-        let scores: Vec<f64> = self.pool.install(|| {
+        let scores: Vec<f32> = self.pool.install(|| {
             self.pop
                 .par_iter()
                 .map(|graph| {
@@ -682,23 +716,30 @@ impl Engine {
                     // drives its weight init, so a blueprint always scores
                     // identically (same run_seed ⇒ same scores ⇒ same run).
                     let mut no = net_opts;
-                    no.seed = Some(graph.options.seed as u64);
+                    no.seed = graph.options.seed;
+                    let node_hidden_dims: Vec<usize> = graph.nodes.iter()
+                        .filter_map(|n| n.hidden_dim).collect();
+                    debug!("    ind[{}] build: nodes={} seed={} node_dims={:?}",
+                        graph.id, graph.nodes.len(), no.seed, node_hidden_dims);
                     let mut net = Network::build_with_options(graph, &no)?;
 
                     // 🧠 Train (when train_epochs > 0).  Each thread gets
                     // its own Network + optimizer — no cross-thread sharing.
                     // The same fitness function drives backward + scoring.
-                    crate::trainer::train_network(&mut net, train_cfg, fitness, &batches)?;
+                    crate::trainer::train_network(&mut net, train_cfg, fitness, &train_batches)?;
+                    debug!("    ind[{}] trained: {} params, {} epochs × {} train batches",
+                        graph.id, net.parameters().len(), train_cfg.num_epochs, train_batches.len());
 
-                    // Score the (possibly trained) network.
+                    // Score on held-out eval batches (honest generalization).
                     let mut total = 0.0;
-                    for (xb, yb) in &batches {
+                    for (xb, yb) in &eval_batches {
                         let x = Variable::new(xb.clone(), false);
                         let y = Variable::new(yb.clone(), false);
                         let pred = net.forward(&x)?;
-                        total += self.fitness.evaluate(&pred, &y)?;
+                        total += self.fitness.score(&pred, &y)?;
                     }
-                    let score = total / batches.len() as f64;
+                    let score = if eval_batches.is_empty() { 0.0 } else { total / eval_batches.len() as f32 };
+                    debug!("    ind[{}] score={:.6}", graph.id, score);
 
                     // 📊 Progress: update best-so-far and print dynamic progress.
                     best_bits
@@ -706,7 +747,7 @@ impl Engine {
                             std::sync::atomic::Ordering::Relaxed,
                             std::sync::atomic::Ordering::Relaxed,
                             |bits| {
-                                if direction.is_better(score, f64::from_bits(bits)) {
+                                if direction.is_better(score, f32::from_bits(bits)) {
                                     Some(score.to_bits())
                                 } else {
                                     None
@@ -715,7 +756,7 @@ impl Engine {
                         )
                         .ok();
                     let cur_best =
-                        f64::from_bits(best_bits.load(std::sync::atomic::Ordering::Relaxed));
+                        f32::from_bits(best_bits.load(std::sync::atomic::Ordering::Relaxed));
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     // Dynamic progress: overwrite the same line with \r.
                     {
@@ -736,37 +777,34 @@ impl Engine {
         println!();
         self.scores = scores;
 
-        let mut best_idx: Option<(usize, f64)> = None;
-        for (i, s) in self.scores.iter().enumerate() {
-            if best_idx
-                .map(|(_, c)| direction.is_better(*s, c))
-                .unwrap_or(true)
-            {
-                best_idx = Some((i, *s));
-            }
-        }
-
-        if let Some((i, score)) = best_idx {
-            let improved = self
+        // Walk the scores: any individual that beats the running best
+        // is a new improvement, recorded immediately.
+        // Copy scores + topologies to avoid borrow conflicts with &mut self.
+        let snapshot: Vec<(usize, f32, Topology)> = self.scores.iter().enumerate()
+            .map(|(i, &s)| (i, s, self.pop[i].clone()))
+            .collect();
+        let mut any_improved = false;
+        for (i, score, topo) in snapshot {
+            let beats_best = self
                 .best
                 .as_ref()
                 .map(|b| direction.is_better(score, b.fitness))
                 .unwrap_or(true);
-            if improved {
+            if beats_best {
                 self.best = Some(BestIndividual {
                     fitness: score,
                     pop_index: i,
-                    topology: self.pop[i].clone(),
+                    topology: topo,
                 });
                 log::info!(
                     "🏆 new best: pop[{i}] fitness {score:.4} at gen {}",
                     self.generation
                 );
                 self.record_improvement()?;
-                return Ok(true);
+                any_improved = true;
             }
         }
-        Ok(false)
+        Ok(any_improved)
     }
 
     /// Sample the per-generation evaluation budget: `num_batches` batches
@@ -778,44 +816,50 @@ impl Engine {
     ///   batches. Every individual sees the same batches.
     /// - Budget > dataset: exhaust all rows (shuffled), produce as many
     ///   full batches as possible, warn, and continue to the next gen.
-    fn sample_batches(&self, rng: &mut fastrand::Rng) -> Result<Vec<(Tensor, Tensor)>> {
+    // ── Batch sampling ──────────────────────────────────────────────────────
+
+    /// Split shuffled indices into non-overlapping train + eval batches.
+    fn sample_batches_split(
+        &self, rng: &mut fastrand::Rng,
+    ) -> Result<(Vec<(Tensor, Tensor)>, Vec<(Tensor, Tensor)>)> {
         let n = self.data.inputs.shape()[0] as usize;
         let bs = self.options.batch_size;
         let total = self.options.num_batches;
-        let max_full = n / bs; // complete batches the dataset can yield
+        let max_full = n / bs;
+        let actual = total.min(max_full).max(1);
 
-        // Shuffle all row indices once — Fisher-Yates.
         let mut all_idx: Vec<i64> = (0..n as i64).collect();
         for i in (1..all_idx.len()).rev() {
             let j = rng.usize(0..=i);
             all_idx.swap(i, j);
         }
 
-        // How many batches can we actually produce?
-        let actual = if total <= max_full {
-            // Budget fits — pick `total` batches from the shuffled pool.
-            total
-        } else {
-            // Budget exceeds dataset — exhaust what we have.
-            log::info!(
-                "  ⚠ requested {total} batches × {bs} rows = {} \
-                 but dataset has only {n} rows — using {max_full} batches (no duplicates)",
-                total * bs
-            );
-            max_full.max(1) // at least 1 batch even if dataset < batch_size
+        // Split: first half = train, second half = eval (no overlap).
+        let train_count = (actual / 2).max(1);
+        let eval_count = (actual - train_count).max(1);
+
+        let make_batch = |start: usize, count: usize| -> Result<Vec<(Tensor, Tensor)>> {
+            let mut batches = Vec::with_capacity(count);
+            for b in 0..count {
+                let s = start + b * bs;
+                let e = (s + bs).min(n);
+                if s >= e { break; }
+                let idx: Vec<i64> = all_idx[s..e].to_vec();
+                let idx_t = Tensor::from_i64(&idx, &[idx.len() as i64], Device::CPU)?;
+                let xb = self.data.inputs.index_select(0, &idx_t)?;
+                let yb = self.data.targets.index_select(0, &idx_t)?;
+                batches.push((xb, yb));
+            }
+            Ok(batches)
         };
 
-        let mut batches = Vec::with_capacity(actual);
-        for b in 0..actual {
-            let start = b * bs;
-            let end = (start + bs).min(n);
-            let idx: Vec<i64> = all_idx[start..end].to_vec();
-            let idx_t = Tensor::from_i64(&idx, &[idx.len() as i64], Device::CPU)?;
-            let xb = self.data.inputs.index_select(0, &idx_t)?;
-            let yb = self.data.targets.index_select(0, &idx_t)?;
-            batches.push((xb, yb));
-        }
-        Ok(batches)
+        let train_batches = make_batch(0, train_count)?;
+        let eval_batches = make_batch(train_count * bs, eval_count)?;
+        // When dataset is too small to split, eval falls back to train data.
+        let eval_batches = if eval_batches.is_empty() { train_batches.clone() } else { eval_batches };
+        debug!("  sample_batches_split — train={} eval={} (from {} total)",
+            train_batches.len(), eval_batches.len(), actual);
+        Ok((train_batches, eval_batches))
     }
 
     /// Append the current best to `run_dir/improvements/` — the evolution
@@ -823,6 +867,8 @@ impl Engine {
     /// (`Topology::from_json` + `Network::build` replicates the net),
     /// so the trail reads top-down and the latest entry is the current best.
     ///   `{counter:04}_gen{gen:02}_fitness{fit:.4}.json`          (recipe)
+    // ── Improvement tracking ────────────────────────────────────────────────
+
     fn record_improvement(&mut self) -> Result<()> {
         let Some(b) = &self.best else { return Ok(()) };
         let dir = self.run_dir.join("improvements");
@@ -830,38 +876,46 @@ impl Engine {
             path: dir.display().to_string(),
             source,
         })?;
+
         // Recipe: the blueprint, exact round-trip.
         let json = b
             .topology
             .to_json()
             .map_err(|e| EngineError::Json(format!("improvement json: {e}")))?;
+       
+        // Filename: 0000_gen00_fitness0.1234.json
         let name = format!(
             "{:04}_gen{:02}_fitness{:.4}.json",
             self.improvements, self.generation, b.fitness
         );
+        
+        // Write the recipe to disk.
         let path = dir.join(&name);
         fs::write(&path, json).map_err(|source| EngineError::Io {
             path: path.display().to_string(),
             source,
         })?;
+        
         // Markdown visualization: tables + wiring diagram.
         let md_name = name.replace(".json", ".md");
         let md_path = dir.join(&md_name);
-        let mut md = crate::ascii_utils::topology_markdown(&b.topology, Some(b.fitness));
-        if let Ok(net) = Network::build(&b.topology, Device::CPU) {
-            md.push_str("\n");
-            md.push_str(&crate::ascii_utils::network_markdown(&net));
-        }
+        let net = Network::build(&b.topology, Device::CPU).ok();
+        let md = crate::utils::ascii_utils::topology_markdown(&b.topology, Some(b.fitness), net.as_ref());
         fs::write(&md_path, md).map_err(|source| EngineError::Io {
             path: md_path.display().to_string(),
             source,
         })?;
+        debug!("record_improvement — saved #{:04} gen={} fitness={:.4} → {}",
+            self.improvements, self.generation, b.fitness, path.display());
         self.improvements += 1;
         Ok(())
     }
 
     /// Advance one generation: select → crossover → mutate → generation += 1.
+    // ── Genetics — selection, crossover, mutation ────────────────────────────
+
     fn next_generation(&mut self) {
+        debug!("next_generation — gen {} → {}", self.generation, self.generation + 1);
         self.select();
         self.crossover();
         self.mutate();
@@ -877,14 +931,14 @@ impl Engine {
             return;
         }
         let dir = self.fitness.direction();
-        let mut rng = fastrand::Rng::with_seed(self.run_seed + self.generation as u64 + 0xCAFE);
+        let mut rng = fastrand::Rng::with_seed(self.seed + self.generation as u64 + 0xCAFE);
         let indices = match self.options.selection {
             crate::selection::SelectionMethod::Tournament { tournament_size } => {
                 crate::selection::select(&self.scores, dir, &mut rng, tournament_size)
             }
         };
         let new_pop: Vec<Topology> = indices.iter().map(|&i| self.pop[i].clone()).collect();
-        let new_scores: Vec<f64> = indices.iter().map(|&i| self.scores[i]).collect();
+        let new_scores: Vec<f32> = indices.iter().map(|&i| self.scores[i]).collect();
         self.pop = new_pop;
         self.scores = new_scores;
         // Summarize selection: who survived and who was culled.
@@ -917,7 +971,7 @@ impl Engine {
         if self.options.mutate_activ_prob <= 0.0 || self.options.activation_pool.len() < 2 {
             return;
         }
-        let mut rng = fastrand::Rng::with_seed(self.run_seed + self.generation as u64 + 0xBEEF);
+        let mut rng = fastrand::Rng::with_seed(self.seed + self.generation as u64 + 0xBEEF);
         for graph in &mut self.pop {
             if rng.f64() >= self.options.mutate_activ_prob {
                 continue;
@@ -944,7 +998,7 @@ impl Engine {
                 }
             };
             graph.nodes[idx].activation = new_act;
-            debug!("  ==> A Mutation happened: graph {} node {} activation changed from {:?} to {:?}", graph.id, idx, cur, new_act);
+            debug!("  ==> A Mutation happened: graph {} node {} activation changed from {} to {}", graph.id, idx, cur, new_act);
         }
     }
 
@@ -955,6 +1009,8 @@ impl Engine {
     /// `Network::build` to recreate the best net) and the **best network
     /// facts** (`Network::to_json` — what that build produced, so the file
     /// is self-describing without running code).
+    // ── Serialization ───────────────────────────────────────────────────────
+
     pub fn to_json(&self) -> Result<String> {
         let best_topology = match &self.best {
             Some(b) => Some(
@@ -967,7 +1023,7 @@ impl Engine {
         let best_net_facts = match &self.best {
             Some(b) => {
                 let mut no = self.options.network;
-                no.seed = Some(b.topology.options.seed as u64);
+                no.seed = b.topology.options.seed;
                 let net = Network::build_with_options(&b.topology, &no)
                     .map_err(|e| EngineError::Json(format!("best net facts build: {e}")))?;
                 Some(
@@ -979,7 +1035,7 @@ impl Engine {
         };
         let spec = serde_json::json!({
             "run_id": self.run_id,
-            "run_seed": self.run_seed,
+            "run_seed": self.seed,
             "data_path": self.data_path.display().to_string(),
             "generation": self.generation,
             "pop_size": self.pop.len(),
@@ -995,14 +1051,10 @@ impl Engine {
 }
 
 /// Deterministic child-seed derivation: one population base seed chains into
-/// every individual's seed (and their wiring/n_hidden draws), so the whole
-/// population is reproducible from `run_seed` alone. SplitMix64 finalizer
-/// over `base` mixed with `i` — no extra crate, stable across runs.
-fn derive_seed(base: u64, i: usize) -> u64 {
-    let mut z = base.wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+/// every individual's seed, so the whole population is reproducible from
+/// `run_seed` alone. Multiply by the golden ratio for spread.
+pub(crate) fn derive_seed(base: u64, i: usize) -> u64 {
+    base.wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
 #[cfg(test)]
@@ -1014,8 +1066,8 @@ mod tests {
 
     fn temp_data_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gras_engine_test_{}", fastrand::u64(..)));
-        let ds = crate::synthetic::synthetic_sine(64, 42, Device::CPU).unwrap();
-        crate::data::save_dataset(&dir, &ds).unwrap();
+        let ds = crate::utils::synthetic::synthetic_sine(64, 42, Device::CPU).unwrap();
+        crate::utils::data::save_dataset(&dir, &ds).unwrap();
         dir
     }
 
@@ -1023,13 +1075,17 @@ mod tests {
         EngineOptions {
             pop_size: 3,
             num_generations: 2,
-            topology: TopologyOptions {
+            topology_options: TopologyOptions {
                 hidden_dim: 4,
                 ..Default::default()
             },
             hidden_dim_pool: 4..=4, // fixed: every individual uses the template dim
             results_dir: std::env::temp_dir()
                 .join(format!("gras_engine_res_{}", fastrand::u64(..))),
+            training: crate::trainer::TrainingConfig {
+                num_epochs: 1,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -1037,7 +1093,7 @@ mod tests {
     #[test]
     fn test_engine_runs_and_checkpoints() {
         let data_dir = temp_data_dir();
-        let mut engine = Engine::new(test_options(), &data_dir, Fitness::mse()).unwrap();
+        let mut engine = Engine::new(test_options(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
         engine.run().unwrap();
 
         // Run folder: the improvement history + the final envelope only
@@ -1084,7 +1140,7 @@ mod tests {
     #[test]
     fn test_engine_to_json_replicates_experiment() {
         let data_dir = temp_data_dir();
-        let mut engine = Engine::new(test_options(), &data_dir, Fitness::mse()).unwrap();
+        let mut engine = Engine::new(test_options(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
         engine.run().unwrap();
 
         let json = engine.to_json().unwrap();
@@ -1092,17 +1148,17 @@ mod tests {
         assert_eq!(v["run_id"], engine.run_id);
         assert_eq!(v["pop_size"], 3);
         assert_eq!(v["options"]["pop_size"], 3);
-        assert_eq!(v["options"]["topology"]["hidden_dim"], 4);
-        assert_eq!(v["options"]["fitness"], "Mse");
+        assert_eq!(v["options"]["topology_options"]["hidden_dim"], 4);
+        assert_eq!(v["options"]["fitness_label"], "loss");
         assert_eq!(v["data_path"], data_dir.display().to_string());
         assert!(v["best_fitness"].is_number());
         // The resolved base seed is recorded for re-launchability.
-        assert_eq!(v["run_seed"], engine.run_seed);
+        assert_eq!(v["run_seed"], engine.seed);
         // The topology template + materialized net facts ride along, so the
         // file spells out the full option chain and the best's nutrition.
         assert_eq!(v["topology_options"]["input_dim"], 1);
         assert_eq!(v["topology_options"]["hidden_dim"], 4);
-        assert_eq!(v["topology_options"]["seed"], engine.run_seed);
+        assert_eq!(v["topology_options"]["seed"], engine.seed);
         // best_net_facts is a nested JSON doc (like best_topology) — parse
         // it and check the materialized-net nutrition label is present.
         let facts: serde_json::Value =
@@ -1122,7 +1178,7 @@ mod tests {
         let data_dir = temp_data_dir();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls2 = calls.clone();
-        let fitness = Fitness::loss_fn(move |pred, y| {
+        let fitness = Fitness::from_loss(move |pred, y| {
             calls2.fetch_add(1, Ordering::SeqCst);
             // Same math as the built-in Mse, proving the drop-in path.
             mse_loss(pred, y) // Variable — backward + .item() both work
@@ -1130,10 +1186,17 @@ mod tests {
         let opts = test_options();
         let mut engine = Engine::new(opts.clone(), &data_dir, fitness).unwrap();
         engine.run().unwrap();
+        // Each individual calls the fitness: num_batches (scoring) +
+        // num_epochs * num_batches (training). With test_options defaults:
+        // num_batches=16 on 64-row dataset with batch_size=128 → 1 batch;
+        // num_epochs=1 → 1 training + 1 scoring = 2 per individual.
+        let actual_batches = 1usize; // 64 rows / 128 batch_size → 1
+        // With train/eval split: train=1, eval=1 (fallback to train for tiny datasets)
+        let expected_per_individual = opts.training.num_epochs * actual_batches + actual_batches;
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            opts.pop_size * opts.num_generations,
-            "custom fitness must run once per individual per generation"
+            opts.pop_size * opts.num_generations * expected_per_individual,
+            "custom fitness must be called for each batch (scoring + training) per individual"
         );
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&opts.results_dir);
@@ -1145,14 +1208,14 @@ mod tests {
         // Set input_dim to something different — the engine should
         // override it from the dataset shape.
         let opts = EngineOptions {
-            topology: TopologyOptions {
+            topology_options: TopologyOptions {
                 input_dim: 999, // wrong — engine will auto-detect
                 ..Default::default()
             },
             ..test_options()
         };
-        let engine = Engine::new(opts, &data_dir, Fitness::mse()).unwrap();
-        assert_eq!(engine.options.topology.input_dim, 1); // sine dataset
+        let engine = Engine::new(opts, &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        assert_eq!(engine.options.topology_options.input_dim, 1); // sine dataset
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
@@ -1163,7 +1226,7 @@ mod tests {
         // uses both (prediction and target) to prove the minimal signature
         // is ergonomic — no network, no data plumbing.
         let data_dir = temp_data_dir();
-        let fitness = Fitness::loss_fn(|pred, y| {
+        let fitness = Fitness::from_loss(|pred, y| {
             flodl::l1_loss(pred, y) // MAE as Variable
         });
         let opts = EngineOptions {
@@ -1184,7 +1247,7 @@ mod tests {
         let data_dir = temp_data_dir();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls2 = calls.clone();
-        let fitness = Fitness::loss_fn(move |pred, y| {
+        let fitness = Fitness::from_loss(move |pred, y| {
             calls2.fetch_add(1, Ordering::SeqCst);
             mse_loss(pred, y) // Variable
         });
@@ -1197,10 +1260,13 @@ mod tests {
         };
         let mut engine = Engine::new(opts.clone(), &data_dir, fitness).unwrap();
         engine.run().unwrap();
+        // With train/eval split: train gets half, eval gets half.
+        let train_count = (opts.num_batches / 2).max(1);
+        let eval_count = (opts.num_batches - train_count).max(1);
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            opts.pop_size * opts.num_generations * opts.num_batches,
-            "batched evaluation must score one batch at a time"
+            opts.pop_size * opts.num_generations * (train_count * opts.training.num_epochs + eval_count),
+            "fitness must be called for train batches (loss) + eval batches (score) per individual"
         );
         let fitness = engine.best.as_ref().expect("best must exist").fitness;
         assert!(fitness.is_finite());
@@ -1217,7 +1283,7 @@ mod tests {
             batch_size: 0,
             ..test_options()
         };
-        assert!(Engine::new(bad, &data_dir, Fitness::mse()).is_err());
+        assert!(Engine::new(bad, &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).is_err());
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -1232,7 +1298,7 @@ mod tests {
             batch_size: 8,
             ..test_options()
         };
-        let mut engine = Engine::new(opts.clone(), &data_dir, Fitness::mse()).unwrap();
+        let mut engine = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
         engine.run().unwrap();
         let v: serde_json::Value = serde_json::from_str(&engine.to_json().unwrap()).unwrap();
         assert_eq!(v["options"]["num_batches"], 4);
@@ -1250,16 +1316,14 @@ mod tests {
         // forward outputs, the scores vary across individuals.
         let data_dir = temp_data_dir();
         let make_scorer = |dir: Direction| {
-            Fitness::loss_directed(
+            Fitness::new(
                 move |pred, _target| {
                     let vec = pred.data().to_f32_vec().unwrap();
                     let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                    Ok(flodl::Variable::new(
-                        flodl::Tensor::from_f32(&[mean], &[1], Device::CPU).unwrap(),
-                        false,
-                    ))
+                    Ok(mean)
                 },
                 dir,
+                "custom",
             )
         };
         let opts = EngineOptions {
@@ -1271,7 +1335,6 @@ mod tests {
         // Maximize: best fitness >= all individual fitnesses.
         let mut eng =
             Engine::new(opts.clone(), &data_dir, make_scorer(Direction::Maximize)).unwrap();
-        let max_best = eng.best.as_ref().map(|b| b.fitness);
         eng.run().unwrap();
         let max_best = eng.best.as_ref().unwrap().fitness;
         // Minimize on the same population picks the smallest value.
@@ -1302,7 +1365,8 @@ mod tests {
             .set_hidden_dim_pool(8..=32)
             .set_combine_op_pool(vec![CombineOp::Add, CombineOp::Mean])
             .set_activation_pool(vec![Activation::ReLU, Activation::GeLU])
-            .set_budget(4, 32)
+            .set_num_batches(4)
+            .set_batch_size(32)
             .set_num_threads(2)
             .set_dtype(DType::Float32)
             .build()
@@ -1310,8 +1374,8 @@ mod tests {
         assert_eq!(opts.pop_size, 15);
         assert_eq!(opts.num_generations, 3);
         assert_eq!(opts.seed, Some(42));
-        assert_eq!(opts.topology.input_dim, 1);
-        assert_eq!(opts.topology.hidden_dim, 16);
+        assert_eq!(opts.topology_options.input_dim, 1);
+        assert_eq!(opts.topology_options.hidden_dim, 16);
         assert_eq!(opts.hidden_dim_pool, 8..=32);
         assert_eq!(opts.combine_op_pool, vec![CombineOp::Add, CombineOp::Mean]);
         assert_eq!(opts.num_batches, 4);
@@ -1327,12 +1391,11 @@ mod tests {
                 .build()
                 .is_err()
         );
-        assert!(
-            EngineOptions::builder()
-                .set_combine_op_pool(vec![])
-                .build()
-                .is_err()
-        );
+        // Empty pools auto-fill with all built-in ops (no error).
+        let opts = EngineOptions::builder().set_combine_op_pool(vec![]).build().unwrap();
+        assert_eq!(opts.combine_op_pool.len(), 4); // all CombineOp variants
+        let opts = EngineOptions::builder().set_activation_pool(vec![]).build().unwrap();
+        assert_eq!(opts.activation_pool.len(), 14); // all Activation variants
         // An empty range (start > end) is rejected too.
         assert!(
             EngineOptions::builder()
@@ -1343,16 +1406,17 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_builder_build_engine_one_shot() {
-        // build_engine = validated options + Engine::new in one call.
+    fn test_engine_builder_one_shot() {
+        // build() + Engine::new in two calls.
         let data_dir = temp_data_dir();
-        let mut engine = EngineOptions::builder()
+        let opts = EngineOptions::builder()
             .set_pop_size(4)
             .set_num_generations(1)
             .set_seed(Some(7))
             .set_hidden_dim_pool(4..=4)
-            .build_engine(&data_dir, Fitness::mse())
+            .build()
             .unwrap();
+        let mut engine = Engine::new(opts, &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
         engine.run().unwrap();
         assert!(engine.best.is_some());
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -1382,19 +1446,31 @@ mod tests {
             ..test_options()
         };
 
-        let a = Engine::new(make_opts(), &data_dir, Fitness::mse()).unwrap();
-        let b = Engine::new(make_opts(), &data_dir, Fitness::mse()).unwrap();
+        let a = Engine::new(make_opts(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let b = Engine::new(make_opts(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
 
-        // 1. The population actually varies: not all individuals share one
+        // 1. The population actually varies: not all nodes share one
         //    hidden dim, one combine op, or one activation profile.
-        let mut dims: Vec<usize> = a.pop.iter().map(|g| g.options.hidden_dim).collect();
+        let mut dims: Vec<usize> = Vec::new();
+        for g in &a.pop {
+            for n in &g.nodes {
+                if let Some(d) = n.hidden_dim {
+                    if !dims.contains(&d) {
+                        dims.push(d);
+                    }
+                }
+            }
+        }
         dims.sort_unstable();
-        dims.dedup();
         assert!(dims.len() > 1, "hidden dims must vary: {dims:?}");
         let mut combines: Vec<CombineOp> = Vec::new();
         for g in &a.pop {
-            if !combines.contains(&g.options.combine_op) {
-                combines.push(g.options.combine_op);
+            for n in &g.nodes {
+                if let Some(op) = n.combine_op {
+                    if !combines.contains(&op) {
+                        combines.push(op);
+                    }
+                }
             }
         }
         assert!(combines.len() > 1, "combine ops must vary: {combines:?}");
@@ -1437,7 +1513,7 @@ mod tests {
         // only appears when run() is actually called.
         let data_dir = temp_data_dir();
         let opts = test_options();
-        let engine = Engine::new(opts.clone(), &data_dir, Fitness::mse()).unwrap();
+        let engine = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
         assert!(
             !engine.run_dir.exists(),
             "Engine::new must not create the run folder — only run() does"
@@ -1461,15 +1537,15 @@ mod tests {
             num_threads: 4,
             ..test_options()
         };
-        let mut engine = Engine::new(opts.clone(), &data_dir, Fitness::mse()).unwrap();
+        let mut engine = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
         engine.run().unwrap();
         let v: serde_json::Value = serde_json::from_str(&engine.to_json().unwrap()).unwrap();
-        assert_eq!(v["run_seed"], engine.run_seed);
-        assert_eq!(v["topology_options"]["seed"], engine.run_seed);
+        assert_eq!(v["run_seed"], engine.seed);
+        assert_eq!(v["topology_options"]["seed"], engine.seed);
         assert_eq!(v["options"]["seed"], serde_json::Value::Null);
         // And a second randomized launch derives a different base seed.
-        let other = Engine::new(opts.clone(), &data_dir, Fitness::mse()).unwrap();
-        assert_ne!(other.run_seed, engine.run_seed);
+        let other = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        assert_ne!(other.seed, engine.seed);
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&opts.results_dir);
     }
@@ -1485,8 +1561,8 @@ mod tests {
             num_threads: 3, // determinism holds even in parallel (local RNGs)
             ..test_options()
         };
-        let mut a = Engine::new(make(), &data_dir, Fitness::mse()).unwrap();
-        let mut b = Engine::new(make(), &data_dir, Fitness::mse()).unwrap();
+        let mut a = Engine::new(make(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let mut b = Engine::new(make(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
         a.run().unwrap();
         b.run().unwrap();
         let ba = a.best.as_ref().unwrap();
@@ -1502,7 +1578,7 @@ mod tests {
         );
         // The base init seed is baked into the network options like the
         // topology seed — and recorded in engine.json.
-        assert_eq!(a.options.network.seed, Some(123));
+        assert_eq!(a.options.network.seed, 123);
         let v: serde_json::Value = serde_json::from_str(&a.to_json().unwrap()).unwrap();
         assert_eq!(v["options"]["network"]["seed"], 123);
         let _ = std::fs::remove_dir_all(&data_dir);
