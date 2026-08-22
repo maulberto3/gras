@@ -114,8 +114,8 @@ pub fn train_network(
             let y = Variable::new(yb.clone(), false);
 
             let pred = net.forward(&x)?;
-            // fitness.loss() returns the differentiable training loss.
-            let loss = fitness.loss(&pred, &y)?;
+            // fitness.train_metric() returns the differentiable training signal.
+            let loss = fitness.train_metric(&pred, &y)?;
             // Ensure the loss is trackable — custom closures may return
             // Variables with requires_grad=false.
             loss.set_requires_grad(true)?;
