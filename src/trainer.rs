@@ -12,11 +12,11 @@
 //! engine.evaluate_population()
 //!   └─ rayon task (per individual)
 //!        ├─ Network::build_from_topology(graph)
-//!        ├─ train_network(&mut net, config, &batches)   ← this module
+//!        ├─ train_network(&mut net, config, &train_batches)  ← this module
 //!        │     for epoch in 0..config.num_epochs:
-//!        │       for (x, y) in batches:
-//!        │         forward → loss → backward → clip → step
-//!        └─ fitness.evaluate(&net.forward(x), &y)        ← back in engine
+//!        │       for (x, y) in train_batches:
+//!        │         forward → fitness.loss() → backward → clip → step
+//!        └─ fitness.score(&net.forward(x), &y) on eval_batches  ← back in engine
 //! ```
 
 use flodl::Variable;
@@ -24,6 +24,7 @@ use flodl::nn::Module;
 use flodl::nn::optim::Optimizer;
 use flodl::tensor::Result;
 use flodl::{Adam, SGD};
+use log::debug;
 
 use crate::network::Network;
 
@@ -59,7 +60,7 @@ impl Default for TrainingConfig {
         TrainingConfig {
             optimizer: OptimizerKind::Adam,
             learning_rate: 1e-3,
-            num_epochs: 0,
+            num_epochs: 1,
             grad_clip: 0.0,
         }
     }
@@ -69,15 +70,14 @@ impl Default for TrainingConfig {
 
 /// Train a network on the given batches in-place.
 ///
-/// When `config.num_epochs == 0` this is a no-op (random-init forward pass,
-/// the current behavior).  Otherwise runs the standard training loop:
+/// Runs the standard training loop for `config.num_epochs` epochs:
 ///
 /// ```text
 /// for epoch in 0..num_epochs:
 ///     for (x, y) in batches:
 ///         x = Variable::new(x, true)   // track gradients
 ///         pred = net.forward(&x)
-///         loss = fitness.compute_loss(pred, y)  ← same loss for backward + scoring
+///         loss = fitness.loss(pred, y)  ← differentiable training loss for backward
 ///         optimizer.zero_grad()
 ///         loss.backward()
 ///         clip_grad_norm(params, max_norm)  // if > 0
@@ -94,10 +94,11 @@ pub fn train_network(
 ) -> Result<()> {
     if config.num_epochs == 0 || batches.is_empty() {
         return Ok(());
-    }
-
-    net.train();
+    }    net.train();
     let params = net.parameters();
+    debug!("  train_network — {} epochs × {} batches, optimizer={:?} lr={} params={}",
+        config.num_epochs, batches.len(), config.optimizer, config.learning_rate, params.len());
+
 
     // Build optimizer from the trained network's parameters.
     let mut optimizer: Box<dyn Optimizer> = match config.optimizer {
@@ -105,16 +106,19 @@ pub fn train_network(
         OptimizerKind::Adam => Box::new(Adam::new(&params, config.learning_rate)),
     };
 
-    for _epoch in 0..config.num_epochs {
+    for epoch in 0..config.num_epochs {
+        debug!("    epoch {}/{}", epoch + 1, config.num_epochs);
         for (xb, yb) in batches {
             // Variables with track=true so backward can accumulate grads.
             let x = Variable::new(xb.clone(), true);
             let y = Variable::new(yb.clone(), false);
 
             let pred = net.forward(&x)?;
-            // The same fitness function drives backward — no separate
-            // loss config; the user's Fitness IS the training signal.
-            let loss = fitness.compute_loss(&pred, &y)?;
+            // fitness.loss() returns the differentiable training loss.
+            let loss = fitness.loss(&pred, &y)?;
+            // Ensure the loss is trackable — custom closures may return
+            // Variables with requires_grad=false.
+            loss.set_requires_grad(true)?;
 
             optimizer.zero_grad();
             loss.backward()?;
