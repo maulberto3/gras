@@ -40,7 +40,7 @@ impl Default for SelectionMethod {
 /// - Empty `scores` → empty result.
 /// - `tournament` is clamped to at least 1.
 pub fn select(
-    scores: &[f64],
+    scores: &[f32],
     direction: Direction,
     rng: &mut fastrand::Rng,
     tournament: usize,
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn test_select_tournament_trends_toward_best() {
         // With a large tournament size, the best should win most slots.
-        let scores: Vec<f64> = (0..8).map(|i| i as f64).collect();
+        let scores: Vec<f32> = (0..8).map(|i| i as f32).collect();
         let mut rng = fastrand::Rng::with_seed(3);
         let chosen = select(&scores, Direction::Maximize, &mut rng, 8);
         // Best (index 7) kept by elitism.
@@ -134,7 +134,7 @@ mod tests {
             tournament in 1usize..6,
         ) {
             let mut rng = fastrand::Rng::with_seed(seed);
-            let scores: Vec<f64> = (0..n).map(|i| (i as f64) * 0.5 - 2.0).collect();
+            let scores: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 2.0).collect();
             let dir = if maximize { Direction::Maximize } else { Direction::Minimize };
             let chosen = select(&scores, dir, &mut rng, tournament);
             prop_assert_eq!(chosen.len(), n);
