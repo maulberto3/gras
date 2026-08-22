@@ -84,8 +84,10 @@ pub struct EngineOptions {
     /// Rows per batch (used both for sampled batches and for chunking the
     /// whole-dataset pass; default 128).
     pub batch_size: usize,
-    /// Built-in scoring strategy recorded for reproducibility.
+    /// Scoring strategy label recorded for reproducibility.
     pub fitness_label: FitnessLabel,
+    /// Train metric label recorded for reproducibility.
+    pub train_metric_label: FitnessLabel,
     /// Threads for parallel population evaluation (`0` = rayon's default,
     /// i.e. available parallelism; default 3 to stay conservative on shared
     /// machines).
@@ -125,6 +127,7 @@ impl Default for EngineOptions {
             num_batches: 16,
             batch_size: 128,
             fitness_label: FitnessLabel::default(),
+            train_metric_label: FitnessLabel::default(),
             num_threads: 3,
             results_dir: PathBuf::from("results"),
 
@@ -426,6 +429,9 @@ pub struct Engine {
     pub(crate) improvements: usize,
     /// Last generation's scores (for compact logging).
     scores: Vec<f32>,
+    /// Last generation's eval losses (parallel to scores; None when Fitness
+    /// has no explicit loss).
+    eval_losses: Vec<Option<f32>>,
 }
 
 impl Engine {
@@ -511,8 +517,9 @@ impl Engine {
             EngineError::DataMismatch("dataset targets must be 2-D [n, output_dim]".into())
         })?;
         options.topology_options.output_dim = data_out as usize;
-        options.fitness_label = crate::fitness::FitnessLabel(fitness.label().to_string());
-        debug!("Engine::new — input_dim={} output_dim={} seed={} fitness={}", options.topology_options.input_dim, options.topology_options.output_dim, seed, fitness.label());
+        options.fitness_label = crate::fitness::FitnessLabel(fitness.fitness_label().to_string());
+        options.train_metric_label = crate::fitness::FitnessLabel(fitness.train_metric_label().to_string());
+        debug!("Engine::new — input_dim={} output_dim={} seed={} fitness={}", options.topology_options.input_dim, options.topology_options.output_dim, seed, fitness.fitness_label());
 
         debug!("Engine::new — pools: hidden {:?} combine {} acts {} std {}", options.hidden_dim_pool, options.combine_op_pool.len(), options.activation_pool.len(), options.standardize_op_pool.len());
 
@@ -559,6 +566,7 @@ impl Engine {
             best: None,
             improvements: 0,
             scores: Vec::new(),
+            eval_losses: Vec::new(),
         })
     }
 
@@ -656,7 +664,7 @@ impl Engine {
             source,
         })?;
 
-        crate::utils::log_utils::log_best(&self.best, self.generation)?;
+        crate::utils::log_utils::log_best(&self.best, self.generation, &self.fitness)?;
 
         // ══ Log: run summary ══════════════════════════════════════════
         crate::utils::log_utils::log_run_summary(
@@ -708,7 +716,7 @@ impl Engine {
             }));
         let generation = self.generation;
         let progress_lock = std::sync::Mutex::new(());
-        let scores: Vec<f32> = self.pool.install(|| {
+        let pairs: Vec<(f32, Option<f32>)> = self.pool.install(|| {
             self.pop
                 .par_iter()
                 .map(|graph| {
@@ -730,16 +738,21 @@ impl Engine {
                     debug!("    ind[{}] trained: {} params, {} epochs × {} train batches",
                         graph.id, net.parameters().len(), train_cfg.num_epochs, train_batches.len());
 
-                    // Score on held-out eval batches (honest generalization).
-                    let mut total = 0.0;
+                    // Score + loss on held-out eval batches (honest generalization).
+                    let mut score_total = 0.0;
+                    let mut loss_total = 0.0f32;
                     for (xb, yb) in &eval_batches {
                         let x = Variable::new(xb.clone(), false);
                         let y = Variable::new(yb.clone(), false);
                         let pred = net.forward(&x)?;
-                        total += self.fitness.score(&pred, &y)?;
+                        score_total += self.fitness.score(&pred, &y)?;
+                        loss_total += self.fitness.train_metric(&pred, &y)?.item()? as f32;
                     }
-                    let score = if eval_batches.is_empty() { 0.0 } else { total / eval_batches.len() as f32 };
-                    debug!("    ind[{}] score={:.6}", graph.id, score);
+                    let n_eval = eval_batches.len() as f32;
+                    let score = if n_eval == 0.0 { 0.0 } else { score_total / n_eval };
+                    // Loss is always computed; store as None only when dataset is empty.
+                    let loss = if n_eval > 0.0 { Some(loss_total / n_eval) } else { None };
+                    debug!("    ind[{}] score={:.6} loss={:?}", graph.id, score, loss);
 
                     // 📊 Progress: update best-so-far and print dynamic progress.
                     best_bits
@@ -769,22 +782,23 @@ impl Engine {
                         std::io::stdout().flush().unwrap();
                     }
 
-                    Ok(score)
+                    Ok((score, loss))
                 })
                 .collect::<Result<Vec<_>>>()
         })?;
         // Move past the progress line before the generation summary.
         println!();
-        self.scores = scores;
+        self.scores = pairs.iter().map(|&(s, _)| s).collect();
+        self.eval_losses = pairs.iter().map(|&(_, l)| l).collect();
 
         // Walk the scores: any individual that beats the running best
         // is a new improvement, recorded immediately.
         // Copy scores + topologies to avoid borrow conflicts with &mut self.
-        let snapshot: Vec<(usize, f32, Topology)> = self.scores.iter().enumerate()
-            .map(|(i, &s)| (i, s, self.pop[i].clone()))
+        let snapshot: Vec<(usize, f32, Option<f32>, Topology)> = self.scores.iter().enumerate()
+            .map(|(i, &s)| (i, s, self.eval_losses.get(i).copied().flatten(), self.pop[i].clone()))
             .collect();
         let mut any_improved = false;
-        for (i, score, topo) in snapshot {
+        for (i, score, loss, topo) in snapshot {
             let beats_best = self
                 .best
                 .as_ref()
@@ -793,13 +807,30 @@ impl Engine {
             if beats_best {
                 self.best = Some(BestIndividual {
                     fitness: score,
+                    loss,
                     pop_index: i,
                     topology: topo,
                 });
-                log::info!(
-                    "🏆 new best: pop[{i}] fitness {score:.4} at gen {}",
-                    self.generation
-                );
+                let fl = self.fitness.fitness_label();
+                let ll = self.fitness.train_metric_label();
+                if let Some(loss) = loss {
+                    if fl == ll {
+                        log::info!(
+                            "🏆 new best: pop[{i}] {fl} {score:.4} at gen {}",
+                            self.generation
+                        );
+                    } else {
+                        log::info!(
+                            "🏆 new best: pop[{i}] fitness ({fl}) {score:.4} train_metric ({ll}) {loss:.4} at gen {}",
+                            self.generation
+                        );
+                    }
+                } else {
+                    log::info!(
+                        "🏆 new best: pop[{i}] {fl} {score:.4} at gen {}",
+                        self.generation
+                    );
+                }
                 self.record_improvement()?;
                 any_improved = true;
             }
@@ -1042,6 +1073,7 @@ impl Engine {
             "options": &self.options,
             "topology_options": self.options.topology_template(),
             "best_fitness": self.best.as_ref().map(|b| b.fitness),
+            "best_loss": self.best.as_ref().and_then(|b| b.loss),
             "best_topology": best_topology,
             "best_net_facts": best_net_facts,
         });
@@ -1093,7 +1125,7 @@ mod tests {
     #[test]
     fn test_engine_runs_and_checkpoints() {
         let data_dir = temp_data_dir();
-        let mut engine = Engine::new(test_options(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let mut engine = Engine::new(test_options(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
         engine.run().unwrap();
 
         // Run folder: the improvement history + the final envelope only
@@ -1140,7 +1172,7 @@ mod tests {
     #[test]
     fn test_engine_to_json_replicates_experiment() {
         let data_dir = temp_data_dir();
-        let mut engine = Engine::new(test_options(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let mut engine = Engine::new(test_options(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
         engine.run().unwrap();
 
         let json = engine.to_json().unwrap();
@@ -1149,7 +1181,8 @@ mod tests {
         assert_eq!(v["pop_size"], 3);
         assert_eq!(v["options"]["pop_size"], 3);
         assert_eq!(v["options"]["topology_options"]["hidden_dim"], 4);
-        assert_eq!(v["options"]["fitness_label"], "loss");
+        assert_eq!(v["options"]["fitness_label"], "mse");
+        assert_eq!(v["options"]["train_metric_label"], "mse");
         assert_eq!(v["data_path"], data_dir.display().to_string());
         assert!(v["best_fitness"].is_number());
         // The resolved base seed is recorded for re-launchability.
@@ -1180,9 +1213,8 @@ mod tests {
         let calls2 = calls.clone();
         let fitness = Fitness::from_loss(move |pred, y| {
             calls2.fetch_add(1, Ordering::SeqCst);
-            // Same math as the built-in Mse, proving the drop-in path.
-            mse_loss(pred, y) // Variable — backward + .item() both work
-        });
+            mse_loss(pred, y)
+        }, Direction::Minimize, "mse");
         let opts = test_options();
         let mut engine = Engine::new(opts.clone(), &data_dir, fitness).unwrap();
         engine.run().unwrap();
@@ -1191,12 +1223,13 @@ mod tests {
         // num_batches=16 on 64-row dataset with batch_size=128 → 1 batch;
         // num_epochs=1 → 1 training + 1 scoring = 2 per individual.
         let actual_batches = 1usize; // 64 rows / 128 batch_size → 1
-        // With train/eval split: train=1, eval=1 (fallback to train for tiny datasets)
-        let expected_per_individual = opts.training.num_epochs * actual_batches + actual_batches;
+        // With train/eval split: train=1, eval=1 (fallback to train for tiny datasets).
+        // from_loss has explicit loss → eval calls score() + loss() = 2× eval.
+        let expected_per_individual = opts.training.num_epochs * actual_batches + 2 * actual_batches;
         assert_eq!(
             calls.load(Ordering::SeqCst),
             opts.pop_size * opts.num_generations * expected_per_individual,
-            "custom fitness must be called for each batch (scoring + training) per individual"
+            "custom fitness must be called for each batch (scoring + loss on eval, training on train) per individual"
         );
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&opts.results_dir);
@@ -1214,7 +1247,7 @@ mod tests {
             },
             ..test_options()
         };
-        let engine = Engine::new(opts, &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let engine = Engine::new(opts, &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
         assert_eq!(engine.options.topology_options.input_dim, 1); // sine dataset
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -1227,8 +1260,8 @@ mod tests {
         // is ergonomic — no network, no data plumbing.
         let data_dir = temp_data_dir();
         let fitness = Fitness::from_loss(|pred, y| {
-            flodl::l1_loss(pred, y) // MAE as Variable
-        });
+            flodl::l1_loss(pred, y)
+        }, Direction::Minimize, "l1");
         let opts = EngineOptions {
             num_generations: 1,
             ..test_options()
@@ -1249,8 +1282,8 @@ mod tests {
         let calls2 = calls.clone();
         let fitness = Fitness::from_loss(move |pred, y| {
             calls2.fetch_add(1, Ordering::SeqCst);
-            mse_loss(pred, y) // Variable
-        });
+            mse_loss(pred, y)
+        }, Direction::Minimize, "mse");
         let opts = EngineOptions {
             pop_size: 3,
             num_generations: 2,
@@ -1263,10 +1296,12 @@ mod tests {
         // With train/eval split: train gets half, eval gets half.
         let train_count = (opts.num_batches / 2).max(1);
         let eval_count = (opts.num_batches - train_count).max(1);
+        // from_loss has explicit loss → eval batches call score() + loss() = 2× eval.
+        let eval_multiplier = 2; // score + loss on each eval batch
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            opts.pop_size * opts.num_generations * (train_count * opts.training.num_epochs + eval_count),
-            "fitness must be called for train batches (loss) + eval batches (score) per individual"
+            opts.pop_size * opts.num_generations * (train_count * opts.training.num_epochs + eval_count * eval_multiplier),
+            "fitness called for train (loss) + eval (score + loss) per individual"
         );
         let fitness = engine.best.as_ref().expect("best must exist").fitness;
         assert!(fitness.is_finite());
@@ -1283,7 +1318,7 @@ mod tests {
             batch_size: 0,
             ..test_options()
         };
-        assert!(Engine::new(bad, &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).is_err());
+        assert!(Engine::new(bad, &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).is_err());
 
         let _ = std::fs::remove_dir_all(&data_dir);
     }
@@ -1298,7 +1333,7 @@ mod tests {
             batch_size: 8,
             ..test_options()
         };
-        let mut engine = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let mut engine = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
         engine.run().unwrap();
         let v: serde_json::Value = serde_json::from_str(&engine.to_json().unwrap()).unwrap();
         assert_eq!(v["options"]["num_batches"], 4);
@@ -1316,11 +1351,12 @@ mod tests {
         // forward outputs, the scores vary across individuals.
         let data_dir = temp_data_dir();
         let make_scorer = |dir: Direction| {
-            Fitness::new(
+            Fitness::from_loss(
                 move |pred, _target| {
                     let vec = pred.data().to_f32_vec().unwrap();
                     let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                    Ok(mean)
+                    let t = flodl::Tensor::from_f32(&[mean], &[1], flodl::Device::CPU).unwrap();
+                    Ok(Variable::new(t, false))
                 },
                 dir,
                 "custom",
@@ -1416,7 +1452,7 @@ mod tests {
             .set_hidden_dim_pool(4..=4)
             .build()
             .unwrap();
-        let mut engine = Engine::new(opts, &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let mut engine = Engine::new(opts, &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
         engine.run().unwrap();
         assert!(engine.best.is_some());
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -1446,8 +1482,8 @@ mod tests {
             ..test_options()
         };
 
-        let a = Engine::new(make_opts(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
-        let b = Engine::new(make_opts(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let a = Engine::new(make_opts(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
+        let b = Engine::new(make_opts(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
 
         // 1. The population actually varies: not all nodes share one
         //    hidden dim, one combine op, or one activation profile.
@@ -1513,7 +1549,7 @@ mod tests {
         // only appears when run() is actually called.
         let data_dir = temp_data_dir();
         let opts = test_options();
-        let engine = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let engine = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
         assert!(
             !engine.run_dir.exists(),
             "Engine::new must not create the run folder — only run() does"
@@ -1537,14 +1573,14 @@ mod tests {
             num_threads: 4,
             ..test_options()
         };
-        let mut engine = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let mut engine = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
         engine.run().unwrap();
         let v: serde_json::Value = serde_json::from_str(&engine.to_json().unwrap()).unwrap();
         assert_eq!(v["run_seed"], engine.seed);
         assert_eq!(v["topology_options"]["seed"], engine.seed);
         assert_eq!(v["options"]["seed"], serde_json::Value::Null);
         // And a second randomized launch derives a different base seed.
-        let other = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let other = Engine::new(opts.clone(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
         assert_ne!(other.seed, engine.seed);
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&opts.results_dir);
@@ -1561,8 +1597,8 @@ mod tests {
             num_threads: 3, // determinism holds even in parallel (local RNGs)
             ..test_options()
         };
-        let mut a = Engine::new(make(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
-        let mut b = Engine::new(make(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y))).unwrap();
+        let mut a = Engine::new(make(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
+        let mut b = Engine::new(make(), &data_dir, Fitness::from_loss(|p, y| flodl::nn::loss::mse_loss(p, y), Direction::Minimize, "mse")).unwrap();
         a.run().unwrap();
         b.run().unwrap();
         let ba = a.best.as_ref().unwrap();
