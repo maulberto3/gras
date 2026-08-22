@@ -64,86 +64,73 @@ impl Direction {
 
 // ── Fitness — the scoring + training interface ────────────────────────────
 
-/// The fitness/loss interface — separates **scoring** (ranking individuals)
+/// The fitness interface — separates **scoring** (ranking individuals)
 /// from **training** (backward pass). The engine calls `score()` on held-out
-/// data to rank, and `loss()` on training data to update weights.
+/// data to rank, and `train_metric()` on training data to update weights.
 ///
 /// ```text
-/// Fitness::new(score_fn)                       ← loss defaults to MSE
-/// Fitness::new_with_loss(score_fn, loss_fn)    ← explicit training loss
+/// Fitness::from_loss(f)                        ← same function for both
+/// Fitness::from_loss_with_other(score, train_metric, ...) ← separate
 /// ```
+///
+/// **The user must always provide an explicit train metric.** The engine
+/// cannot guess the right training signal for different output formats
+/// (regression, binary, multi-class, etc.).
 pub struct Fitness {
     /// The ranking metric — `(pred, target) → f32` score.
     /// Called on **eval** batches to rank individuals.
     score_fn: Box<dyn Fn(&Variable, &Variable) -> Result<f32> + Send + Sync>,
-    /// The training loss — `(pred, target) → Variable` for backward.
-    /// If None, defaults to MSE loss.
-    loss_fn: Option<Box<dyn Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync>>,
+    /// The training metric — `(pred, target) → Variable` for backward.
+    /// Always required — the engine cannot guess the right signal for different
+    /// output formats (regression, binary, multi-class, etc.).
+    train_metric_fn: Box<dyn Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync>,
     /// Which direction is better for the **score** (ranking individuals).
     score_direction: Direction,
-    /// Which direction is better for the **loss** (training signal).
-    /// Always Minimize in practice (backward minimizes), but explicit
-    /// here for API clarity and logging.
-    loss_direction: Direction,
-    /// Human label for logs (e.g. "accuracy", "mse").
-    label: String,
+    /// Which direction is better for the **train metric** (training signal).
+    train_metric_direction: Direction,
+    /// Label for the fitness/scoring function (e.g. "accuracy", "r2").
+    fitness_label: String,
+    /// Label for the train metric (e.g. "cross_entropy", "mse").
+    train_metric_label: String,
 }
 
 impl Fitness {
-    /// Create a fitness with a scoring function. The training loss defaults
-    /// to MSE when `loss()` is called.
+    // TODO(fitness): separate ranking + training when multi-objective selection
+    // is implemented (Pareto or weighted). The tension: evolution ranks on
+    // fitness (e.g. accuracy) but training minimizes a differentiable loss
+    // (e.g. cross-entropy). Without multi-objective selection, the two can
+    // drift apart — evolution picks nets that don't train well, or training
+    // improves the loss but not the fitness. Implementing this requires either
+    // Pareto-dominance selection or a weighted scalar projection.
+    //
+    // pub fn from_loss_with_other<S, L>(
+    //     score_fn: S,
+    //     train_metric_fn: L,
+    //     score_direction: Direction,
+    //     train_metric_direction: Direction,
+    //     fitness_label: &str,
+    //     train_metric_label: &str,
+    // ) -> Self
+    // where
+    //     S: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
+    //     L: Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync + 'static,
+    // {
+    //     Fitness {
+    //         score_fn: Box::new(score_fn),
+    //         train_metric_fn: Box::new(train_metric_fn),
+    //         score_direction,
+    //         train_metric_direction,
+    //         fitness_label: fitness_label.to_string(),
+    //         train_metric_label: train_metric_label.to_string(),
+    //     }
+    // }
+
+    /// Same function for both scoring and training.
     ///
     /// ```text
-    /// Fitness::new(|pred, y| accuracy(pred, y))
-    /// // ranking: accuracy (↑ higher is better)
-    /// // training: MSE (↓ lower is better)
+    /// Fitness::from_loss(|pred, y| mse_loss(pred, y), Direction::Minimize, "mse")
     /// ```
-    pub fn new<F>(score_fn: F, score_direction: Direction, label: &str) -> Self
-    where
-        F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
-    {
-        Fitness {
-            score_fn: Box::new(score_fn),
-            loss_fn: None,
-            score_direction,
-            loss_direction: Direction::Minimize, // MSE default, always minimize
-            label: label.to_string(),
-        }
-    }
-
-    /// Create a fitness with both a scoring function and a training loss.
-    ///
-    /// ```text
-    /// Fitness::new_with_loss(
-    ///     |pred, y| accuracy(pred, y),           // ranking metric
-    ///     |pred, y| cross_entropy(pred, y),       // training loss
-    ///     Direction::Maximize,
-    ///     "accuracy",
-    /// )
-    /// ```
-    pub fn new_with_loss<S, L>(
-        score_fn: S,
-        loss_fn: L,
-        score_direction: Direction,
-        loss_direction: Direction,
-        label: &str,
-    ) -> Self
-    where
-        S: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
-        L: Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync + 'static,
-    {
-        Fitness {
-            score_fn: Box::new(score_fn),
-            loss_fn: Some(Box::new(loss_fn)),
-            score_direction,
-            loss_direction,
-            label: label.to_string(),
-        }
-    }
-
-    /// Convenience: same function for both scoring and loss (returns Variable,
-    /// score = `.item()`). Direction defaults to Minimize.
-    pub fn from_loss<F>(f: F) -> Self
+    pub fn from_loss<F>(f: F, direction: Direction, label: &str) -> Self
     where
         F: Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync + 'static,
     {
@@ -153,10 +140,11 @@ impl Fitness {
             score_fn: Box::new(move |pred, y| {
                 Ok(f(pred, y)?.item()? as f32)
             }),
-            loss_fn: Some(Box::new(move |pred, y| f2(pred, y))),
-            score_direction: Direction::Minimize,
-            loss_direction: Direction::Minimize,
-            label: "loss".to_string(),
+            train_metric_fn: Box::new(move |pred, y| f2(pred, y)),
+            score_direction: direction,
+            train_metric_direction: direction,
+            fitness_label: label.to_string(),
+            train_metric_label: label.to_string(),
         }
     }
 
@@ -166,13 +154,9 @@ impl Fitness {
         (self.score_fn)(pred, target)
     }
 
-    /// Compute the loss tensor — used for backward (training).
-    /// If no explicit loss was provided, defaults to MSE.
-    pub fn loss(&self, pred: &Variable, target: &Variable) -> Result<Variable> {
-        match &self.loss_fn {
-            Some(f) => f(pred, target),
-            None => flodl::nn::loss::mse_loss(pred, target),
-        }
+    /// Compute the training metric tensor — used for backward (training).
+    pub fn train_metric(&self, pred: &Variable, target: &Variable) -> Result<Variable> {
+        (self.train_metric_fn)(pred, target)
     }
 
     /// Which direction is better for the **score** (ranking individuals).
@@ -180,14 +164,24 @@ impl Fitness {
         self.score_direction
     }
 
-    /// Which direction is better for the **loss** (training signal).
-    pub fn loss_direction(&self) -> Direction {
-        self.loss_direction
+    /// Which direction is better for the **train metric** (training signal).
+    pub fn train_metric_direction(&self) -> Direction {
+        self.train_metric_direction
     }
 
-    /// Human label for logs.
-    pub fn label(&self) -> &str {
-        &self.label
+    /// Fitness/scoring label for logs.
+    pub fn fitness_label(&self) -> &str {
+        &self.fitness_label
+    }
+
+    /// Train metric label for logs.
+    pub fn train_metric_label(&self) -> &str {
+        &self.train_metric_label
+    }
+
+    /// Whether fitness and train metric use the same function.
+    pub fn train_metric_is_fitness(&self) -> bool {
+        self.fitness_label == self.train_metric_label
     }
 }
 
@@ -338,6 +332,8 @@ pub fn cross_entropy_onehot_loss(pred: &Variable, y: &Variable) -> Result<Variab
 #[derive(Clone, Debug)]
 pub struct BestIndividual {
     pub fitness: f32,
+    /// Loss on eval batches (only when Fitness has an explicit loss).
+    pub loss: Option<f32>,
     /// Index in the population (`pop[i]`) that produced this best.
     pub pop_index: usize,
     /// The blueprint that scored best — `to_json` it to replicate the net.
@@ -400,7 +396,7 @@ mod tests {
 
     #[test]
     fn test_fitness_from_loss() {
-        let f = Fitness::from_loss(|pred, y| flodl::nn::loss::mse_loss(pred, y));
+        let f = Fitness::from_loss(|pred, y| flodl::nn::loss::mse_loss(pred, y), Direction::Minimize, "mse");
         let net = tiny_net();
         let x = input(&[1.0, 2.0, 3.0]);
         let y = input(&[1.0, 2.0, 3.0]);
@@ -409,34 +405,25 @@ mod tests {
         assert!(score.is_finite());
         assert!(score >= 0.0);
         assert_eq!(f.direction(), Direction::Minimize);
-        // loss() and score() should agree (score = loss.item())
-        let loss_t = f.loss(&pred, &y).unwrap();
-        let loss_v = loss_t.item().unwrap() as f32;
-        assert!((score - loss_v).abs() < 1e-6);
+        // train_metric() and score() should agree (score = train_metric.item())
+        let tm = f.train_metric(&pred, &y).unwrap();
+        let tm_v = tm.item().unwrap() as f32;
+        assert!((score - tm_v).abs() < 1e-6);
     }
 
-    #[test]
-    fn test_fitness_new_with_loss() {
-        let f = Fitness::new_with_loss(
-            accuracy_score,
-            |pred, y| flodl::nn::loss::mse_loss(pred, y),
-            Direction::Maximize,  // score: accuracy
-            Direction::Minimize,  // loss: MSE
-            "accuracy",
-        );
-        let net = tiny_net();
-        let x = input(&[1.0, 2.0, 3.0]);
-        let y = input(&[1.0, 2.0, 3.0]);
-        let pred = net.forward(&x).unwrap();
-        let score = f.score(&pred, &y).unwrap();
-        assert!(score.is_finite());
-        assert!(score >= 0.0 && score <= 1.0);
-        assert_eq!(f.direction(), Direction::Maximize);
-        assert_eq!(f.label(), "accuracy");
-        // loss() returns MSE, not accuracy
-        let loss_t = f.loss(&pred, &y).unwrap();
-        assert!(loss_t.item().unwrap().is_finite());
-    }
+    // TODO: uncomment when from_loss_with_other is re-enabled.
+    // #[test]
+    // fn test_fitness_from_loss_with_other() {
+    //     let f = Fitness::from_loss_with_other(
+    //         accuracy_score,
+    //         |pred, y| flodl::nn::loss::mse_loss(pred, y),
+    //         Direction::Maximize,
+    //         Direction::Minimize,
+    //         "accuracy",
+    //         "mse",
+    //     );
+    //     ...
+    // }
 
     #[test]
     fn test_scoring_helpers() {
