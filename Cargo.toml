@@ -36,8 +36,11 @@ debug = false
 
 [dev-dependencies]
 git-cliff = "2.13.1"
+# kaggle = "2.0.0"  # requires: sudo apt-get install libssl-dev pkg-config
+# tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 proptest = "1.11.0"
 ureq = "3"
+zip = "2"
 
 [package.metadata.release]
 pre-release-commit-message = "chore(release): bump version to {{version}}"
