@@ -1,18 +1,8 @@
-//! Scoring strategies 🎯 — the fitness/loss split and direction.
+//! Scoring strategies  — fitness/loss split and direction.
 //!
-//! The engine consumes a [`Fitness`] that separates **scoring** (ranking
-//! individuals) from **loss** (training via backward). The user always
-//! provides a scoring function; the loss function is optional — when
-//! absent, MSE is the default training signal.
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────┐
-//! │  Fitness                                        │
-//! │  ├─ score_fn:  (pred, y) → f32    ← ranking    │
-//! │  └─ loss_fn:   (pred, y) → Variable ← training │
-//! │               (None → MSE default)              │
-//! └─────────────────────────────────────────────────┘
-//! ```
+//! The engine uses [`Fitness`] to separate **scoring** (ranking) from
+//! **training** (backward). User always provides a train metric;
+//! the engine cannot guess the right signal for different output formats.
 
 use flodl::Variable;
 use flodl::tensor::Result;
@@ -20,21 +10,18 @@ use serde::{Deserialize, Serialize};
 
 // ── Direction — lower or higher is better ─────────────────────────────────
 
-/// Whether a **lower** or a **higher** score is better.
-///
-/// - Losses (`Mse`, `Mae`, ...) → [`Minimize`](Direction::Minimize).
-/// - Metrics (`R2`, `Accuracy`, `F1`) → [`Maximize`](Direction::Maximize).
+/// Whether lower or higher is better.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub enum Direction {
-    /// Lower scores are better (losses).
+    /// Lower is better (losses).
     #[default]
     Minimize,
-    /// Higher scores are better (metrics like accuracy).
+    /// Higher is better (metrics).
     Maximize,
 }
 
 impl Direction {
-    /// Is `new` better than `current` under this direction?
+    /// Is `new` better than `current`?
     pub fn is_better(&self, new: f32, current: f32) -> bool {
         match self {
             Direction::Minimize => new < current,
@@ -42,7 +29,7 @@ impl Direction {
         }
     }
 
-    /// A compact arrow for logs: `↓` = lower is better, `↑` = higher.
+    /// Compact arrow for logs: `↓` or `↑`.
     pub fn arrow(&self) -> &'static str {
         match self {
             Direction::Minimize => "↓",
@@ -50,10 +37,8 @@ impl Direction {
         }
     }
 
-    /// Total-order comparison under this direction, ready for `max_by`:
-    /// returns [`Ordering::Greater`](std::cmp::Ordering::Greater) when `a` is
-    /// **better** than `b`. NaN is treated as equal (deterministic, never
-    /// panics).
+    /// Total-order comparison under this direction (for `max_by`).
+    /// NaN treated as equal.
     pub fn cmp(&self, a: f32, b: f32) -> std::cmp::Ordering {
         match self {
             Direction::Minimize => b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal),
@@ -64,33 +49,26 @@ impl Direction {
 
 // ── Fitness — the scoring + training interface ────────────────────────────
 
-/// The fitness interface — separates **scoring** (ranking individuals)
-/// from **training** (backward pass). The engine calls `score()` on held-out
-/// data to rank, and `train_metric()` on training data to update weights.
+/// Scoring (ranking) + training (backward) interface.
 ///
 /// ```text
-/// Fitness::from_loss(f)                        ← same function for both
-/// Fitness::from_loss_with_other(score, train_metric, ...) ← separate
+/// Fitness::from_loss(f)                                  ← same function for both
+/// Fitness::from_loss_with_other(score, train, ...)       ← separate (planned)
 /// ```
 ///
-/// **The user must always provide an explicit train metric.** The engine
-/// cannot guess the right training signal for different output formats
-/// (regression, binary, multi-class, etc.).
+/// User must always provide an explicit train metric.
 pub struct Fitness {
-    /// The ranking metric — `(pred, target) → f32` score.
-    /// Called on **eval** batches to rank individuals.
+    /// Ranking metric: `(pred, target) → f32`.
     score_fn: Box<dyn Fn(&Variable, &Variable) -> Result<f32> + Send + Sync>,
-    /// The training metric — `(pred, target) → Variable` for backward.
-    /// Always required — the engine cannot guess the right signal for different
-    /// output formats (regression, binary, multi-class, etc.).
+    /// Training metric: `(pred, target) → Variable` for backward.
     train_metric_fn: Box<dyn Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync>,
-    /// Which direction is better for the **score** (ranking individuals).
+    /// Score direction.
     score_direction: Direction,
-    /// Which direction is better for the **train metric** (training signal).
+    /// Train metric direction.
     train_metric_direction: Direction,
-    /// Label for the fitness/scoring function (e.g. "accuracy", "r2").
+    /// Fitness/scoring label.
     fitness_label: String,
-    /// Label for the train metric (e.g. "cross_entropy", "mse").
+    /// Train metric label.
     train_metric_label: String,
 }
 
@@ -126,10 +104,6 @@ impl Fitness {
     // }
 
     /// Same function for both scoring and training.
-    ///
-    /// ```text
-    /// Fitness::from_loss(|pred, y| mse_loss(pred, y), Direction::Minimize, "mse")
-    /// ```
     pub fn from_loss<F>(f: F, direction: Direction, label: &str) -> Self
     where
         F: Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync + 'static,
@@ -137,9 +111,7 @@ impl Fitness {
         let f = std::sync::Arc::new(f);
         let f2 = f.clone();
         Fitness {
-            score_fn: Box::new(move |pred, y| {
-                Ok(f(pred, y)?.item()? as f32)
-            }),
+            score_fn: Box::new(move |pred, y| Ok(f(pred, y)?.item()? as f32)),
             train_metric_fn: Box::new(move |pred, y| f2(pred, y)),
             score_direction: direction,
             train_metric_direction: direction,
@@ -148,8 +120,7 @@ impl Fitness {
         }
     }
 
-    /// Score a prediction against its target — the scalar ranking metric.
-    /// Called on **eval** batches to rank individuals.
+    /// Score prediction against target — scalar ranking metric.
     pub fn score(&self, pred: &Variable, target: &Variable) -> Result<f32> {
         (self.score_fn)(pred, target)
     }
@@ -159,17 +130,17 @@ impl Fitness {
         (self.train_metric_fn)(pred, target)
     }
 
-    /// Which direction is better for the **score** (ranking individuals).
+    /// Score direction.
     pub fn direction(&self) -> Direction {
         self.score_direction
     }
 
-    /// Which direction is better for the **train metric** (training signal).
+    /// Train metric direction.
     pub fn train_metric_direction(&self) -> Direction {
         self.train_metric_direction
     }
 
-    /// Fitness/scoring label for logs.
+    /// Fitness label for logs.
     pub fn fitness_label(&self) -> &str {
         &self.fitness_label
     }
@@ -179,10 +150,17 @@ impl Fitness {
         &self.train_metric_label
     }
 
-    /// Whether fitness and train metric use the same function.
+    /// Whether fitness and train metric are the same function.
     pub fn train_metric_is_fitness(&self) -> bool {
         self.fitness_label == self.train_metric_label
     }
+
+    // TODO(fitness 2.0): when from_loss_with_other is re-enabled, expose
+    // per-individual loss_history via engine. The engine tracks
+    // loss_history: Vec<Vec<f32>> (one curve per individual), and this
+    // method returns the curve for the best individual.
+    //
+    // pub fn loss_history(&self) -> &[f32] { &self._loss_history }
 }
 
 // ── Scoring helpers — public utility functions ────────────────────────────
@@ -200,7 +178,11 @@ pub fn r2_score(pred: &Variable, y: &Variable) -> Result<f32> {
     let ss_tot: f32 = t.iter().map(|&v| (v - mean_t).powi(2)).sum();
     let ss_res: f32 = t.iter().zip(&p).map(|(&a, &b)| (a - b).powi(2)).sum();
     if ss_tot.abs() < f32::EPSILON {
-        return Ok(if ss_res.abs() < f32::EPSILON { 1.0 } else { 0.0 });
+        return Ok(if ss_res.abs() < f32::EPSILON {
+            1.0
+        } else {
+            0.0
+        });
     }
     Ok(1.0 - ss_res / ss_tot)
 }
@@ -320,9 +302,7 @@ pub fn cross_entropy_onehot_loss(pred: &Variable, y: &Variable) -> Result<Variab
     let ls = pred.data().log_softmax(1)?;
     let masked = ls.mul(&y.data())?;
     let neg = flodl::Tensor::from_f32(&[-1.0], &[1], masked.device())?;
-    let n = flodl::Tensor::from_f32(
-        &[y.data().shape()[0] as f32], &[1], y.data().device(),
-    )?;
+    let n = flodl::Tensor::from_f32(&[y.data().shape()[0] as f32], &[1], y.data().device())?;
     Ok(Variable::new(masked.sum()?.mul(&neg)?.div(&n)?, false))
 }
 
@@ -355,12 +335,6 @@ impl Default for FitnessLabel {
     }
 }
 
-impl std::fmt::Display for FitnessLabel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -370,6 +344,7 @@ mod tests {
     use crate::node::Node;
     use crate::topology::Topology;
     use flodl::nn::Module;
+    use proptest::prelude::*;
 
     fn tiny_net() -> Network {
         let mut graph = Topology::new(0, None);
@@ -396,7 +371,11 @@ mod tests {
 
     #[test]
     fn test_fitness_from_loss() {
-        let f = Fitness::from_loss(|pred, y| flodl::nn::loss::mse_loss(pred, y), Direction::Minimize, "mse");
+        let f = Fitness::from_loss(
+            |pred, y| flodl::nn::loss::mse_loss(pred, y),
+            Direction::Minimize,
+            "mse",
+        );
         let net = tiny_net();
         let x = input(&[1.0, 2.0, 3.0]);
         let y = input(&[1.0, 2.0, 3.0]);
@@ -434,7 +413,10 @@ mod tests {
         let y = Variable::new(pred.data().clone(), false);
         let r2 = r2_score(&pred, &y).unwrap();
         assert!((r2 - 1.0).abs() < 1e-3, "perfect fit → R2 ≈ 1, got {r2}");
-        let mse = flodl::nn::loss::mse_loss(&pred, &y).unwrap().item().unwrap() as f32;
+        let mse = flodl::nn::loss::mse_loss(&pred, &y)
+            .unwrap()
+            .item()
+            .unwrap() as f32;
         assert!(mse < 1e-6);
     }
 
@@ -481,5 +463,85 @@ mod tests {
         assert!((f1_from_vecs(&pa, &ta, 2) - 1.0 / 3.0).abs() < 1e-9);
         assert_eq!(f1_from_vecs(&[], &[], 2), 0.0);
         assert_eq!(precision_from_vecs(&[0], &[0], 0), 0.0);
+    }
+
+    #[test]
+    fn test_all_scoring_helpers() {
+        let net = tiny_net();
+        let x = input(&[1.0, 2.0, 3.0]);
+        let pred = net.forward(&x).unwrap();
+        // Use pred as both pred and y for perfect-fit case.
+        let y = Variable::new(pred.data().clone(), false);
+
+        let mse = mse_loss_score(&pred, &y).unwrap();
+        assert!(mse < 1e-6, "mse_score = {mse}");
+        let l1 = l1_loss_score(&pred, &y).unwrap();
+        assert!(l1 < 1e-6, "l1_score = {l1}");
+        let rmse = rmse_score(&pred, &y).unwrap();
+        assert!(rmse < 1e-3, "rmse_score = {rmse}");
+        let r2 = r2_score(&pred, &y).unwrap();
+        assert!((r2 - 1.0).abs() < 1e-3, "r2_score = {r2}");
+
+        // Cross-entropy: > 0 for valid predictions
+        let mut graph2 = Topology::new(0, None);
+        graph2.options.input_dim = 2;
+        graph2.nodes.push(Node::new_input(0, 2));
+        graph2.nodes.push(Node::new_hidden(1, 2, 2));
+        graph2.nodes.push(Node::new_output(2, 2, 3));
+        graph2.nodes[2].hidden_dim = Some(3);
+        graph2.finalize();
+        let cat_net = Network::build(&graph2, flodl::Device::CPU).unwrap();
+        let cx = Variable::new(
+            flodl::Tensor::from_f32(&[1.0, 0.5, 0.1, 0.9], &[2, 2], flodl::Device::CPU).unwrap(),
+            false,
+        );
+        let cpred = cat_net.forward(&cx).unwrap();
+        // One-hot targets
+        let ct = Variable::new(
+            flodl::Tensor::from_f32(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], &[2, 3], flodl::Device::CPU)
+                .unwrap(),
+            false,
+        );
+        let ce = cross_entropy_onehot(&cpred, &ct).unwrap();
+        assert!(ce > 0.0 && ce.is_finite(), "cross_entropy = {ce}");
+        let acc = accuracy_score(&cpred, &ct).unwrap();
+        assert!(acc >= 0.0 && acc <= 1.0, "accuracy = {acc}");
+        let f1 = f1_score(&cpred, &ct).unwrap();
+        assert!(f1 >= 0.0 && f1 <= 1.0, "f1 = {f1}");
+        let prec = precision_score(&cpred, &ct).unwrap();
+        assert!(prec >= 0.0 && prec <= 1.0, "precision = {prec}");
+        let (pa, ta) = argmax_classes(&cpred, &ct).unwrap();
+        assert_eq!(pa.len(), 2);
+        assert_eq!(ta.len(), 2);
+    }
+
+    proptest! {
+        #[test]
+        fn prop_direction_is_better_is_antisymmetric(a in -100.0f32..100.0, b in -100.0f32..100.0) {
+            if a != b {
+                if Direction::Minimize.is_better(a, b) {
+                    prop_assert!(!Direction::Minimize.is_better(b, a));
+                }
+                if Direction::Maximize.is_better(a, b) {
+                    prop_assert!(!Direction::Maximize.is_better(b, a));
+                }
+            }
+        }
+
+        #[test]
+        fn prop_from_loss_score_and_train_metric_agree(val in -10.0f32..10.0) {
+            let f = Fitness::from_loss(
+                |pred, y| flodl::nn::loss::mse_loss(pred, y),
+                Direction::Minimize, "mse",
+            );
+            // Use identity: pred == target means loss == 0
+            let t = Variable::new(
+                flodl::Tensor::from_f32(&[val], &[1, 1], flodl::Device::CPU).unwrap(),
+                false,
+            );
+            let score = f.score(&t, &t).unwrap();
+            let tm = f.train_metric(&t, &t).unwrap().item().unwrap() as f32;
+            prop_assert!((score - tm).abs() < 1e-5, "score={score} tm={tm}");
+        }
     }
 }
