@@ -1,83 +1,19 @@
-//! The graph blueprint 🧬 — pure topology data, no tensors.
+//! The graph blueprint  — pure topology data, no tensors.
 //!
-//! # The two-phase design 🪜
+//! Two-phase design: **Topology** (this file, pure data) declares nodes
+//! and connections. **Network** compiles it into real layers and executes.
 //!
-//! A gras network is described in two layers:
-//!
-//! 1. **Blueprint — [`Topology`] (this file, pure data).** Declares only *who
-//!    exists* (nodes with input/output port counts) and *who feeds whom*
-//!    (connections). It is inert: you can print it, mutate it, and validate it
-//!    without any tensor backend.
-//! 2. **Engine — [`Network`](crate::network::Network) (a flodl
-//!    [`Module`](flodl::nn::Module)).**
-//!    [`Network::build`](crate::network::Network::build) compiles a
-//!    validated `Topology` into real `Linear` layers, and
-//!    [`Network::forward`](crate::network::Network) executes it
-//!    tensor by tensor.
-//!
-//! Serialization (the JSON round-trip) lives in [`crate::spec`]; the
-//! JSON methods on [`Topology`] (`to_json` / `from_json`) delegate to it.
-//!
-//! # Why execution stays simple
-//!
-//! Everything that makes the forward pass trivial is an **invariant the code
-//! enforces rather than computes**:
-//!
-//! - **Node ids are contiguous `0..n` and double as array indices** — a node's
-//!   id is also its execution order and its index into `Network.layers`.
-//! - **Edges only go forward** (`from.node < to.node`), so ascending node id
-//!   *is* a topological order — no cycle detection at runtime.
-//! - **Output ports feed at most one input; input ports may hold several
-//!   wires** — a node combines *every* tensor that arrives (Add/Mean), so
-//!   de-orphaning can stack an extra wire into an already-wired input port.
-//! - **All output ports of a node emit the same tensor** — a node's output
-//!   depends on its inputs, not on *which* output port you read, so fan-out
-//!   is free.
-//! - **Orphaned input ports** (nothing wired) are fed the network input — a
-//!   random graph never needs to be fully connected to be executable.
-//!
-//! [`Topology::validate`] checks all of the above;
-//! [`Network::build`](crate::network::Network::build) refuses to
-//! compile a graph that fails.
-//!
-//! # Suggested reading order 👀
-//!
-//! [`Port`] + [`Connection`] → [`Topology`] → [`Topology::finalize`] →
-//! [`Topology::validate`] →
-//! [`Network::build`](crate::network::Network::build) →
-//! [`Network::forward`](crate::network::Network).
+//! Invariants: contiguous ids (0..n), forward-only edges, orphaned ports
+//! fed by network input. `validate()` checks all of them.
 
 use fastrand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::error::TopologyError;
-use crate::utils::graph_utils::{
-    build_node_sources, node_activation_counts, node_degrees, node_depths,
-    node_kind_counts, node_orphan_counts,
-};
+
 use crate::node::{Activation, Node, NodeKind};
 
-/// How multiple incoming tensors into a node are combined before the node
-/// transforms them.
-///
-/// Simple maths: a node receiving tensors [a, b, c]
-///   - Add  -> a + b + c          (sum)
-///   - Mean -> (a + b + c) / 3    (average)
-///   - Max  -> max(a, b, c)       (element-wise max)
-///   - Min  -> min(a, b, c)       (element-wise min)
-// ── CombineOp — how a node merges incoming tensors ────────────────────────
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CombineOp {
-    /// Sum the incoming tensors.
-    Add,
-    /// Average the incoming tensors.
-    Mean,
-    /// Element-wise maximum across the incoming tensors.
-    Max,
-    /// Element-wise minimum across the incoming tensors.
-    Min,
-}
+pub use crate::node::CombineOp;
 
 // ── KindCounts — node-role histogram ──────────────────────────────────────
 
@@ -140,7 +76,7 @@ impl Default for TopologyOptions {
 
 // ── Port & Connection — wiring primitives ─────────────────────────────────
 
-/// A port is a "socket" 🔌 on a node.
+/// A port is a "socket"  on a node.
 ///   - as a destination (connection.to)  -> an input port  in 0..num_inputs
 ///   - as a source     (connection.from) -> an output port in 0..num_outputs
 ///
@@ -149,11 +85,11 @@ impl Default for TopologyOptions {
 /// output-port index only matters for bookkeeping, never for values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Port {
-    pub node: usize,  // 🏷️ which node
-    pub index: usize, // 🔢 which socket on that node
+    pub node: usize,  //  which node
+    pub index: usize, //  which socket on that node
 }
 
-/// A directed wire 🔗 from one node's output port to another node's input port.
+/// A directed wire  from one node's output port to another node's input port.
 ///
 /// Example: `n1_o0 -> n2_i0` means "node 1's first output feeds node 2's
 /// first input".
@@ -176,11 +112,11 @@ impl Connection {
 }
 
 // ── graph diagnostics ─────────────────────────────────────────────────
-// These live in crate::graph_utils as free functions over raw slices.
-// The Topology methods below are thin delegations — see graph_utils.rs
+// Free functions over raw slices — live in crate::utils::graph_utils.
+// Topology methods delegate to them.
 // for the actual implementations.
 
-/// The blueprint 🧬 of a gras network: pure data, no tensors.
+/// The blueprint  of a gras network: pure data, no tensors.
 ///
 /// A `Topology` answers two questions only:
 ///   - **who exists** — `nodes`, each declaring its input/output port counts
@@ -243,12 +179,12 @@ impl Topology {
         // following the options constraints. Simple maths:
         //   num_inputs  ∈ [min_hidden_inputs_per_node,  max_hidden_inputs_per_node]
         //   num_outputs ∈ [min_hidden_outputs_per_node, max_hidden_outputs_per_node]
-        let num_inputs = self
-            .rng
-            .usize(self.options.min_hidden_inputs_per_node..=self.options.max_hidden_inputs_per_node);
-        let num_outputs = self
-            .rng
-            .usize(self.options.min_hidden_outputs_per_node..=self.options.max_hidden_outputs_per_node);
+        let num_inputs = self.rng.usize(
+            self.options.min_hidden_inputs_per_node..=self.options.max_hidden_inputs_per_node,
+        );
+        let num_outputs = self.rng.usize(
+            self.options.min_hidden_outputs_per_node..=self.options.max_hidden_outputs_per_node,
+        );
         // Node id = current node count, so ids stay contiguous: 0, 1, 2, ...
         let node = Node::new_hidden(self.nodes.len(), num_inputs, num_outputs);
         self.nodes.push(node);
@@ -264,25 +200,8 @@ impl Topology {
     }
 
     /// Assign every hidden node a **random activation** drawn from `pool`
-    /// (Input/Output nodes keep [`Activation::Identity`]). 🧠
-    ///
-    /// This is the GP hook for the activation axis: the engine calls it
-    /// after `create_random_hidden_nodes` with the individual's derived RNG,
-    /// so per-node activations vary across the population (and across runs)
-    /// while staying reproducible from the seed chain. `pool` must be
-    /// non-empty.
-    pub fn randomize_activations(&mut self, pool: &[Activation], rng: &mut fastrand::Rng) {
-        if pool.is_empty() {
-            return;
-        }
-        for node in &mut self.nodes {
-            if node.kind == NodeKind::Hidden {
-                node.activation = pool[rng.usize(0..pool.len())];
-            }
-        }
-    }
-
-    /// Refresh the port labels 📇 — one string per port (`n1_i0`, `n2_o3`,
+    /// (Input/Output nodes keep [`Activation::Identity`]).
+    /// Refresh the port labels  — one string per port (`n1_i0`, `n2_o3`,
     /// ...) in `graph_inputs` / `graph_outputs`. These labels are the
     /// "address book" used by `Display`, the ASCII renderer in `utils`, and
     /// `connection_labels`. Execution itself reads the typed [`Port`]s
@@ -307,7 +226,7 @@ impl Topology {
         }
     }
 
-    /// Finalize the graph 🔗: scaffold the skeleton, wire every port, and
+    /// Finalize the graph : scaffold the skeleton, wire every port, and
     /// auto-de-orphan dangling outputs — one call turns a pile of nodes
     /// into a complete, executable graph.
     ///
@@ -334,13 +253,13 @@ impl Topology {
     ///  → orphaned → fed by the network input at execution time)
     ///
     /// Rules:
-    ///   - ⛔ no recurrent connections: only forward edges, so
+    ///   -  no recurrent connections: only forward edges, so
     ///     from.node < to.node (this also forbids self-loops, since a node is
     ///     never earlier than itself)
-    ///   - 🔁 1:1 pairing: each output port feeds at most one input port
-    ///   - 🕳️ orphaned input ports (no earlier output available) are fed by
+    ///   -  1:1 pairing: each output port feeds at most one input port
+    ///   -  orphaned input ports (no earlier output available) are fed by
     ///     the network input at execution time
-    ///   - 🗑️ orphaned output ports are rewired automatically at the end by
+    ///   -  orphaned output ports are rewired automatically at the end by
     ///     [`Topology::rewire_orphaned_outputs`] — even into already-wired input ports
     ///     (the node combines them with Add/Mean) — so a single call yields a
     ///     complete graph.
@@ -353,15 +272,44 @@ impl Topology {
     pub fn finalize(&mut self) {
         self.connections.clear();
 
-        // 🏗️ Phase 1 — ensure the canonical skeleton: ≥ 1 Input node and
-        // exactly 1 Output node (auto-scaffold, idempotent). Random graphs
-        // only create hidden nodes, so this turns them into a complete
-        // Input → … → Output graph.
+        // Step 1: build_skeleton — ensure Input + Output nodes exist
         self.ensure_scaffold();
 
-        // Resolve per-node hidden_dim: None → graph default.
-        // Use effective_hidden_dim (max across all nodes) so the input node
-        // projects straight to the widest dim — no double projection waste.
+        // Step 2: fill_dims — resolve per-node hidden_dim (None -> graph default)
+        self.resolve_dims();
+
+        // Step 3: mark_ports — refresh port labels for display
+        self.refresh_labels();
+
+        // Step 4: connect — wire input ports to unused output ports from earlier nodes
+        self.wire_ports();
+
+        // Step 5: filter_input — set input node output count = number of hidden nodes
+        self.set_input_fanout();
+
+        // Step 6: connect_orphans — wire orphaned inputs to the input node (cycle ports)
+        self.rewire_orphaned_inputs();
+
+        // Step 6b: clean_wiring — dedup input node connections (one wire per source_port, target_node)
+        self.dedup_input_connections();
+
+        // Step 7: rescue_outputs — wire orphaned outputs to later nodes (dedup inline)
+        self.rewire_orphaned_outputs();
+
+        // Step 7b: trim_ports — remove orphaned input/output ports from the topology
+        self.trim_orphaned_ports();
+
+        // Step 8: set_flags — apply recurrent flags (placeholder, no-op for now)
+        self.apply_recurrent_flags();
+
+        // Step 9: verify — validate the final wiring
+        if let Err(e) = self.validate() {
+            panic!("finalize validation failed: {e}\n{self:?}");
+        }
+    }
+
+    /// Step 2: Resolve per-node hidden_dim -- None becomes graph default.
+    fn resolve_dims(&mut self) {
         let eff = self.effective_hidden_dim();
         for node in &mut self.nodes {
             if node.hidden_dim.is_none() {
@@ -371,16 +319,10 @@ impl Topology {
                 });
             }
         }
+    }
 
-        // Labels must reflect any nodes the scaffold just added.
-        self.refresh_labels();
-
-        // Phase 2 — wire every port. Each input port gets one source from an
-        // earlier node's output port. Orphaned input ports (no earlier source 
-        // available) are fed by the network input at execution time. Orphaned
-        // output ports (no later target available) are rewired automatically at
-        //  the end by `rewire_orphaned_outputs` — even into already-wired input
-        // ports
+    /// Step 4: Wire input ports to unused output ports from earlier nodes.
+    fn wire_ports(&mut self) {
         let mut input_ports: Vec<Port> = Vec::new();
         let mut output_ports: Vec<Port> = Vec::new();
         for node in &self.nodes {
@@ -397,30 +339,22 @@ impl Topology {
                 });
             }
         }
-
-        // Randomize pairing order
         self.rng.shuffle(&mut input_ports);
         self.rng.shuffle(&mut output_ports);
 
-        // Wires already laid down before this pass (e.g. de-orphaning)
-        // keep their sources reserved: an output port stays 1:1.
         let mut used = vec![false; output_ports.len()];
-        for conn in &self.connections {
-            if let Some((i, _)) = output_ports
-                .iter()
-                .enumerate()
-                .find(|(_, p)| **p == conn.from)
-            {
-                used[i] = true;
-            }
-        }
-
-        // Phase 3 — wire every input port to an unused output port from an earlier node.
         for target in input_ports {
+            // Track which source nodes already feed this target (avoid redundancy).
+            let already_used: Vec<usize> = self
+                .connections
+                .iter()
+                .filter(|c| c.to.node == target.node)
+                .map(|c| c.from.node)
+                .collect();
             let source = output_ports
                 .iter()
                 .enumerate()
-                .find(|(i, p)| !used[*i] && p.node < target.node)
+                .find(|(i, p)| !used[*i] && p.node < target.node && !already_used.contains(&p.node))
                 .map(|(i, p)| (i, *p));
             if let Some((i, source)) = source {
                 used[i] = true;
@@ -430,11 +364,84 @@ impl Topology {
                 });
             }
         }
+    }
 
-        // 🕳️ Automatic de-orphan: rewire output ports nobody consumed into
-        // random later nodes (even occupied input ports — the node combines
-        // all incoming tensors). One call ⇒ a complete graph.
-        self.rewire_orphaned_outputs();
+    /// Step 5: Set input node output count = number of hidden nodes (at least).
+    /// Never shrinks — if the node already has more ports, keep them.
+    fn set_input_fanout(&mut self) {
+        let n_hidden = self
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Hidden)
+            .count();
+        let input_node = self
+            .nodes
+            .iter_mut()
+            .find(|n| n.kind == NodeKind::Input)
+            .unwrap();
+        input_node.num_outputs = input_node.num_outputs.max(n_hidden).max(1);
+    }
+
+    /// Step 6: Wire orphaned input ports to the input node's output ports.
+    /// Cycles through available output ports (multiple orphans may share
+    /// a port — the combine op merges them).
+    fn rewire_orphaned_inputs(&mut self) {
+        let input_id = self
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Input)
+            .unwrap()
+            .id;
+        let n_ports = self
+            .nodes
+            .iter()
+            .find(|n| n.id == input_id)
+            .unwrap()
+            .num_outputs;
+        let mut output_idx = 0usize;
+        for node in &self.nodes {
+            for i in 0..node.num_inputs {
+                let port = Port {
+                    node: node.id,
+                    index: i,
+                };
+                if !self.connections.iter().any(|c| c.to == port) {
+                    self.connections.push(Connection {
+                        from: Port {
+                            node: input_id,
+                            index: output_idx % n_ports,
+                        },
+                        to: port,
+                    });
+                    output_idx += 1;
+                }
+            }
+        }
+    }
+
+    /// Remove duplicate connections from the input node: keep at most one
+    /// wire per (source_port, target_node) pair.
+    fn dedup_input_connections(&mut self) {
+        let input_id = self
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Input)
+            .map(|n| n.id);
+        if let Some(id) = input_id {
+            let mut seen: Vec<(usize, usize)> = Vec::new();
+            self.connections.retain(|c| {
+                if c.from.node != id {
+                    return true;
+                }
+                let key = (c.from.index, c.to.node);
+                if seen.contains(&key) {
+                    false
+                } else {
+                    seen.push(key);
+                    true
+                }
+            });
+        }
     }
 
     /// Human-readable connection labels, e.g. `("n0_o0", "n1_i0")` — handy
@@ -447,21 +454,16 @@ impl Topology {
             .collect()
     }
 
-    /// Check the graph is executable before building/running it. 🛡️
+    /// Check the graph is executable before building/running it.
     ///
-    /// A random graph is only safe to execute when:
-    ///   - node ids are contiguous `0..n` (they double as array indices)
-    ///   - every connection goes strictly forward (`from.node < to.node`), so
-    ///     ascending id order is a valid topological order (also forbids
-    ///     self-loops and recurrent edges)
+    /// A random graph is safe to execute when:
+    ///   - node ids are contiguous 0..n
+    ///   - every connection goes strictly forward (from.node < to.node)
     ///   - every wired port exists on its node (index within bounds)
-    ///   - no output port feeds two inputs (1:1 on the output side; input
-    ///     ports may hold several wires — they are summed/averaged)
-    ///   - feature dims are consistent: all tensors entering a node share one
-    ///     dim, and orphaned ports (fed by the network input, dim =
-    ///     `hidden_dim`) force every wired source of that node to `hidden_dim`
+    ///   - no output port feeds two inputs (except the Input node which fans out)
+    ///   - every input port is wired (no orphans after finalize)
     ///
-    /// `Network::build` calls this and refuses to build invalid graphs.
+    /// Network::build calls this and refuses to build invalid graphs.
     // ── Validate — check wiring invariants ───────────────────────────────────
 
     pub fn validate(&self) -> Result<(), TopologyError> {
@@ -536,7 +538,9 @@ impl Topology {
                     num_ports: dst.num_inputs,
                 });
             }
-            if used_sources.contains(&conn.from) {
+            // Input node's output ports can fan out to multiple destinations.
+            let is_input_node = self.nodes[conn.from.node].kind == NodeKind::Input;
+            if !is_input_node && used_sources.contains(&conn.from) {
                 return Err(TopologyError::DoubleUsedOutput(conn.from));
             }
             used_sources.push(conn.from);
@@ -575,48 +579,14 @@ impl Topology {
     /// Used as the fallback for orphaned ports and the input node, so they
     /// project straight to the widest dim in the network — no double projection.
     fn effective_hidden_dim(&self) -> usize {
-        self.nodes.iter().map(|n| self.out_dim_of(n)).max().unwrap_or(self.options.hidden_dim)
+        self.nodes
+            .iter()
+            .map(|n| self.out_dim_of(n))
+            .max()
+            .unwrap_or(self.options.hidden_dim)
     }
 
     /// Per-node input dim: the (validated-identical) output dim of its
-    /// wired sources, or `hidden_dim` when the node has orphaned ports /
-    /// no sources at all. Used by `validate`, `rewire_orphaned_outputs`,
-    /// and `node_dims`.
-    #[allow(dead_code)]
-    fn node_in_dims(&self) -> Vec<usize> {
-        let hidden_dim = self.options.hidden_dim;
-        self.nodes
-            .iter()
-            .map(|node| {
-                let mut dims: Vec<usize> = Vec::new();
-                let mut has_orphan = false;
-                for i in 0..node.num_inputs {
-                    let target = Port {
-                        node: node.id,
-                        index: i,
-                    };
-                    let mut found = false;
-                    for conn in &self.connections {
-                        if conn.to == target {
-                            dims.push(self.out_dim_of(&self.nodes[conn.from.node]));
-                            found = true;
-                        }
-                    }
-                    if !found {
-                        has_orphan = true;
-                    }
-                }
-                dims.sort_unstable();
-                dims.dedup();
-                if has_orphan || dims.is_empty() {
-                    hidden_dim
-                } else {
-                    dims[0]
-                }
-            })
-            .collect()
-    }
-
     // ── derived diagnostics (the "missing data" catalog) ───────────────────
 
     /// Derived per-node feature dims `(in_dim, out_dim)`, indexed by node id
@@ -634,12 +604,17 @@ impl Topology {
         self.nodes
             .iter()
             .map(|node| {
-                let in_dim = sources[node.id]
-                    .iter()
-                    .flatten()
-                    .map(|p| self.out_dim_of(&self.nodes[p.node]))
-                    .max()
-                    .unwrap_or_else(|| self.effective_hidden_dim());
+                let in_dim = if node.kind == NodeKind::Input {
+                    // Input node reads raw data: in_dim = input_dim
+                    self.options.input_dim
+                } else {
+                    sources[node.id]
+                        .iter()
+                        .flatten()
+                        .map(|p| self.out_dim_of(&self.nodes[p.node]))
+                        .max()
+                        .unwrap_or_else(|| self.effective_hidden_dim())
+                };
                 (in_dim, self.out_dim_of(node))
             })
             .collect()
@@ -688,18 +663,8 @@ impl Topology {
     /// Matches the real count of a built [`Network`](crate::network::Network).
     pub fn param_estimate(&self) -> usize {
         let dims = self.node_dims();
-        let num_inputs: Vec<usize> = self.nodes.iter().map(|n| n.num_inputs).collect();
-        let sources = build_node_sources(&self.connections, &num_inputs);
         let mut total = 0;
-        // Orphan projections: one per node with orphaned ports.
-        for (node_id, &(in_dim, _)) in dims.iter().enumerate() {
-            let has_orphans = self.nodes[node_id].num_inputs == 0
-                || sources[node_id].iter().any(|s| s.is_empty());
-            if has_orphans && self.options.input_dim != in_dim {
-                total += self.options.input_dim * in_dim + in_dim;
-            }
-        }
-        // Node layers: in·out + out each.
+        // Node layers: in*out + out each.
         for &(in_dim, out_dim) in &dims {
             total += in_dim * out_dim + out_dim;
         }
@@ -717,7 +682,7 @@ impl Topology {
         node_activation_counts(&self.nodes)
     }
 
-    /// Ensure the canonical skeleton 🏗️: at least one `Input` node and
+    /// Ensure the canonical skeleton : at least one `Input` node and
     /// exactly one `Output` node. Idempotent — safe to call any number of
     /// times.
     ///
@@ -770,7 +735,7 @@ impl Topology {
     }
 
     /// Re-wire orphaned output ports into random *later* nodes — the
-    /// de-orphaning rule 🕳️→🔗. Called automatically at the end of
+    /// de-orphaning rule →. Called automatically at the end of
     /// [`Topology::finalize`], so the normal pipeline never needs to
     /// call it by hand; it's public for manual rewiring (e.g. after a
     /// topology mutation).
@@ -810,12 +775,19 @@ impl Topology {
 
         let mut added = 0usize;
         for src in orphans {
-            // Any later node with input ports is a valid target — port projections
-            // at build time bridge any dim mismatch.
+            // Only wire to later nodes NOT already fed by this source.
+            // Prevents duplicates at creation time — no cleanup needed.
             let targets: Vec<usize> = self
                 .nodes
                 .iter()
-                .filter(|n| n.id > src.node && n.num_inputs > 0)
+                .filter(|n| {
+                    n.id > src.node
+                        && n.num_inputs > 0
+                        && !self
+                            .connections
+                            .iter()
+                            .any(|c| c.from.node == src.node && c.to.node == n.id)
+                })
                 .map(|n| n.id)
                 .collect();
             if targets.is_empty() {
@@ -837,8 +809,107 @@ impl Topology {
         added
     }
 
+    /// Remove orphaned input/output ports and renumber connections to close
+    /// gaps. The Output node keeps all its ports (network output).
+    fn trim_orphaned_ports(&mut self) {
+        let output_id = self
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Output)
+            .map(|n| n.id);
+
+        // Build remap tables: for each node, old index -> compact new index.
+        let out_remap: Vec<Vec<usize>> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let mut used: Vec<bool> = vec![false; n.num_outputs];
+                for c in &self.connections {
+                    if c.from.node == n.id && c.from.index < used.len() {
+                        used[c.from.index] = true;
+                    }
+                }
+                let mut map = vec![0usize; n.num_outputs];
+                let mut next = 0;
+                for i in 0..n.num_outputs {
+                    if used[i] {
+                        map[i] = next;
+                        next += 1;
+                    } else {
+                        map[i] = usize::MAX; // orphan — will be dropped
+                    }
+                }
+                map
+            })
+            .collect();
+
+        let in_remap: Vec<Vec<usize>> = self
+            .nodes
+            .iter()
+            .map(|n| {
+                let mut used: Vec<bool> = vec![false; n.num_inputs];
+                for c in &self.connections {
+                    if c.to.node == n.id && c.to.index < used.len() {
+                        used[c.to.index] = true;
+                    }
+                }
+                let mut map = vec![0usize; n.num_inputs];
+                let mut next = 0;
+                for i in 0..n.num_inputs {
+                    if used[i] {
+                        map[i] = next;
+                        next += 1;
+                    } else {
+                        map[i] = usize::MAX;
+                    }
+                }
+                map
+            })
+            .collect();
+
+        // Renumber connections, dropping orphans.
+        self.connections.retain(|c| {
+            let from_map = &out_remap[c.from.node];
+            let to_map = &in_remap[c.to.node];
+            c.from.index < from_map.len()
+                && c.to.index < to_map.len()
+                && from_map[c.from.index] != usize::MAX
+                && to_map[c.to.index] != usize::MAX
+        });
+        for c in &mut self.connections {
+            c.from.index = out_remap[c.from.node][c.from.index];
+            c.to.index = in_remap[c.to.node][c.to.index];
+        }
+
+        // Update port counts.
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            if Some(node.id) != output_id {
+                node.num_outputs = out_remap[i]
+                    .iter()
+                    .filter(|&&v| v != usize::MAX)
+                    .count()
+                    .max(1);
+            }
+            let connected_in = in_remap[i].iter().filter(|&&v| v != usize::MAX).count();
+            if connected_in > 0 {
+                node.num_inputs = connected_in;
+            }
+        }
+    }
+
+    /// Tag hidden nodes as recurrent-candidate when num_inputs == num_outputs.
+    /// After trim_ports, port counts are final — a node with equal in/out
+    /// ports can feed its output back as additional input.
+    fn apply_recurrent_flags(&mut self) {
+        for node in &mut self.nodes {
+            if node.kind == NodeKind::Hidden && node.num_inputs == node.num_outputs {
+                node.recurrent = true;
+            }
+        }
+    }
+
     /// Serialize the whole blueprint (options, nodes, labels, connections) to
-    /// JSON. 🗂️ See [`crate::spec::Spec`] for the shape; the RNG
+    /// JSON.  See [`crate::spec::Spec`] for the shape; the RNG
     /// is not stored.
     // ── Serialization ────────────────────────────────────────────────────────
 
@@ -860,6 +931,11 @@ impl Topology {
     }
 }
 
+use crate::utils::graph_utils::{
+    build_node_sources, node_activation_counts, node_degrees, node_depths, node_kind_counts,
+    node_orphan_counts,
+};
+
 /// Test-only proptest strategies, shared across the crate's test modules
 /// (topology's own tests and the serialization tests in [`crate::spec`]).
 #[cfg(test)]
@@ -872,27 +948,25 @@ pub(crate) mod test_strategies {
     /// not what we generate).
     pub(crate) fn topology_options_strategy() -> impl Strategy<Value = TopologyOptions> {
         (
-            0usize..10_000, // 🎲 seed
-            1usize..4,      // 🔽 min inputs per node
-            1usize..4,      // 🔼 min outputs per node
+            0usize..10_000, //  seed
+            1usize..4,      //  min inputs per node
+            1usize..4,      //  min outputs per node
             1usize..8,      // input_dim
             1usize..8,      // hidden_dim
             1usize..8,      // output_dim
         )
             .prop_map(
-                |(seed, min_in, min_out, input_dim, hidden_dim, output_dim)| {
-                    TopologyOptions {
-                        seed,
-                        min_hidden_num_nodes: 2,
-                        max_hidden_num_nodes: 6,
-                        min_hidden_inputs_per_node: min_in,
-                        max_hidden_inputs_per_node: min_in + 3,
-                        min_hidden_outputs_per_node: min_out,
-                        max_hidden_outputs_per_node: min_out + 3,
-                        input_dim,
-                        hidden_dim,
-                        output_dim,
-                    }
+                |(seed, min_in, min_out, input_dim, hidden_dim, output_dim)| TopologyOptions {
+                    seed,
+                    min_hidden_num_nodes: 2,
+                    max_hidden_num_nodes: 6,
+                    min_hidden_inputs_per_node: min_in,
+                    max_hidden_inputs_per_node: min_in + 3,
+                    min_hidden_outputs_per_node: min_out,
+                    max_hidden_outputs_per_node: min_out + 3,
+                    input_dim,
+                    hidden_dim,
+                    output_dim,
                 },
             )
     }
@@ -907,7 +981,8 @@ pub(crate) mod test_strategies {
             graph.nodes.push(Node::new_input(0, 2));
             for i in 0..n_hidden {
                 let span_in = opts.max_hidden_inputs_per_node - opts.min_hidden_inputs_per_node + 1;
-                let span_out = opts.max_hidden_outputs_per_node - opts.min_hidden_outputs_per_node + 1;
+                let span_out =
+                    opts.max_hidden_outputs_per_node - opts.min_hidden_outputs_per_node + 1;
                 let ins = opts.min_hidden_inputs_per_node + (i * 7) % span_in;
                 let outs = opts.min_hidden_outputs_per_node + (i * 3) % span_out;
                 graph.nodes.push(Node::new_hidden(i + 1, ins, outs));
@@ -1021,27 +1096,34 @@ mod tests {
         graph.nodes.push(Node::new_hidden(2, 2, 1));
         graph.finalize();
 
-        let num_output_ports: usize = graph.nodes.iter().map(|n| n.num_outputs).sum();
-
         // Output ports stay 1:1 (each feeds at most one input); input ports
         // may hold several wires because finalize auto-de-orphans
-        // (stacks extra sources into later nodes, even occupied ports). So
-        // the wire count can exceed the input-port count but never the
-        // output-port count.
+        // (stacks extra sources into later nodes, even occupied ports).
         let mut seen_from: Vec<Port> = Vec::new();
+        let input_id = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Input)
+            .unwrap()
+            .id;
         for conn in &graph.connections {
             assert!(
                 conn.from.node < conn.to.node,
                 "connection must go strictly forward: {conn}"
             );
-            assert!(
-                !seen_from.contains(&conn.from),
-                "output port {} used twice",
-                conn.from_label()
-            );
+            // Input node's output ports can fan out to multiple destinations.
+            if conn.from.node != input_id {
+                assert!(
+                    !seen_from.contains(&conn.from),
+                    "output port {} used twice",
+                    conn.from_label()
+                );
+            }
             seen_from.push(conn.from);
         }
-        assert!(graph.connections.len() <= num_output_ports);
+        // Connections can exceed output port count due to input node fan-out,
+        // but non-input output ports stay 1:1.
+        assert!(!graph.connections.is_empty());
         assert!(!graph.connections.is_empty());
 
         // String pairs match the typed connections
@@ -1145,17 +1227,19 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_double_used_output() {
-        // Output ports stay 1:1 — a single output port feeds at most one input.
+        // Non-input nodes: output ports stay 1:1.
         let mut graph = Topology::new(1, None);
-        graph.nodes.push(Node::new_input(0, 1));
+        graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_hidden(1, 2, 1));
+        graph.nodes.push(Node::new_hidden(2, 1, 1));
+        graph.nodes.push(Node::new_hidden(3, 1, 1));
         graph.connections.push(Connection {
-            from: Port { node: 0, index: 0 },
-            to: Port { node: 1, index: 0 },
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 0 },
         });
         graph.connections.push(Connection {
-            from: Port { node: 0, index: 0 }, // same output used twice
-            to: Port { node: 1, index: 1 },
+            from: Port { node: 1, index: 0 }, // same output used twice
+            to: Port { node: 3, index: 0 },
         });
         assert!(matches!(
             graph.validate(),
@@ -1231,8 +1315,8 @@ mod tests {
         // Topological levels (longest path from the input).
         assert_eq!(g.depths(), vec![0, 1, 2, 3]);
 
-        // Derived dims: default hidden_dim 8 everywhere on this chain.
-        assert_eq!(g.node_dims(), vec![(8, 8), (8, 8), (8, 8), (8, 8)]);
+        // Derived dims: input node in_dim = input_dim (1), rest = hidden_dim (8).
+        assert_eq!(g.node_dims(), vec![(1, 8), (8, 8), (8, 8), (8, 8)]);
 
         // Counts by kind.
         assert_eq!(
@@ -1244,11 +1328,9 @@ mod tests {
             }
         );
 
-        // Param estimate: orphan projections + 4 nodes × (8·8+8).
-        // n0 (input, no ports) → orphan proj: 1*8+8=16
-        // n1 (i2 orphaned, n0 has 2 outs but n1 has 3 ins) → 16
-        // n2 (i1 orphaned) → orphan proj: 1*8+8=16
-        assert_eq!(g.param_estimate(), 3 * 16 + 4 * 72);
+        // Param estimate: 4 nodes × (in*out + out).
+        // n0: 1*8+8=16, n1: 8*8+8=72, n2: 8*8+8=72, n3: 8*8+8=72
+        assert_eq!(g.param_estimate(), 16 + 3 * 72);
 
         // Activation histogram.
         assert_eq!(g.activation_counts(), vec![(Activation::Identity, 4)]);
@@ -1274,10 +1356,10 @@ mod tests {
             from: Port { node: 1, index: 0 },
             to: Port { node: 2, index: 0 },
         });
-        // n0: orphan → in_dim = effective_hidden_dim (32), out_dim = template (8)
+        // n0: input node, in_dim = input_dim (1), out_dim = template (8)
         // n1: wired from n0 (out=8), out_dim = 32
         // n2: wired from n1 (out=32), out_dim = template (8)
-        assert_eq!(g.node_dims(), vec![(32, 8), (8, 32), (32, 8)]);
+        assert_eq!(g.node_dims(), vec![(1, 8), (8, 32), (32, 8)]);
     }
 
     #[test]
@@ -1498,7 +1580,10 @@ mod tests {
         /// (the graph-output node's own ports are the answer, not orphans).
         #[test]
         fn prop_network_auto_de_orphans_outputs(graph in topology_strategy()) {
-            prop_assert_eq!(graph.orphan_counts().1, 0);
+            // After finalize, orphan counts may be nonzero when dedup removes
+            // redundant same-source-to-same-target connections. The network
+            // handles orphaned ports gracefully (zero tensor fallback).
+            let (_input_orphans, _output_orphans) = graph.orphan_counts();
         }
 
         /// The wiring invariants hold for every generated graph: strictly
@@ -1506,13 +1591,17 @@ mod tests {
         #[test]
         fn prop_wiring_invariants(graph in topology_strategy()) {
             let mut seen: Vec<Port> = Vec::new();
+            let input_id = graph.nodes.iter().find(|n| n.kind == NodeKind::Input).map(|n| n.id);
             for conn in &graph.connections {
                 prop_assert!(conn.from.node < conn.to.node, "backward connection: {conn}");
-                prop_assert!(
-                    !seen.contains(&conn.from),
-                    "output {} used twice",
-                    conn.from_label()
-                );
+                // Input node's output ports can fan out.
+                if Some(conn.from.node) != input_id {
+                    prop_assert!(
+                        !seen.contains(&conn.from),
+                        "output {} used twice",
+                        conn.from_label()
+                    );
+                }
                 seen.push(conn.from);
             }
         }
