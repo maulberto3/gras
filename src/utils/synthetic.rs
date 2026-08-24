@@ -1,4 +1,4 @@
-//! Synthetic datasets 🧪 — generators for every built-in scorer family.
+//! Synthetic datasets  — generators for every built-in scorer family.
 //!
 //! Continuous generators produce targets `[n, 1]`; categorical ones produce
 //! **one-hot** targets `[n, C]`. Every generator has the same signature

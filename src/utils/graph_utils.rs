@@ -1,23 +1,11 @@
-//! Graph diagnostic utilities — shared "nutrition facts" over raw node/connection data.
-//!
-//! These functions operate on slices (`&[Node]`, `&[Connection]`) so both the
-//! blueprint ([`Topology`](crate::topology::Topology) methods) and the
-//! materialized module ([`Network::to_json`](crate::network::Network::to_json))
-//! report the *same* numbers from the *same* code — no drift between what the
-//! topology says and what the built net says.
+//! Graph diagnostic utilities — shared helpers over raw node/connection data.
 
 use std::collections::HashMap;
 
 use crate::node::{Activation, Node, NodeKind};
 use crate::topology::{Connection, KindCounts, Port};
 
-/// Precompute the wiring table: for each node (by id), one entry per input
-/// port — a *list* of source ports feeding it (empty = orphaned, fed by
-/// net_input). A port can hold several wires because de-orphaning stacks
-/// extra sources into already-wired ports; the node combines them all.
-///
-/// Built once at compile/build time so the forward pass resolves each port
-/// in O(1) instead of scanning the connection list.
+/// Precompute wiring table: per node, per port, list of source ports.
 pub(crate) fn build_node_sources(
     connections: &[Connection],
     num_inputs: &[usize],
@@ -46,7 +34,6 @@ pub(crate) fn build_node_sources(
 }
 
 /// Orphaned-port counts `(inputs, outputs)` over raw graph data.
-/// `output_node`'s own output ports are the graph's answer, never orphans.
 pub(crate) fn node_orphan_counts(
     nodes: &[Node],
     connections: &[Connection],
@@ -74,7 +61,7 @@ pub(crate) fn node_orphan_counts(
     (orphaned_inputs, orphaned_outputs)
 }
 
-/// Wired degrees `(in_degree, out_degree)` per node (one count per *wire*).
+/// Wired degrees `(in_degree, out_degree)` per node.
 pub(crate) fn node_degrees(nodes: &[Node], connections: &[Connection]) -> Vec<(usize, usize)> {
     let mut deg = vec![(0usize, 0usize); nodes.len()];
     for c in connections {
@@ -84,7 +71,7 @@ pub(crate) fn node_degrees(nodes: &[Node], connections: &[Connection]) -> Vec<(u
     deg
 }
 
-/// Longest path from an `Input` node per node id — a topological *level*.
+/// Longest path from an Input node per node id.
 pub(crate) fn node_depths(nodes: &[Node], connections: &[Connection]) -> Vec<usize> {
     let mut depth = vec![0usize; nodes.len()];
     for node in nodes {
@@ -119,7 +106,7 @@ pub(crate) fn node_kind_counts(nodes: &[Node]) -> KindCounts {
     counts
 }
 
-/// Activation histogram across nodes: `(activation, count)` pairs.
+/// Activation histogram across nodes.
 pub(crate) fn node_activation_counts(nodes: &[Node]) -> Vec<(Activation, usize)> {
     let mut counts: Vec<(Activation, usize)> = Vec::new();
     for n in nodes {
@@ -132,6 +119,7 @@ pub(crate) fn node_activation_counts(nodes: &[Node]) -> Vec<(Activation, usize)>
     counts
 }
 
+/// Standardize-op histogram across nodes.
 pub(crate) fn node_standardize_counts(nodes: &[Node]) -> Vec<(crate::node::StandardizeOp, usize)> {
     let mut counts: Vec<(crate::node::StandardizeOp, usize)> = Vec::new();
     for n in nodes {

@@ -1,4 +1,4 @@
-//! Hand-written `Display` impls — all formatting in one place. 🖨️
+//! Hand-written `Display` impls — all formatting in one place.
 //!
 //! `Debug` impls are `#[derive(Debug)]` on each type and stay with their
 //! type; only hand-written formatting lives here. The big ASCII renderers
@@ -10,7 +10,7 @@
 use std::fmt::Display;
 
 use crate::engine::EngineOptions;
-use crate::fitness::Direction;
+use crate::fitness::{Direction, FitnessLabel};
 use crate::network::{Network, NetworkOptions};
 use crate::node::{Activation, Node};
 use crate::selection::SelectionMethod;
@@ -130,6 +130,12 @@ impl Display for crate::node::StandardizeOp {
     }
 }
 
+impl Display for FitnessLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl Display for Direction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -141,7 +147,11 @@ impl Display for Direction {
 
 impl Display for KindCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} input · {} hidden · {} output", self.input, self.hidden, self.output)
+        write!(
+            f,
+            "{} input · {} hidden · {} output",
+            self.input, self.hidden, self.output
+        )
     }
 }
 

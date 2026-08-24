@@ -1,4 +1,4 @@
-//! Tensor data I/O — the engine's data contract. 📦
+//! Tensor data I/O — the engine's data contract.
 //!
 //! The engine consumes data as a **path to tensors** (flodl-native; this
 //! crate deals with no other data formats). Since flodl has no built-in

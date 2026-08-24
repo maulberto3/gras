@@ -1,4 +1,4 @@
-//! Custom error types 🛡️ — one enum per domain, all in one place.
+//! Custom error types  — one enum per domain, all in one place.
 //!
 //! Every module's fallible paths build its **typed** error here, then convert
 //! into flodl's [`TensorError`] at the API boundary (the public signatures
@@ -27,7 +27,7 @@ use crate::topology::{Connection, Port};
 // ── Topology ─────────────────────────────────────────────────────────────
 
 /// Why a [`Topology`](crate::topology::Topology) failed
-/// [`Topology::validate`](crate::topology::Topology::validate). 🛡️
+/// [`Topology::validate`](crate::topology::Topology::validate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopologyError {
     /// Node ids aren't 0, 1, 2, ... — they double as array indices, so gaps
@@ -80,7 +80,7 @@ impl Display for TopologyError {
 
 // ── Node ─────────────────────────────────────────────────────────────────
 
-/// Per-node invariant violations. ⚙️
+/// Per-node invariant violations.
 ///
 /// Forward-looking: node constructors and builders are infallible, and
 /// `Activation::apply` delegates to flodl directly — so nothing constructs
@@ -109,7 +109,7 @@ impl Display for NodeError {
 
 // ── Network ──────────────────────────────────────────────────────────────
 
-/// Compiling a blueprint into an executable [`Network`](crate::network::Network). 🏭
+/// Compiling a blueprint into an executable [`Network`](crate::network::Network).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkError {
     /// The blueprint failed
@@ -134,7 +134,7 @@ impl Display for NetworkError {
 
 // ── Engine ───────────────────────────────────────────────────────────────
 
-/// The NAS loop: options, data contract, checkpoints. 🏭
+/// The NAS loop: options, data contract, checkpoints.
 #[derive(Debug)]
 pub enum EngineError {
     /// Options that can't produce a valid run (e.g. `pop_size == 0`).
@@ -166,7 +166,7 @@ impl Display for EngineError {
 
 // ── Data ─────────────────────────────────────────────────────────────────
 
-/// The tensor file / dataset format. 📦
+/// The tensor file / dataset format.
 #[derive(Debug)]
 pub enum DataError {
     /// Filesystem failure while reading or writing a tensor file or dataset
