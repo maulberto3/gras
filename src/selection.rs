@@ -1,4 +1,4 @@
-//! Genetic operators 🧬 — selection first.
+//! Genetic operators  — selection first.
 //!
 //! The engine's `next_generation` needs three steps to actually evolve a
 //! population: **select** parents, **crossover** them, **mutate** the
@@ -29,17 +29,38 @@ impl Default for SelectionMethod {
     }
 }
 
-/// Tournament selection with **elitism** — the engine's parent-picking step.
+impl SelectionMethod {
+    /// Dispatch to the concrete selection algorithm.
+    /// Returns indices into `scores` chosen as the next generation.
+    pub fn apply(
+        &self,
+        scores: &[f32],
+        direction: Direction,
+        rng: &mut fastrand::Rng,
+    ) -> Vec<usize> {
+        match self {
+            Self::Tournament { tournament_size } => {
+                tournament_select(scores, direction, rng, *tournament_size)
+            }
+        }
+    }
+
+    /// Short label for logging (e.g. "tournament(k=3)").
+    pub fn label(&self) -> String {
+        match self {
+            Self::Tournament { tournament_size } => {
+                format!("tournament(k={})", tournament_size)
+            }
+        }
+    }
+}
+
+/// Tournament selection with elitism.
 ///
-/// Returns the indices into `scores` chosen as the next generation's parents
-/// (same length as `scores`). The single best individual under `direction`
-/// is always kept (elitism, index 0 of the result); every other slot is
-/// filled by a `tournament`-way random draw where the best-scoring contestant
-/// wins. Higher tournament sizes pressure selection more toward the fittest.
-///
-/// - Empty `scores` → empty result.
-/// - `tournament` is clamped to at least 1.
-pub fn select(
+/// Returns `scores.len()` indices. The best individual is always kept;
+/// every other slot is a `tournament`-way random draw.
+/// Tournament size is clamped to at least 1.
+fn tournament_select(
     scores: &[f32],
     direction: Direction,
     rng: &mut fastrand::Rng,
@@ -81,51 +102,59 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
-    fn test_select_empty_and_single() {
+    fn test_tournament_select_empty_and_single() {
         let mut rng = fastrand::Rng::with_seed(1);
-        assert!(select(&[], Direction::Minimize, &mut rng, 3).is_empty());
-        let one = select(&[2.5], Direction::Minimize, &mut rng, 3);
+        assert!(tournament_select(&[], Direction::Minimize, &mut rng, 3).is_empty());
+        let one = tournament_select(&[2.5], Direction::Minimize, &mut rng, 3);
         assert_eq!(one, vec![0]);
     }
 
     #[test]
-    fn test_select_elitism_minimize() {
+    fn test_tournament_select_elitism_minimize() {
         let scores = [3.0, 1.0, 4.0, 2.0];
         let mut rng = fastrand::Rng::with_seed(7);
-        let chosen = select(&scores, Direction::Minimize, &mut rng, 2);
+        let chosen = tournament_select(&scores, Direction::Minimize, &mut rng, 2);
         assert_eq!(chosen.len(), scores.len());
-        // The minimum (index 1) is always kept.
         assert!(chosen.contains(&1));
-        // All indices are in range.
         assert!(chosen.iter().all(|&i| i < scores.len()));
     }
 
     #[test]
-    fn test_select_elitism_maximize() {
+    fn test_tournament_select_elitism_maximize() {
         let scores = [3.0, 1.0, 4.0, 2.0];
         let mut rng = fastrand::Rng::with_seed(7);
-        let chosen = select(&scores, Direction::Maximize, &mut rng, 2);
+        let chosen = tournament_select(&scores, Direction::Maximize, &mut rng, 2);
         assert_eq!(chosen.len(), scores.len());
-        // The maximum (index 2) is always kept.
         assert!(chosen.contains(&2));
     }
 
     #[test]
-    fn test_select_tournament_trends_toward_best() {
-        // With a large tournament size, the best should win most slots.
+    fn test_tournament_select_trends_toward_best() {
         let scores: Vec<f32> = (0..8).map(|i| i as f32).collect();
         let mut rng = fastrand::Rng::with_seed(3);
-        let chosen = select(&scores, Direction::Maximize, &mut rng, 8);
-        // Best (index 7) kept by elitism.
+        let chosen = tournament_select(&scores, Direction::Maximize, &mut rng, 8);
         assert!(chosen.contains(&7));
-        // With tournament == n, nearly every draw is a contest including 7.
         let best_count = chosen.iter().filter(|&&i| i == 7).count();
         assert!(best_count >= chosen.len() / 2);
     }
 
+    #[test]
+    fn test_apply_dispatches_tournament() {
+        let method = SelectionMethod::Tournament { tournament_size: 4 };
+        let scores = [5.0, 1.0, 3.0, 2.0];
+        let mut rng = fastrand::Rng::with_seed(9);
+        let chosen = method.apply(&scores, Direction::Minimize, &mut rng);
+        assert_eq!(chosen.len(), 4);
+        assert!(chosen.contains(&1)); // elitism keeps the best
+    }
+
+    #[test]
+    fn test_label() {
+        let m = SelectionMethod::Tournament { tournament_size: 5 };
+        assert_eq!(m.label(), "tournament(k=5)");
+    }
+
     proptest! {
-        /// Selection always returns `scores.len()` in-range indices and
-        /// always keeps the direction's best.
         #[test]
         fn prop_select_preserves_size_and_elitism(
             n in 1usize..12,
@@ -136,7 +165,8 @@ mod tests {
             let mut rng = fastrand::Rng::with_seed(seed);
             let scores: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5 - 2.0).collect();
             let dir = if maximize { Direction::Maximize } else { Direction::Minimize };
-            let chosen = select(&scores, dir, &mut rng, tournament);
+            let method = SelectionMethod::Tournament { tournament_size: tournament };
+            let chosen = method.apply(&scores, dir, &mut rng);
             prop_assert_eq!(chosen.len(), n);
             prop_assert!(chosen.iter().all(|&i| i < n));
             let best = if maximize { n - 1 } else { 0 };
