@@ -25,38 +25,45 @@ fn cat_net() -> Network {
 
 fn main() {
     let blobs = synthetic::synthetic_blobs(64, 7, Device::CPU).unwrap();
-    let cpred = cat_net().forward(&Variable::new(blobs.inputs.clone(), false)).unwrap();
+    let cpred = cat_net()
+        .forward(&Variable::new(blobs.inputs.clone(), false))
+        .unwrap();
     let by = Variable::new(blobs.targets.clone(), false);
 
     // 1. Scoring helpers — public functions.
     println!("═ 1. Scoring helpers ═");
-    println!("  acc   {:.6}", fitness::accuracy_score(&cpred, &by).unwrap());
-    println!("  xent  {:.6}", fitness::cross_entropy_onehot(&cpred, &by).unwrap());
+    println!(
+        "  acc   {:.6}",
+        fitness::accuracy_score(&cpred, &by).unwrap()
+    );
+    println!(
+        "  xent  {:.6}",
+        fitness::cross_entropy_onehot(&cpred, &by).unwrap()
+    );
     println!("  f1    {:.6}", fitness::f1_score(&cpred, &by).unwrap());
 
     // 2. Fitness constructors.
     println!("\n═ 2. Fitness constructors ═");
 
     // Same function for both loss + scoring (loss.item() = score).
-    let mse = Fitness::from_loss(|pred, y| flodl::nn::loss::mse_loss(pred, y));
-    println!("  from_loss(mse)       → score={:.6}", mse.score(&cpred, &by).unwrap());
-
-    // Separate score + loss: accuracy for ranking, cross-entropy for training.
-    let acc_xent = Fitness::new_with_loss(
-        fitness::accuracy_score,
-        fitness::cross_entropy_onehot_loss,
-        Direction::Maximize,   // score direction
-        Direction::Minimize,   // loss direction
-        "accuracy",
+    let mse = Fitness::from_loss(
+        |pred, y| flodl::nn::loss::mse_loss(pred, y),
+        Direction::Minimize,
+        "mse",
     );
-    println!("  new_with_loss(acc,xent) → score={:.6} loss={:.6}",
-        acc_xent.score(&cpred, &by).unwrap(),
-        acc_xent.loss(&cpred, &by).unwrap().item().unwrap());
+    println!(
+        "  from_loss(mse)       → score={:.6}",
+        mse.score(&cpred, &by).unwrap()
+    );
+
+    // TODO: from_loss_with_other — separate ranking + training (placeholder).
+    // Requires multi-objective selection (Pareto or weighted) to avoid
+    // evolution and training drifting apart.
 
     // 3. Train/test split — honest scoring.
     println!("\n═ 3. Train/test split ═");
     println!("  Engine samples non-overlapping train + eval batches.");
-    println!("  Train: fitness.loss() → backward. Eval: fitness.score() → ranking.");
+    println!("  Train: fitness.train_metric() → backward. Eval: fitness.score() → ranking.");
     println!("  Prevents memorization — score reflects generalization.");
 
     // More: r2_score, rmse_score, l1_loss_score, precision_score, f1_from_vecs,

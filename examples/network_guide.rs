@@ -12,13 +12,23 @@ use gras::topology::{CombineOp, Connection, Port, Topology};
 
 fn rand_input(batch: i64, dim: usize) -> Variable {
     Variable::new(
-        Tensor::randn(&[batch, dim as i64], TensorOptions { dtype: DType::Float32, device: Device::CPU }).unwrap(),
+        Tensor::randn(
+            &[batch, dim as i64],
+            TensorOptions {
+                dtype: DType::Float32,
+                device: Device::CPU,
+            },
+        )
+        .unwrap(),
         false,
     )
 }
 
 fn total_params(net: &Network) -> i64 {
-    net.parameters().iter().map(|p| p.variable.data().numel()).sum()
+    net.parameters()
+        .iter()
+        .map(|p| p.variable.data().numel())
+        .sum()
 }
 
 /// A small hand-built chain: input → hidden → output, fully wired.
@@ -27,8 +37,14 @@ fn chain() -> Topology {
     g.nodes.push(Node::new_input(0, 1));
     g.nodes.push(Node::new_hidden(1, 1, 1));
     g.nodes.push(Node::new_output(2, 1, 1));
-    g.connections.push(Connection { from: Port { node: 0, index: 0 }, to: Port { node: 1, index: 0 } });
-    g.connections.push(Connection { from: Port { node: 1, index: 0 }, to: Port { node: 2, index: 0 } });
+    g.connections.push(Connection {
+        from: Port { node: 0, index: 0 },
+        to: Port { node: 1, index: 0 },
+    });
+    g.connections.push(Connection {
+        from: Port { node: 1, index: 0 },
+        to: Port { node: 2, index: 0 },
+    });
     g.refresh_labels();
     g
 }
@@ -47,15 +63,26 @@ fn main() {
     // ── 2. Forward ──────────────────────────────────────────────────────────
     println!("═ 2. Forward — shapes across batches ═");
     for batch in [1i64, 4, 16] {
-        let out = net.forward(&rand_input(batch, random.options.input_dim)).unwrap();
-        println!("  batch {batch:<2}: [batch, {}] -> {:?}", random.options.hidden_dim, out.shape());
+        let out = net
+            .forward(&rand_input(batch, random.options.input_dim))
+            .unwrap();
+        println!(
+            "  batch {batch:<2}: [batch, {}] -> {:?}",
+            random.options.hidden_dim,
+            out.shape()
+        );
     }
     println!();
 
     // ── 3. Parameters + derived dims ────────────────────────────────────────
     println!("═ 3. Parameters + derived dims ═");
     for p in &net.parameters() {
-        println!("  {:<22} {:?} ({} elements)", p.name, p.variable.data().shape(), p.variable.data().numel());
+        println!(
+            "  {:<22} {:?} ({} elements)",
+            p.name,
+            p.variable.data().shape(),
+            p.variable.data().numel()
+        );
     }
     println!("  total learnable elements: {}", total_params(&net));
     // Widen the middle node → downstream dims re-derive automatically.
@@ -63,9 +90,11 @@ fn main() {
     wide.nodes[1].hidden_dim = Some(32);
     wide.validate().unwrap();
     let wide_net = Network::build(&wide, Device::CPU).unwrap();
-    println!("  chain with hidden_dim 32: {} → {} elements",
+    println!(
+        "  chain with hidden_dim 32: {} → {} elements",
         total_params(&Network::build(&chain(), Device::CPU).unwrap()),
-        total_params(&wide_net));
+        total_params(&wide_net)
+    );
     println!();
 
     // ── 4. Combine ops ──────────────────────────────────────────────────────
@@ -76,24 +105,40 @@ fn main() {
         g.nodes.push(Node::new_hidden(1, 1, 1));
         g.nodes.push(Node::new_output(2, 2, 1));
         g.nodes[1].combine_op = Some(op);
-        g.connections.push(Connection { from: Port { node: 0, index: 0 }, to: Port { node: 2, index: 0 } });
-        g.connections.push(Connection { from: Port { node: 1, index: 0 }, to: Port { node: 2, index: 1 } });
+        g.connections.push(Connection {
+            from: Port { node: 0, index: 0 },
+            to: Port { node: 2, index: 0 },
+        });
+        g.connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 1 },
+        });
         g
     };
     for op in [CombineOp::Add, CombineOp::Mean] {
         let g = fan_in(op);
         g.validate().unwrap();
-        let out = Network::build(&g, Device::CPU).unwrap()
-            .forward(&rand_input(2, g.options.input_dim)).unwrap();
-        println!("  {op:?}: header shows `combine: {op:?}`, forward {:?} ✓", out.shape());
+        let out = Network::build(&g, Device::CPU)
+            .unwrap()
+            .forward(&rand_input(2, g.options.input_dim))
+            .unwrap();
+        println!(
+            "  {op:?}: header shows `combine: {op:?}`, forward {:?} ✓",
+            out.shape()
+        );
     }
     // Per-node mix: hidden uses Add, output uses Mean.
     let mut g = fan_in(CombineOp::Add);
     g.nodes[2].combine_op = Some(CombineOp::Mean);
     g.validate().unwrap();
-    let out = Network::build(&g, Device::CPU).unwrap()
-        .forward(&rand_input(2, g.options.input_dim)).unwrap();
-    println!("  per-node mix: hidden=Add, output=Mean → forward {:?} ✓", out.shape());
+    let out = Network::build(&g, Device::CPU)
+        .unwrap()
+        .forward(&rand_input(2, g.options.input_dim))
+        .unwrap();
+    println!(
+        "  per-node mix: hidden=Add, output=Mean → forward {:?} ✓",
+        out.shape()
+    );
     println!("  Add sums incoming tensors; Mean averages them\n");
 
     // ── 5. Rebuild + uniqueness ─────────────────────────────────────────────
@@ -101,11 +146,18 @@ fn main() {
     let a = Network::build(&random, Device::CPU).unwrap();
     let b = Network::build(&random, Device::CPU).unwrap();
     assert_ne!(a.name(), b.name());
-    println!("  two builds get distinct names: {} vs {}", a.name(), b.name());
+    println!(
+        "  two builds get distinct names: {} vs {}",
+        a.name(),
+        b.name()
+    );
     let json = random.to_json().unwrap();
     let rebuilt = Network::build(&Topology::from_json(&json).unwrap(), Device::CPU).unwrap();
     assert_eq!(rebuilt.parameters().len(), a.parameters().len());
-    println!("  JSON round-trip → {} param tensors (same arch, fresh weights)\n", rebuilt.parameters().len());
+    println!(
+        "  JSON round-trip → {} param tensors (same arch, fresh weights)\n",
+        rebuilt.parameters().len()
+    );
 
     // ── 6. Devices ──────────────────────────────────────────────────────────
     println!("═ 6. Devices ═");

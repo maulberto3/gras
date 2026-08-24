@@ -14,7 +14,14 @@ use gras::topology::{Topology, TopologyOptions};
 
 fn rand_input(batch: i64, input_dim: usize) -> Variable {
     Variable::new(
-        Tensor::randn(&[batch, input_dim as i64], TensorOptions { dtype: DType::Float32, device: Device::CPU }).unwrap(),
+        Tensor::randn(
+            &[batch, input_dim as i64],
+            TensorOptions {
+                dtype: DType::Float32,
+                device: Device::CPU,
+            },
+        )
+        .unwrap(),
         false,
     )
 }
@@ -24,8 +31,11 @@ fn summarize(name: &str, g: &Topology) {
     let (oi, oo) = g.orphan_counts();
     let pi: usize = g.nodes.iter().map(|n| n.num_inputs).sum();
     let po: usize = g.nodes.iter().map(|n| n.num_outputs).sum();
-    println!("  {name}: {} nodes · {pi} in-ports · {po} out-ports · {} wires · {oi} orphan-in / {oo} orphan-out · valid ✓\n",
-        g.nodes.len(), g.connections.len());
+    println!(
+        "  {name}: {} nodes · {pi} in-ports · {po} out-ports · {} wires · {oi} orphan-in / {oo} orphan-out · valid ✓\n",
+        g.nodes.len(),
+        g.connections.len()
+    );
 }
 
 fn main() {
@@ -40,15 +50,23 @@ fn main() {
     let net = Network::build(&graph, Device::CPU).unwrap();
     let input = rand_input(2, graph.options.input_dim);
     let output = net.forward(&input).unwrap();
-    println!("  forward: {:?} -> {:?} ({} param tensors)\n",
-        input.shape(), output.shape(), net.parameters().len());
+    println!(
+        "  forward: {:?} -> {:?} ({} param tensors)\n",
+        input.shape(),
+        output.shape(),
+        net.parameters().len()
+    );
 
     // ── 2. Hand-built graph ──────────────────────────────────────────────────
     println!("═ 2. Hand-built graph ═");
     let mut manual = Topology::new(1, None);
     manual.nodes.push(Node::new_input(0, 2));
-    manual.nodes.push(Node::new_hidden(1, 3, 2).with_activation(Activation::GeLU));
-    manual.nodes.push(Node::new_hidden(2, 2, 1).with_hidden_dim(32));
+    manual
+        .nodes
+        .push(Node::new_hidden(1, 3, 2).with_activation(Activation::GeLU));
+    manual
+        .nodes
+        .push(Node::new_hidden(2, 2, 1).with_hidden_dim(32));
     manual.nodes.push(Node::new_output(3, 1, 1));
     manual.refresh_labels();
     manual.finalize();
@@ -59,7 +77,10 @@ fn main() {
     println!("═ 3. Random generation + scaffolding ═");
     let mut bare = Topology::new(5, None);
     bare.create_random_hidden_nodes(2);
-    println!("  hidden-only: {} nodes, no Input/Output yet", bare.nodes.len());
+    println!(
+        "  hidden-only: {} nodes, no Input/Output yet",
+        bare.nodes.len()
+    );
     bare.ensure_scaffold();
     bare.refresh_labels();
     bare.finalize();
@@ -76,18 +97,27 @@ fn main() {
             node.activation = pool[rng.usize(0..pool.len())];
         }
     }
-    let acts: Vec<String> = graph.nodes.iter()
+    let acts: Vec<String> = graph
+        .nodes
+        .iter()
         .filter(|n| n.kind == NodeKind::Hidden)
-        .map(|n| n.activation.to_string()).collect();
+        .map(|n| n.activation.to_string())
+        .collect();
     println!("  inline pool draw → hidden acts: [{}]\n", acts.join(", "));
 
     // ── 5. Custom options ────────────────────────────────────────────────────
     println!("═ 5. Custom options ═");
     let opts = TopologyOptions {
-        seed: 42, min_hidden_num_nodes: 2, max_hidden_num_nodes: 5,
-        min_hidden_inputs_per_node: 2, max_hidden_inputs_per_node: 3,
-        min_hidden_outputs_per_node: 2, max_hidden_outputs_per_node: 3,
-        input_dim: 4, hidden_dim: 16, output_dim: 2,
+        seed: 42,
+        min_hidden_num_nodes: 2,
+        max_hidden_num_nodes: 5,
+        min_hidden_inputs_per_node: 2,
+        max_hidden_inputs_per_node: 3,
+        min_hidden_outputs_per_node: 2,
+        max_hidden_outputs_per_node: 3,
+        input_dim: 4,
+        hidden_dim: 16,
+        output_dim: 2,
     };
     let mut custom = Topology::new(3, Some(opts));
     custom.create_random_hidden_nodes(4);
