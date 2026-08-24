@@ -1,72 +1,89 @@
-//! The node type — the "compute box" 🧮 at the heart of every gras graph.
+//! The node type  — pure metadata (ports, kind, dim, activation).
 //!
-//! A [`Node`] is **pure metadata** (port counts, kind, optional dim/activation
-//! override) — it holds no tensors. Execution only happens once the graph is
-//! compiled into a [`Network`](crate::network::Network); see the
-//! full pipeline in [`crate::topology`]. This file is step 2 of it:
-//!
-//! ```text
-//!   1. Topology::new            empty blueprint + options
-//!   2. Node::new_* (here)    define the compute boxes (ids stay contiguous)
-//!   3. refresh_labels  one label per port (rendering)
-//!   4. finalize        scaffold Input/Output, wire ports + auto-de-orphan
-//!   5. validate              check wiring is executable
-//!   6. Network::build      one Linear per node + input projection
-//!   7. forward               per node: gather → combine → linear → activation
-//! ```
-//!
-//! The **NAS evolution knobs** live on [`Node`] too: [`Node::hidden_dim`]
-//! (per-node channel width), [`Node::activation`] (which activation runs
-//! after the linear) and [`Node::combine_op`] (how this node merges its
-//! incoming tensors, overriding the graph default).
-//! [`crate::topology::Topology::validate`] enforces the
-//! invariants that keep execution simple (contiguous ids, forward-only 1:1
-//! wiring, consistent dims).
+//! Nodes hold no tensors; execution happens in
+//! [`Network`](crate::network::Network). The NAS knobs live here:
+//! `hidden_dim`, `activation`, `combine_op`, `standardize`.
 
 use flodl::Variable;
 use serde::{Deserialize, Serialize};
 
-use crate::topology::CombineOp;
+/// How multiple incoming tensors are combined before the node transforms them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CombineOp {
+    /// Sum of incoming tensors.
+    Add,
+    /// Average of incoming tensors.
+    Mean,
+    /// Element-wise maximum across incoming tensors.
+    Max,
+    /// Element-wise minimum across incoming tensors.
+    Min,
+}
 
-/// Activation function applied after a node's linear transform. 🧠
-///
-/// The variants map 1:1 to flodl's `Variable` activation ops, so adding a new
-/// one is a single match arm. `Identity` (no activation) is the default and
-/// preserves the original linear-only behaviour.
-///
-/// This is the knob NAS evolution will mutate later: a random graph can be
-/// grown not only by rewiring nodes but also by swapping per-node activations
-/// (ReLU, GeLU, SELU, ...).
+impl CombineOp {
+    /// Apply this combine operation to a slice of tensors.
+    pub fn apply(&self, tensors: &[Variable]) -> flodl::tensor::Result<Variable> {
+        match self {
+            CombineOp::Add => {
+                let mut result = tensors[0].clone();
+                for t in &tensors[1..] {
+                    result = result.add(t)?;
+                }
+                Ok(result)
+            }
+            CombineOp::Mean => {
+                let sum = CombineOp::Add.apply(tensors)?;
+                sum.mul_scalar(1.0 / tensors.len() as f64)
+            }
+            CombineOp::Max => {
+                let mut result = tensors[0].clone();
+                for t in &tensors[1..] {
+                    result = result.maximum(t)?;
+                }
+                Ok(result)
+            }
+            CombineOp::Min => {
+                let mut result = tensors[0].clone();
+                for t in &tensors[1..] {
+                    result = result.minimum(t)?;
+                }
+                Ok(result)
+            }
+        }
+    }
+}
+
+/// Activation applied after a node's linear transform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Activation {
-    /// No activation — pure linear. Default.
+    /// No activation -- pure linear.
     #[default]
     Identity,
-    /// Rectified Linear Unit.
+    /// max(0, x) -- sparse, efficient.
     ReLU,
-    /// Gaussian Error Linear Unit.
+    /// x * Phi(x) -- smooth ReLU approximation.
     GeLU,
-    /// Sigmoid Linear Unit (SiLU / Swish).
+    /// x * sigmoid(x) -- self-gated, smooth.
     SiLU,
-    /// Scaled Exponential Linear Unit.
+    /// Self-normalizing ELU -- preserves mean/variance.
     SELU,
-    /// Hyperbolic tangent.
+    /// Hyperbolic tangent -- output in (-1, 1).
     Tanh,
-    /// Logistic sigmoid.
+    /// 1/(1+e^-x) -- output in (0, 1), for gating.
     Sigmoid,
-    /// Mish.
+    /// x * tanh(softplus(x)) -- smooth, non-monotonic.
     Mish,
-    /// Leaky Rectified Linear Unit (negative_slope = 0.01).
+    /// max(0.01x, x) -- leaky ReLU with slope 0.01.
     LeakyReLU,
-    /// Exponential Linear Unit (alpha = 1.0).
+    /// x if x>0, else e^x - 1 -- smooth negative branch.
     ELU,
-    /// Tanh approximation of GeLU.
+    /// GeLU via tanh approximation -- faster than exact GeLU.
     GeluTanh,
-    /// Smooth approximation of ReLU (beta = 1.0, threshold = 20.0).
+    /// log(1 + e^x) -- smooth ReLU, always positive.
     Softplus,
-    /// MobileNet's hard swish: x · hard_sigmoid(x).
+    /// x * ReLU6(x+3)/6 -- efficient GeLU variant.
     HardSwish,
-    /// Piecewise-linear sigmoid approximation.
+    /// ReLU6(x+3)/6 -- efficient Sigmoid approximation.
     HardSigmoid,
 }
 
@@ -92,11 +109,7 @@ impl Activation {
     }
 }
 
-/// Normalization applied **after** the linear layer and **before** the
-/// activation. Part of the per-node NAS evolution knobs — the engine
-/// samples from a pool and each node can have a different choice.
-////// `LayerNorm` normalizes across the feature dimension (same behavior
-/// train/eval, no running stats). `Identity` skips normalization.
+/// Normalization after linear, before activation. Part of per-node NAS knobs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StandardizeOp {
     /// No normalization — the linear output passes straight to activation.
@@ -107,11 +120,7 @@ pub enum StandardizeOp {
 }
 
 impl StandardizeOp {
-    /// Apply this standardize op to a tensor.
-    ///
-    /// `LayerNorm` normalizes to zero-mean/unit-variance across the feature
-    /// dimension — no learnable parameters, pure normalization. This is a
-    /// "standardize" layer (like z-score), not a trainable `nn::LayerNorm`.
+    /// Apply this standardize op. LayerNorm = z-score, no learnable params.
     pub fn apply(&self, x: &Variable) -> flodl::tensor::Result<Variable> {
         match self {
             StandardizeOp::Identity => Ok(x.clone()),
@@ -128,26 +137,13 @@ impl StandardizeOp {
     }
 }
 
-/// A node in the computational graph — a tiny "compute box" 🧮.
-///
-/// It receives `num_inputs` tensors, combines them, transforms them with its
-/// layer, applies its activation, and exposes `num_outputs` tensors for other
-/// nodes to consume.
-///
-/// **Invariants** (enforced by [`crate::topology::Topology::validate`]):
-///   - `id` is both identity AND execution order: ids are contiguous `0..n`
-///     and double as array indices into `Network.layers`
-///   - `num_inputs == 0` for input nodes — they are fed the network input
-///   - `hidden_dim` optionally overrides the graph's default channel count
-///     for this node's layer output
-///   - `activation` runs after the node's linear transform
-///   - each input port may hold **several wires** (de-orphaning stacks extra
-///     sources); all incoming tensors are combined with Add/Mean
+/// A node in the computational graph . Receives tensors, transforms,
+/// applies activation, exposes outputs. Invariants enforced by `Topology::validate`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
-    pub id: usize,          // 🏷️ unique id; also execution order (0 runs first)
-    pub num_inputs: usize,  // 🔽 how many input ports this node has
-    pub num_outputs: usize, // 🔼 how many output ports this node has
+    pub id: usize,          //  unique id; also execution order (0 runs first)
+    pub num_inputs: usize,  //  how many input ports this node has
+    pub num_outputs: usize, //  how many output ports this node has
     pub kind: NodeKind,     // role: Input / Hidden / Output
     /// Per-node feature-dimension override for the layer's *output*
     /// (`None` = inherit the graph's `hidden_dim`). The layer's *input* dim
@@ -165,18 +161,22 @@ pub struct Node {
     /// activation (`None` = inherit the graph's `standardize_op`).
     #[serde(default)]
     pub standardize: Option<StandardizeOp>,
+    /// Recurrent flag: when true, this hidden node feeds its output back
+    /// as an additional input for `num_recurrence_steps` steps (BPTT).
+    /// Constraint: `in_dim == out_dim` for recurrent nodes.
+    #[serde(default)]
+    pub recurrent: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum NodeKind {
-    Input,  // 📥 start of the network: no inputs, feeds the rest
-    Hidden, // 🕶️ middle of the network: combine -> transform -> pass on
-    Output, // 📤 end of the network: its output becomes the network output
+    Input,  //  start of the network: no inputs, feeds the rest
+    Hidden, //  middle of the network: combine -> transform -> pass on
+    Output, //  end of the network: its output becomes the network output
 }
 
 impl Node {
-    /// 📥 Create an input node: 0 inputs (it is fed by the network input
-    /// tensor) and `num_outputs` outputs to hand out to other nodes.
+    ///  Create an input node: 0 inputs, `num_outputs` outputs.
     pub fn new_input(id: usize, num_outputs: usize) -> Self {
         Node {
             id,
@@ -187,11 +187,11 @@ impl Node {
             activation: Activation::Identity,
             combine_op: None,
             standardize: None,
+            recurrent: false,
         }
     }
 
-    /// 🕶️ Create a hidden node: `num_inputs` inputs to combine/transform,
-    /// then `num_outputs` outputs to pass on.
+    ///  Create a hidden node.
     pub fn new_hidden(id: usize, num_inputs: usize, num_outputs: usize) -> Self {
         Node {
             id,
@@ -202,11 +202,11 @@ impl Node {
             activation: Activation::Identity,
             combine_op: None,
             standardize: None,
+            recurrent: false,
         }
     }
 
-    /// 📤 Create an output node: `num_inputs` inputs (its result becomes the
-    /// network output) and `num_outputs` outputs.
+    ///  Create an output node.
     pub fn new_output(id: usize, num_inputs: usize, num_outputs: usize) -> Self {
         Node {
             id,
@@ -217,32 +217,32 @@ impl Node {
             activation: Activation::Identity,
             combine_op: None,
             standardize: None,
+            recurrent: false,
         }
     }
 
-    /// Set the activation for hand-built graphs (builder style). 🧠
-    ///
-    /// The constructors default to [`Activation::Identity`]; NAS evolution
-    /// mutates `activation` in place, while hand-written graphs can chain
-    /// this instead:
-    /// `Node::new_hidden(1, 3, 2).with_activation(Activation::GeLU)`.
+    /// Set activation (builder style).
     pub fn with_activation(mut self, activation: Activation) -> Self {
         self.activation = activation;
         self
     }
 
-    /// Set the combine-op override for hand-built graphs (builder style):
-    /// `Node::new_hidden(1, 2, 2).with_combine_op(CombineOp::Mean)` merges
-    /// this node's incoming tensors with Mean instead of the graph default.
+    /// Set combine-op override (builder style).
     pub fn with_combine_op(mut self, combine_op: CombineOp) -> Self {
         self.combine_op = Some(combine_op);
         self
     }
 
-    /// Set the per-node channel-width override for hand-built graphs
-    /// (builder style). `None` inherits the graph's `hidden_dim`.
+    /// Set per-node channel-width override (builder style).
     pub fn with_hidden_dim(mut self, hidden_dim: usize) -> Self {
         self.hidden_dim = Some(hidden_dim);
+        self
+    }
+
+    /// Set recurrent flag (builder style). Recurrent nodes feed output
+    /// back as additional input (requires in_dim == out_dim).
+    pub fn with_recurrent(mut self, recurrent: bool) -> Self {
+        self.recurrent = recurrent;
         self
     }
 }
@@ -268,7 +268,8 @@ mod tests {
                 hidden_dim: None,
                 activation: Activation::Identity,
                 combine_op: None,
-            standardize: None,
+                standardize: None,
+                recurrent: false,
             },
         )
     }
