@@ -8,7 +8,7 @@
 //! - `Serialize` / `Deserialize` impls for [`Topology`] that convert through
 //!   [`Spec`]
 //!
-//! # Reproducibility 🎲
+//! # Reproducibility
 //!
 //! The RNG is **re-seeded from `options.seed`** on load, so a loaded graph
 //! regenerates wiring identically to a fresh graph with the same options
@@ -124,7 +124,13 @@ impl NetworkFacts {
             num_wires: net.connections.len(),
             param_tensors: params.len(),
             param_elements,
-            port_projections: net.port_projections.iter().flatten().flatten().filter(|p| p.is_some()).count(),
+            port_projections: net
+                .port_projections
+                .iter()
+                .flatten()
+                .flatten()
+                .filter(|p| p.is_some())
+                .count(),
             node_dims: net.node_dims.clone(),
             degrees: graph_utils::node_degrees(&net.nodes, &net.connections),
             depths: graph_utils::node_depths(&net.nodes, &net.connections),
@@ -155,8 +161,9 @@ impl NetworkFacts {
             "activation_counts": self.activation_counts,
             "standardize_counts": self.standardize_counts,
         });
-        serde_json::to_string_pretty(&spec)
-            .map_err(|e| crate::utils::error::NetworkError::Json(format!("network facts: {e}")).into())
+        serde_json::to_string_pretty(&spec).map_err(|e| {
+            crate::utils::error::NetworkError::Json(format!("network facts: {e}")).into()
+        })
     }
 }
 
