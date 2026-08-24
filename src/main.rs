@@ -1,4 +1,4 @@
-//! 🧬 gras — the minimal pipeline, now engine-driven.
+//!  gras — the minimal pipeline, now engine-driven.
 //!
 //! The tight loop (random graph → wire → validate → build → forward) used to
 //! live here by hand; the engine owns it now. This file shows the whole crate
@@ -10,7 +10,7 @@
 //!
 //! Run with: `source env_setup.sh && cargo run`
 //!
-//! ── ✅ what the crate offers today ─────────────────────────────────────────
+//! ──  what the crate offers today ─────────────────────────────────────────
 //! • random topologies from ONE seed — a deterministic chain seeds every
 //!   individual (the resolved `run_seed` is recorded in engine.json, so any
 //!   run is reproducible)
@@ -49,7 +49,7 @@ use std::io::Write;
 use flodl::Device;
 
 use gras::data;
-use gras::engine::{Engine, EngineOptions, Direction, Fitness};
+use gras::engine::{CrossoverKind, Direction, Engine, EngineOptions, Fitness};
 use gras::selection::SelectionMethod;
 
 fn main() {
@@ -87,22 +87,29 @@ fn main() {
         .set_num_threads(1)
         .set_results_dir("results")
         // ── GP Algo (per-individual randomization) ───────────────────
-        .set_pop_size(1000)
-        .set_num_generations(1)
-        .set_mutate_activ_prob(0.0)
+        .set_pop_size(100)
+        .set_num_generations(10)
+        .set_mutate_activ_prob(0.1)
+        .set_mutate_recurrent_prob(0.1)
+        .set_mutate_dim_prob(0.1)
+        .set_mutate_combine_prob(0.1)
+        .set_mutate_standardize_prob(0.1)
+        // .set_recurrent(false) // even if true, not yet wired into the loop (TODO)
+        // .set_recurrent_prob(0.3)
+        .set_crossover_pool(vec![CrossoverKind::TwoPoint])
         .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
         // ── GP pools (per-node randomization) ────────────────────────
-        .set_hidden_dim_pool(8..=16)      // variable per-node output width
+        .set_hidden_dim_pool(8..=16) // variable per-node output width
         // ── GP pools: omit to use ALL built-in ops available ────────
         // .set_combine_op_pool(vec![CombineOp::Add, CombineOp::Mean])
         // .set_activation_pool(vec![Activation::ReLU, Activation::GeLU])
         // .set_standardize_op_pool(vec![StandardizeOp::LayerNorm])
         // ── Topology (blueprint) ──────────────────────────────────────
-        .set_min_hidden_num_nodes(1)
+        .set_min_hidden_num_nodes(3)
         .set_max_hidden_num_nodes(10)
-        .set_min_hidden_inputs_per_node(1)
+        .set_min_hidden_inputs_per_node(3)
         .set_max_hidden_inputs_per_node(10)
-        .set_min_hidden_outputs_per_node(1)
+        .set_min_hidden_outputs_per_node(3)
         .set_max_hidden_outputs_per_node(10)
         // ── Evaluation budget ─────────────────────────────────────────
         .set_num_batches(16) // 16 random batches per gen
@@ -113,6 +120,7 @@ fn main() {
         .set_learning_rate(1e-3)
         .set_optimizer(gras::trainer::OptimizerKind::Adam)
         .set_grad_clip(1.0)
+        .set_dropout_prob(0.05)
         // ── Build ─────────────────────────────────────────────────────
         .build()
         .unwrap();
@@ -122,12 +130,14 @@ fn main() {
     //    is logged by the engine — this file is intentionally minimal.
     // Accuracy for ranking (↑), cross-entropy for training (↓).
     let mut engine = Engine::new(
-        opts, data_dir,
+        opts,
+        data_dir,
         Fitness::from_loss(
             gras::fitness::cross_entropy_onehot_loss,
             Direction::Minimize,
             "cross_entropy",
-        )
-    ).unwrap();
+        ),
+    )
+    .unwrap();
     engine.run().unwrap();
 }
