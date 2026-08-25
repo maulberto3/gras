@@ -1,4 +1,4 @@
-//! 🚀 Quick showcase — grasp in one shot.
+//! Quick showcase — gras in one shot.
 //!
 //! Run: `source env_setup.sh && cargo run --example quick_showcase`
 
