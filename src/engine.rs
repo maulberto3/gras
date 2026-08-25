@@ -4,9 +4,7 @@
 //! reused per individual per generation. Replicate via
 //! Engine::to_json -> Topology::from_json + Network::build.
 
-use std::collections::hash_map::DefaultHasher;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -17,7 +15,9 @@ use log::debug;
 use rayon::prelude::*;
 use serde::Serialize;
 
+pub use crate::crossover::CrossoverKind;
 pub use crate::fitness::{Direction, Fitness, FitnessLabel};
+pub use crate::mutation::MutationKind;
 use crate::network::{Network, NetworkOptions};
 use crate::node::{Activation, NodeKind};
 use crate::selection::SelectionMethod;
@@ -25,28 +25,16 @@ use crate::topology::{CombineOp, Topology, TopologyOptions};
 use crate::utils::data::Dataset;
 use crate::utils::error::EngineError;
 
-// ── Crossover operators ───────────────────────────────────────────────────
 
-/// Crossover strategy for combining two parent topologies.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub enum CrossoverKind {
-    TwoPoint,
-}
-
-impl std::fmt::Display for CrossoverKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CrossoverKind::TwoPoint => write!(f, "two_point"),
-        }
-    }
-}
 
 // ── EngineOptions -- the experiment configuration ──────────────────────────
 
 /// Run configuration -- serialized to engine.json for reproducibility.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EngineOptions {
+    // 
     pub pop_size: usize,
+    // 
     pub num_generations: usize,
     /// Population base seed. None -> random per run, recorded as run_seed.
     pub seed: Option<u64>,
@@ -64,42 +52,41 @@ pub struct EngineOptions {
     pub num_batches: usize,
     /// Rows per batch.
     pub batch_size: usize,
+    // 
     pub fitness_label: FitnessLabel,
+    // 
     pub train_metric_label: FitnessLabel,
     /// Threads for parallel eval (0 = rayon default).
     pub num_threads: usize,
     pub results_dir: PathBuf,
-    /// Per-individual activation mutation probability (0.0 = off).
-    pub mutate_activ_prob: f32,
-    /// Probability of toggling recurrent on eligible hidden nodes (num_in == num_out).
-    pub mutate_recurrent_prob: f32,
-    /// Probability of mutating hidden_dim per node.
-    pub mutate_dim_prob: f32,
-    /// Probability of mutating combine_op per node.
-    pub mutate_combine_prob: f32,
-    /// Probability of mutating standardize_op per node.
-    pub mutate_standardize_prob: f32,
     /// Training config applied to every individual before scoring.
     pub training: crate::trainer::TrainingConfig,
     /// Selection strategy for the next generation.
     pub selection: SelectionMethod,
-    /// Crossover strategies. Empty -> [TwoPoint].
-    pub crossover_pool: Vec<CrossoverKind>,
+    /// Crossover strategy.
+    pub crossover: CrossoverKind,
+    /// Mutation strategy.
+    pub mutation: MutationKind,
     /// Network execution options (device, dtype, seed).
     pub network: NetworkOptions,
     /// Dropout probability for hidden nodes (0.0 = no dropout).
     pub dropout_prob: f32,
-    /// Enable recurrent hidden nodes (feed output back as additional input).
+    /// Enable recurrent hidden nodes (placeholder, not yet wired).
     /// Default: false.
     pub recurrent: bool,
-    /// Probability of toggling recurrent on eligible hidden nodes.
-    pub recurrent_prob: f32,
     /// Detach gradients between generations (stop BPTT across gen boundary).
     /// Default: false.
     pub detach: bool,
     /// Sample batches proportional to target class frequency (categorical data).
     /// Default: false (uniform random sampling).
-    pub proportional_batches: bool,
+    pub y_proportional_batches: bool,
+    /// Deduplicate population by full topology comparison.
+    /// Applied after create_population and after select each generation.
+    /// Default: true.
+    pub dedup_pop: bool,
+    /// Print progress every N individuals during evaluation.
+    /// 0 = no progress output. Default: 50.
+    pub progress_interval: usize,
 }
 
 impl Default for EngineOptions {
@@ -119,21 +106,17 @@ impl Default for EngineOptions {
             train_metric_label: FitnessLabel::default(),
             num_threads: 1,
             results_dir: PathBuf::from("results"),
-            mutate_activ_prob: 0.1,
-            mutate_recurrent_prob: 0.1,
-            mutate_dim_prob: 0.1,
-            mutate_combine_prob: 0.1,
-            mutate_standardize_prob: 0.1,
-
             training: crate::trainer::TrainingConfig::default(),
             selection: SelectionMethod::default(),
-            crossover_pool: vec![],
+            crossover: CrossoverKind::default(),
+            mutation: MutationKind::default(),
             network: NetworkOptions::default(),
             dropout_prob: 0.05,
             recurrent: false,
-            recurrent_prob: 0.3f32,
             detach: false,
-            proportional_batches: false,
+            y_proportional_batches: false,
+            dedup_pop: true,
+            progress_interval: 50,
         }
     }
 }
@@ -233,10 +216,6 @@ impl EngineOptionsBuilder {
         self.inner.results_dir = p.into();
         self
     }
-    pub fn set_mutate_activ_prob(mut self, p: f32) -> Self {
-        self.inner.mutate_activ_prob = p.clamp(0.0, 1.0);
-        self
-    }
     pub fn set_selection(mut self, method: SelectionMethod) -> Self {
         self.inner.selection = method;
         self
@@ -247,7 +226,7 @@ impl EngineOptionsBuilder {
         self.inner.training.num_epochs = n;
         self
     }
-    pub fn set_learning_rate(mut self, lr: f64) -> Self {
+    pub fn set_learning_rate(mut self, lr: f32) -> Self {
         self.inner.training.learning_rate = lr;
         self
     }
@@ -255,7 +234,7 @@ impl EngineOptionsBuilder {
         self.inner.training.optimizer = kind;
         self
     }
-    pub fn set_grad_clip(mut self, max_norm: f64) -> Self {
+    pub fn set_grad_clip(mut self, max_norm: f32) -> Self {
         self.inner.training.grad_clip = max_norm;
         self
     }
@@ -267,36 +246,28 @@ impl EngineOptionsBuilder {
         self.inner.recurrent = on;
         self
     }
-    pub fn set_recurrent_prob(mut self, p: f32) -> Self {
-        self.inner.recurrent_prob = p.clamp(0.0, 1.0);
-        self
-    }
-    pub fn set_mutate_recurrent_prob(mut self, p: f32) -> Self {
-        self.inner.mutate_recurrent_prob = p.clamp(0.0, 1.0);
-        self
-    }
-    pub fn set_mutate_dim_prob(mut self, p: f32) -> Self {
-        self.inner.mutate_dim_prob = p.clamp(0.0, 1.0);
-        self
-    }
-    pub fn set_mutate_combine_prob(mut self, p: f32) -> Self {
-        self.inner.mutate_combine_prob = p.clamp(0.0, 1.0);
-        self
-    }
-    pub fn set_mutate_standardize_prob(mut self, p: f32) -> Self {
-        self.inner.mutate_standardize_prob = p.clamp(0.0, 1.0);
-        self
-    }
-    pub fn set_crossover_pool(mut self, pool: Vec<CrossoverKind>) -> Self {
-        self.inner.crossover_pool = pool;
-        self
-    }
     pub fn set_detach(mut self, on: bool) -> Self {
         self.inner.detach = on;
         self
     }
-    pub fn set_proportional_batches(mut self, on: bool) -> Self {
-        self.inner.proportional_batches = on;
+    pub fn set_y_proportional_batches(mut self, on: bool) -> Self {
+        self.inner.y_proportional_batches = on;
+        self
+    }
+    pub fn set_crossover(mut self, kind: CrossoverKind) -> Self {
+        self.inner.crossover = kind;
+        self
+    }
+    pub fn set_mutation(mut self, kind: MutationKind) -> Self {
+        self.inner.mutation = kind;
+        self
+    }
+    pub fn set_dedup_pop(mut self, on: bool) -> Self {
+        self.inner.dedup_pop = on;
+        self
+    }
+    pub fn set_progress_interval(mut self, n: usize) -> Self {
+        self.inner.progress_interval = n;
         self
     }
 
@@ -389,11 +360,71 @@ pub struct Engine {
     pub(crate) data_path: PathBuf,
     pub generation: usize,
     pub best: Option<BestIndividual>,
-    pub(crate) improvements: usize,
-    last_improvement_hash: Option<u64>,
-    last_improvement_prefix: Option<String>,
+
+
     scores: Vec<f32>,
     eval_losses: Vec<Option<f32>>,
+}
+
+// ── Progress tracker — periodic stdout updates during evaluation ─────────
+
+struct ProgressTracker {
+    done: std::sync::atomic::AtomicUsize,
+    best_bits: std::sync::atomic::AtomicU32,
+    interval: usize,
+    generation: usize,
+    pop_size: usize,
+}
+
+impl ProgressTracker {
+    fn new(generation: usize, pop_size: usize, interval: usize, direction: Direction) -> Self {
+        let init = if direction == Direction::Minimize {
+            f32::INFINITY
+        } else {
+            f32::NEG_INFINITY
+        };
+        ProgressTracker {
+            done: std::sync::atomic::AtomicUsize::new(0),
+            best_bits: std::sync::atomic::AtomicU32::new(f32::to_bits(init)),
+            interval,
+            generation,
+            pop_size,
+        }
+    }
+
+    /// Workers call this after scoring. Prints progress at interval boundaries.
+    fn increment(&self, score: f32, direction: Direction) {
+        // Track best
+        let _ = self.best_bits.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |bits| {
+                let cur = f32::from_bits(bits);
+                if direction.is_better(score, cur) {
+                    Some(score.to_bits())
+                } else {
+                    None
+                }
+            },
+        );
+        // Progress
+        let n = self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if self.interval > 0 && n % self.interval == 0 {
+            let best = f32::from_bits(self.best_bits.load(std::sync::atomic::Ordering::Relaxed));
+            let _ = std::io::Write::write_all(
+                &mut std::io::stdout(),
+                format!("\rgen {:02}  net {:>3}/{:<3}  best {best:.4}\x1b[K", self.generation, n, self.pop_size).as_bytes(),
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    }
+
+    /// Print final progress line + newline.
+    fn finish(&self) {
+        let n = self.done.load(std::sync::atomic::Ordering::Relaxed);
+        let best = f32::from_bits(self.best_bits.load(std::sync::atomic::Ordering::Relaxed));
+        println!("\rgen {:02}  net {:>3}/{:<3}  best {best:.4}", self.generation, n, self.pop_size);
+    }
 }
 
 impl Engine {
@@ -411,7 +442,10 @@ impl Engine {
         let dataset = Self::load_data(&mut options, data_path)?;
 
         // Step 4: Create population
-        let pop = Self::create_population(&options, seed)?;
+        let mut pop = Self::create_population(&options, seed)?;
+        if options.dedup_pop {
+            Self::dedup_population(&mut pop);
+        }
 
         // Step 5: Log initialization
         Self::log_initialization(&options, &dataset, &pop, seed, &fitness);
@@ -422,8 +456,8 @@ impl Engine {
 
     /// Step 1: Validate options and fill empty pools with all built-ins.
     fn validate_and_fill_options(options: &mut EngineOptions) -> Result<()> {
-        if options.pop_size == 0 {
-            return Err(EngineError::InvalidOptions("pop_size must be > 0".into()).into());
+        if options.pop_size < 2 {
+            return Err(EngineError::InvalidOptions("pop_size must be >= 2 for crossover".into()).into());
         }
         if options.num_batches > 0 && options.batch_size == 0 {
             return Err(EngineError::InvalidOptions(
@@ -452,11 +486,22 @@ impl Engine {
         if options.num_batches == 0 {
             options.num_batches = 16;
         }
-        if options.crossover_pool.is_empty() {
-            options.crossover_pool = vec![CrossoverKind::TwoPoint];
+
+        // Propagate pools from engine options into mutation config.
+        if options.mutation.activation_pool.is_empty() {
+            options.mutation.activation_pool = options.activation_pool.clone();
+        }
+        if options.mutation.combine_pool.is_empty() {
+            options.mutation.combine_pool = options.combine_op_pool.clone();
+        }
+        if options.mutation.standardize_pool.is_empty() {
+            options.mutation.standardize_pool = options.standardize_op_pool.clone();
+        }
+        if options.mutation.dim_pool.is_empty() {
+            options.mutation.dim_pool = options.hidden_dim_pool.clone();
         }
         // Propagate engine-level flags into training config.
-        options.training.proportional_batches = options.proportional_batches;
+        options.training.y_proportional_batches = options.y_proportional_batches;
         Ok(())
     }
 
@@ -527,18 +572,7 @@ impl Engine {
             graph.refresh_labels();
             graph.finalize();
 
-            // Randomly toggle recurrent on eligible nodes (num_inputs == num_outs).
-            if options.recurrent {
-                for node in &mut graph.nodes {
-                    if node.recurrent && rng.f64() > options.recurrent_prob as f64 {
-                        node.recurrent = false;
-                    }
-                }
-            } else {
-                for node in &mut graph.nodes {
-                    node.recurrent = false;
-                }
-            }
+
 
             debug!(
                 "  ind[{i}] seed={} n_hidden={} nodes={} wires={}",
@@ -550,6 +584,27 @@ impl Engine {
             pop.push(graph);
         }
         Ok(pop)
+    }
+
+    /// Remove duplicate topologies from the population (full Spec comparison).
+    /// Keeps the first occurrence of each unique topology.
+    fn dedup_population(pop: &mut Vec<Topology>) {
+        use crate::spec::Spec;
+        let before = pop.len();
+        let mut seen: Vec<Spec> = Vec::new();
+        pop.retain(|topo| {
+            let spec = Spec::from(topo);
+            if seen.iter().any(|s| *s == spec) {
+                false
+            } else {
+                seen.push(spec);
+                true
+            }
+        });
+        let removed = before - pop.len();
+        if removed > 0 {
+            debug!("  dedup: removed {removed} duplicates, {}/{} remain", pop.len(), before);
+        }
     }
 
     /// Step 5: Log all resolved options, dataset, and population.
@@ -601,9 +656,8 @@ impl Engine {
             data_path: data_path.to_path_buf(),
             generation: 0,
             best: None,
-            improvements: 0,
-            last_improvement_hash: None,
-            last_improvement_prefix: None,
+
+
             scores: Vec::new(),
             eval_losses: Vec::new(),
         })
@@ -658,7 +712,6 @@ impl Engine {
         })?;
         crate::utils::log_utils::log_run_summary(
             run_elapsed,
-            self.improvements,
             &self.best,
             &self.fitness,
             &self.options,
@@ -678,30 +731,26 @@ impl Engine {
         // Step 2: Store scores and losses
         self.update_scores(results);
 
-        // Step 3: Track improvements and record new bests
-        self.track_improvements()
+        // Step 3: Save best + worst for this generation
+        self.save_generation_snapshots()
     }
 
     /// Step 1: Parallel rayon loop -- build, train, score each individual.
     fn eval_all_individuals(&self) -> Result<Vec<(f32, Option<f32>)>> {
-        let direction = self.fitness.direction();
         let net_opts = self.options.network;
         let train_cfg = &self.options.training;
         let fitness = &self.fitness;
         let dataset = &self.dataset;
-        let pop_size = self.pop.len();
         let batch_seed = derive_seed(self.seed, self.generation * 3);
-        let done = std::sync::atomic::AtomicUsize::new(0);
-        let best_bits =
-            std::sync::atomic::AtomicU32::new(f32::to_bits(if direction == Direction::Minimize {
-                f32::INFINITY
-            } else {
-                f32::NEG_INFINITY
-            }));
-        let generation = self.generation;
-        let progress_lock = std::sync::Mutex::new(());
+        let direction = self.fitness.direction();
+        let tracker = ProgressTracker::new(
+            self.generation,
+            self.pop.len(),
+            self.options.progress_interval,
+            direction,
+        );
 
-        self.pool.install(|| {
+        let results = self.pool.install(|| {
             self.pop
                 .par_iter()
                 .map(|graph| {
@@ -712,136 +761,109 @@ impl Engine {
                     let result = crate::trainer::train_network(
                         &mut net, train_cfg, fitness, dataset, batch_seed,
                     )?;
-                    let score = result.score;
-                    let loss = result.eval_loss;
-
-                    best_bits
-                        .fetch_update(
-                            std::sync::atomic::Ordering::Relaxed,
-                            std::sync::atomic::Ordering::Relaxed,
-                            |bits| {
-                                if direction.is_better(score, f32::from_bits(bits)) {
-                                    Some(score.to_bits())
-                                } else {
-                                    None
-                                }
-                            },
-                        )
-                        .ok();
-                    let cur_best =
-                        f32::from_bits(best_bits.load(std::sync::atomic::Ordering::Relaxed));
-                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    {
-                        let _guard = progress_lock.lock().unwrap();
-                        use std::io::Write;
-                        print!(
-                            "\r  gen {:02} net {:>2}/{pop_size}  best {cur_best:.4}\x1b[K",
-                            generation, n
-                        );
-                        std::io::stdout().flush().unwrap();
-                    }
-
-                    Ok((score, loss))
+                    tracker.increment(result.score, direction);
+                    Ok((result.score, result.eval_loss))
                 })
                 .collect::<Result<Vec<_>>>()
-        })
+        });
+        tracker.finish();
+        results
     }
 
     /// Step 2: Store scores and eval_losses from parallel results.
     fn update_scores(&mut self, results: Vec<(f32, Option<f32>)>) {
-        println!();
         self.scores = results.iter().map(|&(s, _)| s).collect();
         self.eval_losses = results.iter().map(|&(_, l)| l).collect();
     }
 
-    /// Step 3: Walk scores, record new improvements immediately.
-    fn track_improvements(&mut self) -> Result<bool> {
+    /// Step 3: Find best + worst in current gen, save both to disk.
+    fn save_generation_snapshots(&mut self) -> Result<bool> {
         let direction = self.fitness.direction();
-        // Collect indices that beat current best (all, if first gen).
-        let mut improved: Vec<usize> = self
-            .scores
-            .iter()
-            .enumerate()
-            .filter(|&(_i, &score)| {
-                self.best
-                    .as_ref()
-                    .map(|b| direction.is_better(score, b.fitness))
-                    .unwrap_or(true)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        if improved.is_empty() {
+        if self.scores.is_empty() {
             return Ok(false);
         }
-        // Sort best-first so self.best always tracks the true best.
-        improved.sort_by(|&a, &b| direction.cmp(self.scores[a], self.scores[b]));
 
-        let mut any_improved = false;
-        for &i in &improved {
-            let score = self.scores[i];
-            let loss = self.eval_losses.get(i).copied().flatten();
-            let topo = self.pop[i].clone();
-            // Record to disk + update best (no console logging — progress line shows running best).
-            self.best = Some(BestIndividual {
-                fitness: score,
-                loss,
-                pop_index: i,
-                topology: topo,
-            });
-            self.record_improvement()?;
-            any_improved = true;
+        // Find best and worst indices
+        let mut best_idx = 0;
+        let mut worst_idx = 0;
+        for (i, &score) in self.scores.iter().enumerate() {
+            if direction.is_better(score, self.scores[best_idx]) {
+                best_idx = i;
+            }
+            if direction.is_better(self.scores[worst_idx], score) {
+                worst_idx = i;
+            }
         }
-        Ok(any_improved)
+
+        let best_score = self.scores[best_idx];
+        let best_loss = self.eval_losses.get(best_idx).copied().flatten();
+        let worst_score = self.scores[worst_idx];
+        let _worst_loss = self.eval_losses.get(worst_idx).copied().flatten();
+
+        // Update overall best if this gen's best is better
+        let improved = self
+            .best
+            .as_ref()
+            .map(|b| direction.is_better(best_score, b.fitness))
+            .unwrap_or(true);
+        if improved {
+            self.best = Some(BestIndividual {
+                fitness: best_score,
+                loss: best_loss,
+                pop_index: best_idx,
+                topology: self.pop[best_idx].clone(),
+            });
+        }
+
+        // Save best + worst snapshots
+        let best_topo = self.pop[best_idx].clone();
+        let worst_topo = self.pop[worst_idx].clone();
+        self.record_snapshot("best", &best_topo, best_score)?;
+        self.record_snapshot("worst", &worst_topo, worst_score)?;
+
+        Ok(improved)
     }
 
     // ── Improvement tracking ────────────────────────────────────────────────
 
-    fn record_improvement(&mut self) -> std::result::Result<(), EngineError> {
-        let Some(b) = &self.best else { return Ok(()) };
+    /// Save a snapshot (best or worst) for the current generation.
+    fn record_snapshot(
+        &mut self,
+        label: &str,
+        topo: &Topology,
+        fitness: f32,
+    ) -> std::result::Result<(), EngineError> {
         let dir = self.run_dir.join("improvements");
         fs::create_dir_all(&dir).map_err(|source| EngineError::Io {
             path: dir.display().to_string(),
             source,
         })?;
-        let json_str = self.build_envelope(Some(b))
-            .and_then(|v| serde_json::to_string_pretty(&v)
-                .map_err(|e| EngineError::Json(format!("improvement json: {e}"))))?;
 
-        // Hash topology for fast comparison.
-        let mut hasher = DefaultHasher::new();
-        json_str.hash(&mut hasher);
-        let hash = hasher.finish();
+        let prefix = format!("gen{:02}_{}_{:.4}", self.generation, label, fitness);
+        let env = serde_json::json!({
+            "run_id": self.run_id,
+            "run_seed": self.seed,
+            "data_path": self.data_path.display().to_string(),
+            "generation": self.generation,
+            "snapshot": label,
+            "fitness": fitness,
+            "best_topology": topo.to_json()
+                .map_err(|e| EngineError::Json(format!("snapshot json: {e}")))?,
+        });
+        let json_str = serde_json::to_string_pretty(&env)
+            .map_err(|e| EngineError::Json(format!("snapshot json: {e}")))?;
 
-        let same_topo = self
-            .last_improvement_hash
-            .map_or(false, |prev| prev == hash);
-
-        if same_topo {
-            // Delete old files for this topology, then save with updated fitness.
-            if let Some(prefix) = &self.last_improvement_prefix {
-                let _ = fs::remove_file(dir.join(format!("{prefix}.json")));
-                let _ = fs::remove_file(dir.join(format!("{prefix}.md")));
-            }
-        } else {
-            self.improvements += 1;
-        }
-
-        let prefix = format!(
-            "{:04}_gen{:02}_fitness{:.4}",
-            self.improvements - 1,
-            self.generation,
-            b.fitness
-        );
         let path = dir.join(format!("{prefix}.json"));
         fs::write(&path, &json_str).map_err(|source| EngineError::Io {
             path: path.display().to_string(),
             source,
         })?;
+
         let md_path = dir.join(format!("{prefix}.md"));
-        let net = Network::build(&b.topology, Device::CPU).ok();
+        let net = Network::build(topo, Device::CPU).ok();
         let md = crate::utils::ascii_utils::topology_markdown(
-            &b.topology,
-            Some(b.fitness),
+            topo,
+            Some(fitness),
             net.as_ref(),
         );
         fs::write(&md_path, md).map_err(|source| EngineError::Io {
@@ -849,52 +871,83 @@ impl Engine {
             source,
         })?;
 
-        self.last_improvement_hash = Some(hash);
-        self.last_improvement_prefix = Some(prefix);
-        debug!(
-            "record_improvement -- saved #{:04} gen={} fitness={:.4}{}",
-            self.improvements - 1,
-            self.generation,
-            b.fitness,
-            if same_topo {
-                " (same arch, replaced)"
-            } else {
-                ""
-            },
-        );
+        debug!("record_snapshot -- gen={} {label} fitness={:.4}", self.generation, fitness);
         Ok(())
     }
 
     // ── Logging ─────────────────────────────────────────────────────────────
 
     fn log_generation_summary(&self) {
-        if let Some(best) = &self.best {
-            log::info!("  gen {:02} best {:.4}", self.generation, best.fitness);
+        if self.scores.is_empty() {
+            return;
+        }
+        let direction = self.fitness.direction();
+        let mut best_idx = 0;
+        let mut worst_idx = 0;
+        for (i, &score) in self.scores.iter().enumerate() {
+            if direction.is_better(score, self.scores[best_idx]) {
+                best_idx = i;
+            }
+            if direction.is_better(self.scores[worst_idx], score) {
+                worst_idx = i;
+            }
+        }
+        let fl = self.fitness.fitness_label();
+        let ll = self.fitness.train_metric_label();
+        let best_loss = self.eval_losses.get(best_idx).copied().flatten();
+        let worst_loss = self.eval_losses.get(worst_idx).copied().flatten();
+        if fl == ll {
+            log::info!(
+                "  gen {:02} best {fl}={:.4} · worst {fl}={:.4}",
+                self.generation,
+                self.scores[best_idx],
+                self.scores[worst_idx],
+            );
+        } else {
+            let bl = best_loss.map_or(String::new(), |v| format!(" {ll}={v:.4}"));
+            let wl = worst_loss.map_or(String::new(), |v| format!(" {ll}={v:.4}"));
+            log::info!(
+                "  gen {:02} best {fl}={:.4}{bl} · worst {fl}={:.4}{wl}",
+                self.generation,
+                self.scores[best_idx],
+                self.scores[worst_idx],
+            );
         }
     }
 
     // ── Genetics -- selection, crossover, mutation ────────────────────────────
 
     fn next_generation(&mut self) {
-        debug!(
-            "next_generation -- gen {} -> {}",
-            self.generation,
-            self.generation + 1
+        let (unique, sel_label) = self.select();
+        let cx_pairs = self.crossover();
+        let pre_dedup = self.pop.len();
+        if self.options.dedup_pop {
+            Self::dedup_population(&mut self.pop);
+        }
+        let dedup_removed = pre_dedup - self.pop.len();
+        let mut_count = self.mutate();
+        let dedup_str = if dedup_removed > 0 {
+            format!(" · dedup -{dedup_removed}")
+        } else {
+            String::new()
+        };
+        log::info!(
+            "  evolve  sel {unique} unique ({sel_label}){dedup_str} · cx {cx_pairs} pairs · mut {mut_count} nets"
         );
-        self.select();
-        self.crossover();
-        self.mutate();
         self.generation += 1;
     }
 
     /// Selection -- reorder pop/scores so fittest survive.
-    pub fn select(&mut self) {
+    /// Returns (unique_survivors, selection_label).
+    pub fn select(&mut self) -> (usize, String) {
         if self.scores.is_empty() {
-            return;
+            return (0, self.options.selection.label().to_string());
         }
         let dir = self.fitness.direction();
         let mut rng = fastrand::Rng::with_seed(derive_seed(self.seed, self.generation * 3 + 1));
         let indices = self.options.selection.apply(&self.scores, dir, &mut rng);
+        let label = self.options.selection.label().to_string();
+
         // In-place reorder: build new pop from selected indices.
         let new_pop: Vec<Topology> = indices.iter().map(|&i| self.pop[i].clone()).collect();
         let new_scores: Vec<f32> = indices.iter().map(|&i| self.scores[i]).collect();
@@ -905,24 +958,127 @@ impl Engine {
         for &i in &indices {
             counts[i] += 1;
         }
-        let selected: Vec<usize> = (0..counts.len()).filter(|&i| counts[i] > 0).collect();
-        let highlights: Vec<String> = selected
-            .iter()
-            .map(|&i| format!("pop[{i}]x{}", counts[i]))
-            .collect();
+        let unique = counts.iter().filter(|&&c| c > 0).count();
         debug!(
-            "  selection [{}] survivors: {}",
-            self.options.selection.label(),
-            highlights.join(" ")
+            "  selection [{}] {} unique survivors",
+            label, unique
         );
+        (unique, label)
     }
 
-    pub fn crossover(&mut self) {
-        // TODO: topology-level crossover
+    /// Crossover — DEAP-style: clone pop, pair up, apply crossover kind.
+    /// Returns number of pairs actually crossed.
+    pub fn crossover(&mut self) -> usize {
+        let pop_size = self.pop.len();
+        if pop_size < 2 {
+            return 0;
+        }
+        let mut rng = fastrand::Rng::with_seed(derive_seed(self.seed, self.generation * 3 + 2));
+        let kind = &self.options.crossover;
+        let cxpb = kind.action_prob();
+        if cxpb <= 0.0 {
+            return 0;
+        }
+
+        let mut offspring = self.pop.clone();
+        let mut cx_count = 0usize;
+        let mut i = 0;
+        while i + 1 < pop_size {
+            if rng.f32() < cxpb {
+                let (left, right) = offspring.split_at_mut(i + 1);
+                let crossed = match &kind {
+                    CrossoverKind::TwoPoint { .. } => {
+                        Topology::cx_two_point(&mut left[i], &mut right[0], &mut rng)
+                    }
+                    CrossoverKind::Uniform { swap_prob, .. } => {
+                        Topology::cx_uniform(&mut left[i], &mut right[0], *swap_prob, &mut rng)
+                    }
+                };
+                if crossed {
+                    cx_count += 1;
+                }
+            }
+            i += 2;
+        }
+
+        debug!("  crossover {cx_count} pairs ({kind})");
+        self.pop = offspring;
+        cx_count
     }
 
-    pub fn mutate(&mut self) {
-        // TODO: topology-level mutation
+    /// Mutation — one roll per individual; if it hits, pick one random
+    /// type and mutate one random hidden node. Returns individuals mutated.
+    pub fn mutate(&mut self) -> usize {
+        let mut rng = fastrand::Rng::with_seed(derive_seed(self.seed, self.generation * 3 + 3));
+        let m = &self.options.mutation;
+        if m.mut_prob <= 0.0 {
+            return 0;
+        }
+
+        // Collect available mutation types from non-empty pools
+        #[derive(Clone, Copy)]
+        enum MutType {
+            Activation,
+            CombineOp,
+            Standardize,
+            HiddenDim,
+        }
+        let mut types: Vec<MutType> = Vec::new();
+        if !m.activation_pool.is_empty() {
+            types.push(MutType::Activation);
+        }
+        if !m.combine_pool.is_empty() {
+            types.push(MutType::CombineOp);
+        }
+        if !m.standardize_pool.is_empty() {
+            types.push(MutType::Standardize);
+        }
+        if !m.dim_pool.is_empty() {
+            types.push(MutType::HiddenDim);
+        }
+        if types.is_empty() {
+            return 0;
+        }
+
+        let mut mut_count = 0usize;
+        for topo in &mut self.pop {
+            if rng.f32() >= m.mut_prob {
+                continue;
+            }
+            // Collect hidden node indices
+            let hidden: Vec<usize> = topo
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.kind == NodeKind::Hidden)
+                .map(|(i, _)| i)
+                .collect();
+            if hidden.is_empty() {
+                continue;
+            }
+            // Pick one random hidden node and one random mutation type
+            let node_idx = hidden[rng.usize(0..hidden.len())];
+            let mtype = types[rng.usize(0..types.len())];
+            let node = &mut topo.nodes[node_idx];
+            match mtype {
+                MutType::Activation => {
+                    node.activation = m.activation_pool[rng.usize(0..m.activation_pool.len())];
+                }
+                MutType::CombineOp => {
+                    node.combine_op = Some(m.combine_pool[rng.usize(0..m.combine_pool.len())]);
+                }
+                MutType::Standardize => {
+                    node.standardize = Some(m.standardize_pool[rng.usize(0..m.standardize_pool.len())]);
+                }
+                MutType::HiddenDim => {
+                    node.hidden_dim = Some(rng.usize(m.dim_pool.clone()));
+                }
+            }
+            topo.finalize();
+            mut_count += 1;
+        }
+        debug!("  mutate {mut_count} nets ({})", m);
+        mut_count
     }
 
     // ── Serialization ────────────────────────────────────────────────────────
@@ -1001,6 +1157,7 @@ mod tests {
         EngineOptions {
             pop_size: 3,
             num_generations: 2,
+            dedup_pop: false,
             topology_options: TopologyOptions {
                 hidden_dim: 4,
                 ..Default::default()
@@ -1035,9 +1192,14 @@ mod tests {
             .collect();
         json_files.sort();
         assert!(!json_files.is_empty());
-        assert_eq!(json_files.len(), engine.improvements);
+        // 2 files per gen (best + worst)
+        assert_eq!(json_files.len(), engine.options.num_generations * 2);
+        // Load the best snapshot of the last generation
+        let last_gen = engine.options.num_generations - 1;
+        let best_prefix = format!("gen{:02}_best_", last_gen);
+        let best_file = json_files.iter().find(|f| f.starts_with(&best_prefix)).unwrap();
         let latest_json =
-            std::fs::read_to_string(imp_dir.join(json_files.last().unwrap())).unwrap();
+            std::fs::read_to_string(imp_dir.join(best_file)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&latest_json).unwrap();
         let latest = Topology::from_json(v["best_topology"].as_str().unwrap()).unwrap();
         let best_topo = engine.best.as_ref().unwrap().topology.clone();
@@ -1431,5 +1593,38 @@ mod tests {
         assert!(engine.best.is_some());
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&opts.results_dir);
+    }
+
+    #[test]
+    fn test_engine_from_loss_with_diff() {
+        let data_dir = temp_data_dir();
+        // Train on MSE, evolve on negative MSE (maximize) — different directions
+        let fitness = Fitness::from_loss_with_diff(
+            |pred, y| {
+                let diff = pred.data().sub(&y.data())?;
+                let sq = diff.mul(&diff)?;
+                Ok(sq.mean()?.item()? as f32)
+            },
+            Direction::Minimize,
+            "mse_score",
+            |pred, y| flodl::mse_loss(pred, y),
+            Direction::Minimize,
+            "mse_train",
+        );
+        assert!(!fitness.train_metric_is_fitness());
+        assert_eq!(fitness.fitness_label(), "mse_score");
+        assert_eq!(fitness.train_metric_label(), "mse_train");
+        let opts = EngineOptions {
+            num_generations: 1,
+            ..test_options()
+        };
+        let mut engine = Engine::new(opts, &data_dir, fitness).unwrap();
+        engine.run().unwrap();
+        assert!(engine.best.is_some());
+        let best = engine.best.as_ref().unwrap();
+        assert!(best.fitness.is_finite());
+        assert!(best.loss.is_some());
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&engine.options.results_dir);
     }
 }
