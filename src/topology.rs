@@ -7,6 +7,7 @@
 //! fed by network input. `validate()` checks all of them.
 
 use fastrand::Rng;
+use log::debug;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::error::TopologyError;
@@ -210,6 +211,14 @@ impl Topology {
     ///
     /// Simple maths: a node i with `num_inputs` inputs and `num_outputs`
     /// outputs contributes exactly
+    /// Re-number node IDs to be contiguous 0..n.
+    /// Needed after crossover swaps nodes between topologies.
+    pub fn renumber_ids(&mut self) {
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            node.id = i;
+        }
+    }
+
     ///   num_inputs  labels to graph_inputs  -> "n{i}_i0", "n{i}_i1", ...
     ///   num_outputs labels to graph_outputs -> "n{i}_o0", "n{i}_o1", ...
     pub fn refresh_labels(&mut self) {
@@ -299,10 +308,7 @@ impl Topology {
         // Step 7b: trim_ports — remove orphaned input/output ports from the topology
         self.trim_orphaned_ports();
 
-        // Step 8: set_flags — apply recurrent flags (placeholder, no-op for now)
-        self.apply_recurrent_flags();
-
-        // Step 9: verify — validate the final wiring
+        // Step 8: verify — validate the final wiring
         if let Err(e) = self.validate() {
             panic!("finalize validation failed: {e}\n{self:?}");
         }
@@ -897,17 +903,6 @@ impl Topology {
         }
     }
 
-    /// Tag hidden nodes as recurrent-candidate when num_inputs == num_outputs.
-    /// After trim_ports, port counts are final — a node with equal in/out
-    /// ports can feed its output back as additional input.
-    fn apply_recurrent_flags(&mut self) {
-        for node in &mut self.nodes {
-            if node.kind == NodeKind::Hidden && node.num_inputs == node.num_outputs {
-                node.recurrent = true;
-            }
-        }
-    }
-
     /// Serialize the whole blueprint (options, nodes, labels, connections) to
     /// JSON.  See [`crate::spec::Spec`] for the shape; the RNG
     /// is not stored.
@@ -928,6 +923,140 @@ impl Topology {
     /// architecture, fresh random weights (no weights are ever serialized).
     pub fn from_json(s: &str) -> Result<Topology, serde_json::Error> {
         serde_json::from_str(s)
+    }
+
+    // ── Crossover ──────────────────────────────────────────────────────────
+
+    /// Find a hidden node with the same signature in both topologies.
+    /// Signature: (activation, combine_op, standardize, hidden_dim, num_inputs, num_outputs).
+    /// Returns (index_in_a, index_in_b) of hidden-only lists.
+    fn find_matching_node(
+        a: &Topology,
+        b: &Topology,
+        rng: &mut Rng,
+    ) -> Option<(usize, usize)> {
+        let ha: Vec<usize> = a
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.kind == NodeKind::Hidden)
+            .map(|(i, _)| i)
+            .collect();
+        let hb: Vec<usize> = b
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.kind == NodeKind::Hidden)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Collect all matching pairs — only structural interface matters
+        // (num_inputs, num_outputs). finalize() handles wiring;
+        // activation, combine_op, etc. can differ freely.
+        let mut matches: Vec<(usize, usize)> = Vec::new();
+        for (ai, &a_idx) in ha.iter().enumerate() {
+            let an = &a.nodes[a_idx];
+            for (bi, &b_idx) in hb.iter().enumerate() {
+                let bn = &b.nodes[b_idx];
+                if an.num_inputs == bn.num_inputs && an.num_outputs == bn.num_outputs {
+                    matches.push((ai, bi));
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            None
+        } else {
+            Some(matches[rng.usize(0..matches.len())])
+        }
+    }
+
+    /// Crossover: find a matching-node pivot (same num_inputs/num_outputs),
+    /// swap everything from that pivot onward, then finalize both.
+    /// Returns true if a swap happened.
+    pub fn cx_two_point(a: &mut Topology, b: &mut Topology, rng: &mut Rng) -> bool {
+        let ha: Vec<usize> = a
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.kind == NodeKind::Hidden)
+            .map(|(i, _)| i)
+            .collect();
+        let hb: Vec<usize> = b
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.kind == NodeKind::Hidden)
+            .map(|(i, _)| i)
+            .collect();
+
+        if ha.is_empty() || hb.is_empty() {
+            return false;
+        }
+
+        // Only crossover if a matching-node pivot exists — no random cuts
+        if let Some((pivot_a, pivot_b)) = Self::find_matching_node(a, b, rng) {
+            let swap_a = &ha[pivot_a..];
+            let swap_b = &hb[pivot_b..];
+            let len = swap_a.len().min(swap_b.len());
+            for k in 0..len {
+                let tmp = a.nodes[swap_a[k]].clone();
+                a.nodes[swap_a[k]] = b.nodes[swap_b[k]].clone();
+                b.nodes[swap_b[k]] = tmp;
+            }
+            a.renumber_ids();
+            a.finalize();
+            b.renumber_ids();
+            b.finalize();
+            debug!("cx_two_point: pivot hidden[{}] <-> hidden[{}], swapped {} nodes", pivot_a, pivot_b, len);
+            return true;
+        }
+        debug!("cx_two_point: no matching node found, skipping");
+        false
+    }
+
+    /// Uniform crossover: per-node independent swap.
+    /// Requires same number of hidden nodes; each hidden node's attributes
+    /// are independently swapped with probability `swap_prob`.
+    /// Returns true if at least one swap happened.
+    pub fn cx_uniform(a: &mut Topology, b: &mut Topology, swap_prob: f32, rng: &mut Rng) -> bool {
+        let ha: Vec<usize> = a
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.kind == NodeKind::Hidden)
+            .map(|(i, _)| i)
+            .collect();
+        let hb: Vec<usize> = b
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.kind == NodeKind::Hidden)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Same-length requirement for per-node alignment
+        if ha.len() != hb.len() || ha.is_empty() {
+            debug!("cx_uniform: hidden node count mismatch ({} vs {}), skipping", ha.len(), hb.len());
+            return false;
+        }
+
+        let mut swaps = 0usize;
+        for (&ai, &bi) in ha.iter().zip(hb.iter()) {
+            if rng.f32() < swap_prob {
+                std::mem::swap(&mut a.nodes[ai], &mut b.nodes[bi]);
+                swaps += 1;
+            }
+        }
+
+        if swaps > 0 {
+            a.renumber_ids();
+            a.finalize();
+            b.renumber_ids();
+            b.finalize();
+            debug!("cx_uniform: swapped {swaps}/{} hidden nodes", ha.len());
+        }
+        swaps > 0
     }
 }
 
