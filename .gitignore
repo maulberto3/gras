@@ -23,3 +23,10 @@ trash/
 proptest-regressions/
 
 proptest-regressions/topology.txt
+
+# Untracked user-specific files
+kaggle_guide.rs
+
+Makefile
+
+examples/main.rs
