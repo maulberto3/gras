@@ -9,8 +9,10 @@
 
 use std::fmt::Display;
 
+use crate::crossover::CrossoverKind;
 use crate::engine::EngineOptions;
 use crate::fitness::{Direction, FitnessLabel};
+use crate::mutation::MutationKind;
 use crate::network::{Network, NetworkOptions};
 use crate::node::{Activation, Node};
 use crate::selection::SelectionMethod;
@@ -171,5 +173,27 @@ impl Display for OptimizerKind {
             OptimizerKind::SGD => write!(f, "sgd"),
             OptimizerKind::Adam => write!(f, "adam"),
         }
+    }
+}
+
+impl Display for CrossoverKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CrossoverKind::TwoPoint { action_prob } => {
+                write!(f, "two_point(p={action_prob:.0}%)")
+            }
+            CrossoverKind::Uniform {
+                action_prob,
+                swap_prob,
+            } => {
+                write!(f, "uniform(p={action_prob:.0}%,swap={swap_prob:.0}%)")
+            }
+        }
+    }
+}
+
+impl Display for MutationKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mut(p={:.0}%)", self.mut_prob * 100.0)
     }
 }

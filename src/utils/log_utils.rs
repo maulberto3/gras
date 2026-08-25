@@ -62,10 +62,14 @@ pub(crate) fn log_initialization(
         log::info!("  fitness   {fl} (fitness) · {ll} (train_metric)");
         log::info!("            {better}");
     }
-    log::info!(
-        "  mutation  act_prob {:.0}%",
-        options.mutate_activ_prob * 100.0_f32
-    );
+    // Mutation
+    log::info!("  mutation  {}", options.mutation);
+    // Crossover
+    log::info!("  crossover {}", options.crossover);
+    // Dedup
+    if options.dedup_pop {
+        log::info!("  dedup     on (full topology comparison)");
+    }
 
     // Dataset
     let n = dataset.inputs.shape()[0];
@@ -107,8 +111,8 @@ pub(crate) fn log_initialization(
     } else {
         String::new()
     };
-    let prop_str = if options.proportional_batches {
-        " · proportional"
+    let prop_str = if options.y_proportional_batches {
+        " · y_proportional"
     } else {
         ""
     };
@@ -163,7 +167,6 @@ pub(crate) fn log_run_start(run_dir: &Path) {
 /// No GP pool duplication — those are in initialization.
 pub(crate) fn log_run_summary(
     run_elapsed: Duration,
-    improvements: usize,
     best: &Option<BestIndividual>,
     fitness: &crate::fitness::Fitness,
     options: &EngineOptions,
@@ -178,7 +181,6 @@ pub(crate) fn log_run_summary(
     let m = (secs as u64 % 3600) / 60;
     let s = secs - (h * 3600 + m * 60) as f64;
     log::info!("  duration  {h}h {m}m {s:.3}s");
-    log::info!("  improvements {improvements}");
 
     // Winner
     if let Some(best) = best {
@@ -306,18 +308,18 @@ fn log_rebuild_helper(run_dir: &Path, options: &EngineOptions) {
     let dev = options.network.device;
     log::info!("");
     log::info!("══ rebuild ════════════════════════════════════════════════════════");
-    log::info!("  copy-paste this to reconstruct the best network:");
+    log::info!("  copy-paste this to reconstruct any saved topology:");
     log::info!("    use gras::topology::Topology;");
     log::info!("    use gras::network::Network;");
     log::info!("    use flodl::nn::Module;");
     log::info!("");
+    log::info!("    // Load from engine.json or any improvement .json (same format)");
     log::info!("    let v: serde_json::Value = serde_json::from_str(");
-    log::info!(
-        "        &std::fs::read_to_string(\"{}/engine.json\").unwrap()).unwrap();",
-        run_dir.display()
-    );
+    log::info!("        &std::fs::read_to_string(\"<path_to_json>\").unwrap()).unwrap();");
     log::info!("    let topo = Topology::from_json(");
     log::info!("        v[\"best_topology\"].as_str().unwrap()).unwrap();");
     log::info!("    let net = Network::build(&topo, {dev:?}).unwrap();");
-    log::info!("    // Your best architecture, ready for inference");
+    log::info!("");
+    log::info!("  run_dir: {}", run_dir.display());
+    log::info!("  engine.json or improvements/*.json — drop any path into <path_to_json>");
 }
