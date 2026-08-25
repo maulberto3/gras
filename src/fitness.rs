@@ -52,8 +52,8 @@ impl Direction {
 /// Scoring (ranking) + training (backward) interface.
 ///
 /// ```text
-/// Fitness::from_loss(f)                                  ← same function for both
-/// Fitness::from_loss_with_other(score, train, ...)       ← separate (planned)
+/// Fitness::from_loss(f)                        ← same function for both
+/// Fitness::from_loss_with_diff(...)            ← separate scoring + training
 /// ```
 ///
 /// User must always provide an explicit train metric.
@@ -73,35 +73,31 @@ pub struct Fitness {
 }
 
 impl Fitness {
-    // TODO(fitness): separate ranking + training when multi-objective selection
-    // is implemented (Pareto or weighted). The tension: evolution ranks on
-    // fitness (e.g. accuracy) but training minimizes a differentiable loss
-    // (e.g. cross-entropy). Without multi-objective selection, the two can
-    // drift apart — evolution picks nets that don't train well, or training
-    // improves the loss but not the fitness. Implementing this requires either
-    // Pareto-dominance selection or a weighted scalar projection.
-    //
-    // pub fn from_loss_with_other<S, L>(
-    //     score_fn: S,
-    //     train_metric_fn: L,
-    //     score_direction: Direction,
-    //     train_metric_direction: Direction,
-    //     fitness_label: &str,
-    //     train_metric_label: &str,
-    // ) -> Self
-    // where
-    //     S: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
-    //     L: Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync + 'static,
-    // {
-    //     Fitness {
-    //         score_fn: Box::new(score_fn),
-    //         train_metric_fn: Box::new(train_metric_fn),
-    //         score_direction,
-    //         train_metric_direction,
-    //         fitness_label: fitness_label.to_string(),
-    //         train_metric_label: train_metric_label.to_string(),
-    //     }
-    // }
+    /// Separate scoring (evolution ranking) from training (backward).
+    ///
+    /// `score_fn` returns f32 for ranking; `train_metric_fn` returns
+    /// Variable for backward. The engine evolves on score, trains on train_metric.
+    pub fn from_loss_with_diff<S, L>(
+        score_fn: S,
+        score_direction: Direction,
+        fitness_label: &str,
+        train_metric_fn: L,
+        train_metric_direction: Direction,
+        train_metric_label: &str,
+    ) -> Self
+    where
+        S: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
+        L: Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync + 'static,
+    {
+        Fitness {
+            score_fn: Box::new(score_fn),
+            train_metric_fn: Box::new(train_metric_fn),
+            score_direction,
+            train_metric_direction,
+            fitness_label: fitness_label.to_string(),
+            train_metric_label: train_metric_label.to_string(),
+        }
+    }
 
     /// Same function for both scoring and training.
     pub fn from_loss<F>(f: F, direction: Direction, label: &str) -> Self
@@ -155,12 +151,6 @@ impl Fitness {
         self.fitness_label == self.train_metric_label
     }
 
-    // TODO(fitness 2.0): when from_loss_with_other is re-enabled, expose
-    // per-individual loss_history via engine. The engine tracks
-    // loss_history: Vec<Vec<f32>> (one curve per individual), and this
-    // method returns the curve for the best individual.
-    //
-    // pub fn loss_history(&self) -> &[f32] { &self._loss_history }
 }
 
 // ── Scoring helpers — public utility functions ────────────────────────────
