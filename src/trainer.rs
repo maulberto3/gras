@@ -27,17 +27,17 @@ pub enum OptimizerKind {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TrainingConfig {
     pub optimizer: OptimizerKind,
-    pub learning_rate: f64,
+    pub learning_rate: f32,
     /// Training epochs (0 = no training, random-init forward pass).
     pub num_epochs: usize,
     /// Gradient clipping max-norm (0.0 = no clipping).
-    pub grad_clip: f64,
+    pub grad_clip: f32,
     /// Rows per batch.
     pub batch_size: usize,
     /// Number of batches per generation (split into train/eval).
     pub num_batches: usize,
     /// Sample batches proportional to target class frequency.
-    pub proportional_batches: bool,
+    pub y_proportional_batches: bool,
 }
 
 impl Default for TrainingConfig {
@@ -49,7 +49,7 @@ impl Default for TrainingConfig {
             grad_clip: 0.0,
             batch_size: 128,
             num_batches: 16,
-            proportional_batches: false,
+            y_proportional_batches: false,
         }
     }
 }
@@ -79,7 +79,7 @@ pub fn train_network(
         config.batch_size,
         config.num_batches,
         seed,
-        config.proportional_batches,
+        config.y_proportional_batches,
     )?;
 
     if config.num_epochs == 0 || train_batches.is_empty() {
@@ -103,8 +103,8 @@ pub fn train_network(
     );
 
     let mut optimizer: Box<dyn Optimizer> = match config.optimizer {
-        OptimizerKind::SGD => Box::new(SGD::new(&params, config.learning_rate, 0.9)),
-        OptimizerKind::Adam => Box::new(Adam::new(&params, config.learning_rate)),
+        OptimizerKind::SGD => Box::new(SGD::new(&params, config.learning_rate as f64, 0.9)),
+        OptimizerKind::Adam => Box::new(Adam::new(&params, config.learning_rate as f64)),
     };
 
     let mut loss_curve = Vec::with_capacity(config.num_epochs);
@@ -128,7 +128,7 @@ pub fn train_network(
             loss.backward()?;
 
             if config.grad_clip > 0.0 {
-                flodl::clip_grad_norm(&params, config.grad_clip)?;
+                flodl::clip_grad_norm(&params, config.grad_clip as f64)?;
             }
             optimizer.step()?;
         }
