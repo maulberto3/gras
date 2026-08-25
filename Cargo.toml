@@ -1,6 +1,6 @@
 [package]
 name = "gras"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "A Genetic Programming framework for Neural Architecture Search in Rust"
 license = "MIT"
@@ -35,15 +35,6 @@ panic = "abort"
 debug = false
 
 [dev-dependencies]
-git-cliff = "2.13.1"
-# kaggle = "2.0.0"  # requires: sudo apt-get install libssl-dev pkg-config
-# tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 proptest = "1.11.0"
 ureq = "3"
 zip = "2"
-
-[package.metadata.release]
-pre-release-commit-message = "chore(release): bump version to {{version}}"
-tag-message = "v{{version}}"
-sign-tag = false
-push = true
