@@ -2,29 +2,37 @@
 
 use serde::Serialize;
 
-use crate::node::{Activation, CombineOp, StandardizeOp};
-
-/// Per-individual mutation configuration. One roll per individual;
-/// if it hits, a random type is chosen and one random hidden node is mutated.
+/// Mutation strategy for perturbing a single topology.
+/// Each variant carries its own probability. The mutation pool (which
+/// activations, combine ops, or standardize ops to pick from) is always
+/// taken from the engine-level pools — not per-variant.
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct MutationKind {
-    /// Probability of mutating an individual (0.0 = off).
-    pub mut_prob: f32,
-    pub activation_pool: Vec<Activation>,
-    pub combine_pool: Vec<CombineOp>,
-    pub standardize_pool: Vec<StandardizeOp>,
-    /// Hidden-dim range for dim mutations. Empty -> no dim mutations.
-    pub dim_pool: std::ops::RangeInclusive<usize>,
+pub enum MutationMethod {
+    /// Swap a random hidden node's activation.
+    Activation {
+        /// Probability of mutating an individual (0.0 = off).
+        prob: f32,
+    },
+    /// Swap a random hidden node's combine op.
+    CombineOp { prob: f32 },
+    /// Swap a random hidden node's standardize op.
+    Standardize { prob: f32 },
 }
 
-impl Default for MutationKind {
+impl Default for MutationMethod {
     fn default() -> Self {
-        MutationKind {
-            mut_prob: 0.1,
-            activation_pool: vec![],
-            combine_pool: vec![],
-            standardize_pool: vec![],
-            dim_pool: 1..=1,
+        // Disabled by default — user must call set_mutation() explicitly.
+        MutationMethod::Activation { prob: 0.0 }
+    }
+}
+
+impl MutationMethod {
+    /// The mutation probability for this variant.
+    pub fn prob(&self) -> f32 {
+        match self {
+            MutationMethod::Activation { prob }
+            | MutationMethod::CombineOp { prob }
+            | MutationMethod::Standardize { prob } => *prob,
         }
     }
 }
