@@ -501,15 +501,7 @@ impl Network {
         }
     }
 
-    /// Placeholder: detach gradients for hidden nodes.
-    /// When EngineOptions::detach is true, hidden node outputs are
-    /// detached from the computation graph (stopping BPTT).  Currently
-    /// a no-op -- the flag is not yet wired.
-    fn apply_detach(&self, _node_id: usize, x: Variable) -> flodl::tensor::Result<Variable> {
-        // TODO: when self.detach is true, call x.detach() for hidden nodes.
-        // For now, pass through unchanged.
-        Ok(x)
-    }
+
 
     /// Serialize the **materialized network facts**  — the nutrition label
     /// of the built module, no weights (a rebuilt Network has the same
@@ -571,8 +563,7 @@ impl Module for Network {
                 let transformed = self.layers[node_id].forward(&combined)?;
                 let activated = self.activate(node_id, transformed)?;
                 let standardized = self.standardize(node_id, activated)?;
-                let dropped = self.apply_dropout(node_id, standardized)?;
-                self.apply_detach(node_id, dropped)?
+                self.apply_dropout(node_id, standardized)?
             };
             node_outputs.insert(node_id, y);
         }
