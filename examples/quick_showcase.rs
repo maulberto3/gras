@@ -21,15 +21,23 @@ fn main() {
         data::save_dataset(data_dir, &ds).unwrap();
     }
 
-    // 2. Options — minimal setup.
+    // 2. Options — mandatory: pop_size, num_generations, mutation.
+    //    Everything else has conservative defaults.
     let opts = EngineOptions::builder()
         .set_pop_size(50)
         .set_num_generations(2)
+        .set_selection(gras::SelectionMethod::Tournament { tournament_size: 2 })
+        .set_crossover(gras::CrossoverMethod::OnePoint { action_prob: 0.5 })
+        .set_mutation(gras::MutationMethod::Activation { prob: 0.1 })
         .set_hidden_dim_pool(8..=16)
         .set_combine_op_pool(vec![CombineOp::Add])
         .set_num_batches(4)
         .set_batch_size(32)
         .set_num_epochs(1)
+        .set_dedup_pop_and_fill(true)
+        .set_gens_history(true)
+        .set_device(gras::auto_device())
+        .set_seed(Some(42))
         .build()
         .unwrap();
 
@@ -46,4 +54,15 @@ fn main() {
     let best = engine.best.as_ref().unwrap();
     println!("\n  best fitness: {:.4}", best.fitness);
     println!("  {} nodes", best.topology.nodes.len());
+
+    // 5. History (if gens_history was enabled).
+    if !engine.history.is_empty() {
+        println!("\n  generation history:");
+        for h in &engine.history {
+            println!(
+                "    gen {:02}  best {:.4}  worst {:.4}",
+                h.generation, h.best_score, h.worst_score
+            );
+        }
+    }
 }
