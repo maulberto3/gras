@@ -15,15 +15,16 @@ pub mod utils;
 pub use utils::{data, synthetic};
 
 // ── re-exports: core types at crate root ──────────────────────────────
-pub use crossover::CrossoverKind;
-pub use engine::{Engine, EngineOptions, Fitness};
-pub use fitness::{BestIndividual, Direction, FitnessLabel};
-pub use mutation::MutationKind;
-pub use network::Network;
+pub use crossover::CrossoverMethod;
+pub use engine::{Engine, EngineOptions, GenerationStats};
+pub use fitness::{BestIndividual, Direction, Fitness, FitnessLabel};
+pub use mutation::MutationMethod;
+pub use network::{Network, NetworkOptions};
 pub use node::{Activation, CombineOp, Node, NodeKind, StandardizeOp};
 pub use selection::SelectionMethod;
 pub use topology::{Topology, TopologyOptions};
 pub use trainer::{OptimizerKind, TrainingConfig};
+pub use utils::data::Dataset;
 
 // ── re-exports: scoring helpers ──────────────────────────────────────
 pub use fitness::{
@@ -31,3 +32,32 @@ pub use fitness::{
     f1_score, l1_loss_score, mse_loss_score, precision_from_vecs, precision_score, r2_score,
     rmse_score,
 };
+
+// ── device helpers ────────────────────────────────────────────────────
+
+/// Auto-detect the best device based on compiled features.
+///
+/// - With `cuda` feature: returns `Device::CUDA(0)`
+/// - Without `cuda` feature: returns `Device::CPU`
+///
+/// # Example
+///
+/// ```no_run
+/// let opts = gras::EngineOptions::builder()
+///     .set_device(gras::auto_device())
+///     .set_selection(gras::SelectionMethod::Tournament { tournament_size: 2 })
+///     .set_crossover(gras::CrossoverMethod::OnePoint { action_prob: 0.5 })
+///     .set_mutation(gras::MutationMethod::Activation { prob: 0.1 })
+///     .build()
+///     .unwrap();
+/// ```
+pub fn auto_device() -> flodl::Device {
+    #[cfg(feature = "cuda")]
+    {
+        flodl::Device::CUDA(0)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        flodl::Device::CPU
+    }
+}
