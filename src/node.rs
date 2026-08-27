@@ -85,6 +85,10 @@ pub enum Activation {
     HardSwish,
     /// ReLU6(x+3)/6 -- efficient Sigmoid approximation.
     HardSigmoid,
+    /// sin(x) -- periodic, bounded in (-1, 1).
+    Sin,
+    /// cos(x) -- periodic, bounded in (-1, 1).
+    Cos,
 }
 
 impl Activation {
@@ -105,6 +109,8 @@ impl Activation {
             Activation::Softplus => x.softplus(1.0, 20.0),
             Activation::HardSwish => x.hardswish(),
             Activation::HardSigmoid => x.hardsigmoid(),
+            Activation::Sin => x.sin(),
+            Activation::Cos => x.cos(),
         }
     }
 }
@@ -161,11 +167,7 @@ pub struct Node {
     /// activation (`None` = inherit the graph's `standardize_op`).
     #[serde(default)]
     pub standardize: Option<StandardizeOp>,
-    /// Recurrent flag: when true, this hidden node feeds its output back
-    /// as an additional input for `num_recurrence_steps` steps (BPTT).
-    /// Constraint: `in_dim == out_dim` for recurrent nodes.
-    #[serde(default)]
-    pub recurrent: bool,
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -187,7 +189,7 @@ impl Node {
             activation: Activation::Identity,
             combine_op: None,
             standardize: None,
-            recurrent: false,
+
         }
     }
 
@@ -202,7 +204,7 @@ impl Node {
             activation: Activation::Identity,
             combine_op: None,
             standardize: None,
-            recurrent: false,
+
         }
     }
 
@@ -217,7 +219,7 @@ impl Node {
             activation: Activation::Identity,
             combine_op: None,
             standardize: None,
-            recurrent: false,
+
         }
     }
 
@@ -239,12 +241,7 @@ impl Node {
         self
     }
 
-    /// Set recurrent flag (builder style). Recurrent nodes feed output
-    /// back as additional input (requires in_dim == out_dim).
-    pub fn with_recurrent(mut self, recurrent: bool) -> Self {
-        self.recurrent = recurrent;
-        self
-    }
+
 }
 
 #[cfg(test)]
@@ -269,7 +266,7 @@ mod tests {
                 activation: Activation::Identity,
                 combine_op: None,
                 standardize: None,
-                recurrent: false,
+    
             },
         )
     }
