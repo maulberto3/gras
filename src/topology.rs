@@ -974,7 +974,7 @@ impl Topology {
     /// Crossover: find a matching-node pivot (same num_inputs/num_outputs),
     /// swap everything from that pivot onward, then finalize both.
     /// Returns true if a swap happened.
-    pub fn cx_two_point(a: &mut Topology, b: &mut Topology, rng: &mut Rng) -> bool {
+    pub fn cx_one_point(a: &mut Topology, b: &mut Topology, rng: &mut Rng) -> bool {
         let ha: Vec<usize> = a
             .nodes
             .iter()
@@ -1008,10 +1008,10 @@ impl Topology {
             a.finalize();
             b.renumber_ids();
             b.finalize();
-            debug!("cx_two_point: pivot hidden[{}] <-> hidden[{}], swapped {} nodes", pivot_a, pivot_b, len);
+            debug!("cx_one_point: pivot hidden[{}] <-> hidden[{}], swapped {} nodes", pivot_a, pivot_b, len);
             return true;
         }
-        debug!("cx_two_point: no matching node found, skipping");
+        debug!("cx_one_point: no matching node found, skipping");
         false
     }
 
