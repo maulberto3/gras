@@ -65,9 +65,11 @@ pub(crate) fn log_initialization(
     // Mutation
     log::info!("  mutation  {}", options.mutation);
     // Crossover
-    log::info!("  crossover {}", options.crossover);
+    if let Some(ref cx) = options.crossover {
+        log::info!("  crossover {}", cx);
+    }
     // Dedup
-    if options.dedup_pop {
+    if options.dedup_pop_and_fill {
         log::info!("  dedup     on (full topology comparison)");
     }
 
@@ -158,7 +160,7 @@ pub(crate) fn log_initialization(
 pub(crate) fn log_run_start(run_dir: &Path) {
     log::info!("");
     log::info!("══ run ════════════════════════════════════════════════════════════");
-    log::info!("  run_dir   {}", run_dir.display());
+    log::info!("  run_dir    {}", run_dir.display());
 }
 
 // ── Run summary ─────────────────────────────────────────────────────────
@@ -315,11 +317,11 @@ fn log_rebuild_helper(run_dir: &Path, options: &EngineOptions) {
     log::info!("");
     log::info!("    // Load from engine.json or any improvement .json (same format)");
     log::info!("    let v: serde_json::Value = serde_json::from_str(");
-    log::info!("        &std::fs::read_to_string(\"<path_to_json>\").unwrap()).unwrap();");
+    log::info!("        &std::fs::read_to_string(\"results/<run_id>/engine.json\").unwrap()).unwrap();");
     log::info!("    let topo = Topology::from_json(");
     log::info!("        v[\"best_topology\"].as_str().unwrap()).unwrap();");
     log::info!("    let net = Network::build(&topo, {dev:?}).unwrap();");
     log::info!("");
     log::info!("  run_dir: {}", run_dir.display());
-    log::info!("  engine.json or improvements/*.json — drop any path into <path_to_json>");
+    log::info!("  engine.json or improvements/*.json — drop any path into the read_to_string above");
 }

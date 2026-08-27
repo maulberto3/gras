@@ -9,10 +9,10 @@
 
 use std::fmt::Display;
 
-use crate::crossover::CrossoverKind;
+use crate::crossover::CrossoverMethod;
 use crate::engine::EngineOptions;
 use crate::fitness::{Direction, FitnessLabel};
-use crate::mutation::MutationKind;
+use crate::mutation::MutationMethod;
 use crate::network::{Network, NetworkOptions};
 use crate::node::{Activation, Node};
 use crate::selection::SelectionMethod;
@@ -58,6 +58,8 @@ impl Display for Activation {
             Activation::Softplus => "softplus",
             Activation::HardSwish => "hardswish",
             Activation::HardSigmoid => "hardsigmoid",
+            Activation::Sin => "sin",
+            Activation::Cos => "cos",
         };
         write!(f, "{name}")
     }
@@ -176,13 +178,13 @@ impl Display for OptimizerKind {
     }
 }
 
-impl Display for CrossoverKind {
+impl Display for CrossoverMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CrossoverKind::TwoPoint { action_prob } => {
-                write!(f, "two_point(p={action_prob:.0}%)")
+            CrossoverMethod::OnePoint { action_prob } => {
+                write!(f, "one_point(p={action_prob:.0}%)")
             }
-            CrossoverKind::Uniform {
+            CrossoverMethod::Uniform {
                 action_prob,
                 swap_prob,
             } => {
@@ -192,8 +194,18 @@ impl Display for CrossoverKind {
     }
 }
 
-impl Display for MutationKind {
+impl Display for MutationMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "mut(p={:.0}%)", self.mut_prob * 100.0)
+        match self {
+            MutationMethod::Activation { prob } => {
+                write!(f, "mut_activation(p={:.0}%)", prob * 100.0)
+            }
+            MutationMethod::CombineOp { prob } => {
+                write!(f, "mut_combine(p={:.0}%)", prob * 100.0)
+            }
+            MutationMethod::Standardize { prob } => {
+                write!(f, "mut_standardize(p={:.0}%)", prob * 100.0)
+            }
+        }
     }
 }

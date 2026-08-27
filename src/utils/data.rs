@@ -57,6 +57,23 @@ impl Dataset {
             targets: cast(&self.targets)?,
         })
     }
+
+    /// Move both tensors to the given device.
+    /// The engine calls this on load to place data on CUDA when needed.
+    pub fn to_device(&self, device: Device) -> Result<Dataset> {
+        let transfer = |t: &Tensor| -> Result<Tensor> {
+            if t.device() == device {
+                Ok(t.clone())
+            } else {
+                let data = t.to_f32_vec()?;
+                Tensor::from_f32(&data, &t.shape(), device)
+            }
+        };
+        Ok(Dataset {
+            inputs: transfer(&self.inputs)?,
+            targets: transfer(&self.targets)?,
+        })
+    }
 }
 
 // ── the binary tensor format ─────────────────────────────────────────────
@@ -159,7 +176,7 @@ pub fn load_tensor(path: &Path) -> Result<Tensor> {
 
 // ── datasets ─────────────────────────────────────────────────────────────
 
-/// Save a dataset into `dir` as `inputs.bin` + `targets.bin` (+ `meta.json`).
+/// Save a dataset into `dir` as `inputs.bin` + `targets.bin`.
 pub fn save_dataset(dir: &Path, ds: &Dataset) -> Result<()> {
     fs::create_dir_all(dir).map_err(|source| DataError::Io {
         path: dir.display().to_string(),
