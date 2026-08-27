@@ -15,9 +15,9 @@ use log::debug;
 use rayon::prelude::*;
 use serde::Serialize;
 
-pub use crate::crossover::CrossoverKind;
+pub use crate::crossover::CrossoverMethod;
 pub use crate::fitness::{Direction, Fitness, FitnessLabel};
-pub use crate::mutation::MutationKind;
+pub use crate::mutation::MutationMethod;
 use crate::network::{Network, NetworkOptions};
 use crate::node::{Activation, NodeKind};
 use crate::selection::SelectionMethod;
@@ -62,61 +62,62 @@ pub struct EngineOptions {
     /// Training config applied to every individual before scoring.
     pub training: crate::trainer::TrainingConfig,
     /// Selection strategy for the next generation.
-    pub selection: SelectionMethod,
+    pub selection: Option<SelectionMethod>,
     /// Crossover strategy.
-    pub crossover: CrossoverKind,
+    pub crossover: Option<CrossoverMethod>,
     /// Mutation strategy.
-    pub mutation: MutationKind,
+    pub mutation: MutationMethod,
     /// Network execution options (device, dtype, seed).
     pub network: NetworkOptions,
     /// Dropout probability for hidden nodes (0.0 = no dropout).
     pub dropout_prob: f32,
-    /// Enable recurrent hidden nodes (placeholder, not yet wired).
-    /// Default: false.
-    pub recurrent: bool,
-    /// Detach gradients between generations (stop BPTT across gen boundary).
-    /// Default: false.
-    pub detach: bool,
+
+
     /// Sample batches proportional to target class frequency (categorical data).
     /// Default: false (uniform random sampling).
     pub y_proportional_batches: bool,
     /// Deduplicate population by full topology comparison.
     /// Applied after create_population and after select each generation.
     /// Default: true.
-    pub dedup_pop: bool,
-    /// Print progress every N individuals during evaluation.
-    /// 0 = no progress output. Default: 50.
-    pub progress_interval: usize,
+    pub dedup_pop_and_fill: bool,
+    /// Track per-generation metrics in engine.json history.
+    /// Default: false.
+    pub gens_history: bool,
 }
 
 impl Default for EngineOptions {
     fn default() -> Self {
         EngineOptions {
-            pop_size: 10,
-            num_generations: 5,
-            seed: None,
-            topology_options: TopologyOptions::default(),
-            hidden_dim_pool: 4..=8,
-            combine_op_pool: vec![],
-            activation_pool: vec![],
-            standardize_op_pool: vec![],
-            num_batches: 16,
-            batch_size: 128,
-            fitness_label: FitnessLabel::default(),
-            train_metric_label: FitnessLabel::default(),
+            // ── Required (must be set by user) ─────────────────────────
+            pop_size: 10,            // ≥ 2 required (crossover)
+            num_generations: 5,      // > 0 required
+            mutation: MutationMethod::default(), // disabled, must call set_mutation()
+            // ── Engine ────────────────────────────────────────────────
+            seed: None,              // random if not set
             num_threads: 1,
             results_dir: PathBuf::from("results"),
+            dedup_pop_and_fill: false,
+            gens_history: false,
+            // ── Topology / GP pools ───────────────────────────────────
+            topology_options: TopologyOptions::default(),
+            hidden_dim_pool: 4..=8,
+            combine_op_pool: vec![],   // empty = all built-ins
+            activation_pool: vec![],   // empty = all built-ins
+            standardize_op_pool: vec![], // empty = all built-ins
+            // ── Evaluation budget ─────────────────────────────────────
+            num_batches: 4,
+            batch_size: 32,
+            // ── Training ──────────────────────────────────────────────
             training: crate::trainer::TrainingConfig::default(),
-            selection: SelectionMethod::default(),
-            crossover: CrossoverKind::default(),
-            mutation: MutationKind::default(),
-            network: NetworkOptions::default(),
+            fitness_label: FitnessLabel::default(),
+            train_metric_label: FitnessLabel::default(),
+            // ── Network ───────────────────────────────────────────────
+            network: NetworkOptions::default(), // CPU, Float32
             dropout_prob: 0.05,
-            recurrent: false,
-            detach: false,
+            // ── Genetics ──────────────────────────────────────────────
+            selection: None,
+            crossover: None,
             y_proportional_batches: false,
-            dedup_pop: true,
-            progress_interval: 50,
         }
     }
 }
@@ -149,24 +150,55 @@ pub struct EngineOptionsBuilder {
 }
 
 impl EngineOptionsBuilder {
-    /// Validate and return the accumulated options. Fills empty pools with all built-ins.
+    /// Validate required fields and return the accumulated options.
+    /// Fills empty pools with all built-ins.
     pub fn build(mut self) -> Result<EngineOptions> {
         let o = &mut self.inner;
-        if o.pop_size == 0 {
-            return Err(EngineError::InvalidOptions("pop_size must be > 0".into()).into());
-        }
-        if o.num_batches > 0 && o.batch_size == 0 {
+        // ── Required fields ────────────────────────────────────────────
+        if o.pop_size < 2 {
             return Err(EngineError::InvalidOptions(
-                "num_batches > 0 requires batch_size > 0".to_string(),
+                "pop_size must be >= 2 (required for crossover)".into(),
             )
             .into());
+        }
+        if o.num_generations == 0 {
+            return Err(EngineError::InvalidOptions(
+                "num_generations must be > 0".into(),
+            )
+            .into());
+        }
+        if o.selection.is_none() {
+            return Err(EngineError::InvalidOptions(
+                "set_selection() is required — choose SelectionMethod::Tournament"
+                    .into(),
+            )
+            .into());
+        }
+        if o.crossover.is_none() {
+            return Err(EngineError::InvalidOptions(
+                "set_crossover() is required — choose CrossoverMethod::OnePoint or Uniform"
+                    .into(),
+            )
+            .into());
+        }
+        if o.mutation.prob() <= 0.0 {
+            return Err(EngineError::InvalidOptions(
+                "set_mutation() is required — choose MutationMethod::Activation, CombineOp, or Standardize"
+                    .into(),
+            )
+            .into());
+        }
+        // ── Conservative defaults for non-required fields ──────────────
+        if o.num_batches > 0 && o.batch_size == 0 {
+            o.batch_size = 32;
         }
         if o.hidden_dim_pool.is_empty() {
-            return Err(EngineError::InvalidOptions(
-                "hidden_dim_pool must be a non-empty range (start <= end)".to_string(),
-            )
-            .into());
+            o.hidden_dim_pool = 4..=8;
         }
+        if o.training.num_epochs == 0 {
+            o.training.num_epochs = 1;
+        }
+        // ── Auto-fill pools with all built-ins ─────────────────────────
         if o.combine_op_pool.is_empty() {
             o.combine_op_pool = crate::pools::all_combine_ops();
         }
@@ -175,12 +207,6 @@ impl EngineOptionsBuilder {
         }
         if o.standardize_op_pool.is_empty() {
             o.standardize_op_pool = crate::pools::all_standardize_ops();
-        }
-        if o.training.num_epochs == 0 {
-            return Err(EngineError::InvalidOptions(
-                "num_epochs must be > 0 (set via set_num_epochs)".to_string(),
-            )
-            .into());
         }
         Ok(self.inner)
     }
@@ -217,7 +243,7 @@ impl EngineOptionsBuilder {
         self
     }
     pub fn set_selection(mut self, method: SelectionMethod) -> Self {
-        self.inner.selection = method;
+        self.inner.selection = Some(method);
         self
     }
 
@@ -242,32 +268,26 @@ impl EngineOptionsBuilder {
         self.inner.dropout_prob = p.clamp(0.0, 1.0);
         self
     }
-    pub fn set_recurrent(mut self, on: bool) -> Self {
-        self.inner.recurrent = on;
-        self
-    }
-    pub fn set_detach(mut self, on: bool) -> Self {
-        self.inner.detach = on;
-        self
-    }
+
+
     pub fn set_y_proportional_batches(mut self, on: bool) -> Self {
         self.inner.y_proportional_batches = on;
         self
     }
-    pub fn set_crossover(mut self, kind: CrossoverKind) -> Self {
-        self.inner.crossover = kind;
+    pub fn set_crossover(mut self, kind: CrossoverMethod) -> Self {
+        self.inner.crossover = Some(kind);
         self
     }
-    pub fn set_mutation(mut self, kind: MutationKind) -> Self {
+    pub fn set_mutation(mut self, kind: MutationMethod) -> Self {
         self.inner.mutation = kind;
         self
     }
-    pub fn set_dedup_pop(mut self, on: bool) -> Self {
-        self.inner.dedup_pop = on;
+    pub fn set_dedup_pop_and_fill(mut self, on: bool) -> Self {
+        self.inner.dedup_pop_and_fill = on;
         self
     }
-    pub fn set_progress_interval(mut self, n: usize) -> Self {
-        self.inner.progress_interval = n;
+    pub fn set_gens_history(mut self, on: bool) -> Self {
+        self.inner.gens_history = on;
         self
     }
 
@@ -346,6 +366,16 @@ impl EngineOptionsBuilder {
 
 pub use crate::fitness::BestIndividual;
 
+/// Per-generation metrics, accumulated when `gens_history` is enabled.
+#[derive(Clone, Debug, Serialize)]
+pub struct GenerationStats {
+    pub generation: usize,
+    pub best_score: f32,
+    pub best_loss: Option<f32>,
+    pub worst_score: f32,
+    pub worst_loss: Option<f32>,
+}
+
 // ── Engine -- the NAS experiment runner ────────────────────────────────────
 
 pub struct Engine {
@@ -360,70 +390,41 @@ pub struct Engine {
     pub(crate) data_path: PathBuf,
     pub generation: usize,
     pub best: Option<BestIndividual>,
-
+    pub history: Vec<GenerationStats>,
 
     scores: Vec<f32>,
     eval_losses: Vec<Option<f32>>,
+    /// Cached per-gen summary — computed once in save_generation_snapshots.
+    gen_best_score: f32,
+    gen_best_loss: Option<f32>,
+    gen_worst_score: f32,
+    gen_worst_loss: Option<f32>,
 }
 
 // ── Progress tracker — periodic stdout updates during evaluation ─────────
 
 struct ProgressTracker {
     done: std::sync::atomic::AtomicUsize,
-    best_bits: std::sync::atomic::AtomicU32,
-    interval: usize,
-    generation: usize,
     pop_size: usize,
 }
 
 impl ProgressTracker {
-    fn new(generation: usize, pop_size: usize, interval: usize, direction: Direction) -> Self {
-        let init = if direction == Direction::Minimize {
-            f32::INFINITY
-        } else {
-            f32::NEG_INFINITY
-        };
+    fn new(pop_size: usize) -> Self {
         ProgressTracker {
             done: std::sync::atomic::AtomicUsize::new(0),
-            best_bits: std::sync::atomic::AtomicU32::new(f32::to_bits(init)),
-            interval,
-            generation,
             pop_size,
         }
     }
 
-    /// Workers call this after scoring. Prints progress at interval boundaries.
-    fn increment(&self, score: f32, direction: Direction) {
-        // Track best
-        let _ = self.best_bits.fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |bits| {
-                let cur = f32::from_bits(bits);
-                if direction.is_better(score, cur) {
-                    Some(score.to_bits())
-                } else {
-                    None
-                }
-            },
-        );
-        // Progress
-        let n = self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if self.interval > 0 && n % self.interval == 0 {
-            let best = f32::from_bits(self.best_bits.load(std::sync::atomic::Ordering::Relaxed));
-            let _ = std::io::Write::write_all(
-                &mut std::io::stdout(),
-                format!("\rgen {:02}  net {:>3}/{:<3}  best {best:.4}\x1b[K", self.generation, n, self.pop_size).as_bytes(),
-            );
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
+    /// Workers call this after scoring. Just counts — no printing.
+    fn increment(&self) {
+        self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Print final progress line + newline.
+    /// Print the final count line.
     fn finish(&self) {
         let n = self.done.load(std::sync::atomic::Ordering::Relaxed);
-        let best = f32::from_bits(self.best_bits.load(std::sync::atomic::Ordering::Relaxed));
-        println!("\rgen {:02}  net {:>3}/{:<3}  best {best:.4}", self.generation, n, self.pop_size);
+        println!("  nets scored: {:>3}/{:<3}", n, self.pop_size);
     }
 }
 
@@ -443,8 +444,9 @@ impl Engine {
 
         // Step 4: Create population
         let mut pop = Self::create_population(&options, seed)?;
-        if options.dedup_pop {
+        if options.dedup_pop_and_fill {
             Self::dedup_population(&mut pop);
+            Self::refill_population(&options, seed, 0, &mut pop);
         }
 
         // Step 5: Log initialization
@@ -454,23 +456,27 @@ impl Engine {
         Self::assemble_engine(options, seed, dataset, pop, fitness, data_path)
     }
 
-    /// Step 1: Validate options and fill empty pools with all built-ins.
+    /// Step 1: Propagate engine-level pools into mutation variant, fill defaults.
+    /// All required validation is done in `EngineOptionsBuilder::build()`.
     fn validate_and_fill_options(options: &mut EngineOptions) -> Result<()> {
-        if options.pop_size < 2 {
-            return Err(EngineError::InvalidOptions("pop_size must be >= 2 for crossover".into()).into());
-        }
+        // Sanity checks (builder auto-fills these, but direct construction may not).
         if options.num_batches > 0 && options.batch_size == 0 {
             return Err(EngineError::InvalidOptions(
-                "num_batches > 0 requires batch_size > 0".to_string(),
+                "num_batches > 0 requires batch_size > 0".into(),
             )
             .into());
+        }
+        if options.num_batches == 0 {
+            options.num_batches = 4;
+        }
+        if options.training.num_epochs == 0 {
+            options.training.num_epochs = 1;
         }
         if options.hidden_dim_pool.is_empty() {
-            return Err(EngineError::InvalidOptions(
-                "hidden_dim_pool must be a non-empty range".to_string(),
-            )
-            .into());
+            options.hidden_dim_pool = 4..=8;
         }
+
+        // Auto-fill empty pools with all built-ins.
         if options.combine_op_pool.is_empty() {
             options.combine_op_pool = crate::pools::all_combine_ops();
         }
@@ -479,26 +485,6 @@ impl Engine {
         }
         if options.standardize_op_pool.is_empty() {
             options.standardize_op_pool = crate::pools::all_standardize_ops();
-        }
-        if options.training.num_epochs == 0 {
-            return Err(EngineError::InvalidOptions("num_epochs must be > 0".to_string()).into());
-        }
-        if options.num_batches == 0 {
-            options.num_batches = 16;
-        }
-
-        // Propagate pools from engine options into mutation config.
-        if options.mutation.activation_pool.is_empty() {
-            options.mutation.activation_pool = options.activation_pool.clone();
-        }
-        if options.mutation.combine_pool.is_empty() {
-            options.mutation.combine_pool = options.combine_op_pool.clone();
-        }
-        if options.mutation.standardize_pool.is_empty() {
-            options.mutation.standardize_pool = options.standardize_op_pool.clone();
-        }
-        if options.mutation.dim_pool.is_empty() {
-            options.mutation.dim_pool = options.hidden_dim_pool.clone();
         }
         // Propagate engine-level flags into training config.
         options.training.y_proportional_batches = options.y_proportional_batches;
@@ -522,7 +508,7 @@ impl Engine {
     /// Step 3: Load dataset and bind input_dim/output_dim to options.
     fn load_data(options: &mut EngineOptions, data_path: &Path) -> Result<Dataset> {
         let dataset =
-            crate::utils::data::load_dataset(data_path)?.to_dtype(options.network.dtype)?;
+            crate::utils::data::load_dataset(data_path)?.to_dtype(options.network.dtype)?.to_device(options.network.device)?;
         let data_in = dataset.inputs.shape().get(1).copied().ok_or_else(|| {
             EngineError::DataMismatch("dataset inputs must be 2-D [n, input_dim]".into())
         })?;
@@ -607,6 +593,56 @@ impl Engine {
         }
     }
 
+    /// Refill population back to `pop_size` with fresh random individuals.
+    /// Called after dedup to keep the population at full strength.
+    /// Returns the number of individuals added.
+    fn refill_population(
+        options: &EngineOptions,
+        seed: u64,
+        generation: usize,
+        pop: &mut Vec<Topology>,
+    ) -> usize {
+        let target = options.pop_size;
+        if pop.len() >= target {
+            return 0;
+        }
+        let needed = target - pop.len();
+        // Offset into a disjoint seed space (initial pop uses 0..pop_size).
+        let base_offset = 1_000_000 + generation * target + pop.len();
+        for k in 0..needed {
+            let ind_seed = derive_seed(seed, base_offset + k);
+            let mut rng = fastrand::Rng::with_seed(ind_seed);
+            let n_hidden = rng.usize(
+                options.topology_options.min_hidden_num_nodes
+                    ..=options.topology_options.max_hidden_num_nodes,
+            );
+            let ind_opts = options.derive_topology_options(ind_seed as usize);
+            let id = pop.len();
+            let mut graph = Topology::new(id, Some(ind_opts));
+            graph.create_random_hidden_nodes(n_hidden);
+            let pool_len_a = options.activation_pool.len();
+            let pool_len_c = options.combine_op_pool.len();
+            let pool_len_s = options.standardize_op_pool.len();
+            for node in &mut graph.nodes {
+                if node.kind == NodeKind::Hidden {
+                    node.hidden_dim = Some(rng.usize(options.hidden_dim_pool.clone()));
+                    node.activation = options.activation_pool[rng.usize(0..pool_len_a)];
+                    node.combine_op = Some(options.combine_op_pool[rng.usize(0..pool_len_c)]);
+                    node.standardize = Some(options.standardize_op_pool[rng.usize(0..pool_len_s)]);
+                }
+            }
+            graph.refresh_labels();
+            graph.finalize();
+            debug!(
+                "  refill[{id}] seed={} n_hidden={} nodes={} wires={}",
+                ind_seed, n_hidden, graph.nodes.len(), graph.connections.len()
+            );
+            pop.push(graph);
+        }
+        debug!("  refill: added {needed} individuals, {}/{} remain", pop.len(), target);
+        needed
+    }
+
     /// Step 5: Log all resolved options, dataset, and population.
     fn log_initialization(
         options: &EngineOptions,
@@ -656,10 +692,14 @@ impl Engine {
             data_path: data_path.to_path_buf(),
             generation: 0,
             best: None,
-
+            history: Vec::new(),
 
             scores: Vec::new(),
             eval_losses: Vec::new(),
+            gen_best_score: 0.0,
+            gen_best_loss: None,
+            gen_worst_score: 0.0,
+            gen_worst_loss: None,
         })
     }
 
@@ -696,6 +736,8 @@ impl Engine {
     fn run_generations(&mut self) {
         for g in 0..self.options.num_generations {
             debug!("== gen {:02}/{:02} ==", g, self.options.num_generations);
+            log::info!("");
+            log::info!("  ── gen {:02}  ──", self.generation);
             let _improved = self.evaluate_population();
             self.log_generation_summary();
             self.next_generation();
@@ -742,13 +784,7 @@ impl Engine {
         let fitness = &self.fitness;
         let dataset = &self.dataset;
         let batch_seed = derive_seed(self.seed, self.generation * 3);
-        let direction = self.fitness.direction();
-        let tracker = ProgressTracker::new(
-            self.generation,
-            self.pop.len(),
-            self.options.progress_interval,
-            direction,
-        );
+        let tracker = ProgressTracker::new(self.pop.len());
 
         let results = self.pool.install(|| {
             self.pop
@@ -761,7 +797,7 @@ impl Engine {
                     let result = crate::trainer::train_network(
                         &mut net, train_cfg, fitness, dataset, batch_seed,
                     )?;
-                    tracker.increment(result.score, direction);
+                    tracker.increment();
                     Ok((result.score, result.eval_loss))
                 })
                 .collect::<Result<Vec<_>>>()
@@ -799,6 +835,12 @@ impl Engine {
         let best_loss = self.eval_losses.get(best_idx).copied().flatten();
         let worst_score = self.scores[worst_idx];
         let _worst_loss = self.eval_losses.get(worst_idx).copied().flatten();
+
+        // Cache for log_generation_summary and history (avoid re-iterating)
+        self.gen_best_score = best_score;
+        self.gen_best_loss = best_loss;
+        self.gen_worst_score = worst_score;
+        self.gen_worst_loss = self.eval_losses.get(worst_idx).copied().flatten();
 
         // Update overall best if this gen's best is better
         let improved = self
@@ -881,37 +923,12 @@ impl Engine {
         if self.scores.is_empty() {
             return;
         }
-        let direction = self.fitness.direction();
-        let mut best_idx = 0;
-        let mut worst_idx = 0;
-        for (i, &score) in self.scores.iter().enumerate() {
-            if direction.is_better(score, self.scores[best_idx]) {
-                best_idx = i;
-            }
-            if direction.is_better(self.scores[worst_idx], score) {
-                worst_idx = i;
-            }
-        }
+        let all_time = self.best.as_ref().map(|b| b.fitness).unwrap_or(self.gen_best_score);
         let fl = self.fitness.fitness_label();
-        let ll = self.fitness.train_metric_label();
-        let best_loss = self.eval_losses.get(best_idx).copied().flatten();
-        let worst_loss = self.eval_losses.get(worst_idx).copied().flatten();
-        if fl == ll {
-            log::info!(
-                "  gen {:02} best {fl}={:.4} · worst {fl}={:.4}",
-                self.generation,
-                self.scores[best_idx],
-                self.scores[worst_idx],
-            );
-        } else {
-            let bl = best_loss.map_or(String::new(), |v| format!(" {ll}={v:.4}"));
-            let wl = worst_loss.map_or(String::new(), |v| format!(" {ll}={v:.4}"));
-            log::info!(
-                "  gen {:02} best {fl}={:.4}{bl} · worst {fl}={:.4}{wl}",
-                self.generation,
-                self.scores[best_idx],
-                self.scores[worst_idx],
-            );
+        log::info!("  best {fl}={:.4}  all {fl}={:.4}", self.gen_best_score, all_time);
+        if let Some(loss) = self.gen_best_loss {
+            let ll = self.fitness.train_metric_label();
+            log::info!("  loss {ll}={loss:.4}");
         }
     }
 
@@ -921,19 +938,54 @@ impl Engine {
         let (unique, sel_label) = self.select();
         let cx_pairs = self.crossover();
         let pre_dedup = self.pop.len();
-        if self.options.dedup_pop {
+        if self.options.dedup_pop_and_fill {
             Self::dedup_population(&mut self.pop);
         }
         let dedup_removed = pre_dedup - self.pop.len();
-        let mut_count = self.mutate();
-        let dedup_str = if dedup_removed > 0 {
-            format!(" · dedup -{dedup_removed}")
-        } else {
-            String::new()
-        };
-        log::info!(
-            "  evolve  sel {unique} unique ({sel_label}){dedup_str} · cx {cx_pairs} pairs · mut {mut_count} nets"
+        let refill_added = Self::refill_population(
+            &self.options,
+            self.seed,
+            self.generation,
+            &mut self.pop,
         );
+        // Post-refill safety: catch any accidental duplicates between refilled
+        // individuals and existing crossover survivors.
+        let pre_post_dedup = self.pop.len();
+        if self.options.dedup_pop_and_fill && refill_added > 0 {
+            Self::dedup_population(&mut self.pop);
+        }
+        let post_refill_dedup = pre_post_dedup - self.pop.len();
+        let mut_count = self.mutate();
+        // Log in order of operations: select → crossover → dedup → refill → dedup → mutate
+        let target = self.options.pop_size;
+        log::info!("  ── genetics ──");
+        log::info!("  selection    {unique}/{target} unique ({sel_label})");
+        log::info!("  crossover    {cx_pairs} pairs  {target}/{target}");
+        if dedup_removed > 0 {
+            log::info!("  dedup        -{dedup_removed}  {}/{} → {}/{}", pre_dedup, target, pre_dedup - dedup_removed, target);
+        } else {
+            log::info!("  dedup        -0  {target}/{target}");
+        }
+        if refill_added > 0 {
+            let after_refill = self.pop.len();
+            log::info!("  refill       +{refill_added}  {}/{} → {}/{}", after_refill - refill_added, target, after_refill, target);
+        } else {
+            log::info!("  refill       +0  {}/{}", self.pop.len(), target);
+        }
+        if post_refill_dedup > 0 {
+            log::info!("  dedup        -{post_refill_dedup} (post-refill)  {}/{}", self.pop.len(), target);
+        }
+        log::info!("  mutation     {mut_count} nets  {}/{}", self.pop.len(), target);
+        // Capture history if enabled (uses cached values from save_generation_snapshots)
+        if self.options.gens_history && !self.scores.is_empty() {
+            self.history.push(GenerationStats {
+                generation: self.generation,
+                best_score: self.gen_best_score,
+                best_loss: self.gen_best_loss,
+                worst_score: self.gen_worst_score,
+                worst_loss: self.gen_worst_loss,
+            });
+        }
         self.generation += 1;
     }
 
@@ -941,12 +993,13 @@ impl Engine {
     /// Returns (unique_survivors, selection_label).
     pub fn select(&mut self) -> (usize, String) {
         if self.scores.is_empty() {
-            return (0, self.options.selection.label().to_string());
+            return (0, self.options.selection.as_ref().unwrap().label().to_string());
         }
         let dir = self.fitness.direction();
         let mut rng = fastrand::Rng::with_seed(derive_seed(self.seed, self.generation * 3 + 1));
-        let indices = self.options.selection.apply(&self.scores, dir, &mut rng);
-        let label = self.options.selection.label().to_string();
+        let selection = self.options.selection.as_ref().unwrap();
+        let indices = selection.apply(&self.scores, dir, &mut rng);
+        let label = selection.label().to_string();
 
         // In-place reorder: build new pop from selected indices.
         let new_pop: Vec<Topology> = indices.iter().map(|&i| self.pop[i].clone()).collect();
@@ -974,7 +1027,7 @@ impl Engine {
             return 0;
         }
         let mut rng = fastrand::Rng::with_seed(derive_seed(self.seed, self.generation * 3 + 2));
-        let kind = &self.options.crossover;
+        let kind = self.options.crossover.as_ref().unwrap();
         let cxpb = kind.action_prob();
         if cxpb <= 0.0 {
             return 0;
@@ -987,10 +1040,10 @@ impl Engine {
             if rng.f32() < cxpb {
                 let (left, right) = offspring.split_at_mut(i + 1);
                 let crossed = match &kind {
-                    CrossoverKind::TwoPoint { .. } => {
-                        Topology::cx_two_point(&mut left[i], &mut right[0], &mut rng)
+                    CrossoverMethod::OnePoint { .. } => {
+                        Topology::cx_one_point(&mut left[i], &mut right[0], &mut rng)
                     }
-                    CrossoverKind::Uniform { swap_prob, .. } => {
+                    CrossoverMethod::Uniform { swap_prob, .. } => {
                         Topology::cx_uniform(&mut left[i], &mut right[0], *swap_prob, &mut rng)
                     }
                 };
@@ -1006,43 +1059,19 @@ impl Engine {
         cx_count
     }
 
-    /// Mutation — one roll per individual; if it hits, pick one random
-    /// type and mutate one random hidden node. Returns individuals mutated.
+    /// Mutation — one roll per individual; if it hits, mutate one random
+    /// hidden node according to the configured variant. The mutation pool
+    /// is always taken from the engine-level pools. Returns individuals mutated.
     pub fn mutate(&mut self) -> usize {
         let mut rng = fastrand::Rng::with_seed(derive_seed(self.seed, self.generation * 3 + 3));
         let m = &self.options.mutation;
-        if m.mut_prob <= 0.0 {
-            return 0;
-        }
-
-        // Collect available mutation types from non-empty pools
-        #[derive(Clone, Copy)]
-        enum MutType {
-            Activation,
-            CombineOp,
-            Standardize,
-            HiddenDim,
-        }
-        let mut types: Vec<MutType> = Vec::new();
-        if !m.activation_pool.is_empty() {
-            types.push(MutType::Activation);
-        }
-        if !m.combine_pool.is_empty() {
-            types.push(MutType::CombineOp);
-        }
-        if !m.standardize_pool.is_empty() {
-            types.push(MutType::Standardize);
-        }
-        if !m.dim_pool.is_empty() {
-            types.push(MutType::HiddenDim);
-        }
-        if types.is_empty() {
+        if m.prob() <= 0.0 {
             return 0;
         }
 
         let mut mut_count = 0usize;
         for topo in &mut self.pop {
-            if rng.f32() >= m.mut_prob {
+            if rng.f32() >= m.prob() {
                 continue;
             }
             // Collect hidden node indices
@@ -1056,22 +1085,23 @@ impl Engine {
             if hidden.is_empty() {
                 continue;
             }
-            // Pick one random hidden node and one random mutation type
             let node_idx = hidden[rng.usize(0..hidden.len())];
-            let mtype = types[rng.usize(0..types.len())];
             let node = &mut topo.nodes[node_idx];
-            match mtype {
-                MutType::Activation => {
-                    node.activation = m.activation_pool[rng.usize(0..m.activation_pool.len())];
+            match m {
+                MutationMethod::Activation { .. } => {
+                    let pool = &self.options.activation_pool;
+                    if pool.is_empty() { continue; }
+                    node.activation = pool[rng.usize(0..pool.len())];
                 }
-                MutType::CombineOp => {
-                    node.combine_op = Some(m.combine_pool[rng.usize(0..m.combine_pool.len())]);
+                MutationMethod::CombineOp { .. } => {
+                    let pool = &self.options.combine_op_pool;
+                    if pool.is_empty() { continue; }
+                    node.combine_op = Some(pool[rng.usize(0..pool.len())]);
                 }
-                MutType::Standardize => {
-                    node.standardize = Some(m.standardize_pool[rng.usize(0..m.standardize_pool.len())]);
-                }
-                MutType::HiddenDim => {
-                    node.hidden_dim = Some(rng.usize(m.dim_pool.clone()));
+                MutationMethod::Standardize { .. } => {
+                    let pool = &self.options.standardize_op_pool;
+                    if pool.is_empty() { continue; }
+                    node.standardize = Some(pool[rng.usize(0..pool.len())]);
                 }
             }
             topo.finalize();
@@ -1122,6 +1152,7 @@ impl Engine {
             "best_loss": best.and_then(|b| b.loss),
             "best_topology": best_topology,
             "best_net_facts": best_net_facts,
+            "history": if self.history.is_empty() { serde_json::Value::Null } else { serde_json::to_value(&self.history).unwrap_or(serde_json::Value::Null) },
         }))
     }
 
@@ -1157,12 +1188,15 @@ mod tests {
         EngineOptions {
             pop_size: 3,
             num_generations: 2,
-            dedup_pop: false,
+            dedup_pop_and_fill: false,
             topology_options: TopologyOptions {
                 hidden_dim: 4,
                 ..Default::default()
             },
             hidden_dim_pool: 4..=4,
+            selection: Some(SelectionMethod::Tournament { tournament_size: 2 }),
+            crossover: Some(CrossoverMethod::OnePoint { action_prob: 0.5 }),
+            mutation: crate::mutation::MutationMethod::Activation { prob: 0.1 },
             results_dir: std::env::temp_dir()
                 .join(format!("gras_engine_res_{}", fastrand::u64(..))),
             training: crate::trainer::TrainingConfig {
@@ -1388,6 +1422,9 @@ mod tests {
             .set_hidden_dim_pool(8..=32)
             .set_combine_op_pool(vec![CombineOp::Add, CombineOp::Mean])
             .set_activation_pool(vec![Activation::ReLU, Activation::GeLU])
+            .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
+            .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.5 })
+            .set_mutation(crate::mutation::MutationMethod::Activation { prob: 0.1 })
             .set_num_batches(4)
             .set_batch_size(32)
             .set_num_threads(2)
@@ -1410,16 +1447,34 @@ mod tests {
                 .build()
                 .is_err()
         );
+        // set_mutation() is required — omitting it should error at build time.
+        assert!(
+            EngineOptions::builder()
+                .set_pop_size(4)
+                .set_num_generations(1)
+                .set_hidden_dim_pool(4..=4)
+                .set_num_batches(2)
+                .set_batch_size(8)
+                .set_num_epochs(1)
+                .build()
+                .is_err()
+        );
         let opts = EngineOptions::builder()
+            .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
+            .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.5 })
+            .set_mutation(crate::mutation::MutationMethod::Activation { prob: 0.1 })
             .set_combine_op_pool(vec![])
             .build()
             .unwrap();
         assert_eq!(opts.combine_op_pool.len(), 4);
         let opts = EngineOptions::builder()
+            .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
+            .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.5 })
+            .set_mutation(crate::mutation::MutationMethod::Activation { prob: 0.1 })
             .set_activation_pool(vec![])
             .build()
             .unwrap();
-        assert_eq!(opts.activation_pool.len(), 14);
+        assert_eq!(opts.activation_pool.len(), 16);
     }
 
     #[test]
@@ -1430,6 +1485,9 @@ mod tests {
             .set_num_generations(1)
             .set_seed(Some(7))
             .set_hidden_dim_pool(4..=4)
+            .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
+            .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.5 })
+            .set_mutation(crate::mutation::MutationMethod::Activation { prob: 0.1 })
             .build()
             .unwrap();
         let mut engine = Engine::new(
