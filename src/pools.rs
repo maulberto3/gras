@@ -22,6 +22,8 @@ pub fn all_activations() -> Vec<Activation> {
         Activation::Softplus,
         Activation::HardSwish,
         Activation::HardSigmoid,
+        Activation::Sin,
+        Activation::Cos,
     ]
 }
 
