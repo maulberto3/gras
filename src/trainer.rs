@@ -7,7 +7,7 @@ use flodl::nn::Module;
 use flodl::nn::optim::Optimizer;
 use flodl::tensor::Result;
 use flodl::{Adam, SGD};
-use flodl::{Device, Tensor, Variable};
+use flodl::{Tensor, Variable};
 use log::{debug, trace};
 
 use crate::network::Network;
@@ -266,7 +266,7 @@ fn sample_batches(
                 break;
             }
             let idx: Vec<i64> = all_idx[s..e].to_vec();
-            let idx_t = Tensor::from_i64(&idx, &[idx.len() as i64], Device::CPU)?;
+            let idx_t = Tensor::from_i64(&idx, &[idx.len() as i64], inputs.device())?;
             let xb = inputs.index_select(0, &idx_t)?;
             let yb = targets.index_select(0, &idx_t)?;
             batches.push((xb, yb));
