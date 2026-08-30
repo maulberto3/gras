@@ -39,18 +39,7 @@ pub use fitness::{
 ///
 /// - With `cuda` feature: returns `Device::CUDA(0)`
 /// - Without `cuda` feature: returns `Device::CPU`
-///
-/// # Example
-///
-/// ```no_run
-/// let opts = gras::EngineOptions::builder()
-///     .set_device(gras::auto_device())
-///     .set_selection(gras::SelectionMethod::Tournament { tournament_size: 2 })
-///     .set_crossover(gras::CrossoverMethod::OnePoint { action_prob: 0.5 })
-///     .set_mutation(gras::MutationMethod::Activation { prob: 0.1 })
-///     .build()
-///     .unwrap();
-/// ```
+/// Auto-detect the best available device (CUDA if feature enabled, else CPU).
 pub fn auto_device() -> flodl::Device {
     #[cfg(feature = "cuda")]
     {
