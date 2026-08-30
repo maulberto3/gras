@@ -413,7 +413,8 @@ impl Network {
                     Ok(combined)
                 }
             }
-            CombineOp::Max | CombineOp::Min => {
+            CombineOp::Multiply | CombineOp::Subtract | CombineOp::Divide
+            | CombineOp::Max | CombineOp::Min => {
                 let port_tensors = self.gather_port_tensors(node_outputs, node_id);
                 if port_tensors.is_empty() {
                     return Ok(combined);
@@ -422,6 +423,9 @@ impl Network {
                 let mut result = iter.next().unwrap();
                 for t in iter {
                     result = match op {
+                        CombineOp::Multiply => result.mul(&t)?,
+                        CombineOp::Subtract => result.sub(&t)?,
+                        CombineOp::Divide => result.div(&t)?,
                         CombineOp::Max => result.maximum(&t)?,
                         CombineOp::Min => result.minimum(&t)?,
                         _ => unreachable!(),
