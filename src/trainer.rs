@@ -32,12 +32,17 @@ pub struct TrainingConfig {
     pub num_epochs: usize,
     /// Gradient clipping max-norm (0.0 = no clipping).
     pub grad_clip: f32,
-    /// Rows per batch.
-    pub batch_size: usize,
-    /// Number of batches per generation (split into train/eval).
-    pub num_batches: usize,
+    /// Rows per training batch.
+    pub batch_size_train: usize,
+    /// Rows per evaluation batch.
+    pub batch_size_eval: usize,
+    /// Number of training batches per generation.
+    pub num_batches_train: usize,
+    /// Number of evaluation batches per generation.
+    pub num_batches_eval: usize,
     /// Sample batches proportional to target class frequency.
-    pub y_proportional_batches: bool,
+    pub train_y_proportional: bool,
+    pub test_y_proportional: bool,
 }
 
 impl Default for TrainingConfig {
@@ -47,9 +52,12 @@ impl Default for TrainingConfig {
             learning_rate: 1e-3,
             num_epochs: 1,
             grad_clip: 0.0,
-            batch_size: 128,
-            num_batches: 16,
-            y_proportional_batches: false,
+            batch_size_train: 128,
+            batch_size_eval: 128,
+            num_batches_train: 16,
+            num_batches_eval: 16,
+            train_y_proportional: false,
+            test_y_proportional: false,
         }
     }
 }
@@ -65,21 +73,39 @@ pub struct TrainResult {
 
 /// Train a network: sample batches, train, score on eval batches.
 /// Receives a pre-loaded dataset (no file I/O).
+/// `train_indices` — subset for training (resampled each generation).
+/// `eval_indices` — fixed subset for evaluation (same every generation).
+/// `train_seed` — changes each generation for train batch shuffling.
+/// `eval_seed` — fixed across generations for consistent eval batches.
 pub fn train_network(
     net: &mut Network,
     config: &TrainingConfig,
     fitness: &crate::fitness::Fitness,
     dataset: &Dataset,
-    seed: u64,
+    train_indices: &[i64],
+    eval_indices: &[i64],
+    train_seed: u64,
+    eval_seed: u64,
 ) -> Result<TrainResult> {
-    // Sample batches (train/eval split)
-    let (train_batches, eval_batches) = sample_batches(
+    // Sample train batches from train_indices (resampled each generation)
+    let train_batches = sample_batches_from_indices(
         &dataset.inputs,
         &dataset.targets,
-        config.batch_size,
-        config.num_batches,
-        seed,
-        config.y_proportional_batches,
+        train_indices,
+        config.batch_size_train,
+        config.num_batches_train,
+        train_seed,
+        config.train_y_proportional,
+    )?;
+    // Use eval_indices directly (fixed across generations)
+    let eval_batches = sample_batches_from_indices(
+        &dataset.inputs,
+        &dataset.targets,
+        eval_indices,
+        config.batch_size_eval,
+        config.num_batches_eval,
+        eval_seed,  // fixed across generations for consistent eval
+        config.test_y_proportional,
     )?;
 
     if config.num_epochs == 0 || train_batches.is_empty() {
@@ -94,9 +120,10 @@ pub fn train_network(
     net.train();
     let params = net.parameters();
     debug!(
-        "  train -- {} epochs x {} batches, optimizer={:?} lr={} params={}",
+        "  train -- {} epochs x {} batches (eval {}), optimizer={:?} lr={} params={}",
         config.num_epochs,
         train_batches.len(),
+        eval_batches.len(),
         config.optimizer,
         config.learning_rate,
         params.len()
@@ -142,7 +169,7 @@ pub fn train_network(
         );
     }
 
-    // Eval: score on held-out batches
+    // Eval: score on held-out batches (always uses the trained net)
     net.eval();
     let mut score_total = 0.0;
     let mut loss_total = 0.0f32;
@@ -179,18 +206,22 @@ pub fn train_network(
 
 // ── Private helpers ─────────────────────────────────────────────────────────
 
-/// Shuffle data and split into train/eval batches.
-/// When `proportional` is true and targets are categorical (2D one-hot),
-/// each batch is sampled proportional to class frequency.
-fn sample_batches(
+/// Sample random batches from a subset of indices.
+/// Same as sample_batches but operates on a pre-defined index subset.
+/// Silent fallback: if requested more than available, use what's there.
+fn sample_batches_from_indices(
     inputs: &Tensor,
     targets: &Tensor,
+    indices: &[i64],
     batch_size: usize,
     num_batches: usize,
     seed: u64,
     proportional: bool,
-) -> Result<(Vec<(Tensor, Tensor)>, Vec<(Tensor, Tensor)>)> {
-    let n = inputs.shape()[0] as usize;
+) -> Result<Vec<(Tensor, Tensor)>> {
+    let n = indices.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
     let max_full = n / batch_size;
     let actual = num_batches.min(max_full).max(1);
     let total_samples = actual * batch_size;
@@ -200,27 +231,22 @@ fn sample_batches(
     // Decide whether proportional sampling applies.
     let use_proportional = proportional && targets.ndim() == 2 && targets.shape()[1] > 1;
 
-    let all_idx: Vec<i64> = if use_proportional {
+    let pool: Vec<i64> = if use_proportional {
         // Build per-class index lists from one-hot targets.
         let n_classes = targets.shape()[1] as usize;
         let target_vec = targets.to_f32_vec().unwrap_or_default();
-        let mut class_indices: Vec<Vec<usize>> = vec![Vec::new(); n_classes];
-        for (i, row) in target_vec.chunks(n_classes).enumerate() {
-            if let Some(cls) = row
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-            {
-                class_indices[cls.0].push(i);
+        let mut class_indices: Vec<Vec<i64>> = vec![Vec::new(); n_classes];
+        for &idx in indices {
+            let row_start = idx as usize * n_classes;
+            if row_start + n_classes <= target_vec.len() {
+                let row = &target_vec[row_start..row_start + n_classes];
+                if let Some(cls) = row.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()) {
+                    class_indices[cls.0].push(idx);
+                }
             }
         }
-        // Compute class weights (frequency / total).
-        let total = n as f64;
-        let weights: Vec<f64> = class_indices
-            .iter()
-            .map(|c| c.len() as f64 / total)
-            .collect();
-        // Sample `total_samples` indices proportional to class weights.
+        // Sample proportional to class frequency.
+        let weights: Vec<f64> = class_indices.iter().map(|c| c.len() as f64 / n as f64).collect();
         let mut sampled = Vec::with_capacity(total_samples);
         for _ in 0..total_samples {
             let r: f64 = rng.f64();
@@ -235,37 +261,34 @@ fn sample_batches(
             }
             if let Some(pool) = class_indices.get(chosen) {
                 if !pool.is_empty() {
-                    sampled.push(pool[rng.usize(0..pool.len())] as i64);
+                    sampled.push(pool[rng.usize(0..pool.len())]);
                 }
             }
         }
         // Pad if undersampled.
         while sampled.len() < total_samples {
-            sampled.push(rng.usize(0..n) as i64);
+            sampled.push(indices[rng.usize(0..n)]);
         }
         sampled
     } else {
-        // Uniform random shuffle.
-        let mut idx: Vec<i64> = (0..n as i64).collect();
-        for i in (1..idx.len()).rev() {
+        // Shuffle the index subset.
+        let mut pool = indices.to_vec();
+        for i in (1..pool.len()).rev() {
             let j = rng.usize(0..=i);
-            idx.swap(i, j);
+            pool.swap(i, j);
         }
-        idx
+        pool
     };
 
-    let train_count = (actual / 2).max(1);
-    let eval_count = (actual - train_count).max(1);
-
-    let make_batch = |start: usize, count: usize| -> Result<Vec<(Tensor, Tensor)>> {
+    let make_batches = |count: usize| -> Result<Vec<(Tensor, Tensor)>> {
         let mut batches = Vec::with_capacity(count);
         for b in 0..count {
-            let s = start + b * batch_size;
-            let e = (s + batch_size).min(all_idx.len());
+            let s = b * batch_size;
+            let e = (s + batch_size).min(pool.len());
             if s >= e {
                 break;
             }
-            let idx: Vec<i64> = all_idx[s..e].to_vec();
+            let idx: Vec<i64> = pool[s..e].to_vec();
             let idx_t = Tensor::from_i64(&idx, &[idx.len() as i64], inputs.device())?;
             let xb = inputs.index_select(0, &idx_t)?;
             let yb = targets.index_select(0, &idx_t)?;
@@ -274,19 +297,7 @@ fn sample_batches(
         Ok(batches)
     };
 
-    let train_batches = make_batch(0, train_count)?;
-    let eval_batches = make_batch(train_count * batch_size, eval_count)?;
-    let eval_batches = if eval_batches.is_empty() {
-        train_batches.clone()
-    } else {
-        eval_batches
-    };
-
-    debug!(
-        "  sample_batches -- train={} eval={} (from {} total)",
-        train_batches.len(),
-        eval_batches.len(),
-        actual
-    );
-    Ok((train_batches, eval_batches))
+    let batches = make_batches(actual)?;
+    debug!("  sample_batches_from_indices -- {} batches ({} samples from {} pool)", batches.len(), total_samples, n);
+    Ok(batches)
 }
