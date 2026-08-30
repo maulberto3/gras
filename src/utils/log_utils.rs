@@ -18,6 +18,13 @@ use crate::fitness::Direction;
 use crate::network::Network;
 use crate::topology::Topology;
 
+/// Hash a topology JSON string — returns first 8 hex chars of DefaultHasher digest.
+fn topo_hash(topology_json: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    topology_json.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())[..8].to_string()
+}
 // ── Initialization ───────────────────────────────────────────────────────
 
 /// Single section logging all resolved options, dataset, and population.
@@ -28,11 +35,17 @@ pub(crate) fn log_initialization(
     pop: &[Topology],
     seed: u64,
     fitness: &crate::fitness::Fitness,
+    data_path: &std::path::Path,
 ) {
     let fl = fitness.fitness_label();
     let ll = fitness.train_metric_label();
-    let dir = fitness.direction();
-    let better = match dir {
+    let score_dir = fitness.direction();
+    let train_dir = fitness.train_metric_direction();
+    let score_better = match score_dir {
+        Direction::Minimize => "lower = better",
+        Direction::Maximize => "higher = better",
+    };
+    let train_better = match train_dir {
         Direction::Minimize => "lower = better",
         Direction::Maximize => "higher = better",
     };
@@ -43,52 +56,102 @@ pub(crate) fn log_initialization(
     // Engine core
     log::info!(
         "  engine    pop {} · {} gens",
-        options.pop_size,
-        options.num_generations
+        options.pop_size.unwrap_or(0),
+        options.num_generations.unwrap_or(0)
     );
     log::info!("  seed      {seed}  (set_seed(Some({seed})) to reproduce)");
-    log::info!(
-        "  engine    budget {}bt x {} · {} threads",
-        options.num_batches,
-        options.batch_size,
-        options.num_threads
-    );
-    log::info!("  engine    results_dir {}", options.results_dir.display());
 
-    // Fitness & direction
-    if fl == ll {
-        log::info!("  fitness   {} ({fl}) · {better}", fl);
-    } else {
-        log::info!("  fitness   {fl} (fitness) · {ll} (train_metric)");
-        log::info!("            {better}");
-    }
-    // Mutation
-    log::info!("  mutation  {}", options.mutation);
-    // Crossover
-    if let Some(ref cx) = options.crossover {
-        log::info!("  crossover {}", cx);
-    }
-    // Dedup
+    // Data split
+    log::info!(
+        "  split     {:.0}% train / {:.0}% test",
+        options.train_test_split.0 * 100.0,
+        options.train_test_split.1 * 100.0
+    );
+
+    // Batch budget
+    log::info!(
+        "  budget    train {}bt × {} · test {}bt × {}",
+        options.train_num_batches,
+        options.train_batch_size,
+        options.test_num_batches,
+        options.test_batch_size
+    );
+
+    // Data & coefs randomization
+    log::info!(
+        "  random    data train={} test={}  coefs {}",
+        if options.train_random_data { "yes" } else { "no" },
+        if options.test_random_data { "yes" } else { "no" },
+        if options.train_fixed_coefs { "fixed" } else { "rand" }
+    );
+
+    // Engine knobs
+    log::info!("  threads   {}", options.num_threads);
+    log::info!("  elite     {}", options.elite_count);
     if options.dedup_pop_and_fill {
         log::info!("  dedup     on (full topology comparison)");
     }
+    log::info!("  results   {}", options.results_dir.display());
+
+    // Warm start
+    if !options.prior_topology_paths.is_empty() {
+        log::info!("  warm      {} prior topologies", options.prior_topology_paths.len());
+        for (i, path) in options.prior_topology_paths.iter().enumerate() {
+            let fitness_info = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .and_then(|v| v.get("best_fitness")?.as_f64())
+                .map(|f| format!(" fitness={f:.4}"))
+                .unwrap_or_default();
+            log::info!("  warm[{i}]   {}{}", path.display(), fitness_info);
+        }
+    }
+
+    // Fitness & direction
+    if fl == ll {
+        log::info!("  fitness   {fl} · {score_better}");
+    } else {
+        log::info!("  fitness   {fl} (score) · {score_better}");
+        log::info!("            {ll} (train) · {train_better}");
+    }
+
+    // Genetics
+    if let Some(ref sel) = options.selection {
+        log::info!("  selection {}", sel);
+    }
+    if let Some(ref cx) = options.crossover {
+        log::info!("  crossover {}", cx);
+    }
+    log::info!("  mutation  {}", options.mutation);
 
     // Dataset
     let n = dataset.inputs.shape()[0];
     let d_in = dataset.inputs.shape().get(1).copied().unwrap_or(0);
     let d_out = dataset.targets.shape().get(1).copied().unwrap_or(0);
-    log::info!("  data      [{n}x{d_in}] -> [{n}x{d_out}]");
+    // Detect data format
+    let cache_dir = data_path.join("flodl_data");
+    let format_str = if cache_dir.join("inputs.bin").exists() {
+        "csv → bin (cached)"
+    } else if data_path.join("inputs.bin").exists() {
+        "bin (native)"
+    } else if data_path.join("inputs.csv").exists() {
+        "csv → bin (converted)"
+    } else {
+        "unknown"
+    };
+    log::info!("  data      [{n}×{d_in}] → [{n}×{d_out}]  {format_str}");
 
     // Topology
     log::info!(
-        "  topo      input {} -> hidden (pool {}..={}) -> output {}",
+        "  topo      input {} → hidden (pool {}..={} stride {}) → output {}",
         options.topology_options.input_dim,
         options.hidden_dim_pool.start(),
         options.hidden_dim_pool.end(),
+        options.hidden_dim_stride,
         options.topology_options.output_dim
     );
     log::info!(
-        "  topo      hidden nodes {}..={} · inputs/node {}..={} · outputs/node {}..={}",
+        "  topo      hidden {}..={} nodes · in {}..={} · out {}..={}",
         options.topology_options.min_hidden_num_nodes,
         options.topology_options.max_hidden_num_nodes,
         options.topology_options.min_hidden_inputs_per_node,
@@ -97,35 +160,34 @@ pub(crate) fn log_initialization(
         options.topology_options.max_hidden_outputs_per_node
     );
 
-    // Network
-    log::info!(
-        "  net       device {:?} · dtype {:?}",
-        options.network.device,
-        options.network.dtype
-    );
-    if options.dropout_prob > 0.0 {
-        log::info!("  net       dropout {:.0}%", options.dropout_prob * 100.0);
-    }
-
     // Training
     let clip_str = if options.training.grad_clip > 0.0 {
-        format!(" · clip {:.1}", options.training.grad_clip)
+        format!(" · clip {}", options.training.grad_clip)
     } else {
         String::new()
     };
-    let prop_str = if options.y_proportional_batches {
-        " · y_proportional"
-    } else {
-        ""
-    };
     log::info!(
-        "  train     {} epochs · lr {} · {}{}{}",
+        "  train     {} epochs · lr {} · {}{}",
         options.training.num_epochs,
         options.training.learning_rate,
         options.training.optimizer,
         clip_str,
-        prop_str,
     );
+    log::info!(
+        "  sampling  train={} test={}",
+        if options.train_y_proportional { "y_prop" } else { "uniform" },
+        if options.test_y_proportional { "y_prop" } else { "uniform" }
+    );
+
+    // Network
+    log::info!(
+        "  net       {:?} · {:?}",
+        options.network.device,
+        options.network.dtype
+    );
+    if options.dropout_prob > 0.0 {
+        log::info!("  net       dropout {}%", (options.dropout_prob * 100.0) as usize);
+    }
 
     // GP pools
     let act_names: Vec<String> = options
@@ -138,7 +200,7 @@ pub(crate) fn log_initialization(
         .iter()
         .map(|s| s.to_string())
         .collect();
-    log::info!("  pools     hidden {:?}", options.hidden_dim_pool);
+    log::info!("  pools     hidden {:?} stride {}", options.hidden_dim_pool, options.hidden_dim_stride);
     log::info!("  pools     combine {:?}", options.combine_op_pool);
     log::info!("  pools     activations [{}]", act_names.join(", "));
     log::info!("  pools     standardize [{}]", std_names.join(", "));
@@ -165,13 +227,11 @@ pub(crate) fn log_run_start(run_dir: &Path) {
 
 // ── Run summary ─────────────────────────────────────────────────────────
 
-/// Final summary after run() completes. Winner, artifacts, rebuild helper.
-/// No GP pool duplication — those are in initialization.
+/// Final summary after run() completes. Winner, artifacts, examples reference.
 pub(crate) fn log_run_summary(
     run_elapsed: Duration,
     best: &Option<BestIndividual>,
     fitness: &crate::fitness::Fitness,
-    options: &EngineOptions,
     run_dir: &Path,
 ) -> Result<(), EngineError> {
     log::info!("");
@@ -198,7 +258,7 @@ pub(crate) fn log_run_summary(
     log_artifacts(run_dir);
 
     // Rebuild
-    log_rebuild_helper(run_dir, options);
+    log_examples(run_dir);
 
     Ok(())
 }
@@ -305,23 +365,87 @@ fn log_artifacts(run_dir: &Path) {
     }
 }
 
-/// Print copy-paste rebuild snippet.
-fn log_rebuild_helper(run_dir: &Path, options: &EngineOptions) {
-    let dev = options.network.device;
+/// Print examples reference.
+fn log_examples(run_dir: &Path) {
     log::info!("");
-    log::info!("══ rebuild ════════════════════════════════════════════════════════");
-    log::info!("  copy-paste this to reconstruct any saved topology:");
-    log::info!("    use gras::topology::Topology;");
-    log::info!("    use gras::network::Network;");
-    log::info!("    use flodl::nn::Module;");
+    log::info!("══ examples ══════════════════════════════════════════════════════");
+    log::info!("  # Generate MD for a specific topology from gen_XX.json");
+    log::info!("  cargo run --example generate_md_from_gen -- {}/improvements/gen_00.json --best", run_dir.display());
     log::info!("");
-    log::info!("    // Load from engine.json or any improvement .json (same format)");
-    log::info!("    let v: serde_json::Value = serde_json::from_str(");
-    log::info!("        &std::fs::read_to_string(\"results/<run_id>/engine.json\").unwrap()).unwrap();");
-    log::info!("    let topo = Topology::from_json(");
-    log::info!("        v[\"best_topology\"].as_str().unwrap()).unwrap();");
-    log::info!("    let net = Network::build(&topo, {dev:?}).unwrap();");
+    log::info!("  # Fully train a specific network and see it working");
+    log::info!("  cargo run --example train_from_gen -- {}/improvements/gen_00.json --best", run_dir.display());
     log::info!("");
-    log::info!("  run_dir: {}", run_dir.display());
-    log::info!("  engine.json or improvements/*.json — drop any path into the read_to_string above");
+    log::info!("  # Convert .bin data to CSV for inspection");
+    log::info!("  cargo run --example bin_to_csv -- data/mnist/train");
+}
+
+/// Print the top-N repeated topologies sorted by mean fitness.
+pub(crate) fn log_repeated_topologies(
+    robustness: &std::collections::HashMap<String, crate::engine::RobustnessEntry>,
+    top_n: usize,
+) {
+    // Only show topologies that appeared more than once
+    let mut entries: Vec<&crate::engine::RobustnessEntry> = robustness.values()
+        .filter(|e| e.count > 1)
+        .collect();
+    // Best: sort by appearances desc, then std_dev asc, then mean desc
+    entries.sort_by(|a, b| {
+        b.count.cmp(&a.count)
+            .then_with(|| a.std_dev().partial_cmp(&b.std_dev()).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| b.mean.partial_cmp(&a.mean).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    if entries.is_empty() {
+        return;
+    }
+
+    let n = top_n.min(entries.len());
+    log::info!("");
+    log::info!("── repeated topologies (top {n}) ──");
+    log::info!("  {:<6} {:>11} {:>9} {:>9} {:>9} {:>9} {:>8}  {}",
+        "rank", "appearances", "mean", "std_dev", "min", "max", "params", "topo_id");
+
+    for (rank, entry) in entries.iter().take(n).enumerate() {
+        let topo_id = topo_hash(&entry.topology_json);
+        log::info!("  {:<6} {:>11} {:>9.4} {:>9.4} {:>9.4} {:>9.4} {:>8}  {}",
+            format!("#{}", rank + 1),
+            entry.count,
+            entry.mean,
+            entry.std_dev(),
+            entry.min_fitness,
+            entry.max_fitness,
+            entry.param_count,
+            topo_id,
+        );
+    }
+
+    // Worst topologies: sort by appearances asc, then std_dev desc, then mean asc
+    let mut worst: Vec<&crate::engine::RobustnessEntry> = robustness.values()
+        .filter(|e| e.count > 1)
+        .collect();
+    worst.sort_by(|a, b| {
+        a.count.cmp(&b.count)
+            .then_with(|| b.std_dev().partial_cmp(&a.std_dev()).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.mean.partial_cmp(&b.mean).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let n_worst = top_n.min(worst.len());
+    if n_worst > 0 {
+        log::info!("");
+        log::info!("── worst topologies (bottom {n_worst}) ──");
+        log::info!("  {:<6} {:>11} {:>9} {:>9} {:>9} {:>9} {:>8}  {}",
+            "rank", "appearances", "mean", "std_dev", "min", "max", "params", "topo_id");
+        for (rank, entry) in worst.iter().take(n_worst).enumerate() {
+            let topo_id = topo_hash(&entry.topology_json);
+            log::info!("  {:<6} {:>11} {:>9.4} {:>9.4} {:>9.4} {:>9.4} {:>8}  {}",
+                format!("#{}", rank + 1),
+                entry.count,
+                entry.mean,
+                entry.std_dev(),
+                entry.min_fitness,
+                entry.max_fitness,
+                entry.param_count,
+                topo_id,
+            );
+        }
+    }
 }

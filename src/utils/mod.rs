@@ -1,7 +1,9 @@
-pub mod ascii_utils;
+pub mod ascii;
 pub mod data;
 pub mod display;
 pub(crate) mod error;
 pub mod graph_utils;
 pub(crate) mod log_utils;
+pub mod markdown;
+pub mod mermaid;
 pub mod synthetic;

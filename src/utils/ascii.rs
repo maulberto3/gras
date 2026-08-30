@@ -1,4 +1,4 @@
-//! ASCII pretty-printing helpers  for graphs and flodl nets.
+//! ASCII pretty-printing helpers for graphs and flodl nets.
 //!
 //! Rendering is a presentation concern, so it lives outside the core graph
 //! types: `topology_ascii` draws a [`Topology`] and `network_ascii`
@@ -24,19 +24,7 @@ pub(crate) struct AsciiNode {
 }
 
 /// Render nodes + connections as an ASCII diagram with Manhattan (right-angle)
-/// arrows , like a circuit schematic:
-///
-/// ```text
-///  n0 I 0i/2o
-///                        o0 ▶───────────────┐
-///                        o1 ▶───────┐       │
-///                                   │       │
-///  n1 H 3i/1o                      │       │
-///    i0 ◀───────────────────────────┘       │
-///    i1 ◀───────────────────────────────────┘
-
-///    i2*                                  (orphan → network input)
-/// ```
+/// arrows , like a circuit schematic.
 ///
 /// Layout: one node per 4 rows (label / inputs / outputs / blank); each wire
 /// gets its own vertical lane on the right, so a long jump (n1 → n7) shows as
@@ -351,13 +339,6 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
 ///
 /// Sorts connections by source node, shows the distance (in hops) between
 /// source and target, and highlights long-range jumps with `>>>` markers.
-///
-/// ```text
-/// edges (7 wires):
-///   n0_o0 → n1_i0   ··  (1)
-///   n0_o1 → n2_i0   >>> (2)     long jump
-///   n1_o0 → n3_i0   >>>>>> (4)  long jump
-/// ```
 pub(crate) fn edge_list(graph: &Topology) -> String {
     let mut out = String::new();
     let n = graph.connections.len();
@@ -389,7 +370,7 @@ pub(crate) fn edge_list(graph: &Topology) -> String {
     out
 }
 
-/// ASCII topology view of a [`Topology`] : a header box plus the Manhattan-wired
+/// ASCII topology view of a [`Topology`]: a header box plus the Manhattan-wired
 /// node diagram.
 pub fn topology_ascii(graph: &Topology) -> String {
     let header = format!(
@@ -432,7 +413,7 @@ pub fn topology_ascii(graph: &Topology) -> String {
     out
 }
 
-/// Compact net view of a [`Network`]  — derived from the blueprint,
+/// Compact net view of a [`Network`] — derived from the blueprint,
 /// focused on what execution actually cares about:
 ///
 /// ```text
@@ -515,142 +496,6 @@ pub(crate) fn network_ascii(g: &Network) -> String {
     out
 }
 
-// ── Markdown output ────────────────────────────────────────────────────
-
-/// Markdown rendering of a [`Topology`]: header, merged nodes/network table,
-/// edge list, and the visual wiring diagram in a code block.
-/// When a built [`Network`] is provided, the nodes table includes linear dims
-/// and source wiring (merged topology + network view).
-pub(crate) fn topology_markdown(
-    graph: &Topology,
-    fitness: Option<f32>,
-    net: Option<&Network>,
-) -> String {
-    let mut out = String::new();
-
-    // Header
-    if let Some(f) = fitness {
-        out.push_str(&format!("# Topology #{} · fitness {f:.4}\n\n", graph.id));
-    } else {
-        out.push_str(&format!("# Topology #{}\n\n", graph.id));
-    }
-
-    // Summary
-    let hidden_range: Vec<usize> = graph.nodes.iter().filter_map(|n| n.hidden_dim).collect();
-    let hidden_info = if hidden_range.is_empty() {
-        format!("hidden {}", graph.options.hidden_dim)
-    } else {
-        let min = *hidden_range.iter().min().unwrap();
-        let max = *hidden_range.iter().max().unwrap();
-        if min == max {
-            format!("hidden {min}")
-        } else {
-            format!("hidden {min}–{max}")
-        }
-    };
-    out.push_str(&format!(
-        "**{} nodes** · **{} wires** · input {} → {} → output {}\n\n",
-        graph.nodes.len(),
-        graph.connections.len(),
-        graph.options.input_dim,
-        hidden_info,
-        graph.options.output_dim,
-    ));
-
-    // ── Nodes table (merged topology + network layer info) ──
-    out.push_str("## Nodes\n\n");
-    if let Some(net) = net {
-        // Full table: ID, Kind, In, Out, Linear, Activation, Combine, Std, Sources
-        out.push_str("| ID | Kind | In | Out | Linear | Activation | Combine | Std | Sources |\n");
-        out.push_str("|----|------|----|-----|--------|------------|---------|-----|---------|\n");
-        let node_sources = super::graph_utils::build_node_sources(
-            &net.connections,
-            &net.nodes.iter().map(|n| n.num_inputs).collect::<Vec<_>>(),
-        );
-        for (i, node) in graph.nodes.iter().enumerate() {
-            let kind = match node.kind {
-                crate::node::NodeKind::Input => "Input",
-                crate::node::NodeKind::Hidden => "Hidden",
-                crate::node::NodeKind::Output => "Output",
-            };
-            let act = node.activation;
-            let combine = node.combine_op.map_or("—".into(), |op| format!("{op}"));
-            let std = node.standardize.map_or("—".into(), |s| format!("{s}"));
-            let (in_dim, out_dim) = graph.node_dims().get(i).copied().unwrap_or((0, 0));
-            let marker = if i == net.output_node { " " } else { "" };
-            let sources: Vec<String> = node_sources[i]
-                .iter()
-                .flatten()
-                .map(|p| format!("n{}_o{}", p.node, p.index))
-                .collect();
-            let src_str = if sources.is_empty() {
-                "*".into()
-            } else {
-                sources.join(", ")
-            };
-            out.push_str(&format!(
-                "| {id} {kind}{marker} | {kind} | {ni} | {no} | {in_dim} → {out_dim} | {act} | {combine} | {std} | {src_str} |\n",
-                id = i,
-                ni = node.num_inputs,
-                no = node.num_outputs,
-            ));
-        }
-    } else {
-        // Topology-only table: no linear dims or sources
-        out.push_str("| ID | Kind | In | Out | Activation | Combine | Std | Dims |\n");
-        out.push_str("|----|------|----|-----|------------|---------|-----|------|\n");
-        for (node_id, node) in graph.nodes.iter().enumerate() {
-            let kind = match node.kind {
-                crate::node::NodeKind::Input => "Input",
-                crate::node::NodeKind::Hidden => "Hidden",
-                crate::node::NodeKind::Output => "Output",
-            };
-            let act = node.activation;
-            let combine = node.combine_op.map_or("—".into(), |op| format!("{op}"));
-            let std = node.standardize.map_or("—".into(), |s| format!("{s}"));
-            let (in_dim, out_dim) = graph.node_dims().get(node_id).copied().unwrap_or((0, 0));
-            out.push_str(&format!(
-                "| {id} | {kind} | {ni} | {no} | {act} | {combine} | {std} | {in_dim}→{out_dim} |\n",
-                id = node.id,
-                ni = node.num_inputs,
-                no = node.num_outputs,
-            ));
-        }
-    }
-    out.push('\n');
-
-    // ── Edge list with distance markers ──
-    out.push_str("## Edges\n\n");
-    out.push_str("```text\n");
-    out.push_str(&edge_list(graph));
-    out.push_str("```\n\n");
-
-    // ── Wiring diagram (with out dims) ──
-    out.push_str("## Wiring diagram\n\n");
-    out.push_str("```text\n");
-    let node_dims = graph.node_dims();
-    let nodes: Vec<AsciiNode> = graph
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| AsciiNode {
-            id: n.id,
-            kind: n.kind,
-            num_inputs: n.num_inputs,
-            num_outputs: n.num_outputs,
-            out_dim: node_dims.get(i).map(|&(_, out)| out),
-        })
-        .collect();
-    out.push_str(&render_wire_diagram(&nodes, &graph.connections));
-    out.push_str("```\n");
-    out.push_str("\n> **Legend**:\n");
-    out.push_str("> - I=input  H=hidden  O=output\n");
-    out.push_str("> - 0i/4o = input ports / output ports\n");
-    out.push_str("> - ->dim = output dimension\n");
-    out.push_str("> - ▶ connected output  ◀ connected input  * orphaned port\n");
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::{network_ascii, topology_ascii};
@@ -671,17 +516,13 @@ mod tests {
         // Header box with the graph summary
         assert!(s.contains("Topology #1"));
         // One label per node with its port counts
-        // Labels now compact: n{id} {kind} {in}i/{out}o ->dim
         assert!(s.contains("n0 I"), "label: {s}");
-        assert!(s.contains("n1 H"), "label: {s}");
-        // Port counts may be trimmed by finalize (orphaned ports removed).
         assert!(s.contains("n1 H"), "label: {s}");
         // Manhattan corners + box border present
         assert!(s.contains('┌'));
         assert!(s.contains('┐'));
         assert!(s.contains('┘'));
         // Every wire is drawn with arrowheads on the canvas.
-        // Count only standalone '>' and '<' (not '->' from labels).
         let has_arrows = s
             .lines()
             .any(|line| line.contains('>') && !line.contains("->"));
@@ -713,8 +554,6 @@ mod tests {
 
     #[test]
     fn test_render_network_all_ports_wired() {
-        // After finalize, dedup may leave orphaned ports when the same source
-        // would feed the same target twice. The network still builds and runs.
         let mut graph = Topology::new(0, None);
         graph.nodes.push(Node::new_hidden(0, 2, 1));
         graph.nodes.push(Node::new_output(1, 1, 1));

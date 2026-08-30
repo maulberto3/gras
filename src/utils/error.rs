@@ -188,6 +188,8 @@ pub enum DataError {
     UnknownDtypeTag(u8),
     /// JSON metadata (`meta.json`) serialization failure.
     Json(String),
+    /// CSV parsing error.
+    Csv(String),
 }
 
 impl Display for DataError {
@@ -215,6 +217,7 @@ impl Display for DataError {
                 write!(f, "gras data: unknown dtype tag {tag} in tensor file")
             }
             DataError::Json(msg) => write!(f, "gras data: JSON: {msg}"),
+            DataError::Csv(msg) => write!(f, "gras data: CSV: {msg}"),
         }
     }
 }

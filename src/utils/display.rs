@@ -21,13 +21,13 @@ use crate::trainer::OptimizerKind;
 
 impl Display for Topology {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", super::ascii_utils::topology_ascii(self))
+        write!(f, "{}", super::ascii::topology_ascii(self))
     }
 }
 
 impl Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", super::ascii_utils::network_ascii(self))
+        write!(f, "{}", super::ascii::network_ascii(self))
     }
 }
 
@@ -99,12 +99,16 @@ impl Display for EngineOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "pop {} · {} gens · seed {:?} · budget {}bt of {} · {} threads · fitness {} · results {}/",
-            self.pop_size,
-            self.num_generations,
+            "pop {} · {} gens · seed {:?} · split {}%/{}, budget train {}bt x {} eval {}bt x {} · {} threads · fitness {} · results {}/",
+            self.pop_size.unwrap_or(0),
+            self.num_generations.unwrap_or(0),
             self.seed,
-            self.num_batches,
-            self.batch_size,
+            self.train_test_split.0 * 100.0,
+            self.train_test_split.1 * 100.0,
+            self.train_num_batches,
+            self.train_batch_size,
+            self.test_num_batches,
+            self.test_batch_size,
             self.num_threads,
             self.fitness_label,
             self.results_dir.display()
@@ -117,6 +121,9 @@ impl Display for CombineOp {
         let name = match self {
             CombineOp::Add => "add",
             CombineOp::Mean => "mean",
+            CombineOp::Multiply => "mul",
+            CombineOp::Subtract => "sub",
+            CombineOp::Divide => "div",
             CombineOp::Max => "max",
             CombineOp::Min => "min",
         };
@@ -182,13 +189,13 @@ impl Display for CrossoverMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CrossoverMethod::OnePoint { action_prob } => {
-                write!(f, "one_point(p={action_prob:.0}%)")
+                write!(f, "one_point(p={}%)", (action_prob * 100.0).round())
             }
             CrossoverMethod::Uniform {
                 action_prob,
                 swap_prob,
             } => {
-                write!(f, "uniform(p={action_prob:.0}%,swap={swap_prob:.0}%)")
+                write!(f, "uniform(p={}%,swap={}%)", (action_prob * 100.0).round(), (swap_prob * 100.0).round())
             }
         }
     }
