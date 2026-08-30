@@ -308,6 +308,8 @@ pub struct BestIndividual {
     pub pop_index: usize,
     /// The blueprint that scored best — `to_json` it to replicate the net.
     pub topology: crate::topology::Topology,
+    /// Number of learnable parameters in the best network.
+    pub param_count: usize,
 }
 
 // ── Re-exports for backward compat ────────────────────────────────────────
