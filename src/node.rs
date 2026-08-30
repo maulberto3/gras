@@ -14,6 +14,12 @@ pub enum CombineOp {
     Add,
     /// Average of incoming tensors.
     Mean,
+    /// Element-wise product of incoming tensors.
+    Multiply,
+    /// Element-wise subtraction: first - second - third - ...
+    Subtract,
+    /// Element-wise division: first / second / third - ...
+    Divide,
     /// Element-wise maximum across incoming tensors.
     Max,
     /// Element-wise minimum across incoming tensors.
@@ -34,6 +40,27 @@ impl CombineOp {
             CombineOp::Mean => {
                 let sum = CombineOp::Add.apply(tensors)?;
                 sum.mul_scalar(1.0 / tensors.len() as f64)
+            }
+            CombineOp::Multiply => {
+                let mut result = tensors[0].clone();
+                for t in &tensors[1..] {
+                    result = result.mul(t)?;
+                }
+                Ok(result)
+            }
+            CombineOp::Subtract => {
+                let mut result = tensors[0].clone();
+                for t in &tensors[1..] {
+                    result = result.sub(t)?;
+                }
+                Ok(result)
+            }
+            CombineOp::Divide => {
+                let mut result = tensors[0].clone();
+                for t in &tensors[1..] {
+                    result = result.div(t)?;
+                }
+                Ok(result)
             }
             CombineOp::Max => {
                 let mut result = tensors[0].clone();
