@@ -34,6 +34,9 @@ pub fn all_combine_ops() -> Vec<CombineOp> {
         CombineOp::Mean,
         CombineOp::Max,
         CombineOp::Min,
+        // CombineOp::Multiply, Subtract, Divide excluded by default —
+        // numerically unstable with random weights (overflow, large losses).
+        // Add explicitly: .set_combine_op_pool(vec![..., CombineOp::Multiply])
     ]
 }
 
