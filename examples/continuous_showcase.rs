@@ -1,6 +1,8 @@
-//! Quick showcase — gras in one shot.
+//! Continuous (regression) showcase — gras evolves nets to fit y = sin(2πx).
 //!
-//! Run: `source env_setup.sh && cargo run --example quick_showcase`
+//! Demonstrates: MSE loss, Minimize direction, single-output target.
+//!
+//! Run: `source env_setup.sh && cargo run --example continuous_showcase`
 
 use flodl::Device;
 use gras::data;
@@ -14,25 +16,30 @@ fn main() {
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
 
-    // 1. Data — synthetic y = sin(2πx), saved to a temp dir.
+    // 1. Data — synthetic y = sin(2πx), 256 samples, saved to disk.
+    //    inputs: [256, 1], targets: [256, 1]
     let data_dir = std::path::Path::new("data/sine");
     if std::fs::read_dir(data_dir).is_err() {
         let ds = gras::synthetic::synthetic_sine(256, 42, Device::CPU).unwrap();
         data::save_dataset(data_dir, &ds).unwrap();
     }
 
-    // 2. Options — mandatory: pop_size, num_generations, mutation.
-    //    Everything else has conservative defaults.
+    // 2. Options — the 5 mandatory fields + conservative defaults.
     let opts = EngineOptions::builder()
+        // ── mandatory ─────────────────────────────────────────────
         .set_pop_size(50)
-        .set_num_generations(2)
+        .set_num_generations(5)
         .set_selection(gras::SelectionMethod::Tournament { tournament_size: 2 })
         .set_crossover(gras::CrossoverMethod::OnePoint { action_prob: 0.5 })
         .set_mutation(gras::MutationMethod::Activation { prob: 0.1 })
+        // ── optional ──────────────────────────────────────────────
         .set_hidden_dim_pool(8..=16)
         .set_combine_op_pool(vec![CombineOp::Add])
-        .set_num_batches(4)
-        .set_batch_size(32)
+        .set_train_test_split(0.8, 0.2)
+        .set_train_num_batches(4)
+        .set_test_num_batches(4)
+        .set_train_batch_size(32)
+        .set_test_batch_size(32)
         .set_num_epochs(1)
         .set_dedup_pop_and_fill(true)
         .set_gens_history(true)
@@ -41,7 +48,7 @@ fn main() {
         .build()
         .unwrap();
 
-    // 3. Run — seed, evaluate, evolve.
+    // 3. Run — MSE loss, Minimize direction (lower is better).
     let fitness = Fitness::from_loss(
         |p, y| flodl::nn::loss::mse_loss(p, y),
         Direction::Minimize,
