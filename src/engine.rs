@@ -1312,13 +1312,13 @@ pub(crate) fn derive_seed(base: u64, i: usize) -> u64 {
 mod tests {
     use super::*;
     use flodl::nn::loss::mse_loss;
-    use flodl::Device;
+    
 
 
     fn temp_data_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gras_engine_test_{}", fastrand::u64(..)));
-        let ds = crate::utils::synthetic::synthetic_sine(64, 42, Device::CPU).unwrap();
-        crate::utils::data::save_dataset(&dir, &ds).unwrap();
+        let (inputs, targets) = crate::utils::data::make_sine(64);
+        crate::utils::data::save_dataset(&dir, &crate::Dataset { inputs, targets }).unwrap();
         dir
     }
 
