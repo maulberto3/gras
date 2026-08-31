@@ -7,3 +7,4 @@ pub(crate) mod log_utils;
 pub mod markdown;
 pub mod mermaid;
 pub mod synthetic;
+pub mod supervised;
