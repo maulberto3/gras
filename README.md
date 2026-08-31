@@ -7,9 +7,11 @@
 [![Crates.io](https://img.shields.io/crates/v/gras.svg)](https://crates.io/crates/gras)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Evolves neural network topologies using genetic algorithms.
-The engine builds, trains, and scores populations of random architectures in parallel,
-then selects, crosses over, and mutates the best — repeating until convergence.
+**Bring your data, your training loop, your fitness function — gras handles the rest.**
+
+The engine evolves neural network topologies using genetic algorithms.
+You provide a `Trainer` (how to train) and a `Fitness` (how to rank),
+and gras searches for the best architecture in parallel.
 
 </div>
 
@@ -74,6 +76,19 @@ cargo build --features cuda
 ```
 
 `auto_device()` returns `Device::CUDA(0)` when compiled with `--features cuda`, `Device::CPU` otherwise.
+
+## What You Bring
+
+gras is flexible — it evolves over **your** training setup:
+
+| You provide | What gras does |
+|-------------|----------------|
+| **Data** — `.bin` or `.csv` files (auto-detected) | Loads, splits, batches |
+| **Trainer** — your training loop (or use `SupervisedTrainer`) | Trains each network per generation |
+| **Fitness** — your ranking metric (or use built-in scorers) | Ranks individuals for selection |
+
+The engine handles topology creation, evolution loop, selection, crossover, mutation,
+logging, and robustness tracking. You stay in control of training and evaluation.
 
 ## Quick Start
 
@@ -172,6 +187,20 @@ Everything else has conservative defaults. Set only what your experiment needs:
 | `prior_topologies` | None | `.set_prior_topologies(vec!["a.json", "b.json"])` |
 
 ## Fitness
+
+Your fitness function ranks individuals. Use built-ins or write your own:
+
+```rust
+// Built-in
+let fitness = Fitness::new(f1_score, Direction::Maximize, "f1");
+
+// Custom
+let fitness = Fitness::new(
+    |pred, y| { my_metric(pred, y) },
+    Direction::Maximize,
+    "my_metric",
+);
+```
 
 ### Built-in scorers
 
