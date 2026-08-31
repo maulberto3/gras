@@ -441,6 +441,35 @@ pub fn synthetic_classification(
     Ok(Dataset { inputs, targets })
 }
 
+/// Synthetic sine wave: `y = sin(2πx)`, `x ∈ [-1, 1]`. Returns `(inputs, targets)` tensors.
+pub fn make_sine(n: usize) -> (Tensor, Tensor) {
+    let mut rng = fastrand::Rng::with_seed(42);
+    let inputs: Vec<f32> = (0..n).map(|_| rng.f32() * 2.0 - 1.0).collect();
+    let targets: Vec<f32> = inputs.iter().map(|x| (x * std::f32::consts::TAU).sin()).collect();
+    let inputs = Tensor::from_f32(&inputs, &[n as i64, 1], Device::CPU).unwrap();
+    let targets = Tensor::from_f32(&targets, &[n as i64, 1], Device::CPU).unwrap();
+    (inputs, targets)
+}
+
+/// Synthetic XOR: 2 features, 2 classes (one-hot `[n, 2]`). Returns `(inputs, targets)` tensors.
+pub fn make_xor(n: usize) -> (Tensor, Tensor) {
+    let mut rng = fastrand::Rng::with_seed(42);
+    let mut inputs = Vec::with_capacity(n * 2);
+    let mut targets = Vec::with_capacity(n * 2);
+    for _ in 0..n {
+        let a = rng.f32();
+        let b = rng.f32();
+        inputs.push(a);
+        inputs.push(b);
+        let xor = if (a > 0.5) ^ (b > 0.5) { 1.0 } else { 0.0 };
+        targets.push(xor);
+        targets.push(1.0 - xor);
+    }
+    let inputs = Tensor::from_f32(&inputs, &[n as i64, 2], Device::CPU).unwrap();
+    let targets = Tensor::from_f32(&targets, &[n as i64, 2], Device::CPU).unwrap();
+    (inputs, targets)
+}
+
 /// Split a dataset length into train and eval index vectors.
 /// Returns `(train_indices, eval_indices)`.
 pub fn split_indices(
@@ -588,4 +617,14 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+}
+
+/// One-hot encode class indices: `indices: Vec<usize>` → `[n, num_classes]` tensor.
+pub fn one_hot(indices: &[usize], num_classes: usize, device: Device) -> Result<Tensor> {
+    let n = indices.len();
+    let mut data = vec![0.0f32; n * num_classes];
+    for (i, &c) in indices.iter().enumerate() {
+        data[i * num_classes + c] = 1.0;
+    }
+    Tensor::from_f32(&data, &[n as i64, num_classes as i64], device)
 }

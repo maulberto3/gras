@@ -6,5 +6,5 @@ pub mod graph_utils;
 pub(crate) mod log_utils;
 pub mod markdown;
 pub mod mermaid;
-pub mod synthetic;
+pub mod scoring;
 pub mod supervised;
