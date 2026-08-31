@@ -17,14 +17,15 @@ pub use utils::{data, synthetic};
 // ── re-exports: core types at crate root ──────────────────────────────
 pub use crossover::CrossoverMethod;
 pub use engine::{Engine, EngineOptions, GenerationStats};
-pub use fitness::{BestIndividual, Direction, Fitness, FitnessLabel};
+pub use fitness::{Direction, Fitness, FitnessLabel};
 pub use mutation::MutationMethod;
 pub use network::{Network, NetworkOptions};
 pub use node::{Activation, CombineOp, Node, NodeKind, StandardizeOp};
 pub use selection::SelectionMethod;
 pub use topology::{Topology, TopologyOptions};
-pub use trainer::{OptimizerKind, TrainingConfig};
+pub use trainer::{OptimizerKind, Trainer, TrainingConfig, SupervisedTrainer};
 pub use utils::data::Dataset;
+pub use utils::supervised::TrainResult;
 
 // ── re-exports: scoring helpers ──────────────────────────────────────
 pub use fitness::{

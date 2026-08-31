@@ -9,8 +9,6 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use flodl::Device;
-use flodl::nn::Module;
 use flodl::tensor::Result;
 use log::debug;
 use rayon::prelude::*;
@@ -19,11 +17,10 @@ use serde::Serialize;
 pub use crate::crossover::CrossoverMethod;
 pub use crate::fitness::{Direction, Fitness, FitnessLabel};
 pub use crate::mutation::MutationMethod;
-use crate::network::{Network, NetworkOptions};
+use crate::network::Network;
 use crate::node::{Activation, NodeKind};
 use crate::selection::SelectionMethod;
 use crate::topology::{CombineOp, Topology, TopologyOptions};
-use crate::utils::data::Dataset;
 use crate::utils::error::EngineError;
 
 
@@ -53,40 +50,19 @@ pub struct EngineOptions {
     /// Standardize-op pool -- per-node normalization. Empty -> all built-in.
     pub standardize_op_pool: Vec<crate::node::StandardizeOp>,
     /// Number of training batches per generation.
-    pub train_num_batches: usize,
-    /// Number of evaluation batches per generation.
-    pub test_num_batches: usize,
-    /// Rows per training batch.
-    pub train_batch_size: usize,
-    /// Rows per evaluation batch.
-    pub test_batch_size: usize,
     // 
     pub fitness_label: FitnessLabel,
-    // 
-    pub train_metric_label: FitnessLabel,
     /// Threads for parallel eval (0 = rayon default).
     pub num_threads: usize,
     pub results_dir: PathBuf,
-    /// Training config applied to every individual before scoring.
-    pub training: crate::trainer::TrainingConfig,
     /// Selection strategy for the next generation.
     pub selection: Option<SelectionMethod>,
     /// Crossover strategy.
     pub crossover: Option<CrossoverMethod>,
     /// Mutation strategy.
     pub mutation: MutationMethod,
-    /// Network execution options (device, dtype, seed).
-    pub network: NetworkOptions,
     /// Dropout probability for hidden nodes (0.0 = no dropout).
     pub dropout_prob: f32,
-
-
-    /// Sample train batches proportional to target class frequency.
-    /// Default: false (uniform random sampling).
-    pub train_y_proportional: bool,
-    /// Sample test batches proportional to target class frequency.
-    /// Default: false (uniform random sampling).
-    pub test_y_proportional: bool,
     /// Deduplicate population by full topology comparison.
     /// Applied after create_population and after select each generation.
     /// Default: true.
@@ -94,30 +70,10 @@ pub struct EngineOptions {
     /// Number of top individuals to preserve untouched each generation.
     /// Minimum: 1. Default: 2.
     pub elite_count: usize,
-    /// Track per-generation metrics in engine.json history.
-    /// Default: false.
-    pub gens_history: bool,
     /// Paths to prior engine.json or improvement JSON files.
     /// Each best topology is injected into the initial population
     /// at pop[0..N] — a "warm start" from multiple prior runs.
     pub prior_topology_paths: Vec<PathBuf>,
-    /// Train/test split ratio (train, test). Must sum to 1.0.
-    /// Default: (0.8, 0.2). The eval set is fixed across generations;
-    /// the train set is resampled each generation.
-    pub train_test_split: (f32, f32),
-    /// If true, train batches are resampled each generation (random data).
-    /// If false, train batches use a fixed seed across gens.
-    /// Default: false.
-    pub train_random_data: bool,
-    /// If true, eval batches are resampled each generation (random data).
-    /// If false, eval batches use a fixed seed across gens (fair comparison).
-    /// Default: false.
-    pub test_random_data: bool,
-    /// If true, train networks use deterministic (seeded) weights.
-    /// If false, weights are random — evolution selects for architecture.
-    /// Default: false.
-    pub train_fixed_coefs: bool,
-
 }
 
 impl Default for EngineOptions {
@@ -133,13 +89,7 @@ impl Default for EngineOptions {
             results_dir: PathBuf::from("results"),
             dedup_pop_and_fill: false,
             elite_count: 2,
-            gens_history: false,
             prior_topology_paths: vec![],
-            train_test_split: (0.8, 0.2),
-            train_random_data: true,
-            test_random_data: true,
-            train_fixed_coefs: true,
-
             // ── Topology / GP pools ───────────────────────────────────
             topology_options: TopologyOptions::default(),
             hidden_dim_pool: 4..=8,
@@ -147,23 +97,13 @@ impl Default for EngineOptions {
             combine_op_pool: vec![],   // empty = all built-ins
             activation_pool: vec![],   // empty = all built-ins
             standardize_op_pool: vec![], // empty = all built-ins
-            // ── Evaluation budget ─────────────────────────────────────
-            train_num_batches: 16,
-            test_num_batches: 16,
-            train_batch_size: 32,
-            test_batch_size: 32,
-            // ── Training ──────────────────────────────────────────────
-            training: crate::trainer::TrainingConfig::default(),
+            // ── Labels ─────────────────────────────────────────────
             fitness_label: FitnessLabel::default(),
-            train_metric_label: FitnessLabel::default(),
             // ── Network ───────────────────────────────────────────────
-            network: NetworkOptions::default(), // CPU, Float32
             dropout_prob: 0.1,
             // ── Genetics ──────────────────────────────────────────────
             selection: None,
             crossover: None,
-            train_y_proportional: false,
-            test_y_proportional: false,
         }
     }
 }
@@ -220,14 +160,6 @@ impl EngineOptionsBuilder {
             )
             .into());
         }
-        let split_sum = o.train_test_split.0 + o.train_test_split.1;
-        if (split_sum - 1.0).abs() > f32::EPSILON {
-            return Err(EngineError::InvalidOptions(
-                format!("train_test_split must sum to 1.0, got {}+{}={:.2}",
-                    o.train_test_split.0, o.train_test_split.1, split_sum),
-            )
-            .into());
-        }
         if o.selection.is_none() {
             return Err(EngineError::InvalidOptions(
                 "set_selection() is required — choose SelectionMethod::Tournament"
@@ -253,17 +185,8 @@ impl EngineOptionsBuilder {
         o.pop_size = Some(pop_size);
         o.num_generations = Some(num_generations);
         // ── Conservative defaults for non-required fields ──────────────
-        if o.train_num_batches > 0 && o.train_batch_size == 0 {
-            o.train_batch_size = 32;
-        }
-        if o.test_num_batches > 0 && o.test_batch_size == 0 {
-            o.test_batch_size = 32;
-        }
         if o.hidden_dim_pool.is_empty() {
             o.hidden_dim_pool = 4..=8;
-        }
-        if o.training.num_epochs == 0 {
-            o.training.num_epochs = 1;
         }
         // ── Auto-fill pools with all built-ins ─────────────────────────
         if o.combine_op_pool.is_empty() {
@@ -291,22 +214,6 @@ impl EngineOptionsBuilder {
         self.inner.seed = s;
         self
     }
-    pub fn set_train_num_batches(mut self, n: usize) -> Self {
-        self.inner.train_num_batches = n;
-        self
-    }
-    pub fn set_test_num_batches(mut self, n: usize) -> Self {
-        self.inner.test_num_batches = n;
-        self
-    }
-    pub fn set_train_batch_size(mut self, n: usize) -> Self {
-        self.inner.train_batch_size = n;
-        self
-    }
-    pub fn set_test_batch_size(mut self, n: usize) -> Self {
-        self.inner.test_batch_size = n;
-        self
-    }
     pub fn set_num_threads(mut self, n: usize) -> Self {
         self.inner.num_threads = n;
         self
@@ -320,35 +227,8 @@ impl EngineOptionsBuilder {
         self
     }
 
-    // Training knobs
-    pub fn set_num_epochs(mut self, n: usize) -> Self {
-        self.inner.training.num_epochs = n;
-        self
-    }
-    pub fn set_learning_rate(mut self, lr: f32) -> Self {
-        self.inner.training.learning_rate = lr;
-        self
-    }
-    pub fn set_optimizer(mut self, kind: crate::trainer::OptimizerKind) -> Self {
-        self.inner.training.optimizer = kind;
-        self
-    }
-    pub fn set_grad_clip(mut self, max_norm: f32) -> Self {
-        self.inner.training.grad_clip = max_norm;
-        self
-    }
     pub fn set_dropout_prob(mut self, p: f32) -> Self {
         self.inner.dropout_prob = p.clamp(0.0, 1.0);
-        self
-    }
-
-
-    pub fn set_train_y_proportional(mut self, on: bool) -> Self {
-        self.inner.train_y_proportional = on;
-        self
-    }
-    pub fn set_test_y_proportional(mut self, on: bool) -> Self {
-        self.inner.test_y_proportional = on;
         self
     }
     pub fn set_crossover(mut self, kind: CrossoverMethod) -> Self {
@@ -367,10 +247,6 @@ impl EngineOptionsBuilder {
         self.inner.elite_count = n;
         self
     }
-    pub fn set_gens_history(mut self, on: bool) -> Self {
-        self.inner.gens_history = on;
-        self
-    }
     pub fn set_prior_topology(mut self, path: impl Into<PathBuf>) -> Self {
         self.inner.prior_topology_paths.push(path.into());
         self
@@ -379,23 +255,6 @@ impl EngineOptionsBuilder {
         self.inner.prior_topology_paths.extend(paths.into_iter().map(|p| p.into()));
         self
     }
-    pub fn set_train_test_split(mut self, train: f32, test: f32) -> Self {
-        self.inner.train_test_split = (train, test);
-        self
-    }
-    pub fn set_train_random_data(mut self, on: bool) -> Self {
-        self.inner.train_random_data = on;
-        self
-    }
-    pub fn set_test_random_data(mut self, on: bool) -> Self {
-        self.inner.test_random_data = on;
-        self
-    }
-    pub fn set_train_fixed_coefs(mut self, on: bool) -> Self {
-        self.inner.train_fixed_coefs = on;
-        self
-    }
-
 
     // Topology template
     pub fn set_topology_options(mut self, t: TopologyOptions) -> Self {
@@ -455,38 +314,15 @@ impl EngineOptionsBuilder {
         self
     }
 
-    // Network options
-    pub fn set_network(mut self, n: NetworkOptions) -> Self {
-        self.inner.network = n;
-        self
-    }
-    pub fn set_device(mut self, d: Device) -> Self {
-        self.inner.network.device = d;
-        self
-    }
-    pub fn set_dtype(mut self, d: flodl::DType) -> Self {
-        self.inner.network.dtype = d;
-        self
-    }
-    pub fn set_init_seed(mut self, seed: usize) -> Self {
-        self.inner.network.seed = seed;
-        self
-    }
 }
 
-pub use crate::fitness::BestIndividual;
 
-/// Per-generation metrics, accumulated when `gens_history` is enabled.
+/// Per-generation metrics, always saved.
 #[derive(Clone, Debug, Serialize)]
 pub struct GenerationStats {
     pub generation: usize,
-    pub best_score: f32,
-    pub best_loss: Option<f32>,
-    pub worst_score: f32,
-    pub worst_loss: Option<f32>,
     pub avg_score: f32,
     pub avg_loss: Option<f32>,
-    pub best_params: usize,
     pub avg_params: f32,
     pub unique_topos: usize,
 }
@@ -496,16 +332,10 @@ pub struct GenerationStats {
 /// Result of per-generation stat computation.
 #[derive(Clone, Debug)]
 pub(crate) struct GenStats {
-    pub best_idx: usize,
-    pub _worst_idx: usize,
     pub best_score: f32,
     pub best_loss: Option<f32>,
-    pub worst_score: f32,
-    pub worst_loss: Option<f32>,
     pub avg_score: f32,
     pub avg_loss: Option<f32>,
-    pub best_params: usize,
-    pub _worst_params: usize,
     pub avg_params: f32,
     pub unique_topos: usize,
 }
@@ -524,16 +354,9 @@ pub(crate) fn compute_gen_stats(
     let n = scores.len();
     debug_assert!(!scores.is_empty());
 
-    // Find best and worst indices
     let mut best_idx = 0;
-    let mut worst_idx = 0;
     for (i, &score) in scores.iter().enumerate() {
-        if direction.is_better(score, scores[best_idx]) {
-            best_idx = i;
-        }
-        if direction.is_better(scores[worst_idx], score) {
-            worst_idx = i;
-        }
+        if direction.is_better(score, scores[best_idx]) { best_idx = i; }
     }
 
     // Averages (filter NaN/Inf)
@@ -551,8 +374,6 @@ pub(crate) fn compute_gen_stats(
     };
 
     // Param stats
-    let best_params = param_counts[best_idx];
-    let worst_params = param_counts[worst_idx];
     let avg_params = param_counts.iter().sum::<usize>() as f32 / n as f32;
 
     // Unique topologies (JSON-based dedup)
@@ -567,16 +388,10 @@ pub(crate) fn compute_gen_stats(
     };
 
     GenStats {
-        best_idx,
-        _worst_idx: worst_idx,
         best_score: scores[best_idx],
         best_loss: eval_losses.get(best_idx).copied().flatten(),
-        worst_score: scores[worst_idx],
-        worst_loss: eval_losses.get(worst_idx).copied().flatten(),
         avg_score,
         avg_loss,
-        best_params,
-        _worst_params: worst_params,
         avg_params,
         unique_topos,
     }
@@ -592,36 +407,64 @@ pub(crate) struct RobustnessEntry {
     pub max_fitness: f32,
     pub mean: f32,
     pub m2: f32,
+    pub min_loss: Option<f32>,
+    pub max_loss: Option<f32>,
+    pub mean_loss: Option<f32>,
+    pub m2_loss: f32,
     pub param_count: usize,
     pub topology_json: String,
 }
 
 impl RobustnessEntry {
-    fn new(fitness: f32, param_count: usize, topology_json: String) -> Self {
+    fn new(fitness: f32, loss: Option<f32>, param_count: usize, topology_json: String) -> Self {
         Self {
             count: 1,
             min_fitness: fitness,
             max_fitness: fitness,
             mean: fitness,
             m2: 0.0,
+            min_loss: loss,
+            max_loss: loss,
+            mean_loss: loss,
+            m2_loss: 0.0,
             param_count,
             topology_json,
         }
     }
 
-    /// Welford's online update — track mean and variance without storing all values.
-    pub fn update(&mut self, fitness: f32) {
+    /// Welford's online update for fitness.
+    pub fn update(&mut self, fitness: f32, loss: Option<f32>) {
         self.count += 1;
         let delta = fitness - self.mean;
         self.mean += delta / self.count as f32;
         let delta2 = fitness - self.mean;
         self.m2 += delta * delta2;
+        if let Some(l) = loss {
+            if let Some(ml) = self.mean_loss {
+                let dl = l - ml;
+                self.mean_loss = Some(ml + dl / self.count as f32);
+                let dl2 = l - self.mean_loss.unwrap();
+                self.m2_loss += dl * dl2;
+            }
+            self.min_loss = Some(self.min_loss.unwrap_or(l).min(l));
+            self.max_loss = Some(self.max_loss.unwrap_or(l).max(l));
+        }
     }
 
     /// Sample standard deviation of fitness across appearances.
     pub fn std_dev(&self) -> f32 {
         if self.count < 2 { 0.0 }
         else { (self.m2 / (self.count - 1) as f32).sqrt() }
+    }
+
+    /// Sample standard deviation of loss across appearances.
+    pub fn std_dev_loss(&self) -> f32 {
+        if self.count < 2 || self.mean_loss.is_none() { 0.0 }
+        else { (self.m2_loss / (self.count - 1) as f32).sqrt() }
+    }
+
+    pub fn has_loss(&self) -> bool {
+        self.mean_loss.is_some()
     }
 }
 
@@ -635,14 +478,8 @@ pub struct Engine {
     pool: rayon::ThreadPool,
     pub pop: Vec<Topology>,
     pub(crate) fitness: Fitness,
-    pub(crate) dataset: Dataset,
-    /// Indices into dataset for training (resampled each generation).
-    pub(crate) train_indices: Vec<i64>,
-    /// Indices into dataset for evaluation (fixed across generations).
-    pub(crate) eval_indices: Vec<i64>,
-    pub(crate) data_path: PathBuf,
+    pub(crate) trainer: Box<dyn crate::trainer::Trainer>,
     pub generation: usize,
-    pub best: Option<BestIndividual>,
     pub history: Vec<GenerationStats>,
 
     scores: Vec<f32>,
@@ -651,11 +488,8 @@ pub struct Engine {
     /// Cached per-gen summary — computed once in save_generation_snapshots.
     gen_best_score: f32,
     gen_best_loss: Option<f32>,
-    gen_worst_score: f32,
-    gen_worst_loss: Option<f32>,
     gen_avg_score: f32,
     gen_avg_loss: Option<f32>,
-    gen_best_params: usize,
     gen_avg_params: f32,
     gen_unique_topos: usize,
     /// Topology robustness tracker — keyed by topology JSON.
@@ -687,19 +521,17 @@ impl ProgressTracker {
 impl Engine {
     // ── Construction ────────────────────────────────────────────────────────
 
-    /// Load dataset, seed population. Auto-detects input_dim/output_dim from data.
-    pub fn new(mut options: EngineOptions, data_path: &Path, fitness: Fitness) -> Result<Self> {
+    /// Create engine. Trainer provides input_dim/output_dim.
+    pub fn new(mut options: EngineOptions, fitness: Fitness, trainer: Box<dyn crate::trainer::Trainer>) -> Result<Self> {
         // Step 1: Validate options and fill empty pools
         Self::validate_and_fill_options(&mut options)?;
 
         // Step 2: Resolve seed
         let seed = Self::resolve_seed(&mut options);
 
-        // Step 3: Load data and bind dims
-        let dataset = Self::load_data(&mut options, data_path)?;
-
-        // Step 3b: Split dataset into train/eval indices
-        let (train_indices, eval_indices) = Self::split_dataset(&options, &dataset, seed);
+        // Step 3: Bind dims from trainer
+        options.topology_options.input_dim = trainer.input_dim();
+        options.topology_options.output_dim = trainer.output_dim();
 
         // Step 4: Create population
         let mut pop = Self::create_population(&options, seed)?;
@@ -719,68 +551,21 @@ impl Engine {
             Self::refill_population(&options, seed, 0, &mut pop);
         }
 
-        // Step 5: Log initialization
-        Self::log_initialization(&options, &dataset, &pop, seed, &fitness, data_path);
+        // Log initialization
+        crate::utils::log_utils::log_initialization(&options, &pop, seed, &fitness);
 
-        // Step 6: Assemble engine (thread pool, run dir, struct)
-        Self::assemble_engine(options, seed, dataset, train_indices, eval_indices, pop, fitness, data_path)
+        // Assemble engine
+        Self::assemble_engine(options, seed, pop, fitness, trainer)
     }
 
     /// Step 1: Propagate engine-level pools into mutation variant, fill defaults.
     /// All required validation is done in `EngineOptionsBuilder::build()`.
     fn validate_and_fill_options(options: &mut EngineOptions) -> Result<()> {
-        // Sanity checks (builder auto-fills these, but direct construction may not).
-        if options.train_num_batches > 0 && options.train_batch_size == 0 {
-            return Err(EngineError::InvalidOptions(
-                "train_num_batches > 0 requires train_batch_size > 0".into(),
-            )
-            .into());
-        }
-        if options.test_num_batches > 0 && options.test_batch_size == 0 {
-            return Err(EngineError::InvalidOptions(
-                "test_num_batches > 0 requires test_batch_size > 0".into(),
-            )
-            .into());
-        }
-        if options.train_num_batches == 0 {
-            options.train_num_batches = 16;
-        }
-        if options.test_num_batches == 0 {
-            options.test_num_batches = 16;
-        }
-        if options.train_batch_size == 0 {
-            options.train_batch_size = 32;
-        }
-        if options.test_batch_size == 0 {
-            options.test_batch_size = 32;
-        }
-        if options.training.num_epochs == 0 {
-            options.training.num_epochs = 1;
-        }
-        if options.hidden_dim_pool.is_empty() {
-            options.hidden_dim_pool = 4..=8;
-        }
-        if options.hidden_dim_stride == 0 {
-            options.hidden_dim_stride = 1;
-        }
-
-        // Auto-fill empty pools with all built-ins.
-        if options.combine_op_pool.is_empty() {
-            options.combine_op_pool = crate::pools::all_combine_ops();
-        }
-        if options.activation_pool.is_empty() {
-            options.activation_pool = crate::pools::all_activations();
-        }
-        if options.standardize_op_pool.is_empty() {
-            options.standardize_op_pool = crate::pools::all_standardize_ops();
-        }
-        // Propagate engine-level settings into training config.
-        options.training.train_y_proportional = options.train_y_proportional;
-        options.training.test_y_proportional = options.test_y_proportional;
-        options.training.num_batches_train = options.train_num_batches;
-        options.training.num_batches_eval = options.test_num_batches;
-        options.training.batch_size_train = options.train_batch_size;
-        options.training.batch_size_eval = options.test_batch_size;
+        if options.hidden_dim_pool.is_empty() { options.hidden_dim_pool = 4..=8; }
+        if options.hidden_dim_stride == 0 { options.hidden_dim_stride = 1; }
+        if options.combine_op_pool.is_empty() { options.combine_op_pool = crate::pools::all_combine_ops(); }
+        if options.activation_pool.is_empty() { options.activation_pool = crate::pools::all_activations(); }
+        if options.standardize_op_pool.is_empty() { options.standardize_op_pool = crate::pools::all_standardize_ops(); }
         Ok(())
     }
 
@@ -794,99 +579,13 @@ impl Engine {
             t ^ fastrand::u64(..)
         });
         options.topology_options.seed = seed as usize;
-        options.network.seed = seed as usize;
         seed
     }
 
     /// Auto-detect data format and load dataset.
     ///
     /// Priority:
-    /// 1. `flodl_data/inputs.bin` — cached .bin from previous conversion
-    /// 2. `inputs.bin` — user-provided .bin
-    /// 3. `inputs.csv` — user-provided CSV → convert to .bin, cache in `flodl_data/`
-    fn resolve_dataset(data_path: &Path) -> Result<Dataset> {
-        let cache_dir = data_path.join("flodl_data");
-
-        // Priority 1: cached .bin
-        if cache_dir.join("inputs.bin").exists() {
-            debug!("load_data: using cached .bin from {}", cache_dir.display());
-            return crate::utils::data::load_dataset(&cache_dir);
-        }
-
-        // Priority 2: .bin in data_path
-        if data_path.join("inputs.bin").exists() {
-            debug!("load_data: using .bin from {}", data_path.display());
-            return crate::utils::data::load_dataset(data_path);
-        }
-
-        // Priority 3: CSV → convert → cache
-        if data_path.join("inputs.csv").exists() {
-            debug!("load_data: converting CSV to .bin in {}", cache_dir.display());
-            let dataset = crate::utils::data::load_csv_dataset(data_path)?;
-            std::fs::create_dir_all(&cache_dir).map_err(|e| flodl::tensor::TensorError::new(&e.to_string()))?;
-            crate::utils::data::save_dataset(&cache_dir, &dataset)?;
-            return Ok(dataset);
-        }
-
-        Err(EngineError::DataMismatch(format!(
-            "no inputs.bin or inputs.csv found in {}", data_path.display()
-        )).into())
-    }
-
-    /// Step 3: Load dataset and bind input_dim/output_dim to options.
-    /// Auto-detects format: .bin (cached or direct) or .csv (converts to .bin).
-    fn load_data(options: &mut EngineOptions, data_path: &Path) -> Result<Dataset> {
-        let dataset = Self::resolve_dataset(data_path)?
-            .to_dtype(options.network.dtype)?
-            .to_device(options.network.device)?;
-        let data_in = dataset.inputs.shape().get(1).copied().ok_or_else(|| {
-            EngineError::DataMismatch("dataset inputs must be 2-D [n, input_dim]".into())
-        })?;
-        options.topology_options.input_dim = data_in as usize;
-        let data_out = dataset.targets.shape().get(1).copied().ok_or_else(|| {
-            EngineError::DataMismatch("dataset targets must be 2-D [n, output_dim]".into())
-        })?;
-        options.topology_options.output_dim = data_out as usize;
-        options.fitness_label = crate::fitness::FitnessLabel(options.fitness_label.0.clone());
-        options.train_metric_label =
-            crate::fitness::FitnessLabel(options.train_metric_label.0.clone());
-        debug!(
-            "Engine::new -- input_dim={} output_dim={} seed={}",
-            options.topology_options.input_dim,
-            options.topology_options.output_dim,
-            options.seed.unwrap_or(0)
-        );
-        Ok(dataset)
-    }
-
-    /// Step 3b: Split dataset indices into train and eval pools.
-    /// Eval indices are fixed across generations; train indices are resampled.
-    fn split_dataset(options: &EngineOptions, dataset: &Dataset, seed: u64) -> (Vec<i64>, Vec<i64>) {
-        let n = dataset.inputs.shape()[0] as usize;
-        let (_train_ratio, eval_ratio) = options.train_test_split;
-        let eval_count = (n as f32 * eval_ratio).round() as usize;
-        let train_count = n - eval_count;
-
-        // Shuffle all indices deterministically
-        let mut indices: Vec<i64> = (0..n as i64).collect();
-        let mut rng = fastrand::Rng::with_seed(seed);
-        for i in (1..indices.len()).rev() {
-            let j = rng.usize(0..=i);
-            indices.swap(i, j);
-        }
-
-        let eval_indices = indices[..eval_count].to_vec();
-        let train_indices = indices[eval_count..eval_count + train_count].to_vec();
-
-        debug!(
-            "  split_dataset -- total={} train={} eval={} (split {:.0}%/{:.0}%)",
-            n, train_indices.len(), eval_indices.len(),
-            options.train_test_split.0 * 100.0, options.train_test_split.1 * 100.0
-        );
-        (train_indices, eval_indices)
-    }
-
-    /// Step 4: Create a population of random topologies, seeded deterministically.
+    /// Create a population of random topologies, seeded deterministically.
     fn create_population(options: &EngineOptions, seed: u64) -> Result<Vec<Topology>> {
         let pop_size = options.pop_size.unwrap();
         let mut pop = Vec::with_capacity(pop_size);
@@ -1031,27 +730,13 @@ impl Engine {
     }
 
     /// Step 5: Log all resolved options, dataset, and population.
-    fn log_initialization(
-        options: &EngineOptions,
-        dataset: &Dataset,
-        pop: &[Topology],
-        seed: u64,
-        fitness: &Fitness,
-        data_path: &Path,
-    ) {
-        crate::utils::log_utils::log_initialization(options, dataset, pop, seed, fitness, data_path);
-    }
-
-    /// Step 6: Build thread pool, generate run id, assemble Engine struct.
+    /// Build thread pool, generate run id, assemble Engine struct.
     fn assemble_engine(
         options: EngineOptions,
         seed: u64,
-        dataset: Dataset,
-        train_indices: Vec<i64>,
-        eval_indices: Vec<i64>,
         pop: Vec<Topology>,
         fitness: Fitness,
-        data_path: &Path,
+        trainer: Box<dyn crate::trainer::Trainer>,
     ) -> Result<Engine> {
         let threads = if options.num_threads > 0 {
             options.num_threads
@@ -1078,12 +763,8 @@ impl Engine {
             pool,
             pop,
             fitness,
-            dataset,
-            train_indices,
-            eval_indices,
-            data_path: data_path.to_path_buf(),
+            trainer,
             generation: 0,
-            best: None,
             history: Vec::new(),
 
             scores: Vec::new(),
@@ -1091,11 +772,8 @@ impl Engine {
             param_counts: Vec::new(),
             gen_best_score: 0.0,
             gen_best_loss: None,
-            gen_worst_score: 0.0,
-            gen_worst_loss: None,
             gen_avg_score: 0.0,
             gen_avg_loss: None,
-            gen_best_params: 0,
             gen_avg_params: 0.0,
             gen_unique_topos: 0,
             robustness: std::collections::HashMap::new(),
@@ -1106,6 +784,42 @@ impl Engine {
 
     pub fn scores(&self) -> &[f32] {
         &self.scores
+    }
+
+    pub fn show_robustness(&self, top_n: usize, which: &str) {
+        match which {
+            "best" => { crate::utils::log_utils::log_repeated_topologies(&self.robustness, top_n, true); }
+            "worst" => { crate::utils::log_utils::log_repeated_topologies(&self.robustness, top_n, false); }
+            _ => {
+                crate::utils::log_utils::log_repeated_topologies(&self.robustness, top_n, true);
+                crate::utils::log_utils::log_repeated_topologies(&self.robustness, top_n, false);
+            }
+        }
+    }
+    pub fn export_robustness(&self) -> Result<()> { let path = self.run_dir.join("robustness.csv"); self.export_robustness_to(&path) }
+    fn export_robustness_to(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+        let has_loss = self.robustness.values().any(|e| e.has_loss());
+        let mut file = fs::File::create(path).map_err(|source| EngineError::Io { path: path.display().to_string(), source })?;
+        if has_loss { writeln!(file, "topo_id,appearances,fit_mean,fit_sd,fit_min,fit_max,loss_mean,loss_sd,loss_min,loss_max,params").map_err(|source| EngineError::Io { path: path.display().to_string(), source })?; }
+        else { writeln!(file, "topo_id,appearances,fit_mean,fit_sd,fit_min,fit_max,params").map_err(|source| EngineError::Io { path: path.display().to_string(), source })?; }
+        let mut entries: Vec<&RobustnessEntry> = self.robustness.values().collect();
+        entries.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| b.mean.partial_cmp(&a.mean).unwrap_or(std::cmp::Ordering::Equal)));
+        for entry in &entries {
+            let tid = crate::utils::log_utils::topo_hash(&entry.topology_json);
+            if has_loss {
+                writeln!(file, "{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{}",
+                    tid, entry.count, entry.mean, entry.std_dev(), entry.min_fitness, entry.max_fitness,
+                    entry.mean_loss.unwrap_or(0.0), entry.std_dev_loss(),
+                    entry.min_loss.unwrap_or(0.0), entry.max_loss.unwrap_or(0.0), entry.param_count)
+                    .map_err(|source| EngineError::Io { path: path.display().to_string(), source })?;
+            } else {
+                writeln!(file, "{},{},{:.6},{:.6},{:.6},{:.6},{}",
+                    tid, entry.count, entry.mean, entry.std_dev(), entry.min_fitness, entry.max_fitness, entry.param_count)
+                    .map_err(|source| EngineError::Io { path: path.display().to_string(), source })?;
+            }
+        }
+        Ok(())
     }
 
     // ── Run -- the main loop ─────────────────────────────────────────────────
@@ -1154,16 +868,11 @@ impl Engine {
             path: self.run_dir.join("engine.json").display().to_string(),
             source,
         })?;
-        crate::utils::log_utils::log_run_summary(
-            run_elapsed,
-            &self.best,
-            &self.fitness,
-            &self.run_dir,
-        )
-        .map_err(|e| EngineError::Json(format!("run summary log: {e}")))?;
+        let num_gens = self.options.num_generations.unwrap();
+        let robustness_csv = self.run_dir.join("robustness.csv");
+        self.export_robustness_to(&robustness_csv)?;
+        crate::utils::log_utils::log_done(run_elapsed, num_gens, &self.run_dir, &robustness_csv);
 
-        // Log top-N robust topologies
-        crate::utils::log_utils::log_repeated_topologies(&self.robustness, 20);
 
         Ok(())
     }
@@ -1184,45 +893,23 @@ impl Engine {
 
     /// Step 1: Parallel rayon loop -- build, train, score each individual.
     fn eval_all_individuals(&self) -> Result<Vec<(f32, Option<f32>, usize)>> {
-        let net_opts = self.options.network;
-        let train_cfg = &self.options.training;
-        let fitness = &self.fitness;
-        let dataset = &self.dataset;
-        let train_indices = &self.train_indices;
-        let eval_indices = &self.eval_indices;
-        let batch_seed = if self.options.train_random_data {
-            derive_seed(self.seed, self.generation * 3)  // changes per gen
-        } else {
-            derive_seed(self.seed, 0)  // fixed across gens
-        };
-        let test_seed = if self.options.test_random_data {
-            derive_seed(self.seed, self.generation * 3 + 1)  // changes per gen
-        } else {
-            derive_seed(self.seed, usize::MAX)  // fixed across generations
-        };
+        let device = self.trainer.device();
+        let dtype = self.trainer.dtype();
         let tracker = ProgressTracker::new();
-
         let results = self.pool.install(|| {
-            self.pop
-                .par_iter()
-                .map(|graph| {
-                    let mut no = net_opts;
-                    no.seed = graph.options.seed;
-                    no.dropout_prob = self.options.dropout_prob;
-                    // Randomize weights when train_fixed_coefs is false —
-                    // isolates architecture selection from weight init luck.
-                    if !self.options.train_fixed_coefs {
-                        no.seed = fastrand::usize(..);
-                    }
-                    let mut net = Network::build_with_options(graph, &no)?;
-                    let result = crate::trainer::train_network(
-                        &mut net, train_cfg, fitness, dataset, train_indices, eval_indices, batch_seed, test_seed,
-                    )?;
-                    let param_count: usize = net.layers.iter().flat_map(|l| l.parameters()).map(|p| p.variable.numel() as usize).sum();
-                    tracker.increment();
-                    Ok((result.score, result.eval_loss, param_count))
-                })
-                .collect::<Result<Vec<_>>>()
+            self.pop.par_iter().map(|graph| {
+                let no = crate::network::NetworkOptions {
+                    device,
+                    dtype,
+                    seed: graph.options.seed,
+                    dropout_prob: self.options.dropout_prob,
+                };
+                let net = Network::build_with_options(graph, &no)?;
+                let gen_seed = self.seed.wrapping_add(self.generation as u64 * 0x9E37_79B9_7F4A_7C15);
+                let (score, loss, params) = self.trainer.evaluate(net, &self.fitness, gen_seed)?;
+                tracker.increment();
+                Ok((score, loss, params))
+            }).collect::<Result<Vec<_>>>()
         });
         tracker.finish();
         results
@@ -1254,37 +941,18 @@ impl Engine {
         // 2. Cache for logging / history
         self.gen_best_score = stats.best_score;
         self.gen_best_loss = stats.best_loss;
-        self.gen_worst_score = stats.worst_score;
-        self.gen_worst_loss = stats.worst_loss;
         self.gen_avg_score = stats.avg_score;
         self.gen_avg_loss = stats.avg_loss;
-        self.gen_best_params = stats.best_params;
         self.gen_avg_params = stats.avg_params;
         self.gen_unique_topos = stats.unique_topos;
 
-        // 3. Update overall best if this gen's best is better
-        let improved = self
-            .best
-            .as_ref()
-            .map(|b| direction.is_better(stats.best_score, b.fitness))
-            .unwrap_or(true);
-        if improved {
-            self.best = Some(BestIndividual {
-                fitness: stats.best_score,
-                loss: stats.best_loss,
-                pop_index: stats.best_idx,
-                topology: self.pop[stats.best_idx].clone(),
-                param_count: stats.best_params,
-            });
-        }
-
-        // 4. Save per-gen data (one JSON + one MD)
+        // 3. Save per-gen data (one JSON + one MD)
         self.save_gen_data(&stats)?;
 
         // 5. Update robustness tracker
-        self.update_robustness(&stats);
+        self.update_robustness();
 
-        Ok(improved)
+        Ok(true)
     }
 
     // ── Per-gen data persistence ────────────────────────────────────────────
@@ -1333,11 +1001,9 @@ impl Engine {
             "stats": {
                 "best_score": stats.best_score,
                 "best_loss": stats.best_loss,
-                "best_params": stats.best_params,
-                "worst_score": stats.worst_score,
-                "worst_loss": stats.worst_loss,
                 "avg_score": stats.avg_score,
                 "avg_loss": stats.avg_loss,
+                "avg_params": stats.avg_params,
             },
             "individuals": individuals,
         });
@@ -1349,14 +1015,8 @@ impl Engine {
             source,
         })?;
 
-        // Write MD for best topology only
-        let best_topo = &self.pop[stats.best_idx];
-        let net = Network::build(best_topo, Device::CPU).ok();
-        let md = crate::utils::markdown::topology_markdown(
-            best_topo,
-            Some(stats.best_score),
-            net.as_ref(),
-        );
+        let best_topo = &self.pop[0];
+        let md = crate::utils::markdown::topology_markdown(best_topo, Some(stats.best_score), None);
         let md_path = dir.join(format!("gen_{:02}.md", self.generation));
         fs::write(&md_path, md).map_err(|source| EngineError::Io {
             path: md_path.display().to_string(),
@@ -1368,9 +1028,10 @@ impl Engine {
     }
 
     /// Update the robustness tracker with this gen's population.
-    fn update_robustness(&mut self, _stats: &GenStats) {
+    fn update_robustness(&mut self) {
         for (i, topo) in self.pop.iter().enumerate() {
             let fitness = self.scores[i];
+            let loss = self.eval_losses.get(i).and_then(|l| *l);
             let key = match topo.to_json() {
                 Ok(j) => j,
                 Err(_) => continue,
@@ -1379,14 +1040,12 @@ impl Engine {
             match self.robustness.entry(key) {
                 Entry::Occupied(mut e) => {
                     let entry = e.get_mut();
-                    entry.update(fitness);
-                    if fitness < entry.min_fitness { entry.min_fitness = fitness; }
-                    if fitness > entry.max_fitness { entry.max_fitness = fitness; }
+                    entry.update(fitness, loss);
                 }
                 Entry::Vacant(e) => {
                     let topo_json = e.key().clone();
                     let param_count = self.param_counts.get(i).copied().unwrap_or(0);
-                    e.insert(RobustnessEntry::new(fitness, param_count, topo_json));
+                    e.insert(RobustnessEntry::new(fitness, loss, param_count, topo_json));
                 }
             }
         }
@@ -1398,32 +1057,15 @@ impl Engine {
         if self.scores.is_empty() {
             return;
         }
-        let global_best = self.best.as_ref().map(|b| b.fitness).unwrap_or(self.gen_best_score);
-        let fl = self.fitness.fitness_label();
-        log::info!("  {:<16}{:>8}  {:<10}{:>8}  {:<5}{:>8}",
-            format!("{fl} global:"), format!("{global_best:.4}"),
-            "gen_best:", format!("{:.4}", self.gen_best_score),
-            "avg:", format!("{:.4}", self.gen_avg_score));
+        let fl = self.fitness.label();
+        log::info!("  {:<14}{:>8}  {:<5}{:>8}", format!("{fl} best:"), format!("{:.4}", self.gen_best_score), "avg:", format!("{:.4}", self.gen_avg_score));
         if self.gen_best_loss.is_some() || self.gen_avg_loss.is_some() {
-            let ll = self.fitness.train_metric_label();
-            let global_l = self.best.as_ref().and_then(|b| b.loss)
-                .map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into());
             let best_l = self.gen_best_loss.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into());
             let avg_l = self.gen_avg_loss.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into());
-            log::info!("  {:<16}{:>8}  {:<10}{:>8}  {:<5}{:>8}",
-                format!("{ll} global:"), &global_l, "gen_best:", &best_l, "avg:", &avg_l);
+            log::info!("  {:<14}{:>8}  {:<5}{:>8}", "loss best:", &best_l, "avg:", &avg_l);
         }
-        // Params (learnable parameters)
-        let global_params = self.best.as_ref().map(|b| b.param_count).unwrap_or(self.gen_best_params);
-        log::info!("  {:<16}{:>10}  {:<12}{:>10}  {:<5}{:>10}",
-            "params global:", global_params,
-            "gen_best:", self.gen_best_params,
-            "avg:", format!("{:.0}", self.gen_avg_params));
-        // Unique topologies
-        log::info!("  {:<16}{:>10}/{:<10}",
-            "topologies:",
-            self.gen_unique_topos,
-            self.pop.len());
+        log::info!("  {:<14}{:<10}  {:<5}{:<10}", "params:", "—", "avg:", format!("{:.0}", self.gen_avg_params));
+        log::info!("  {:<14}{:<10}", "topologies:", format!("{}/{}", self.gen_unique_topos, self.pop.len()));
     }
 
     // ── Genetics -- selection, crossover, mutation ────────────────────────────
@@ -1478,17 +1120,12 @@ impl Engine {
             log::info!("  {:<14}  -{:<4}  {:>5}/{}", "dedup (post)", post_refill_dedup, self.pop.len(), target);
         }
         log::info!("  {:<14}{:>5} nets  {:>5}/{}", "mutation", mut_count, self.pop.len(), target);
-        // Capture history if enabled (uses cached values from save_generation_snapshots)
-        if self.options.gens_history && !self.scores.is_empty() {
+        // Always capture history
+        if !self.scores.is_empty() {
             self.history.push(GenerationStats {
                 generation: self.generation,
-                best_score: self.gen_best_score,
-                best_loss: self.gen_best_loss,
-                worst_score: self.gen_worst_score,
-                worst_loss: self.gen_worst_loss,
                 avg_score: self.gen_avg_score,
                 avg_loss: self.gen_avg_loss,
-                best_params: self.gen_best_params,
                 avg_params: self.gen_avg_params,
                 unique_topos: self.gen_unique_topos,
             });
@@ -1622,31 +1259,7 @@ impl Engine {
 
     /// Build the full JSON envelope for a given best individual.
     /// Shared by `to_json` (run-level) and `record_improvement` (per-snapshot).
-    fn build_envelope(
-        &self,
-        best: Option<&BestIndividual>,
-    ) -> std::result::Result<serde_json::Value, EngineError> {
-        let best_topology = match best {
-            Some(b) => Some(
-                b.topology
-                    .to_json()
-                    .map_err(|e| EngineError::Json(format!("best topology: {e}")))?,
-            ),
-            None => None,
-        };
-        let best_net_facts = match best {
-            Some(b) => {
-                let mut no = self.options.network;
-                no.seed = b.topology.options.seed;
-                let net = Network::build_with_options(&b.topology, &no)
-                    .map_err(|e| EngineError::Json(format!("best net facts build: {e}")))?;
-                Some(
-                    net.to_json()
-                        .map_err(|e| EngineError::Json(format!("best net facts: {e}")))?,
-                )
-            }
-            None => None,
-        };
+    fn build_envelope(&self) -> std::result::Result<serde_json::Value, EngineError> {
         // Repeated topologies: sort by appearances desc, then mean desc
         let mut robust_entries: Vec<&RobustnessEntry> = self.robustness.values().collect();
         robust_entries.sort_by(|a, b| {
@@ -1659,9 +1272,12 @@ impl Engine {
         Ok(serde_json::json!({
             "run_id": self.run_id,
             "run_seed": self.seed,
-            "data_path": self.data_path.display().to_string(),
             "generation": self.generation,
             "pop_size": self.pop.len(),
+            "fitness_label": self.fitness.label(),
+            "fitness_direction": format!("{:?}", self.fitness.direction()),
+            "input_dim": self.options.topology_options.input_dim,
+            "output_dim": self.options.topology_options.output_dim,
             "options": &self.options,
             "topology_options": serde_json::json!({
                 "input_dim": self.options.topology_options.input_dim,
@@ -1675,18 +1291,13 @@ impl Engine {
                 "min_hidden_outputs_per_node": self.options.topology_options.min_hidden_outputs_per_node,
                 "max_hidden_outputs_per_node": self.options.topology_options.max_hidden_outputs_per_node,
             }),
-            "best_fitness": best.map(|b| b.fitness),
-            "best_loss": best.and_then(|b| b.loss),
-            "best_topology": best_topology,
-            "best_net_facts": best_net_facts,
             "history": if self.history.is_empty() { serde_json::Value::Null } else { serde_json::to_value(&self.history).unwrap_or(serde_json::Value::Null) },
             "robustness": robustness_val,
         }))
     }
 
     pub fn to_json(&self) -> Result<String> {
-        let spec = self.build_envelope(self.best.as_ref())
-            .map_err(|e| flodl::tensor::TensorError::new(&e.to_string()))?;
+        let spec = self.build_envelope().map_err(|e| flodl::tensor::TensorError::new(&e.to_string()))?;
         serde_json::to_string_pretty(&spec)
             .map_err(|e| EngineError::Json(format!("to_json: {e}")).into())
     }
@@ -1701,15 +1312,28 @@ pub(crate) fn derive_seed(base: u64, i: usize) -> u64 {
 mod tests {
     use super::*;
     use flodl::nn::loss::mse_loss;
-    use flodl::{DType, Variable};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use flodl::Device;
+
 
     fn temp_data_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gras_engine_test_{}", fastrand::u64(..)));
         let ds = crate::utils::synthetic::synthetic_sine(64, 42, Device::CPU).unwrap();
         crate::utils::data::save_dataset(&dir, &ds).unwrap();
         dir
+    }
+
+    fn test_trainer() -> Box<dyn crate::trainer::Trainer> {
+        let dir = temp_data_dir();
+        Box::new(crate::trainer::SupervisedTrainer::new(
+            &dir,
+            1,  // input_dim
+            1,  // output_dim
+            crate::trainer::TrainingConfig {
+                num_epochs: 1,
+                ..Default::default()
+            },
+            |p, y| mse_loss(p, y),
+        ).unwrap())
     }
 
     fn test_options() -> EngineOptions {
@@ -1727,10 +1351,7 @@ mod tests {
             mutation: crate::mutation::MutationMethod::Activation { prob: 0.1 },
             results_dir: std::env::temp_dir()
                 .join(format!("gras_engine_res_{}", fastrand::u64(..))),
-            training: crate::trainer::TrainingConfig {
-                num_epochs: 1,
-                ..Default::default()
-            },
+
             ..Default::default()
         }
     }
@@ -1740,8 +1361,8 @@ mod tests {
         let data_dir = temp_data_dir();
         let mut engine = Engine::new(
             test_options(),
-            &data_dir,
-            Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse"),
+            Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+                test_trainer(),
         )
         .unwrap();
         engine.run().unwrap();
@@ -1775,7 +1396,7 @@ mod tests {
             assert!(ind["params"].is_u64());
         }
         assert!(engine.run_dir.join("engine.json").exists());
-        let fitness = engine.best.as_ref().expect("best must exist").fitness;
+        let fitness = engine.scores().iter().copied().reduce(f32::max).unwrap();
         assert!(fitness.is_finite());
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&engine.options.results_dir);
@@ -1786,8 +1407,8 @@ mod tests {
         let data_dir = temp_data_dir();
         let mut engine = Engine::new(
             test_options(),
-            &data_dir,
-            Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse"),
+            Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+                test_trainer(),
         )
         .unwrap();
         engine.run().unwrap();
@@ -1795,148 +1416,28 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["run_id"], engine.run_id);
         assert_eq!(v["pop_size"], 3);
-        assert!(v["best_fitness"].is_number());
         assert_eq!(v["run_seed"], engine.seed);
-        let best_topo = Topology::from_json(v["best_topology"].as_str().unwrap()).unwrap();
-        assert_eq!(best_topo.validate(), Ok(()));
+        assert!(v["history"].is_array());
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&engine.options.results_dir);
     }
 
-    #[test]
-    fn test_engine_custom_fitness_invoked_every_individual() {
-        let data_dir = temp_data_dir();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls2 = calls.clone();
-        let fitness = Fitness::from_loss(
-            move |pred, y| {
-                calls2.fetch_add(1, Ordering::SeqCst);
-                mse_loss(pred, y)
-            },
-            Direction::Minimize,
-            "mse",
-        );
-        let opts = test_options();
-        let mut engine = Engine::new(opts.clone(), &data_dir, fitness).unwrap();
-        engine.run().unwrap();
-        // sample_batches_from_indices clips to min(num_batches, pool_size / batch_size).max(1)
-        let n_samples = 64usize; // synthetic_sine default
-        let (_train_ratio, eval_ratio) = opts.train_test_split;
-        let eval_pool = (n_samples as f32 * eval_ratio).round() as usize;
-        let train_pool = n_samples - eval_pool;
-        let actual_train = (opts.train_num_batches.min(train_pool / opts.train_batch_size)).max(1);
-        let actual_eval = (opts.test_num_batches.min(eval_pool / opts.test_batch_size)).max(1);
-        // Train: fitness called once per batch per epoch.
-        // Eval: fitness called twice per batch (score + train_metric).
-        let expected_per_individual = actual_train * opts.training.num_epochs + actual_eval * 2;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            opts.pop_size.unwrap() * opts.num_generations.unwrap() * expected_per_individual,
-        );
-        let _ = std::fs::remove_dir_all(&data_dir);
-        let _ = std::fs::remove_dir_all(&opts.results_dir);
-    }
+    // test_engine_custom_fitness_invoked_every_individual removed — call counting is now trainer-internal
 
-    #[test]
-    fn test_engine_auto_detects_input_dim() {
-        let data_dir = temp_data_dir();
-        let opts = EngineOptions {
-            topology_options: TopologyOptions {
-                input_dim: 999,
-                ..Default::default()
-            },
-            ..test_options()
-        };
-        let engine = Engine::new(
-            opts,
-            &data_dir,
-            Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse"),
-        )
-        .unwrap();
-        assert_eq!(engine.options.topology_options.input_dim, 1);
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
+    // test_engine_auto_detects_input_dim removed — dims now user-provided via trainer
 
-    #[test]
-    fn test_engine_batched_evaluation() {
-        let data_dir = temp_data_dir();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls2 = calls.clone();
-        let fitness = Fitness::from_loss(
-            move |pred, y| {
-                calls2.fetch_add(1, Ordering::SeqCst);
-                mse_loss(pred, y)
-            },
-            Direction::Minimize,
-            "mse",
-        );
-        let opts = EngineOptions {
-            pop_size: Some(3),
-            num_generations: Some(2),
-            train_num_batches: 3,
-            test_num_batches: 3,
-            train_batch_size: 8,
-            test_batch_size: 8,
-            training: crate::trainer::TrainingConfig {
-                num_batches_train: 3,
-                num_batches_eval: 3,
-                batch_size_train: 8,
-                batch_size_eval: 8,
-                ..crate::trainer::TrainingConfig::default()
-            },
-            ..test_options()
-        };
-        let mut engine = Engine::new(opts.clone(), &data_dir, fitness).unwrap();
-        engine.run().unwrap();
-        // Account for train_test_split: pool_size = n_samples * ratio
-        let n_samples = 64usize;
-        let (_train_ratio, eval_ratio) = opts.train_test_split;
-        let eval_pool = (n_samples as f32 * eval_ratio).round() as usize;
-        let train_pool = n_samples - eval_pool;
-        let actual_train = (opts.train_num_batches.min(train_pool / opts.train_batch_size)).max(1);
-        let actual_eval = (opts.test_num_batches.min(eval_pool / opts.test_batch_size)).max(1);
-        let eval_multiplier = 2;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            opts.pop_size.unwrap()
-                * opts.num_generations.unwrap()
-                * (actual_train * opts.training.num_epochs + actual_eval * eval_multiplier),
-        );
-        let _ = std::fs::remove_dir_all(&data_dir);
-        let _ = std::fs::remove_dir_all(&opts.results_dir);
-    }
+    // test_engine_batched_evaluation removed — batch budget is now trainer-internal
 
-    #[test]
-    fn test_engine_rejects_bad_budget() {
-        let data_dir = temp_data_dir();
-        let bad = EngineOptions {
-            train_num_batches: 2,
-            test_num_batches: 2,
-            train_batch_size: 0,
-            test_batch_size: 0,
-            ..test_options()
-        };
-        assert!(
-            Engine::new(
-                bad,
-                &data_dir,
-                Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse")
-            )
-            .is_err()
-        );
-        let _ = std::fs::remove_dir_all(&data_dir);
-    }
+    // test_engine_rejects_bad_budget removed — batch budget is now trainer-internal
 
     #[test]
     fn test_engine_maximize_direction() {
         let data_dir = temp_data_dir();
         let make_scorer = |dir: Direction| {
-            Fitness::from_loss(
+            Fitness::new(
                 move |pred, _target| {
                     let vec = pred.data().to_f32_vec().unwrap();
-                    let mean = vec.iter().sum::<f32>() / vec.len() as f32;
-                    let t = flodl::Tensor::from_f32(&[mean], &[1], Device::CPU).unwrap();
-                    Ok(Variable::new(t, false))
+                    Ok(vec.iter().sum::<f32>() / vec.len() as f32)
                 },
                 dir,
                 "custom",
@@ -1949,13 +1450,13 @@ mod tests {
             ..test_options()
         };
         let mut eng =
-            Engine::new(opts.clone(), &data_dir, make_scorer(Direction::Maximize)).unwrap();
+            Engine::new(opts.clone(), make_scorer(Direction::Maximize), test_trainer()).unwrap();
         eng.run().unwrap();
-        let max_best = eng.best.as_ref().unwrap().fitness;
+        let max_best = eng.scores().iter().copied().reduce(f32::max).unwrap();
         let mut eng =
-            Engine::new(opts.clone(), &data_dir, make_scorer(Direction::Minimize)).unwrap();
+            Engine::new(opts.clone(), make_scorer(Direction::Minimize), test_trainer()).unwrap();
         eng.run().unwrap();
-        let min_best = eng.best.as_ref().unwrap().fitness;
+        let min_best = eng.scores().iter().copied().reduce(f32::min).unwrap();
         assert!(max_best.is_finite());
         assert!(min_best.is_finite());
         assert_ne!(max_best, min_best);
@@ -1976,12 +1477,7 @@ mod tests {
             .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
             .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.5 })
             .set_mutation(crate::mutation::MutationMethod::Activation { prob: 0.1 })
-            .set_train_num_batches(4)
-            .set_test_num_batches(4)
-            .set_train_batch_size(32)
-            .set_test_batch_size(32)
-            .set_num_threads(2)
-            .set_dtype(DType::Float32)
+                        .set_num_threads(2)
             .build()
             .unwrap();
         assert_eq!(opts.pop_size, Some(15));
@@ -1989,30 +1485,15 @@ mod tests {
         assert_eq!(opts.seed, Some(42));
         assert_eq!(opts.hidden_dim_pool, 8..=32);
         assert_eq!(opts.combine_op_pool, vec![CombineOp::Add, CombineOp::Mean]);
-        assert_eq!(opts.train_num_batches, 4);
-        assert_eq!(opts.test_num_batches, 4);
-        assert_eq!(opts.train_batch_size, 32);
-        assert_eq!(opts.test_batch_size, 32);
-        assert_eq!(opts.network.dtype, DType::Float32);
+
         assert!(EngineOptions::builder().set_pop_size(0).build().is_err());
-        assert!(
-            EngineOptions::builder()
-                .set_train_num_batches(2)
-                .set_train_batch_size(0)
-                .build()
-                .is_err()
-        );
+
         // set_mutation() is required — omitting it should error at build time.
         assert!(
             EngineOptions::builder()
                 .set_pop_size(4)
                 .set_num_generations(1)
                 .set_hidden_dim_pool(4..=4)
-                .set_train_num_batches(2)
-                .set_test_num_batches(2)
-                .set_train_batch_size(8)
-                .set_test_batch_size(8)
-                .set_num_epochs(1)
                 .build()
                 .is_err()
         );
@@ -2053,12 +1534,12 @@ mod tests {
             .unwrap();
         let mut engine = Engine::new(
             opts,
-            &data_dir,
-            Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse"),
+            Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+                test_trainer(),
         )
         .unwrap();
         engine.run().unwrap();
-        assert!(engine.best.is_some());
+        assert!(!engine.scores().is_empty());
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&engine.options.results_dir);
     }
@@ -2084,14 +1565,14 @@ mod tests {
         };
         let a = Engine::new(
             make_opts(),
-            &data_dir,
-            Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse"),
+            Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+                test_trainer(),
         )
         .unwrap();
         let b = Engine::new(
             make_opts(),
-            &data_dir,
-            Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse"),
+            Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+                test_trainer(),
         )
         .unwrap();
         let mut dims: Vec<usize> = Vec::new();
@@ -2121,8 +1602,8 @@ mod tests {
         let opts = test_options();
         let engine = Engine::new(
             opts.clone(),
-            &data_dir,
-            Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse"),
+            Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+                test_trainer(),
         )
         .unwrap();
         assert!(!engine.run_dir.exists());
@@ -2144,8 +1625,8 @@ mod tests {
         };
         let mut engine = Engine::new(
             opts.clone(),
-            &data_dir,
-            Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse"),
+            Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+                test_trainer(),
         )
         .unwrap();
         engine.run().unwrap();
@@ -2153,8 +1634,8 @@ mod tests {
         assert_eq!(v["run_seed"], engine.seed);
         let other = Engine::new(
             opts.clone(),
-            &data_dir,
-            Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse"),
+            Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+                test_trainer(),
         )
         .unwrap();
         assert_ne!(other.seed, engine.seed);
@@ -2169,30 +1650,24 @@ mod tests {
             seed: Some(123),
             num_threads: 3,
             dropout_prob: 0.0,
-            train_fixed_coefs: true,
             ..test_options()
         };
         let mut a = Engine::new(
             make(),
-            &data_dir,
-            Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse"),
+            Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+                test_trainer(),
         )
         .unwrap();
         let mut b = Engine::new(
             make(),
-            &data_dir,
-            Fitness::from_loss(|p, y| mse_loss(p, y), Direction::Minimize, "mse"),
+            Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+                test_trainer(),
         )
         .unwrap();
         a.run().unwrap();
         b.run().unwrap();
-        let ba = a.best.as_ref().unwrap();
-        let bb = b.best.as_ref().unwrap();
-        assert_eq!(ba.fitness, bb.fitness);
-        assert_eq!(
-            crate::spec::Spec::from(&ba.topology),
-            crate::spec::Spec::from(&bb.topology)
-        );
+        // Seeded runs should produce identical scores
+        assert_eq!(a.scores(), b.scores());
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&a.options.results_dir);
         let _ = std::fs::remove_dir_all(&b.options.results_dir);
@@ -2202,50 +1677,19 @@ mod tests {
     fn test_fitness_custom_sees_pred_and_target() {
         let data_dir = temp_data_dir();
         let fitness =
-            Fitness::from_loss(|pred, y| flodl::l1_loss(pred, y), Direction::Minimize, "l1");
+            Fitness::new(|pred, y| Ok(flodl::l1_loss(pred, y)?.item()? as f32), Direction::Minimize, "l1");
         let opts = EngineOptions {
             num_generations: Some(1),
             ..test_options()
         };
-        let mut engine = Engine::new(opts.clone(), &data_dir, fitness).unwrap();
+        let mut engine = Engine::new(opts.clone(), fitness, test_trainer()).unwrap();
         engine.run().unwrap();
-        assert!(engine.best.is_some());
+        assert!(!engine.scores().is_empty());
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&opts.results_dir);
     }
 
-    #[test]
-    fn test_engine_from_loss_with_diff() {
-        let data_dir = temp_data_dir();
-        // Train on MSE, evolve on negative MSE (maximize) — different directions
-        let fitness = Fitness::from_loss_with_diff(
-            |pred, y| {
-                let diff = pred.data().sub(&y.data())?;
-                let sq = diff.mul(&diff)?;
-                Ok(sq.mean()?.item()? as f32)
-            },
-            Direction::Minimize,
-            "mse_score",
-            |pred, y| flodl::mse_loss(pred, y),
-            Direction::Minimize,
-            "mse_train",
-        );
-        assert!(!fitness.train_metric_is_fitness());
-        assert_eq!(fitness.fitness_label(), "mse_score");
-        assert_eq!(fitness.train_metric_label(), "mse_train");
-        let opts = EngineOptions {
-            num_generations: Some(1),
-            ..test_options()
-        };
-        let mut engine = Engine::new(opts, &data_dir, fitness).unwrap();
-        engine.run().unwrap();
-        assert!(engine.best.is_some());
-        let best = engine.best.as_ref().unwrap();
-        assert!(best.fitness.is_finite());
-        assert!(best.loss.is_some());
-        let _ = std::fs::remove_dir_all(&data_dir);
-        let _ = std::fs::remove_dir_all(&engine.options.results_dir);
-    }
+    // test_engine_from_loss_with_diff removed — Fitness no longer has train_metric
 
     #[test]
     fn test_hidden_dim_stride() {
