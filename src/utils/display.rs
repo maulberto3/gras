@@ -99,16 +99,10 @@ impl Display for EngineOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "pop {} · {} gens · seed {:?} · split {}%/{}, budget train {}bt x {} eval {}bt x {} · {} threads · fitness {} · results {}/",
+            "pop {} · {} gens · seed {:?} · {} threads · fitness {} · results {}/",
             self.pop_size.unwrap_or(0),
             self.num_generations.unwrap_or(0),
             self.seed,
-            self.train_test_split.0 * 100.0,
-            self.train_test_split.1 * 100.0,
-            self.train_num_batches,
-            self.train_batch_size,
-            self.test_num_batches,
-            self.test_batch_size,
             self.num_threads,
             self.fitness_label,
             self.results_dir.display()

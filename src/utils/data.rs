@@ -34,6 +34,11 @@ pub struct Dataset {
 }
 
 impl Dataset {
+    /// Number of samples in the dataset.
+    pub fn len(&self) -> usize {
+        self.inputs.shape()[0] as usize
+    }
+
     /// Cast both tensors to `Float32` if they aren't already — flodl's
     /// native workhorse dtype and this crate's default precision. The
     /// engine calls this on load, so a dataset written in another dtype
@@ -202,6 +207,44 @@ pub fn load_dataset(dir: &Path) -> Result<Dataset> {
     let inputs = load_tensor(&dir.join("inputs.bin"))?;
     let targets = load_tensor(&dir.join("targets.bin"))?;
     Ok(Dataset { inputs, targets })
+}
+
+/// Auto-detect data format: .bin (cached or direct) or .csv (converts to .bin).
+///
+/// Priority:
+/// 1. `{dir}/flodl_data/inputs.bin` (cached .bin)
+/// 2. `{dir}/inputs.bin` (direct .bin)
+/// 3. `{dir}/inputs.csv` → convert → cache in `{dir}/flodl_data/`
+pub fn resolve_dataset(dir: &Path) -> Result<Dataset> {
+    let cache_dir = dir.join("flodl_data");
+
+    // Priority 1: cached .bin
+    if cache_dir.join("inputs.bin").exists() {
+        return load_dataset(&cache_dir);
+    }
+
+    // Priority 2: .bin in dir
+    if dir.join("inputs.bin").exists() {
+        return load_dataset(dir);
+    }
+
+    // Priority 3: CSV → convert → cache
+    if dir.join("inputs.csv").exists() {
+        let dataset = load_csv_dataset(dir)?;
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|e| flodl::tensor::TensorError::new(&e.to_string()))?;
+        save_dataset(&cache_dir, &dataset)?;
+        return Ok(dataset);
+    }
+
+    Err(DataError::Io {
+        path: dir.display().to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no inputs.bin or inputs.csv found in {}", dir.display()),
+        ),
+    }
+    .into())
 }
 
 /// Load a dataset from CSV files (`inputs.csv` + `targets.csv`).
@@ -396,6 +439,30 @@ pub fn synthetic_classification(
     }
     let targets = Tensor::from_f32(&targets, &[n as i64, out_dim as i64], device)?;
     Ok(Dataset { inputs, targets })
+}
+
+/// Split a dataset length into train and eval index vectors.
+/// Returns `(train_indices, eval_indices)`.
+pub fn split_indices(
+    len: usize,
+    train_ratio: f32,
+    eval_ratio: f32,
+    seed: u64,
+) -> (Vec<i64>, Vec<i64>) {
+    assert!((train_ratio + eval_ratio - 1.0).abs() < 1e-6, "ratios must sum to 1.0");
+    let mut indices: Vec<i64> = (0..len as i64).collect();
+    // Deterministic shuffle via seed
+    let mut rng = fastrand::Rng::with_seed(seed);
+    for i in (1..indices.len()).rev() {
+        let j = rng.usize(0..=i);
+        indices.swap(i, j);
+    }
+    let split = (len as f32 * train_ratio).round() as usize;
+    let train: Vec<i64> = indices[..split].to_vec();
+    let eval: Vec<i64> = indices[split..].to_vec();
+    // Silent fallback: if eval is empty, use all data for eval
+    let eval = if eval.is_empty() { indices.clone() } else { eval };
+    (train, eval)
 }
 
 #[cfg(test)]
