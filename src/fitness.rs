@@ -1,8 +1,7 @@
-//! Scoring strategies  — fitness/loss split and direction.
+//! Scoring — fitness function for ranking individuals.
 //!
-//! The engine uses [`Fitness`] to separate **scoring** (ranking) from
-//! **training** (backward). User always provides a train metric;
-//! the engine cannot guess the right signal for different output formats.
+//! [`Fitness`] is a pure scoring function. Training loss is the user's
+//! responsibility (lives inside the [`Trainer`](crate::trainer::Trainer)).
 
 use flodl::Variable;
 use flodl::tensor::Result;
@@ -47,72 +46,31 @@ impl Direction {
     }
 }
 
-// ── Fitness — the scoring + training interface ────────────────────────────
+// ── Fitness — pure scoring ───────────────────────────────────────────────
 
-/// Scoring (ranking) + training (backward) interface.
+/// Pure scoring function for ranking individuals.
 ///
-/// ```text
-/// Fitness::from_loss(f)                        ← same function for both
-/// Fitness::from_loss_with_diff(...)            ← separate scoring + training
-/// ```
-///
-/// User must always provide an explicit train metric.
+/// The engine evolves on `score()`. Training loss is the user's
+/// responsibility — lives inside the trainer, not here.
 pub struct Fitness {
     /// Ranking metric: `(pred, target) → f32`.
     score_fn: Box<dyn Fn(&Variable, &Variable) -> Result<f32> + Send + Sync>,
-    /// Training metric: `(pred, target) → Variable` for backward.
-    train_metric_fn: Box<dyn Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync>,
     /// Score direction.
-    score_direction: Direction,
-    /// Train metric direction.
-    train_metric_direction: Direction,
-    /// Fitness/scoring label.
-    fitness_label: String,
-    /// Train metric label.
-    train_metric_label: String,
+    direction: Direction,
+    /// Label for logs.
+    label: String,
 }
 
 impl Fitness {
-    /// Separate scoring (evolution ranking) from training (backward).
-    ///
-    /// `score_fn` returns f32 for ranking; `train_metric_fn` returns
-    /// Variable for backward. The engine evolves on score, trains on train_metric.
-    pub fn from_loss_with_diff<S, L>(
-        score_fn: S,
-        score_direction: Direction,
-        fitness_label: &str,
-        train_metric_fn: L,
-        train_metric_direction: Direction,
-        train_metric_label: &str,
-    ) -> Self
+    /// Create a new fitness function.
+    pub fn new<F>(score_fn: F, direction: Direction, label: &str) -> Self
     where
-        S: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
-        L: Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync + 'static,
+        F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
     {
         Fitness {
             score_fn: Box::new(score_fn),
-            train_metric_fn: Box::new(train_metric_fn),
-            score_direction,
-            train_metric_direction,
-            fitness_label: fitness_label.to_string(),
-            train_metric_label: train_metric_label.to_string(),
-        }
-    }
-
-    /// Same function for both scoring and training.
-    pub fn from_loss<F>(f: F, direction: Direction, label: &str) -> Self
-    where
-        F: Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync + 'static,
-    {
-        let f = std::sync::Arc::new(f);
-        let f2 = f.clone();
-        Fitness {
-            score_fn: Box::new(move |pred, y| Ok(f(pred, y)?.item()? as f32)),
-            train_metric_fn: Box::new(move |pred, y| f2(pred, y)),
-            score_direction: direction,
-            train_metric_direction: direction,
-            fitness_label: label.to_string(),
-            train_metric_label: label.to_string(),
+            direction,
+            label: label.to_string(),
         }
     }
 
@@ -121,36 +79,15 @@ impl Fitness {
         (self.score_fn)(pred, target)
     }
 
-    /// Compute the training metric tensor — used for backward (training).
-    pub fn train_metric(&self, pred: &Variable, target: &Variable) -> Result<Variable> {
-        (self.train_metric_fn)(pred, target)
-    }
-
     /// Score direction.
     pub fn direction(&self) -> Direction {
-        self.score_direction
+        self.direction
     }
 
-    /// Train metric direction.
-    pub fn train_metric_direction(&self) -> Direction {
-        self.train_metric_direction
+    /// Label for logs.
+    pub fn label(&self) -> &str {
+        &self.label
     }
-
-    /// Fitness label for logs.
-    pub fn fitness_label(&self) -> &str {
-        &self.fitness_label
-    }
-
-    /// Train metric label for logs.
-    pub fn train_metric_label(&self) -> &str {
-        &self.train_metric_label
-    }
-
-    /// Whether fitness and train metric are the same function.
-    pub fn train_metric_is_fitness(&self) -> bool {
-        self.fitness_label == self.train_metric_label
-    }
-
 }
 
 // ── Scoring helpers — public utility functions ────────────────────────────
@@ -296,22 +233,6 @@ pub fn cross_entropy_onehot_loss(pred: &Variable, y: &Variable) -> Result<Variab
     Ok(Variable::new(masked.sum()?.mul(&neg)?.div(&n)?, false))
 }
 
-// ── BestIndividual — the current champion ─────────────────────────────────
-
-/// The best individual seen so far — scored by a [`Fitness`].
-#[derive(Clone, Debug)]
-pub struct BestIndividual {
-    pub fitness: f32,
-    /// Loss on eval batches (only when Fitness has an explicit loss).
-    pub loss: Option<f32>,
-    /// Index in the population (`pop[i]`) that produced this best.
-    pub pop_index: usize,
-    /// The blueprint that scored best — `to_json` it to replicate the net.
-    pub topology: crate::topology::Topology,
-    /// Number of learnable parameters in the best network.
-    pub param_count: usize,
-}
-
 // ── Re-exports for backward compat ────────────────────────────────────────
 
 // Backward-compat: old code used FitnessKind in EngineOptions.
@@ -362,9 +283,13 @@ mod tests {
     }
 
     #[test]
-    fn test_fitness_from_loss() {
-        let f = Fitness::from_loss(
-            |pred, y| flodl::nn::loss::mse_loss(pred, y),
+    fn test_fitness_new() {
+        let f = Fitness::new(
+            |pred, y| {
+                let diff = pred.data().sub(&y.data())?;
+                let sq = diff.mul(&diff)?;
+                Ok(sq.mean()?.item()? as f32)
+            },
             Direction::Minimize,
             "mse",
         );
@@ -376,10 +301,7 @@ mod tests {
         assert!(score.is_finite());
         assert!(score >= 0.0);
         assert_eq!(f.direction(), Direction::Minimize);
-        // train_metric() and score() should agree (score = train_metric.item())
-        let tm = f.train_metric(&pred, &y).unwrap();
-        let tm_v = tm.item().unwrap() as f32;
-        assert!((score - tm_v).abs() < 1e-6);
+        assert_eq!(f.label(), "mse");
     }
 
     // TODO: uncomment when from_loss_with_other is re-enabled.
@@ -520,20 +442,6 @@ mod tests {
             }
         }
 
-        #[test]
-        fn prop_from_loss_score_and_train_metric_agree(val in -10.0f32..10.0) {
-            let f = Fitness::from_loss(
-                |pred, y| flodl::nn::loss::mse_loss(pred, y),
-                Direction::Minimize, "mse",
-            );
-            // Use identity: pred == target means loss == 0
-            let t = Variable::new(
-                flodl::Tensor::from_f32(&[val], &[1, 1], flodl::Device::CPU).unwrap(),
-                false,
-            );
-            let score = f.score(&t, &t).unwrap();
-            let tm = f.train_metric(&t, &t).unwrap().item().unwrap() as f32;
-            prop_assert!((score - tm).abs() < 1e-5, "score={score} tm={tm}");
-        }
+
     }
 }
