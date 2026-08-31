@@ -15,6 +15,66 @@ and gras searches for the best architecture in parallel.
 
 </div>
 
+## Why gras?
+
+Hand-designing networks is slow and misses non-obvious architectures.
+gras discovers better structures automatically:
+
+
+
+### Before vs After
+
+<div align="center">
+
+**Hand-designed** — same width, same activation, straight pipeline:
+
+```mermaid
+graph LR
+    I[Input 100] --> H1[64 · relu]
+    H1 --> H2[64 · relu]
+    H2 --> O[Output 1]
+```
+
+</div>
+
+<div align="center">
+
+**gras evolved** — variable dims, diverse activations, rich wiring:
+
+```mermaid
+graph LR
+    I[Input 100] --> H1
+    H1[64 · relu] --> H2[[96 · gelu]]
+    H1 --> H3(32 · silu)
+    I --> H4[48 · mish]
+    H2 --> H4
+    H3 --> H4
+    H2 --> H5[64 · tanh]
+    H4 --> H5
+    H5 --> O[Output 1]
+```
+
+
+
+</div>
+
+> Each hidden node has its own width, activation, and standardization —
+> all discovered by evolution, not hand-tuned.
+
+### How evolution works
+
+```mermaid
+graph TD
+    A[Initial Population<br/>random topologies] --> B[Evaluate<br/>train + score all nets]
+    B --> C{Best enough?}
+    C -->|No| D[Select<br/>tournament + elitism]
+    C -->|Yes| E[Done ✓]
+    D --> F[Crossover<br/>swap subtrees]
+    F --> G[Dedup & Refill<br/>remove duplicates]
+    G --> H[Mutate<br/>activation / combine / std]
+    H --> B
+```
+
 ## Features
 
 - **Evolutionary NAS** — evolve hidden layer count, dims, activations, combine ops, standardize ops per node
@@ -40,10 +100,10 @@ and gras searches for the best architecture in parallel.
 
 ```toml
 [dependencies]
-gras = "0.1"
+gras = "0.1.6"
 
 # Optional CUDA
-gras = { version = "0.1", features = ["cuda"] }
+gras = { version = "0.1.6", features = ["cuda"] }
 ```
 
 ## Setup
@@ -84,8 +144,8 @@ gras is flexible — it evolves over **your** training setup:
 | You provide | What gras does |
 |-------------|----------------|
 | **Data** — `.bin` or `.csv` files (auto-detected) | Loads, splits, batches |
-| **Trainer** — your training loop (or use `SupervisedTrainer`) | Trains each network per generation |
-| **Fitness** — your ranking metric (or use built-in scorers) | Ranks individuals for selection |
+| **Trainer** — implement the `Trainer` trait (we provide `SupervisedTrainer`) | Trains each network per generation |
+| **Fitness** — your ranking metric | Ranks individuals for selection |
 
 The engine handles topology creation, evolution loop, selection, crossover, mutation,
 logging, and robustness tracking. You stay in control of training and evaluation.
@@ -93,53 +153,42 @@ logging, and robustness tracking. You stay in control of training and evaluation
 ## Quick Start
 
 ```rust
-use std::path::Path;
-use flodl::Device;
-use gras::{data, Engine, EngineOptions, Fitness, Direction, MutationMethod, SelectionMethod, CrossoverMethod};
+use gras::{Engine, EngineOptions, Fitness, Direction, SelectionMethod, CrossoverMethod, MutationMethod};
 use gras::trainer::{SupervisedTrainer, TrainingConfig};
 
-fn main() {
-    // 1. Data
-    let data_dir = Path::new("data/sine");
-    if !data_dir.exists() {
-        let ds = gras::synthetic::synthetic_sine(256, 42, Device::CPU).unwrap();
-        data::save_dataset(data_dir, &ds).unwrap();
-    }
+// 1. Prepare your data: inputs.csv + targets.csv (or .bin)
+let data_dir = std::path::Path::new("data/my_problem");
 
-    // 2. Fitness — pure scoring for ranking
-    let fitness = Fitness::new(
-        |p, y| {
-            let diff = p.data().sub(&y.data()).unwrap();
-            let sq = diff.mul(&diff).unwrap();
-            Ok(sq.mean().unwrap().item().unwrap() as f32)
-        },
-        Direction::Minimize,
-        "mse",
-    );
+// 2. Define how to rank individuals
+let fitness = Fitness::new(
+    |pred, target| { /* your metric */ Ok(0.0) },
+    Direction::Maximize,
+    "my_metric",
+);
 
-    // 3. Trainer — owns data, loss, split, everything
-    let trainer = SupervisedTrainer::new(
-        data_dir, 1, 1,
-        TrainingConfig { num_epochs: 1, ..Default::default() },
-        |p, y| flodl::nn::loss::mse_loss(p, y),
-    ).unwrap();
+// 3. Define how to train (or use SupervisedTrainer)
+let trainer = SupervisedTrainer::new(
+    data_dir,
+    10,    // input_dim
+    2,     // output_dim
+    TrainingConfig::default(),
+    |pred, target| { /* your loss: e.g. MSE, cross-entropy */ Ok(pred.clone()) },
+).unwrap();
 
-    // 4. Engine
-    let opts = EngineOptions::builder()
-        .set_pop_size(50)
-        .set_num_generations(5)
-        .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
-        .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.5 })
-        .set_mutation(MutationMethod::Activation { prob: 0.1 })
-        .build()
-        .unwrap();
+// 4. Configure evolution
+let opts = EngineOptions::builder()
+    .set_pop_size(50)
+    .set_num_generations(10)
+    .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
+    .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.5 })
+    .set_mutation(MutationMethod::Activation { prob: 0.1 })
+    .build()
+    .unwrap();
 
-    let mut engine = Engine::new(opts, fitness, Box::new(trainer)).unwrap();
-    engine.run().unwrap();
-
-    // 5. Inspect robustness
-    engine.show_robustness(10, "both");
-}
+// 5. Run
+let mut engine = Engine::new(opts, fitness, Box::new(trainer)).unwrap();
+engine.run().unwrap();
+engine.show_robustness(10, "both");
 ```
 
 ## Options Reference
@@ -183,58 +232,22 @@ Everything else has conservative defaults. Set only what your experiment needs:
 
 | Option | Default | Builder method |
 |--------|---------|---------------|
-| `prior_topology` | None | `.set_prior_topology("engine.json")` |
-| `prior_topologies` | None | `.set_prior_topologies(vec!["a.json", "b.json"])` |
+| `prior_topology_paths` | `[]` (empty) | `.set_prior_topology("engine.json")` — add one path |
+| | | `.set_prior_topologies(vec!["a.json", "b.json"])` — add multiple |
 
 ## Fitness
 
-Your fitness function ranks individuals. Use built-ins or write your own:
+You bring your own fitness function — it ranks individuals for selection:
 
 ```rust
-// Built-in
-let fitness = Fitness::new(f1_score, Direction::Maximize, "f1");
-
-// Custom
 let fitness = Fitness::new(
-    |pred, y| { my_metric(pred, y) },
+    |pred, y| my_metric(pred, y),
     Direction::Maximize,
     "my_metric",
 );
 ```
 
-### Built-in scorers
-
-**Continuous** (targets `[n, 1]`):
-
-| Function | Direction |
-|----------|-----------|
-| `mse_loss_score` | Minimize |
-| `rmse_score` | Minimize |
-| `l1_loss_score` | Minimize |
-| `r2_score` | Maximize |
-
-**Categorical** (targets `[n, C]` one-hot):
-
-| Function | Direction |
-|----------|-----------|
-| `accuracy_score` | Maximize |
-| `f1_score` | Maximize |
-| `precision_score` | Maximize |
-| `cross_entropy_onehot` | Minimize |
-| `cross_entropy_onehot_loss` | Minimize (Variable, for backward) |
-
-**Custom** — any closure `fn(&Variable, &Variable) -> Result<f32>`:
-
-```rust
-Fitness::new(
-    |pred, y| {
-        let my_metric = custom_computation(pred, y)?;
-        Ok(my_metric)
-    },
-    Direction::Maximize,
-    "my_metric",
-)
-```
+The closure receives `(&Variable, &Variable)` → `Result<f32>`. Direction is `Maximize` or `Minimize`.
 
 ## Data Format
 
@@ -260,50 +273,6 @@ data/your_problem/
 - CSV headers are auto-detected (skipped if non-numeric)
 - Lines starting with `#` are treated as comments
 
-### Framing Your Problem
-
-**Regression** — 1 output, continuous target:
-```text
-inputs:  [n, features]    targets: [n, 1]
-```
-
-**Binary classification** — 1 output, target 0.0 or 1.0:
-```text
-inputs:  [n, features]    targets: [n, 1]
-```
-
-**Multi-class** — C outputs, one-hot targets:
-```text
-inputs:  [n, features]    targets: [n, C]
-```
-
-**Multi-output regression** — multiple continuous targets:
-```text
-inputs:  [n, features]    targets: [n, outputs]
-```
-
-## Synthetic Datasets
-
-| Generator | Task | Input dim | Target dim |
-|-----------|------|-----------|------------|
-| `synthetic_sine(n, seed, device)` | Regression | 1 | 1 |
-| `synthetic_poly3(n, seed, device)` | Regression | 1 | 1 |
-| `synthetic_sigmoid(n, seed, device)` | Regression | 1 | 1 |
-| `synthetic_multi_sine(n, seed, device)` | Regression | 5 | 1 |
-| `synthetic_xor(n, seed, device)` | Classification | 2 | 2 (one-hot) |
-| `synthetic_blobs(n, seed, device)` | Classification | 2 | 3 (one-hot) |
-| `synthetic_spiral(n, seed, device)` | Classification | 2 | 3 (one-hot) |
-| `synthetic_iris_like(n, seed, device)` | Classification | 4 | 3 (one-hot) |
-| `synthetic_classification(n, in, out, seed, dev)` | Classification | custom | custom |
-
-```rust
-use gras::synthetic;
-use gras::data::save_dataset;
-
-let ds = synthetic::synthetic_sine(256, 42, Device::CPU).unwrap();
-save_dataset(Path::new("data/sine"), &ds).unwrap();
-```
-
 ## Outputs
 
 ### Run Directory Structure
@@ -311,6 +280,7 @@ save_dataset(Path::new("data/sine"), &ds).unwrap();
 ```
 results/<run_id>/
 ├── engine.json                    # Full run config + best topology + robustness
+├── robustness.csv                 # Topology appearances, fitness stats (top 20 best/worst)
 ├── improvements/
 │   ├── gen_00.json                # All individuals (seed, fitness, loss, params, topology)
 │   ├── gen_00.md                  # Markdown for best topology
@@ -325,24 +295,6 @@ At run end, the engine logs repeated topologies:
 ── repeated topologies (top 20) ──
   rank   appearances      mean   std_dev      min      max    params  topo_id
   #1             44    0.6103    0.0873   0.4611   0.7855   121610  3a7f2b1c
-```
-
-## Examples
-
-| Example | Description |
-|---------|-------------|
-| `generate_md_from_gen` | Generate markdown for any topology from gen_XX.json |
-| `train_from_gen` | Fully train a specific network and see results |
-
-```bash
-# Generate MD for a specific topology
-cargo run --example generate_md_from_gen -- results/.../improvements/gen_00.json --best
-
-# Via results directory + topo hash
-cargo run --example generate_md_from_gen -- results/... 5e639bae
-
-# Fully train a specific network
-cargo run --example train_from_gen -- results/.../improvements/gen_00.json --best
 ```
 
 ## Contributing
