@@ -5,7 +5,7 @@
 //! Run: `source env_setup.sh && cargo run --example continuous_showcase`
 
 
-use flodl::Device;
+
 use gras::data;
 use gras::engine::{Engine, EngineOptions};
 use gras::fitness::{Direction, Fitness};
@@ -20,8 +20,8 @@ fn main() {
 
     // 1. Data — synthetic sine wave
     let data_dir = std::env::temp_dir().join(format!("gras_cont_showcase_{}", fastrand::u64(..)));
-    let ds = gras::synthetic::synthetic_sine(256, 42, Device::CPU).unwrap();
-    data::save_dataset(&data_dir, &ds).unwrap();
+    let (inputs, targets) = gras::data::make_sine(256);
+    data::save_dataset(&data_dir, &gras::Dataset { inputs, targets }).unwrap();
 
     // 2. Options — the 5 mandatory fields + conservative defaults.
     let opts = EngineOptions::builder()
