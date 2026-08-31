@@ -18,7 +18,7 @@ use flodl::tensor::Result;
 use gras::topology::Topology;
 use gras::network::Network;
 use gras::utils::data::resolve_dataset;
-use gras::fitness::{Fitness, Direction, f1_score, cross_entropy_onehot_loss};
+use gras::{Fitness, Direction, f1_score, cross_entropy_onehot_loss};
 
 /// Try to find the data path from the engine.json in results dir.
 fn find_data_path(json_path: &Path) -> PathBuf {
