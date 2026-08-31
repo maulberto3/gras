@@ -11,12 +11,13 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use flodl::{Device, DType};
+use flodl::{Device, DType, Variable};
 use flodl::nn::Module;
+use flodl::tensor::Result;
 
 use gras::topology::Topology;
 use gras::network::Network;
-use gras::utils::data::load_dataset;
+use gras::utils::data::resolve_dataset;
 use gras::fitness::{Fitness, Direction, f1_score, cross_entropy_onehot_loss};
 
 /// Try to find the data path from the engine.json in results dir.
@@ -136,7 +137,7 @@ fn main() {
     let data_path = find_data_path(&json_path);
     println!("  data       {}", data_path.display());
 
-    let dataset = load_dataset(&data_path)
+    let dataset = resolve_dataset(&data_path)
         .and_then(|ds| ds.to_dtype(DType::Float32))
         .and_then(|ds| ds.to_device(Device::CPU))
         .unwrap_or_else(|e| {
@@ -157,15 +158,15 @@ fn main() {
     });
     println!("  params     {}", net.parameters().len());
 
-    // Create fitness functions
-    let fitness = Fitness::from_loss_with_diff(
+    // Fitness — pure scoring
+    let fitness = Fitness::new(
         |pred, y| f1_score(pred, y),
         Direction::Maximize,
         "f1",
-        |pred, y| cross_entropy_onehot_loss(pred, y),
-        Direction::Minimize,
-        "cross_entropy",
     );
+
+    // Loss function
+    let loss_fn = |pred: &Variable, y: &Variable| -> Result<Variable> { cross_entropy_onehot_loss(pred, y) };
 
     // Training config
     let config = gras::trainer::TrainingConfig {
@@ -179,6 +180,9 @@ fn main() {
         num_batches_eval: 16,
         train_y_proportional: true,
         test_y_proportional: true,
+        eval_ratio: 0.2,
+        device: flodl::Device::CPU,
+        dtype: flodl::DType::Float32,
     };
 
     // Split dataset into train/eval
@@ -193,15 +197,15 @@ fn main() {
 
     // Train
     let mut net = net;
-    let result = gras::trainer::train_network(
+    let result = gras::utils::supervised::train_network(
         &mut net,
         &config,
+        &loss_fn,
         &fitness,
         &dataset,
         &train_indices,
         &eval_indices,
-        42,  // train_seed
-        42,  // eval_seed
+        42,  // gen_seed
     ).unwrap_or_else(|e| {
         eprintln!("Error training: {}", e);
         std::process::exit(1);

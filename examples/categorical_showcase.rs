@@ -1,15 +1,16 @@
-//! Categorical (classification) showcase — gras evolves nets for 3-class blobs.
+//! Categorical (classification) showcase — gras evolves nets for MNIST-style data.
 //!
-//! Demonstrates: F1 + cross-entropy, Maximize direction, one-hot targets,
-//! dual fitness (ranking metric + training loss).
+//! Demonstrates: F1 score for ranking, cross-entropy for training.
 //!
 //! Run: `source env_setup.sh && cargo run --example categorical_showcase`
 
+
 use flodl::Device;
 use gras::data;
-use gras::engine::{Engine, EngineOptions, Fitness};
-use gras::fitness::Direction;
+use gras::engine::{Engine, EngineOptions};
+use gras::fitness::{Direction, Fitness};
 use gras::topology::CombineOp;
+use gras::trainer::{SupervisedTrainer, TrainingConfig};
 
 fn main() {
     use std::io::Write;
@@ -17,65 +18,50 @@ fn main() {
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
 
-    // 1. Data — synthetic 3-class Gaussian blobs, 256 samples.
-    //    inputs: [256, 2], targets: [256, 3] (one-hot)
-    let data_dir = std::path::Path::new("data/blobs");
-    if std::fs::read_dir(data_dir).is_err() {
-        let ds = gras::synthetic::synthetic_blobs(256, 42, Device::CPU).unwrap();
-        data::save_dataset(data_dir, &ds).unwrap();
-    }
+    // 1. Data — synthetic classification
+    let data_dir = std::env::temp_dir().join(format!("gras_cat_showcase_{}", fastrand::u64(..)));
+    let ds = data::synthetic_classification(1024, 16, 4, 42, Device::CPU).unwrap();
+    data::save_dataset(&data_dir, &ds).unwrap();
 
-    // 2. Options — the 5 mandatory fields + conservative defaults.
+    // 2. Options
     let opts = EngineOptions::builder()
-        // ── mandatory ─────────────────────────────────────────────
         .set_pop_size(50)
         .set_num_generations(5)
         .set_selection(gras::SelectionMethod::Tournament { tournament_size: 2 })
         .set_crossover(gras::CrossoverMethod::OnePoint { action_prob: 0.5 })
         .set_mutation(gras::MutationMethod::Activation { prob: 0.1 })
-        // ── optional ──────────────────────────────────────────────
         .set_hidden_dim_pool(8..=16)
         .set_combine_op_pool(vec![CombineOp::Add])
-        .set_train_test_split(0.8, 0.2)
-        .set_train_num_batches(4)
-        .set_test_num_batches(4)
-        .set_train_batch_size(32)
-        .set_test_batch_size(32)
-        .set_num_epochs(1)
         .set_dedup_pop_and_fill(true)
-        .set_gens_history(true)
-        .set_device(gras::auto_device())
         .set_seed(Some(42))
         .build()
         .unwrap();
 
-    // 3. Run — dual fitness:
-    //    ranking:  F1 score (Maximize) — how good is the prediction?
-    //    training: cross-entropy loss (Minimize) — what the nets optimize against.
-    let fitness = Fitness::from_loss_with_diff(
+    // 3. Fitness — F1 for ranking
+    let fitness = Fitness::new(
         |pred, y| gras::f1_score(pred, y),
         Direction::Maximize,
         "f1",
-        |pred, y| gras::cross_entropy_onehot_loss(pred, y),
-        Direction::Minimize,
-        "cross_entropy",
     );
-    let mut engine = Engine::new(opts, data_dir, fitness).unwrap();
+
+    // 4. Trainer — cross-entropy for training
+    let trainer = SupervisedTrainer::new(
+        &data_dir,
+        16,   // input_dim
+        4,    // output_dim (4 classes)
+        TrainingConfig {
+            num_epochs: 1,
+            ..Default::default()
+        },
+        |pred, y| gras::cross_entropy_onehot_loss(pred, y),
+    )
+    .unwrap();
+
+    let mut engine = Engine::new(opts, fitness, Box::new(trainer)).unwrap();
     engine.run().unwrap();
 
-    // 4. Inspect the best.
-    let best = engine.best.as_ref().unwrap();
-    println!("\n  best fitness: {:.4}", best.fitness);
-    println!("  {} nodes", best.topology.nodes.len());
+    // 5. Inspect robustness.
+    engine.show_robustness(5, "best");
 
-    // 5. History (if gens_history was enabled).
-    if !engine.history.is_empty() {
-        println!("\n  generation history:");
-        for h in &engine.history {
-            println!(
-                "    gen {:02}  best {:.4}  worst {:.4}",
-                h.generation, h.best_score, h.worst_score
-            );
-        }
-    }
+    let _ = std::fs::remove_dir_all(&data_dir);
 }

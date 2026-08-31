@@ -4,11 +4,13 @@
 //!
 //! Run: `source env_setup.sh && cargo run --example continuous_showcase`
 
+
 use flodl::Device;
 use gras::data;
-use gras::engine::{Engine, EngineOptions, Fitness};
-use gras::fitness::Direction;
+use gras::engine::{Engine, EngineOptions};
+use gras::fitness::{Direction, Fitness};
 use gras::topology::CombineOp;
+use gras::trainer::{SupervisedTrainer, TrainingConfig};
 
 fn main() {
     use std::io::Write;
@@ -16,60 +18,62 @@ fn main() {
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
 
-    // 1. Data — synthetic y = sin(2πx), 256 samples, saved to disk.
-    //    inputs: [256, 1], targets: [256, 1]
-    let data_dir = std::path::Path::new("data/sine");
-    if std::fs::read_dir(data_dir).is_err() {
-        let ds = gras::synthetic::synthetic_sine(256, 42, Device::CPU).unwrap();
-        data::save_dataset(data_dir, &ds).unwrap();
-    }
+    // 1. Data — synthetic sine wave
+    let data_dir = std::env::temp_dir().join(format!("gras_cont_showcase_{}", fastrand::u64(..)));
+    let ds = gras::synthetic::synthetic_sine(256, 42, Device::CPU).unwrap();
+    data::save_dataset(&data_dir, &ds).unwrap();
 
     // 2. Options — the 5 mandatory fields + conservative defaults.
     let opts = EngineOptions::builder()
-        // ── mandatory ─────────────────────────────────────────────
         .set_pop_size(50)
         .set_num_generations(5)
         .set_selection(gras::SelectionMethod::Tournament { tournament_size: 2 })
         .set_crossover(gras::CrossoverMethod::OnePoint { action_prob: 0.5 })
         .set_mutation(gras::MutationMethod::Activation { prob: 0.1 })
-        // ── optional ──────────────────────────────────────────────
         .set_hidden_dim_pool(8..=16)
         .set_combine_op_pool(vec![CombineOp::Add])
-        .set_train_test_split(0.8, 0.2)
-        .set_train_num_batches(4)
-        .set_test_num_batches(4)
-        .set_train_batch_size(32)
-        .set_test_batch_size(32)
-        .set_num_epochs(1)
         .set_dedup_pop_and_fill(true)
-        .set_gens_history(true)
-        .set_device(gras::auto_device())
         .set_seed(Some(42))
         .build()
         .unwrap();
 
-    // 3. Run — MSE loss, Minimize direction (lower is better).
-    let fitness = Fitness::from_loss(
-        |p, y| flodl::nn::loss::mse_loss(p, y),
+    // 3. Fitness — MSE loss, Minimize direction (lower is better).
+    let fitness = Fitness::new(
+        |p, y| {
+            let diff = p.data().sub(&y.data())?;
+            let sq = diff.mul(&diff)?;
+            Ok(sq.mean()?.item()? as f32)
+        },
         Direction::Minimize,
         "mse",
     );
-    let mut engine = Engine::new(opts, data_dir, fitness).unwrap();
+
+    // 4. Trainer — owns all training config.
+    let trainer = SupervisedTrainer::new(
+        &data_dir,
+        1,    // input_dim (sine: 1 feature)
+        1,    // output_dim (sine: 1 target)
+        TrainingConfig {
+            num_epochs: 1,
+            ..Default::default()
+        },
+        |p, y| flodl::nn::loss::mse_loss(p, y),
+    )
+    .unwrap();
+
+    let mut engine = Engine::new(opts, fitness, Box::new(trainer)).unwrap();
     engine.run().unwrap();
 
-    // 4. Inspect the best.
-    let best = engine.best.as_ref().unwrap();
-    println!("\n  best fitness: {:.4}", best.fitness);
-    println!("  {} nodes", best.topology.nodes.len());
+    // 5. Inspect robustness.
+    engine.show_robustness(5, "best");
 
-    // 5. History (if gens_history was enabled).
+    // 6. History (always saved).
     if !engine.history.is_empty() {
         println!("\n  generation history:");
         for h in &engine.history {
-            println!(
-                "    gen {:02}  best {:.4}  worst {:.4}",
-                h.generation, h.best_score, h.worst_score
-            );
+            println!("    gen {:02}  avg_score={:.4}  topologies={}", h.generation, h.avg_score, h.unique_topos);
         }
     }
+
+    let _ = std::fs::remove_dir_all(&data_dir);
 }
