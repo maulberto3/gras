@@ -27,6 +27,9 @@ pub use trainer::{OptimizerKind, Trainer, TrainingConfig, SupervisedTrainer};
 pub use utils::data::{Dataset, make_sine, make_xor, one_hot};
 pub use utils::supervised::TrainResult;
 
+// ── re-exports: flodl types users need ─────────────────────────────────
+pub use flodl::{DType, Device, Variable};
+
 // ── re-exports: scoring helpers ──────────────────────────────────────
 pub use utils::scoring::{
     accuracy_score, argmax_classes, cross_entropy_onehot, cross_entropy_onehot_loss, f1_from_vecs,
