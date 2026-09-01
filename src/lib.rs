@@ -34,13 +34,6 @@ pub use utils::scoring::{
     rmse_score,
 };
 
-// ── device helpers ────────────────────────────────────────────────────
-
-/// Auto-detect the best device based on compiled features.
-///
-/// - With `cuda` feature: returns `Device::CUDA(0)`
-/// - Without `cuda` feature: returns `Device::CPU`
-/// Auto-detect the best available device (CUDA if feature enabled, else CPU).
 pub fn auto_device() -> flodl::Device {
     #[cfg(feature = "cuda")]
     {

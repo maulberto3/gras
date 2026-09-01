@@ -8,7 +8,7 @@ use flodl::Variable;
 use serde::{Deserialize, Serialize};
 
 /// How multiple incoming tensors are combined before the node transforms them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CombineOp {
     /// Sum of incoming tensors.
     Add,
@@ -81,7 +81,7 @@ impl CombineOp {
 }
 
 /// Activation applied after a node's linear transform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum Activation {
     /// No activation -- pure linear.
     #[default]
@@ -143,7 +143,7 @@ impl Activation {
 }
 
 /// Normalization after linear, before activation. Part of per-node NAS knobs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StandardizeOp {
     /// No normalization — the linear output passes straight to activation.
     #[default]
@@ -172,7 +172,7 @@ impl StandardizeOp {
 
 /// A node in the computational graph . Receives tensors, transforms,
 /// applies activation, exposes outputs. Invariants enforced by `Topology::validate`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Node {
     pub id: usize,          //  unique id; also execution order (0 runs first)
     pub num_inputs: usize,  //  how many input ports this node has
@@ -197,7 +197,7 @@ pub struct Node {
 
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeKind {
     Input,  //  start of the network: no inputs, feeds the rest
     Hidden, //  middle of the network: combine -> transform -> pass on

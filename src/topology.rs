@@ -30,7 +30,7 @@ pub struct KindCounts {
 /// Knobs for building a graph. Mostly used by the random-generation
 /// methods (`create_random_hidden_node`, `finalize`); `input_dim`,
 /// `hidden_dim` and `combine_op` are what execution actually cares about.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 // ── TopologyOptions — the blueprint template ──────────────────────────────
 
 pub struct TopologyOptions {
@@ -94,7 +94,7 @@ pub struct Port {
 ///
 /// Example: `n1_o0 -> n2_i0` means "node 1's first output feeds node 2's
 /// first input".
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Connection {
     pub from: Port,
     pub to: Port,

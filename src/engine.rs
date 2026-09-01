@@ -20,9 +20,9 @@ pub use crate::mutation::MutationMethod;
 use crate::network::Network;
 use crate::node::{Activation, NodeKind};
 use crate::selection::SelectionMethod;
-use crate::topology::{CombineOp, Topology, TopologyOptions};
-use crate::utils::error::EngineError;
-
+use crate::topology::{CombineOp, Topology, TopologyOptions};use crate::utils::error::EngineError;
+use crate::utils::progress::ProgressTracker;
+pub(crate) use crate::utils::robustness::RobustnessEntry;
 
 
 // ── EngineOptions -- the experiment configuration ──────────────────────────
@@ -49,11 +49,11 @@ pub struct EngineOptions {
     pub activation_pool: Vec<Activation>,
     /// Standardize-op pool -- per-node normalization. Empty -> all built-in.
     pub standardize_op_pool: Vec<crate::node::StandardizeOp>,
-    /// Number of training batches per generation.
-    // 
+    /// Fitness name
     pub fitness_label: FitnessLabel,
     /// Threads for parallel eval (0 = rayon default).
     pub num_threads: usize,
+    /// Directory for engine.json, per-gen snapshots, and robustness.csv.
     pub results_dir: PathBuf,
     /// Selection strategy for the next generation.
     pub selection: Option<SelectionMethod>,
@@ -64,15 +64,10 @@ pub struct EngineOptions {
     /// Dropout probability for hidden nodes (0.0 = no dropout).
     pub dropout_prob: f32,
     /// Deduplicate population by full topology comparison.
-    /// Applied after create_population and after select each generation.
-    /// Default: true.
     pub dedup_pop_and_fill: bool,
     /// Number of top individuals to preserve untouched each generation.
-    /// Minimum: 1. Default: 2.
     pub elite_count: usize,
     /// Paths to prior engine.json or improvement JSON files.
-    /// Each best topology is injected into the initial population
-    /// at pop[0..N] — a "warm start" from multiple prior runs.
     pub prior_topology_paths: Vec<PathBuf>,
 }
 
@@ -316,6 +311,7 @@ impl EngineOptionsBuilder {
 
 }
 
+// ── Generation statistics and robustness tracking ─────────────────────────────────
 
 /// Per-generation metrics, always saved.
 #[derive(Clone, Debug, Serialize)]
@@ -397,77 +393,6 @@ pub(crate) fn compute_gen_stats(
     }
 }
 
-// ── Robustness tracking ─────────────────────────────────────────────────
-
-/// Tracks how often a topology appears across generations.
-#[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct RobustnessEntry {
-    pub count: usize,
-    pub min_fitness: f32,
-    pub max_fitness: f32,
-    pub mean: f32,
-    pub m2: f32,
-    pub min_loss: Option<f32>,
-    pub max_loss: Option<f32>,
-    pub mean_loss: Option<f32>,
-    pub m2_loss: f32,
-    pub param_count: usize,
-    pub topology_json: String,
-}
-
-impl RobustnessEntry {
-    fn new(fitness: f32, loss: Option<f32>, param_count: usize, topology_json: String) -> Self {
-        Self {
-            count: 1,
-            min_fitness: fitness,
-            max_fitness: fitness,
-            mean: fitness,
-            m2: 0.0,
-            min_loss: loss,
-            max_loss: loss,
-            mean_loss: loss,
-            m2_loss: 0.0,
-            param_count,
-            topology_json,
-        }
-    }
-
-    /// Welford's online update for fitness.
-    pub fn update(&mut self, fitness: f32, loss: Option<f32>) {
-        self.count += 1;
-        let delta = fitness - self.mean;
-        self.mean += delta / self.count as f32;
-        let delta2 = fitness - self.mean;
-        self.m2 += delta * delta2;
-        if let Some(l) = loss {
-            if let Some(ml) = self.mean_loss {
-                let dl = l - ml;
-                self.mean_loss = Some(ml + dl / self.count as f32);
-                let dl2 = l - self.mean_loss.unwrap();
-                self.m2_loss += dl * dl2;
-            }
-            self.min_loss = Some(self.min_loss.unwrap_or(l).min(l));
-            self.max_loss = Some(self.max_loss.unwrap_or(l).max(l));
-        }
-    }
-
-    /// Sample standard deviation of fitness across appearances.
-    pub fn std_dev(&self) -> f32 {
-        if self.count < 2 { 0.0 }
-        else { (self.m2 / (self.count - 1) as f32).sqrt() }
-    }
-
-    /// Sample standard deviation of loss across appearances.
-    pub fn std_dev_loss(&self) -> f32 {
-        if self.count < 2 || self.mean_loss.is_none() { 0.0 }
-        else { (self.m2_loss / (self.count - 1) as f32).sqrt() }
-    }
-
-    pub fn has_loss(&self) -> bool {
-        self.mean_loss.is_some()
-    }
-}
-
 // ── Engine -- the NAS experiment runner ────────────────────────────────────
 
 pub struct Engine {
@@ -494,28 +419,6 @@ pub struct Engine {
     gen_unique_topos: usize,
     /// Topology robustness tracker — keyed by topology JSON.
     robustness: std::collections::HashMap<String, RobustnessEntry>,
-}
-
-// ── Progress tracker — periodic stdout updates during evaluation ─────────
-
-struct ProgressTracker {
-    done: std::sync::atomic::AtomicUsize,
-}
-
-impl ProgressTracker {
-    fn new() -> Self {
-        ProgressTracker {
-            done: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    /// Workers call this after scoring. Just counts — no printing.
-    fn increment(&self) {
-        self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Final count (no-op — logging handled elsewhere).
-    fn finish(&self) {}
 }
 
 impl Engine {
@@ -582,45 +485,17 @@ impl Engine {
         seed
     }
 
-    /// Auto-detect data format and load dataset.
-    ///
-    /// Priority:
     /// Create a population of random topologies, seeded deterministically.
     fn create_population(options: &EngineOptions, seed: u64) -> Result<Vec<Topology>> {
         let pop_size = options.pop_size.unwrap();
         let mut pop = Vec::with_capacity(pop_size);
         for i in 0..pop_size {
             let ind_seed = derive_seed(seed, i);
-            let mut rng = fastrand::Rng::with_seed(ind_seed);
-            let n_hidden = rng.usize(
-                options.topology_options.min_hidden_num_nodes
-                    ..=options.topology_options.max_hidden_num_nodes,
-            );
-            let ind_opts = options.derive_topology_options(ind_seed as usize);
-
-            // Create a random topology with n_hidden nodes, each node randomly assigned hidden_dim, activation, combine_op, and standardize_op from the respective pools.
-            let mut graph = Topology::new(i, Some(ind_opts));
-            graph.create_random_hidden_nodes(n_hidden);
-            let pool_len_a = options.activation_pool.len();
-            let pool_len_c = options.combine_op_pool.len();
-            let pool_len_s = options.standardize_op_pool.len();
-            for node in &mut graph.nodes {
-                if node.kind == NodeKind::Hidden {
-                    node.hidden_dim = Some(Self::sample_hidden_dim(&options.hidden_dim_pool, options.hidden_dim_stride, &mut rng));
-                    node.activation = options.activation_pool[rng.usize(0..pool_len_a)];
-                    node.combine_op = Some(options.combine_op_pool[rng.usize(0..pool_len_c)]);
-                    node.standardize = Some(options.standardize_op_pool[rng.usize(0..pool_len_s)]);
-                }
-            }
-            graph.refresh_labels();
-            graph.finalize();
-
-
-
+            let graph = Self::create_individual(options, i, ind_seed);
             debug!(
                 "  ind[{i}] seed={} n_hidden={} nodes={} wires={}",
                 ind_seed,
-                n_hidden,
+                graph.nodes.iter().filter(|n| n.kind == NodeKind::Hidden).count(),
                 graph.nodes.len(),
                 graph.connections.len()
             );
@@ -629,20 +504,43 @@ impl Engine {
         Ok(pop)
     }
 
+    /// Create a single random individual from engine pools.
+    /// Shared by `create_population` and `refill_population`.
+    fn create_individual(options: &EngineOptions, id: usize, seed: u64) -> Topology {
+        let mut rng = fastrand::Rng::with_seed(seed);
+        let n_hidden = rng.usize(
+            options.topology_options.min_hidden_num_nodes
+                ..=options.topology_options.max_hidden_num_nodes,
+        );
+        let ind_opts = options.derive_topology_options(seed as usize);
+        let mut graph = Topology::new(id, Some(ind_opts));
+        graph.create_random_hidden_nodes(n_hidden);
+        let pool_len_a = options.activation_pool.len();
+        let pool_len_c = options.combine_op_pool.len();
+        let pool_len_s = options.standardize_op_pool.len();
+        for node in &mut graph.nodes {
+            if node.kind == NodeKind::Hidden {
+                node.hidden_dim = Some(Self::sample_hidden_dim(&options.hidden_dim_pool, options.hidden_dim_stride, &mut rng));
+                node.activation = options.activation_pool[rng.usize(0..pool_len_a)];
+                node.combine_op = Some(options.combine_op_pool[rng.usize(0..pool_len_c)]);
+                node.standardize = Some(options.standardize_op_pool[rng.usize(0..pool_len_s)]);
+            }
+        }
+        graph.refresh_labels();
+        graph.finalize();
+        graph
+    }
+
     /// Remove duplicate topologies from the population (full Spec comparison).
     /// Keeps the first occurrence of each unique topology.
     fn dedup_population(pop: &mut Vec<Topology>) {
         use crate::spec::Spec;
+        use std::collections::HashSet;
         let before = pop.len();
-        let mut seen: Vec<Spec> = Vec::new();
+        let mut seen: HashSet<Spec> = HashSet::new();
         pop.retain(|topo| {
             let spec = Spec::from(topo);
-            if seen.iter().any(|s| *s == spec) {
-                false
-            } else {
-                seen.push(spec);
-                true
-            }
+            seen.insert(spec)
         });
         let removed = before - pop.len();
         if removed > 0 {
@@ -697,31 +595,14 @@ impl Engine {
         let base_offset = 1_000_000 + generation * target + pop.len();
         for k in 0..needed {
             let ind_seed = derive_seed(seed, base_offset + k);
-            let mut rng = fastrand::Rng::with_seed(ind_seed);
-            let n_hidden = rng.usize(
-                options.topology_options.min_hidden_num_nodes
-                    ..=options.topology_options.max_hidden_num_nodes,
-            );
-            let ind_opts = options.derive_topology_options(ind_seed as usize);
             let id = pop.len();
-            let mut graph = Topology::new(id, Some(ind_opts));
-            graph.create_random_hidden_nodes(n_hidden);
-            let pool_len_a = options.activation_pool.len();
-            let pool_len_c = options.combine_op_pool.len();
-            let pool_len_s = options.standardize_op_pool.len();
-            for node in &mut graph.nodes {
-                if node.kind == NodeKind::Hidden {
-                    node.hidden_dim = Some(Self::sample_hidden_dim(&options.hidden_dim_pool, options.hidden_dim_stride, &mut rng));
-                    node.activation = options.activation_pool[rng.usize(0..pool_len_a)];
-                    node.combine_op = Some(options.combine_op_pool[rng.usize(0..pool_len_c)]);
-                    node.standardize = Some(options.standardize_op_pool[rng.usize(0..pool_len_s)]);
-                }
-            }
-            graph.refresh_labels();
-            graph.finalize();
+            let graph = Self::create_individual(options, id, ind_seed);
             debug!(
                 "  refill[{id}] seed={} n_hidden={} nodes={} wires={}",
-                ind_seed, n_hidden, graph.nodes.len(), graph.connections.len()
+                ind_seed,
+                graph.nodes.iter().filter(|n| n.kind == NodeKind::Hidden).count(),
+                graph.nodes.len(),
+                graph.connections.len()
             );
             pop.push(graph);
         }
@@ -782,10 +663,13 @@ impl Engine {
 
     // ── Query ───────────────────────────────────────────────────────────────
 
+    /// Returns the scores from the most recent generation.
     pub fn scores(&self) -> &[f32] {
         &self.scores
     }
 
+    /// Display topology robustness table (most-repeated topologies).
+    /// `which`: "best" (highest fitness), "worst" (lowest fitness), or "both".
     pub fn show_robustness(&self, top_n: usize, which: &str) {
         match which {
             "best" => { crate::utils::log_utils::log_repeated_topologies(&self.robustness, top_n, true); }
@@ -796,6 +680,8 @@ impl Engine {
             }
         }
     }
+
+    /// Export robustness data to `robustness.csv` in the run directory.
     pub fn export_robustness(&self) -> Result<()> { let path = self.run_dir.join("robustness.csv"); self.export_robustness_to(&path) }
     fn export_robustness_to(&self, path: &std::path::Path) -> Result<()> {
         use std::io::Write;
@@ -824,6 +710,8 @@ impl Engine {
 
     // ── Run -- the main loop ─────────────────────────────────────────────────
 
+    /// Execute the full evolution loop: init → generations → finalize.
+    /// Writes engine.json, per-gen snapshots, and robustness.csv.
     pub fn run(&mut self) -> Result<()> {
         let run_start = self.init_run()?;
         self.run_generations();
@@ -1058,14 +946,33 @@ impl Engine {
             return;
         }
         let fl = self.fitness.label();
-        log::info!("  {:<14}{:>8}  {:<5}{:>8}", format!("{fl} best:"), format!("{:.4}", self.gen_best_score), "avg:", format!("{:.4}", self.gen_avg_score));
+        // Collect rows: (label, best_value, avg_value)
+        let mut rows: Vec<(&str, String, String)> = Vec::new();
+        rows.push((
+            fl,
+            format!("{:.4}", self.gen_best_score),
+            format!("{:.4}", self.gen_avg_score),
+        ));
         if self.gen_best_loss.is_some() || self.gen_avg_loss.is_some() {
-            let best_l = self.gen_best_loss.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into());
-            let avg_l = self.gen_avg_loss.map(|v| format!("{v:.4}")).unwrap_or_else(|| "-".into());
-            log::info!("  {:<14}{:>8}  {:<5}{:>8}", "loss best:", &best_l, "avg:", &avg_l);
+            let best_l = self.gen_best_loss.map(|v| format!("{v:.4}")).unwrap_or_else(|| "—".into());
+            let avg_l = self.gen_avg_loss.map(|v| format!("{v:.4}")).unwrap_or_else(|| "—".into());
+            rows.push(("loss", best_l, avg_l));
         }
-        log::info!("  {:<14}{:<10}  {:<5}{:<10}", "params:", "—", "avg:", format!("{:.0}", self.gen_avg_params));
-        log::info!("  {:<14}{:<10}", "topologies:", format!("{}/{}", self.gen_unique_topos, self.pop.len()));
+        rows.push(("params", "—".into(), format!("{:.0}", self.gen_avg_params)));
+        rows.push(("topologies", format!("{}/{}", self.gen_unique_topos, self.pop.len()), "".into()));
+
+        // Compute column widths dynamically
+        let w_label = rows.iter().map(|r| r.0.len()).max().unwrap_or(6);
+        let w_best = rows.iter().map(|r| r.1.len()).max().unwrap_or(4);
+        let w_avg = rows.iter().map(|r| r.2.len()).max().unwrap_or(4);
+
+        for (label, best, avg) in &rows {
+            if avg.is_empty() {
+                log::info!("  {:<w_label$}  {:>w_best$}", label, best);
+            } else {
+                log::info!("  {:<w_label$}  {:>w_best$}  {:>w_avg$}", label, best, avg);
+            }
+        }
     }
 
     // ── Genetics -- selection, crossover, mutation ────────────────────────────
@@ -1100,26 +1007,8 @@ impl Engine {
         }
         let post_refill_dedup = pre_post_dedup - self.pop.len();
         let mut_count = self.mutate();
-        // Log in order of operations: select → crossover → dedup → refill → dedup → mutate
-        let target = self.options.pop_size.unwrap();
-        log::info!("  ── genetics ──");
-        log::info!("  {:<14}{:>5}/{:<5}  unique ({})  elite {}", "selection", unique, target, sel_label, self.options.elite_count);
-        log::info!("  {:<14}{:>5} pairs  {:>5}/{:<5}", "crossover", cx_pairs, target, target);
-        if dedup_removed > 0 {
-            log::info!("  {:<14}  -{:<4}  {:>5}/{} → {:>5}/{}", "dedup", dedup_removed, pre_dedup, target, pre_dedup - dedup_removed, target);
-        } else {
-            log::info!("  {:<14}{:>5}  {:>5}/{}", "dedup", 0, target, target);
-        }
-        if refill_added > 0 {
-            let after_refill = self.pop.len();
-            log::info!("  {:<14}{:>5}  {:>5}/{} → {:>5}/{}", "refill", refill_added, after_refill - refill_added, target, after_refill, target);
-        } else {
-            log::info!("  {:<14}{:>5}  {:>5}/{}", "refill", 0, self.pop.len(), target);
-        }
-        if post_refill_dedup > 0 {
-            log::info!("  {:<14}  -{:<4}  {:>5}/{}", "dedup (post)", post_refill_dedup, self.pop.len(), target);
-        }
-        log::info!("  {:<14}{:>5} nets  {:>5}/{}", "mutation", mut_count, self.pop.len(), target);
+        // Log genetics summary
+        self.log_genetics_summary(unique, &sel_label, cx_pairs, dedup_removed, pre_dedup, refill_added, post_refill_dedup, mut_count);
         // Always capture history
         if !self.scores.is_empty() {
             self.history.push(GenerationStats {
@@ -1131,6 +1020,39 @@ impl Engine {
             });
         }
         self.generation += 1;
+    }
+
+    /// Log the genetics summary for this generation.
+    fn log_genetics_summary(
+        &self,
+        unique: usize,
+        sel_label: &str,
+        cx_pairs: usize,
+        dedup_removed: usize,
+        pre_dedup: usize,
+        refill_added: usize,
+        post_refill_dedup: usize,
+        mut_count: usize,
+    ) {
+        let target = self.options.pop_size.unwrap();
+        log::info!("  ── genetics ──");
+        log::info!("  {:<12}{unique:>5}/{target:<5}  unique ({sel_label})  elite {}", "selection", self.options.elite_count);
+        log::info!("  {:<12}{cx_pairs:>5} pairs  {target:>5}/{target:<5}", "crossover");
+        if dedup_removed > 0 {
+            log::info!("  {:<12} -{dedup_removed:<4}  {pre_dedup:>5}/{target} → {:>5}/{target}", "dedup", pre_dedup - dedup_removed);
+        } else {
+            log::info!("  {:<12}  0     {target:>5}/{target}", "dedup");
+        }
+        if refill_added > 0 {
+            let after_refill = self.pop.len();
+            log::info!("  {:<12}{refill_added:>5}     {}/{} → {after_refill:>5}/{target}", "refill", after_refill - refill_added, target);
+        } else {
+            log::info!("  {:<12}  0     {:>5}/{target}", "refill", self.pop.len());
+        }
+        if post_refill_dedup > 0 {
+            log::info!("  {:<12} -{post_refill_dedup:<4}  {:>5}/{target}", "dedup (post)", self.pop.len());
+        }
+        log::info!("  {:<12}{mut_count:>5} nets  {:>5}/{target}", "mutation", self.pop.len());
     }
 
     /// Selection -- reorder pop/scores so fittest survive.
