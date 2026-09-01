@@ -2,7 +2,8 @@
 
 <!-- <img src="assets/logo.png" alt="gras logo" width="200" /> -->
 
-# 🧬 gras: Neural Architecture Search via Genetic Programming
+# gras
+### Neural Architecture Search via Genetic Programming
 
 [![Crates.io](https://img.shields.io/crates/v/gras.svg)](https://crates.io/crates/gras)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -24,39 +25,52 @@ gras discovers better structures automatically:
 
 ### Before vs After
 
-<div align="center">
-
 **Hand-designed** — same width, same activation, straight pipeline:
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1a3a2a',
+  'primaryTextColor': '#fff',
+  'lineColor': '#2d6a4f',
+  'primaryBorderColor': '#40916c'
+}}}%%
 graph LR
-    I[Input 100] --> H1[64 · relu]
+    I([Input 100]) --> H1[64 · relu]
     H1 --> H2[64 · relu]
-    H2 --> O[Output 1]
+    H2 --> O([Output 1])
+    style I fill:#1b4332,stroke:#40916c,stroke-width:3px,color:#fff
+    style H1 fill:#2d6a4f,stroke:#52b788,stroke-width:3px,color:#fff
+    style H2 fill:#2d6a4f,stroke:#52b788,stroke-width:3px,color:#fff
+    style O fill:#1b4332,stroke:#40916c,stroke-width:3px,color:#fff
 ```
-
-</div>
-
-<div align="center">
 
 **gras evolved** — variable dims, diverse activations, rich wiring:
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1a3a2a',
+  'primaryTextColor': '#fff',
+  'lineColor': '#2d6a4f',
+  'primaryBorderColor': '#40916c'
+}}}%%
 graph LR
-    I[Input 100] --> H1
-    H1[64 · relu] --> H2[[96 · gelu]]
-    H1 --> H3(32 · silu)
-    I --> H4[48 · mish]
-    H2 --> H4
-    H3 --> H4
-    H2 --> H5[64 · tanh]
-    H4 --> H5
-    H5 --> O[Output 1]
+    I([Input 100]) ==> H1[64 · relu]
+    H1 ==> H2[[96 · gelu]]
+    H1 ==> H3(32 · silu)
+    I ==> H4[48 · mish]
+    H2 ==> H4
+    H3 ==> H4
+    H2 ==> H5[64 · tanh]
+    H4 ==> H5
+    H5 ==> O([Output 1])
+    style I fill:#1b4332,stroke:#40916c,stroke-width:3px,color:#fff
+    style H1 fill:#2d6a4f,stroke:#52b788,stroke-width:3px,color:#fff
+    style H2 fill:#1b4332,stroke:#40916c,stroke-width:3px,color:#fff
+    style H3 fill:#40916c,stroke:#95d5b2,stroke-width:3px,color:#fff
+    style H4 fill:#2d6a4f,stroke:#52b788,stroke-width:3px,color:#fff
+    style H5 fill:#1b4332,stroke:#40916c,stroke-width:3px,color:#fff
+    style O fill:#1b4332,stroke:#40916c,stroke-width:3px,color:#fff
 ```
-
-
-
-</div>
 
 > Each hidden node has its own width, activation, and standardization —
 > all discovered by evolution, not hand-tuned.
@@ -64,15 +78,29 @@ graph LR
 ### How evolution works
 
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+  'primaryColor': '#1a2744',
+  'primaryTextColor': '#fff',
+  'lineColor': '#2563eb',
+  'primaryBorderColor': '#3b82f6'
+}}}%%
 graph TD
-    A[Initial Population<br/>random topologies] --> B[Evaluate<br/>train + score all nets]
+    A([Initial Population]) --> B[Evaluate<br/>train + score]
     B --> C{Best enough?}
     C -->|No| D[Select<br/>tournament + elitism]
-    C -->|Yes| E[Done ✓]
-    D --> F[Crossover<br/>swap subtrees]
-    F --> G[Dedup & Refill<br/>remove duplicates]
-    G --> H[Mutate<br/>activation / combine / std]
-    H --> B
+    C -->|Yes| E([Done ✓])
+    D ==> F[Crossover<br/>swap subtrees]
+    F ==> G[Dedup & Refill<br/>remove duplicates]
+    G ==> H[Mutate<br/>activation / combine / std]
+    H ==> B
+    style A fill:#1e3a5f,stroke:#3b82f6,stroke-width:3px,color:#fff
+    style B fill:#1e40af,stroke:#60a5fa,stroke-width:3px,color:#fff
+    style C fill:#1e3a5f,stroke:#3b82f6,stroke-width:3px,color:#fff
+    style D fill:#1e40af,stroke:#60a5fa,stroke-width:3px,color:#fff
+    style E fill:#1e3a5f,stroke:#3b82f6,stroke-width:3px,color:#fff
+    style F fill:#2563eb,stroke:#93c5fd,stroke-width:3px,color:#fff
+    style G fill:#1e40af,stroke:#60a5fa,stroke-width:3px,color:#fff
+    style H fill:#2563eb,stroke:#93c5fd,stroke-width:3px,color:#fff
 ```
 
 ## Features
@@ -100,10 +128,10 @@ graph TD
 
 ```toml
 [dependencies]
-gras = "0.1.6"
+gras = "0.1.7"
 
 # Optional CUDA
-gras = { version = "0.1.6", features = ["cuda"] }
+gras = { version = "0.1.7", features = ["cuda"] }
 ```
 
 ## Setup
@@ -143,7 +171,7 @@ gras is flexible — it evolves over **your** training setup:
 
 | You provide | What gras does |
 |-------------|----------------|
-| **Data** — `.bin` or `.csv` files (auto-detected) | Loads, splits, batches |
+| **Data** — `.bin` or `.csv` files | Loads, splits, batches |
 | **Trainer** — implement the `Trainer` trait (we provide `SupervisedTrainer`) | Trains each network per generation |
 | **Fitness** — your ranking metric | Ranks individuals for selection |
 
@@ -161,7 +189,7 @@ let data_dir = std::path::Path::new("data/my_problem");
 
 // 2. Define how to rank individuals
 let fitness = Fitness::new(
-    |pred, target| { /* your metric */ Ok(0.0) },
+    |pred, target| { /* your metric */ Ok(metric) },
     Direction::Maximize,
     "my_metric",
 );
@@ -172,7 +200,7 @@ let trainer = SupervisedTrainer::new(
     10,    // input_dim
     2,     // output_dim
     TrainingConfig::default(),
-    |pred, target| { /* your loss: e.g. MSE, cross-entropy */ Ok(pred.clone()) },
+    |pred, target| { /* your loss: e.g. MSE, cross-entropy */ Ok(loss) },
 ).unwrap();
 
 // 4. Configure evolution
@@ -296,6 +324,24 @@ At run end, the engine logs repeated topologies:
   rank   appearances      mean   std_dev      min      max    params  topo_id
   #1             44    0.6103    0.0873   0.4611   0.7855   121610  3a7f2b1c
 ```
+
+## Citing gras
+
+If you use gras in your research or project, please mention it:
+
+```bibtex
+@software{gras,
+  title  = {gras: Neural Architecture Search via Genetic Programming},
+  author = {Mauricio Maroto <maulberto3@hotmail.com>},
+  url    = {https://crates.io/crates/gras},
+  year   = {2026}
+}
+```
+
+Or simply reference it in your paper or README:
+
+> Topologies were discovered using [gras](https://crates.io/crates/gras),
+> a genetic programming framework for neural architecture search.
 
 ## Contributing
 
