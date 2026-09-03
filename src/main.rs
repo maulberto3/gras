@@ -5,10 +5,9 @@
 use std::io::Write;
 use std::path::Path;
 
-use flodl::Device;
-
 use gras::data;
-use gras::trainer::{SupervisedTrainer, TrainingConfig, OptimizerKind};
+use gras::Device;
+use gras::trainer::supervised::{OptimizerKind, SupervisedTrainer, TrainingConfig};
 use gras::{CrossoverMethod, Direction, Engine, EngineOptions, Fitness, MutationMethod, f1_score};
 use gras::selection::SelectionMethod;
 
@@ -59,7 +58,7 @@ fn main() {
             test_y_proportional: true,
             eval_ratio: 0.3,
             device: gras::auto_device(),
-            dtype: flodl::DType::Float32,
+            dtype: gras::DType::Float32,
         },
         |pred, y| gras::cross_entropy_onehot_loss(pred, y),
     )
@@ -90,9 +89,9 @@ fn main() {
         .unwrap();
 
     // 5. Run
-    let mut engine = Engine::new(opts, fitness, Box::new(trainer)).unwrap();
+    let mut engine = Engine::new(opts, fitness, trainer).unwrap();
     engine.run().unwrap();
 
     // 6. Robustness analysis
-    // engine.show_robustness(10, "both");
+    // engine.show_robustness(10, gras::engine::RobustnessFilter::Both);
 }
