@@ -11,19 +11,15 @@ use crate::graph::topology::Topology;
 /// edge list, and the visual wiring diagram in a code block.
 /// When a built [`Network`] is provided, the nodes table includes linear dims
 /// and source wiring (merged topology + network view).
-pub fn topology_markdown(
-    graph: &Topology,
-    fitness: Option<f32>,
-    net: Option<&Network>,
-) -> String {
+///
+/// Deliberately stamp-free: the header only identifies the topology — it does
+/// not claim a fitness or rank. Scores live in the CSV; this is a structural
+/// view you generate for any individual you choose.
+pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     let mut out = String::new();
 
     // Header
-    if let Some(f) = fitness {
-        out.push_str(&format!("# Topology #{} · fitness {f:.4}\n\n", graph.id));
-    } else {
-        out.push_str(&format!("# Topology #{}\n\n", graph.id));
-    }
+    out.push_str(&format!("# Topology #{}\n\n", graph.id));
 
     // Summary
     let hidden_range: Vec<usize> = graph.nodes.iter().filter_map(|n| n.hidden_dim).collect();

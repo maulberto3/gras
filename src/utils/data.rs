@@ -12,9 +12,8 @@
 //!
 //! Deliberately **dependency-light**: pure `std` + flodl + fastrand (all
 //! already in the crate), so the library binary stays lean. Real-world
-//! dataset producers that need HTTP (e.g. the MNIST downloader) live in
-//! `examples/` and use `[dev-dependencies]` instead — see
-//! `examples/mnist_data.rs`.
+//! dataset producers that need HTTP (e.g. a MNIST downloader) live in
+//! `examples/` and use `[dev-dependencies]` instead.
 
 use std::fs;
 use std::path::Path;
@@ -181,7 +180,8 @@ pub fn load_tensor(path: &Path) -> Result<Tensor> {
 
 // ── datasets ─────────────────────────────────────────────────────────────
 
-/// Save a dataset into `dir` as `inputs.bin` + `targets.bin`.
+/// Save a dataset into `dir` as `inputs.bin` + `targets.bin`, plus a
+/// human-readable `meta.json` with the tensor shapes (informational only).
 pub fn save_dataset(dir: &Path, ds: &Dataset) -> Result<()> {
     fs::create_dir_all(dir).map_err(|source| DataError::Io {
         path: dir.display().to_string(),

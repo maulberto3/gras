@@ -1,4 +1,9 @@
-//! Run lifecycle logging — run start, done message, next steps.
+//! Run lifecycle logging — run start + done message.
+//!
+//! The run log shows three phases only: initialization (see
+//! `crate::utils::init_log`), one table per generation, and this done
+//! section. Post-run guidance (next steps, examples, how to analyze
+//! individuals) lives in the README, not in the log.
 
 use std::path::Path;
 use std::time::Duration;
@@ -32,62 +37,6 @@ pub(crate) fn log_done(
             vec!["duration".to_string(), format!("{h}h {m}m {s:.3}s")],
             vec!["run_dir".to_string(), run_dir.display().to_string()],
             vec!["robustness".to_string(), robustness_csv.display().to_string()],
-        ],
-        crate::utils::log_utils::TABLE_WIDTH,
-    );
-    log_next_steps(run_dir, num_gens);
-}
-
-/// Print next steps and examples reference.
-fn log_next_steps(run_dir: &Path, num_gens: usize) {
-    crate::utils::log_utils::log_section_table(
-        "next steps",
-        &["purpose", "command"],
-        &[
-            vec![
-                "see which topologies truly performed well across generations".to_string(),
-                "engine.show_robustness(10)".to_string(),
-            ],
-            vec![
-                "top 20 best".to_string(),
-                "engine.show_robustness(20, \"best\")".to_string(),
-            ],
-            vec![
-                "bottom 20 worst".to_string(),
-                "engine.show_robustness(20, \"worst\")".to_string(),
-            ],
-        ],
-        crate::utils::log_utils::TABLE_WIDTH,
-    );
-    let run_id = run_dir
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let gen0 = format!(
-        "gen_{:0width$}.json",
-        0,
-        width = crate::engine::gen_width(num_gens)
-    );
-    crate::utils::log_utils::log_section_table(
-        "examples",
-        &["purpose", "command"],
-        &[
-            vec![
-                "fully train a specific network from a gen_XX.json snapshot".to_string(),
-                format!("cargo run --example train_from_gen -- {run_id}/improvements/{gen0} --best"),
-            ],
-            vec![
-                "visual analysis of a generation's best topology (nodes, wiring diagram, mermaid)".to_string(),
-                format!("open {run_id}/improvements/gen_XX.md"),
-            ],
-            vec![
-                "custom trainer implementing the Trainer trait (early stopping)".to_string(),
-                "cargo run --example custom_trainer".to_string(),
-            ],
-            vec![
-                "quick categorical / continuous showcase".to_string(),
-                "cargo run --example categorical_showcase".to_string(),
-            ],
         ],
         crate::utils::log_utils::TABLE_WIDTH,
     );
