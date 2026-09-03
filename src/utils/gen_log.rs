@@ -35,11 +35,11 @@ pub(crate) fn log_done(
         ],
         crate::utils::log_utils::TABLE_WIDTH,
     );
-    log_next_steps(run_dir);
+    log_next_steps(run_dir, num_gens);
 }
 
 /// Print next steps and examples reference.
-fn log_next_steps(run_dir: &Path) {
+fn log_next_steps(run_dir: &Path, num_gens: usize) {
     crate::utils::log_utils::log_section_table(
         "next steps",
         &["purpose", "command"],
@@ -63,13 +63,22 @@ fn log_next_steps(run_dir: &Path) {
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let gen0 = format!(
+        "gen_{:0width$}.json",
+        0,
+        width = crate::engine::gen_width(num_gens)
+    );
     crate::utils::log_utils::log_section_table(
         "examples",
         &["purpose", "command"],
         &[
             vec![
                 "fully train a specific network from a gen_XX.json snapshot".to_string(),
-                format!("cargo run --example train_from_gen -- {run_id}/improvements/gen_00.json --best"),
+                format!("cargo run --example train_from_gen -- {run_id}/improvements/{gen0} --best"),
+            ],
+            vec![
+                "visual analysis of a generation's best topology (nodes, wiring diagram, mermaid)".to_string(),
+                format!("open {run_id}/improvements/gen_XX.md"),
             ],
             vec![
                 "custom trainer implementing the Trainer trait (early stopping)".to_string(),
