@@ -1,8 +1,8 @@
 //! Initialization logging — options, dataset, population (shown once at new()).
 
 use crate::engine::EngineOptions;
-use crate::fitness::Direction;
-use crate::topology::Topology;
+use crate::engine::fitness::Direction;
+use crate::graph::topology::Topology;
 
 /// Single section logging all resolved options and population.
 /// Shown once at `Engine::new()`. All defaults are visible here.
@@ -10,7 +10,7 @@ pub(crate) fn log_initialization(
     options: &EngineOptions,
     pop: &[Topology],
     seed: u64,
-    fitness: &crate::fitness::Fitness,
+    fitness: &crate::engine::fitness::Fitness,
 ) {
     let fl = fitness.label();
     let score_dir = fitness.direction();
@@ -19,87 +19,122 @@ pub(crate) fn log_initialization(
         Direction::Maximize => "higher = better",
     };
 
-    log::info!("");
-    log::info!("══ initialization ═══════════════════════════════════════════════════");
-
-    log::info!(
-        "  engine    pop {} · {} gens",
-        options.pop_size.unwrap_or(0),
-        options.num_generations.unwrap_or(0)
-    );
-    log::info!("  seed      {seed}  (set_seed(Some({seed})) to reproduce)");
-    log::info!("  threads   {}", options.num_threads);
-    log::info!("  elite     {}", options.elite_count);
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    rows.push(vec![
+        "engine".into(),
+        format!(
+            "pop {} · {} gens",
+            options.pop_size.unwrap_or(0),
+            options.num_generations.unwrap_or(0)
+        ),
+    ]);
+    rows.push(vec![
+        "seed".into(),
+        format!("{seed}  (set_seed(Some({seed})) to reproduce)"),
+    ]);
+    rows.push(vec!["threads".into(), options.num_threads.to_string()]);
+    rows.push(vec!["elite".into(), options.elite_count.to_string()]);
     if options.dedup_pop_and_fill {
-        log::info!("  dedup     on (full topology comparison)");
+        rows.push(vec!["dedup".into(), "on (full topology comparison)".into()]);
     }
-    log::info!("  results   {}", options.results_dir.display());
+    rows.push(vec![
+        "results".into(),
+        options.results_dir.display().to_string(),
+    ]);
 
     if !options.prior_topology_paths.is_empty() {
-        log::info!("  warm      {} prior topologies", options.prior_topology_paths.len());
+        rows.push(vec![
+            "warm".into(),
+            format!("{} prior topologies", options.prior_topology_paths.len()),
+        ]);
         for (i, path) in options.prior_topology_paths.iter().enumerate() {
-            log::info!("  warm[{i}]   {}", path.display());
+            rows.push(vec![format!("warm[{i}]"), path.display().to_string()]);
         }
     }
 
-    log::info!("  fitness   {fl} · {score_better}");
-
+    rows.push(vec!["fitness".into(), format!("{fl} · {score_better}")]);
     if let Some(ref sel) = options.selection {
-        log::info!("  selection {}", sel);
+        rows.push(vec!["selection".into(), sel.to_string()]);
     }
     if let Some(ref cx) = options.crossover {
-        log::info!("  crossover {}", cx);
+        rows.push(vec!["crossover".into(), cx.to_string()]);
     }
-    log::info!("  mutation  {}", options.mutation);
+    rows.push(vec!["mutation".into(), options.mutation.to_string()]);
 
-    log::info!("  input     {} · output {}", options.topology_options.input_dim, options.topology_options.output_dim);
+    rows.push(vec![
+        "input/output".into(),
+        format!(
+            "input {} · output {}",
+            options.topology_options.input_dim, options.topology_options.output_dim
+        ),
+    ]);
 
-    // Topology
-    log::info!(
-        "  topo      input {} → hidden (pool {}..={} stride {}) → output {}",
-        options.topology_options.input_dim,
-        options.hidden_dim_pool.start(),
-        options.hidden_dim_pool.end(),
-        options.hidden_dim_stride,
-        options.topology_options.output_dim
-    );
-    log::info!(
-        "  topo      hidden {}..={} nodes · in {}..={} · out {}..={}",
-        options.topology_options.min_hidden_num_nodes,
-        options.topology_options.max_hidden_num_nodes,
-        options.topology_options.min_hidden_inputs_per_node,
-        options.topology_options.max_hidden_inputs_per_node,
-        options.topology_options.min_hidden_outputs_per_node,
-        options.topology_options.max_hidden_outputs_per_node
-    );
+    rows.push(vec![
+        "topology".into(),
+        format!(
+            "input {} → hidden (pool {}..={} stride {}) → output {}",
+            options.topology_options.input_dim,
+            options.hidden_dim_pool.start(),
+            options.hidden_dim_pool.end(),
+            options.hidden_dim_stride,
+            options.topology_options.output_dim
+        ),
+    ]);
+    rows.push(vec![
+        "nodes".into(),
+        format!(
+            "hidden {}..={} · in {}..={} · out {}..={}",
+            options.topology_options.min_hidden_num_nodes,
+            options.topology_options.max_hidden_num_nodes,
+            options.topology_options.min_hidden_inputs_per_node,
+            options.topology_options.max_hidden_inputs_per_node,
+            options.topology_options.min_hidden_outputs_per_node,
+            options.topology_options.max_hidden_outputs_per_node
+        ),
+    ]);
 
     if options.dropout_prob > 0.0 {
-        log::info!("  dropout   {}%", (options.dropout_prob * 100.0) as usize);
+        rows.push(vec![
+            "dropout".into(),
+            format!("{}%", (options.dropout_prob * 100.0) as usize),
+        ]);
     }
 
-    // GP pools
-    let act_names: Vec<String> = options
-        .activation_pool
-        .iter()
-        .map(|a| a.to_string())
-        .collect();
+    let act_names: Vec<String> = options.activation_pool.iter().map(|a| a.to_string()).collect();
     let std_names: Vec<String> = options
         .standardize_op_pool
         .iter()
         .map(|s| s.to_string())
         .collect();
-    log::info!("  pools     hidden {:?} stride {}", options.hidden_dim_pool, options.hidden_dim_stride);
-    log::info!("  pools     combine {:?}", options.combine_op_pool);
-    log::info!("  pools     activations [{}]", act_names.join(", "));
-    log::info!("  pools     standardize [{}]", std_names.join(", "));
+    rows.push(vec![
+        "pool hidden".into(),
+        format!("{:?} stride {}", options.hidden_dim_pool, options.hidden_dim_stride),
+    ]);
+    rows.push(vec![
+        "pool combine".into(),
+        format!("{:?}", options.combine_op_pool),
+    ]);
+    rows.push(vec![
+        "pool activations".into(),
+        format!("[{}]", act_names.join(", ")),
+    ]);
+    rows.push(vec![
+        "pool standardize".into(),
+        format!("[{}]", std_names.join(", ")),
+    ]);
 
     // Population summary
     let min_nodes = pop.iter().map(|g| g.nodes.len()).min().unwrap_or(0);
     let max_nodes = pop.iter().map(|g| g.nodes.len()).max().unwrap_or(0);
-    log::info!(
-        "  pop       {} individuals · {}-{} nodes",
-        pop.len(),
-        min_nodes,
-        max_nodes
+    rows.push(vec![
+        "population".into(),
+        format!("{} individuals · {}-{} nodes", pop.len(), min_nodes, max_nodes),
+    ]);
+
+    crate::utils::log_utils::log_section_table(
+        "initialization",
+        &["setting", "value"],
+        &rows,
+        crate::utils::log_utils::TABLE_WIDTH,
     );
 }

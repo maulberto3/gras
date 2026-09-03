@@ -490,8 +490,17 @@ pub fn split_indices(
     let train: Vec<i64> = indices[..split].to_vec();
     let eval: Vec<i64> = indices[split..].to_vec();
     // Silent fallback: if eval is empty, use all data for eval
-    let eval = if eval.is_empty() { indices.clone() } else { eval };
-    (train, eval)
+    if eval.is_empty() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            log::warn!(
+                "eval set is empty (train_ratio={train_ratio}) — falling back to using ALL data for eval (train/eval overlap)"
+            );
+        });
+        (train, indices.clone())
+    } else {
+        (train, eval)
+    }
 }
 
 #[cfg(test)]

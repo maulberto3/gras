@@ -9,15 +9,15 @@
 
 use std::fmt::Display;
 
-use crate::crossover::CrossoverMethod;
+use crate::evolution::crossover::CrossoverMethod;
 use crate::engine::EngineOptions;
-use crate::fitness::{Direction, FitnessLabel};
-use crate::mutation::MutationMethod;
-use crate::network::{Network, NetworkOptions};
-use crate::node::{Activation, Node};
-use crate::selection::SelectionMethod;
-use crate::topology::{CombineOp, Connection, KindCounts, Topology, TopologyOptions};
-use crate::trainer::OptimizerKind;
+use crate::engine::fitness::{Direction, FitnessLabel};
+use crate::evolution::mutation::MutationMethod;
+use crate::graph::network::{Network, NetworkOptions};
+use crate::graph::node::{Activation, Node};
+use crate::evolution::selection::SelectionMethod;
+use crate::graph::topology::{CombineOp, Connection, KindCounts, Topology, TopologyOptions};
+use crate::trainer::supervised::OptimizerKind;
 
 impl Display for Topology {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -125,11 +125,11 @@ impl Display for CombineOp {
     }
 }
 
-impl Display for crate::node::StandardizeOp {
+impl Display for crate::graph::node::StandardizeOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
-            crate::node::StandardizeOp::Identity => "identity",
-            crate::node::StandardizeOp::LayerNorm => "layernorm",
+            crate::graph::node::StandardizeOp::Identity => "identity",
+            crate::graph::node::StandardizeOp::LayerNorm => "layernorm",
         };
         write!(f, "{name}")
     }

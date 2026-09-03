@@ -8,9 +8,9 @@
 
 use flodl::nn::Module;
 
-use crate::network::Network;
-use crate::node::NodeKind;
-use crate::topology::{Connection, Port, Topology};
+use crate::graph::network::Network;
+use crate::graph::node::NodeKind;
+use crate::graph::topology::{Connection, Port, Topology};
 
 /// Per-node description consumed by [`render_wire_diagram`].
 #[derive(Clone, Copy)]
@@ -499,9 +499,9 @@ pub(crate) fn network_ascii(g: &Network) -> String {
 #[cfg(test)]
 mod tests {
     use super::{network_ascii, topology_ascii};
-    use crate::network::Network;
-    use crate::node::Node;
-    use crate::topology::Topology;
+    use crate::graph::network::Network;
+    use crate::graph::node::Node;
+    use crate::graph::topology::Topology;
     use flodl::Device;
 
     #[test]

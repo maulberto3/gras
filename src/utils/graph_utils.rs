@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 
-use crate::node::{Activation, Node, NodeKind};
-use crate::topology::{Connection, KindCounts, Port};
+use crate::graph::node::{Activation, Node, NodeKind};
+use crate::graph::topology::{Connection, KindCounts, Port};
 
 /// Precompute wiring table: per node, per port, list of source ports.
 pub(crate) fn build_node_sources(
@@ -120,8 +120,8 @@ pub(crate) fn node_activation_counts(nodes: &[Node]) -> Vec<(Activation, usize)>
 }
 
 /// Standardize-op histogram across nodes.
-pub(crate) fn node_standardize_counts(nodes: &[Node]) -> Vec<(crate::node::StandardizeOp, usize)> {
-    let mut counts: Vec<(crate::node::StandardizeOp, usize)> = Vec::new();
+pub(crate) fn node_standardize_counts(nodes: &[Node]) -> Vec<(crate::graph::node::StandardizeOp, usize)> {
+    let mut counts: Vec<(crate::graph::node::StandardizeOp, usize)> = Vec::new();
     for n in nodes {
         let op = n.standardize.unwrap_or_default();
         if let Some(entry) = counts.iter_mut().find(|(s, _)| *s == op) {

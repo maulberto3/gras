@@ -14,20 +14,20 @@
 //! - [`EngineError`] — the NAS loop (options, data contract, checkpoints).
 //! - [`DataError`] — the tensor file/dataset format.
 //!
-//! [`Topology::validate`]: crate::topology::Topology::validate
-//! [`Network`]: crate::network::Network
+//! [`Topology::validate`]: crate::graph::topology::Topology::validate
+//! [`Network`]: crate::graph::network::Network
 
 use std::fmt::Display;
 use std::io;
 
 use flodl::tensor::TensorError;
 
-use crate::topology::{Connection, Port};
+use crate::graph::topology::{Connection, Port};
 
 // ── Topology ─────────────────────────────────────────────────────────────
 
-/// Why a [`Topology`](crate::topology::Topology) failed
-/// [`Topology::validate`](crate::topology::Topology::validate).
+/// Why a [`Topology`](crate::graph::topology::Topology) failed
+/// [`Topology::validate`](crate::graph::topology::Topology::validate).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopologyError {
     /// Node ids aren't 0, 1, 2, ... — they double as array indices, so gaps
@@ -109,11 +109,11 @@ impl Display for NodeError {
 
 // ── Network ──────────────────────────────────────────────────────────────
 
-/// Compiling a blueprint into an executable [`Network`](crate::network::Network).
+/// Compiling a blueprint into an executable [`Network`](crate::graph::network::Network).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkError {
     /// The blueprint failed
-    /// [`Topology::validate`](crate::topology::Topology::validate) — refused
+    /// [`Topology::validate`](crate::graph::topology::Topology::validate) — refused
     /// before any tensor work is spent.
     InvalidTopology(TopologyError),
     /// A build-time inconsistency not covered by validation.

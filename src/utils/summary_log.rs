@@ -1,7 +1,5 @@
 //! Summary logging — robustness table display.
 
-use comfy_table::{Table, presets::UTF8_FULL, modifiers::UTF8_ROUND_CORNERS, ContentArrangement};
-
 use crate::engine::RobustnessEntry;
 
 /// Print the top-N repeated topologies.
@@ -41,30 +39,21 @@ pub(crate) fn log_repeated_topologies(
     let n = top_n.min(entries.len());
     let label = if best { "top" } else { "bottom" };
     let has_loss = entries.first().map_or(false, |e| e.has_loss());
-    log::info!("");
-    log::info!("── repeated topologies ({label} {n}) ──");
 
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_content_arrangement(ContentArrangement::DynamicFullWidth);
-
-    if has_loss {
-        table.set_header([
+    let header: Vec<&str> = if has_loss {
+        vec![
             "rank", "appearances", "fit_mean", "fit_sd", "fit_min", "fit_max",
             "loss_mean", "loss_sd", "loss_min", "loss_max", "params", "topo_id",
-        ]);
+        ]
     } else {
-        table.set_header([
-            "rank", "appearances", "mean", "std_dev", "min", "max", "params", "topo_id",
-        ]);
-    }
+        vec!["rank", "appearances", "mean", "std_dev", "min", "max", "params", "topo_id"]
+    };
 
+    let mut rows: Vec<Vec<String>> = Vec::new();
     for (rank, entry) in entries.iter().take(n).enumerate() {
         let tid = topo_hash(&entry.topology_json);
         if has_loss {
-            table.add_row([
+            rows.push(vec![
                 format!("#{}", rank + 1),
                 entry.count.to_string(),
                 format!("{:.4}", entry.mean),
@@ -79,7 +68,7 @@ pub(crate) fn log_repeated_topologies(
                 tid,
             ]);
         } else {
-            table.add_row([
+            rows.push(vec![
                 format!("#{}", rank + 1),
                 entry.count.to_string(),
                 format!("{:.4}", entry.mean),
@@ -92,11 +81,12 @@ pub(crate) fn log_repeated_topologies(
         }
     }
 
-    // Print table line-by-line through log::info
-    let rendered = table.to_string();
-    for line in rendered.lines() {
-        log::info!("  {line}");
-    }
+    crate::utils::log_utils::log_section_table(
+        &format!("repeated topologies ({label} {n})"),
+        &header,
+        &rows,
+        crate::utils::log_utils::TABLE_WIDTH,
+    );
 }
 
 /// xxh3 hash — 16 hex chars, deterministic, near-zero collisions.

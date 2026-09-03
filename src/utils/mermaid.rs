@@ -1,7 +1,7 @@
 //! Mermaid flowchart rendering for topologies.
 
-use crate::node::NodeKind;
-use crate::topology::Topology;
+use crate::graph::node::NodeKind;
+use crate::graph::topology::Topology;
 
 /// Mermaid flowchart of a [`Topology`].
 /// Renders natively in GitHub markdown, GitLab, Notion, etc.

@@ -3,9 +3,9 @@
 
 use super::ascii::{AsciiNode, edge_list, render_wire_diagram};
 use super::mermaid::topology_mermaid;
-use crate::network::Network;
-use crate::node::NodeKind;
-use crate::topology::Topology;
+use crate::graph::network::Network;
+use crate::graph::node::NodeKind;
+use crate::graph::topology::Topology;
 
 /// Markdown rendering of a [`Topology`]: header, merged nodes/network table,
 /// edge list, and the visual wiring diagram in a code block.

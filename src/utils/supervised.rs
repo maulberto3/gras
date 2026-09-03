@@ -1,7 +1,7 @@
 //! Supervised training loop implementation.
 //!
 //! Contains [`train_network`] and batch sampling helpers used by
-//! [`SupervisedTrainer`](crate::trainer::SupervisedTrainer).
+//! [`SupervisedTrainer`](crate::trainer::supervised::SupervisedTrainer).
 
 use flodl::nn::Module;
 use flodl::nn::optim::Optimizer;
@@ -10,9 +10,9 @@ use flodl::{Adam, SGD};
 use flodl::{Tensor, Variable};
 use log::{debug, trace};
 
-use crate::fitness::Fitness;
-use crate::network::Network;
-use crate::trainer::{OptimizerKind, TrainingConfig};
+use crate::engine::fitness::Fitness;
+use crate::graph::network::Network;
+use crate::trainer::supervised::{OptimizerKind, TrainingConfig};
 use super::data::Dataset;
 
 /// Result of a training run.
@@ -123,6 +123,14 @@ fn sample_batches_from_indices(
     }
     let max_full = n / batch_size;
     let actual = num_batches.min(max_full).max(1);
+    if actual != num_batches {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            log::warn!(
+                "requested {num_batches} batches but data only supports {max_full} full batches — using {actual} instead"
+            );
+        });
+    }
     let total_samples = actual * batch_size;
 
     let mut rng = fastrand::Rng::with_seed(seed);
