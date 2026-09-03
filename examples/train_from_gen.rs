@@ -72,7 +72,26 @@ fn main() {
             eprintln!("Error: gen_idx must be a number, got '{}'", args[1]);
             std::process::exit(1);
         });
-        (results_dir.join("improvements").join(format!("gen_{:02}.json", gen_idx)), args[2].clone())
+        let improvements = results_dir.join("improvements");
+        // Match gen_XX.json regardless of zero-padding width (gen_5 vs gen_005).
+        let gen_file = std::fs::read_dir(&improvements)
+            .unwrap_or_else(|_| {
+                eprintln!("Error: {} not found", improvements.display());
+                std::process::exit(1);
+            })
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|f| {
+                f.strip_prefix("gen_")
+                    .and_then(|s| s.strip_suffix(".json"))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    == Some(gen_idx)
+            })
+            .unwrap_or_else(|| {
+                eprintln!("Error: gen_{gen_idx}.json not found in {}", improvements.display());
+                std::process::exit(1);
+            });
+        (improvements.join(gen_file), args[2].clone())
     };
 
     if !json_path.exists() {
