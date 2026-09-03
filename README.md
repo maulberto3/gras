@@ -229,8 +229,9 @@ engine.show_robustness(10, RobustnessFilter::Both);
 stopping, RL, segmentation, anything with its own config — implement the
 [`Trainer`] trait directly (see `examples/custom_trainer.rs`). A built-in
 `SupervisedTrainer` with a `TrainingConfig` also ships at
-`gras::trainer::supervised` for standard SGD/Adam supervised learning; it is
-a convenience, not the intended default.
+`gras::trainer::supervised` (re-exported at `gras::trainer` for short) for
+standard SGD/Adam supervised learning; it is a convenience, not the intended
+default.
 
 ## Options Reference
 
