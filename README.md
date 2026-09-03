@@ -273,7 +273,7 @@ Everything else has conservative defaults. Set only what your experiment needs:
 
 | Option | Default | Builder method |
 |--------|---------|---------------|
-| `prior_topology_paths` | `[]` (empty) | `.set_prior_topology("engine.json")` — add one path |
+| `prior_topology_paths` | `[]` (empty) | `.set_prior_topology("some_topology.json")` — add one path |
 | | | `.set_prior_topologies(vec!["a.json", "b.json"])` — add multiple |
 
 ## Fitness
@@ -289,6 +289,31 @@ let fitness = Fitness::new(
 ```
 
 The closure receives `(&Variable, &Variable)` → `Result<f32>`. Direction is `Maximize` or `Minimize`.
+
+## Trainer
+
+You bring your own training loop — it trains and scores each network:
+
+```rust
+let trainer = from_fn(
+    10,    // input_dim
+    2,     // output_dim
+    gras::auto_device(),
+    gras::DType::Float32,
+    |net, gen_seed| {
+        // load your data, split by gen_seed, train with your loss,
+        // score on held-out rows
+        Ok((score, Some(loss), param_count))
+    },
+);
+```
+
+The closure receives `(Network, u64)` → `Result<(f32, Option<f32>, usize)>`: the
+network to train and the generation seed (split your data with it to keep runs
+reproducible). Return `(score, eval_loss, param_count)` — the engine ranks on
+`score`; `eval_loss` and `param_count` are used for logging and robustness.
+For stateful or complex trainers, implement the `Trainer` trait instead (see
+`examples/custom_trainer.rs`).
 
 ## Data Format
 
@@ -316,17 +341,63 @@ data/your_problem/
 
 ## Outputs
 
+### Your experience
+
+Running `engine.run()` gives you three layers, from most to least durable:
+
+1. **All data saved automatically** — every run writes `results/<run_id>/`:
+   `robustness.csv` with per-topology stats, `engine.json` with the full
+   config + best topology, and per-generation snapshots. This is the source
+   of truth — everything you see in the terminal comes from these files.
+2. **Terminal logs (via env var)** — logs are printed through `env_logger`,
+   controlled by the `RUST_LOG` environment variable. Default is `info`
+   (`RUST_LOG=debug` for per-generation detail, `RUST_LOG=warn` to quiet it).
+3. **Tables for convenience** — the same numbers are rendered as comfy tables:
+   an initialization summary at start, one table per generation, and the
+   robustness top-20 at the end. They are a human-friendly view of the run;
+   the CSV holds every row if you want the raw data.
+
 ### Run Directory Structure
 
 ```
 results/<run_id>/
 ├── engine.json                    # Full run config + best topology + robustness
-├── robustness.csv                 # Topology appearances, fitness stats (top 20 best/worst)
+├── robustness.csv                 # Every repeated topology, one row each
 ├── improvements/
 │   ├── gen_00.json                # All individuals (seed, fitness, loss, params, topology)
-│   ├── gen_00.md                  # Markdown for best topology
+│   ├── gen_00.md                  # Visual analysis of the generation's best topology
 │   └── ...
 ```
+
+### Per-generation analysis (.md)
+
+Alongside each `gen_XX.json`, the engine writes `gen_XX.md` — a visual
+analysis of that generation's **best** topology containing:
+
+- a **nodes table** (kind, in/out ports, linear dims, activation, combine, standardize, sources)
+- an **edge list** with distance markers
+- an ASCII **wiring diagram** — Manhattan-style right-angle arrows, like a circuit schematic
+- a **Mermaid flowchart** of the full graph
+
+You can generate the same analysis for **any** individual — load its topology
+from a `gen_XX.json` and call
+`gras::utils::markdown::topology_markdown(&topo, fitness, net)` (pass the
+built `Network` to enrich the nodes table with linear dims and source
+wiring). The Mermaid block renders natively on GitHub, or locally with `mmdc`
+(mermaid-cli).
+
+### robustness.csv
+
+One row per repeated topology — this is the complete record of what the run
+saw, in plain CSV:
+
+| Column | Meaning |
+|--------|---------|
+| `topo_id` | hash of the topology |
+| `appearances` | how many times it appeared across generations |
+| `fit_mean`, `fit_sd`, `fit_min`, `fit_max` | fitness distribution across appearances |
+| `loss_mean`, `loss_sd`, `loss_min`, `loss_max` | loss distribution (present only when trainers report loss) |
+| `params` | parameter count |
 
 ### Robustness Tracking
 
