@@ -1,12 +1,17 @@
 [package]
 name = "gras"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2024"
 description = "A Genetic Programming framework for Neural Architecture Search in Rust"
 license = "MIT"
+readme = "README.md"
+rust-version = "1.85"
+keywords = ["neural-network", "genetic-algorithm", "neural-architecture-search", "machine-learning", "evolutionary"]
+categories = ["algorithms", "artificial-intelligence", "mathematics"]
 homepage = "https://github.com/maulberto3/gras"
 repository = "https://github.com/maulberto3/gras"
-authors = ["Mauricio Maroto <your.email@example.com>"]
+documentation = "https://docs.rs/gras"
+authors = ["Mauricio Maroto <maulberto3@hotmail.com>"]
 
 [features]
 default = []

@@ -128,10 +128,10 @@ graph TD
 
 ```toml
 [dependencies]
-gras = "0.1.7"
+gras = "0.1"
 
 # Optional CUDA
-gras = { version = "0.1.7", features = ["cuda"] }
+gras = { version = "0.1", features = ["cuda"] }
 ```
 
 ## Setup
@@ -172,7 +172,7 @@ gras is flexible — it evolves over **your** training setup:
 | You provide | What gras does |
 |-------------|----------------|
 | **Data** — `.bin` or `.csv` files | Loads, splits, batches |
-| **Trainer** — implement the `Trainer` trait (we provide `SupervisedTrainer`) | Trains each network per generation |
+| **Trainer** — wrap a closure with `trainer::from_fn`, or implement the `Trainer` trait | Trains each network per generation |
 | **Fitness** — your ranking metric | Ranks individuals for selection |
 
 The engine handles topology creation, evolution loop, selection, crossover, mutation,
@@ -181,8 +181,8 @@ logging, and robustness tracking. You stay in control of training and evaluation
 ## Quick Start
 
 ```rust
-use gras::{Engine, EngineOptions, Fitness, Direction, SelectionMethod, CrossoverMethod, MutationMethod};
-use gras::trainer::{SupervisedTrainer, TrainingConfig};
+use gras::{Engine, EngineOptions, Fitness, Direction, SelectionMethod, CrossoverMethod, MutationMethod, RobustnessFilter};
+use gras::trainer::from_fn;
 
 // 1. Prepare your data: inputs.csv + targets.csv (or .bin)
 let data_dir = std::path::Path::new("data/my_problem");
@@ -194,14 +194,18 @@ let fitness = Fitness::new(
     "my_metric",
 );
 
-// 3. Define how to train (or use SupervisedTrainer)
-let trainer = SupervisedTrainer::new(
-    data_dir,
+// 3. Define how to train — one closure owns your whole loop
+let trainer = from_fn(
     10,    // input_dim
     2,     // output_dim
-    TrainingConfig::default(),
-    |pred, target| { /* your loss: e.g. MSE, cross-entropy */ Ok(loss) },
-).unwrap();
+    gras::auto_device(),
+    gras::DType::Float32,
+    |net, gen_seed| {
+        // load your data, split by gen_seed, train with your loss,
+        // score on held-out rows
+        Ok((score, Some(loss), param_count))
+    },
+);
 
 // 4. Configure evolution
 let opts = EngineOptions::builder()
@@ -214,10 +218,19 @@ let opts = EngineOptions::builder()
     .unwrap();
 
 // 5. Run
-let mut engine = Engine::new(opts, fitness, Box::new(trainer)).unwrap();
+let mut engine = Engine::new(opts, fitness, trainer).unwrap();
 engine.run().unwrap();
-engine.show_robustness(10, "both");
+engine.show_robustness(10, RobustnessFilter::Both);
 ```
+
+## Custom Training
+
+`from_fn` covers quick custom loops. For stateful or complex trainers — early
+stopping, RL, segmentation, anything with its own config — implement the
+[`Trainer`] trait directly (see `examples/custom_trainer.rs`). A built-in
+`SupervisedTrainer` with a `TrainingConfig` also ships at
+`gras::trainer::supervised` for standard SGD/Adam supervised learning; it is
+a convenience, not the intended default.
 
 ## Options Reference
 
@@ -297,7 +310,7 @@ data/your_problem/
     └── targets.bin
 ```
 
-- `input_dim` and `output_dim` are **auto-detected** from data shapes
+- `input_dim` and `output_dim` are **provided by your trainer** (they must match the data shapes)
 - CSV headers are auto-detected (skipped if non-numeric)
 - Lines starting with `#` are treated as comments
 

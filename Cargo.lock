@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "gras"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "comfy-table",
  "env_logger",
