@@ -71,7 +71,7 @@ fn test_engine_runs_and_checkpoints() {
     assert_eq!(json_files.len(), num_gens);
     // Load the last generation's data
     let last_gen = num_gens - 1;
-    let gen_file = format!("gen_{:02}.json", last_gen);
+    let gen_file = format!("gen_{:0width$}.json", last_gen, width = super::gen_width(num_gens));
     let latest_json =
         std::fs::read_to_string(imp_dir.join(&gen_file)).unwrap();
     let v: serde_json::Value = serde_json::from_str(&latest_json).unwrap();

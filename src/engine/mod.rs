@@ -57,6 +57,13 @@ pub(crate) struct GenStats {
     pub unique_topos: usize,
 }
 
+/// Digit width for zero-padded generation numbers, derived from the total
+/// generation count — so filenames stay fixed-width and sort chronologically
+/// at any scale (`gen_00` … `gen_99` … `gen_100` …).
+pub(crate) fn gen_width(num_gens: usize) -> usize {
+    num_gens.max(1).to_string().len()
+}
+
 /// Pure function: compute per-generation statistics from raw scores.
 /// No mutation — safe to test in isolation.
 pub(crate) fn compute_gen_stats(
@@ -437,21 +444,22 @@ impl Engine {
     /// Phase 2: The evolution loop.
     fn run_generations(&mut self) {
         let num_gens = self.config.num_generations;
+        let width = gen_width(num_gens);
         for g in 0..num_gens {
             let gen_start = Instant::now();
-            debug!("== gen {:02}/{:02} ==", g, num_gens);
+            debug!("== gen {:0width$}/{:0width$} ==", g, num_gens, width = width);
             let _improved = self.evaluate_population();
             // One table per generation: scores + evolution, so all of a
             // single generation's data reads as one unit.
             let mut rows = self.generation_summary_rows();
             rows.extend(self.next_generation());
             crate::utils::log_utils::log_section_table(
-                &format!("gen {:02} of {:02}", g, num_gens),
+                &format!("gen {:0width$} of {:0width$}", g, num_gens, width = width),
                 &["metric", "best", "avg"],
                 &rows,
                 crate::utils::log_utils::TABLE_WIDTH,
             );
-            log::info!("  gen {:02} done in {:.1}s", g, gen_start.elapsed().as_secs_f64());
+            log::info!("  gen {:0width$} done in {elapsed:.1}s", g, elapsed = gen_start.elapsed().as_secs_f64(), width = width);
         }
     }
 

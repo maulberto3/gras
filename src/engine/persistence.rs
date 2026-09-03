@@ -132,7 +132,8 @@ impl Engine {
         });
         let json_str = serde_json::to_string_pretty(&gen_json)
             .map_err(|e| EngineError::Json(format!("gen json: {e}")))?;
-        let json_path = dir.join(format!("gen_{:02}.json", self.generation));
+        let width = super::gen_width(self.config.num_generations);
+        let json_path = dir.join(format!("gen_{:0width$}.json", self.generation, width = width));
         fs::write(&json_path, &json_str).map_err(|source| EngineError::Io {
             path: json_path.display().to_string(),
             source,
@@ -140,7 +141,7 @@ impl Engine {
 
         let best_topo = &self.pop[0];
         let md = crate::utils::markdown::topology_markdown(best_topo, Some(stats.best_score), None);
-        let md_path = dir.join(format!("gen_{:02}.md", self.generation));
+        let md_path = dir.join(format!("gen_{:0width$}.md", self.generation, width = width));
         fs::write(&md_path, md).map_err(|source| EngineError::Io {
             path: md_path.display().to_string(),
             source,
