@@ -7,6 +7,9 @@
 //! for standard SGD/Adam supervised learning; it is not the intended path.
 
 pub mod supervised;
+// Flat re-export so `gras::trainer::{SupervisedTrainer, TrainingConfig,
+// OptimizerKind}` works alongside `gras::trainer::supervised::…`.
+pub use supervised::{OptimizerKind, SupervisedTrainer, TrainingConfig};
 
 use flodl::tensor::Result;
 use flodl::{DType, Device};
