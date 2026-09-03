@@ -323,7 +323,7 @@ For stateful or complex trainers, implement the `Trainer` trait instead (see
 | Format | Detection | Conversion |
 |--------|-----------|------------|
 | `.bin` (native) | `inputs.bin` + `targets.bin` exist | None — used directly |
-| `.csv` | `inputs.csv` + `targets.csv` exist | Auto-converts to `.bin` in `flodl_data/` |
+| `.csv` | `inputs.csv` + `targets.csv` exist | Auto-converts to `.bin` in `flodl_data/` on first load, then reads the cache |
 
 ### Required Layout
 
@@ -340,6 +340,55 @@ data/your_problem/
 - CSV headers are auto-detected (skipped if non-numeric)
 - Lines starting with `#` are treated as comments
 
+### The `.bin` format
+
+`inputs.bin` / `targets.bin` each hold one tensor in a tiny custom binary
+format — no external dependency (see `src/utils/data.rs` for the exact
+code):
+
+```text
+magic "GRA1" (4 bytes) | dtype tag (1 byte) | ndim (u64 LE)
+| shape (ndim × u64 LE) | row-major tensor bytes
+```
+
+- **dtype tag**: `0` = f32, `1` = f64, `2` = i64 — only these three dtypes
+  are storable; anything else is rejected with an error. Datasets are read
+  back in whatever dtype was saved (trainers usually cast to f32 on load).
+- Header fields are little-endian; the payload is the tensor's raw row-major
+  bytes, so the file is exactly `header + numel × element_size` bytes.
+- `save_dataset` also writes a small human-readable `meta.json` beside the
+  tensors with the input/target shapes (informational only — loading does
+  not depend on it).
+
+### How data is loaded
+
+`resolve_dataset(dir)` picks the data source, in priority order:
+
+1. `{dir}/flodl_data/inputs.bin` — the cached `.bin` (created when a `.csv`
+   was converted on a previous run)
+2. `{dir}/inputs.bin` — direct native `.bin`
+3. `{dir}/inputs.csv` — parsed and **auto-converted** to `.bin` in
+   `{dir}/flodl_data/`, so the CSV is only parsed once
+
+### Reading & writing data in code
+
+```rust
+use gras::data::{resolve_dataset, save_dataset};
+
+// Write a Dataset (inputs [n, in_dim] + targets [n, out_dim]) to a directory:
+save_dataset(Path::new("data/my_problem"), &ds).unwrap(); // inputs.bin + targets.bin + meta.json
+
+// Load it back — .bin or .csv, conversion handled for you:
+let ds = resolve_dataset(Path::new("data/my_problem")).unwrap(); // Dataset { inputs, targets }
+```
+
+- `Dataset` is just `{ inputs: Tensor, targets: Tensor }`.
+- `save_tensor(path, &tensor)` / `load_tensor(path)` operate on a single
+  tensor file; `save_csv_dataset` / `load_csv_dataset` are the CSV
+  counterparts.
+- The engine itself only calls `resolve_dataset` — your `Trainer` provides
+  `input_dim`/`output_dim`, which must match the loaded shapes.
+
 ## Outputs
 
 ### Your experience
@@ -348,44 +397,65 @@ Running `engine.run()` gives you three layers, from most to least durable:
 
 1. **All data saved automatically** — every run writes `results/<run_id>/`:
    `robustness.csv` with per-topology stats, `engine.json` with the full
-   config + best topology, and per-generation snapshots. This is the source
-   of truth — everything you see in the terminal comes from these files.
+   config + whole-run record, and one `gen_XXX.json` snapshot per
+   generation. This is the source of truth — everything you see in the
+   terminal comes from these files.
 2. **Terminal logs (via env var)** — logs are printed through `env_logger`,
    controlled by the `RUST_LOG` environment variable. Default is `info`
    (`RUST_LOG=debug` for per-generation detail, `RUST_LOG=warn` to quiet it).
-3. **Tables for convenience** — the same numbers are rendered as comfy tables:
-   an initialization summary at start, one table per generation, and the
-   robustness top-20 at the end. They are a human-friendly view of the run;
-   the CSV holds every row if you want the raw data.
+3. **Tables for convenience** — the run log is three phases: an
+   initialization summary, one table per generation, and a done section.
+   Post-run analysis is yours: `robustness.csv` holds every row, and
+   `engine.show_robustness(...)` (see Quick Start) prints the same data as
+   a table in code.
 
 ### Run Directory Structure
 
 ```
 results/<run_id>/
-├── engine.json                    # Full run config + best topology + robustness
-├── robustness.csv                 # Every repeated topology, one row each
+├── engine.json                    # Full run config + whole-run robustness record
+├── robustness.csv                 # Every repeated topology, one row each — the analysis artifact
 ├── improvements/
-│   ├── gen_00.json                # All individuals (seed, fitness, loss, params, topology)
-│   ├── gen_00.md                  # Visual analysis of the generation's best topology
+│   ├── gen_00.json                # All individuals (seed, fitness, loss, params, topology, topo_hash)
 │   └── ...
 ```
 
-### Per-generation analysis (.md)
+The engine writes snapshots only — it does **not** judge topologies for you.
+Per-generation files are raw data; which topology is worth inspecting (and
+how it truly performed) is answered by `robustness.csv`, which aggregates
+appearances of each topology across the whole run. Terminal logs cover three
+phases: an initialization summary, one table per generation, and a done
+section pointing at `engine.json` and `robustness.csv`.
 
-Alongside each `gen_XX.json`, the engine writes `gen_XX.md` — a visual
-analysis of that generation's **best** topology containing:
+### Analyzing an individual (.md)
+
+Every topology carries one canonical hash — 16 hex chars (xxh3) — everywhere
+it appears: `topo_hash` on each individual in the `gen_XX.json` snapshots and
+`topo_id` in `robustness.csv`. To look at a specific topology, copy its hash
+from the CSV and render it:
+
+```bash
+cargo run --example analyze_from_gen -- results/<run_id> <topo_id>
+# or write to a file:  ... results/<run_id> <topo_id> analysis.md
+```
+
+The example finds every generation that topology appeared in (reported as
+`gen_<NNN> · idx <i>`) and prints the analysis of the latest occurrence:
 
 - a **nodes table** (kind, in/out ports, linear dims, activation, combine, standardize, sources)
 - an **edge list** with distance markers
 - an ASCII **wiring diagram** — Manhattan-style right-angle arrows, like a circuit schematic
 - a **Mermaid flowchart** of the full graph
 
-You can generate the same analysis for **any** individual — load its topology
-from a `gen_XX.json` and call
-`gras::utils::markdown::topology_markdown(&topo, fitness, net)` (pass the
-built `Network` to enrich the nodes table with linear dims and source
-wiring). The Mermaid block renders natively on GitHub, or locally with `mmdc`
+The same output comes from
+`gras::utils::markdown::topology_markdown(&topo, net)` — pass the built
+`Network` to enrich the nodes table with linear dims and source wiring.
+The Mermaid block renders natively on GitHub, or locally with `mmdc`
 (mermaid-cli).
+
+Other runnable examples: `cargo run --example custom_trainer` (implementing
+the `Trainer` trait) and `cargo run --example categorical_showcase` (quick
+categorical / continuous showcase).
 
 ### robustness.csv
 
@@ -394,7 +464,7 @@ saw, in plain CSV:
 
 | Column | Meaning |
 |--------|---------|
-| `topo_id` | hash of the topology |
+| `topo_id` | canonical topology hash (16 hex chars) — same as `topo_hash` in the snapshots |
 | `appearances` | how many times it appeared across generations |
 | `fit_mean`, `fit_sd`, `fit_min`, `fit_max` | fitness distribution across appearances |
 | `loss_mean`, `loss_sd`, `loss_min`, `loss_max` | loss distribution (present only when trainers report loss) |
@@ -402,12 +472,14 @@ saw, in plain CSV:
 
 ### Robustness Tracking
 
-At run end, the engine logs repeated topologies:
+In code, `engine.show_robustness(10, RobustnessFilter::Both)` prints the
+most-appeared topologies as a table; the CSV above is the same data in
+plain text. Repeated topologies look like:
 
 ```
 ── repeated topologies (top 20) ──
   rank   appearances      mean   std_dev      min      max    params  topo_id
-  #1             44    0.6103    0.0873   0.4611   0.7855   121610  3a7f2b1c
+  #1             44    0.6103    0.0873   0.4611   0.7855   121610  3a7f2b1c9d4e5f06
 ```
 
 ## Citing gras
