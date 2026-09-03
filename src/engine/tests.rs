@@ -93,6 +93,93 @@ fn test_engine_runs_and_checkpoints() {
     let _ = std::fs::remove_dir_all(&engine.options.results_dir);
 }
 
+/// Every individual's `topo_hash` in each gen snapshot must be the canonical
+/// xxh3 hash (16 hex chars) of its own topology string — the same hash
+/// `robustness.csv` exposes as `topo_id`, so a hash copied from the CSV
+/// resolves to the topology in the snapshots.
+#[test]
+fn test_gen_json_topo_hash_is_canonical() {
+    let data_dir = temp_data_dir();
+    let mut engine = Engine::new(
+        EngineOptions { seed: Some(321), ..test_options() },
+        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+        test_trainer(),
+    )
+    .unwrap();
+    engine.run().unwrap();
+
+    let imp_dir = engine.run_dir.join("improvements");
+    let num_gens = engine.options.num_generations.unwrap();
+    let width = super::gen_width(num_gens);
+    let mut run_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for g in 0..num_gens {
+        let stem = format!("gen_{g:0width$}");
+        let raw = std::fs::read_to_string(imp_dir.join(format!("{stem}.json"))).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for ind in v["individuals"].as_array().unwrap() {
+            let topo_json = ind["topology"].as_str().unwrap();
+            let stored = ind["topo_hash"].as_str().unwrap();
+            assert_eq!(stored.len(), 16, "topo_hash must be 16 hex chars");
+            assert_eq!(
+                stored,
+                crate::utils::log_utils::topo_hash(topo_json),
+                "topo_hash must match the canonical xxh3 hash of the topology"
+            );
+            run_hashes.insert(stored.to_string());
+        }
+    }
+
+    // Every topology the CSV reports must exist in the snapshots.
+    let csv = std::fs::read_to_string(engine.run_dir.join("robustness.csv")).unwrap();
+    for line in csv.lines().skip(1) {
+        let topo_id = line.split(',').next().unwrap();
+        assert!(
+            run_hashes.contains(topo_id),
+            "csv topo_id {topo_id} must resolve in the gen snapshots"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::remove_dir_all(&engine.options.results_dir);
+}
+
+/// Selection must keep the parallel metric arrays in lockstep with `pop`:
+/// after `select()`, `pop[i] ↔ scores[i] ↔ eval_losses[i] ↔ param_counts[i]`
+/// still all refer to the same individual.
+#[test]
+fn test_select_keeps_metrics_in_lockstep() {
+    let data_dir = temp_data_dir();
+    let mut engine = Engine::new(
+        test_options(),
+        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+        test_trainer(),
+    )
+    .unwrap();
+
+    // Fake a just-evaluated generation: distinct scores with loss/params
+    // derived from each score, so misalignment is detectable afterwards.
+    let n = engine.pop.len();
+    engine.scores = (0..n).map(|i| i as f32).collect();
+    engine.eval_losses = engine.scores.iter().map(|&s| Some(s * 2.0)).collect();
+    engine.param_counts = engine.scores.iter().map(|&s| s as usize * 10 + 1).collect();
+
+    engine.select();
+
+    assert_eq!(engine.pop.len(), n);
+    assert_eq!(engine.scores.len(), n);
+    assert_eq!(engine.eval_losses.len(), n);
+    assert_eq!(engine.param_counts.len(), n);
+    for i in 0..n {
+        let s = engine.scores[i];
+        assert_eq!(engine.eval_losses[i], Some(s * 2.0), "loss out of lockstep at {i}");
+        assert_eq!(engine.param_counts[i], s as usize * 10 + 1, "params out of lockstep at {i}");
+    }
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::remove_dir_all(&engine.options.results_dir);
+}
+
 #[test]
 fn test_engine_to_json_replicates_experiment() {
     let data_dir = temp_data_dir();

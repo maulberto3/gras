@@ -80,9 +80,11 @@ impl Engine {
         Ok(())
     }
 
-    /// Save one JSON + one MD per generation.
-    /// JSON contains all individuals with metrics + topologies.
-    /// MD is for the best topology only.
+    /// Save one JSON per generation: every individual with its metrics,
+    /// topology, and canonical topology hash (same xxh3 hash used in
+    /// robustness.csv — see `crate::utils::summary_log::topo_hash`).
+    /// Post-run analysis (which topology to inspect, how it performed) is
+    /// the user's job via robustness.csv; no per-gen .md is written here.
     pub(crate) fn save_gen_data(&self, stats: &GenStats) -> std::result::Result<(), EngineError> {
         let dir = self.run_dir.join("improvements");
         fs::create_dir_all(&dir).map_err(|source| EngineError::Io {
@@ -98,21 +100,13 @@ impl Engine {
             let params = self.param_counts[i];
             let topo_json = topo.to_json()
                 .map_err(|e| EngineError::Json(format!("individual topo json: {e}")))?;
-            // Hash: SHA-like digest of full topology JSON — unique per topology
-            let topo_hash = {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                topo_json.hash(&mut hasher);
-                let h = hasher.finish();
-                format!("{:016x}", h)[..8].to_string()  // first 8 hex chars
-            };
             individuals.push(serde_json::json!({
                 "idx": i,
                 "seed": topo.options.seed,
                 "fitness": fitness,
                 "loss": loss,
                 "params": params,
-                "topo_hash": topo_hash,
+                "topo_hash": crate::utils::log_utils::topo_hash(&topo_json),
                 "topology": topo_json,
             }));
         }
@@ -136,14 +130,6 @@ impl Engine {
         let json_path = dir.join(format!("gen_{:0width$}.json", self.generation, width = width));
         fs::write(&json_path, &json_str).map_err(|source| EngineError::Io {
             path: json_path.display().to_string(),
-            source,
-        })?;
-
-        let best_topo = &self.pop[0];
-        let md = crate::utils::markdown::topology_markdown(best_topo, Some(stats.best_score), None);
-        let md_path = dir.join(format!("gen_{:0width$}.md", self.generation, width = width));
-        fs::write(&md_path, md).map_err(|source| EngineError::Io {
-            path: md_path.display().to_string(),
             source,
         })?;
 

@@ -711,11 +711,32 @@ impl Engine {
         let indices = selection.apply(&self.scores, dir, &mut rng, self.options.elite_count);
         let label = selection.label().to_string();
 
-        // In-place reorder: build new pop from selected indices.
+        // In-place reorder: build the new pop from selected indices, keeping
+        // every parallel metric array in lockstep so `pop[i] ↔ scores[i] ↔
+        // eval_losses[i] ↔ param_counts[i]` always refers to one individual.
+        // (select() runs right after evaluation, when all three arrays are
+        // populated; the length guards keep a caller-visible invariant.)
+        let n = self.scores.len();
         let new_pop: Vec<Topology> = indices.iter().map(|&i| self.pop[i].clone()).collect();
         let new_scores: Vec<f32> = indices.iter().map(|&i| self.scores[i]).collect();
+        let new_losses: Vec<Option<f32>> = if self.eval_losses.len() == n {
+            indices.iter().map(|&i| self.eval_losses[i]).collect()
+        } else {
+            Vec::new()
+        };
+        let new_params: Vec<usize> = if self.param_counts.len() == n {
+            indices.iter().map(|&i| self.param_counts[i]).collect()
+        } else {
+            Vec::new()
+        };
         self.pop = new_pop;
         self.scores = new_scores;
+        if new_losses.len() == n {
+            self.eval_losses = new_losses;
+        }
+        if new_params.len() == n {
+            self.param_counts = new_params;
+        }
 
         let mut counts = vec![0usize; self.pop.len()];
         for &i in &indices {
