@@ -16,7 +16,7 @@
 //!
 //! Weights are **never** serialized — the blueprint is the single source of
 //! truth, and the executable module is rebuilt with fresh random weights via
-//! [`Network::build`](crate::network::Network::build). Saving a
+//! [`Network::build`](crate::graph::network::Network::build). Saving a
 //! found architecture is `graph.to_json()`, reloading it is
 //! `Topology::from_json(&json)` then `Network::build(&graph, device)`.
 
@@ -25,8 +25,8 @@ use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
-use crate::node::Node;
-use crate::topology::{Connection, Topology, TopologyOptions};
+use crate::graph::node::Node;
+use crate::graph::topology::{Connection, Topology, TopologyOptions};
 
 /// JSON round-trip representation of a [`Topology`] — the blueprint minus the
 /// RNG. `options.seed` is what makes regeneration reproducible, so the RNG is
@@ -80,7 +80,7 @@ impl<'de> Deserialize<'de> for Topology {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::test_strategies::topology_strategy;
+    use crate::graph::topology::test_strategies::topology_strategy;
     use proptest::prelude::*;
 
     // ── serialization ───────────────────────────────────────────────────────
@@ -127,8 +127,8 @@ mod tests {
         // The blueprint is the single source of truth: saving/loading it and
         // re-building yields the same architecture (fresh random weights —
         // weights are never serialized).
-        use crate::network::Network;
-        use crate::node::Activation;
+        use crate::graph::network::Network;
+        use crate::graph::node::Activation;
         use flodl::nn::Module;
         use flodl::{Device, Tensor, TensorOptions, Variable};
 

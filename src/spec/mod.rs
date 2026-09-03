@@ -2,7 +2,7 @@
 //!
 //! This module provides:
 //!
-//! - [`Spec`] — a plain, fully-serializable mirror of [`Topology`](crate::topology::Topology)
+//! - [`Spec`] — a plain, fully-serializable mirror of [`Topology`](crate::graph::topology::Topology)
 //! - [`NetworkFacts`] — materialized-network diagnostics ("nutrition label")
 
 mod network_facts;

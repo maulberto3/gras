@@ -25,13 +25,13 @@ pub struct NetworkFacts {
     pub depths: Vec<usize>,
     pub orphan_counts: (usize, usize),
     pub kind_counts: (usize, usize, usize),
-    pub activation_counts: Vec<(crate::node::Activation, usize)>,
-    pub standardize_counts: Vec<(crate::node::StandardizeOp, usize)>,
+    pub activation_counts: Vec<(crate::graph::node::Activation, usize)>,
+    pub standardize_counts: Vec<(crate::graph::node::StandardizeOp, usize)>,
 }
 
 impl NetworkFacts {
     /// Compute facts from a built network (pure read-only diagnostics).
-    pub fn from_network(net: &crate::network::Network) -> Self {
+    pub fn from_network(net: &crate::graph::network::Network) -> Self {
         let output_node = net.output_node;
         let (orphan_in, orphan_out) =
             graph_utils::node_orphan_counts(&net.nodes, &net.connections, output_node);
