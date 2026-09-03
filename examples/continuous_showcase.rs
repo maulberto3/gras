@@ -4,13 +4,17 @@
 //!
 //! Run: `source env_setup.sh && cargo run --example continuous_showcase`
 
-
-
 use gras::data;
 use gras::engine::{Engine, EngineOptions};
 use gras::fitness::{Direction, Fitness};
+use gras::flodl::nn::loss::mse_loss;
+use gras::flodl::nn::Module;
+use gras::flodl::nn::optim::Optimizer;
+use gras::flodl::{Adam, Tensor, Variable};
 use gras::topology::CombineOp;
-use gras::trainer::{SupervisedTrainer, TrainingConfig};
+use gras::trainer::from_fn;
+use gras::utils::data::split_indices;
+use gras::{DType, Device};
 
 fn main() {
     use std::io::Write;
@@ -18,10 +22,9 @@ fn main() {
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
 
-    // 1. Data — synthetic sine wave
-    let data_dir = std::env::temp_dir().join(format!("gras_cont_showcase_{}", fastrand::u64(..)));
-    let (inputs, targets) = gras::data::make_sine(256);
-    data::save_dataset(&data_dir, &gras::Dataset { inputs, targets }).unwrap();
+    // 1. Data — synthetic sine wave (kept in memory — your trainer's job)
+    let (inputs, targets) = data::make_sine(256);
+    let ds = gras::Dataset { inputs, targets };
 
     // 2. Options — the 5 mandatory fields + conservative defaults.
     let opts = EngineOptions::builder()
@@ -48,24 +51,53 @@ fn main() {
         "mse",
     );
 
-    // 4. Trainer — owns all training config.
-    let trainer = SupervisedTrainer::new(
-        &data_dir,
-        1,    // input_dim (sine: 1 feature)
-        1,    // output_dim (sine: 1 target)
-        TrainingConfig {
-            num_epochs: 1,
-            ..Default::default()
-        },
-        |p, y| flodl::nn::loss::mse_loss(p, y),
-    )
-    .unwrap();
+    // 4. Trainer — build your own from the Trainer contract.
+    //    One closure owns the whole loop: split, train, eval, score.
+    let trainer = from_fn(1, 1, Device::CPU, DType::Float32, move |net, gen_seed| {
+        let n = ds.len();
+        let (train_idx, _) = split_indices(n, 0.8, 0.2, gen_seed);
+        let (_, eval_idx) = split_indices(n, 0.8, 0.2, gen_seed.wrapping_add(0xFFFF));
 
-    let mut engine = Engine::new(opts, fitness, Box::new(trainer)).unwrap();
+        // Train — one epoch of MSE with Adam, 32-row batches
+        let params = net.parameters();
+        let mut opt = Adam::new(&params, 1e-3);
+        net.train();
+        for chunk in train_idx.chunks(32) {
+            let idx = Tensor::from_i64(chunk, &[chunk.len() as i64], Device::CPU)?;
+            let x = Variable::new(ds.inputs.index_select(0, &idx)?, true);
+            let y = Variable::new(ds.targets.index_select(0, &idx)?, false);
+            let pred = net.forward(&x)?;
+            let loss = mse_loss(&pred, &y)?;
+            loss.set_requires_grad(true)?;
+            opt.zero_grad();
+            loss.backward()?;
+            opt.step()?;
+        }
+
+        // Eval — mean squared error on held-out rows
+        net.eval();
+        let mut loss_sum = 0.0;
+        for chunk in eval_idx.chunks(32) {
+            let idx = Tensor::from_i64(chunk, &[chunk.len() as i64], Device::CPU)?;
+            let x = Variable::new(ds.inputs.index_select(0, &idx)?, false);
+            let y = Variable::new(ds.targets.index_select(0, &idx)?, false);
+            let pred = net.forward(&x)?;
+            loss_sum += mse_loss(&pred, &y)?.item()? as f32;
+        }
+        let n_eval = eval_idx.len() as f32;
+        let param_count = net
+            .parameters()
+            .iter()
+            .map(|p| p.variable.numel() as usize)
+            .sum::<usize>();
+        Ok((loss_sum / n_eval, Some(loss_sum / n_eval), param_count))
+    });
+
+    let mut engine = Engine::new(opts, fitness, trainer).unwrap();
     engine.run().unwrap();
 
     // 5. Inspect robustness.
-    engine.show_robustness(5, "best");
+    engine.show_robustness(5, gras::engine::RobustnessFilter::Best);
 
     // 6. History (always saved).
     if !engine.history.is_empty() {
@@ -74,6 +106,4 @@ fn main() {
             println!("    gen {:02}  avg_score={:.4}  topologies={}", h.generation, h.avg_score, h.unique_topos);
         }
     }
-
-    let _ = std::fs::remove_dir_all(&data_dir);
 }

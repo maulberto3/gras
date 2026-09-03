@@ -11,9 +11,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use flodl::{Device, DType, Variable};
-use flodl::nn::Module;
-use flodl::tensor::Result;
+use gras::{Device, DType, Variable};
+use gras::flodl::nn::Module;
+use gras::flodl::tensor::Result;
 
 use gras::topology::Topology;
 use gras::network::Network;
@@ -169,10 +169,10 @@ fn main() {
     let loss_fn = |pred: &Variable, y: &Variable| -> Result<Variable> { cross_entropy_onehot_loss(pred, y) };
 
     // Training config
-    let config = gras::trainer::TrainingConfig {
+    let config = gras::trainer::supervised::TrainingConfig {
         num_epochs: 10,
         learning_rate: 1e-3,
-        optimizer: gras::trainer::OptimizerKind::Adam,
+        optimizer: gras::trainer::supervised::OptimizerKind::Adam,
         grad_clip: 1.0,
         batch_size_train: 32,
         batch_size_eval: 32,
@@ -181,8 +181,8 @@ fn main() {
         train_y_proportional: true,
         test_y_proportional: true,
         eval_ratio: 0.2,
-        device: flodl::Device::CPU,
-        dtype: flodl::DType::Float32,
+        device: Device::CPU,
+        dtype: DType::Float32,
     };
 
     // Split dataset into train/eval

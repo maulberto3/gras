@@ -4,13 +4,16 @@
 //!
 //! Run: `source env_setup.sh && cargo run --example categorical_showcase`
 
-
-use flodl::Device;
 use gras::data;
 use gras::engine::{Engine, EngineOptions};
 use gras::fitness::{Direction, Fitness};
+use gras::flodl::nn::Module;
+use gras::flodl::nn::optim::Optimizer;
+use gras::flodl::{Adam, Tensor, Variable};
 use gras::topology::CombineOp;
-use gras::trainer::{SupervisedTrainer, TrainingConfig};
+use gras::trainer::from_fn;
+use gras::utils::data::split_indices;
+use gras::{DType, Device};
 
 fn main() {
     use std::io::Write;
@@ -18,10 +21,8 @@ fn main() {
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
 
-    // 1. Data — synthetic classification
-    let data_dir = std::env::temp_dir().join(format!("gras_cat_showcase_{}", fastrand::u64(..)));
+    // 1. Data — synthetic classification (kept in memory — your trainer's job)
     let ds = data::synthetic_classification(1024, 16, 4, 42, Device::CPU).unwrap();
-    data::save_dataset(&data_dir, &ds).unwrap();
 
     // 2. Options
     let opts = EngineOptions::builder()
@@ -44,24 +45,53 @@ fn main() {
         "f1",
     );
 
-    // 4. Trainer — cross-entropy for training
-    let trainer = SupervisedTrainer::new(
-        &data_dir,
-        16,   // input_dim
-        4,    // output_dim (4 classes)
-        TrainingConfig {
-            num_epochs: 1,
-            ..Default::default()
-        },
-        |pred, y| gras::cross_entropy_onehot_loss(pred, y),
-    )
-    .unwrap();
+    // 4. Trainer — build your own from the Trainer contract.
+    //    One closure owns the whole loop: split, train, eval, score.
+    let trainer = from_fn(16, 4, Device::CPU, DType::Float32, move |net, gen_seed| {
+        let n = ds.len();
+        let (train_idx, _) = split_indices(n, 0.8, 0.2, gen_seed);
+        let (_, eval_idx) = split_indices(n, 0.8, 0.2, gen_seed.wrapping_add(0xFFFF));
 
-    let mut engine = Engine::new(opts, fitness, Box::new(trainer)).unwrap();
+        // Train — one epoch of cross-entropy with Adam, 32-row batches
+        let params = net.parameters();
+        let mut opt = Adam::new(&params, 1e-3);
+        net.train();
+        for chunk in train_idx.chunks(32) {
+            let idx = Tensor::from_i64(chunk, &[chunk.len() as i64], Device::CPU)?;
+            let x = Variable::new(ds.inputs.index_select(0, &idx)?, true);
+            let y = Variable::new(ds.targets.index_select(0, &idx)?, false);
+            let pred = net.forward(&x)?;
+            let loss = gras::cross_entropy_onehot_loss(&pred, &y)?;
+            loss.set_requires_grad(true)?;
+            opt.zero_grad();
+            loss.backward()?;
+            opt.step()?;
+        }
+
+        // Eval — F1 + cross-entropy on held-out batches
+        net.eval();
+        let mut score = 0.0;
+        let mut loss_sum = 0.0;
+        for chunk in eval_idx.chunks(32) {
+            let idx = Tensor::from_i64(chunk, &[chunk.len() as i64], Device::CPU)?;
+            let x = Variable::new(ds.inputs.index_select(0, &idx)?, false);
+            let y = Variable::new(ds.targets.index_select(0, &idx)?, false);
+            let pred = net.forward(&x)?;
+            score += gras::f1_score(&pred, &y)?;
+            loss_sum += gras::cross_entropy_onehot_loss(&pred, &y)?.item()? as f32;
+        }
+        let n_eval = eval_idx.len() as f32;
+        let param_count = net
+            .parameters()
+            .iter()
+            .map(|p| p.variable.numel() as usize)
+            .sum::<usize>();
+        Ok((score / n_eval, Some(loss_sum / n_eval), param_count))
+    });
+
+    let mut engine = Engine::new(opts, fitness, trainer).unwrap();
     engine.run().unwrap();
 
     // 5. Inspect robustness.
-    engine.show_robustness(5, "best");
-
-    let _ = std::fs::remove_dir_all(&data_dir);
+    engine.show_robustness(5, gras::engine::RobustnessFilter::Best);
 }
