@@ -233,6 +233,12 @@ stopping, RL, segmentation, anything with its own config — implement the
 standard SGD/Adam supervised learning; it is a convenience, not the intended
 default.
 
+Training hyperparameters (optimizer, lr, epochs, batch sizes, **dropout**)
+live on the `TrainingConfig` — the evolution engine owns no training knobs.
+Dropout is a `TrainingConfig` field (default 0.0); the engine bakes it into
+every network it builds and records it per individual, so saved graphs stay
+self-describing.
+
 ## Options Reference
 
 ### Mandatory Fields
@@ -253,7 +259,6 @@ Everything else has conservative defaults. Set only what your experiment needs:
 |--------|---------|---------------|
 | `seed` | None (random) | `.set_seed(Some(42))` |
 | `num_threads` | 1 | `.set_num_threads(0)` (0 = auto) |
-| `dropout_prob` | 0.0 | `.set_dropout_prob(0.1)` |
 | `elite_count` | 2 | `.set_elite_count(5)` |
 | `dedup_pop_and_fill` | false | `.set_dedup_pop_and_fill(true)` |
 
@@ -461,9 +466,9 @@ results/<run_id>/
 ├── checkpoint.json                # Frontier population + RNG states — resume target (see Resume)
 ├── robustness.csv                 # Every repeated topology, one row each — the analysis artifact
 ├── improvements/
-│   ├── gen_00.json                # gen_seed + individuals (seed, dropout_prob, fitness,
-│   │                              #   loss, params, per-epoch train/eval loss curves,
-│   │                              #   topology, topo_hash)
+│   ├── gen_00.json                # gen_seed + individuals (seed, dropout_prob, fitness_mean,
+│   │                              #   eval_loss_mean, params, per-step train_losses +
+│   │                              #   per-epoch eval_losses, topology, topo_hash)
 │   └── ...
 ```
 
@@ -537,26 +542,34 @@ the chain is seeded and recorded, so a saved run can be replayed bit-for-bit:
 | Component | Seeded by | Recorded in `gen_XX.json` |
 |-----------|-----------|---------------------------|
 | Initial weights | `topology.options.seed` (inside the embedded topology) | individual `seed` |
-| Dropout | `topology.options.dropout_prob` (applied at build) | individual `dropout_prob` |
-| Train/eval split | `gen_seed` → `split_indices` | top-level `gen_seed` |
-| Batch sequence | `gen_seed` (reseeded per epoch) | derived from `gen_seed` |
+| Dropout | trainer's `TrainingConfig` → `topology.options.dropout_prob` (applied at build) | individual `dropout_prob` |
+| Train/eval split | `gen_seed` → `split_indices` (eval set: `gen_seed + EVAL_SEED_OFFSET`) | top-level `gen_seed` |
+| Batch sequence | `gen_seed` via `sample_batches_from_indices` | derived from `gen_seed` |
 | Dropout masks | `flodl::manual_seed(gen_seed)` per training call | derived from `gen_seed` |
-| Per-epoch curves | eval mode each epoch | individual `train_losses` / `eval_losses` |
+| Loss curves | train per step, eval as per-epoch pass means (eval mode each epoch) | individual `train_losses` / `eval_losses` |
 
 Notes:
 
 - `Network::build(topo, device)` derives `seed` and `dropout_prob` from the
   topology itself, so rebuilding a saved topology reproduces the exact net
   the engine evolved (no silent seed-0/dropout-0.05 divergence).
+- Dropout is configured on the **trainer**, not the engine: `from_fn`/custom
+  trainers default to 0.0 (they own regularization) and opt in via
+  `ClosureTrainer::with_dropout(p)` or the `TrainingConfig.dropout_prob` field.
 - `Engine::gen_seed_for(generation)` exposes the per-generation trainer seed;
   `train_network` seeds libtorch's RNG from it so dropout masks replay too.
-- Overfitting is visible per individual: `train_losses` and `eval_losses`
-  hold the per-epoch mean train/test loss, and the last `eval_losses` entry
-  equals the individual's `loss`.
+- Overfitting is visible per individual: `train_losses` holds one value per
+  training step (8 batches → 8 values); `eval_losses` holds the **mean** of
+  each per-epoch eval pass (all eval batches see the same fixed model, so a
+  per-batch eval vector would be pure noise) — with `num_epochs: 10` you get
+  10 eval points to plot against the per-step train line. `fitness_mean`/
+  `eval_loss_mean` are the means of the **final** eval pass (ranking +
+  parity); the last `eval_losses` entry equals `eval_loss_mean`.
 - `cargo run --example train_from_gen -- results/<run_id> <gen_idx> <idx>`
   replays one individual from its gen JSON and **self-checks** the achieved
-  fitness/loss/curves against the recorded values — a mismatch means the
-  reconstruction (config, loss, fitness) differs from the original run.
+  fitness/loss/curves against the recorded `fitness_mean`/`eval_loss_mean`
+  and per-batch curves — a mismatch means the reconstruction (config, loss,
+  fitness) differs from the original run.
 
 ## Citing gras
 
