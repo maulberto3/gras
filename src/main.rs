@@ -46,17 +46,20 @@ fn main() {
         784,   // input_dim
         10,    // output_dim
         TrainingConfig {
-            num_epochs: 1,
+            // >1 epoch: eval runs once per epoch, so the eval curve shows
+            // generalization progress and overfitting becomes visible.
+            num_epochs: 10,
             learning_rate: 1e-3,
             optimizer: OptimizerKind::Adam,
             grad_clip: 1.0,
             batch_size_train: 16,
             batch_size_eval: 16,
             num_batches_train: 16,
-            num_batches_eval: 1,
+            num_batches_eval: 16,
             train_y_proportional: true,
             test_y_proportional: true,
             eval_ratio: 0.3,
+            dropout_prob: 0.1,
             device: gras::auto_device(),
             dtype: gras::DType::Float32,
         },
@@ -72,8 +75,8 @@ fn main() {
         .set_pop_size(20)
         .set_num_generations(5)
         .set_dedup_pop_and_fill(true)
-        .set_elite_count(2)
-        .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
+        .set_elite_count(3)
+        .set_selection(SelectionMethod::Tournament { tournament_size: 3 })
         .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.25 })
         .set_mutation(MutationMethod::Activation { prob: 0.1 })
         .set_hidden_dim_pool(16..=64)
@@ -84,7 +87,6 @@ fn main() {
         .set_max_hidden_inputs_per_node(20)
         .set_min_hidden_outputs_per_node(5)
         .set_max_hidden_outputs_per_node(20)
-        .set_dropout_prob(0.1)
         .build()
         .unwrap();
 
