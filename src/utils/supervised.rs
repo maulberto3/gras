@@ -15,14 +15,26 @@ use crate::graph::network::Network;
 use crate::trainer::supervised::{OptimizerKind, TrainingConfig};
 use super::data::Dataset;
 
+/// The eval-set derivation contract: the held-out split and eval batches
+/// are derived from `gen_seed + EVAL_SEED_OFFSET`, never `gen_seed` itself.
+/// Kept as one named constant so trainers and replay tools can't silently
+/// drift apart on *which rows are held out*.
+pub const EVAL_SEED_OFFSET: u64 = 0xFFFF;
+
 /// Result of a training run.
 pub struct TrainResult {
-    /// Mean training loss per epoch, oldest first.
+    /// Training loss **per step (batch)**, oldest first — one entry per
+    /// (epoch, batch). With 1 epoch × 8 train batches → 8 values.
     pub loss_curve: Vec<f32>,
-    /// Mean held-out loss per epoch, oldest first — the last entry equals
-    /// `eval_loss`. Compare with `loss_curve` to spot overfitting.
+    /// Mean held-out loss **per eval pass** (one pass per epoch, eval mode
+    /// — dropout off), oldest first. All eval batches see the same fixed
+    /// model, so within a pass only the mean is meaningful; the curve of
+    /// pass means across epochs is the overfitting signal. Length =
+    /// `num_epochs` (one entry per epoch that actually evaluated).
     pub eval_loss_curve: Vec<f32>,
+    /// Mean fitness over the final eval pass — the engine's ranking score.
     pub score: f32,
+    /// Mean held-out loss over the final eval pass.
     pub eval_loss: Option<f32>,
 }
 
@@ -45,7 +57,7 @@ pub fn train_network(
     let eval_batches = sample_batches_from_indices(
         &dataset.inputs, &dataset.targets, eval_indices,
         config.batch_size_eval, config.num_batches_eval,
-        gen_seed.wrapping_add(0xFFFF), config.test_y_proportional,
+        gen_seed.wrapping_add(EVAL_SEED_OFFSET), config.test_y_proportional,
     )?;
 
     if config.num_epochs == 0 || train_batches.is_empty() {
@@ -80,10 +92,11 @@ pub fn train_network(
         flodl::manual_seed(gen_seed);
     }
 
-    let mut loss_curve = Vec::with_capacity(config.num_epochs);
-    let mut eval_loss_curve = Vec::with_capacity(config.num_epochs);
+    let mut loss_curve = Vec::with_capacity(config.num_epochs * train_batches.len());
+    let mut eval_loss_curve = Vec::new();
     let last_epoch = config.num_epochs - 1;
     for epoch in 0..config.num_epochs {
+        net.train();
         let mut epoch_loss = 0.0f32;
         let mut n_batches = 0u32;
         for (xb, yb) in &train_batches {
@@ -94,6 +107,9 @@ pub fn train_network(
             let lv = loss.item().unwrap_or(0.0) as f32;
             epoch_loss += lv;
             n_batches += 1;
+            // One value per training step (batch) — the full per-step curve,
+            // so a 1-epoch cheap train of 8 batches yields 8 values.
+            loss_curve.push(lv);
             trace!("    batch loss={lv:.6}");
             loss.set_requires_grad(true)?;
             optimizer.zero_grad();
@@ -103,27 +119,25 @@ pub fn train_network(
             }
             optimizer.step()?;
         }
-        let epoch_avg = epoch_loss / n_batches as f32;
-        loss_curve.push(epoch_avg);
         debug!(
             "    epoch {}/{} avg_loss={:.6}",
             epoch + 1,
             config.num_epochs,
-            epoch_avg
+            epoch_loss / n_batches as f32
         );
 
+        // Eval pass after every epoch (eval mode — dropout off — so the
+        // test curve is stable). All eval batches see the same fixed model,
+        // so only the pass **mean** is recorded (one value per epoch); the
+        // final pass's means become the individual's eval_loss / score,
+        // matching the engine's ranking semantics exactly.
+        let (pass_loss, pass_score) = eval_pass(net, fitness, loss_fn, &eval_batches)?;
+        if let Some(l) = pass_loss {
+            eval_loss_curve.push(l);
+        }
         if epoch == last_epoch {
-            // Final epoch: score on held-out batches using fitness (ranking
-            // only), matching the pre-existing engine semantics exactly.
-            let (score, eval_loss) = score_on_eval(
-                net,
-                fitness,
-                loss_fn,
-                &eval_batches,
-            )?;
-            if let Some(l) = eval_loss {
-                eval_loss_curve.push(l);
-            }
+            let score = pass_score.unwrap_or(0.0);
+            let eval_loss = pass_loss;
             debug!("  train done -- score={score:.6} eval_loss={eval_loss:?}");
             return Ok(TrainResult {
                 loss_curve,
@@ -132,62 +146,45 @@ pub fn train_network(
                 eval_loss,
             });
         }
-
-        // Intermediate epochs: record held-out loss (eval mode — dropout
-        // off — so the test curve is stable) for overfitting tracking.
-        let eval_avg = eval_loss_avg(net, loss_fn, &eval_batches)?;
-        eval_loss_curve.push(eval_avg);
-        net.train();
     }
 
     unreachable!("last epoch handled above")
 }
 
-/// Mean loss over every eval batch, in eval mode. Used between training
-/// epochs to build the per-epoch test-loss curve.
-fn eval_loss_avg(
-    net: &mut Network,
-    loss_fn: &dyn Fn(&Variable, &Variable) -> Result<Variable>,
-    eval_batches: &[(Tensor, Tensor)],
-) -> Result<f32> {
-    net.eval();
-    let mut total = 0.0f32;
-    for (xb, yb) in eval_batches {
-        let x = Variable::new(xb.clone(), false);
-        let y = Variable::new(yb.clone(), false);
-        let pred = net.forward(&x)?;
-        total += loss_fn(&pred, &y)?.item()? as f32;
-    }
-    Ok(total / eval_batches.len().max(1) as f32)
-}
-
-/// Score + mean loss over every eval batch — the engine's final metric.
-/// Runs in eval mode, so dropout and standardize stats are off.
-fn score_on_eval(
+/// One held-out pass, in eval mode: the **mean** loss and **mean** fitness
+/// score over all eval batches. Per-batch values are meaningless here — the
+/// model is fixed — so they're reduced before they leave this function.
+/// Returns `(None, None)` when there are no eval batches.
+fn eval_pass(
     net: &mut Network,
     fitness: &Fitness,
     loss_fn: &dyn Fn(&Variable, &Variable) -> Result<Variable>,
     eval_batches: &[(Tensor, Tensor)],
-) -> Result<(f32, Option<f32>)> {
+) -> Result<(Option<f32>, Option<f32>)> {
     net.eval();
-    let mut score_total = 0.0;
     let mut loss_total = 0.0f32;
+    let mut score_total = 0.0f32;
+    let mut n = 0u32;
     for (xb, yb) in eval_batches {
         let x = Variable::new(xb.clone(), false);
         let y = Variable::new(yb.clone(), false);
         let pred = net.forward(&x)?;
-        score_total += fitness.score(&pred, &y)?;
         loss_total += loss_fn(&pred, &y)?.item()? as f32;
+        score_total += fitness.score(&pred, &y)?;
+        n += 1;
     }
-    let n_eval = eval_batches.len() as f32;
-    let score = if n_eval == 0.0 { 0.0 } else { score_total / n_eval };
-    let eval_loss = if n_eval > 0.0 { Some(loss_total / n_eval) } else { None };
-    Ok((score, eval_loss))
+    if n == 0 {
+        return Ok((None, None));
+    }
+    Ok((Some(loss_total / n as f32), Some(score_total / n as f32)))
 }
 
-/// Sample random batches from a subset of indices.
+/// Sample random batches from a subset of indices — **the** reproducibility
+/// primitive: given the same indices, seed, and config, it produces the exact
+/// same batches the engine trained on. Public so replay/harness tools can
+/// reproduce batch sequences directly instead of re-implementing the shuffle.
 /// Silent fallback: if requested more than available, use what's there.
-fn sample_batches_from_indices(
+pub fn sample_batches_from_indices(
     inputs: &Tensor,
     targets: &Tensor,
     indices: &[i64],

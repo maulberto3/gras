@@ -93,10 +93,16 @@ pub(crate) fn log_initialization(
         ),
     ]);
 
-    if options.dropout_prob > 0.0 {
+    // Dropout lives on the trainer (a training hyperparameter) and is
+    // embedded into every topology — read it back from the population.
+    if let Some(dropout) = pop
+        .first()
+        .map(|t| t.options.dropout_prob)
+        .filter(|&d| d > 0.0)
+    {
         rows.push(vec![
             "dropout".into(),
-            format!("{}%", (options.dropout_prob * 100.0) as usize),
+            format!("{}%", (dropout * 100.0) as usize),
         ]);
     }
 
