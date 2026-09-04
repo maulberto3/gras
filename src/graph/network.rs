@@ -39,7 +39,11 @@ impl Default for NetworkOptions {
             device: Device::CPU,
             dtype: DType::Float32,
             seed: 0,
-            dropout_prob: 0.05,
+            // 0.0 — never silently inject regularization. (`Network::build`
+            // reads dropout from the topology anyway; this default only
+            // guards direct `build_with_options` callers using
+            // `..Default::default()` from picking up an unrequested 5%.)
+            dropout_prob: 0.0,
         }
     }
 }
