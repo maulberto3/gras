@@ -11,7 +11,7 @@ use flodl::Variable;
 
 use crate::engine::fitness::Fitness;
 use crate::graph::network::Network;
-use crate::trainer::Trainer;
+use crate::trainer::{EvalOutcome, Trainer};
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -98,7 +98,14 @@ impl SupervisedTrainer {
         config: TrainingConfig,
         loss_fn: impl Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync + 'static,
     ) -> Result<Self> {
-        let dataset = crate::utils::data::resolve_dataset(data_path)?;
+        // P1 fix: resolve_dataset loads on CPU — move the data to the
+        // trainer's device + dtype up front, so a CUDA `config.device`
+        // doesn't device-mismatch on every forward pass (nets are built on
+        // `device()`). Also cast to the net's dtype so data and weights
+        // always agree.
+        let dataset = crate::utils::data::resolve_dataset(data_path)?
+            .to_dtype(config.dtype)?
+            .to_device(config.device)?;
         Ok(Self {
             dataset,
             input_dim,
@@ -115,7 +122,7 @@ impl Trainer for SupervisedTrainer {
     fn device(&self) -> Device { self.config.device }
     fn dtype(&self) -> DType { self.config.dtype }
 
-    fn evaluate(&self, mut net: Network, fitness: &Fitness, gen_seed: u64) -> Result<(f32, Option<f32>, usize)> {
+    fn evaluate(&self, mut net: Network, fitness: &Fitness, gen_seed: u64) -> Result<EvalOutcome> {
         let params: usize = net.layers.iter().flat_map(|l| l.parameters()).map(|p| p.variable.numel() as usize).sum();
         let n = self.dataset.len();
         let eval_ratio = self.config.eval_ratio;
@@ -131,6 +138,14 @@ impl Trainer for SupervisedTrainer {
             &self.dataset, &train_idx, &eval_idx,
             gen_seed,
         )?;
-        Ok((result.score, result.eval_loss, params))
+        // Per-epoch curves ride along so the engine can persist them on this
+        // individual in the gen JSONs (overfitting tracking).
+        Ok(EvalOutcome {
+            score: result.score,
+            eval_loss: result.eval_loss,
+            param_count: params,
+            train_losses: result.loss_curve,
+            eval_losses: result.eval_loss_curve,
+        })
     }
 }
