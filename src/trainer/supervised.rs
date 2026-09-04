@@ -45,6 +45,11 @@ pub struct TrainingConfig {
     pub test_y_proportional: bool,
     /// Train/eval split ratio (0.2 = 20% eval).
     pub eval_ratio: f32,
+    /// Dropout probability on hidden nodes (0.0 = none). A training
+    /// hyperparameter — the engine bakes it into every network it builds
+    /// and records it in each topology, so saved graphs stay
+    /// self-describing.
+    pub dropout_prob: f32,
     /// Device for network building and data placement.
     pub device: Device,
     /// Data type for network weights and data.
@@ -65,6 +70,7 @@ impl Default for TrainingConfig {
             train_y_proportional: false,
             test_y_proportional: false,
             eval_ratio: 0.2,
+            dropout_prob: 0.0,
             device: Device::CPU,
             dtype: DType::Float32,
         }
@@ -126,12 +132,14 @@ impl Trainer for SupervisedTrainer {
         let params: usize = net.layers.iter().flat_map(|l| l.parameters()).map(|p| p.variable.numel() as usize).sum();
         let n = self.dataset.len();
         let eval_ratio = self.config.eval_ratio;
-        // Train: derived from gen_seed. Eval: derived from gen_seed + offset.
+        // Train: derived from gen_seed. Eval: derived from gen_seed + the
+        // documented eval offset (same contract as eval batch sampling).
         let (train_idx, _) = crate::utils::data::split_indices(
             n, 1.0 - eval_ratio, eval_ratio, gen_seed,
         );
         let (_, eval_idx) = crate::utils::data::split_indices(
-            n, 1.0 - eval_ratio, eval_ratio, gen_seed.wrapping_add(0xFFFF),
+            n, 1.0 - eval_ratio, eval_ratio,
+            gen_seed.wrapping_add(crate::utils::supervised::EVAL_SEED_OFFSET),
         );
         let result = crate::utils::supervised::train_network(
             &mut net, &self.config, &self.loss_fn, fitness,
@@ -147,5 +155,9 @@ impl Trainer for SupervisedTrainer {
             train_losses: result.loss_curve,
             eval_losses: result.eval_loss_curve,
         })
+    }
+
+    fn dropout_prob(&self) -> f32 {
+        self.config.dropout_prob
     }
 }

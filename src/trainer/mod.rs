@@ -20,7 +20,7 @@ use crate::graph::network::Network;
 // ── EvalOutcome — what one evaluate() produced ──────────────────────────────
 
 /// Everything one [`Trainer::evaluate`] call returns: the ranking score plus
-/// optional per-epoch train/test loss curves (overfitting tracking). The
+/// optional per-step train/test loss curves (overfitting tracking). The
 /// engine records the curves on each individual in the gen JSONs; leave the
 /// vectors empty when your trainer can't produce them.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -32,10 +32,13 @@ pub struct EvalOutcome {
     pub eval_loss: Option<f32>,
     /// Parameter count, used for the robustness table.
     pub param_count: usize,
-    /// Mean training loss per epoch, oldest first.
+    /// Training loss **per step (batch)**, oldest first. With 1 epoch × 8
+    /// train batches → 8 values.
     pub train_losses: Vec<f32>,
-    /// Mean held-out loss per epoch, oldest first — the last entry equals
-    /// `eval_loss`. Plot both curves to spot overfitting.
+    /// Mean held-out loss **per eval pass** (one per epoch), oldest first —
+    /// all eval batches see the same fixed model, so only the pass mean is
+    /// meaningful. The last entry equals `eval_loss`. Plot against
+    /// `train_losses` to spot overfitting.
     pub eval_losses: Vec<f32>,
 }
 
@@ -87,12 +90,24 @@ pub trait Trainer: Send + Sync {
     /// - `score` — used for evolutionary selection.
     /// - `eval_loss` — optional, used for logging/robustness only.
     /// - `param_count` — optional, used for the robustness table.
-    /// - `train_losses` / `eval_losses` — optional per-epoch loss curves,
-    ///   recorded verbatim on each individual in the gen JSONs.
+    /// - `train_losses` / `eval_losses` — optional curves recorded verbatim
+    ///   on each individual in the gen JSONs: per-step train loss, and the
+    ///   per-epoch eval-pass mean (all eval batches see the same fixed
+    ///   model, so only the pass mean is meaningful).
     ///
     /// `gen_seed` — engine's current generation seed for data shuffling.
     /// Same seed + same options must produce the same outcome.
     fn evaluate(&self, net: Network, fitness: &Fitness, gen_seed: u64) -> Result<EvalOutcome>;
+
+    /// Dropout probability this trainer expects on hidden nodes (0.0 = none).
+    /// The engine bakes it into every network it builds and records it in
+    /// each topology, so the knob lives with the training config — the
+    /// evolution engine itself does not own a dropout setting. Custom
+    /// trainers default to 0.0 (they own their regularization); override to
+    /// opt in, or use [`from_fn`] + [`ClosureTrainer::with_dropout`].
+    fn dropout_prob(&self) -> f32 {
+        0.0
+    }
 }
 
 /// `Box<T>` (including `Box<dyn Trainer>`) acts as a [`Trainer`] — so
@@ -113,6 +128,9 @@ impl<T: Trainer + ?Sized> Trainer for Box<T> {
     }
     fn evaluate(&self, net: Network, fitness: &Fitness, gen_seed: u64) -> Result<EvalOutcome> {
         (**self).evaluate(net, fitness, gen_seed)
+    }
+    fn dropout_prob(&self) -> f32 {
+        (**self).dropout_prob()
     }
 }
 
@@ -146,6 +164,7 @@ pub struct ClosureTrainer {
     output_dim: usize,
     device: Device,
     dtype: DType,
+    dropout_prob: f32,
     evaluate_fn: Box<dyn Fn(Network, u64) -> Result<EvalOutcome> + Send + Sync>,
 }
 
@@ -167,8 +186,18 @@ impl ClosureTrainer {
             output_dim,
             device,
             dtype,
+            dropout_prob: 0.0,
             evaluate_fn: Box::new(move |net, gen_seed| evaluate_fn(net, gen_seed).map(Into::into)),
         }
+    }
+
+    /// Opt into dropout on hidden nodes for this closure trainer. The engine
+    /// bakes the value into every network it builds (and records it in each
+    /// topology). Default: 0.0 — a custom training loop owns its own
+    /// regularization.
+    pub fn with_dropout(mut self, dropout_prob: f32) -> Self {
+        self.dropout_prob = dropout_prob.clamp(0.0, 1.0);
+        self
     }
 }
 
@@ -188,5 +217,8 @@ impl Trainer for ClosureTrainer {
 
     fn evaluate(&self, net: Network, _fitness: &Fitness, gen_seed: u64) -> Result<EvalOutcome> {
         (self.evaluate_fn)(net, gen_seed)
+    }
+    fn dropout_prob(&self) -> f32 {
+        self.dropout_prob
     }
 }
