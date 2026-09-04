@@ -30,7 +30,12 @@ pub struct KindCounts {
 /// Knobs for building a graph. Mostly used by the random-generation
 /// methods (`create_random_hidden_node`, `finalize`); `input_dim`,
 /// `hidden_dim` and `combine_op` are what execution actually cares about.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Serialized with every topology, so a saved graph is **self-describing**
+/// for [`Network::build`](crate::graph::network::Network::build): `seed`
+/// reproduces the initial weights and `dropout_prob` the regularization the
+/// engine applied.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 // ── TopologyOptions — the blueprint template ──────────────────────────────
 
 pub struct TopologyOptions {
@@ -56,6 +61,49 @@ pub struct TopologyOptions {
     /// The output node maps `hidden_dim -> output_dim`; auto-detected from
     /// the dataset's target shape by the engine, or set manually.
     pub output_dim: usize,
+    /// Dropout probability the engine used when building this topology's
+    /// network. Part of the blueprint so replays don't silently diverge;
+    /// defaults to 0.0 when a saved topology predates the field.
+    #[serde(default)]
+    pub dropout_prob: f32,
+}
+
+// `dropout_prob: f32` isn't `Eq`/`Hash`, so these are manual: every other
+// field compares normally, dropout compares by bit pattern (values are
+// always finite — the builder clamps to [0, 1]). Keeps `Spec` (and the
+// engine's `HashSet<Spec>` dedup) working unchanged.
+impl PartialEq for TopologyOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.seed == other.seed
+            && self.min_hidden_num_nodes == other.min_hidden_num_nodes
+            && self.max_hidden_num_nodes == other.max_hidden_num_nodes
+            && self.min_hidden_inputs_per_node == other.min_hidden_inputs_per_node
+            && self.max_hidden_inputs_per_node == other.max_hidden_inputs_per_node
+            && self.min_hidden_outputs_per_node == other.min_hidden_outputs_per_node
+            && self.max_hidden_outputs_per_node == other.max_hidden_outputs_per_node
+            && self.input_dim == other.input_dim
+            && self.hidden_dim == other.hidden_dim
+            && self.output_dim == other.output_dim
+            && self.dropout_prob.to_bits() == other.dropout_prob.to_bits()
+    }
+}
+
+impl Eq for TopologyOptions {}
+
+impl std::hash::Hash for TopologyOptions {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.seed.hash(state);
+        self.min_hidden_num_nodes.hash(state);
+        self.max_hidden_num_nodes.hash(state);
+        self.min_hidden_inputs_per_node.hash(state);
+        self.max_hidden_inputs_per_node.hash(state);
+        self.min_hidden_outputs_per_node.hash(state);
+        self.max_hidden_outputs_per_node.hash(state);
+        self.input_dim.hash(state);
+        self.hidden_dim.hash(state);
+        self.output_dim.hash(state);
+        self.dropout_prob.to_bits().hash(state);
+    }
 }
 
 impl Default for TopologyOptions {
@@ -71,6 +119,7 @@ impl Default for TopologyOptions {
             input_dim: 1,
             hidden_dim: 8,
             output_dim: 1,
+            dropout_prob: 0.0,
         }
     }
 }
@@ -1096,6 +1145,7 @@ pub(crate) mod test_strategies {
                     input_dim,
                     hidden_dim,
                     output_dim,
+                    dropout_prob: 0.0,
                 },
             )
     }
@@ -1170,6 +1220,7 @@ mod tests {
             input_dim: 4,
             hidden_dim: 16,
             output_dim: 10,
+            dropout_prob: 0.0,
         };
         let graph = Topology::new(1, Some(opts));
         assert_eq!(graph.nodes.len(), 0);

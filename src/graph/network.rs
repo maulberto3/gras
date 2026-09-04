@@ -99,13 +99,21 @@ pub struct Network {
 }
 
 impl Network {
-    /// Compile blueprint on the given device. Convenience wrapper over `build_with_options`.
+    /// Compile blueprint on the given device. Convenience wrapper over
+    /// `build_with_options` that derives the **architecture-affecting** knobs
+    /// from the topology itself — `seed: graph.options.seed` (initial
+    /// weights) and `dropout_prob: graph.options.dropout_prob` — so replaying
+    /// a saved topology reproduces the exact net the engine built. It does
+    /// *not* fall back to `NetworkOptions::default()` for those two fields
+    /// anymore: seed 0 / dropout 0.05 silently diverged from evolved nets.
     pub fn build(graph: &Topology, device: Device) -> flodl::tensor::Result<Self> {
         Self::build_with_options(
             graph,
             &NetworkOptions {
                 device,
-                ..Default::default()
+                dtype: DType::Float32,
+                seed: graph.options.seed,
+                dropout_prob: graph.options.dropout_prob,
             },
         )
         .map(|net| {

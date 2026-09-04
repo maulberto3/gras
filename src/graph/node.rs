@@ -403,6 +403,7 @@ mod tests {
                 input_dim: 1,
                 hidden_dim: 8,
                 output_dim: 1,
+                dropout_prob: 0.0,
             };
             let mut graph = Topology::new(0, Some(opts));
             graph.create_random_hidden_node();
