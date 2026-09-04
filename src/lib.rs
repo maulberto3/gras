@@ -50,11 +50,15 @@ pub use evolution::selection::SelectionMethod;
 // ── trainer — the primary extension point ────────────────────────────
 // The built-in SupervisedTrainer + TrainingConfig live at
 // `trainer::supervised` — an optional convenience, not the default.
-pub use trainer::Trainer;
+pub use trainer::{EvalOutcome, Trainer};
 pub use utils::supervised::TrainResult;
 
 // ── data ─────────────────────────────────────────────────────────────
-pub use utils::data::{Dataset, make_sine, make_xor, one_hot};
+pub use utils::data::{
+    DataFormat, Dataset, load_csv_dataset, load_dataset, load_dataset_auto, load_tensor,
+    make_sine, make_xor, one_hot, resolve_dataset, save_csv_dataset, save_dataset,
+    save_dataset_as, save_tensor,
+};
 
 // ── scoring helpers ──────────────────────────────────────────────────
 pub use utils::scoring::{
