@@ -115,14 +115,14 @@ fn main() {
     // Find the target individual
     let target = if idx_arg == "--best" {
         individuals.iter().max_by(|a, b| {
-            a["fitness"].as_f64().unwrap_or(0.0)
-                .partial_cmp(&b["fitness"].as_f64().unwrap_or(0.0))
+            a["fitness_mean"].as_f64().unwrap_or(0.0)
+                .partial_cmp(&b["fitness_mean"].as_f64().unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         }).expect("no individuals found")
     } else if idx_arg == "--worst" {
         individuals.iter().min_by(|a, b| {
-            a["fitness"].as_f64().unwrap_or(0.0)
-                .partial_cmp(&b["fitness"].as_f64().unwrap_or(0.0))
+            a["fitness_mean"].as_f64().unwrap_or(0.0)
+                .partial_cmp(&b["fitness_mean"].as_f64().unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         }).expect("no individuals found")
     } else {
@@ -214,14 +214,19 @@ fn main() {
         train_y_proportional: true,
         test_y_proportional: true,
         eval_ratio: 0.2,
+        // Mirrors the recorded topology's dropout (informational — the net
+        // was already built with it from the topology; train_network does
+        // not read this field).
+        dropout_prob: topo.options.dropout_prob,
         device: Device::CPU,
         dtype: DType::Float32,
     };
 
     // Replicate the engine's exact train/eval split: the trainer derives
-    // train indices from gen_seed and eval indices from gen_seed+0xFFFF
-    // (SupervisedTrainer::evaluate). Anything else silently diverges from
-    // the evolved run and breaks the parity check below.
+    // train indices from gen_seed and eval indices from
+    // gen_seed + EVAL_SEED_OFFSET (SupervisedTrainer::evaluate). Anything
+    // else silently diverges from the evolved run and breaks the parity
+    // check below.
     let n = dataset.inputs.shape()[0] as usize;
     let eval_ratio = config.eval_ratio;
     let (train_indices, _) = gras::utils::data::split_indices(
@@ -234,7 +239,7 @@ fn main() {
         n,
         1.0 - eval_ratio,
         eval_ratio,
-        gen_seed.wrapping_add(0xFFFF),
+        gen_seed.wrapping_add(gras::utils::supervised::EVAL_SEED_OFFSET),
     );
 
     println!("\n  Training for {} epochs...", config.num_epochs);
@@ -271,7 +276,7 @@ fn main() {
     println!("\n══ parity self-check (replay vs gen JSON) ═════════════════════════");
     let mut ok = true;
 
-    let recorded_fitness = target["fitness"].as_f64();
+    let recorded_fitness = target["fitness_mean"].as_f64();
     let achieved_fitness = result.score as f64;
     if let Some(rec) = recorded_fitness {
         let diff = (achieved_fitness - rec).abs();
@@ -281,7 +286,7 @@ fn main() {
             if pass { "✓" } else { "✗ MISMATCH" });
     }
 
-    let recorded_loss = target["loss"].as_f64();
+    let recorded_loss = target["eval_loss_mean"].as_f64();
     if let Some(rec) = recorded_loss {
         let achieved = result.eval_loss.unwrap_or(f32::NAN) as f64;
         let diff = (achieved - rec).abs();
@@ -291,7 +296,8 @@ fn main() {
             if pass { "✓" } else { "✗ MISMATCH" });
     }
 
-    // Per-epoch curves (when the gen JSON was written by a fixed engine).
+    // Per-epoch eval-pass means (when the gen JSON was written by a fixed
+    // engine).
     let recorded_curve: Vec<f64> = target["eval_losses"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
