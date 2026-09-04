@@ -89,7 +89,7 @@ fn test_engine_runs_and_checkpoints() {
     for ind in individuals {
         let topo = Topology::from_json(ind["topology"].as_str().unwrap()).unwrap();
         assert_eq!(topo.validate(), Ok(()));
-        assert!(ind["fitness"].is_f64());
+        assert!(ind["fitness_mean"].is_f64());
         assert!(ind["params"].is_u64());
     }
     assert!(engine.run_dir.join("engine.json").exists());
@@ -156,9 +156,11 @@ fn test_gen_json_topo_hash_is_canonical() {
                 ind["dropout_prob"].as_f64().is_some(),
                 "individual must record dropout_prob"
             );
-            // Per-epoch curves (D1): SupervisedTrainer ran 1 epoch here, so
-            // each individual carries 1-entry curves and its final eval_loss
-            // equals the recorded `loss`.
+            // Curves (D1): SupervisedTrainer ran 1 epoch here, so each
+            // individual carries one train-loss value per train batch used
+            // (≤ the requested num_batches_train) and a single eval-pass
+            // mean loss (one per epoch) — and the eval entry equals the
+            // recorded `eval_loss_mean`.
             let train: Vec<f32> = ind["train_losses"]
                 .as_array()
                 .map(|a| a.iter().map(|x| x.as_f64().unwrap() as f32).collect())
@@ -167,12 +169,16 @@ fn test_gen_json_topo_hash_is_canonical() {
                 .as_array()
                 .map(|a| a.iter().map(|x| x.as_f64().unwrap() as f32).collect())
                 .unwrap_or_default();
-            assert_eq!(train.len(), 1, "train curve must cover the 1 epoch");
-            assert_eq!(eval.len(), 1, "eval curve must cover the 1 epoch");
-            if let Some(loss) = ind["loss"].as_f64() {
+            assert!(
+                !train.is_empty() && train.len() <= 16,
+                "train curve must cover the train batches (≤16 requested, got {})",
+                train.len()
+            );
+            assert_eq!(eval.len(), 1, "one eval-pass mean per epoch (1 epoch here)");
+            if let Some(loss) = ind["eval_loss_mean"].as_f64() {
                 assert!(
                     (eval[eval.len() - 1] as f64 - loss).abs() < 1e-6,
-                    "final eval_losses entry must equal the recorded loss"
+                    "final eval_losses entry must equal the recorded eval_loss_mean"
                 );
             }
             run_hashes.insert(stored.to_string());
@@ -524,7 +530,6 @@ fn test_engine_seeded_run_is_reproducible() {
     let make = || EngineOptions {
         seed: Some(123),
         num_threads: 3,
-        dropout_prob: 0.0,
         ..test_options()
     };
     let mut a = Engine::new(
@@ -566,7 +571,6 @@ fn test_seed_flows_to_initial_population() {
     let make = || EngineOptions {
         seed: Some(2024),
         num_threads: 2,
-        dropout_prob: 0.0,
         ..test_options()
     };
     let a = Engine::new(
@@ -637,7 +641,6 @@ fn test_seed_chains_through_entire_run() {
     let make = || EngineOptions {
         seed: Some(777),
         num_threads: 2,
-        dropout_prob: 0.0,
         ..test_options()
     };
     let mut a = Engine::new(
@@ -698,7 +701,6 @@ fn test_reproduce_from_engine_json() {
     let opts = EngineOptions {
         seed: Some(555),
         num_threads: 2,
-        dropout_prob: 0.0,
         ..test_options()
     };
     let mut first = Engine::new(
@@ -820,7 +822,6 @@ fn test_resume_from_checkpoint_continues_exactly() {
         num_generations: Some(gens),
         seed: Some(31337),
         num_threads: 2,
-        dropout_prob: 0.0,
         results_dir: std::env::temp_dir().join(format!("gras_resume_res_{}", fastrand::u64(..))),
         ..test_options()
     };

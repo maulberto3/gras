@@ -194,6 +194,9 @@ impl Engine {
     /// individual's `seed` is its *topology* seed (weight init, also inside
     /// the embedded topology), and `dropout_prob`/`seed` inside the topology
     /// JSON make the saved graph self-describing for `Network::build`.
+    /// `fitness_mean`/`eval_loss_mean` are the means of the **final** eval
+    /// pass (ranking + parity); `train_losses` holds the per-step train
+    /// curve and `eval_losses` the per-epoch eval-pass means.
     pub(crate) fn save_gen_data(&self, stats: &GenStats) -> std::result::Result<(), EngineError> {
         let dir = self.run_dir.join("improvements");
         fs::create_dir_all(&dir).map_err(|source| EngineError::Io {
@@ -216,8 +219,8 @@ impl Engine {
                 "idx": i,
                 "seed": topo.options.seed,
                 "dropout_prob": topo.options.dropout_prob,
-                "fitness": fitness,
-                "loss": loss,
+                "fitness_mean": fitness,
+                "eval_loss_mean": loss,
                 "params": params,
                 "train_losses": train_losses,
                 "eval_losses": eval_losses,

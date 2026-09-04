@@ -50,8 +50,6 @@ pub struct EngineOptions {
     pub crossover: Option<CrossoverMethod>,
     /// Mutation strategy.
     pub mutation: MutationMethod,
-    /// Dropout probability for hidden nodes (0.0 = no dropout).
-    pub dropout_prob: f32,
     /// Deduplicate population by full topology comparison.
     pub dedup_pop_and_fill: bool,
     /// Number of top individuals to preserve untouched each generation.
@@ -89,8 +87,6 @@ impl Default for EngineOptions {
             standardize_op_pool: vec![], // empty = all built-ins
             // ── Labels ─────────────────────────────────────────────
             fitness_label: FitnessLabel::default(),
-            // ── Network ───────────────────────────────────────────────
-            dropout_prob: 0.1,
             // ── Genetics ──────────────────────────────────────────────
             selection: None,
             crossover: None,
@@ -100,13 +96,16 @@ impl Default for EngineOptions {
 
 impl EngineOptions {
     /// Derive topology options for one individual (clone template + override
-    /// seed and dropout). `dropout_prob` is written into the blueprint so the
-    /// saved graph is self-describing — [`Network::build`] then reproduces
-    /// the exact net the engine built, without needing `EngineOptions`.
-    pub(crate) fn derive_topology_options(&self, seed: usize) -> TopologyOptions {
+    /// seed and dropout). `dropout_prob` comes from the *trainer* (a training
+    /// hyperparameter, not an evolution setting) and is written into the
+    /// blueprint so the saved graph is self-describing —
+    /// [`Network::build`](crate::graph::network::Network::build) then
+    /// reproduces the exact net the engine built, without needing either
+    /// `EngineOptions` or the trainer's config.
+    pub(crate) fn derive_topology_options(&self, seed: usize, dropout_prob: f32) -> TopologyOptions {
         let mut t = self.topology_options;
         t.seed = seed;
-        t.dropout_prob = self.dropout_prob;
+        t.dropout_prob = dropout_prob;
         t
     }
 
@@ -228,10 +227,6 @@ impl EngineOptionsBuilder {
         self
     }
 
-    pub fn set_dropout_prob(mut self, p: f32) -> Self {
-        self.inner.dropout_prob = p.clamp(0.0, 1.0);
-        self
-    }
     pub fn set_crossover(mut self, kind: CrossoverMethod) -> Self {
         self.inner.crossover = Some(kind);
         self

@@ -144,9 +144,9 @@ pub struct Engine {
     scores: Vec<f32>,
     eval_losses: Vec<Option<f32>>,
     param_counts: Vec<usize>,
-    /// Per-individual per-epoch mean training loss (gen JSON curves).
+    /// Per-individual per-step training loss (gen JSON curves).
     train_loss_curves: Vec<Vec<f32>>,
-    /// Per-individual per-epoch mean held-out loss (gen JSON curves).
+    /// Per-individual per-epoch eval-pass mean loss (gen JSON curves).
     eval_loss_curves: Vec<Vec<f32>>,
     /// Topology robustness tracker — keyed by topology JSON.
     robustness: std::collections::HashMap<String, RobustnessEntry>,
@@ -216,7 +216,11 @@ impl Engine {
         options.topology_options.output_dim = trainer.output_dim();
 
         // Step 4: Create population
-        let mut pop = Self::create_population(&options, config.pop_size, seed)?;
+        // Dropout is a training hyperparameter — sourced from the trainer
+        // (the engine itself owns no dropout setting) and embedded into each
+        // topology so saved graphs are self-describing.
+        let dropout_prob = trainer.dropout_prob();
+        let mut pop = Self::create_population(&options, config.pop_size, seed, dropout_prob)?;
 
         // Step 4b: Warm start — inject prior topologies if provided
         for (idx, path) in options.prior_topology_paths.iter().enumerate() {
@@ -266,7 +270,7 @@ impl Engine {
         // checkpoint population is already the run's real frontier.
         if resume_state.is_none() && options.dedup_pop_and_fill {
             Self::dedup_population(&mut pop);
-            Self::refill_population(&options, config.pop_size, seed, 0, &mut pop);
+            Self::refill_population(&options, config.pop_size, seed, 0, dropout_prob, &mut pop);
         }
 
         // Log initialization
@@ -322,15 +326,18 @@ impl Engine {
     }
 
     /// Create a population of random topologies, seeded deterministically.
+    /// `dropout_prob` is the trainer's regularization knob (see
+    /// [`Trainer::dropout_prob`](crate::trainer::Trainer::dropout_prob)).
     fn create_population(
         options: &EngineOptions,
         pop_size: usize,
         seed: u64,
+        dropout_prob: f32,
     ) -> Result<Vec<Topology>> {
         let mut pop = Vec::with_capacity(pop_size);
         for i in 0..pop_size {
             let ind_seed = derive_seed(seed, i);
-            let graph = Self::create_individual(options, i, ind_seed);
+            let graph = Self::create_individual(options, i, ind_seed, dropout_prob);
             debug!(
                 "  ind[{i}] seed={} n_hidden={} nodes={} wires={}",
                 ind_seed,
@@ -349,13 +356,18 @@ impl Engine {
 
     /// Create a single random individual from engine pools.
     /// Shared by `create_population` and `refill_population`.
-    fn create_individual(options: &EngineOptions, id: usize, seed: u64) -> Topology {
+    fn create_individual(
+        options: &EngineOptions,
+        id: usize,
+        seed: u64,
+        dropout_prob: f32,
+    ) -> Topology {
         let mut rng = fastrand::Rng::with_seed(seed);
         let n_hidden = rng.usize(
             options.topology_options.min_hidden_num_nodes
                 ..=options.topology_options.max_hidden_num_nodes,
         );
-        let ind_opts = options.derive_topology_options(seed as usize);
+        let ind_opts = options.derive_topology_options(seed as usize, dropout_prob);
         let mut graph = Topology::new(id, Some(ind_opts));
         graph.create_random_hidden_nodes(n_hidden);
         let pool_len_a = options.activation_pool.len();
@@ -407,6 +419,7 @@ impl Engine {
         target: usize,
         seed: u64,
         generation: usize,
+        dropout_prob: f32,
         pop: &mut Vec<Topology>,
     ) -> usize {
         if pop.len() >= target {
@@ -418,7 +431,7 @@ impl Engine {
         for k in 0..needed {
             let ind_seed = derive_seed(seed, base_offset + k);
             let id = pop.len();
-            let graph = Self::create_individual(options, id, ind_seed);
+            let graph = Self::create_individual(options, id, ind_seed, dropout_prob);
             debug!(
                 "  refill[{id}] seed={} n_hidden={} nodes={} wires={}",
                 ind_seed,
@@ -762,6 +775,7 @@ impl Engine {
             self.config.pop_size,
             self.seed,
             self.generation,
+            self.trainer.dropout_prob(),
             &mut self.pop,
         );
         // Post-refill safety: catch any accidental duplicates between refilled
