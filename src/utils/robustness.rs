@@ -4,7 +4,7 @@
 //! running min/max/mean/stddev for fitness and loss via Welford's algorithm.
 
 /// Tracks how often a topology appears across generations.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RobustnessEntry {
     pub count: usize,
     pub min_fitness: f32,

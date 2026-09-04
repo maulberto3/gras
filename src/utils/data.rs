@@ -180,6 +180,59 @@ pub fn load_tensor(path: &Path) -> Result<Tensor> {
 
 // ── datasets ─────────────────────────────────────────────────────────────
 
+/// On-disk format for [`save_dataset_as`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataFormat {
+    /// flodl-native binary tensors (`inputs.bin` + `targets.bin` + a
+    /// human-readable `meta.json`). Lossless and fast to load — the
+    /// engine's native format.
+    Bin,
+    /// Plain-text floats (`inputs.csv` + `targets.csv`, 6-decimal
+    /// precision). Human-inspectable and portable; lossy for full f32
+    /// precision.
+    Csv,
+    /// Write **both** formats into `dir`, so the same dataset is usable
+    /// by tools that only read one or the other.
+    Both,
+}
+
+/// Save a dataset in the requested format — the one-stop convenience
+/// over [`save_dataset`] (`.bin`) and [`save_csv_dataset`] (`.csv`).
+/// With [`DataFormat::Both`] the directory ends up with `inputs.bin` +
+/// `targets.bin` + `inputs.csv` + `targets.csv`.
+pub fn save_dataset_as(dir: &Path, ds: &Dataset, format: DataFormat) -> Result<()> {
+    match format {
+        DataFormat::Bin => save_dataset(dir, ds),
+        DataFormat::Csv => save_csv_dataset(dir, &ds.inputs, &ds.targets),
+        DataFormat::Both => {
+            save_dataset(dir, ds)?;
+            save_csv_dataset(dir, &ds.inputs, &ds.targets)
+        }
+    }
+}
+
+/// Load a dataset written in **either** format — the read-side counterpart
+/// of [`save_dataset_as`]. Looks for `inputs.bin` (native) first, then
+/// `inputs.csv`; errors if the directory holds neither. Unlike
+/// [`resolve_dataset`] it does no CSV→bin caching — pure "read what's
+/// there".
+pub fn load_dataset_auto(dir: &Path) -> Result<Dataset> {
+    if dir.join("inputs.bin").exists() {
+        return load_dataset(dir);
+    }
+    if dir.join("inputs.csv").exists() {
+        return load_csv_dataset(dir);
+    }
+    Err(DataError::Io {
+        path: dir.display().to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no inputs.bin or inputs.csv found in {}", dir.display()),
+        ),
+    }
+    .into())
+}
+
 /// Save a dataset into `dir` as `inputs.bin` + `targets.bin`, plus a
 /// human-readable `meta.json` with the tensor shapes (informational only).
 pub fn save_dataset(dir: &Path, ds: &Dataset) -> Result<()> {
@@ -598,6 +651,58 @@ mod tests {
         std::fs::write(dir.join("targets.csv"), "# another comment\n0.0\n1.0\n").unwrap();
         let ds = load_csv_dataset(&dir).unwrap();
         assert_eq!(ds.inputs.shape(), &[2, 2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── convenience helpers ───────────────────────────────────────────────
+
+    /// `save_dataset_as` writes what the matching `load_dataset_auto` reads,
+    /// in every format (bin-only dirs, csv-only dirs, both).
+    #[test]
+    fn test_save_dataset_as_roundtrip_all_formats() {
+        let mut rng = fastrand::Rng::with_seed(7);
+        let data: Vec<f32> = (0..24).map(|_| rng.f32()).collect();
+        let ds = Dataset {
+            inputs: Tensor::from_f32(&data, &[8, 3], Device::CPU).unwrap(),
+            targets: Tensor::from_f32(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0], &[8, 1], Device::CPU).unwrap(),
+        };
+
+        for fmt in [DataFormat::Bin, DataFormat::Csv, DataFormat::Both] {
+            let dir = std::env::temp_dir().join(format!("gras_data_fmt_{:?}", fmt));
+            let _ = std::fs::remove_dir_all(&dir);
+            save_dataset_as(&dir, &ds, fmt).unwrap();
+            // Whatever was written, the auto-loader must read it back.
+            let loaded = load_dataset_auto(&dir).unwrap();
+            assert_eq!(loaded.inputs.shape(), ds.inputs.shape());
+            assert_eq!(loaded.targets.shape(), ds.targets.shape());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Both writes bin + csv into the same dir.
+        let dir = std::env::temp_dir().join("gras_data_fmt_Both_files");
+        let _ = std::fs::remove_dir_all(&dir);
+        save_dataset_as(&dir, &ds, DataFormat::Both).unwrap();
+        assert!(dir.join("inputs.bin").exists(), "Bin part of Both");
+        assert!(dir.join("inputs.csv").exists(), "Csv part of Both");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `load_dataset_auto` prefers .bin when both formats are present.
+    #[test]
+    fn test_load_dataset_auto_prefers_bin() {
+        let mut rng = fastrand::Rng::with_seed(11);
+        let data: Vec<f32> = (0..16).map(|_| rng.f32()).collect();
+        let ds = Dataset {
+            inputs: Tensor::from_f32(&data, &[8, 2], Device::CPU).unwrap(),
+            targets: Tensor::from_f32(&data, &[8, 2], Device::CPU).unwrap(),
+        };
+        let dir = std::env::temp_dir().join("gras_data_auto_prefer");
+        let _ = std::fs::remove_dir_all(&dir);
+        save_dataset_as(&dir, &ds, DataFormat::Both).unwrap();
+        let loaded = load_dataset_auto(&dir).unwrap();
+        // .bin is exact f32; .csv would have rounded to 6 decimals — check
+        // a value that exposes rounding if the CSV were picked.
+        assert_eq!(loaded.inputs.to_f32_vec().unwrap(), data, "must load .bin");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
