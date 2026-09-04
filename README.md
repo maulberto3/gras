@@ -277,6 +277,42 @@ Everything else has conservative defaults. Set only what your experiment needs:
 | `prior_topology_paths` | `[]` (empty) | `.set_prior_topology("some_topology.json")` — add one path |
 | | | `.set_prior_topologies(vec!["a.json", "b.json"])` — add multiple |
 
+#### Resume
+
+| Option | Default | Builder method |
+|--------|---------|---------------|
+| `resume_from` | None | `.set_resume_from("results/<run_id>")` — continue a previous run |
+
+Every run writes `checkpoint.json` (at start and after each generation) with
+the frontier population, its topology RNG states, and the `run_seed`. Point
+`set_resume_from` at a run directory to continue it **exactly** where it left
+off: the population is restored, the generation counter continues, and
+`num_generations` counts **additional** generations. Useful when a search
+stalled, got interrupted, or simply didn't converge within its budget:
+
+```rust
+let opts = EngineOptions::builder()
+    .set_pop_size(20)
+    .set_num_generations(30)                    // 30 MORE generations
+    .set_resume_from("results/1788412866750")  // previous run dir
+    .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
+    .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.25 })
+    .set_mutation(MutationMethod::Activation { prob: 0.1 })
+    .build()?;
+```
+
+Because genetics are seeded from the run's `run_seed` + generation counter
+(and the checkpoint restores each topology's RNG position), a resumed run is
+bit-identical to one uninterrupted run with the combined generation count —
+same scores, population, history, and robustness. Notes:
+
+- Keep `pop_size` / `selection` / `crossover` / `mutation` the same as the
+  source run to stay on the original trajectory (a mismatch on `pop_size`
+  warns; differing genetics deliberately branch the search from the frontier).
+- Resumed artifacts go to a **new** run dir — the source run's files are
+  never touched.
+- Mutually exclusive with `set_prior_topology(ies)`.
+
 ## Fitness
 
 You bring your own fitness function — it ranks individuals for selection:
@@ -372,20 +408,28 @@ magic "GRA1" (4 bytes) | dtype tag (1 byte) | ndim (u64 LE)
 
 ### Reading & writing data in code
 
+The one-stop helpers read **either** format and write **either or both**:
+
 ```rust
-use gras::data::{resolve_dataset, save_dataset};
+use gras::data::{DataFormat, load_dataset_auto, save_dataset_as, Dataset};
 
 // Write a Dataset (inputs [n, in_dim] + targets [n, out_dim]) to a directory:
-save_dataset(Path::new("data/my_problem"), &ds).unwrap(); // inputs.bin + targets.bin + meta.json
+save_dataset_as(Path::new("data/my_problem"), &ds, DataFormat::Bin).unwrap();   // .bin only
+save_dataset_as(Path::new("data/my_problem"), &ds, DataFormat::Csv).unwrap();   // .csv only
+save_dataset_as(Path::new("data/my_problem"), &ds, DataFormat::Both).unwrap();  // both at once
 
-// Load it back — .bin or .csv, conversion handled for you:
-let ds = resolve_dataset(Path::new("data/my_problem")).unwrap(); // Dataset { inputs, targets }
+// Read it back from .bin OR .csv — no need to know which was written:
+let ds: Dataset = load_dataset_auto(Path::new("data/my_problem")).unwrap();
 ```
 
 - `Dataset` is just `{ inputs: Tensor, targets: Tensor }`.
-- `save_tensor(path, &tensor)` / `load_tensor(path)` operate on a single
-  tensor file; `save_csv_dataset` / `load_csv_dataset` are the CSV
-  counterparts.
+- `resolve_dataset(dir)` is the engine's loader: it adds a `flodl_data/`
+  cache — CSV is parsed once, converted to `.bin`, and re-read from the
+  cache on later runs.
+- Lower-level siblings, all public and documented:
+  `save_dataset` / `load_dataset` (`.bin`), `save_csv_dataset` /
+  `load_csv_dataset` (`.csv`), `save_tensor(path, &t)` / `load_tensor(path)`
+  (one raw tensor file).
 - The engine itself only calls `resolve_dataset` — your `Trainer` provides
   `input_dim`/`output_dim`, which must match the loaded shapes.
 
@@ -414,9 +458,12 @@ Running `engine.run()` gives you three layers, from most to least durable:
 ```
 results/<run_id>/
 ├── engine.json                    # Full run config + whole-run robustness record
+├── checkpoint.json                # Frontier population + RNG states — resume target (see Resume)
 ├── robustness.csv                 # Every repeated topology, one row each — the analysis artifact
 ├── improvements/
-│   ├── gen_00.json                # All individuals (seed, fitness, loss, params, topology, topo_hash)
+│   ├── gen_00.json                # gen_seed + individuals (seed, dropout_prob, fitness,
+│   │                              #   loss, params, per-epoch train/eval loss curves,
+│   │                              #   topology, topo_hash)
 │   └── ...
 ```
 
@@ -481,6 +528,35 @@ plain text. Repeated topologies look like:
   rank   appearances      mean   std_dev      min      max    params  topo_id
   #1             44    0.6103    0.0873   0.4611   0.7855   121610  3a7f2b1c9d4e5f06
 ```
+
+## Reproducibility
+
+The contract: **same seed + same options ⇒ same training.** Every piece of
+the chain is seeded and recorded, so a saved run can be replayed bit-for-bit:
+
+| Component | Seeded by | Recorded in `gen_XX.json` |
+|-----------|-----------|---------------------------|
+| Initial weights | `topology.options.seed` (inside the embedded topology) | individual `seed` |
+| Dropout | `topology.options.dropout_prob` (applied at build) | individual `dropout_prob` |
+| Train/eval split | `gen_seed` → `split_indices` | top-level `gen_seed` |
+| Batch sequence | `gen_seed` (reseeded per epoch) | derived from `gen_seed` |
+| Dropout masks | `flodl::manual_seed(gen_seed)` per training call | derived from `gen_seed` |
+| Per-epoch curves | eval mode each epoch | individual `train_losses` / `eval_losses` |
+
+Notes:
+
+- `Network::build(topo, device)` derives `seed` and `dropout_prob` from the
+  topology itself, so rebuilding a saved topology reproduces the exact net
+  the engine evolved (no silent seed-0/dropout-0.05 divergence).
+- `Engine::gen_seed_for(generation)` exposes the per-generation trainer seed;
+  `train_network` seeds libtorch's RNG from it so dropout masks replay too.
+- Overfitting is visible per individual: `train_losses` and `eval_losses`
+  hold the per-epoch mean train/test loss, and the last `eval_losses` entry
+  equals the individual's `loss`.
+- `cargo run --example train_from_gen -- results/<run_id> <gen_idx> <idx>`
+  replays one individual from its gen JSON and **self-checks** the achieved
+  fitness/loss/curves against the recorded values — a mismatch means the
+  reconstruction (config, loss, fitness) differs from the original run.
 
 ## Citing gras
 
