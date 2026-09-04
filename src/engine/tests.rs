@@ -16,8 +16,8 @@ fn test_trainer() -> crate::trainer::supervised::SupervisedTrainer {
     let dir = temp_data_dir();
     crate::trainer::supervised::SupervisedTrainer::new(
         &dir,
-        1,  // input_dim
-        1,  // output_dim
+        1, // input_dim
+        1, // output_dim
         crate::trainer::supervised::TrainingConfig {
             num_epochs: 1,
             ..Default::default()
@@ -40,8 +40,7 @@ fn test_options() -> EngineOptions {
         selection: Some(SelectionMethod::Tournament { tournament_size: 2 }),
         crossover: Some(CrossoverMethod::OnePoint { action_prob: 0.5 }),
         mutation: MutationMethod::Activation { prob: 0.1 },
-        results_dir: std::env::temp_dir()
-            .join(format!("gras_engine_res_{}", fastrand::u64(..))),
+        results_dir: std::env::temp_dir().join(format!("gras_engine_res_{}", fastrand::u64(..))),
 
         ..Default::default()
     }
@@ -52,8 +51,12 @@ fn test_engine_runs_and_checkpoints() {
     let data_dir = temp_data_dir();
     let mut engine = Engine::new(
         test_options(),
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
-            test_trainer(),
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
+        test_trainer(),
     )
     .unwrap();
     engine.run().unwrap();
@@ -71,9 +74,12 @@ fn test_engine_runs_and_checkpoints() {
     assert_eq!(json_files.len(), num_gens);
     // Load the last generation's data
     let last_gen = num_gens - 1;
-    let gen_file = format!("gen_{:0width$}.json", last_gen, width = super::gen_width(num_gens));
-    let latest_json =
-        std::fs::read_to_string(imp_dir.join(&gen_file)).unwrap();
+    let gen_file = format!(
+        "gen_{:0width$}.json",
+        last_gen,
+        width = super::gen_width(num_gens)
+    );
+    let latest_json = std::fs::read_to_string(imp_dir.join(&gen_file)).unwrap();
     let v: serde_json::Value = serde_json::from_str(&latest_json).unwrap();
     // Verify gen JSON structure
     assert_eq!(v["generation"].as_u64().unwrap() as usize, last_gen);
@@ -101,8 +107,15 @@ fn test_engine_runs_and_checkpoints() {
 fn test_gen_json_topo_hash_is_canonical() {
     let data_dir = temp_data_dir();
     let mut engine = Engine::new(
-        EngineOptions { seed: Some(321), ..test_options() },
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+        EngineOptions {
+            seed: Some(321),
+            ..test_options()
+        },
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
         test_trainer(),
     )
     .unwrap();
@@ -117,6 +130,13 @@ fn test_gen_json_topo_hash_is_canonical() {
         let stem = format!("gen_{g:0width$}");
         let raw = std::fs::read_to_string(imp_dir.join(format!("{stem}.json"))).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // gen_seed is recorded and matches the public derivation formula
+        // (reproducibility contract: replays use it for splits/batches).
+        assert_eq!(
+            v["gen_seed"].as_u64().unwrap(),
+            crate::engine::derive_seed(321, g),
+            "gen_seed must equal derive_seed(run_seed, generation)"
+        );
         for ind in v["individuals"].as_array().unwrap() {
             let topo_json = ind["topology"].as_str().unwrap();
             let stored = ind["topo_hash"].as_str().unwrap();
@@ -126,6 +146,35 @@ fn test_gen_json_topo_hash_is_canonical() {
                 crate::utils::log_utils::topo_hash(topo_json),
                 "topo_hash must match the canonical xxh3 hash of the topology"
             );
+            // Self-describing individual: dropout_prob recorded, and the
+            // embedded topology carries the same seed + dropout the engine
+            // built the net with.
+            let topo: crate::graph::topology::Topology =
+                serde_json::from_str(topo_json).unwrap();
+            assert_eq!(ind["seed"].as_u64().unwrap() as usize, topo.options.seed);
+            assert!(
+                ind["dropout_prob"].as_f64().is_some(),
+                "individual must record dropout_prob"
+            );
+            // Per-epoch curves (D1): SupervisedTrainer ran 1 epoch here, so
+            // each individual carries 1-entry curves and its final eval_loss
+            // equals the recorded `loss`.
+            let train: Vec<f32> = ind["train_losses"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap() as f32).collect())
+                .unwrap_or_default();
+            let eval: Vec<f32> = ind["eval_losses"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap() as f32).collect())
+                .unwrap_or_default();
+            assert_eq!(train.len(), 1, "train curve must cover the 1 epoch");
+            assert_eq!(eval.len(), 1, "eval curve must cover the 1 epoch");
+            if let Some(loss) = ind["loss"].as_f64() {
+                assert!(
+                    (eval[eval.len() - 1] as f64 - loss).abs() < 1e-6,
+                    "final eval_losses entry must equal the recorded loss"
+                );
+            }
             run_hashes.insert(stored.to_string());
         }
     }
@@ -152,7 +201,11 @@ fn test_select_keeps_metrics_in_lockstep() {
     let data_dir = temp_data_dir();
     let mut engine = Engine::new(
         test_options(),
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
         test_trainer(),
     )
     .unwrap();
@@ -172,8 +225,16 @@ fn test_select_keeps_metrics_in_lockstep() {
     assert_eq!(engine.param_counts.len(), n);
     for i in 0..n {
         let s = engine.scores[i];
-        assert_eq!(engine.eval_losses[i], Some(s * 2.0), "loss out of lockstep at {i}");
-        assert_eq!(engine.param_counts[i], s as usize * 10 + 1, "params out of lockstep at {i}");
+        assert_eq!(
+            engine.eval_losses[i],
+            Some(s * 2.0),
+            "loss out of lockstep at {i}"
+        );
+        assert_eq!(
+            engine.param_counts[i],
+            s as usize * 10 + 1,
+            "params out of lockstep at {i}"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&data_dir);
@@ -185,8 +246,12 @@ fn test_engine_to_json_replicates_experiment() {
     let data_dir = temp_data_dir();
     let mut engine = Engine::new(
         test_options(),
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
-            test_trainer(),
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
+        test_trainer(),
     )
     .unwrap();
     engine.run().unwrap();
@@ -227,12 +292,20 @@ fn test_engine_maximize_direction() {
         hidden_dim_pool: 4..=8,
         ..test_options()
     };
-    let mut eng =
-        Engine::new(opts.clone(), make_scorer(Direction::Maximize), test_trainer()).unwrap();
+    let mut eng = Engine::new(
+        opts.clone(),
+        make_scorer(Direction::Maximize),
+        test_trainer(),
+    )
+    .unwrap();
     eng.run().unwrap();
     let max_best = eng.scores().iter().copied().reduce(f32::max).unwrap();
-    let mut eng =
-        Engine::new(opts.clone(), make_scorer(Direction::Minimize), test_trainer()).unwrap();
+    let mut eng = Engine::new(
+        opts.clone(),
+        make_scorer(Direction::Minimize),
+        test_trainer(),
+    )
+    .unwrap();
     eng.run().unwrap();
     let min_best = eng.scores().iter().copied().reduce(f32::min).unwrap();
     assert!(max_best.is_finite());
@@ -255,7 +328,7 @@ fn test_engine_builder_chains_and_validates() {
         .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
         .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.5 })
         .set_mutation(MutationMethod::Activation { prob: 0.1 })
-                    .set_num_threads(2)
+        .set_num_threads(2)
         .build()
         .unwrap();
     assert_eq!(opts.pop_size, Some(15));
@@ -312,8 +385,12 @@ fn test_engine_builder_one_shot() {
         .unwrap();
     let mut engine = Engine::new(
         opts,
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
-            test_trainer(),
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
+        test_trainer(),
     )
     .unwrap();
     engine.run().unwrap();
@@ -343,14 +420,22 @@ fn test_engine_gp_sampling_varies_and_reproduces() {
     };
     let a = Engine::new(
         make_opts(),
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
-            test_trainer(),
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
+        test_trainer(),
     )
     .unwrap();
     let b = Engine::new(
         make_opts(),
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
-            test_trainer(),
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
+        test_trainer(),
     )
     .unwrap();
     let mut dims: Vec<usize> = Vec::new();
@@ -380,8 +465,12 @@ fn test_engine_new_leaves_no_folder() {
     let opts = test_options();
     let engine = Engine::new(
         opts.clone(),
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
-            test_trainer(),
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
+        test_trainer(),
     )
     .unwrap();
     assert!(!engine.run_dir.exists());
@@ -403,8 +492,12 @@ fn test_engine_random_seed_recorded() {
     };
     let mut engine = Engine::new(
         opts.clone(),
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
-            test_trainer(),
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
+        test_trainer(),
     )
     .unwrap();
     engine.run().unwrap();
@@ -412,8 +505,12 @@ fn test_engine_random_seed_recorded() {
     assert_eq!(v["run_seed"], engine.seed);
     let other = Engine::new(
         opts.clone(),
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
-            test_trainer(),
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
+        test_trainer(),
     )
     .unwrap();
     assert_ne!(other.seed, engine.seed);
@@ -432,14 +529,22 @@ fn test_engine_seeded_run_is_reproducible() {
     };
     let mut a = Engine::new(
         make(),
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
-            test_trainer(),
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
+        test_trainer(),
     )
     .unwrap();
     let mut b = Engine::new(
         make(),
-        Fitness::new(|p, y| Ok(mse_loss(p, y)?.item()? as f32), Direction::Minimize, "mse"),
-            test_trainer(),
+        Fitness::new(
+            |p, y| Ok(mse_loss(p, y)?.item()? as f32),
+            Direction::Minimize,
+            "mse",
+        ),
+        test_trainer(),
     )
     .unwrap();
     a.run().unwrap();
@@ -464,28 +569,56 @@ fn test_seed_flows_to_initial_population() {
         dropout_prob: 0.0,
         ..test_options()
     };
-    let a = Engine::new(make(), Fitness::new(mse_scorer(), Direction::Minimize, "mse"), test_trainer()).unwrap();
-    let b = Engine::new(make(), Fitness::new(mse_scorer(), Direction::Minimize, "mse"), test_trainer()).unwrap();
-
-    // Per-individual seed derivation: pop[i].options.seed == derive_seed(run_seed, i)
-    for (i, (ta, tb)) in a.pop.iter().zip(&b.pop).enumerate() {
-        assert_eq!(ta.options.seed as u64, derive_seed(a.seed, i), "ind {i} seed must derive from run_seed");
-        assert_eq!(ta.options.seed, tb.options.seed, "ind {i} seed matches across runs");
-    }
-
-    // Identical blueprints (Spec = JSON round-trip mirror of the topology)
-    for (i, (ta, tb)) in a.pop.iter().zip(&b.pop).enumerate() {
-        assert_eq!(crate::spec::Spec::from(ta), crate::spec::Spec::from(tb), "ind {i} blueprint");
-    }
-
-    // A different seed must produce a different population (at least one individual)
-    let c = Engine::new(
-        EngineOptions { seed: Some(2025), ..make() },
+    let a = Engine::new(
+        make(),
         Fitness::new(mse_scorer(), Direction::Minimize, "mse"),
         test_trainer(),
     )
     .unwrap();
-    let same = a.pop.iter().zip(&c.pop).all(|(ta, tc)| crate::spec::Spec::from(ta) == crate::spec::Spec::from(tc));
+    let b = Engine::new(
+        make(),
+        Fitness::new(mse_scorer(), Direction::Minimize, "mse"),
+        test_trainer(),
+    )
+    .unwrap();
+
+    // Per-individual seed derivation: pop[i].options.seed == derive_seed(run_seed, i)
+    for (i, (ta, tb)) in a.pop.iter().zip(&b.pop).enumerate() {
+        assert_eq!(
+            ta.options.seed as u64,
+            derive_seed(a.seed, i),
+            "ind {i} seed must derive from run_seed"
+        );
+        assert_eq!(
+            ta.options.seed, tb.options.seed,
+            "ind {i} seed matches across runs"
+        );
+    }
+
+    // Identical blueprints (Spec = JSON round-trip mirror of the topology)
+    for (i, (ta, tb)) in a.pop.iter().zip(&b.pop).enumerate() {
+        assert_eq!(
+            crate::spec::Spec::from(ta),
+            crate::spec::Spec::from(tb),
+            "ind {i} blueprint"
+        );
+    }
+
+    // A different seed must produce a different population (at least one individual)
+    let c = Engine::new(
+        EngineOptions {
+            seed: Some(2025),
+            ..make()
+        },
+        Fitness::new(mse_scorer(), Direction::Minimize, "mse"),
+        test_trainer(),
+    )
+    .unwrap();
+    let same = a
+        .pop
+        .iter()
+        .zip(&c.pop)
+        .all(|(ta, tc)| crate::spec::Spec::from(ta) == crate::spec::Spec::from(tc));
     assert!(!same, "different run_seed must change the population");
 
     let _ = std::fs::remove_dir_all(&data_dir);
@@ -507,8 +640,18 @@ fn test_seed_chains_through_entire_run() {
         dropout_prob: 0.0,
         ..test_options()
     };
-    let mut a = Engine::new(make(), Fitness::new(mse_scorer(), Direction::Minimize, "mse"), test_trainer()).unwrap();
-    let mut b = Engine::new(make(), Fitness::new(mse_scorer(), Direction::Minimize, "mse"), test_trainer()).unwrap();
+    let mut a = Engine::new(
+        make(),
+        Fitness::new(mse_scorer(), Direction::Minimize, "mse"),
+        test_trainer(),
+    )
+    .unwrap();
+    let mut b = Engine::new(
+        make(),
+        Fitness::new(mse_scorer(), Direction::Minimize, "mse"),
+        test_trainer(),
+    )
+    .unwrap();
     a.run().unwrap();
     b.run().unwrap();
 
@@ -518,11 +661,19 @@ fn test_seed_chains_through_entire_run() {
     assert_eq!(a.history, b.history, "per-generation history must match");
     // Final population identical (selection/crossover/mutation all seeded)
     for (i, (ta, tb)) in a.pop.iter().zip(&b.pop).enumerate() {
-        assert_eq!(crate::spec::Spec::from(ta), crate::spec::Spec::from(tb), "final pop ind {i}");
+        assert_eq!(
+            crate::spec::Spec::from(ta),
+            crate::spec::Spec::from(tb),
+            "final pop ind {i}"
+        );
     }
     // On-disk engine.json identical except run_id (time-based)
-    let ja: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(a.run_dir.join("engine.json")).unwrap()).unwrap();
-    let jb: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(b.run_dir.join("engine.json")).unwrap()).unwrap();
+    let ja: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(a.run_dir.join("engine.json")).unwrap())
+            .unwrap();
+    let jb: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(b.run_dir.join("engine.json")).unwrap())
+            .unwrap();
     assert_eq!(ja["run_seed"], jb["run_seed"]);
     // Compare options except results_dir (random temp dir differs per test)
     let mut oa = ja["options"].clone();
@@ -562,22 +713,43 @@ fn test_reproduce_from_engine_json() {
     let raw = std::fs::read_to_string(first.run_dir.join("engine.json")).unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let recorded_seed = v["run_seed"].as_u64().unwrap();
-    assert_eq!(recorded_seed, first.seed, "engine.json must record the actual run seed");
-    assert_eq!(v["options"]["seed"].as_u64(), Some(recorded_seed), "options block must carry the resolved seed");
+    assert_eq!(
+        recorded_seed, first.seed,
+        "engine.json must record the actual run seed"
+    );
+    assert_eq!(
+        v["options"]["seed"].as_u64(),
+        Some(recorded_seed),
+        "options block must carry the resolved seed"
+    );
 
     // Rebuild a fresh engine from the JSON: same seed + same options
     let mut replay = Engine::new(
-        EngineOptions { seed: Some(recorded_seed), ..opts.clone() },
+        EngineOptions {
+            seed: Some(recorded_seed),
+            ..opts.clone()
+        },
         Fitness::new(mse_scorer(), Direction::Minimize, "mse"),
         test_trainer(),
     )
     .unwrap();
     replay.run().unwrap();
 
-    assert_eq!(first.scores(), replay.scores(), "scores must reproduce from engine.json");
-    assert_eq!(first.history, replay.history, "history must reproduce from engine.json");
+    assert_eq!(
+        first.scores(),
+        replay.scores(),
+        "scores must reproduce from engine.json"
+    );
+    assert_eq!(
+        first.history, replay.history,
+        "history must reproduce from engine.json"
+    );
     for (i, (ta, tb)) in first.pop.iter().zip(&replay.pop).enumerate() {
-        assert_eq!(crate::spec::Spec::from(ta), crate::spec::Spec::from(tb), "pop ind {i} must reproduce");
+        assert_eq!(
+            crate::spec::Spec::from(ta),
+            crate::spec::Spec::from(tb),
+            "pop ind {i} must reproduce"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&data_dir);
@@ -602,10 +774,16 @@ fn test_auto_seed_recorded_in_options() {
     )
     .unwrap();
     engine.run().unwrap();
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(engine.run_dir.join("engine.json")).unwrap()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(engine.run_dir.join("engine.json")).unwrap())
+            .unwrap();
     let run_seed = v["run_seed"].as_u64().unwrap();
     assert_ne!(run_seed, 0);
-    assert_eq!(v["options"]["seed"].as_u64(), Some(run_seed), "auto seed must be written back into options");
+    assert_eq!(
+        v["options"]["seed"].as_u64(),
+        Some(run_seed),
+        "auto seed must be written back into options"
+    );
     let _ = std::fs::remove_dir_all(&data_dir);
     let _ = std::fs::remove_dir_all(&opts.results_dir);
 }
@@ -614,11 +792,199 @@ fn mse_scorer() -> impl Fn(&flodl::Variable, &flodl::Variable) -> flodl::tensor:
     |p, y| Ok(mse_loss(p, y)?.item()? as f32)
 }
 
+/// Trainer over a shared data dir — resume tests need byte-identical data
+/// across the interrupted run, the resumed run, and the uninterrupted control.
+fn shared_trainer(data_dir: &PathBuf) -> crate::trainer::supervised::SupervisedTrainer {
+    crate::trainer::supervised::SupervisedTrainer::new(
+        data_dir,
+        1,
+        1,
+        crate::trainer::supervised::TrainingConfig {
+            num_epochs: 1,
+            ..Default::default()
+        },
+        |p, y| mse_loss(p, y),
+    )
+    .unwrap()
+}
+
+/// Resume must be a seamless continuation: a run split at the frontier
+/// (A runs 3 gens, then B resumes for 2 more via set_resume_from) must be
+/// bit-identical — scores, population, history, robustness, engine.json — to
+/// one uninterrupted run (C) with the combined 5 generations.
+#[test]
+fn test_resume_from_checkpoint_continues_exactly() {
+    let data_dir = temp_data_dir();
+    let make_opts = |gens: usize| EngineOptions {
+        pop_size: Some(4),
+        num_generations: Some(gens),
+        seed: Some(31337),
+        num_threads: 2,
+        dropout_prob: 0.0,
+        results_dir: std::env::temp_dir().join(format!("gras_resume_res_{}", fastrand::u64(..))),
+        ..test_options()
+    };
+
+    // A: 3 generations, completed normally.
+    let mut a = Engine::new(
+        make_opts(3),
+        Fitness::new(mse_scorer(), Direction::Minimize, "mse"),
+        shared_trainer(&data_dir),
+    )
+    .unwrap();
+    a.run().unwrap();
+    assert!(
+        a.run_dir.join("checkpoint.json").exists(),
+        "run must write checkpoint.json"
+    );
+    assert_eq!(a.generation, 3);
+
+    // B: resume A's run dir for 2 more generations.
+    let mut b_opts = make_opts(2);
+    b_opts.resume_from = Some(a.run_dir.clone());
+    let mut b = Engine::new(
+        b_opts,
+        Fitness::new(mse_scorer(), Direction::Minimize, "mse"),
+        shared_trainer(&data_dir),
+    )
+    .unwrap();
+    assert_eq!(b.generation, 3, "resume starts at the checkpoint frontier");
+    assert_eq!(b.seed, a.seed, "resume inherits the run seed");
+    assert_eq!(
+        b.pop.len(),
+        a.pop.len(),
+        "resume inherits the frontier population"
+    );
+    for (i, (ta, tb)) in a.pop.iter().zip(&b.pop).enumerate() {
+        assert_eq!(
+            crate::spec::Spec::from(ta),
+            crate::spec::Spec::from(tb),
+            "frontier pop ind {i}"
+        );
+    }
+    assert_eq!(
+        b.history, a.history,
+        "resume restores the source run's history"
+    );
+    b.run().unwrap();
+    assert_eq!(b.generation, 5);
+
+    // C: the same 5 generations in one uninterrupted run.
+    let mut c = Engine::new(
+        make_opts(5),
+        Fitness::new(mse_scorer(), Direction::Minimize, "mse"),
+        shared_trainer(&data_dir),
+    )
+    .unwrap();
+    c.run().unwrap();
+
+    // The resumed run must match the uninterrupted run exactly.
+    assert_eq!(
+        b.scores(),
+        c.scores(),
+        "final scores must match the uninterrupted run"
+    );
+    assert_eq!(
+        b.history.len(),
+        c.history.len(),
+        "history must span the whole search"
+    );
+    assert_eq!(
+        b.history, c.history,
+        "history must match the uninterrupted run"
+    );
+    for (i, (tb, tc)) in b.pop.iter().zip(&c.pop).enumerate() {
+        assert_eq!(
+            crate::spec::Spec::from(tb),
+            crate::spec::Spec::from(tc),
+            "final pop ind {i}"
+        );
+    }
+
+    // On-disk artifacts are continuous and identical to the control.
+    let jb: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(b.run_dir.join("engine.json")).unwrap())
+            .unwrap();
+    let jc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(c.run_dir.join("engine.json")).unwrap())
+            .unwrap();
+    assert_eq!(jb["generation"], 5);
+    assert_eq!(
+        jb["history"], jc["history"],
+        "engine.json history must match"
+    );
+    assert_eq!(
+        jb["robustness"], jc["robustness"],
+        "engine.json robustness must match"
+    );
+    // B's gen snapshots continue the numbering from the frontier.
+    assert!(b.run_dir.join("improvements").join("gen_3.json").exists());
+    assert!(b.run_dir.join("improvements").join("gen_4.json").exists());
+    assert!(
+        !b.run_dir.join("improvements").join("gen_0.json").exists(),
+        "no gen re-run below the frontier"
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::remove_dir_all(&a.options.results_dir);
+    let _ = std::fs::remove_dir_all(&b.options.results_dir);
+    let _ = std::fs::remove_dir_all(&c.options.results_dir);
+}
+
+#[test]
+fn test_resume_requires_checkpoint() {
+    let data_dir = temp_data_dir();
+    let dir = std::env::temp_dir().join(format!("gras_no_ckpt_{}", fastrand::u64(..)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let opts = EngineOptions {
+        resume_from: Some(dir.clone()),
+        ..test_options()
+    };
+    let res = Engine::new(
+        opts,
+        Fitness::new(mse_scorer(), Direction::Minimize, "mse"),
+        test_trainer(),
+    );
+    assert!(
+        res.is_err(),
+        "resume from a dir without checkpoint.json must fail"
+    );
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_resume_and_prior_topology_are_exclusive() {
+    let res = EngineOptions::builder()
+        .set_pop_size(4)
+        .set_num_generations(1)
+        .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
+        .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.5 })
+        .set_mutation(MutationMethod::Activation { prob: 0.1 })
+        .set_resume_from("results/some_run")
+        .set_prior_topology("results/some_run/engine.json")
+        .build();
+    assert!(res.is_err(), "resume + prior topology must be rejected");
+    // resume alone is fine at build time (existence is checked at Engine::new).
+    let ok = EngineOptions::builder()
+        .set_pop_size(4)
+        .set_num_generations(1)
+        .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
+        .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.5 })
+        .set_mutation(MutationMethod::Activation { prob: 0.1 })
+        .set_resume_from("results/some_run")
+        .build();
+    assert!(ok.is_ok());
+}
+
 #[test]
 fn test_fitness_custom_sees_pred_and_target() {
     let data_dir = temp_data_dir();
-    let fitness =
-        Fitness::new(|pred, y| Ok(flodl::l1_loss(pred, y)?.item()? as f32), Direction::Minimize, "l1");
+    let fitness = Fitness::new(
+        |pred, y| Ok(flodl::l1_loss(pred, y)?.item()? as f32),
+        Direction::Minimize,
+        "l1",
+    );
     let opts = EngineOptions {
         num_generations: Some(1),
         ..test_options()

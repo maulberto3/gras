@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use flodl::tensor::Result;
 use serde::Serialize;
 
+use crate::engine::fitness::FitnessLabel;
 use crate::evolution::crossover::CrossoverMethod;
 use crate::evolution::mutation::MutationMethod;
 use crate::evolution::selection::SelectionMethod;
-use crate::engine::fitness::FitnessLabel;
 use crate::graph::node::Activation;
 use crate::graph::topology::{CombineOp, TopologyOptions};
 use crate::utils::error::EngineError;
@@ -58,6 +58,11 @@ pub struct EngineOptions {
     pub elite_count: usize,
     /// Paths to prior engine.json or improvement JSON files.
     pub prior_topology_paths: Vec<PathBuf>,
+    /// Resume a previous run: path to a run directory containing a
+    /// `checkpoint.json`. The checkpoint's population + `run_seed` replace
+    /// the fresh random population, the generation counter continues from the
+    /// checkpoint, and `num_generations` counts **additional** generations.
+    pub resume_from: Option<PathBuf>,
 }
 
 impl Default for EngineOptions {
@@ -68,18 +73,19 @@ impl Default for EngineOptions {
             num_generations: None,
             mutation: MutationMethod::default(), // prob=0 → build() rejects unless user calls set_mutation()
             // ── Engine ────────────────────────────────────────────────
-            seed: None,              // random if not set
+            seed: None, // random if not set
             num_threads: 1,
             results_dir: PathBuf::from("results"),
             dedup_pop_and_fill: false,
             elite_count: 2,
             prior_topology_paths: vec![],
+            resume_from: None,
             // ── Topology / GP pools ───────────────────────────────────
             topology_options: TopologyOptions::default(),
             hidden_dim_pool: 4..=8,
             hidden_dim_stride: 1,
-            combine_op_pool: vec![],   // empty = all built-ins
-            activation_pool: vec![],   // empty = all built-ins
+            combine_op_pool: vec![],     // empty = all built-ins
+            activation_pool: vec![],     // empty = all built-ins
             standardize_op_pool: vec![], // empty = all built-ins
             // ── Labels ─────────────────────────────────────────────
             fitness_label: FitnessLabel::default(),
@@ -93,10 +99,14 @@ impl Default for EngineOptions {
 }
 
 impl EngineOptions {
-    /// Derive topology options for one individual (clone template + override seed).
+    /// Derive topology options for one individual (clone template + override
+    /// seed and dropout). `dropout_prob` is written into the blueprint so the
+    /// saved graph is self-describing — [`Network::build`] then reproduces
+    /// the exact net the engine built, without needing `EngineOptions`.
     pub(crate) fn derive_topology_options(&self, seed: usize) -> TopologyOptions {
         let mut t = self.topology_options;
         t.seed = seed;
+        t.dropout_prob = self.dropout_prob;
         t
     }
 
@@ -159,6 +169,15 @@ impl EngineOptionsBuilder {
         if o.mutation.prob() <= 0.0 {
             return Err(EngineError::InvalidOptions(
                 "set_mutation() is required — choose MutationMethod::Activation, CombineOp, or Standardize"
+                    .into(),
+            )
+            .into());
+        }
+        // Resume replaces the population wholesale — it cannot be combined
+        // with warm-starting individual topologies into a fresh population.
+        if o.resume_from.is_some() && !o.prior_topology_paths.is_empty() {
+            return Err(EngineError::InvalidOptions(
+                "set_resume_from() and set_prior_topology() are mutually exclusive — resume replaces the population, warm start injects into a fresh one"
                     .into(),
             )
             .into());
@@ -234,7 +253,18 @@ impl EngineOptionsBuilder {
         self
     }
     pub fn set_prior_topologies(mut self, paths: Vec<impl Into<PathBuf>>) -> Self {
-        self.inner.prior_topology_paths.extend(paths.into_iter().map(|p| p.into()));
+        self.inner
+            .prior_topology_paths
+            .extend(paths.into_iter().map(|p| p.into()));
+        self
+    }
+    /// Resume from a previous run's directory (must contain `checkpoint.json`,
+    /// written at run start and after every generation). The resumed run
+    /// continues with the checkpoint's population and `run_seed`; set
+    /// `num_generations` to the number of **additional** generations to run.
+    /// Mutually exclusive with `set_prior_topology(ies)`.
+    pub fn set_resume_from(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.inner.resume_from = Some(dir.into());
         self
     }
 

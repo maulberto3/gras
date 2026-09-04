@@ -12,12 +12,12 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use flodl::tensor::Result;
 use log::debug;
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+pub use self::fitness::{Direction, Fitness, FitnessLabel};
 pub use crate::evolution::crossover::CrossoverMethod;
 pub use crate::evolution::mutation::MutationMethod;
 pub use crate::evolution::selection::SelectionMethod;
-pub use self::fitness::{Direction, Fitness, FitnessLabel};
 use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
 use crate::graph::topology::Topology;
@@ -35,7 +35,7 @@ mod tests;
 // ── Generation statistics and robustness tracking ─────────────────────────────────
 
 /// Per-generation metrics, always saved.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GenerationStats {
     pub generation: usize,
     pub avg_score: f32,
@@ -80,7 +80,9 @@ pub(crate) fn compute_gen_stats(
 
     let mut best_idx = 0;
     for (i, &score) in scores.iter().enumerate() {
-        if direction.is_better(score, scores[best_idx]) { best_idx = i; }
+        if direction.is_better(score, scores[best_idx]) {
+            best_idx = i;
+        }
     }
 
     // Averages (filter NaN/Inf)
@@ -90,7 +92,11 @@ pub(crate) fn compute_gen_stats(
     } else {
         valid_scores.iter().sum::<f32>() / valid_scores.len() as f32
     };
-    let valid_losses: Vec<f32> = eval_losses.iter().filter_map(|&v| v).filter(|v| v.is_finite()).collect();
+    let valid_losses: Vec<f32> = eval_losses
+        .iter()
+        .filter_map(|&v| v)
+        .filter(|v| v.is_finite())
+        .collect();
     let avg_loss = if valid_losses.is_empty() {
         None
     } else {
@@ -138,6 +144,10 @@ pub struct Engine {
     scores: Vec<f32>,
     eval_losses: Vec<Option<f32>>,
     param_counts: Vec<usize>,
+    /// Per-individual per-epoch mean training loss (gen JSON curves).
+    train_loss_curves: Vec<Vec<f32>>,
+    /// Per-individual per-epoch mean held-out loss (gen JSON curves).
+    eval_loss_curves: Vec<Vec<f32>>,
     /// Topology robustness tracker — keyed by topology JSON.
     robustness: std::collections::HashMap<String, RobustnessEntry>,
     /// Per-generation summary — computed once in save_generation_snapshots.
@@ -157,11 +167,15 @@ pub enum RobustnessFilter {
     Both,
 }
 
-/// Result of training + scoring one individual — named triple.
+/// Result of training + scoring one individual — the ranking metrics plus
+/// optional per-epoch train/test loss curves, persisted per individual in
+/// the gen JSONs (overfitting tracking).
 pub(crate) struct EvalResult {
     pub score: f32,
     pub eval_loss: Option<f32>,
     pub param_count: usize,
+    pub train_losses: Vec<f32>,
+    pub eval_losses: Vec<f32>,
 }
 
 /// Builder-validated core settings, resolved once at construction.
@@ -177,15 +191,20 @@ impl Engine {
     // ── Construction ────────────────────────────────────────────────────────
 
     /// Create engine. Pass the trainer directly — no `Box::new` needed.
-    pub fn new(mut options: EngineOptions, fitness: Fitness, trainer: impl crate::trainer::Trainer + 'static) -> Result<Self> {
+    pub fn new(
+        mut options: EngineOptions,
+        fitness: Fitness,
+        trainer: impl crate::trainer::Trainer + 'static,
+    ) -> Result<Self> {
         // Step 1: Validate options and fill empty pools
         Self::validate_and_fill_options(&mut options)?;
 
         // Step 2: Resolve seed + builder-validated core settings. The
         // unwraps happen here once, at the construction boundary — never
-        // inside the run loop.
-        let seed = Self::resolve_seed(&mut options);
-        let config = ResolvedConfig {
+        // inside the run loop. Both are overridden on resume (the checkpoint
+        // carries its own run_seed, and num_generations counts additions).
+        let mut seed = Self::resolve_seed(&mut options);
+        let mut config = ResolvedConfig {
             pop_size: options.pop_size.expect("validated by build()"),
             num_generations: options.num_generations.expect("validated by build()"),
             selection: options.selection.clone().expect("validated by build()"),
@@ -206,10 +225,46 @@ impl Engine {
             }
             let topo = Self::load_prior_topology(path)?;
             pop[idx] = topo;
-            log::info!("  warm start: loaded prior topology into pop[{}] from {}", idx, path.display());
+            log::info!(
+                "  warm start: loaded prior topology into pop[{}] from {}",
+                idx,
+                path.display()
+            );
         }
 
-        if options.dedup_pop_and_fill {
+        // Step 4c: Resume — replace the random population with the exact
+        // frontier from a previous run's checkpoint.json. The checkpoint's
+        // run_seed keeps the genetics deterministic (selection/crossover/
+        // mutation/refill all derive from it), the generation counter
+        // continues, and `config.num_generations` counts ADDITIONAL gens.
+        let mut resume_state: Option<persistence::LoadedCheckpoint> = None;
+        if let Some(dir) = options.resume_from.clone() {
+            let state = persistence::load_checkpoint(&dir)?;
+            if state.pop.len() != config.pop_size {
+                log::warn!(
+                    "  resume: checkpoint holds {} individuals but set_pop_size({}) was given — using the checkpoint's size",
+                    state.pop.len(),
+                    config.pop_size
+                );
+            }
+            config.pop_size = state.pop.len();
+            seed = state.run_seed;
+            options.seed = Some(seed);
+            options.topology_options.seed = seed as usize;
+            log::info!(
+                "  resume: continuing from generation {} (run_seed {}) with {} individuals — {} additional generations",
+                state.generation,
+                seed,
+                state.pop.len(),
+                config.num_generations
+            );
+            pop = state.pop.clone();
+            resume_state = Some(state);
+        }
+
+        // Dedup/refill only applies to freshly-created populations — a
+        // checkpoint population is already the run's real frontier.
+        if resume_state.is_none() && options.dedup_pop_and_fill {
             Self::dedup_population(&mut pop);
             Self::refill_population(&options, config.pop_size, seed, 0, &mut pop);
         }
@@ -218,17 +273,34 @@ impl Engine {
         crate::utils::log_utils::log_initialization(&options, &pop, seed, &fitness);
 
         // Assemble engine
-        Self::assemble_engine(options, config, seed, pop, fitness, Box::new(trainer))
+        let mut engine =
+            Self::assemble_engine(options, config, seed, pop, fitness, Box::new(trainer))?;
+        if let Some(state) = resume_state {
+            engine.generation = state.generation;
+            engine.history = state.history;
+            engine.robustness = state.robustness;
+        }
+        Ok(engine)
     }
 
     /// Step 1: Propagate engine-level pools into mutation variant, fill defaults.
     /// All required validation is done in `EngineOptionsBuilder::build()`.
     fn validate_and_fill_options(options: &mut EngineOptions) -> Result<()> {
-        if options.hidden_dim_pool.is_empty() { options.hidden_dim_pool = 4..=8; }
-        if options.hidden_dim_stride == 0 { options.hidden_dim_stride = 1; }
-        if options.combine_op_pool.is_empty() { options.combine_op_pool = crate::evolution::pools::all_combine_ops(); }
-        if options.activation_pool.is_empty() { options.activation_pool = crate::evolution::pools::all_activations(); }
-        if options.standardize_op_pool.is_empty() { options.standardize_op_pool = crate::evolution::pools::all_standardize_ops(); }
+        if options.hidden_dim_pool.is_empty() {
+            options.hidden_dim_pool = 4..=8;
+        }
+        if options.hidden_dim_stride == 0 {
+            options.hidden_dim_stride = 1;
+        }
+        if options.combine_op_pool.is_empty() {
+            options.combine_op_pool = crate::evolution::pools::all_combine_ops();
+        }
+        if options.activation_pool.is_empty() {
+            options.activation_pool = crate::evolution::pools::all_activations();
+        }
+        if options.standardize_op_pool.is_empty() {
+            options.standardize_op_pool = crate::evolution::pools::all_standardize_ops();
+        }
         Ok(())
     }
 
@@ -250,7 +322,11 @@ impl Engine {
     }
 
     /// Create a population of random topologies, seeded deterministically.
-    fn create_population(options: &EngineOptions, pop_size: usize, seed: u64) -> Result<Vec<Topology>> {
+    fn create_population(
+        options: &EngineOptions,
+        pop_size: usize,
+        seed: u64,
+    ) -> Result<Vec<Topology>> {
         let mut pop = Vec::with_capacity(pop_size);
         for i in 0..pop_size {
             let ind_seed = derive_seed(seed, i);
@@ -258,7 +334,11 @@ impl Engine {
             debug!(
                 "  ind[{i}] seed={} n_hidden={} nodes={} wires={}",
                 ind_seed,
-                graph.nodes.iter().filter(|n| n.kind == NodeKind::Hidden).count(),
+                graph
+                    .nodes
+                    .iter()
+                    .filter(|n| n.kind == NodeKind::Hidden)
+                    .count(),
                 graph.nodes.len(),
                 graph.connections.len()
             );
@@ -283,7 +363,11 @@ impl Engine {
         let pool_len_s = options.standardize_op_pool.len();
         for node in &mut graph.nodes {
             if node.kind == NodeKind::Hidden {
-                node.hidden_dim = Some(Self::sample_hidden_dim(&options.hidden_dim_pool, options.hidden_dim_stride, &mut rng));
+                node.hidden_dim = Some(Self::sample_hidden_dim(
+                    &options.hidden_dim_pool,
+                    options.hidden_dim_stride,
+                    &mut rng,
+                ));
                 node.activation = options.activation_pool[rng.usize(0..pool_len_a)];
                 node.combine_op = Some(options.combine_op_pool[rng.usize(0..pool_len_c)]);
                 node.standardize = Some(options.standardize_op_pool[rng.usize(0..pool_len_s)]);
@@ -307,7 +391,11 @@ impl Engine {
         });
         let removed = before - pop.len();
         if removed > 0 {
-            debug!("  dedup: removed {removed} duplicates, {}/{} remain", pop.len(), before);
+            debug!(
+                "  dedup: removed {removed} duplicates, {}/{} remain",
+                pop.len(),
+                before
+            );
         }
     }
 
@@ -334,13 +422,21 @@ impl Engine {
             debug!(
                 "  refill[{id}] seed={} n_hidden={} nodes={} wires={}",
                 ind_seed,
-                graph.nodes.iter().filter(|n| n.kind == NodeKind::Hidden).count(),
+                graph
+                    .nodes
+                    .iter()
+                    .filter(|n| n.kind == NodeKind::Hidden)
+                    .count(),
                 graph.nodes.len(),
                 graph.connections.len()
             );
             pop.push(graph);
         }
-        debug!("  refill: added {needed} individuals, {}/{} remain", pop.len(), target);
+        debug!(
+            "  refill: added {needed} individuals, {}/{} remain",
+            pop.len(),
+            target
+        );
         needed
     }
 
@@ -386,6 +482,8 @@ impl Engine {
             scores: Vec::new(),
             eval_losses: Vec::new(),
             param_counts: Vec::new(),
+            train_loss_curves: Vec::new(),
+            eval_loss_curves: Vec::new(),
             gen_stats: None,
             config,
             robustness: std::collections::HashMap::new(),
@@ -397,6 +495,14 @@ impl Engine {
     /// Returns the scores from the most recent generation.
     pub fn scores(&self) -> &[f32] {
         &self.scores
+    }
+
+    /// The deterministic training seed the engine passes to every individual
+    /// of `generation` (`derive_seed(run_seed, generation)`) — public so
+    /// replay tools can reproduce a run's train/eval split and batch
+    /// sampling from the gen JSONs alone.
+    pub fn gen_seed_for(&self, generation: usize) -> u64 {
+        derive_seed(self.seed, generation)
     }
 
     /// Display topology robustness table (most-repeated topologies).
@@ -422,7 +528,7 @@ impl Engine {
     /// Writes engine.json, per-gen snapshots, and robustness.csv.
     pub fn run(&mut self) -> Result<()> {
         let run_start = self.init_run()?;
-        self.run_generations();
+        self.run_generations()?;
         self.finalize_run(run_start)
     }
 
@@ -438,29 +544,43 @@ impl Engine {
             path: self.run_dir.join("engine.json").display().to_string(),
             source,
         })?;
+        // Frontier checkpoint — resume target if the run is interrupted
+        // before completing its first generation.
+        self.save_checkpoint()?;
         Ok(Instant::now())
     }
 
-    /// Phase 2: The evolution loop.
-    fn run_generations(&mut self) {
+    /// Phase 2: The evolution loop. On a resumed run, `num_generations` counts
+    /// the generations this process runs; `self.generation` already holds the
+    /// frontier the loop continues from, so the counter (not the loop index)
+    /// is what shows up in logs, gen file names, and gen_seed derivation.
+    fn run_generations(&mut self) -> Result<()> {
         let num_gens = self.config.num_generations;
-        let width = gen_width(num_gens);
-        for g in 0..num_gens {
+        let total = self.generation + num_gens;
+        let width = gen_width(total);
+        for _ in 0..num_gens {
+            let g = self.generation;
             let gen_start = Instant::now();
-            debug!("== gen {:0width$}/{:0width$} ==", g, num_gens, width = width);
-            let _improved = self.evaluate_population();
+            debug!("== gen {g:0width$}/{total:0width$} ==", width = width);
+            let _improved = self.evaluate_population()?;
             // One table per generation: scores + evolution, so all of a
             // single generation's data reads as one unit.
             let mut rows = self.generation_summary_rows();
-            rows.extend(self.next_generation());
+            rows.extend(self.next_generation()?);
             crate::utils::log_utils::log_section_table(
-                &format!("gen {:0width$} of {:0width$}", g, num_gens, width = width),
+                &format!("gen {g:0width$} of {total:0width$}", width = width),
                 &["metric", "best", "avg"],
                 &rows,
                 crate::utils::log_utils::TABLE_WIDTH,
             );
-            log::info!("  gen {:0width$} done in {elapsed:.1}s", g, elapsed = gen_start.elapsed().as_secs_f64(), width = width);
+            log::info!(
+                "  gen {g:0width$} done in {elapsed:.1}s",
+                g = g,
+                elapsed = gen_start.elapsed().as_secs_f64(),
+                width = width
+            );
         }
+        Ok(())
     }
 
     /// Phase 3: Write final engine.json, log run summary.
@@ -475,7 +595,6 @@ impl Engine {
         let robustness_csv = self.run_dir.join("robustness.csv");
         self.export_robustness_to(&robustness_csv)?;
         crate::utils::log_utils::log_done(run_elapsed, num_gens, &self.run_dir, &robustness_csv);
-
 
         Ok(())
     }
@@ -500,29 +619,53 @@ impl Engine {
         let dtype = self.trainer.dtype();
         let tracker = ProgressTracker::new();
         let results = self.pool.install(|| {
-            self.pop.par_iter().map(|graph| {
-                let no = crate::graph::network::NetworkOptions {
-                    device,
-                    dtype,
-                    seed: graph.options.seed,
-                    dropout_prob: self.options.dropout_prob,
-                };
-                let net = Network::build_with_options(graph, &no)?;
-                let gen_seed = derive_seed(self.seed, self.generation);
-                let (score, loss, params) = self.trainer.evaluate(net, &self.fitness, gen_seed)?;
-                tracker.increment();
-                Ok(EvalResult { score, eval_loss: loss, param_count: params })
-            }).collect::<Result<Vec<_>>>()
+            self.pop
+                .par_iter()
+                .enumerate()
+                .map(|(idx, graph)| {
+                    // dropout comes from the individual's own blueprint, which
+                    // the engine seeded from EngineOptions at creation — a
+                    // saved topology is therefore self-describing.
+                    let no = crate::graph::network::NetworkOptions {
+                        device,
+                        dtype,
+                        seed: graph.options.seed,
+                        dropout_prob: graph.options.dropout_prob,
+                    };
+                    let net = Network::build_with_options(graph, &no)?;
+                    let gen_seed = derive_seed(self.seed, self.generation);
+                    let outcome = self
+                        .trainer
+                        .evaluate(net, &self.fitness, gen_seed)
+                        .map_err(|e| {
+                            flodl::tensor::TensorError::new(&format!(
+                                "individual {idx} (generation {}) failed to evaluate on {device:?}: {e}",
+                                self.generation
+                            ))
+                        })?;
+                    tracker.increment();
+                    Ok(EvalResult {
+                        score: outcome.score,
+                        eval_loss: outcome.eval_loss,
+                        param_count: outcome.param_count,
+                        train_losses: outcome.train_losses,
+                        eval_losses: outcome.eval_losses,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
         });
         tracker.finish();
         results
     }
 
-    /// Step 2: Store scores, eval_losses, and param_counts from parallel results.
+    /// Step 2: Store scores, eval_losses, param_counts, and loss curves from
+    /// the parallel results — all arrays stay in lockstep with `pop`.
     fn update_scores(&mut self, results: Vec<EvalResult>) {
         self.scores = results.iter().map(|r| r.score).collect();
         self.eval_losses = results.iter().map(|r| r.eval_loss).collect();
         self.param_counts = results.iter().map(|r| r.param_count).collect();
+        self.train_loss_curves = results.iter().map(|r| r.train_losses.clone()).collect();
+        self.eval_loss_curves = results.iter().map(|r| r.eval_losses.clone()).collect();
     }
 
     /// Step 3: Find best + worst in current gen, save both to disk.
@@ -568,8 +711,14 @@ impl Engine {
             format!("{:.4}", stats.avg_score),
         ]);
         if stats.best_loss.is_some() || stats.avg_loss.is_some() {
-            let best_l = stats.best_loss.map(|v| format!("{v:.4}")).unwrap_or_else(|| "—".into());
-            let avg_l = stats.avg_loss.map(|v| format!("{v:.4}")).unwrap_or_else(|| "—".into());
+            let best_l = stats
+                .best_loss
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "—".into());
+            let avg_l = stats
+                .avg_loss
+                .map(|v| format!("{v:.4}"))
+                .unwrap_or_else(|| "—".into());
             rows.push(vec!["loss".into(), best_l, avg_l]);
         }
         rows.push(vec![
@@ -588,7 +737,11 @@ impl Engine {
     // ── Genetics -- selection, crossover, mutation ────────────────────────────
 
     /// Sample a hidden_dim from the pool, respecting stride.
-    fn sample_hidden_dim(pool: &RangeInclusive<usize>, stride: usize, rng: &mut fastrand::Rng) -> usize {
+    fn sample_hidden_dim(
+        pool: &RangeInclusive<usize>,
+        stride: usize,
+        rng: &mut fastrand::Rng,
+    ) -> usize {
         let start = *pool.start();
         let end = *pool.end();
         let n = ((end - start) / stride) + 1;
@@ -596,7 +749,7 @@ impl Engine {
     }
 
     /// Returns the evolution rows for the per-generation table.
-    fn next_generation(&mut self) -> Vec<Vec<String>> {
+    fn next_generation(&mut self) -> Result<Vec<Vec<String>>> {
         let (unique, sel_label) = self.select();
         let cx_pairs = self.crossover();
         let pre_dedup = self.pop.len();
@@ -620,8 +773,14 @@ impl Engine {
         let post_refill_dedup = pre_post_dedup - self.pop.len();
         let mut_count = self.mutate();
         let genetics = self.genetics_summary_rows(
-            unique, &sel_label, cx_pairs, dedup_removed, pre_dedup,
-            refill_added, post_refill_dedup, mut_count,
+            unique,
+            &sel_label,
+            cx_pairs,
+            dedup_removed,
+            pre_dedup,
+            refill_added,
+            post_refill_dedup,
+            mut_count,
         );
         // Always capture history
         if let Some(stats) = &self.gen_stats {
@@ -634,7 +793,11 @@ impl Engine {
             });
         }
         self.generation += 1;
-        genetics
+        // Persist the frontier: the population about to be evaluated at the
+        // next generation, so a run killed mid-evaluation resumes exactly
+        // from here (re-evaluating the interrupted generation).
+        self.save_checkpoint()?;
+        Ok(genetics)
     }
 
     /// Evolution rows for the per-generation table: (step, count, detail).
@@ -665,17 +828,27 @@ impl Engine {
             rows.push(vec![
                 "dedup".into(),
                 format!("-{dedup_removed}"),
-                format!("{pre_dedup}/{target} → {}/{target}", pre_dedup - dedup_removed),
+                format!(
+                    "{pre_dedup}/{target} → {}/{target}",
+                    pre_dedup - dedup_removed
+                ),
             ]);
         } else {
-            rows.push(vec!["dedup".into(), "0".into(), format!("{target}/{target}")]);
+            rows.push(vec![
+                "dedup".into(),
+                "0".into(),
+                format!("{target}/{target}"),
+            ]);
         }
         if refill_added > 0 {
             let after_refill = self.pop.len();
             rows.push(vec![
                 "refill".into(),
                 format!("+{refill_added}"),
-                format!("{}/{target} → {after_refill}/{target}", after_refill - refill_added),
+                format!(
+                    "{}/{target} → {after_refill}/{target}",
+                    after_refill - refill_added
+                ),
             ]);
         } else {
             rows.push(vec![
@@ -729,6 +902,16 @@ impl Engine {
         } else {
             Vec::new()
         };
+        let new_train_curves: Vec<Vec<f32>> = if self.train_loss_curves.len() == n {
+            indices.iter().map(|&i| self.train_loss_curves[i].clone()).collect()
+        } else {
+            Vec::new()
+        };
+        let new_eval_curves: Vec<Vec<f32>> = if self.eval_loss_curves.len() == n {
+            indices.iter().map(|&i| self.eval_loss_curves[i].clone()).collect()
+        } else {
+            Vec::new()
+        };
         self.pop = new_pop;
         self.scores = new_scores;
         if new_losses.len() == n {
@@ -737,16 +920,19 @@ impl Engine {
         if new_params.len() == n {
             self.param_counts = new_params;
         }
+        if new_train_curves.len() == n {
+            self.train_loss_curves = new_train_curves;
+        }
+        if new_eval_curves.len() == n {
+            self.eval_loss_curves = new_eval_curves;
+        }
 
         let mut counts = vec![0usize; self.pop.len()];
         for &i in &indices {
             counts[i] += 1;
         }
         let unique = counts.iter().filter(|&&c| c > 0).count();
-        debug!(
-            "  selection [{}] {} unique survivors",
-            label, unique
-        );
+        debug!("  selection [{}] {} unique survivors", label, unique);
         (unique, label)
     }
 
@@ -821,17 +1007,23 @@ impl Engine {
             match m {
                 MutationMethod::Activation { .. } => {
                     let pool = &self.options.activation_pool;
-                    if pool.is_empty() { continue; }
+                    if pool.is_empty() {
+                        continue;
+                    }
                     node.activation = pool[rng.usize(0..pool.len())];
                 }
                 MutationMethod::CombineOp { .. } => {
                     let pool = &self.options.combine_op_pool;
-                    if pool.is_empty() { continue; }
+                    if pool.is_empty() {
+                        continue;
+                    }
                     node.combine_op = Some(pool[rng.usize(0..pool.len())]);
                 }
                 MutationMethod::Standardize { .. } => {
                     let pool = &self.options.standardize_op_pool;
-                    if pool.is_empty() { continue; }
+                    if pool.is_empty() {
+                        continue;
+                    }
                     node.standardize = Some(pool[rng.usize(0..pool.len())]);
                 }
             }
@@ -841,10 +1033,16 @@ impl Engine {
         debug!("  mutate {mut_count} nets ({})", m);
         mut_count
     }
-
 }
 
 /// Deterministic child-seed derivation: multiply by golden ratio for spread.
-pub(crate) fn derive_seed(base: u64, i: usize) -> u64 {
+///
+/// Every seeded stream in the engine derives from this:
+/// - individual `i` of the initial population: `derive_seed(run_seed, i)`
+///   (also the topology `options.seed`)
+/// - generation `g`'s trainer seed (train/eval split + batch sampling):
+///   `derive_seed(run_seed, g)` — see [`Engine::gen_seed_for`]
+/// - selection/crossover/mutation streams: `derive_seed(run_seed, g*3 + k)`
+pub fn derive_seed(base: u64, i: usize) -> u64 {
     base.wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
