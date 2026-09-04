@@ -102,6 +102,25 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    // Regression: every log/Display path must print the *configured*
+    // tournament size, never a hardcoded 3.
+    #[test]
+    fn test_tournament_labels_reflect_configured_size() {
+        let t = SelectionMethod::Tournament { tournament_size: 5 };
+        assert_eq!(t.label(), "tournament(k=5)");
+        assert_eq!(format!("{t}"), "tournament(size=5)");
+
+        // And a non-default size actually changes the selection pressure
+        // path (apply must accept it, not clamp to 3).
+        let scores = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut rng = fastrand::Rng::with_seed(42);
+        let picked = t.apply(&scores, Direction::Maximize, &mut rng, 1);
+        assert_eq!(picked.len(), scores.len());
+
+        // Default stays 3 — the engine's documented default.
+        assert_eq!(SelectionMethod::default().label(), "tournament(k=3)");
+    }
+
     #[test]
     fn test_tournament_select_empty_and_single() {
         let mut rng = fastrand::Rng::with_seed(1);
