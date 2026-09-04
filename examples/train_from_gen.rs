@@ -140,17 +140,31 @@ fn main() {
     let topo_json = target["topology"].as_str().expect("missing 'topology' field");
     let idx = target["idx"].as_u64().unwrap_or(0);
 
-    // Parse topology
+    // Parse topology — the embedded options carry the individual's seed and
+    // dropout_prob, so Network::build reproduces the exact net the engine
+    // built (initial weights + regularization).
     let topo = Topology::from_json(topo_json).unwrap_or_else(|e| {
         eprintln!("Error parsing topology: {}", e);
         std::process::exit(1);
     });
+
+    // The generation's trainer seed — recorded in gen JSONs since the
+    // reproducibility fixes. Old JSONs (or hand-edited ones) may lack it.
+    let gen_seed = data["gen_seed"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            eprintln!("WARNING: gen JSON has no 'gen_seed' (pre-fix file?) — falling back to 42; the parity check will likely fail");
+            42
+        });
 
     println!("══ train from gen_idx ════════════════════════════════════════════════");
     println!("  topology   idx={idx}");
     println!("  nodes      {}", topo.nodes.len());
     println!("  input_dim  {}", topo.options.input_dim);
     println!("  output_dim {}", topo.options.output_dim);
+    println!("  seed       {} (weight init)", topo.options.seed);
+    println!("  dropout    {} (regularization)", topo.options.dropout_prob);
+    println!("  gen_seed   {gen_seed} (train/eval split + batch sequence)");
 
     // Load dataset — try results dir's data first, then fallback to default
     let data_path = find_data_path(&json_path);
@@ -204,17 +218,31 @@ fn main() {
         dtype: DType::Float32,
     };
 
-    // Split dataset into train/eval
+    // Replicate the engine's exact train/eval split: the trainer derives
+    // train indices from gen_seed and eval indices from gen_seed+0xFFFF
+    // (SupervisedTrainer::evaluate). Anything else silently diverges from
+    // the evolved run and breaks the parity check below.
     let n = dataset.inputs.shape()[0] as usize;
-    let train_count = (n as f32 * 0.8) as usize;
-    let _eval_count = n - train_count;
-    let train_indices: Vec<i64> = (0..train_count as i64).collect();
-    let eval_indices: Vec<i64> = (train_count as i64..n as i64).collect();
+    let eval_ratio = config.eval_ratio;
+    let (train_indices, _) = gras::utils::data::split_indices(
+        n,
+        1.0 - eval_ratio,
+        eval_ratio,
+        gen_seed,
+    );
+    let (_, eval_indices) = gras::utils::data::split_indices(
+        n,
+        1.0 - eval_ratio,
+        eval_ratio,
+        gen_seed.wrapping_add(0xFFFF),
+    );
 
     println!("\n  Training for {} epochs...", config.num_epochs);
     println!("  train={} eval={}", train_indices.len(), eval_indices.len());
 
-    // Train
+    // Train — same call the engine makes, same gen_seed, same config, so
+    // weights, split, batches, optimizer trajectory, and (with manual_seed
+    // inside train_network) dropout masks all reproduce.
     let mut net = net;
     let result = gras::utils::supervised::train_network(
         &mut net,
@@ -224,7 +252,7 @@ fn main() {
         &dataset,
         &train_indices,
         &eval_indices,
-        42,  // gen_seed
+        gen_seed,
     ).unwrap_or_else(|e| {
         eprintln!("Error training: {}", e);
         std::process::exit(1);
@@ -234,5 +262,60 @@ fn main() {
     println!("  f1             {:.4}", result.score);
     if let Some(loss) = result.eval_loss {
         println!("  cross_entropy  {:.4}", loss);
+    }
+
+    // ── Parity self-check ─────────────────────────────────────────────────
+    // "Same seed + same options ⇒ same training": if the reconstruction is
+    // exact, this run's numbers must match what the gen JSON recorded for
+    // this individual during evolution.
+    println!("\n══ parity self-check (replay vs gen JSON) ═════════════════════════");
+    let mut ok = true;
+
+    let recorded_fitness = target["fitness"].as_f64();
+    let achieved_fitness = result.score as f64;
+    if let Some(rec) = recorded_fitness {
+        let diff = (achieved_fitness - rec).abs();
+        let pass = diff < 1e-4;
+        ok &= pass;
+        println!("  fitness    recorded={rec:.6}  achieved={achieved_fitness:.6}  {}",
+            if pass { "✓" } else { "✗ MISMATCH" });
+    }
+
+    let recorded_loss = target["loss"].as_f64();
+    if let Some(rec) = recorded_loss {
+        let achieved = result.eval_loss.unwrap_or(f32::NAN) as f64;
+        let diff = (achieved - rec).abs();
+        let pass = diff < 1e-4;
+        ok &= pass;
+        println!("  loss       recorded={rec:.6}  achieved={achieved:.6}  {}",
+            if pass { "✓" } else { "✗ MISMATCH" });
+    }
+
+    // Per-epoch curves (when the gen JSON was written by a fixed engine).
+    let recorded_curve: Vec<f64> = target["eval_losses"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_f64()).collect())
+        .unwrap_or_default();
+    if !recorded_curve.is_empty() && !result.eval_loss_curve.is_empty() {
+        let n_epochs = recorded_curve.len().min(result.eval_loss_curve.len());
+        let mut max_diff = 0.0f64;
+        for e in 0..n_epochs {
+            max_diff = max_diff.max(
+                (recorded_curve[e] - result.eval_loss_curve[e] as f64).abs(),
+            );
+        }
+        let pass = max_diff < 1e-4;
+        ok &= pass;
+        println!("  eval curve max diff over {n_epochs} epochs: {max_diff:.6}  {}",
+            if pass { "✓" } else { "✗ MISMATCH" });
+    }
+
+    if ok {
+        println!("  ✓ replay reproduces the evolved individual exactly");
+    } else {
+        eprintln!("  ✗ replay diverges from the recorded run. Likely causes:");
+        eprintln!("    • this example's TrainingConfig/loss/fitness differs from the original run's (they are not recorded in gen JSONs)");
+        eprintln!("    • the gen JSON predates the gen_seed/dropout recording fixes");
+        std::process::exit(1);
     }
 }

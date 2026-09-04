@@ -75,7 +75,12 @@ impl Trainer for EarlyStoppingTrainer {
         self.dtype
     }
 
-    fn evaluate(&self, net: Network, fitness: &Fitness, gen_seed: u64) -> Result<(f32, Option<f32>, usize)> {
+    fn evaluate(
+        &self,
+        net: Network,
+        fitness: &Fitness,
+        gen_seed: u64,
+    ) -> Result<gras::EvalOutcome> {
         let n = self.dataset.len();
         let (train_idx, _) = split_indices(n, 0.8, 0.2, gen_seed);
         let (_, eval_idx) = split_indices(n, 0.8, 0.2, gen_seed.wrapping_add(0xFFFF));
@@ -138,7 +143,11 @@ impl Trainer for EarlyStoppingTrainer {
             .iter()
             .map(|p| p.variable.numel() as usize)
             .sum::<usize>();
-        Ok((score / n_rows, Some(best as f32), param_count))
+        Ok(gras::EvalOutcome::new(
+            score / n_rows,
+            Some(best as f32),
+            param_count,
+        ))
     }
 }
 
