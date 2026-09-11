@@ -99,6 +99,25 @@ impl Fitness {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FitnessLabel(pub String);
 
+/// An informative (non-ranking) metric configured for a run — e.g. "accuracy",
+/// "f1". Carries only its label; the actual per-step values live in
+/// `NetMetrics::informative` (same order as the run's `Vec<Metric>`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Metric(pub String);
+
+impl Metric {
+    /// Label for logs.
+    pub fn label(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for Metric {
+    fn default() -> Self {
+        Metric("accuracy".to_string())
+    }
+}
+
 impl Default for FitnessLabel {
     fn default() -> Self {
         FitnessLabel("loss".to_string())
