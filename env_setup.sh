@@ -14,6 +14,7 @@ if [ "${1}" = "cuda" ]; then
     export LIBRARY_PATH="${LIBTORCH_PATH}/lib:${CUDA_HOME}/lib64${LIBRARY_PATH:+:$LIBRARY_PATH}"
     export CARGO_TARGET_DIR="target_cuda"
     export FLODL_VARIANT="cuda"
+    export GRAS_FEATURES="--features cuda"
     echo "Environment set: CUDA (cu128) — libtorch at ${LIBTORCH_PATH}, CUDA at ${CUDA_HOME}"
 else
     export LIBTORCH_PATH="${FLODL_BASE}/cpu"
@@ -21,5 +22,6 @@ else
     export LIBRARY_PATH="${LIBTORCH_PATH}/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
     export CARGO_TARGET_DIR="target_cpu"
     export FLODL_VARIANT="cpu"
+    export GRAS_FEATURES=""
     echo "Environment set: CPU — libtorch at ${LIBTORCH_PATH}"
 fi
