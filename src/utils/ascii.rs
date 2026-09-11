@@ -1,14 +1,7 @@
-//! ASCII pretty-printing helpers for graphs and flodl nets.
-//!
-//! Rendering is a presentation concern, so it lives outside the core graph
-//! types: `topology_ascii` draws a [`Topology`] and `network_ascii`
-//! draws a [`Network`], both via the shared Manhattan-wiring diagram
-//! `render_wire_diagram`. The types only keep their `Display` impls, which
-//! delegate here.
+//! ASCII diagram primitives used by [`super::markdown`] — the Manhattan-wire
+//! rendering and compact edge list. Extracted from the old ascii module;
+//! only the pieces markdown needs survive.
 
-use flodl::nn::Module;
-
-use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
 use crate::graph::topology::{Connection, Port, Topology};
 
@@ -23,18 +16,6 @@ pub(crate) struct AsciiNode {
     pub out_dim: Option<usize>,
 }
 
-/// Render nodes + connections as an ASCII diagram with Manhattan (right-angle)
-/// arrows , like a circuit schematic.
-///
-/// Layout: one node per 4 rows (label / inputs / outputs / blank); each wire
-/// gets its own vertical lane on the right, so a long jump (n1 → n7) shows as
-/// a tall `│` run. Assumes contiguous node ids (row = id × 4), which our
-/// constructors guarantee. Ports beyond index 9 are not rendered faithfully.
-///
-/// Edges are strictly forward (from.node < to.node) — like the schematic style
-/// from GP papers, but WITHOUT the backward edges that figure shows. So the
-/// source is always above the target and every arrow points DOWN ⬇; long
-/// jumps are fine, backward jumps are not.
 pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection]) -> String {
     if nodes.is_empty() {
         return "(empty graph)".to_string();
@@ -339,6 +320,10 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
 ///
 /// Sorts connections by source node, shows the distance (in hops) between
 /// source and target, and highlights long-range jumps with `>>>` markers.
+
+/// ASCII topology view of a [`Topology`]: a header box plus the Manhattan-wired
+/// node diagram.
+
 pub(crate) fn edge_list(graph: &Topology) -> String {
     let mut out = String::new();
     let n = graph.connections.len();
@@ -370,198 +355,3 @@ pub(crate) fn edge_list(graph: &Topology) -> String {
     out
 }
 
-/// ASCII topology view of a [`Topology`]: a header box plus the Manhattan-wired
-/// node diagram.
-pub fn topology_ascii(graph: &Topology) -> String {
-    let header = format!(
-        " Topology #{} · {} nodes · {} input ports · {} output ports · {} wires",
-        graph.id,
-        graph.nodes.len(),
-        graph.graph_inputs.len(),
-        graph.graph_outputs.len(),
-        graph.connections.len(),
-    );
-    let mut out = String::new();
-    out.push_str(&format!("┌{}┐\n", "─".repeat(header.len() + 4)));
-    out.push_str(&format!("│  {}  │\n", header));
-    out.push_str(&format!("└{}┘\n", "─".repeat(header.len() + 4)));
-    out.push('\n');
-
-    let node_dims = graph.node_dims();
-    let nodes: Vec<AsciiNode> = graph
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| AsciiNode {
-            id: n.id,
-            kind: n.kind,
-            num_inputs: n.num_inputs,
-            num_outputs: n.num_outputs,
-            out_dim: node_dims.get(i).map(|&(_, out)| out),
-        })
-        .collect();
-    out.push_str(&render_wire_diagram(&nodes, &graph.connections));
-
-    out.push('\n');
-    out.push_str(&edge_list(graph));
-    out.push('\n');
-    out.push_str("Legend:\n");
-    out.push_str("  I=input  H=hidden  O=output\n");
-    out.push_str("  0i/4o=input ports / output ports\n");
-    out.push_str("  ->dim=output dimension\n");
-    out.push_str("  ▶ connected output  ◀ connected input  * orphaned port\n");
-    out
-}
-
-/// Compact net view of a [`Network`] — derived from the blueprint,
-/// focused on what execution actually cares about:
-///
-/// ```text
-///  flodl net (Network) · 7 nodes · 12 wires · 16 param tensors
-///      n0 input   : orphan_proj(1→8) · Linear(8 → 8) · act: identity
-///      n1 hidden  : Linear(8 → 8) · act: gelu · in 3 · i0←n0_o0 · i1←n0_o1
-///      n2 hidden  : orphan_proj(1→16) · Linear(16 → 16) · act: identity · i1*
-///      n3 output  : Linear(16 → 10) · act: identity ←  network output
-/// ```
-///
-/// Per node: orphan projection (if any), layer dims, activation, and
-/// source wiring. `i{k}*` = orphaned port fed via orphan projection.
-pub(crate) fn network_ascii(g: &Network) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        " flodl net (Network) · {} nodes · {} wires · {} param tensors",
-        g.layers.len(),
-        g.connections.len(),
-        g.parameters().len(),
-    ));
-    out.push('\n');
-
-    let kind_name = |kind: NodeKind| match kind {
-        NodeKind::Input => "I",
-        NodeKind::Hidden => "H",
-        NodeKind::Output => "O",
-    };
-
-    for node_id in 0..g.layers.len() {
-        let node = &g.nodes[node_id];
-        let (in_dim, out_dim) = g.node_dims[node_id];
-        let marker = if node_id == g.output_node {
-            "   ←  network output"
-        } else {
-            ""
-        };
-
-        // Incoming ops: one entry per input port — its sources (`i0←n1_o0`),
-        // or `*` when orphaned (fed net_input). Nodes with no input ports
-        // (input nodes) show their output count instead.
-        let mut ports: Vec<String> = Vec::new();
-        for i in 0..node.num_inputs {
-            let target = Port {
-                node: node_id,
-                index: i,
-            };
-            let sources: Vec<String> = g
-                .connections
-                .iter()
-                .filter(|c| c.to == target)
-                .map(|c| c.from_label())
-                .collect();
-            ports.push(if sources.is_empty() {
-                format!("i{i}*")
-            } else {
-                format!("i{i}←{}", sources.join("+"))
-            });
-        }
-        let port_str = if ports.is_empty() {
-            format!("out {}", node.num_outputs)
-        } else {
-            format!("in {} · {}", node.num_inputs, ports.join(" · "))
-        };
-
-        let std_str = node
-            .standardize
-            .map_or(String::new(), |s| format!(" · std: {s}"));
-        out.push_str(&format!(
-            "    n{} {:<7} : Linear({} → {}) · act: {:<8} · {}{}{}\n",
-            node_id,
-            kind_name(node.kind),
-            in_dim,
-            out_dim,
-            node.activation,
-            port_str,
-            marker,
-            std_str,
-        ));
-    }
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{network_ascii, topology_ascii};
-    use crate::graph::network::Network;
-    use crate::graph::node::Node;
-    use crate::graph::topology::Topology;
-    use flodl::Device;
-
-    #[test]
-    fn test_render_graph_topology() {
-        let mut graph = Topology::new(1, None);
-        graph.nodes.push(Node::new_input(0, 2));
-        graph.nodes.push(Node::new_hidden(1, 3, 1));
-        graph.refresh_labels();
-        graph.finalize();
-
-        let s = topology_ascii(&graph);
-        // Header box with the graph summary
-        assert!(s.contains("Topology #1"));
-        // One label per node with its port counts
-        assert!(s.contains("n0 I"), "label: {s}");
-        assert!(s.contains("n1 H"), "label: {s}");
-        // Manhattan corners + box border present
-        assert!(s.contains('┌'));
-        assert!(s.contains('┐'));
-        assert!(s.contains('┘'));
-        // Every wire is drawn with arrowheads on the canvas.
-        let has_arrows = s
-            .lines()
-            .any(|line| line.contains('>') && !line.contains("->"));
-        assert!(has_arrows, "wiring diagram must contain arrowheads");
-        // Display impl delegates to the utils function
-        assert_eq!(format!("{graph}"), s);
-    }
-
-    #[test]
-    fn test_render_network_net() {
-        let mut graph = Topology::new(0, None);
-        graph.nodes.push(Node::new_input(0, 2));
-        graph.nodes.push(Node::new_output(1, 2, 1));
-        graph.finalize();
-
-        let module = Network::build(&graph, Device::CPU).unwrap();
-        let s = network_ascii(&module);
-
-        assert!(!s.contains('▶'));
-        assert!(!s.contains('┌'));
-        // One Linear per node, with dims + activation (no orphan_proj)
-        assert!(s.contains("Linear(1 → 8)"));
-        assert!(s.contains("act: identity"));
-        assert!(s.contains("n0 I"));
-        assert!(s.contains("i0←n0_o0"));
-        assert!(s.contains(" network output"));
-        assert_eq!(format!("{module}"), s);
-    }
-
-    #[test]
-    fn test_render_network_all_ports_wired() {
-        let mut graph = Topology::new(0, None);
-        graph.nodes.push(Node::new_hidden(0, 2, 1));
-        graph.nodes.push(Node::new_output(1, 1, 1));
-        graph.finalize();
-
-        let module = Network::build(&graph, Device::CPU).unwrap();
-        let s = network_ascii(&module);
-        // Network builds and forward works even with orphaned ports.
-        assert!(!s.is_empty());
-    }
-}

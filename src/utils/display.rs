@@ -1,35 +1,20 @@
 //! Hand-written `Display` impls — all formatting in one place.
 //!
 //! `Debug` impls are `#[derive(Debug)]` on each type and stay with their
-//! type; only hand-written formatting lives here. The big ASCII renderers
-//! live in [`crate::utils`] — these impls just delegate to them.
+//! type; only hand-written formatting lives here.
 //!
 //! Trait impls are crate-global: moving them here does not change any call
 //! site (`println!("{graph}")` works exactly the same).
 
 use std::fmt::Display;
 
-use crate::evolution::crossover::CrossoverMethod;
-use crate::engine::EngineOptions;
 use crate::engine::fitness::{Direction, FitnessLabel};
+use crate::evolution::crossover::CrossoverMethod;
 use crate::evolution::mutation::MutationMethod;
-use crate::graph::network::{Network, NetworkOptions};
-use crate::graph::node::{Activation, Node};
 use crate::evolution::selection::SelectionMethod;
-use crate::graph::topology::{CombineOp, Connection, KindCounts, Topology, TopologyOptions};
-use crate::trainer::supervised::OptimizerKind;
-
-impl Display for Topology {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", super::ascii::topology_ascii(self))
-    }
-}
-
-impl Display for Network {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", super::ascii::network_ascii(self))
-    }
-}
+use crate::graph::network::NetworkOptions;
+use crate::graph::node::{Activation, Node};
+use crate::graph::topology::{CombineOp, Connection, KindCounts, TopologyOptions};
 
 impl Display for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -89,23 +74,8 @@ impl Display for NetworkOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "device {:?} · dtype {:?} · init_seed {:?}",
-            self.device, self.dtype, self.seed
-        )
-    }
-}
-
-impl Display for EngineOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "pop {} · {} gens · seed {:?} · {} threads · fitness {} · results {}/",
-            self.pop_size.unwrap_or(0),
-            self.num_generations.unwrap_or(0),
-            self.seed,
-            self.num_threads,
-            self.fitness_label,
-            self.results_dir.display()
+            "device {:?} · dtype {:?} · topology_seed {:?}",
+            self.device, self.dtype, self.topology_seed
         )
     }
 }
@@ -166,15 +136,7 @@ impl Display for SelectionMethod {
             SelectionMethod::Tournament { tournament_size } => {
                 write!(f, "tournament(size={tournament_size})")
             }
-        }
-    }
-}
-
-impl Display for OptimizerKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OptimizerKind::SGD => write!(f, "sgd"),
-            OptimizerKind::Adam => write!(f, "adam"),
+            SelectionMethod::Roulette => write!(f, "roulette"),
         }
     }
 }
@@ -183,13 +145,18 @@ impl Display for CrossoverMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CrossoverMethod::OnePoint { action_prob } => {
-                write!(f, "one_point(p={}%)", (action_prob * 100.0).round())
+                write!(f, "one_point(p={}%))", (action_prob * 100.0).round())
             }
             CrossoverMethod::Uniform {
                 action_prob,
                 swap_prob,
             } => {
-                write!(f, "uniform(p={}%,swap={}%)", (action_prob * 100.0).round(), (swap_prob * 100.0).round())
+                write!(
+                    f,
+                    "uniform(p={}%,swap={}%)",
+                    (action_prob * 100.0).round(),
+                    (swap_prob * 100.0).round()
+                )
             }
         }
     }

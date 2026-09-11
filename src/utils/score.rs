@@ -141,3 +141,21 @@ pub fn cross_entropy_onehot_loss(pred: &Variable, y: &Variable) -> Result<Variab
     let n = flodl::Tensor::from_f32(&[y.data().shape()[0] as f32], &[1], y.data().device())?;
     Ok(Variable::new(masked.sum()?.mul(&neg)?.div(&n)?, false))
 }
+
+/// Score by metric label — the informative-metric dispatcher. Maps a label
+/// (e.g. "accuracy", "f1", "mse") to its scoring function. Unknown labels
+/// error so a typo in the run config surfaces immediately.
+pub fn score_by_label(label: &str, pred: &Variable, y: &Variable) -> Result<f32> {
+    match label {
+        "accuracy" => accuracy_score(pred, y),
+        "f1" => f1_score(pred, y),
+        "precision" => precision_score(pred, y),
+        "mse" => mse_loss_score(pred, y),
+        "mae" | "l1" => l1_loss_score(pred, y),
+        "rmse" => rmse_score(pred, y),
+        "r2" => r2_score(pred, y),
+        other => Err(flodl::tensor::TensorError::new(&format!(
+            "score_by_label: unknown informative metric '{other}'"
+        ))),
+    }
+}

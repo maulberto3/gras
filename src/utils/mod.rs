@@ -1,15 +1,13 @@
+//! Utilities — data I/O, graph helpers, scoring, rendering, and the
+//! step-race training primitives.
+
 pub mod ascii;
 pub mod data;
 pub mod display;
 pub(crate) mod error;
 pub mod graph_utils;
-pub(crate) mod gen_log;
-pub(crate) mod init_log;
-pub(crate) mod log_utils;
 pub mod markdown;
 pub mod mermaid;
-pub(crate) mod progress;
-pub(crate) mod robustness;
+pub mod race_steps;
 pub mod scoring;
-pub mod summary_log;
-pub mod supervised;
+pub mod seed;
