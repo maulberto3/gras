@@ -29,7 +29,7 @@ use crate::utils::graph_utils::build_node_sources;
 pub struct NetworkOptions {
     pub device: Device,
     pub dtype: DType,
-    pub seed: usize,
+    pub topology_seed: usize,
     pub dropout_prob: f32,
 }
 
@@ -38,7 +38,7 @@ impl Default for NetworkOptions {
         NetworkOptions {
             device: Device::CPU,
             dtype: DType::Float32,
-            seed: 0,
+            topology_seed: 0,
             // 0.0 — never silently inject regularization. (`Network::build`
             // reads dropout from the topology anyway; this default only
             // guards direct `build_with_options` callers using
@@ -72,7 +72,7 @@ impl serde::Serialize for NetworkOptions {
             DType::Int64 => "Int64",
         };
         st.serialize_field("dtype", dtype)?;
-        st.serialize_field("seed", &(self.seed as u64))?;
+        st.serialize_field("topology_seed", &(self.topology_seed as u64))?;
         st.serialize_field("dropout_prob", &self.dropout_prob)?;
         st.end()
     }
@@ -105,7 +105,7 @@ pub struct Network {
 impl Network {
     /// Compile blueprint on the given device. Convenience wrapper over
     /// `build_with_options` that derives the **architecture-affecting** knobs
-    /// from the topology itself — `seed: graph.options.seed` (initial
+    /// from the topology itself — `seed: graph.options.topology_seed` (initial
     /// weights) and `dropout_prob: graph.options.dropout_prob` — so replaying
     /// a saved topology reproduces the exact net the engine built. It does
     /// *not* fall back to `NetworkOptions::default()` for those two fields
@@ -116,7 +116,7 @@ impl Network {
             &NetworkOptions {
                 device,
                 dtype: DType::Float32,
-                seed: graph.options.seed,
+                topology_seed: graph.options.topology_seed,
                 dropout_prob: graph.options.dropout_prob,
             },
         )
@@ -176,7 +176,7 @@ impl Network {
         let node_inputs: Vec<usize> = graph.nodes.iter().map(|n| n.num_inputs).collect();
         let node_sources = build_node_sources(&graph.connections, &node_inputs);
         let node_dims = graph.node_dims();
-        let rng = Some(fastrand::Rng::with_seed(opts.seed as u64));
+        let rng = Some(fastrand::Rng::with_seed(opts.topology_seed as u64));
         debug!(
             "Network::build -- graph id={} nodes={} wires={} input_dim={}",
             graph.id,
@@ -363,7 +363,7 @@ impl Network {
     }
 }
 
-// ── Forward pass — gather → combine → standardize → activate ─────────────
+// Forward pass — gather → combine → standardize (LayerNorm) → activate → dropout ───────────────────────
 
 impl Network {
     /// Step 1: Gather -- collect wired source tensors per port.
@@ -577,9 +577,9 @@ impl Module for Network {
                 let gathered = self.gather_inputs(&node_outputs, node_id)?;
                 let combined = self.combine_inputs(gathered, &node_outputs, node_id)?;
                 let transformed = self.layers[node_id].forward(&combined)?;
-                let activated = self.activate(node_id, transformed)?;
-                let standardized = self.standardize(node_id, activated)?;
-                self.apply_dropout(node_id, standardized)?
+                let standardized = self.standardize(node_id, transformed)?;
+                let activated = self.activate(node_id, standardized)?;
+                self.apply_dropout(node_id, activated)?
             };
             node_outputs.insert(node_id, y);
         }
@@ -816,7 +816,7 @@ mod tests {
             Network::build_with_options(
                 &graph,
                 &NetworkOptions {
-                    seed,
+                    topology_seed: seed,
                     ..Default::default()
                 },
             )

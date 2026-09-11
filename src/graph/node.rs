@@ -393,7 +393,7 @@ mod tests {
             span_out in 0usize..4,
         ) {
             let opts = TopologyOptions {
-                seed: 16,
+                topology_seed: 16,
                 min_hidden_num_nodes: 2,
                 max_hidden_num_nodes: 5,
                 min_hidden_inputs_per_node: min_inputs,

@@ -40,7 +40,7 @@ pub struct KindCounts {
 
 pub struct TopologyOptions {
     /// RNG seed — same seed => same random graph.
-    pub seed: usize,
+    pub topology_seed: usize,
     /// Min hidden nodes per individual (sampled by engine).
     pub min_hidden_num_nodes: usize,
     /// Max hidden nodes per individual (sampled by engine).
@@ -74,7 +74,7 @@ pub struct TopologyOptions {
 // engine's `HashSet<Spec>` dedup) working unchanged.
 impl PartialEq for TopologyOptions {
     fn eq(&self, other: &Self) -> bool {
-        self.seed == other.seed
+        self.topology_seed == other.topology_seed
             && self.min_hidden_num_nodes == other.min_hidden_num_nodes
             && self.max_hidden_num_nodes == other.max_hidden_num_nodes
             && self.min_hidden_inputs_per_node == other.min_hidden_inputs_per_node
@@ -92,7 +92,7 @@ impl Eq for TopologyOptions {}
 
 impl std::hash::Hash for TopologyOptions {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.seed.hash(state);
+        self.topology_seed.hash(state);
         self.min_hidden_num_nodes.hash(state);
         self.max_hidden_num_nodes.hash(state);
         self.min_hidden_inputs_per_node.hash(state);
@@ -109,7 +109,7 @@ impl std::hash::Hash for TopologyOptions {
 impl Default for TopologyOptions {
     fn default() -> Self {
         TopologyOptions {
-            seed: 55,
+            topology_seed: 55,
             min_hidden_num_nodes: 2,
             max_hidden_num_nodes: 5,
             min_hidden_inputs_per_node: 2,
@@ -119,6 +119,10 @@ impl Default for TopologyOptions {
             input_dim: 1,
             hidden_dim: 8,
             output_dim: 1,
+            // 0.0 keeps the race's determinism contract intact: dropout masks
+            // draw from libtorch's global RNG (unseeded), so any nonzero
+            // default makes training non-reproducible. Opt in per-binary via
+            // `config.topology_options.dropout_prob` when you accept that.
             dropout_prob: 0.0,
         }
     }
@@ -217,7 +221,7 @@ impl Topology {
             graph_inputs: Vec::new(),
             graph_outputs: Vec::new(),
             connections: Vec::new(),
-            rng: Rng::with_seed(opts.seed as u64),
+            rng: Rng::with_seed(opts.topology_seed as u64),
         }
     }
 
@@ -803,7 +807,7 @@ impl Topology {
     /// adds another term to the sum.
     ///
     /// The target is drawn from `self.rng`, so the rewiring is deterministic
-    /// per `options.seed` — same seed => same de-orphaned graph.
+    /// per `options.topology_seed` — same seed => same de-orphaned graph.
     ///
     /// Returns the number of wires added. Graphs where a source has no
     /// compatible later target (e.g. its output dim doesn't match any later
@@ -963,7 +967,7 @@ impl Topology {
 
     /// Deserialize a blueprint from JSON (see [`Topology::to_json`]).
     ///
-    /// The RNG is **re-seeded from `options.seed`**, so any regeneration after
+    /// The RNG is **re-seeded from `options.topology_seed`**, so any regeneration after
     /// loading (e.g. `finalize`) is deterministic — a loaded graph
     /// wires identically to a freshly created graph with the same options.
     ///
@@ -1135,7 +1139,7 @@ pub(crate) mod test_strategies {
         )
             .prop_map(
                 |(seed, min_in, min_out, input_dim, hidden_dim, output_dim)| TopologyOptions {
-                    seed,
+                    topology_seed: seed,
                     min_hidden_num_nodes: 2,
                     max_hidden_num_nodes: 6,
                     min_hidden_inputs_per_node: min_in,
@@ -1210,7 +1214,7 @@ mod tests {
     #[test]
     fn test_new_with_options() {
         let opts = TopologyOptions {
-            seed: 123,
+            topology_seed: 123,
             min_hidden_num_nodes: 3,
             max_hidden_num_nodes: 10,
             min_hidden_inputs_per_node: 1,
@@ -1611,7 +1615,7 @@ mod tests {
         // graph (targets drawn from graph.rng), always valid.
         let build = |seed: usize| {
             let mut graph = Topology::new(0, None);
-            graph.options.seed = seed;
+            graph.options.topology_seed = seed;
             graph.nodes.push(Node::new_input(0, 2));
             graph.nodes.push(Node::new_hidden(1, 2, 2));
             graph.nodes.push(Node::new_hidden(2, 2, 2));
