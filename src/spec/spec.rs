@@ -10,7 +10,7 @@
 //!
 //! # Reproducibility
 //!
-//! The RNG is **re-seeded from `options.seed`** on load, so a loaded graph
+//! The RNG is **re-seeded from `options.topology_seed`** on load, so a loaded graph
 //! regenerates wiring identically to a fresh graph with the same options
 //! (`Topology::to_json` / `Topology::from_json` delegate here).
 //!
@@ -29,7 +29,7 @@ use crate::graph::node::Node;
 use crate::graph::topology::{Connection, Topology, TopologyOptions};
 
 /// JSON round-trip representation of a [`Topology`] — the blueprint minus the
-/// RNG. `options.seed` is what makes regeneration reproducible, so the RNG is
+/// RNG. `options.topology_seed` is what makes regeneration reproducible, so the RNG is
 /// rebuilt from it on load rather than stored.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Spec {
@@ -70,9 +70,9 @@ impl<'de> Deserialize<'de> for Topology {
             graph_inputs: spec.graph_inputs,
             graph_outputs: spec.graph_outputs,
             connections: spec.connections,
-            // Reproducibility: the RNG is re-seeded from options.seed, so
+            // Reproducibility: the RNG is re-seeded from options.topology_seed, so
             // a loaded graph regenerates wiring identically to a fresh one.
-            rng: Rng::with_seed(spec.options.seed as u64),
+            rng: Rng::with_seed(spec.options.topology_seed as u64),
         })
     }
 }
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn test_topology_json_rewiring_is_deterministic() {
-        // The RNG is re-seeded from options.seed on load, so a loaded graph
+        // The RNG is re-seeded from options.topology_seed on load, so a loaded graph
         // wires identically to a fresh graph with the same options.
         let mut original = Topology::new(3, None);
         original.nodes.push(Node::new_input(0, 2));
@@ -184,8 +184,8 @@ mod tests {
             // fresh graph with the same topology and options.
             let mut loaded = loaded;
             let mut fresh = graph;
-            loaded.rng = fastrand::Rng::with_seed(loaded.options.seed as u64);
-            fresh.rng = fastrand::Rng::with_seed(fresh.options.seed as u64);
+            loaded.rng = fastrand::Rng::with_seed(loaded.options.topology_seed as u64);
+            fresh.rng = fastrand::Rng::with_seed(fresh.options.topology_seed as u64);
             loaded.finalize();
             fresh.finalize();
             prop_assert_eq!(loaded.connections, fresh.connections);
