@@ -1,6 +1,6 @@
 [package]
 name = "gras"
-version = "0.1.14"
+version = "1.0.0"
 edition = "2024"
 description = "A Genetic Programming framework for Neural Architecture Search in Rust"
 license = "MIT"
@@ -19,6 +19,7 @@ cuda = ["flodl/cuda"]
 
 [dependencies]
 flodl = "0.7.0"
+clap = { version = "4", features = ["derive", "env"] }
 env_logger = "0.11"
 fastrand = "2.5.0"
 log = "0.4"
