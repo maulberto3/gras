@@ -21,6 +21,9 @@ pub enum SelectionMethod {
     /// random draw. Higher `tournament_size` pressures selection more
     /// toward the fittest.
     Tournament { tournament_size: usize },
+    /// Fitness-proportionate (roulette wheel) selection: one draw returns
+    /// one index, weighted by the (direction-adjusted, non-negative) scores.
+    Roulette,
 }
 
 impl Default for SelectionMethod {
@@ -43,6 +46,7 @@ impl SelectionMethod {
             Self::Tournament { tournament_size } => {
                 tournament_select(scores, direction, rng, *tournament_size, elite_count)
             }
+            Self::Roulette => roulette_select(scores, direction, rng),
         }
     }
 
@@ -52,8 +56,42 @@ impl SelectionMethod {
             Self::Tournament { tournament_size } => {
                 format!("tournament(k={})", tournament_size)
             }
+            Self::Roulette => "roulette".to_string(),
         }
     }
+}
+
+/// One roulette-wheel draw: returns a single index into `scores`, chosen with
+/// probability proportional to its direction-adjusted weight. Negative scores
+/// are clamped to 0; if the total weight is 0 (or the slice is empty), returns
+/// an empty vec (no pick possible).
+fn roulette_select(scores: &[f32], direction: Direction, rng: &mut fastrand::Rng) -> Vec<usize> {
+    if scores.is_empty() {
+        return Vec::new();
+    }
+    // Direction-adjusted weights: higher-is-better keeps raw scores; lower-is-
+    // better inverts so the smallest loss gets the biggest slice.
+    let raw: Vec<f32> = match direction {
+        Direction::Maximize => scores.to_vec(),
+        Direction::Minimize => {
+            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            scores.iter().map(|&s| max - s).collect()
+        }
+    };
+    let weights: Vec<f32> = raw.iter().map(|&w| w.max(0.0)).collect();
+    let total: f32 = weights.iter().sum();
+    if total <= 0.0 {
+        // No useful spread: fall back to a uniform draw.
+        return vec![rng.usize(0..scores.len())];
+    }
+    let mut roll = rng.f32() * total;
+    for (i, &w) in weights.iter().enumerate() {
+        roll -= w;
+        if roll <= 0.0 {
+            return vec![i];
+        }
+    }
+    vec![weights.len() - 1]
 }
 
 /// Tournament selection with elitism.
@@ -183,6 +221,56 @@ mod tests {
     fn test_label() {
         let m = SelectionMethod::Tournament { tournament_size: 5 };
         assert_eq!(m.label(), "tournament(k=5)");
+    }
+
+    // Iter-5: roulette distribution sanity — the wheel must be biased
+    // toward higher-ranked nets in expectation (3:1 for weights 3,1) and
+    // deterministic under a fixed seed.
+    #[test]
+    fn test_roulette_biased_toward_higher_score() {
+        let scores = [3.0, 1.0];
+        let mut rng = fastrand::Rng::with_seed(99);
+        let n = 2_000;
+        let mut first = 0usize;
+        for _ in 0..n {
+            if SelectionMethod::Roulette
+                .apply(&scores, Direction::Maximize, &mut rng, 0)
+                .first() == Some(&0)
+            {
+                first += 1;
+            }
+        }
+        // weights 3:1 ⇒ expect ~75% for index 0; allow a wide band for noise.
+        let frac = first as f32 / n as f32;
+        assert!(
+            (0.65..0.85).contains(&frac),
+            "index 0 (weight 3) should win ~75% of draws, got {frac}"
+        );
+    }
+
+    #[test]
+    fn test_roulette_deterministic_and_minimize_inverts() {
+        // Minimize direction inverts: the *smallest* score gets the biggest
+        // slice, so index 0 (score 1.0) should dominate over index 1 (9.0).
+        let scores = [1.0, 9.0];
+        let mut rng = fastrand::Rng::with_seed(5);
+        let mut first = 0usize;
+        for _ in 0..500 {
+            if roulette_select(&scores, Direction::Minimize, &mut rng)[0] == 0 {
+                first += 1;
+            }
+        }
+        assert!(first > 350, "minimize should favor the smallest loss, got {first}/500");
+
+        // Same seed ⇒ same sequence (determinism contract).
+        let mut a = fastrand::Rng::with_seed(1234);
+        let mut b = fastrand::Rng::with_seed(1234);
+        for _ in 0..50 {
+            assert_eq!(
+                roulette_select(&scores, Direction::Maximize, &mut a),
+                roulette_select(&scores, Direction::Maximize, &mut b),
+            );
+        }
     }
 
     proptest! {
