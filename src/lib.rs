@@ -1,22 +1,19 @@
-//! gras — neural architecture search over random topologies.
+//! gras — neural architecture search over random topologies, run as a
+//! continuous step-race (see `RACE_REVAMP.md`).
 //!
-//! The engine evolves graph blueprints ([`Topology`]) generation by
-//! generation — seed, score, select, crossover, mutate — and compiles the
-//! winners into executable [`Network`]s. Bring your own [`Trainer`]:
-//! wrap a closure with [`trainer::from_fn`], or implement the trait for
-//! fully custom training loops.
+//! One global step clock: every live net trains and evaluates on the same
+//! shared batch each step. Divergence over the population's smoothed fitness
+//! culls the worst net and births a caught-up replacement. Blueprints
+//! ([`Topology`]) are compiled into executable [`Network`]s; you supply the
+//! loss and fitness as plain closures.
 //!
 //! Quick start:
 //! ```
-//! # use gras::*;
-//! let opts = EngineOptions::builder()
-//!     .set_pop_size(20)
-//!     .set_num_generations(5)
-//!     .set_selection(SelectionMethod::Tournament { tournament_size: 2 })
-//!     .set_crossover(CrossoverMethod::OnePoint { action_prob: 0.25 })
-//!     .set_mutation(MutationMethod::Activation { prob: 0.1 })
-//!     .build()
-//!     .unwrap();
+//! # use gras::engine::RaceConfig;
+//! let config = RaceConfig::builder()
+//!     .set_pop_size(6)
+//!     .set_max_steps(100)
+//!     .build();
 //! ```
 
 // ── module tree ──────────────────────────────────────────────────────
@@ -24,6 +21,7 @@ pub mod engine;
 pub mod evolution;
 pub mod graph;
 pub mod spec;
+pub mod state;
 pub mod trainer;
 pub mod utils;
 
@@ -33,9 +31,10 @@ pub use evolution::{crossover, mutation, pools, selection};
 pub use graph::{network, node, topology};
 pub use utils::data;
 
-// ── engine ───────────────────────────────────────────────────────────
-pub use engine::{Engine, EngineOptions, GenerationStats, RobustnessFilter};
-pub use engine::fitness::{Direction, Fitness, FitnessLabel};
+// ── engine — the step-race loop ──────────────────────────────────────
+pub use engine::{
+    Direction, Fitness, FitnessLabel, RaceConfig, RaceEngine, RaceSnapshot, RunMode, RunSpec, StopReason,
+};
 
 // ── graph — blueprints + executable networks ─────────────────────────
 pub use graph::network::{Network, NetworkOptions};
@@ -47,11 +46,10 @@ pub use evolution::crossover::CrossoverMethod;
 pub use evolution::mutation::MutationMethod;
 pub use evolution::selection::SelectionMethod;
 
-// ── trainer — the primary extension point ────────────────────────────
-// The built-in SupervisedTrainer + TrainingConfig live at
-// `trainer::supervised` — an optional convenience, not the default.
-pub use trainer::{EvalOutcome, Trainer};
-pub use utils::supervised::TrainResult;
+// ── trainer — shared deterministic batching ──────────────────────────
+pub use trainer::stream::{BatchStream, PoolSplit};
+pub use trainer::supervised::TabularTrainer;
+pub use trainer::{IntoBoxedTrainer, LossFn, RunData, StepContext, StepEnv, StepReport, StreamShape, Trainer};
 
 // ── data ─────────────────────────────────────────────────────────────
 pub use utils::data::{
@@ -61,11 +59,14 @@ pub use utils::data::{
 };
 
 // ── scoring helpers ──────────────────────────────────────────────────
-pub use utils::scoring::{
+pub use utils::score::{
     accuracy_score, argmax_classes, cross_entropy_onehot, cross_entropy_onehot_loss, f1_from_vecs,
     f1_score, l1_loss_score, mse_loss_score, precision_from_vecs, precision_score, r2_score,
     rmse_score,
 };
+
+// ── step primitives ──────────────────────────────────────────────────
+pub use utils::race_steps::{eval_one_step, seed_step_randomness, train_one_step};
 
 // ── flodl — the tensor backend ───────────────────────────────────────
 pub use flodl::{DType, Device, Variable};
