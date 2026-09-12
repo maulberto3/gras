@@ -14,19 +14,19 @@ pub fn topology_mermaid(graph: &Topology) -> String {
     for node in &graph.nodes {
         let label = match node.kind {
             NodeKind::Input => {
-                let dim = node.hidden_dim.unwrap_or(graph.options.hidden_dim);
-                format!("n{}[\"Input<br/>{}→{}\"]", node.id, graph.options.input_dim, dim)
+                let dim = node.hidden_dim.or(graph.options.hidden_dim).unwrap_or(1);
+                format!("n{}[\"Input<br/>{}→{}\"]", node.id, graph.options.input_dim.unwrap_or(1), dim)
             }
             NodeKind::Hidden => {
-                let dim = node.hidden_dim.unwrap_or(graph.options.hidden_dim);
+                let dim = node.hidden_dim.or(graph.options.hidden_dim).unwrap_or(1);
                 let act = format!("{:#?}", node.activation).to_lowercase();
                 let combine = node.combine_op.map(|c| format!("{:#?}", c).to_lowercase()).unwrap_or_default();
                 let std_label = node.standardize.map(|s| format!("{:#?}", s).to_lowercase()).unwrap_or_default();
                 format!("n{}[\"H{}<br/>{}<br/>{}<br/>{}<br/>{}\"]", node.id, node.id, dim, act, combine, std_label)
             }
             NodeKind::Output => {
-                let dim = node.hidden_dim.unwrap_or(graph.options.output_dim);
-                format!("n{}[\"Output<br/>{}→{}\"]", node.id, dim, graph.options.output_dim)
+                let dim = node.hidden_dim.or(graph.options.output_dim).unwrap_or(1);
+                format!("n{}[\"Output<br/>{}→{}\"]", node.id, dim, graph.options.output_dim.unwrap_or(1))
             }
         };
         out.push_str(&format!("    {}\n", label));

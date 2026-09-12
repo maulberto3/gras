@@ -320,10 +320,6 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
 ///
 /// Sorts connections by source node, shows the distance (in hops) between
 /// source and target, and highlights long-range jumps with `>>>` markers.
-
-/// ASCII topology view of a [`Topology`]: a header box plus the Manhattan-wired
-/// node diagram.
-
 pub(crate) fn edge_list(graph: &Topology) -> String {
     let mut out = String::new();
     let n = graph.connections.len();

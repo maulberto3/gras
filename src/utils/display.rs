@@ -58,12 +58,15 @@ impl Display for Connection {
 
 impl Display for TopologyOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let in_str = self.input_dim.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+        let hid_str = self.hidden_dim.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
+        let out_str = self.output_dim.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
         write!(
             f,
             "input {} → hidden {} → output {} · hidden_nodes {}..={}",
-            self.input_dim,
-            self.hidden_dim,
-            self.output_dim,
+            in_str,
+            hid_str,
+            out_str,
             self.min_hidden_num_nodes,
             self.max_hidden_num_nodes,
         )

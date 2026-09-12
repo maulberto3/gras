@@ -9,5 +9,5 @@ pub mod graph_utils;
 pub mod markdown;
 pub mod mermaid;
 pub mod race_steps;
-pub mod scoring;
+pub mod score;
 pub mod seed;

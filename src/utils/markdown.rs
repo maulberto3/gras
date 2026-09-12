@@ -24,7 +24,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     // Summary
     let hidden_range: Vec<usize> = graph.nodes.iter().filter_map(|n| n.hidden_dim).collect();
     let hidden_info = if hidden_range.is_empty() {
-        format!("hidden {}", graph.options.hidden_dim)
+        format!("hidden {}", graph.options.hidden_dim.map(|x| x.to_string()).unwrap_or_else(|| "?".into()))
     } else {
         let min = *hidden_range.iter().min().unwrap();
         let max = *hidden_range.iter().max().unwrap();
@@ -38,9 +38,9 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
         "**{} nodes** · **{} wires** · input {} → {} → output {}\n\n",
         graph.nodes.len(),
         graph.connections.len(),
-        graph.options.input_dim,
+        graph.options.input_dim.map(|x| x.to_string()).unwrap_or_else(|| "?".into()),
         hidden_info,
-        graph.options.output_dim,
+        graph.options.output_dim.map(|x| x.to_string()).unwrap_or_else(|| "?".into()),
     ));
 
     // ── Nodes table (merged topology + network layer info) ──

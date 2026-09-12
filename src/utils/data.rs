@@ -556,6 +556,16 @@ pub fn split_indices(
     }
 }
 
+/// One-hot encode class indices: `indices: Vec<usize>` → `[n, num_classes]` tensor.
+pub fn one_hot(indices: &[usize], num_classes: usize, device: Device) -> Result<Tensor> {
+    let n = indices.len();
+    let mut data = vec![0.0f32; n * num_classes];
+    for (i, &c) in indices.iter().enumerate() {
+        data[i * num_classes + c] = 1.0;
+    }
+    Tensor::from_f32(&data, &[n as i64, num_classes as i64], device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,14 +741,4 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
-}
-
-/// One-hot encode class indices: `indices: Vec<usize>` → `[n, num_classes]` tensor.
-pub fn one_hot(indices: &[usize], num_classes: usize, device: Device) -> Result<Tensor> {
-    let n = indices.len();
-    let mut data = vec![0.0f32; n * num_classes];
-    for (i, &c) in indices.iter().enumerate() {
-        data[i * num_classes + c] = 1.0;
-    }
-    Tensor::from_f32(&data, &[n as i64, num_classes as i64], device)
 }
