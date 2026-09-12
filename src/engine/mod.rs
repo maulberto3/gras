@@ -23,7 +23,7 @@ pub mod population;
 pub mod race_engine;
 pub mod run_spec;
 
-pub use config::{RaceConfig, RaceSnapshot, StopReason};
+pub use config::{RaceConfig, RaceSnapshot, RunMode, StopReason};
 pub use fitness::{Direction, Fitness, FitnessLabel};
 pub use race_engine::RaceEngine;
-pub use run_spec::{RunSpec, StreamSpec};
+pub use run_spec::{RunSpec, StreamShape};

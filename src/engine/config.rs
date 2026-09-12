@@ -17,9 +17,17 @@ pub enum StopReason {
     CustomStop,
 }
 
+// ── Consolidated defaults (one place for all engine constants) ────────────────────
+
+/// Per-net smoothed-fitness rolling window for divergence ( K ).
+pub const DIVERGENCE_WINDOW: usize = 10;
+
 /// Steps between population checkpoints — the cadence every evolution gate
 /// hangs off.
 pub const DEFAULT_CHECKPOINT_EVERY: usize = 10;
+
+/// Learning rate default for the Adam optimizers.
+pub const DEFAULT_LR: f32 = 1e-3;
 
 /// Per-step log verbosity for the race engine.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -63,8 +71,16 @@ pub enum CheckMode {
     Soft,
 }
 
-/// Learning rate default for the Adam optimizers.
-pub const DEFAULT_LR: f32 = 1e-3;
+/// The training paradigm / problem space the run targets.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+pub enum RunMode {
+    #[default]
+    Tabular,
+    OneCImage,
+    ThreeCImage,
+    Nlp,
+    Rl,
+}
 
 /// Step-race knob surface. Defaults are conservative and small for quick
 /// testing (pop 5, grace 15, threshold 0.20, batch 16, train_eval_split_ratio 0.2,
@@ -99,9 +115,12 @@ pub struct RaceConfig {
     /// Target fitness: stop when the best smoothed fitness reaches this
     /// (None = no target stop). Compared under the fitness direction.
     pub target_score: Option<f32>,
-    // NOTE: the shared batch stream knobs (batch_size, train_eval_split_ratio,
-    // held_out_eval_rows) live on `RunSpec::stream` — engine infrastructure,
-    // not training/evolution options. See `run_spec.rs`.
+    // NOTE: the shared batch stream (batch size, split ratio, eval rows) is
+    // NOT a RaceConfig knob. It is engine infrastructure, rebuilt each run
+    // from the trainer's optional stream_shape() request + the dataset's
+    // seeded split. The trainer owns batch geometry; the engine owns data
+    // integrity (split ratio) and can always read the effective shape via
+    // stream_info().
     /// Hidden-dim sampling range, same convention as the old generational
     /// engine's `set_hidden_dim_pool(min, max)`. When `None`, the default
     /// 4..=8 range is used.
@@ -125,6 +144,8 @@ pub struct RaceConfig {
     pub mutate_prob: f32,
     /// How many parents the evolved path may try to combine (1 or 2).
     pub crossover_parents: usize,
+    /// Whether to fall back to random immigrant if crossover fails.
+    pub crossover_fallback_to_immigrant: bool,
     /// Pluggable stop criterion **in addition** to the built-ins (Iter 5
     /// contract). When `None`, only the built-ins apply.
     pub custom_stop: StopFn,
@@ -134,6 +155,10 @@ pub struct RaceConfig {
     /// Their labels determine the extra columns a reader may expect in a
     /// per-net metrics snapshot.
     pub metrics: Vec<Metric>,
+    /// The training paradigm / problem space target.
+    pub mode: RunMode,
+    /// Whether to write lossless long-form logs metrics.csv + options.csv.
+    pub csv_export: bool,
 }
 
 /// Type alias for the pluggable Iter-5 stop closure.
@@ -202,6 +227,7 @@ impl RaceConfig {
             cross_rolls: 1,
             mutate_rolls: 1,
             check: CheckMode::default(),
+            crossover_fallback_to_immigrant: false,
             max_steps: None,
             wall_clock_seconds: None,
             max_culls: None,
@@ -218,6 +244,8 @@ impl RaceConfig {
             custom_stop: None,
             metrics: Vec::new(),
             log_level: LogLevel::default(),
+            mode: RunMode::Tabular,
+            csv_export: true,
         }
     }
 
@@ -228,6 +256,12 @@ impl RaceConfig {
         RaceConfigBuilder {
             cfg: RaceConfig::defaults(),
         }
+    }
+}
+
+impl Default for RaceConfig {
+    fn default() -> Self {
+        Self::defaults()
     }
 }
 
@@ -290,16 +324,66 @@ impl RaceConfigBuilder {
         self.cfg.combine_op_pool = pool;
         self
     }
+    pub fn set_combine_ops(self, ops: &[&str]) -> Self {
+        self.set_combine_op_pool(ops.iter().map(|s| s.to_string()).collect())
+    }
     pub fn set_activation_pool(mut self, pool: Vec<String>) -> Self {
         self.cfg.activation_pool = pool;
         self
+    }
+    pub fn set_activations(self, ops: &[&str]) -> Self {
+        self.set_activation_pool(ops.iter().map(|s| s.to_string()).collect())
     }
     pub fn set_standardize_op_pool(mut self, pool: Vec<String>) -> Self {
         self.cfg.standardize_op_pool = pool;
         self
     }
+    pub fn set_standardize_ops(self, ops: &[&str]) -> Self {
+        self.set_standardize_op_pool(ops.iter().map(|s| s.to_string()).collect())
+    }
     pub fn set_topology_options(mut self, opts: TopologyOptions) -> Self {
         self.cfg.topology_options = opts;
+        self
+    }
+    // ── individual topology fields (direct, no need to build a full TopologyOptions)
+    pub fn set_min_hidden_num_nodes(mut self, n: usize) -> Self {
+        self.cfg.topology_options.min_hidden_num_nodes = n;
+        self
+    }
+    pub fn set_max_hidden_num_nodes(mut self, n: usize) -> Self {
+        self.cfg.topology_options.max_hidden_num_nodes = n;
+        self
+    }
+    pub fn set_min_hidden_inputs_per_node(mut self, n: usize) -> Self {
+        self.cfg.topology_options.min_hidden_inputs_per_node = n;
+        self
+    }
+    pub fn set_max_hidden_inputs_per_node(mut self, n: usize) -> Self {
+        self.cfg.topology_options.max_hidden_inputs_per_node = n;
+        self
+    }
+    pub fn set_min_hidden_outputs_per_node(mut self, n: usize) -> Self {
+        self.cfg.topology_options.min_hidden_outputs_per_node = n;
+        self
+    }
+    pub fn set_max_hidden_outputs_per_node(mut self, n: usize) -> Self {
+        self.cfg.topology_options.max_hidden_outputs_per_node = n;
+        self
+    }
+    pub fn set_input_dim(mut self, n: usize) -> Self {
+        self.cfg.topology_options.input_dim = Some(n);
+        self
+    }
+    pub fn set_output_dim(mut self, n: usize) -> Self {
+        self.cfg.topology_options.output_dim = Some(n);
+        self
+    }
+    pub fn set_hidden_dim(mut self, n: usize) -> Self {
+        self.cfg.topology_options.hidden_dim = Some(n);
+        self
+    }
+    pub fn set_topology_seed(mut self, n: usize) -> Self {
+        self.cfg.topology_options.topology_seed = n;
         self
     }
     pub fn set_crossover_prob(mut self, v: f32) -> Self {
@@ -312,6 +396,15 @@ impl RaceConfigBuilder {
     }
     pub fn set_crossover_parents(mut self, n: usize) -> Self {
         self.cfg.crossover_parents = n;
+        self
+    }
+    // Propagation strategy when a crossover roll fires but produces no
+    // checkpoint-passing child: by default the attempt is discarded; flip
+    // this on to back-fill one random immigrant (same path as a
+    // mutation-roll insertion, no checkpoint gate) per failed crossover
+    // roll.
+    pub fn set_crossover_fallback_to_immigrant(mut self, on: bool) -> Self {
+        self.cfg.crossover_fallback_to_immigrant = on;
         self
     }
     pub fn set_metrics(mut self, metrics: Vec<Metric>) -> Self {
@@ -329,6 +422,16 @@ impl RaceConfigBuilder {
     /// `topology_options.dropout_prob` from config construction).
     pub fn set_dropout_prob(mut self, p: f32) -> Self {
         self.cfg.topology_options.dropout_prob = p;
+        self
+    }
+    /// Set the training paradigm / problem space target.
+    pub fn set_mode(mut self, mode: RunMode) -> Self {
+        self.cfg.mode = mode;
+        self
+    }
+    /// Set whether to write lossless long-form logs (metrics.csv and options.csv).
+    pub fn set_csv_export(mut self, enabled: bool) -> Self {
+        self.cfg.csv_export = enabled;
         self
     }
     pub fn build(self) -> RaceConfig {

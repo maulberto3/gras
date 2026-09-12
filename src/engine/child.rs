@@ -70,10 +70,12 @@ impl RaceEngine {
                 Err(e) => {
                     // Crossover machinery failed hard (not just a no-op):
                     // fall back to a random child so the race never stalls.
-                    info!(
-                        "step {} │ evolved child failed ({:?}) → random fallback",
-                        clock, e,
-                    );
+                    if self.verbose_detail() {
+                        info!(
+                            "step {} │ evolved child failed ({:?}) → random fallback",
+                            clock, e,
+                        );
+                    }
                     self.random_child(clock, child_idx)
                 }
             }
@@ -158,10 +160,12 @@ impl RaceEngine {
                 // the fittest: cloning reinforces the leader and starves
                 // diversity; a random entrant brings new blood. The race
                 // never stalls either way (pop size stays constant).
-                info!(
-                    "step {} │ crossover produced no child after 3 attempts (incompatible dims) → random topology fallback",
-                    clock,
-                );
+                if self.verbose_detail() {
+                    info!(
+                        "step {} │ crossover produced no child after 3 attempts (incompatible dims) → random topology fallback",
+                        clock,
+                    );
+                }
                 return self.random_child(clock, child_idx);
             }
         };
@@ -253,10 +257,10 @@ impl RaceEngine {
         // the same shared stream the rest of the population uses.
         // match the actual data).
         let mut opts = topo_opts;
-        opts.input_dim = self.header.input_dim;
-        opts.output_dim = self.header.output_dim;
+        opts.input_dim = Some(self.header.input_dim);
+        opts.output_dim = Some(self.header.output_dim);
         if let Some(pool) = &self.config.hidden_dim_pool {
-            opts.hidden_dim = *pool.start();
+            opts.hidden_dim = Some(*pool.start());
         }
         // The topology's internal rng must also derive from the run seed —
         // seeding it with the template's default would make every random
@@ -321,7 +325,7 @@ impl RaceEngine {
         let new_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx) as usize;
         topo.options.topology_seed = new_seed;
         let lineage = if parents.is_empty() {
-            format!("{origin}")
+            origin.to_string()
         } else {
             format!("{origin}:parents={}", parents.join(","))
         };
@@ -345,10 +349,10 @@ impl RaceEngine {
     // ── Catch-up ────────────────────────────────────────────────────────────
 
     /// Catch-up a newcomer by replaying the shared stream solo for steps
-    /// `0..clock`. Each step calls the same `train_one_step` + `eval_one_step`
-    /// + `seed_step_randomness` as the group loop, so the child reproduces
-    /// exactly what a group net would have seen at each step — that's the
-    /// replay contract.
+    /// `0..clock`. Each step calls the same `train_one_step` and
+    /// `eval_one_step` plus `seed_step_randomness` as the group loop, so the
+    /// child reproduces exactly what a group net would have seen at each
+    /// step — that's the replay contract.
     ///
     /// The child's network is rebuilt from its topology + seed at insertion
     /// time (in `clone_fittest_parent`), so catch-up starts from fresh weights
@@ -356,7 +360,7 @@ impl RaceEngine {
     /// a group net also started fresh at step 0 and saw the same batch sequence.
     ///
     /// Writes the child's state file **once at the end** (with the final step
-    /// + last metrics). During catch-up the child is not live in the population,
+    /// and last metrics). During catch-up the child is not live in the population,
     /// so no one reads its file per-step; for Item-6 resume, the recorded
     /// `step` field is what matters, not intermediate writes. The asymmetry
     /// with the group loop (which writes every step) is noted — Item 6 may
@@ -394,8 +398,6 @@ impl RaceEngine {
                     live_count: self.state.live_count(),
                     checkpoint_every: self.config.checkpoint_every,
                     divergence_window: crate::engine::divergence::DIVERGENCE_WINDOW,
-                    best_eval_fitness: self.best_eval_fitness,
-                    best_eval_step: self.best_eval_step,
                 },
                 net_hash: &child.state.hash,
                 net_seed: child.state.net_seed as u64,
@@ -491,6 +493,7 @@ impl RaceEngine {
             topology: state.topology,
             net_seed: state.net_seed,
             step: 0,
+            is_alive: true,
             entered_at_step: state.entered_at_step,
             created_from: state.created_from,
             last_metrics: None,

@@ -49,7 +49,7 @@ pub fn rolling_mean(buf: &RollingBuffer) -> f32 {
 
 /// Per-step divergence computation (D3). Rolling mean K=10 over each net's
 /// per-step fitness, then `(max-min)/max` over the live population.
-pub const DIVERGENCE_WINDOW: usize = 10;
+pub use crate::engine::config::DIVERGENCE_WINDOW;
 
 /// The built-in divergence policy: `(max - min) / max` over the population's
 /// smoothed fitness — bounded in [0, 1] (0 = identical population, 1 = worst

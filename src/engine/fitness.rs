@@ -132,7 +132,7 @@ mod tests {
     use crate::graph::network::Network;
     use crate::graph::node::Node;
     use crate::graph::topology::Topology;
-    use crate::utils::scoring::*;
+    use crate::utils::score::*;
     use flodl::nn::Module;
     use proptest::prelude::*;
 
@@ -214,8 +214,8 @@ mod tests {
     #[test]
     fn test_categorical_helpers() {
         let mut graph = Topology::new(0, None);
-        graph.options.input_dim = 2;
-        graph.options.hidden_dim = 4;
+        graph.options.input_dim = Some(2);
+        graph.options.hidden_dim = Some(4);
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_hidden(1, 2, 2));
         graph.nodes.push(Node::new_output(2, 2, 2));
@@ -275,7 +275,7 @@ mod tests {
 
         // Cross-entropy: > 0 for valid predictions
         let mut graph2 = Topology::new(0, None);
-        graph2.options.input_dim = 2;
+        graph2.options.input_dim = Some(2);
         graph2.nodes.push(Node::new_input(0, 2));
         graph2.nodes.push(Node::new_hidden(1, 2, 2));
         graph2.nodes.push(Node::new_output(2, 2, 3));
@@ -296,11 +296,11 @@ mod tests {
         let ce = cross_entropy_onehot(&cpred, &ct).unwrap();
         assert!(ce > 0.0 && ce.is_finite(), "cross_entropy = {ce}");
         let acc = accuracy_score(&cpred, &ct).unwrap();
-        assert!(acc >= 0.0 && acc <= 1.0, "accuracy = {acc}");
+        assert!((0.0..=1.0).contains(&acc), "accuracy = {acc}");
         let f1 = f1_score(&cpred, &ct).unwrap();
-        assert!(f1 >= 0.0 && f1 <= 1.0, "f1 = {f1}");
+        assert!((0.0..=1.0).contains(&f1), "f1 = {f1}");
         let prec = precision_score(&cpred, &ct).unwrap();
-        assert!(prec >= 0.0 && prec <= 1.0, "precision = {prec}");
+        assert!((0.0..=1.0).contains(&prec), "precision = {prec}");
         let (pa, ta) = argmax_classes(&cpred, &ct).unwrap();
         assert_eq!(pa.len(), 2);
         assert_eq!(ta.len(), 2);
