@@ -120,9 +120,8 @@ impl Network {
                 dropout_prob: graph.options.dropout_prob,
             },
         )
-        .map(|net| {
+        .inspect(|net| {
             net.eval();
-            net
         })
     }
 
@@ -182,7 +181,7 @@ impl Network {
             graph.id,
             graph.nodes.len(),
             graph.connections.len(),
-            graph.options.input_dim
+            graph.options.input_dim.unwrap_or(1)
         );
         (rng, node_sources, node_dims)
     }
@@ -296,12 +295,12 @@ impl Network {
         );
         Ok(Network {
             name,
-            input_dim: topo.input_dim,
+            input_dim: topo.input_dim.unwrap_or(1),
             hidden_dim: node_dims
                 .iter()
                 .map(|&(_, out)| out)
                 .max()
-                .unwrap_or(topo.hidden_dim),
+                .unwrap_or_else(|| topo.hidden_dim.unwrap_or(1)),
             layers,
             connections: graph.connections.clone(),
             nodes: graph.nodes.clone(),
@@ -598,10 +597,8 @@ impl Module for Network {
         }
         for ports in &self.port_projections {
             for port_projs in ports {
-                for proj in port_projs {
-                    if let Some(p) = proj {
-                        params.extend(p.parameters());
-                    }
+                for p in port_projs.iter().flatten() {
+                    params.extend(p.parameters());
                 }
             }
         }
@@ -615,10 +612,8 @@ impl Module for Network {
     }
 
     fn set_training(&self, training: bool) {
-        for d in &self.dropout_layers {
-            if let Some(d) = d {
-                d.set_training(training);
-            }
+        for d in self.dropout_layers.iter().flatten() {
+            d.set_training(training);
         }
     }
 }
@@ -658,9 +653,9 @@ mod tests {
         let module = Network::build(&graph, Device::CPU).unwrap();
 
         let batch = 4i64;
-        let input = rand_input(batch, graph.options.input_dim);
+        let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.output_dim as i64]);
+        assert_eq!(output.shape(), &[batch, graph.options.output_dim.unwrap_or(1) as i64]);
 
         // One Linear (weight + bias) per node, plus orphan projections
         // for nodes with orphaned ports (at least the input node).
@@ -678,9 +673,9 @@ mod tests {
 
         let module = Network::build(&graph, Device::CPU).unwrap();
         let batch = 2i64;
-        let input = rand_input(batch, graph.options.input_dim);
+        let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.output_dim as i64]);
+        assert_eq!(output.shape(), &[batch, graph.options.output_dim.unwrap_or(1) as i64]);
     }
 
     #[test]
@@ -693,9 +688,9 @@ mod tests {
 
         let module = Network::build(&graph, Device::CPU).unwrap();
         let batch = 2i64;
-        let input = rand_input(batch, graph.options.input_dim);
+        let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.output_dim as i64]);
+        assert_eq!(output.shape(), &[batch, graph.options.output_dim.unwrap_or(1) as i64]);
     }
 
     #[test]
@@ -727,7 +722,7 @@ mod tests {
         assert_eq!(module.node_dims[2].1, 8); // n2 out_dim
 
         let batch = 3i64;
-        let input = rand_input(batch, graph.options.input_dim);
+        let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
         let output = module.forward(&input).unwrap();
         assert_eq!(output.shape(), &[batch, 8]);
     }
@@ -845,9 +840,9 @@ mod tests {
         );
         // And the seeded weights are actually used: a forward is finite.
         let out = seeded(42)
-            .forward(&rand_input(2, graph.options.input_dim))
+            .forward(&rand_input(2, graph.options.input_dim.unwrap_or(1)))
             .unwrap();
-        assert_eq!(out.shape(), &[2, graph.options.output_dim as i64]);
+        assert_eq!(out.shape(), &[2, graph.options.output_dim.unwrap_or(1) as i64]);
     }
 }
 
@@ -958,13 +953,13 @@ mod var_dim_test {
             let net = Network::build(&topo, Device::CPU).unwrap();
             let bs = 4;
             let input = Variable::new(
-                Tensor::randn(&[bs as i64, topo.options.input_dim as i64],
+                Tensor::randn(&[bs as i64, topo.options.input_dim.unwrap_or(1) as i64],
                     TensorOptions { dtype: DType::Float32, device: Device::CPU }).unwrap(),
                 false,
             );
             let out = net.forward(&input).unwrap();
             prop_assert_eq!(out.shape()[0], bs as i64);
-            prop_assert_eq!(out.shape()[1], topo.options.output_dim as i64);
+            prop_assert_eq!(out.shape()[1], topo.options.output_dim.unwrap_or(1) as i64);
         }
     }
 }

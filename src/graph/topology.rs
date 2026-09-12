@@ -54,13 +54,21 @@ pub struct TopologyOptions {
     /// Each random hidden node gets at most this many outputs.
     pub max_hidden_outputs_per_node: usize,
     /// Feature dimension of the network input tensor.
-    pub input_dim: usize,
+    /// Feature dimension of the network input tensor.
+    /// `None` means "infer from the dataset at run start" — the engine's
+    /// `RaceEngine::new` fills this in from `data_dir` when it is unset.
+    /// When set explicitly by the user, the engine validates it against the
+    /// dataset's input dim and errors on mismatch.
+    pub input_dim: Option<usize>,
     /// Internal feature dimension shared by every node.
-    pub hidden_dim: usize,
+    /// `None` means "use a conservative default at run start" — the engine
+    /// fills this in if unset. When set explicitly, it is used as-is.
+    pub hidden_dim: Option<usize>,
     /// Output dimension of the network (set on the Output node's layer).
     /// The output node maps `hidden_dim -> output_dim`; auto-detected from
     /// the dataset's target shape by the engine, or set manually.
-    pub output_dim: usize,
+    /// `None` means "infer from the dataset at run start".
+    pub output_dim: Option<usize>,
     /// Dropout probability the engine used when building this topology's
     /// network. Part of the blueprint so replays don't silently diverge;
     /// defaults to 0.0 when a saved topology predates the field.
@@ -81,7 +89,7 @@ impl PartialEq for TopologyOptions {
             && self.max_hidden_inputs_per_node == other.max_hidden_inputs_per_node
             && self.min_hidden_outputs_per_node == other.min_hidden_outputs_per_node
             && self.max_hidden_outputs_per_node == other.max_hidden_outputs_per_node
-            && self.input_dim == other.input_dim
+            &&        self.input_dim == other.input_dim
             && self.hidden_dim == other.hidden_dim
             && self.output_dim == other.output_dim
             && self.dropout_prob.to_bits() == other.dropout_prob.to_bits()
@@ -116,9 +124,9 @@ impl Default for TopologyOptions {
             max_hidden_inputs_per_node: 5,
             min_hidden_outputs_per_node: 2,
             max_hidden_outputs_per_node: 5,
-            input_dim: 1,
-            hidden_dim: 8,
-            output_dim: 1,
+            input_dim: None,
+            hidden_dim: Some(8),
+            output_dim: None,
             // 0.0 keeps the race's determinism contract intact: dropout masks
             // draw from libtorch's global RNG (unseeded), so any nonzero
             // default makes training non-reproducible. Opt in per-binary via
@@ -315,22 +323,20 @@ impl Topology {
     ///  → orphaned → fed by the network input at execution time)
     ///
     /// Rules:
-    ///   -  no recurrent connections: only forward edges, so
-    ///     from.node < to.node (this also forbids self-loops, since a node is
-    ///     never earlier than itself)
-    ///   -  1:1 pairing: each output port feeds at most one input port
-    ///   -  orphaned input ports (no earlier output available) are fed by
-    ///     the network input at execution time
-    ///   -  orphaned output ports are rewired automatically at the end by
-    ///     [`Topology::rewire_orphaned_outputs`] — even into already-wired input ports
-    ///     (the node combines them with Add/Mean) — so a single call yields a
-    ///     complete graph.
+    /// - no recurrent connections: only forward edges, so
+    ///   `from.node < to.node` (this also forbids self-loops, since a node is
+    ///   never earlier than itself)
+    /// - 1:1 pairing: each output port feeds at most one input port
+    /// - orphaned input ports (no earlier output available) are fed by
+    ///   the network input at execution time
+    /// - orphaned output ports are rewired automatically at the end by
+    ///   [`Topology::rewire_orphaned_outputs`] — even into already-wired input ports
+    ///   (the node combines them with Add/Mean) — so a single call yields a
+    ///   complete graph.
     ///
     /// Simple maths: with I input ports and O output ports the random pass
     /// creates at most min(I, O) connections; the de-orphan pass may add
     /// more (one per orphaned output with a compatible later target).
-    // ── Finalize — scaffold + wiring ─────────────────────────────────────────
-
     pub fn finalize(&mut self) {
         self.connections.clear();
 
@@ -373,7 +379,7 @@ impl Topology {
         for node in &mut self.nodes {
             if node.hidden_dim.is_none() {
                 node.hidden_dim = Some(match node.kind {
-                    NodeKind::Output => self.options.output_dim,
+                    NodeKind::Output => self.options.output_dim.unwrap_or(1),
                     _ => eff,
                 });
             }
@@ -523,16 +529,14 @@ impl Topology {
     ///   - every input port is wired (no orphans after finalize)
     ///
     /// Network::build calls this and refuses to build invalid graphs.
-    // ── Validate — check wiring invariants ───────────────────────────────────
-
     pub fn validate(&self) -> Result<(), TopologyError> {
         // 1. Options sanity
-        if self.options.input_dim == 0
-            || self.options.hidden_dim == 0
-            || self.options.output_dim == 0
+        if self.options.input_dim == Some(0)
+            || self.options.hidden_dim == Some(0)
+            || self.options.output_dim == Some(0)
         {
             return Err(TopologyError::InvalidOptions(
-                "input_dim, hidden_dim, and output_dim must be > 0".to_string(),
+                "input_dim, hidden_dim, and output_dim must be > 0 or unset (None)".to_string(),
             ));
         }
         if self.options.min_hidden_inputs_per_node > self.options.max_hidden_inputs_per_node
@@ -620,8 +624,6 @@ impl Topology {
     /// - an **orphaned output port** has no wire feeding another node. The
     ///   graph-output node's own output ports are **excluded** — those are
     ///   the graph's answer, consumed by the caller, not orphans.
-    // ── Diagnostics — derived graph stats ────────────────────────────────────
-
     pub fn orphan_counts(&self) -> (usize, usize) {
         node_orphan_counts(&self.nodes, &self.connections, self.nodes.len() - 1)
     }
@@ -630,7 +632,7 @@ impl Topology {
 
     /// Output dim of a node: its `hidden_dim` override, or the graph default.
     fn out_dim_of(&self, node: &Node) -> usize {
-        node.hidden_dim.unwrap_or(self.options.hidden_dim)
+        node.hidden_dim.unwrap_or_else(|| self.options.hidden_dim.unwrap_or(8))
     }
 
     /// The effective hidden dim for orphan projections: the max output dim
@@ -642,12 +644,12 @@ impl Topology {
             .iter()
             .map(|n| self.out_dim_of(n))
             .max()
-            .unwrap_or(self.options.hidden_dim)
+            .unwrap_or_else(|| self.options.hidden_dim.unwrap_or(8))
     }
 
-    /// Per-node input dim: the (validated-identical) output dim of its
-    // ── derived diagnostics (the "missing data" catalog) ───────────────────
-
+    /// Per-node input dim: the (validated-identical) output dim of its wired
+    /// sources.
+    ///
     /// Derived per-node feature dims `(in_dim, out_dim)`, indexed by node id
     /// — the same derivation [`Network::build`](crate::graph::network::Network::build)
     /// uses.
@@ -665,7 +667,7 @@ impl Topology {
             .map(|node| {
                 let in_dim = if node.kind == NodeKind::Input {
                     // Input node reads raw data: in_dim = input_dim
-                    self.options.input_dim
+                    self.options.input_dim.unwrap_or(1)
                 } else {
                     sources[node.id]
                         .iter()
@@ -765,8 +767,6 @@ impl Topology {
     /// connections are re-mapped to match (`finalize` re-mints the port
     /// labels afterwards; call [`Topology::refresh_labels`] yourself when
     /// calling this standalone).
-    // ── Scaffold & de-orphaning ──────────────────────────────────────────────
-
     pub fn ensure_scaffold(&mut self) {
         // 1. At least one Input node (single output port; net_input feeds
         //    the rest of the graph).
@@ -788,7 +788,7 @@ impl Topology {
         let has_output = self.nodes.iter().any(|n| n.kind == NodeKind::Output);
         if !has_output {
             let mut out = Node::new_output(self.nodes.len(), 1, 1);
-            out.hidden_dim = Some(self.options.output_dim);
+            out.hidden_dim = Some(self.options.output_dim.unwrap_or(1));
             self.nodes.push(out);
         }
     }
@@ -959,8 +959,6 @@ impl Topology {
     /// Serialize the whole blueprint (options, nodes, labels, connections) to
     /// JSON.  See [`crate::spec::Spec`] for the shape; the RNG
     /// is not stored.
-    // ── Serialization ────────────────────────────────────────────────────────
-
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
@@ -1146,9 +1144,9 @@ pub(crate) mod test_strategies {
                     max_hidden_inputs_per_node: min_in + 3,
                     min_hidden_outputs_per_node: min_out,
                     max_hidden_outputs_per_node: min_out + 3,
-                    input_dim,
-                    hidden_dim,
-                    output_dim,
+                    input_dim: Some(input_dim),
+                    hidden_dim: Some(hidden_dim),
+                    output_dim: Some(output_dim),
                     dropout_prob: 0.0,
                 },
             )
@@ -1221,18 +1219,18 @@ mod tests {
             max_hidden_inputs_per_node: 5,
             min_hidden_outputs_per_node: 1,
             max_hidden_outputs_per_node: 5,
-            input_dim: 4,
-            hidden_dim: 16,
-            output_dim: 10,
+            input_dim: Some(4),
+            hidden_dim: Some(16),
+            output_dim: Some(10),
             dropout_prob: 0.0,
         };
         let graph = Topology::new(1, Some(opts));
         assert_eq!(graph.nodes.len(), 0);
         assert_eq!(graph.options.min_hidden_num_nodes, 3);
         assert_eq!(graph.options.max_hidden_num_nodes, 10);
-        assert_eq!(graph.options.input_dim, 4);
-        assert_eq!(graph.options.hidden_dim, 16);
-        assert_eq!(graph.options.output_dim, 10);
+        assert_eq!(graph.options.input_dim, Some(4));
+        assert_eq!(graph.options.hidden_dim, Some(16));
+        assert_eq!(graph.options.output_dim, Some(10));
     }
 
     #[test]
@@ -1404,9 +1402,9 @@ mod tests {
 
         let module = Network::build(&graph, Device::CPU).unwrap();
         let batch = 2i64;
-        let input = rand_input(batch, graph.options.input_dim);
+        let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.hidden_dim as i64]);
+        assert_eq!(output.shape(), &[batch, graph.options.hidden_dim.unwrap_or(1) as i64]);
     }
 
     #[test]
@@ -1583,9 +1581,9 @@ mod tests {
 
         let module = Network::build(&graph, Device::CPU).unwrap();
         let batch = 2i64;
-        let input = rand_input(batch, graph.options.input_dim);
+        let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.hidden_dim as i64]);
+        assert_eq!(output.shape(), &[batch, graph.options.hidden_dim.unwrap_or(1) as i64]);
     }
 
     #[test]
@@ -1795,9 +1793,9 @@ mod tests {
         #[test]
         fn prop_random_graphs_build_and_forward(graph in topology_strategy()) {
             let module = Network::build(&graph, Device::CPU).unwrap();
-            let input = rand_input(2, graph.options.input_dim);
+            let input = rand_input(2, graph.options.input_dim.unwrap_or(1));
             let out = module.forward(&input).unwrap();
-            prop_assert_eq!(out.shape(), &[2, graph.options.output_dim as i64]);
+            prop_assert_eq!(out.shape(), &[2, graph.options.output_dim.unwrap_or(1) as i64]);
         }
 
         /// The blueprint's derived diagnostics match the built engine

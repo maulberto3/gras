@@ -400,9 +400,9 @@ mod tests {
                 max_hidden_inputs_per_node: min_inputs + span_in,
                 min_hidden_outputs_per_node: min_outputs,
                 max_hidden_outputs_per_node: min_outputs + span_out,
-                input_dim: 1,
-                hidden_dim: 8,
-                output_dim: 1,
+                input_dim: Some(4),
+                hidden_dim: Some(8),
+                output_dim: Some(2),
                 dropout_prob: 0.0,
             };
             let mut graph = Topology::new(0, Some(opts));
