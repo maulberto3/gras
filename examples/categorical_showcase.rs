@@ -1,19 +1,16 @@
-//! Categorical (classification) showcase — gras evolves nets for MNIST-style data.
+//! Categorical (classification) showcase — the step-race engine evolving nets
+//! for MNIST-shaped synthetic data.
 //!
-//! Demonstrates: F1 score for ranking, cross-entropy for training.
+//! Demonstrates: `RaceConfig` builder, accuracy fitness (Maximize),
+//! informative metrics, divergence-driven culling.
 //!
 //! Run: `source env_setup.sh && cargo run --example categorical_showcase`
 
-use gras::data;
-use gras::engine::{Engine, EngineOptions};
-use gras::fitness::{Direction, Fitness};
-use gras::flodl::nn::Module;
-use gras::flodl::nn::optim::Optimizer;
-use gras::flodl::{Adam, Tensor, Variable};
-use gras::topology::CombineOp;
-use gras::trainer::from_fn;
-use gras::utils::data::split_indices;
-use gras::{DType, Device};
+use std::path::Path;
+
+use gras::engine::fitness::{Direction, Fitness, Metric};
+use gras::engine::{RaceConfig, RaceEngine};
+use gras::utils::{data, score};
 
 fn main() {
     use std::io::Write;
@@ -21,77 +18,59 @@ fn main() {
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
 
-    // 1. Data — synthetic classification (kept in memory — your trainer's job)
-    let ds = data::synthetic_classification(1024, 16, 4, 42, Device::CPU).unwrap();
-
-    // 2. Options
-    let opts = EngineOptions::builder()
-        .set_pop_size(50)
-        .set_num_generations(5)
-        .set_selection(gras::SelectionMethod::Tournament { tournament_size: 2 })
-        .set_crossover(gras::CrossoverMethod::OnePoint { action_prob: 0.5 })
-        .set_mutation(gras::MutationMethod::Activation { prob: 0.1 })
-        .set_hidden_dim_pool(8..=16)
-        .set_combine_op_pool(vec![CombineOp::Add])
-        .set_dedup_pop_and_fill(true)
-        .set_seed(Some(42))
-        .build()
-        .unwrap();
-
-    // 3. Fitness — F1 for ranking
-    let fitness = Fitness::new(
-        |pred, y| gras::f1_score(pred, y),
-        Direction::Maximize,
-        "f1",
+    // 1. Data — synthetic classification, persisted so the engine's
+    //    reproducibility contract (deterministic split from run_seed) holds.
+    //    The ENGINE loads it from data_dir; we only peek at the dims here.
+    let data_dir = Path::new("results/examples/categorical");
+    if !data_dir.exists() {
+        let ds = data::synthetic_classification(1024, 16, 4, 42, gras::auto_device()).unwrap();
+        data::save_dataset(data_dir, &ds).unwrap();
+    }
+    let peeked = data::resolve_dataset(data_dir).unwrap();
+    let (d_in, d_out) = (
+        peeked.inputs.shape()[1] as usize,
+        peeked.targets.shape()[1] as usize,
     );
+    drop(peeked);
 
-    // 4. Trainer — build your own from the Trainer contract.
-    //    One closure owns the whole loop: split, train, eval, score.
-    let trainer = from_fn(16, 4, Device::CPU, DType::Float32, move |net, gen_seed| {
-        let n = ds.len();
-        let (train_idx, _) = split_indices(n, 0.8, 0.2, gen_seed);
-        let (_, eval_idx) = split_indices(n, 0.8, 0.2, gen_seed.wrapping_add(0xFFFF));
+    // 2. Fitness — accuracy, maximize. Informative metrics ride along but
+    //    never drive ranking/culling.
+    let fitness = Fitness::new(
+        score::accuracy_score,
+        Direction::Maximize,
+        "accuracy",
+    );
+    let metrics = vec![Metric("f1".into())];
 
-        // Train — one epoch of cross-entropy with Adam, 32-row batches
-        let params = net.parameters();
-        let mut opt = Adam::new(&params, 1e-3);
-        net.train();
-        for chunk in train_idx.chunks(32) {
-            let idx = Tensor::from_i64(chunk, &[chunk.len() as i64], Device::CPU)?;
-            let x = Variable::new(ds.inputs.index_select(0, &idx)?, true);
-            let y = Variable::new(ds.targets.index_select(0, &idx)?, false);
-            let pred = net.forward(&x)?;
-            let loss = gras::cross_entropy_onehot_loss(&pred, &y)?;
-            loss.set_requires_grad(true)?;
-            opt.zero_grad();
-            loss.backward()?;
-            opt.step()?;
-        }
+    // 3. Config — budgets inactive unless set; here a step budget only.
+    //    Topology dims must match the dataset (16 features → 4 classes).
+    let mut topo_opts = gras::graph::topology::TopologyOptions::default();
+    topo_opts.input_dim = Some(d_in);
+    topo_opts.output_dim = Some(d_out);
+    let config = RaceConfig::builder()
+        .set_pop_size(6)
+        .set_max_steps(50)
+        .set_hidden_range(4, 8)
+        .set_topology_options(topo_opts)
+        .set_metrics(metrics.clone())
+        .build();
 
-        // Eval — F1 + cross-entropy on held-out batches
-        net.eval();
-        let mut score = 0.0;
-        let mut loss_sum = 0.0;
-        for chunk in eval_idx.chunks(32) {
-            let idx = Tensor::from_i64(chunk, &[chunk.len() as i64], Device::CPU)?;
-            let x = Variable::new(ds.inputs.index_select(0, &idx)?, false);
-            let y = Variable::new(ds.targets.index_select(0, &idx)?, false);
-            let pred = net.forward(&x)?;
-            score += gras::f1_score(&pred, &y)?;
-            loss_sum += gras::cross_entropy_onehot_loss(&pred, &y)?.item()? as f32;
-        }
-        let n_eval = eval_idx.len() as f32;
-        let param_count = net
-            .parameters()
-            .iter()
-            .map(|p| p.variable.numel() as usize)
-            .sum::<usize>();
-        Ok((score / n_eval, Some(loss_sum / n_eval), param_count))
-    });
-
-    let mut engine = Engine::new(opts, fitness, trainer).unwrap();
-    engine.run().unwrap();
-
-    // 5. Inspect robustness.
-    engine.show_robustness(5, gras::engine::RobustnessFilter::Best);
+    // 4. Run — one RunSpec; the cross-entropy loss lives inside the trainer.
+    let run_seed = 42u64;
+    let run_dir = Path::new("results/examples").join(format!("categorical-{run_seed}"));
+    let mut engine = RaceEngine::new(gras::engine::RunSpec {
+        data_dir: data_dir.to_path_buf(),
+        config,
+        fitness,
+        trainer: Box::new(gras::TabularTrainer::new(
+            score::cross_entropy_onehot_loss,
+        )),
+        seed: Some(run_seed),
+        run_dir: Some(run_dir),
+    })
+    .unwrap();
+    match engine.run() {
+        Ok(reason) => println!("race stopped: {reason:?}"),
+        Err(e) => eprintln!("race error: {e}"),
+    }
 }
