@@ -217,6 +217,10 @@ impl RunHeader {
     }
 }
 
+fn default_alive() -> bool {
+    true
+}
+
 // ── Per-net state (nets/<hash>.json) ──────────────────────────────────────
 
 /// The last-known state of one live net. Written to `nets/<hash>.json` and
@@ -242,6 +246,10 @@ pub struct NetState {
     /// the stream from step 0 up to (but not including) this step, then
     /// continues from here.
     pub step: usize,
+    /// Whether this net is currently alive in the active population. Culled nets
+    /// are written as final tombstones to disk with `is_alive: false`.
+    #[serde(default = "default_alive")]
+    pub is_alive: bool,
     /// When this individual entered the live population. For lifetime tracking
     /// and the robustness-equivalent (appearances / span / final score).
     pub entered_at_step: usize,
@@ -361,6 +369,7 @@ impl NetState {
             topology: topo_json,
             net_seed,
             step,
+            is_alive: true,
             entered_at_step: step,
             created_from,
             last_metrics: None,
@@ -697,9 +706,9 @@ mod tests {
             max_hidden_inputs_per_node: 1,
             min_hidden_outputs_per_node: 1,
             max_hidden_outputs_per_node: 1,
-            input_dim: 2,
-            hidden_dim: 4,
-            output_dim: 2,
+            input_dim: Some(2),
+            hidden_dim: Some(4),
+            output_dim: Some(2),
             dropout_prob: 0.0,
         }));
         topo.nodes.push(crate::graph::node::Node::new_input(0, 2));
