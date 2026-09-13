@@ -1,5 +1,5 @@
 //! gras — neural architecture search over random topologies, run as a
-//! continuous step-race (see `RACE_REVAMP.md`).
+//! continuous step-race.
 //!
 //! One global step clock: every live net trains and evaluates on the same
 //! shared batch each step. Divergence over the population's smoothed fitness
@@ -33,7 +33,8 @@ pub use utils::data;
 
 // ── engine — the step-race loop ──────────────────────────────────────
 pub use engine::{
-    Direction, Fitness, FitnessLabel, RaceConfig, RaceEngine, RaceSnapshot, RunMode, RunSpec, StopReason,
+    Direction, Fitness, FitnessLabel, RaceConfig, RaceEngine, RaceSnapshot, RunMode, RunSpec,
+    StopReason,
 };
 
 // ── graph — blueprints + executable networks ─────────────────────────
@@ -49,13 +50,15 @@ pub use evolution::selection::SelectionMethod;
 // ── trainer — shared deterministic batching ──────────────────────────
 pub use trainer::stream::{BatchStream, PoolSplit};
 pub use trainer::supervised::TabularTrainer;
-pub use trainer::{IntoBoxedTrainer, LossFn, RunData, StepContext, StepEnv, StepReport, StreamShape, Trainer};
+pub use trainer::{
+    IntoBoxedTrainer, LossFn, RunData, StepContext, StepEnv, StepReport, StreamShape, Trainer,
+};
 
 // ── data ─────────────────────────────────────────────────────────────
 pub use utils::data::{
-    DataFormat, Dataset, load_csv_dataset, load_dataset, load_dataset_auto, load_tensor,
-    make_sine, make_xor, one_hot, resolve_dataset, save_csv_dataset, save_dataset,
-    save_dataset_as, save_tensor,
+    DataFormat, Dataset, load_csv_dataset, load_dataset, load_dataset_auto, load_tensor, make_sine,
+    make_xor, one_hot, resolve_dataset, save_csv_dataset, save_dataset, save_dataset_as,
+    save_tensor,
 };
 
 // ── scoring helpers ──────────────────────────────────────────────────
