@@ -296,11 +296,7 @@ impl Network {
         Ok(Network {
             name,
             input_dim: topo.input_dim.unwrap_or(1),
-            hidden_dim: node_dims
-                .iter()
-                .map(|&(_, out)| out)
-                .max()
-                .unwrap_or_else(|| topo.hidden_dim.unwrap_or(1)),
+            hidden_dim: node_dims.iter().map(|&(_, out)| out).max().unwrap_or(8),
             layers,
             connections: graph.connections.clone(),
             nodes: graph.nodes.clone(),
@@ -424,8 +420,11 @@ impl Network {
                     Ok(combined)
                 }
             }
-            CombineOp::Multiply | CombineOp::Subtract | CombineOp::Divide
-            | CombineOp::Max | CombineOp::Min => {
+            CombineOp::Multiply
+            | CombineOp::Subtract
+            | CombineOp::Divide
+            | CombineOp::Max
+            | CombineOp::Min => {
                 let port_tensors = self.gather_port_tensors(node_outputs, node_id);
                 if port_tensors.is_empty() {
                     return Ok(combined);
@@ -515,8 +514,6 @@ impl Network {
             None => Ok(x),
         }
     }
-
-
 
     /// Serialize the **materialized network facts**  — the nutrition label
     /// of the built module, no weights (a rebuilt Network has the same
@@ -655,7 +652,10 @@ mod tests {
         let batch = 4i64;
         let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.output_dim.unwrap_or(1) as i64]);
+        assert_eq!(
+            output.shape(),
+            &[batch, graph.options.output_dim.unwrap_or(1) as i64]
+        );
 
         // One Linear (weight + bias) per node, plus orphan projections
         // for nodes with orphaned ports (at least the input node).
@@ -675,7 +675,10 @@ mod tests {
         let batch = 2i64;
         let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.output_dim.unwrap_or(1) as i64]);
+        assert_eq!(
+            output.shape(),
+            &[batch, graph.options.output_dim.unwrap_or(1) as i64]
+        );
     }
 
     #[test]
@@ -690,7 +693,10 @@ mod tests {
         let batch = 2i64;
         let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.output_dim.unwrap_or(1) as i64]);
+        assert_eq!(
+            output.shape(),
+            &[batch, graph.options.output_dim.unwrap_or(1) as i64]
+        );
     }
 
     #[test]
@@ -842,7 +848,10 @@ mod tests {
         let out = seeded(42)
             .forward(&rand_input(2, graph.options.input_dim.unwrap_or(1)))
             .unwrap();
-        assert_eq!(out.shape(), &[2, graph.options.output_dim.unwrap_or(1) as i64]);
+        assert_eq!(
+            out.shape(),
+            &[2, graph.options.output_dim.unwrap_or(1) as i64]
+        );
     }
 }
 

@@ -194,7 +194,6 @@ pub struct Node {
     /// activation (`None` = inherit the graph's `standardize_op`).
     #[serde(default)]
     pub standardize: Option<StandardizeOp>,
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -216,7 +215,6 @@ impl Node {
             activation: Activation::Identity,
             combine_op: None,
             standardize: None,
-
         }
     }
 
@@ -231,7 +229,6 @@ impl Node {
             activation: Activation::Identity,
             combine_op: None,
             standardize: None,
-
         }
     }
 
@@ -246,7 +243,6 @@ impl Node {
             activation: Activation::Identity,
             combine_op: None,
             standardize: None,
-
         }
     }
 
@@ -267,8 +263,6 @@ impl Node {
         self.hidden_dim = Some(hidden_dim);
         self
     }
-
-
 }
 
 #[cfg(test)]
@@ -293,7 +287,6 @@ mod tests {
                 activation: Activation::Identity,
                 combine_op: None,
                 standardize: None,
-    
             },
         )
     }
@@ -401,7 +394,6 @@ mod tests {
                 min_hidden_outputs_per_node: min_outputs,
                 max_hidden_outputs_per_node: min_outputs + span_out,
                 input_dim: Some(4),
-                hidden_dim: Some(8),
                 output_dim: Some(2),
                 dropout_prob: 0.0,
             };

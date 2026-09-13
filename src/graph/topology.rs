@@ -60,10 +60,6 @@ pub struct TopologyOptions {
     /// When set explicitly by the user, the engine validates it against the
     /// dataset's input dim and errors on mismatch.
     pub input_dim: Option<usize>,
-    /// Internal feature dimension shared by every node.
-    /// `None` means "use a conservative default at run start" — the engine
-    /// fills this in if unset. When set explicitly, it is used as-is.
-    pub hidden_dim: Option<usize>,
     /// Output dimension of the network (set on the Output node's layer).
     /// The output node maps `hidden_dim -> output_dim`; auto-detected from
     /// the dataset's target shape by the engine, or set manually.
@@ -89,8 +85,7 @@ impl PartialEq for TopologyOptions {
             && self.max_hidden_inputs_per_node == other.max_hidden_inputs_per_node
             && self.min_hidden_outputs_per_node == other.min_hidden_outputs_per_node
             && self.max_hidden_outputs_per_node == other.max_hidden_outputs_per_node
-            &&        self.input_dim == other.input_dim
-            && self.hidden_dim == other.hidden_dim
+            && self.input_dim == other.input_dim
             && self.output_dim == other.output_dim
             && self.dropout_prob.to_bits() == other.dropout_prob.to_bits()
     }
@@ -108,7 +103,6 @@ impl std::hash::Hash for TopologyOptions {
         self.min_hidden_outputs_per_node.hash(state);
         self.max_hidden_outputs_per_node.hash(state);
         self.input_dim.hash(state);
-        self.hidden_dim.hash(state);
         self.output_dim.hash(state);
         self.dropout_prob.to_bits().hash(state);
     }
@@ -125,7 +119,6 @@ impl Default for TopologyOptions {
             min_hidden_outputs_per_node: 2,
             max_hidden_outputs_per_node: 5,
             input_dim: None,
-            hidden_dim: Some(8),
             output_dim: None,
             // 0.0 keeps the race's determinism contract intact: dropout masks
             // draw from libtorch's global RNG (unseeded), so any nonzero
@@ -531,12 +524,9 @@ impl Topology {
     /// Network::build calls this and refuses to build invalid graphs.
     pub fn validate(&self) -> Result<(), TopologyError> {
         // 1. Options sanity
-        if self.options.input_dim == Some(0)
-            || self.options.hidden_dim == Some(0)
-            || self.options.output_dim == Some(0)
-        {
+        if self.options.input_dim == Some(0) || self.options.output_dim == Some(0) {
             return Err(TopologyError::InvalidOptions(
-                "input_dim, hidden_dim, and output_dim must be > 0 or unset (None)".to_string(),
+                "input_dim and output_dim must be > 0 or unset (None)".to_string(),
             ));
         }
         if self.options.min_hidden_inputs_per_node > self.options.max_hidden_inputs_per_node
@@ -632,7 +622,7 @@ impl Topology {
 
     /// Output dim of a node: its `hidden_dim` override, or the graph default.
     fn out_dim_of(&self, node: &Node) -> usize {
-        node.hidden_dim.unwrap_or_else(|| self.options.hidden_dim.unwrap_or(8))
+        node.hidden_dim.unwrap_or(8)
     }
 
     /// The effective hidden dim for orphan projections: the max output dim
@@ -644,7 +634,7 @@ impl Topology {
             .iter()
             .map(|n| self.out_dim_of(n))
             .max()
-            .unwrap_or_else(|| self.options.hidden_dim.unwrap_or(8))
+            .unwrap_or(8)
     }
 
     /// Per-node input dim: the (validated-identical) output dim of its wired
@@ -981,11 +971,7 @@ impl Topology {
     /// Find a hidden node with the same signature in both topologies.
     /// Signature: (activation, combine_op, standardize, hidden_dim, num_inputs, num_outputs).
     /// Returns (index_in_a, index_in_b) of hidden-only lists.
-    fn find_matching_node(
-        a: &Topology,
-        b: &Topology,
-        rng: &mut Rng,
-    ) -> Option<(usize, usize)> {
+    fn find_matching_node(a: &Topology, b: &Topology, rng: &mut Rng) -> Option<(usize, usize)> {
         let ha: Vec<usize> = a
             .nodes
             .iter()
@@ -1059,7 +1045,10 @@ impl Topology {
             a.finalize();
             b.renumber_ids();
             b.finalize();
-            debug!("cx_one_point: pivot hidden[{}] <-> hidden[{}], swapped {} nodes", pivot_a, pivot_b, len);
+            debug!(
+                "cx_one_point: pivot hidden[{}] <-> hidden[{}], swapped {} nodes",
+                pivot_a, pivot_b, len
+            );
             return true;
         }
         debug!("cx_one_point: no matching node found, skipping");
@@ -1088,7 +1077,11 @@ impl Topology {
 
         // Same-length requirement for per-node alignment
         if ha.len() != hb.len() || ha.is_empty() {
-            debug!("cx_uniform: hidden node count mismatch ({} vs {}), skipping", ha.len(), hb.len());
+            debug!(
+                "cx_uniform: hidden node count mismatch ({} vs {}), skipping",
+                ha.len(),
+                hb.len()
+            );
             return false;
         }
 
@@ -1132,11 +1125,10 @@ pub(crate) mod test_strategies {
             1usize..4,      //  min inputs per node
             1usize..4,      //  min outputs per node
             1usize..8,      // input_dim
-            1usize..8,      // hidden_dim
             1usize..8,      // output_dim
         )
             .prop_map(
-                |(seed, min_in, min_out, input_dim, hidden_dim, output_dim)| TopologyOptions {
+                |(seed, min_in, min_out, input_dim, output_dim)| TopologyOptions {
                     topology_seed: seed,
                     min_hidden_num_nodes: 2,
                     max_hidden_num_nodes: 6,
@@ -1145,7 +1137,6 @@ pub(crate) mod test_strategies {
                     min_hidden_outputs_per_node: min_out,
                     max_hidden_outputs_per_node: min_out + 3,
                     input_dim: Some(input_dim),
-                    hidden_dim: Some(hidden_dim),
                     output_dim: Some(output_dim),
                     dropout_prob: 0.0,
                 },
@@ -1220,7 +1211,6 @@ mod tests {
             min_hidden_outputs_per_node: 1,
             max_hidden_outputs_per_node: 5,
             input_dim: Some(4),
-            hidden_dim: Some(16),
             output_dim: Some(10),
             dropout_prob: 0.0,
         };
@@ -1229,7 +1219,6 @@ mod tests {
         assert_eq!(graph.options.min_hidden_num_nodes, 3);
         assert_eq!(graph.options.max_hidden_num_nodes, 10);
         assert_eq!(graph.options.input_dim, Some(4));
-        assert_eq!(graph.options.hidden_dim, Some(16));
         assert_eq!(graph.options.output_dim, Some(10));
     }
 
@@ -1404,7 +1393,7 @@ mod tests {
         let batch = 2i64;
         let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.hidden_dim.unwrap_or(1) as i64]);
+        assert_eq!(output.shape(), &[batch, 8]);
     }
 
     #[test]
@@ -1583,7 +1572,7 @@ mod tests {
         let batch = 2i64;
         let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
         let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, graph.options.hidden_dim.unwrap_or(1) as i64]);
+        assert_eq!(output.shape(), &[batch, 8]);
     }
 
     #[test]
