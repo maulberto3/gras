@@ -134,10 +134,14 @@ mod tests {
 
         fn rand_input(batch: i64, input_dim: usize) -> Variable {
             Variable::new(
-                Tensor::randn(&[batch, input_dim as i64], TensorOptions {
-                    dtype: flodl::DType::Float32,
-                    device: Device::CPU,
-                }).unwrap(),
+                Tensor::randn(
+                    &[batch, input_dim as i64],
+                    TensorOptions {
+                        dtype: flodl::DType::Float32,
+                        device: Device::CPU,
+                    },
+                )
+                .unwrap(),
                 false,
             )
         }
