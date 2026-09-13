@@ -314,13 +314,15 @@ pub fn load_csv_dataset(dir: &Path) -> Result<Dataset> {
         return Err(DataError::Io {
             path: inputs_path.display().to_string(),
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "inputs.csv not found"),
-        }.into());
+        }
+        .into());
     }
     if !targets_path.exists() {
         return Err(DataError::Io {
             path: targets_path.display().to_string(),
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "targets.csv not found"),
-        }.into());
+        }
+        .into());
     }
 
     let inputs_raw = std::fs::read_to_string(&inputs_path).map_err(|e| DataError::Io {
@@ -343,7 +345,8 @@ pub fn load_csv_dataset(dir: &Path) -> Result<Dataset> {
             continue;
         }
         // Try to parse as floats — if first non-empty line fails, treat as header
-        let row: Vec<f32> = match line.split(',')
+        let row: Vec<f32> = match line
+            .split(',')
             .map(|s| s.trim().parse::<f32>())
             .collect::<std::result::Result<Vec<_>, _>>()
         {
@@ -360,8 +363,10 @@ pub fn load_csv_dataset(dir: &Path) -> Result<Dataset> {
         if let Some(dim) = input_dim {
             if row.len() != dim {
                 return Err(DataError::Csv(format!(
-                    "inputs.csv: row {n_samples} has {} columns, expected {dim}", row.len()
-                )).into());
+                    "inputs.csv: row {n_samples} has {} columns, expected {dim}",
+                    row.len()
+                ))
+                .into());
             }
         } else {
             input_dim = Some(row.len());
@@ -382,7 +387,8 @@ pub fn load_csv_dataset(dir: &Path) -> Result<Dataset> {
             continue;
         }
         // Try to parse as floats — if first non-empty line fails, treat as header
-        let row: Vec<f32> = match line.split(',')
+        let row: Vec<f32> = match line
+            .split(',')
             .map(|s| s.trim().parse::<f32>())
             .collect::<std::result::Result<Vec<_>, _>>()
         {
@@ -399,8 +405,10 @@ pub fn load_csv_dataset(dir: &Path) -> Result<Dataset> {
         if let Some(dim) = target_dim {
             if row.len() != dim {
                 return Err(DataError::Csv(format!(
-                    "targets.csv: row {n_targets} has {} columns, expected {dim}", row.len()
-                )).into());
+                    "targets.csv: row {n_targets} has {} columns, expected {dim}",
+                    row.len()
+                ))
+                .into());
             }
         } else {
             target_dim = Some(row.len());
@@ -414,11 +422,20 @@ pub fn load_csv_dataset(dir: &Path) -> Result<Dataset> {
     if n_samples != n_targets {
         return Err(DataError::Csv(format!(
             "sample count mismatch: inputs has {n_samples}, targets has {n_targets}"
-        )).into());
+        ))
+        .into());
     }
 
-    let inputs = Tensor::from_f32(&inputs_flat, &[n_samples as i64, input_dim as i64], Device::CPU)?;
-    let targets = Tensor::from_f32(&targets_flat, &[n_targets as i64, target_dim as i64], Device::CPU)?;
+    let inputs = Tensor::from_f32(
+        &inputs_flat,
+        &[n_samples as i64, input_dim as i64],
+        Device::CPU,
+    )?;
+    let targets = Tensor::from_f32(
+        &targets_flat,
+        &[n_targets as i64, target_dim as i64],
+        Device::CPU,
+    )?;
 
     Ok(Dataset { inputs, targets })
 }
@@ -432,8 +449,12 @@ pub fn save_csv_dataset(dir: &Path, inputs: &Tensor, targets: &Tensor) -> Result
         source,
     })?;
 
-    let in_data = inputs.to_f32_vec().map_err(|e| DataError::Csv(format!("inputs to_f32_vec: {e}")))?;
-    let tgt_data = targets.to_f32_vec().map_err(|e| DataError::Csv(format!("targets to_f32_vec: {e}")))?;
+    let in_data = inputs
+        .to_f32_vec()
+        .map_err(|e| DataError::Csv(format!("inputs to_f32_vec: {e}")))?;
+    let tgt_data = targets
+        .to_f32_vec()
+        .map_err(|e| DataError::Csv(format!("targets to_f32_vec: {e}")))?;
     let in_shape = inputs.shape();
     let tgt_shape = targets.shape();
     let (n_in, dim_in) = (in_shape[0] as usize, in_shape[1] as usize);
@@ -498,7 +519,10 @@ pub fn synthetic_classification(
 pub fn make_sine(n: usize) -> (Tensor, Tensor) {
     let mut rng = fastrand::Rng::with_seed(42);
     let inputs: Vec<f32> = (0..n).map(|_| rng.f32() * 2.0 - 1.0).collect();
-    let targets: Vec<f32> = inputs.iter().map(|x| (x * std::f32::consts::TAU).sin()).collect();
+    let targets: Vec<f32> = inputs
+        .iter()
+        .map(|x| (x * std::f32::consts::TAU).sin())
+        .collect();
     let inputs = Tensor::from_f32(&inputs, &[n as i64, 1], Device::CPU).unwrap();
     let targets = Tensor::from_f32(&targets, &[n as i64, 1], Device::CPU).unwrap();
     (inputs, targets)
@@ -531,7 +555,10 @@ pub fn split_indices(
     eval_ratio: f32,
     seed: u64,
 ) -> (Vec<i64>, Vec<i64>) {
-    assert!((train_ratio + eval_ratio - 1.0).abs() < 1e-6, "ratios must sum to 1.0");
+    assert!(
+        (train_ratio + eval_ratio - 1.0).abs() < 1e-6,
+        "ratios must sum to 1.0"
+    );
     let mut indices: Vec<i64> = (0..len as i64).collect();
     // Deterministic shuffle via seed
     let mut rng = fastrand::Rng::with_seed(seed);
@@ -657,7 +684,11 @@ mod tests {
     fn test_csv_skips_comments() {
         let dir = temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("inputs.csv"), "# header comment\n1.0,2.0\n3.0,4.0\n").unwrap();
+        std::fs::write(
+            dir.join("inputs.csv"),
+            "# header comment\n1.0,2.0\n3.0,4.0\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("targets.csv"), "# another comment\n0.0\n1.0\n").unwrap();
         let ds = load_csv_dataset(&dir).unwrap();
         assert_eq!(ds.inputs.shape(), &[2, 2]);
@@ -674,7 +705,12 @@ mod tests {
         let data: Vec<f32> = (0..24).map(|_| rng.f32()).collect();
         let ds = Dataset {
             inputs: Tensor::from_f32(&data, &[8, 3], Device::CPU).unwrap(),
-            targets: Tensor::from_f32(&[0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0], &[8, 1], Device::CPU).unwrap(),
+            targets: Tensor::from_f32(
+                &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+                &[8, 1],
+                Device::CPU,
+            )
+            .unwrap(),
         };
 
         for fmt in [DataFormat::Bin, DataFormat::Csv, DataFormat::Both] {

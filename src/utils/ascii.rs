@@ -350,4 +350,3 @@ pub(crate) fn edge_list(graph: &Topology) -> String {
     }
     out
 }
-

@@ -14,19 +14,38 @@ pub fn topology_mermaid(graph: &Topology) -> String {
     for node in &graph.nodes {
         let label = match node.kind {
             NodeKind::Input => {
-                let dim = node.hidden_dim.or(graph.options.hidden_dim).unwrap_or(1);
-                format!("n{}[\"Input<br/>{}→{}\"]", node.id, graph.options.input_dim.unwrap_or(1), dim)
+                let dim = node.hidden_dim.unwrap_or(8);
+                format!(
+                    "n{}[\"Input<br/>{}→{}\"]",
+                    node.id,
+                    graph.options.input_dim.unwrap_or(1),
+                    dim
+                )
             }
             NodeKind::Hidden => {
-                let dim = node.hidden_dim.or(graph.options.hidden_dim).unwrap_or(1);
+                let dim = node.hidden_dim.unwrap_or(8);
                 let act = format!("{:#?}", node.activation).to_lowercase();
-                let combine = node.combine_op.map(|c| format!("{:#?}", c).to_lowercase()).unwrap_or_default();
-                let std_label = node.standardize.map(|s| format!("{:#?}", s).to_lowercase()).unwrap_or_default();
-                format!("n{}[\"H{}<br/>{}<br/>{}<br/>{}<br/>{}\"]", node.id, node.id, dim, act, combine, std_label)
+                let combine = node
+                    .combine_op
+                    .map(|c| format!("{:#?}", c).to_lowercase())
+                    .unwrap_or_default();
+                let std_label = node
+                    .standardize
+                    .map(|s| format!("{:#?}", s).to_lowercase())
+                    .unwrap_or_default();
+                format!(
+                    "n{}[\"H{}<br/>{}<br/>{}<br/>{}<br/>{}\"]",
+                    node.id, node.id, dim, act, combine, std_label
+                )
             }
             NodeKind::Output => {
                 let dim = node.hidden_dim.or(graph.options.output_dim).unwrap_or(1);
-                format!("n{}[\"Output<br/>{}→{}\"]", node.id, dim, graph.options.output_dim.unwrap_or(1))
+                format!(
+                    "n{}[\"Output<br/>{}→{}\"]",
+                    node.id,
+                    dim,
+                    graph.options.output_dim.unwrap_or(1)
+                )
             }
         };
         out.push_str(&format!("    {}\n", label));
@@ -45,14 +64,14 @@ pub fn topology_mermaid(graph: &Topology) -> String {
             .find(|n| n.id == conn.to.node)
             .map(|n| n.num_inputs as f32)
             .unwrap_or(1.0);
-        let max_ports = graph
-            .options
-            .max_hidden_inputs_per_node
-            .max(1) as f32;
+        let max_ports = graph.options.max_hidden_inputs_per_node.max(1) as f32;
         // Linear interpolation: MIN_WIDTH at 0 ports, MAX_WIDTH at max_ports
         let t = (port_count / max_ports).clamp(0.0, 1.0);
         let width = MIN_WIDTH + (MAX_WIDTH - MIN_WIDTH) * t;
-        out.push_str(&format!("    linkStyle {} stroke-width:{:.1}px\n", idx, width));
+        out.push_str(&format!(
+            "    linkStyle {} stroke-width:{:.1}px\n",
+            idx, width
+        ));
     }
 
     out.push_str("```\n");

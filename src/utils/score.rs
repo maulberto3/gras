@@ -18,7 +18,11 @@ pub fn r2_score(pred: &Variable, y: &Variable) -> Result<f32> {
     let ss_tot: f32 = t.iter().map(|&v| (v - mean_t).powi(2)).sum();
     let ss_res: f32 = t.iter().zip(&p).map(|(&a, &b)| (a - b).powi(2)).sum();
     if ss_tot.abs() < f32::EPSILON {
-        return Ok(if ss_res.abs() < f32::EPSILON { 1.0 } else { 0.0 });
+        return Ok(if ss_res.abs() < f32::EPSILON {
+            1.0
+        } else {
+            0.0
+        });
     }
     Ok(1.0 - ss_res / ss_tot)
 }

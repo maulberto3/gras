@@ -120,7 +120,9 @@ pub(crate) fn node_activation_counts(nodes: &[Node]) -> Vec<(Activation, usize)>
 }
 
 /// Standardize-op histogram across nodes.
-pub(crate) fn node_standardize_counts(nodes: &[Node]) -> Vec<(crate::graph::node::StandardizeOp, usize)> {
+pub(crate) fn node_standardize_counts(
+    nodes: &[Node],
+) -> Vec<(crate::graph::node::StandardizeOp, usize)> {
     let mut counts: Vec<(crate::graph::node::StandardizeOp, usize)> = Vec::new();
     for n in nodes {
         let op = n.standardize.unwrap_or_default();

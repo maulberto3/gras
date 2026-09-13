@@ -1,5 +1,4 @@
-//! Per-step training/eval primitives for the step-race engine (Iter 2 of the
-//! revamp — see `RACE_REVAMP.md`).
+//! Per-step training/eval primitives for the step-race engine.
 //!
 //! These are the single-batch analogs of [`super::supervised::train_network`]:
 //! one forward+backward+step on one batch (`train_one_step`), one no-grad

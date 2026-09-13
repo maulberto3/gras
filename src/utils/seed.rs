@@ -17,7 +17,10 @@ pub fn derive_seed(base: u64, i: usize) -> u64 {
 /// near-zero collisions. The canonical identity for a topology everywhere it
 /// appears (net state files, race snapshots).
 pub fn topo_hash(topology_json: &str) -> String {
-    format!("{:016x}", xxhash_rust::xxh3::xxh3_64(topology_json.as_bytes()))
+    format!(
+        "{:016x}",
+        xxhash_rust::xxh3::xxh3_64(topology_json.as_bytes())
+    )
 }
 
 #[cfg(test)]
