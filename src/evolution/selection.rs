@@ -235,7 +235,8 @@ mod tests {
         for _ in 0..n {
             if SelectionMethod::Roulette
                 .apply(&scores, Direction::Maximize, &mut rng, 0)
-                .first() == Some(&0)
+                .first()
+                == Some(&0)
             {
                 first += 1;
             }
@@ -260,7 +261,10 @@ mod tests {
                 first += 1;
             }
         }
-        assert!(first > 350, "minimize should favor the smallest loss, got {first}/500");
+        assert!(
+            first > 350,
+            "minimize should favor the smallest loss, got {first}/500"
+        );
 
         // Same seed ⇒ same sequence (determinism contract).
         let mut a = fastrand::Rng::with_seed(1234);
