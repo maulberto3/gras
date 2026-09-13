@@ -19,8 +19,9 @@ pub enum StopReason {
 
 // ── Consolidated defaults (one place for all engine constants) ────────────────────
 
-/// Per-net smoothed-fitness rolling window for divergence ( K ).
-pub const DIVERGENCE_WINDOW: usize = 10;
+/// Per-net smoothed-fitness rolling window (K) — the span every ranking
+/// decision averages over.
+pub const SMOOTHING_WINDOW: usize = 10;
 
 /// Steps between population checkpoints — the cadence every evolution gate
 /// hangs off.
@@ -49,8 +50,8 @@ pub enum LogLevel {
     /// and the current best net. No per-net detail lines, no separate rollup
     /// line — just the table.
     Minimal,
-    /// One compact line per step plus per-net detail lines and the checkpoint +
-    /// divergence diagnostics. The readable, sequential evolve block lives here:
+    /// One compact line per step plus per-net detail lines and the checkpoint
+    /// diagnostic. The readable, sequential evolve block lives here:
     /// what fired, what was checked against gates, what passed/failed, what
     /// entered or left the population, and the net pop change.
     Full,
@@ -157,7 +158,8 @@ pub struct RaceConfig {
     pub metrics: Vec<Metric>,
     /// The training paradigm / problem space target.
     pub mode: RunMode,
-    /// Whether to write lossless long-form logs metrics.csv + options.csv.
+    /// Whether to write the lossless long-form per-step log (`metrics.csv`).
+    /// All run settings live in `engine.json`; there is no `options.csv`.
     pub csv_export: bool,
 }
 
@@ -267,8 +269,8 @@ impl Default for RaceConfig {
 
 /// Fluent builder over [`RaceConfig`]. Only covers the options a caller is
 /// likely to set explicitly; anything not touched keeps its conservative
-/// default. For rarely-used fields (`divergence_fn`, `custom_stop`), set them
-/// directly on the config after `build()`.
+/// default. For rarely-used fields (e.g. `custom_stop`), set them directly on
+/// the config after `build()`.
 pub struct RaceConfigBuilder {
     cfg: RaceConfig,
 }
@@ -378,10 +380,6 @@ impl RaceConfigBuilder {
         self.cfg.topology_options.output_dim = Some(n);
         self
     }
-    pub fn set_hidden_dim(mut self, n: usize) -> Self {
-        self.cfg.topology_options.hidden_dim = Some(n);
-        self
-    }
     pub fn set_topology_seed(mut self, n: usize) -> Self {
         self.cfg.topology_options.topology_seed = n;
         self
@@ -429,7 +427,7 @@ impl RaceConfigBuilder {
         self.cfg.mode = mode;
         self
     }
-    /// Set whether to write lossless long-form logs (metrics.csv and options.csv).
+    /// Set whether to write the lossless long-form per-step log (`metrics.csv`).
     pub fn set_csv_export(mut self, enabled: bool) -> Self {
         self.cfg.csv_export = enabled;
         self
@@ -497,7 +495,10 @@ impl RaceConfig {
         if self.activation_pool.is_empty() {
             return Ok(crate::evolution::pools::all_activations());
         }
-        self.activation_pool.iter().map(|s| Self::parse_activation(s)).collect()
+        self.activation_pool
+            .iter()
+            .map(|s| Self::parse_activation(s))
+            .collect()
     }
 
     /// Resolve the combine-op sampling pool — see
@@ -506,15 +507,23 @@ impl RaceConfig {
         if self.combine_op_pool.is_empty() {
             return Ok(crate::evolution::pools::all_combine_ops());
         }
-        self.combine_op_pool.iter().map(|s| Self::parse_combine(s)).collect()
+        self.combine_op_pool
+            .iter()
+            .map(|s| Self::parse_combine(s))
+            .collect()
     }
 
     /// Resolve the standardize-op sampling pool — see
     /// [`RaceConfig::resolved_activation_pool`].
-    pub fn resolved_standardize_pool(&self) -> Result<Vec<crate::graph::node::StandardizeOp>, String> {
+    pub fn resolved_standardize_pool(
+        &self,
+    ) -> Result<Vec<crate::graph::node::StandardizeOp>, String> {
         if self.standardize_op_pool.is_empty() {
             return Ok(crate::evolution::pools::all_standardize_ops());
         }
-        self.standardize_op_pool.iter().map(|s| Self::parse_standardize(s)).collect()
+        self.standardize_op_pool
+            .iter()
+            .map(|s| Self::parse_standardize(s))
+            .collect()
     }
 }

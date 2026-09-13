@@ -215,7 +215,6 @@ mod tests {
     fn test_categorical_helpers() {
         let mut graph = Topology::new(0, None);
         graph.options.input_dim = Some(2);
-        graph.options.hidden_dim = Some(4);
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_hidden(1, 2, 2));
         graph.nodes.push(Node::new_output(2, 2, 2));

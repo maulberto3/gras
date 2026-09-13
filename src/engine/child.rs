@@ -11,14 +11,14 @@ use flodl::nn::Optimizer;
 use flodl::tensor::Result;
 use log::{debug, info};
 
+use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
 use crate::graph::topology::Topology;
-use crate::graph::network::Network;
 use crate::state::{NetMetrics, NetState, write_net_state};
 use crate::utils::seed::derive_seed;
 
+use super::smoothing::rolling_mean;
 use super::race_engine::RaceEngine;
-use super::divergence::rolling_mean;
 
 /// A freshly-built child net being caught up solo before it rejoins the group.
 ///
@@ -89,7 +89,12 @@ impl RaceEngine {
     /// Called only when ``crossover_prob`` fires; returns an error when there
     /// are no live parents to select from (which is treated as "no crossover
     /// this step" by ``generate_child``, which falls back to random).
-    fn evolved_child(&mut self, clock: usize, child_idx: usize, rng: &mut fastrand::Rng) -> Result<RaceChild> {
+    fn evolved_child(
+        &mut self,
+        clock: usize,
+        child_idx: usize,
+        rng: &mut fastrand::Rng,
+    ) -> Result<RaceChild> {
         // 1. Ranking: live hashes ordered best-first by smoothed fitness.
         let hashes = self.state.live_hashes();
         if hashes.is_empty() {
@@ -100,7 +105,12 @@ impl RaceEngine {
         let direction = self.fitness.direction();
         let mut ranked: Vec<(String, f32)> = hashes
             .iter()
-            .map(|h| (h.clone(), rolling_mean(self.rolling_fitness.get(h).unwrap())))
+            .map(|h| {
+                (
+                    h.clone(),
+                    rolling_mean(self.rolling_fitness.get(h).unwrap()),
+                )
+            })
             .collect();
         ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
         let scores: Vec<f32> = ranked.iter().map(|(_, s)| *s).collect();
@@ -187,7 +197,14 @@ impl RaceEngine {
             false
         };
 
-        self.finalize_child(child_topo, clock, child_idx, &cx_note, &parent_hashes, mutated)
+        self.finalize_child(
+            child_topo,
+            clock,
+            child_idx,
+            &cx_note,
+            &parent_hashes,
+            mutated,
+        )
     }
 
     /// Load a live net's topology by hash (parents must still be live —
@@ -250,18 +267,13 @@ impl RaceEngine {
         let roll_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx);
         let mut rng = fastrand::Rng::with_seed(roll_seed);
         let topo_opts = self.config.topology_options;
-        let n_hidden = rng.usize(
-            topo_opts.min_hidden_num_nodes..=topo_opts.max_hidden_num_nodes,
-        );
+        let n_hidden = rng.usize(topo_opts.min_hidden_num_nodes..=topo_opts.max_hidden_num_nodes);
         // Stamp the run's dataset dims + hidden-dim pool so the child trains on
         // the same shared stream the rest of the population uses.
         // match the actual data).
         let mut opts = topo_opts;
         opts.input_dim = Some(self.header.input_dim);
         opts.output_dim = Some(self.header.output_dim);
-        if let Some(pool) = &self.config.hidden_dim_pool {
-            opts.hidden_dim = Some(*pool.start());
-        }
         // The topology's internal rng must also derive from the run seed —
         // seeding it with the template's default would make every random
         // child with the same n_hidden structurally identical.
@@ -329,7 +341,11 @@ impl RaceEngine {
         } else {
             format!("{origin}:parents={}", parents.join(","))
         };
-        let lineage = if mutated { format!("{lineage}+mut") } else { lineage };
+        let lineage = if mutated {
+            format!("{lineage}+mut")
+        } else {
+            lineage
+        };
         // The child's step counter starts at **0** (it has trained zero steps
         // so far); `entered_at_step` is patched to the run clock right after,
         // so catch-up advances it 0 → clock and it rejoins in lockstep.
@@ -397,14 +413,14 @@ impl RaceEngine {
                     pop_size: self.config.pop_size,
                     live_count: self.state.live_count(),
                     checkpoint_every: self.config.checkpoint_every,
-                    divergence_window: crate::engine::divergence::DIVERGENCE_WINDOW,
+                    smoothing_window: crate::engine::smoothing::SMOOTHING_WINDOW,
                 },
                 net_hash: &child.state.hash,
                 net_seed: child.state.net_seed as u64,
             };
-            let report = self
-                .trainer
-                .train_step(&mut child.net, &mut *child.optimizer, step, &ctx)?;
+            let report =
+                self.trainer
+                    .train_step(&mut child.net, &mut *child.optimizer, step, &ctx)?;
             let metrics = NetMetrics {
                 step,
                 train_loss: report.train_loss,
@@ -489,15 +505,15 @@ impl RaceEngine {
         let net = Network::build(&topo, self.config.device())?;
         let optimizer = self.trainer.make_optimizer(&net);
         let rebuilt = NetState {
-            hash: state.hash,
-            topology: state.topology,
-            net_seed: state.net_seed,
             step: 0,
             is_alive: true,
-            entered_at_step: state.entered_at_step,
-            created_from: state.created_from,
             last_metrics: None,
-            meta: state.meta,
+            // A revived net is alive again: clear any cull markers.
+            culled_at_step: None,
+            cull_reason: None,
+            final_smoothed_fitness: None,
+            // Keep the rest (hash, topology, net_seed, lineage, entry step, meta).
+            ..state
         };
         Ok(RaceChild {
             state: rebuilt,
@@ -505,5 +521,4 @@ impl RaceEngine {
             optimizer,
         })
     }
-
 }

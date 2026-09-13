@@ -1,5 +1,4 @@
-//! Step-race scheduler — Iter 4 of the continuous step-race revamp
-//! (see `RACE_REVAMP.md`).
+//! Step-race scheduler for the continuous step-race engine.
 //!
 //! One global `step_clock`. Every live net — original population or
 //! caught-up newcomer — is at the **same** step at the start of every loop
@@ -11,23 +10,22 @@
 //!    `eval_one_step` on its **live** `Network` + `Optimizer` (coefs evolve
 //!    in place; optimizer state carries forward across steps), records its
 //!    metrics into `nets/<hash>.json`, and logs one per-net line.
-//! 3. After **all** nets stepped: if `step_clock >= grace_steps`, compute
-//!    divergence over the population's smoothed eval fitness (rolling mean
-//!    K=10, `(max-min)/max`, 0 if max==0). On breach: cull worst `cull_count`
-//!    nets (drop their `Network` + `Optimizer` from memory + remove from
-//!    `RaceState`) → generate `cull_count` children (stub: clone fittest
-//!    parent) → catch each up solo through steps `0..step_clock` → insert
-//!    into the live maps → log. **No grace restart** — grace is one-time at
-//!    run start.
-//! 4. Stop criteria checked (max_steps, wall-clock, max_culls, stagnation,
-//!    target_score) — log which fired.
-//! 5. Repeat — the loop's clock is the nets' recorded steps (every net is at
+//! 3. After **all** nets stepped: every `checkpoint_every` steps, record the
+//!    population-mean smoothed fitness in the checkpoint ledger — the bar a
+//!    crossover child must clear.
+//! 4. Evolve — two independent roll groups. Crossover rolls: a checkpoint-gated
+//!    child replaces the worst net only if it clears every gate, otherwise the
+//!    attempt is discarded and the population is unchanged. Immigrant rolls: a
+//!    random entrant replaces an inverse-fitness victim (pop stays constant).
+//! 5. Stop criteria checked (max_steps, wall-clock, max_culls, target_score,
+//!    custom stop) — log which fired.
+//! 6. Repeat — the loop's clock is the nets' recorded steps (every net is at
 //!    the same step after the group steps, so reading any live net's step
 //!    gives the clock).
 //!
 //! Determinism: the children's catch-up uses the same `seed_step_randomness` +
 //! same step primitives as the group loop, so two identical-seed runs produce
-//! identical cull/insertion sequences (the Iter-4 exit proof).
+//! identical cull/insertion sequences.
 //!
 //! Memory model: **all live nets + their optimizers live inside the loop** for
 //! the whole run. Pop 5 → 5 networks + 5 optimizers in memory at once. On
@@ -35,16 +33,16 @@
 //! child's entries are added. This is simple, not minimal-memory — fine for
 //! the small default pop; the user runs bigger pops when it matters.
 //!
-//! Persistence (Iter 4 shape):
+//! Persistence:
 //! - `engine.json` — written once at run start (the run header; `RunHeader`).
 //! - `nets/<hash>.json` — written **once** when a net leaves the live pop
 //!   (cull write — its final state snapshot), and written **once** at run end
 //!   for every still-live net (stop write — the live pop's final state).
 //!   During the run, live nets are held only in memory. An interrupted run
-//!   leaves `engine.json` + the culled nets' JSONs on disk; resume (Item 6)
+//!   leaves `engine.json` + the culled nets' JSONs on disk; resume
 //!   reconstructs the live frontier from those + replays each net's stream.
 //!   There is no per-step file write during the run, and no separate
-//!   `metrics.csv` or `culled.log` artifact (per D8 of RACE_REVAMP.md).
+//!   `metrics.csv` or `culled.log` artifact.
 
 use flodl::nn::Optimizer;
 use flodl::tensor::Result;
@@ -53,26 +51,50 @@ use std::collections::HashMap;
 
 use crate::engine::fitness::{Fitness, FitnessLabel, Metric};
 use crate::graph::network::Network;
-use crate::state::{NetMetrics, NetState, RaceState, RunConfig, RunHeader, write_engine_json, write_net_state};
+use crate::state::{
+    ConfigSnapshot, NetMetrics, NetState, RaceState, RunConfig, RunHeader, write_engine_json,
+    write_net_state,
+};
+use crate::trainer::Trainer;
 use crate::trainer::stream::{BatchStream, PoolSplit};
+// Used only by the debug contract probe in `step_one_net`; gated to match it,
+// or a release build reports this import as unused.
+#[cfg(debug_assertions)]
 use crate::utils::race_steps::eval_one_step;
 
 // ── Display helpers ─────────────────────────────────────────────────────────
 
-/// Format a float to 4 decimals (all per-step metrics print through this).
-fn fmt4(v: f32) -> String {
-    format!("{v:.4}")
+/// Format a float to 2 decimals for the **console log only**. Artifacts
+/// (`engine.json`, `nets/<hash>.json`, `metrics.csv`, `checkpoints.json`) are
+/// always written from the raw `f32` — serde and `Display` emit the shortest
+/// decimal that round-trips, i.e. full precision. Never route anything
+/// persisted through this function.
+fn fmt2(v: f32) -> String {
+    format!("{v:.2}")
 }
 
-/// Format an optional float to 4 decimals — plain `—` when unset (never
+/// Format an optional float to 2 decimals — plain `—` when unset (never
 /// `Some(...)` in user-facing logs).
-fn fmt_opt4(v: &Option<f32>) -> String {
-    v.as_ref().map(|x| format!("{x:.4}")).unwrap_or_else(|| "—".into())
+fn fmt_opt2(v: &Option<f32>) -> String {
+    v.as_ref()
+        .map(|x| format!("{x:.2}"))
+        .unwrap_or_else(|| "—".into())
 }
 
-use super::config::{RaceConfig, RaceSnapshot, StopReason};
+/// RFC4180-quote a CSV field when it holds a delimiter, quote, or newline.
+/// Lineage strings (`crossover:parents=h1,h2`) contain commas, so this is not
+/// optional — an unquoted lineage would shift every later column.
+fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 use super::child::RaceChild;
-use super::divergence::{DIVERGENCE_WINDOW, RollingBuffer, rolling_mean};
+use super::config::{RaceConfig, RaceSnapshot, StopReason};
+use super::smoothing::{SMOOTHING_WINDOW, RollingBuffer, rolling_mean};
 
 /// One entry in the checkpoint ledger: the population-mean smoothed fitness
 /// recorded at a checkpoint step. A crossover child must BEAT this value at
@@ -90,7 +112,8 @@ pub(crate) struct Checkpoint {
 /// Owns the global step clock (implicit — the nets' recorded steps **are** the
 /// clock), the shared batch stream, the in-memory live population (`RaceState`
 /// with per-net `Network` + per-net `Optimizer`), and the per-net rolling
-/// fitness buffers (for divergence smoothing).
+/// fitness buffers (ranking smoothing: cull/insert, parent roulette,
+/// checkpoint means).
 ///
 /// Memory model: **all live nets + their optimizers live inside the loop** for
 /// the whole run. Pop 5 means 5 networks + 5 optimizers in memory at once. On
@@ -129,7 +152,8 @@ pub struct RaceEngine {
     /// forward across steps.
     pub(crate) optimizers: HashMap<String, Box<dyn Optimizer>>,
     /// Rolling fitness history per net (in-memory; equivalent to reading back
-    /// the last K `NetMetrics` snapshots). Used only for divergence smoothing.
+    /// the last K `NetMetrics` snapshots). Every ranking decision reads the
+    /// smoothed mean of this buffer, not the raw per-step value.
     pub(crate) rolling_fitness: HashMap<String, RollingBuffer>,
     pub(crate) rolling_train: HashMap<String, RollingBuffer>,
     pub(crate) rolling_eval: HashMap<String, RollingBuffer>,
@@ -197,7 +221,7 @@ impl RaceEngine {
     ///
     /// After construction, `engine.run_dir()` and `engine.run_seed()` expose
     /// what the engine chose.
-    pub fn new(spec: crate::engine::run_spec::RunSpec) -> Result<Self> {
+    pub fn new<T: Trainer + 'static>(spec: crate::engine::run_spec::RunSpec<T>) -> Result<Self> {
         let crate::engine::run_spec::RunSpec {
             data_dir,
             config,
@@ -206,6 +230,7 @@ impl RaceEngine {
             seed,
             run_dir,
         } = spec;
+        let trainer: Box<dyn Trainer> = Box::new(trainer);
         let dataset = crate::utils::data::resolve_dataset(&data_dir)?;
         // Random seed when omitted: time ^ fastrand (recorded in engine.json).
         let run_seed = seed.unwrap_or_else(|| {
@@ -220,16 +245,14 @@ impl RaceEngine {
             .unwrap()
             .as_millis()
             .to_string();
-        let run_dir = run_dir
-            .unwrap_or_else(|| std::path::Path::new("results").join(&run_id));
+        let run_dir = run_dir.unwrap_or_else(|| std::path::Path::new("results").join(&run_id));
         // Infer dims from data_dir when TopologyOptions leaves them unset.
-        // input_dim/output_dim/hidden_dim are now Option<usize> — None means
+        // input_dim/output_dim are now Option<usize> — None means
         // "fill from dataset at run start", Some(v) means user set it (and
         // the engine validates v against the dataset below).
         let inferred_input_dim = dataset.inputs.shape()[1] as usize;
         let inferred_output_dim = dataset.targets.shape()[1] as usize;
-        let inferred_hidden_dim = (dataset.inputs.shape()[1] as usize).max(8);
-        let mut topology_options = config.topology_options.clone();
+        let mut topology_options = config.topology_options;
         let mut topology_errors: Vec<String> = Vec::new();
         if let Some(user_in) = topology_options.input_dim {
             if user_in != inferred_input_dim {
@@ -249,26 +272,22 @@ impl RaceEngine {
         } else {
             topology_options.output_dim = Some(inferred_output_dim);
         }
-        if let Some(user_hidden) = topology_options.hidden_dim {
-            // hidden_dim is a per-node internal dim — we don't veer the user's
-            // choice, but warn if it's implausibly small relative to input dim.
-            if user_hidden < inferred_input_dim && inferred_input_dim > user_hidden * 2 {
-                topology_errors.push(format!(
-                    "config.topology_options.hidden_dim = {user_hidden} is small relative to the data's input dim {inferred_input_dim} — consider >= {inferred_input_dim}"
-                ));
-            }
-        } else {
-            topology_options.hidden_dim = Some(inferred_hidden_dim);
-        }
         if !topology_errors.is_empty() {
             return Err(crate::utils::error::EngineError::InvalidOptions(
                 topology_errors.join("; "),
-            ).into());
+            )
+            .into());
         }
         let metrics = config.metrics.clone();
         let train_eval_split_ratio = 0.2f32;
         let held_out_eval_rows = 256usize;
         let default_batch_size = 16usize;
+        // The trainer owns batch geometry. Resolve it BEFORE the header so
+        // engine.json records the stream shape the run actually used.
+        let (batch_size, eval_batch_size) = match trainer.stream_shape() {
+            Some(shape) => (shape.batch_size, shape.eval_batch_size),
+            None => (default_batch_size, default_batch_size),
+        };
 
         let header = RunHeader::from_race_options_at(
             RunConfig {
@@ -278,7 +297,7 @@ impl RaceEngine {
                 fitness_direction: fitness.direction(),
                 input_dim: dataset.inputs.shape()[1] as usize,
                 output_dim: dataset.targets.shape()[1] as usize,
-                topology_options: topology_options,
+                topology_options,
                 hidden_dim_pool: config.hidden_dim_pool.clone().unwrap_or(4..=8),
                 hidden_dim_stride: config.hidden_dim_stride,
                 combine_op_pool: config.combine_op_pool.clone(),
@@ -286,10 +305,10 @@ impl RaceEngine {
                 standardize_op_pool: config.standardize_op_pool.clone(),
                 informative_metrics: metrics.clone(),
                 max_steps: config.max_steps,
-                grace_steps: None,
-                divergence_threshold: None,
                 train_eval_split_ratio: Some(train_eval_split_ratio),
                 held_out_eval_rows: Some(held_out_eval_rows),
+                config: ConfigSnapshot::from_config(&config, batch_size, eval_batch_size),
+                trainer: trainer.describe(),
             },
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -308,10 +327,6 @@ impl RaceEngine {
         // trainer may shape batch sizes (`Trainer::stream_shape`) but the
         // split ratio is NOT overridable: which rows are held out protects
         // fitness comparability across every net, whatever the recipe.
-        let (batch_size, eval_batch_size) = match trainer.stream_shape() {
-            Some(shape) => (shape.batch_size, shape.eval_batch_size),
-            None => (default_batch_size, default_batch_size),
-        };
         let split = PoolSplit::of(&dataset, train_eval_split_ratio, run_seed);
         let batch_stream = BatchStream::new(run_seed, batch_size, split)
             .with_eval_batch_size(eval_batch_size)
@@ -391,9 +406,11 @@ impl RaceEngine {
     /// the group steps, every live net is at the same step, so any live net
     /// gives the clock. Returns 0 when the population is empty.
     pub fn step_clock(&self) -> usize {
-        self.state.live_hashes().first().and_then(|h| {
-            self.state.net(h).map(|s| s.step)
-        }).unwrap_or(0)
+        self.state
+            .live_hashes()
+            .first()
+            .and_then(|h| self.state.net(h).map(|s| s.step))
+            .unwrap_or(0)
     }
 
     /// The live population count.
@@ -437,25 +454,22 @@ impl RaceEngine {
     /// (minus seed/run_dir — both come from the persisted `engine.json` and
     /// the directory itself). The trainer must be the same scheme the run
     /// started with; split ratio / eval rows also come from the header.
-    pub fn resume(
+    pub fn resume<T: Trainer + 'static>(
         run_dir: std::path::PathBuf,
         data_dir: std::path::PathBuf,
         config: RaceConfig,
         fitness: Fitness,
-        trainer: Box<dyn crate::trainer::Trainer>,
+        trainer: T,
     ) -> Result<Self> {
+        let trainer: Box<dyn Trainer> = Box::new(trainer);
         let header = crate::state::load_engine_json(&run_dir)?;
         let dataset = crate::utils::data::resolve_dataset(&data_dir)?;
         let metrics = config.metrics.clone();
         let run_seed = header.run_seed;
-            // On resume, stream shape comes from the run header (data integrity),
-            // but the trainer's stream_shape() can still override batch sizes.
-            let header_stream_ratio = header
-                .train_eval_split_ratio
-                .unwrap_or(0.2); // legacy default if header missing it
-            let _header_held_out = header
-                .held_out_eval_rows
-                .unwrap_or(256); // legacy default if header missing it
+        // On resume, stream shape comes from the run header (data integrity),
+        // but the trainer's stream_shape() can still override batch sizes.
+        let header_stream_ratio = header.train_eval_split_ratio.unwrap_or(0.2); // legacy default if header missing it
+        let _header_held_out = header.held_out_eval_rows.unwrap_or(256); // legacy default if header missing it
 
         // Same rule on resume: the trainer's stream shape (same trainer the
         // run started with) overrides batch sizes; the split ratio comes from
@@ -465,8 +479,8 @@ impl RaceEngine {
             None => (16, 16), // conservative default when no stream_shape override
         };
         let split = PoolSplit::of(&dataset, header_stream_ratio, run_seed);
-        let stream = BatchStream::new(run_seed, batch_size, split)
-            .with_eval_batch_size(eval_batch_size);
+        let stream =
+            BatchStream::new(run_seed, batch_size, split).with_eval_batch_size(eval_batch_size);
 
         let log_level = config.log_level;
         let meta_ctx = crate::engine::config::RunMetaCtx {
@@ -510,9 +524,11 @@ impl RaceEngine {
         // Load every persisted net snapshot from `nets/` and replay it.
         let nets_dir = run_dir.join("nets");
         let mut loaded = 0usize;
-        let entries = std::fs::read_dir(&nets_dir).map_err(|source| crate::utils::error::EngineError::Io {
-            path: nets_dir.display().to_string(),
-            source,
+        let entries = std::fs::read_dir(&nets_dir).map_err(|source| {
+            crate::utils::error::EngineError::Io {
+                path: nets_dir.display().to_string(),
+                source,
+            }
         })?;
         for entry in entries {
             let path = entry
@@ -524,28 +540,35 @@ impl RaceEngine {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let raw = std::fs::read_to_string(&path).map_err(|source| crate::utils::error::EngineError::Io {
-                path: path.display().to_string(),
-                source,
+            let raw = std::fs::read_to_string(&path).map_err(|source| {
+                crate::utils::error::EngineError::Io {
+                    path: path.display().to_string(),
+                    source,
+                }
             })?;
             let state = NetState::from_json(&raw)?;
             if !state.is_alive {
-                log::debug!("race resume: skipping tombstone net {} (culled)", state.hash);
+                log::debug!(
+                    "race resume: skipping tombstone net {} (culled)",
+                    state.hash
+                );
                 continue;
             }
             let hash = state.hash.clone();
             let step = state.step;
             let child = engine.replay_loaded_net(state)?;
 
-            // Insert the replayed net into the live maps. Its rolling fitness
-            // buffer is seeded from the replayed trajectory so divergence is
-            // warm on resume (not cold).
-            // Warm all three rolling buffers from the replayed last metrics
-            // (resume resumes the smoothed stats, not just divergence's).
-            let mut buf = RollingBuffer::new(DIVERGENCE_WINDOW);
-            let mut train_buf = RollingBuffer::new(DIVERGENCE_WINDOW);
-            let mut eval_buf = RollingBuffer::new(DIVERGENCE_WINDOW);
-            if let Some(m) = engine.state.net(&hash).and_then(|s| s.last_metrics.as_ref()) {
+            // Insert the replayed net into the live maps. Its rolling buffers
+            // are seeded from the replayed trajectory so the smoothed stats are
+            // warm on resume (not cold) — ranking resumes where it left off.
+            let mut buf = RollingBuffer::new(SMOOTHING_WINDOW);
+            let mut train_buf = RollingBuffer::new(SMOOTHING_WINDOW);
+            let mut eval_buf = RollingBuffer::new(SMOOTHING_WINDOW);
+            if let Some(m) = engine
+                .state
+                .net(&hash)
+                .and_then(|s| s.last_metrics.as_ref())
+            {
                 buf.push(m.fitness);
                 train_buf.push(m.train_loss);
                 if let Some(e) = m.eval_loss {
@@ -554,7 +577,9 @@ impl RaceEngine {
             }
             engine.state.insert(child.state.clone(), None);
             engine.networks.insert(child.state.hash.clone(), child.net);
-            engine.optimizers.insert(child.state.hash.clone(), child.optimizer);
+            engine
+                .optimizers
+                .insert(child.state.hash.clone(), child.optimizer);
             engine.rolling_fitness.insert(hash.clone(), buf);
             engine.rolling_train.insert(hash.clone(), train_buf);
             engine.rolling_eval.insert(hash.clone(), eval_buf);
@@ -604,12 +629,12 @@ impl RaceEngine {
             let opt = self.trainer.make_optimizer(&net);
             self.networks.insert(hash.clone(), net);
             self.optimizers.insert(hash.clone(), opt);
-            self.rolling_fitness.insert(
-                hash.clone(),
-                RollingBuffer::new(DIVERGENCE_WINDOW),
-            );
-            self.rolling_train.insert(hash.clone(), RollingBuffer::new(DIVERGENCE_WINDOW));
-            self.rolling_eval.insert(hash.clone(), RollingBuffer::new(DIVERGENCE_WINDOW));
+            self.rolling_fitness
+                .insert(hash.clone(), RollingBuffer::new(SMOOTHING_WINDOW));
+            self.rolling_train
+                .insert(hash.clone(), RollingBuffer::new(SMOOTHING_WINDOW));
+            self.rolling_eval
+                .insert(hash.clone(), RollingBuffer::new(SMOOTHING_WINDOW));
             self.state.insert(state, initial_fitness);
         }
         let count = self.state.live_count();
@@ -627,21 +652,20 @@ impl RaceEngine {
     ///
     /// Each iteration = one step_clock for the whole group. The loop is the
     /// heart of the step-race model: every live net trains on the same batch,
-    /// is evaluated on the same held-out batch, records its metrics, and then
-    /// (after grace) is subject to divergence-based culling.
+    /// is evaluated on the same held-out batch, records its metrics, then the
+    /// evolve rolls cull and replace by smoothed fitness.
     ///
     /// This is the step-race analog of the generational ``Engine::run``: same
     /// ``info``/``debug`` log discipline, same deterministic seed discipline,
     /// same ``no dead air`` rule from AGENTS.md §5 — only the cadence changes
-    /// from per-generation to per-step and the selection/cull logic moves from
-    /// the end of a generation to a live divergence check.
+    /// from per-generation to per-step and selection runs as per-step evolve
+    /// rolls instead of an end-of-generation sweep.
     ///
     /// Deterministic: two runs with the same `run_seed` + config produce the
-    /// same cull/insertion sequence and the same per-step metrics (the Iter-4
-    /// exit proof — tested in `tests::race_determinism`).
+    /// same cull/insertion sequence and the same per-step metrics (tested in
+    /// `tests::race_determinism`).
     pub fn run(&mut self) -> Result<StopReason> {
         self.apply_eval_defaults();
-        self.write_options_csv()?;
         // `None` mode: one compact start line, then silence until stop.
         if self.verbose_detail() {
             info!(
@@ -651,7 +675,7 @@ impl RaceEngine {
                 self.config.checkpoint_every,
                 self.config.cross_rolls,
                 self.config.mutate_rolls,
-                DIVERGENCE_WINDOW,
+                SMOOTHING_WINDOW,
                 self.config.pop_size,
             );
         }
@@ -688,6 +712,12 @@ impl RaceEngine {
                 }
                 if let Err(e) = self.write_live_frontier_states() {
                     log::warn!("checkpoint live states write failed: {e}");
+                }
+                // Flush metrics at the checkpoint too: an interrupted run then
+                // keeps the per-step history up to its last checkpoint instead
+                // of losing the whole in-memory buffer.
+                if let Err(e) = self.flush_metrics_csv() {
+                    log::warn!("checkpoint metrics flush failed: {e}");
                 }
                 if self.verbose_detail() {
                     info!(
@@ -808,12 +838,11 @@ impl RaceEngine {
         };
         // One step = whatever the caller's training scheme does for one step
         // clock. The engine only consumes the returned report.
-        let optimizer = self
-            .optimizers
-            .get_mut(hash)
-            .ok_or_else(|| crate::utils::error::EngineError::InvalidOptions(
-                format!("race: net {hash} not live (no Optimizer in memory)"),
-            ))?;
+        let optimizer = self.optimizers.get_mut(hash).ok_or_else(|| {
+            crate::utils::error::EngineError::InvalidOptions(format!(
+                "race: net {hash} not live (no Optimizer in memory)"
+            ))
+        })?;
         // Build the context from engine-owned state only. The loss comes
         // from the trainer; to avoid borrowing `self.trainer` immutably here
         // (conflicts with the mutable `train_step` below), we pass a fresh
@@ -840,18 +869,19 @@ impl RaceEngine {
                 pop_size: self.config.pop_size,
                 live_count: self.state.live_count(),
                 checkpoint_every: self.config.checkpoint_every,
-                divergence_window: DIVERGENCE_WINDOW,
+                smoothing_window: SMOOTHING_WINDOW,
             },
             net_hash: hash,
             net_seed,
         };
-        let net = self
-            .networks
-            .get_mut(hash)
-            .ok_or_else(|| crate::utils::error::EngineError::InvalidOptions(
-                format!("race: net {hash} not live (no Network in memory)"),
-            ))?;
-        let report = self.trainer.train_step(net, optimizer.as_mut(), clock, &ctx)?;
+        let net = self.networks.get_mut(hash).ok_or_else(|| {
+            crate::utils::error::EngineError::InvalidOptions(format!(
+                "race: net {hash} not live (no Network in memory)"
+            ))
+        })?;
+        let report = self
+            .trainer
+            .train_step(net, optimizer.as_mut(), clock, &ctx)?;
         // Debug-only contract probe: the Trainer's per-step clause says the
         // report describes the net AFTER this step's training. Re-score the
         // net on the step's eval batch and check the reported eval loss is
@@ -901,16 +931,17 @@ impl RaceEngine {
             "step {} │ net {} │ train_loss↓ {} │ eval_loss↓ {} │ fitness{} {}",
             clock,
             hash,
-            fmt4(metrics.train_loss),
-            fmt_opt4(&metrics.eval_loss),
+            fmt2(metrics.train_loss),
+            fmt_opt2(&metrics.eval_loss),
             dir,
-            fmt4(metrics.fitness),
+            fmt2(metrics.fitness),
         );
         Ok(())
     }
 
-    /// One rollup line per step (Plan A): pop size, train/eval loss ranges
-    /// with means, and the current best net under the fitness direction.
+    /// One rollup line per step: pop size, train/eval loss means ± std, and
+    /// the fitness column in the same shape. Two decimals throughout — the
+    /// spread is the signal worth reading, the extremes are noise.
     fn log_step_rollup(&mut self, clock: usize) {
         // Smoothed (K-step rolling mean) population stats — raw per-step
         // values bounce with batch difficulty; the trend is what matters.
@@ -926,44 +957,35 @@ impl RaceEngine {
                 }
             }
         }
+        // Population mean ± population std, 2 decimals.
         let stats = |v: &[f32]| {
             if v.is_empty() {
                 "—".to_string()
             } else {
-                let min = v.iter().cloned().fold(f32::MAX, f32::min);
-                let max = v.iter().cloned().fold(f32::MIN, f32::max);
-                let mean = v.iter().sum::<f32>() / v.len() as f32;
-                format!("{:.4}…{:.4} (μ {:.4})", min, max, mean)
+                let n = v.len() as f32;
+                let mean = v.iter().sum::<f32>() / n;
+                let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
+                format!("{mean:.2} ± {:.2}", var.sqrt())
             }
         };
-        // Fitness column: smoothed-fitness spread across the population,
-        // same shape as the train/eval columns (min…max (μ mean)) so all
-        // three read alike.
+        // Fitness column: same mean ± std shape so all three read alike.
         let fits: Vec<f32> = self
             .state
             .live_hashes()
             .iter()
-            .filter_map(|h| self.rolling_fitness.get(h.as_str()).filter(|b| !b.is_empty()))
+            .filter_map(|h| {
+                self.rolling_fitness
+                    .get(h.as_str())
+                    .filter(|b| !b.is_empty())
+            })
             .map(rolling_mean)
             .collect();
-        let fit_stats = if fits.is_empty() {
-            "—".to_string()
-        } else {
-            let direction = self.fitness.direction();
-            let min = fits.iter().cloned().fold(f32::MAX, f32::min);
-            let max = fits.iter().cloned().fold(f32::MIN, f32::max);
-            let mean = fits.iter().sum::<f32>() / fits.len() as f32;
-            let (bad, good) = match direction {
-                crate::engine::fitness::Direction::Maximize => (min, max),
-                crate::engine::fitness::Direction::Minimize => (max, min),
-            };
-            format!("{bad:.4}…{good:.4} (μ {mean:.4})")
-        };
+        let fit_stats = stats(&fits);
         // Per-step rollup: Summ = compact one-liner; Minimal = framed table
         // (from step 2 — deltas need a prior step); Full = one-liner + per-net
         // detail + checkpoint + divergence lines.
         if self.log_level == crate::engine::config::LogLevel::Minimal {
-            self.log_minimal_table(clock, &trains, &evals, &fits);
+            self.log_minimal_table(&trains, &evals, &fits);
         } else {
             info!(
                 "step {} │ pop {} │ train_loss↓ {} │ eval_loss↓ {} │ fitness{} {}",
@@ -981,26 +1003,26 @@ impl RaceEngine {
                 if let Some(m) = self.state.net(&h).and_then(|s| s.last_metrics.as_ref()) {
                     log::info!(
                         "step {} │ net {} │ train_loss↓ {} │ eval_loss↓ {} │ fitness{} {}",
-                        clock, h, fmt4(m.train_loss),
-                        fmt_opt4(&m.eval_loss),
+                        clock,
+                        h,
+                        fmt2(m.train_loss),
+                        fmt_opt2(&m.eval_loss),
                         self.fitness.direction().arrow(),
-                        fmt4(m.fitness),
+                        fmt2(m.fitness),
                     );
                 }
             }
-            // Checkpoint ledger + divergence diagnostic.
+            // Checkpoint ledger diagnostic.
             if !self.checkpoints.is_empty() {
                 let last = &self.checkpoints[self.checkpoints.len() - 1];
                 log::info!(
                     "step {} │ checkpoint │ step {} │ pop_mean_fitness {} {:.4}",
-                    clock, last.step, self.fitness.direction().arrow(), last.pop_mean_fitness,
+                    clock,
+                    last.step,
+                    self.fitness.direction().arrow(),
+                    last.pop_mean_fitness,
                 );
             }
-            let div = self.divergence();
-            log::info!(
-                "step {} │ divergence │ K={} │ {:.4}",
-                clock, DIVERGENCE_WINDOW, div,
-            );
         }
     }
 
@@ -1011,7 +1033,7 @@ impl RaceEngine {
     /// last step); a zero delta drops the parenthetical. The evolve counters
     /// and the best-net footer are plain current values — no delta on the
     /// footer. Nothing else is printed per step in this mode.
-    fn log_minimal_table(&mut self, clock: usize, trains: &[f32], evals: &[f32], fits: &[f32]) {
+    fn log_minimal_table(&mut self, trains: &[f32], evals: &[f32], fits: &[f32]) {
         let mean = |v: &[f32]| {
             if v.is_empty() {
                 f32::NAN
@@ -1022,11 +1044,15 @@ impl RaceEngine {
         let (train_m, eval_m, fit_m) = (mean(trains), mean(evals), mean(fits));
         // Delta vs the previous step's mean; omitted entirely when 0. The
         // first table render (step 2) sets the baseline without deltas.
+        // Only surface a delta that survives 2-decimal rounding, so the table
+        // never shows a meaningless `(∆+0.00)`.
         let delta = |cur: f32, prev: Option<f32>| match prev {
-            Some(p) if (cur - p).abs() >= 1e-6 => format!(" (∆{:+.4})", cur - p),
+            Some(p) if (cur - p).abs() >= 5e-3 => format!(" (∆{:+.2})", cur - p),
             _ => String::new(),
         };
-        let (pt, pe, pf) = self.minimal_prev_means.unwrap_or((f32::NAN, f32::NAN, f32::NAN));
+        let (pt, pe, pf) = self
+            .minimal_prev_means
+            .unwrap_or((f32::NAN, f32::NAN, f32::NAN));
         let pop = self.state.live_count();
         let e = self.step_evolve;
         // Build the rows first, THEN size the box: a fixed width overflowed
@@ -1038,11 +1064,15 @@ impl RaceEngine {
         // per column) — so alignment holds.
         let rows: Vec<String> = vec![
             format!(
-                "pop {:>3} │ train_loss↓ {:.4}{} │ eval_loss↓ {:.4}{}",
-                pop, train_m, delta(train_m, Some(pt)), eval_m, delta(eval_m, Some(pe)),
+                "pop {:>3} │ train_loss↓ {:.2}{} │ eval_loss↓ {:.2}{}",
+                pop,
+                train_m,
+                delta(train_m, Some(pt)),
+                eval_m,
+                delta(eval_m, Some(pe)),
             ),
             format!(
-                "fitness{} {:.4}{} │ culls {} │ inserts {}",
+                "fitness{} {:.2}{} │ culls {} │ inserts {}",
                 self.fitness.direction().arrow(),
                 fit_m,
                 delta(fit_m, Some(pf)),
@@ -1055,15 +1085,15 @@ impl RaceEngine {
             ),
         ];
         // Display width: count chars, not bytes (↓/↑/∆ are 3 bytes, 1 char).
-        let inner = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0).max(20);
+        let inner = rows
+            .iter()
+            .map(|r| r.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(20);
         let pad = |s: &String| {
             let visible = s.chars().count();
             format!("│ {}{}│", s, " ".repeat(inner.saturating_sub(visible)))
-        };
-        let line = |s: String| {
-            let visible = s.chars().count();
-            let dashes = "-".repeat(inner.saturating_sub(visible) + 2);
-            println!("\x1b[2K\r{}{}{}", s, dashes, s.chars().last().unwrap_or('-'));
         };
         let top = format!("┌{}┐", "-".repeat(inner + 2));
         let bot = format!("└{}┘", "-".repeat(inner + 2));
@@ -1077,32 +1107,18 @@ impl RaceEngine {
         self.minimal_prev_means = Some((train_m, eval_m, fit_m));
     }
 
-    // ── Divergence ──────────────────────────────────────────────────────────
-
-    /// Compute population divergence at the current step (D3).
-    ///
-    /// Each net's smoothed fitness = rolling mean of its last K per-step
-    /// fitness values (from the in-memory `rolling_fitness` buffer, kept in
-    /// sync with `record_step` calls). Divergence = `(max - min) / max` over
-    /// the live population's smoothed fitness; 0 if max is 0 (avoids
-    /// div-by-zero early in a run).
-    /// Diagnostic only since the checkpoint-gate model: the loop no longer
-    /// acts on divergence, but the metric is still informative.
-    pub fn divergence(&self) -> f32 {
-        super::divergence::built_in_divergence(&self.smoothed_fitness_values())
-    }
+    // ── Smoothed fitness ────────────────────────────────────────────────────
 
     /// Per-net rolling-mean fitness over the live population, in
-    /// `live_hashes()` order — the shared input for the divergence diagnostic,
-    /// the checkpoint ledger, and `RaceSnapshot`.
+    /// `live_hashes()` order — the shared input for the checkpoint ledger,
+    /// cull/insert ranking, and `RaceSnapshot`.
     fn smoothed_fitness_values(&self) -> Vec<f32> {
-        // Only nets with a non-empty rolling buffer earn a divergence verdict.
-        // A freshly caught-up child's buffer is populated during catch-up (replayed
-        // fitness for steps 0..clock), so it IS included in the post-insert
-        // re-check — the new child enters the divergence population immediately
+        // Only nets with a non-empty rolling buffer get a smoothed value. A
+        // freshly caught-up child's buffer is populated during catch-up
+        // (replayed fitness for steps 0..clock), so it IS included immediately
         // after insertion, not after a group step. Nets with empty buffers
-        // (shouldn't exist in normal operation) are excluded to avoid phantom
-        // 0.0 values pinning divergence at 1.0.
+        // (shouldn't exist in normal operation) are excluded so phantom 0.0
+        // values don't drag the population mean down.
         self.state
             .live_hashes()
             .iter()
@@ -1134,38 +1150,18 @@ impl RaceEngine {
         best
     }
 
-    // ── Breach handling ─────────────────────────────────────────────────────
+    // ── Cull + insert ───────────────────────────────────────────────────────
 
-    /// On a divergence breach: cull the worst `cull_count` nets (drop their
-    /// `Network` + `Optimizer` from memory + remove from `RaceState`), generate
-    /// `cull_count` children (stub: clone fittest parent each), catch each up
-    /// solo through steps `0..step_clock`, insert them into the live maps, log.
-    ///
-    /// This is the step-race analog of the generational ``next_generation``
-    /// path (select → crossover → dedup → mutate → refill). The differences:
-    /// selection is divergence-based rather than fitness-ranked, only one child
-    /// type is produced per breach here (stub), and the child is caught up
-    /// before rejoining instead of being dropped into the next generation.
-    ///
-    /// Generates **one child per culled slot** so the population count stays at
-    /// `pop_size` across the run (the user's "pop size should be the same along
-    /// all experiment run" rule). With the default `cull_count == 1` this is a
-    /// non-issue; the general case keeps pop constant.
-    ///
-    /// Each culled net's state is written to `nets/<hash>.json` **before** it
-    /// is dropped (cull write — final snapshot). Each inserted child is caught
-    /// up solo and its state is written **once** at the end of its catch-up
-    /// (see `catch_up`'s doc on the asymmetry with the group loop).
-    /// Fresh empty rolling buffer for a net about to be caught up (so
+    /// Fresh empty rolling buffer for a net about to be caught up, so
     /// catch-up's per-step pushes land somewhere — a live net must never be
-    /// without a buffer entry).
+    /// without a buffer entry.
     fn pre_insert_buffer(&mut self, hash: &str) {
         self.rolling_fitness
-            .insert(hash.to_string(), RollingBuffer::new(DIVERGENCE_WINDOW));
+            .insert(hash.to_string(), RollingBuffer::new(SMOOTHING_WINDOW));
         self.rolling_train
-            .insert(hash.to_string(), RollingBuffer::new(DIVERGENCE_WINDOW));
+            .insert(hash.to_string(), RollingBuffer::new(SMOOTHING_WINDOW));
         self.rolling_eval
-            .insert(hash.to_string(), RollingBuffer::new(DIVERGENCE_WINDOW));
+            .insert(hash.to_string(), RollingBuffer::new(SMOOTHING_WINDOW));
     }
 
     /// A guaranteed-fresh random child: bump the clock ordinal until the
@@ -1190,7 +1186,6 @@ impl RaceEngine {
             "race: could not generate a unique random child after 8 attempts",
         ))
     }
-
 
     /// Insert a caught-up child into the live maps (state, network, optimizer;
     /// its rolling buffer was pre-inserted before catch-up and is NOT reset).
@@ -1276,19 +1271,18 @@ impl RaceEngine {
                     self.catch_up_range(&mut child, replayed_to, last.step)?;
                     replayed_to = last.step;
                     last_checkpoint_step = last.step;
-                    let mean_of_means =
-                        relevant.iter().map(|(_, c)| c.pop_mean_fitness).sum::<f32>()
-                            / checkpoint_count as f32;
+                    let mean_of_means = relevant
+                        .iter()
+                        .map(|(_, c)| c.pop_mean_fitness)
+                        .sum::<f32>()
+                        / checkpoint_count as f32;
                     let child_fit = self
                         .rolling_fitness
                         .get(&child.state.hash)
                         .map(rolling_mean)
                         .unwrap_or(f32::NAN);
                     child_fit_at_gate = child_fit;
-                    let beat = self
-                        .fitness
-                        .direction()
-                        .is_better(child_fit, mean_of_means);
+                    let beat = self.fitness.direction().is_better(child_fit, mean_of_means);
                     if !beat {
                         failed_gate = Some((checkpoint_count, last.step, child_fit, mean_of_means));
                     }
@@ -1342,16 +1336,15 @@ impl RaceEngine {
     fn evolve_random_immigrant(&mut self, clock: usize, roll: usize) -> Result<()> {
         // Pick a victim: fitness-inverse when possible, worst-net when
         // buffers are cold, first-live as last resort.
-        let victim = self.select_inverse_proportional()?
-            .unwrap_or_else(|| {
-                // No fitness verdict available — fall back to worst-net, then
-                // first-live as last resort.
-                let worst = match self.worst_nets_by_smoothed_fitness(1) {
-                    Ok(mut w) => w.pop(),
-                    Err(_) => None,
-                };
-                worst.unwrap_or_else(|| self.state.live_hashes().first().unwrap().clone())
-            });
+        let victim = self.select_inverse_proportional()?.unwrap_or_else(|| {
+            // No fitness verdict available — fall back to worst-net, then
+            // first-live as last resort.
+            let worst = match self.worst_nets_by_smoothed_fitness(1) {
+                Ok(mut w) => w.pop(),
+                Err(_) => None,
+            };
+            worst.unwrap_or_else(|| self.state.live_hashes().first().unwrap().clone())
+        });
         self.cull_net(&victim, clock, "immigrant-slot")?;
         let idx = self.next_child_ordinal(clock);
         let mut child = self.generate_random_at(clock, idx)?;
@@ -1398,11 +1391,21 @@ impl RaceEngine {
         if self.verbose_detail() {
             info!(
                 "step {} │ culled {} smoothed{} {} ({}) → tombstone, pop now {}",
-                clock, hash, dir, fmt4(smoothed), reason, self.state.live_count() - 1,
+                clock,
+                hash,
+                dir,
+                fmt2(smoothed),
+                reason,
+                self.state.live_count() - 1,
             );
         }
         if let Some(mut state) = self.state.net(hash).cloned() {
             state.is_alive = false;
+            // Cull metadata turns the tombstone into a complete record of
+            // when/why this net left the population, not just a dead snapshot.
+            state.culled_at_step = Some(clock);
+            state.cull_reason = Some(reason.to_string());
+            state.final_smoothed_fitness = Some(smoothed);
             write_net_state(&self.run_dir, &state)?;
         }
         self.state.remove(hash);
@@ -1445,7 +1448,12 @@ impl RaceEngine {
                     .map(|b| b.iter().count() > 0)
                     .unwrap_or(false)
             })
-            .map(|h| (h.clone(), rolling_mean(self.rolling_fitness.get(h).unwrap())))
+            .map(|h| {
+                (
+                    h.clone(),
+                    rolling_mean(self.rolling_fitness.get(h).unwrap()),
+                )
+            })
             .collect();
         if scored.len() < 2 {
             return Ok(None);
@@ -1491,7 +1499,9 @@ impl RaceEngine {
     /// replaced the clone-fittest path, and culling uses `worst_nets`. Keep
     /// for the determinism tests (and any future elite-preservation policy).
     #[cfg(test)]
-    pub(crate) fn fittest_net_hash(&self) -> std::result::Result<String, crate::utils::error::EngineError> {
+    pub(crate) fn fittest_net_hash(
+        &self,
+    ) -> std::result::Result<String, crate::utils::error::EngineError> {
         let hashes = self.state.live_hashes();
         if hashes.is_empty() {
             return Err(crate::utils::error::EngineError::InvalidOptions(
@@ -1529,7 +1539,12 @@ impl RaceEngine {
                     .map(|b| b.iter().count() > 0)
                     .unwrap_or(false)
             })
-            .map(|h| (h.clone(), rolling_mean(self.rolling_fitness.get(h).unwrap())))
+            .map(|h| {
+                (
+                    h.clone(),
+                    rolling_mean(self.rolling_fitness.get(h).unwrap()),
+                )
+            })
             .collect();
         // Sort worst-first: `Direction::cmp(a, b)` orders ascending for
         // Maximize (smallest = worst first) and descending for Minimize
@@ -1628,18 +1643,20 @@ impl RaceEngine {
                 serde_json::Value::Object({
                     let mut m = serde_json::Map::new();
                     m.insert("step".into(), serde_json::Value::from(c.step));
-                    m.insert("pop_mean_fitness".into(), serde_json::Value::from(c.pop_mean_fitness));
+                    m.insert(
+                        "pop_mean_fitness".into(),
+                        serde_json::Value::from(c.pop_mean_fitness),
+                    );
                     m
                 })
             })
             .collect();
-        let raw = serde_json::to_string_pretty(&v)
-            .map_err(|e| crate::utils::error::EngineError::Json(format!("checkpoints serialize: {e}")))?;
-        std::fs::write(&path, raw).map_err(|source| {
-            crate::utils::error::EngineError::Io {
-                path: path.display().to_string(),
-                source,
-            }
+        let raw = serde_json::to_string_pretty(&v).map_err(|e| {
+            crate::utils::error::EngineError::Json(format!("checkpoints serialize: {e}"))
+        })?;
+        std::fs::write(&path, raw).map_err(|source| crate::utils::error::EngineError::Io {
+            path: path.display().to_string(),
+            source,
         })?;
         Ok(())
     }
@@ -1655,44 +1672,6 @@ impl RaceEngine {
         Ok(())
     }
 
-    /// Write the options/configuration CSV once at startup.
-    fn write_options_csv(&self) -> Result<()> {
-        if !self.config.csv_export {
-            return Ok(());
-        }
-        let path = self.run_dir.join("options.csv");
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| crate::utils::error::EngineError::Io {
-                path: parent.display().to_string(),
-                source,
-            })?;
-        }
-        let headers = "run_id,run_seed,pop_size,checkpoint_every,crossover_prob,mutate_prob,crossover_parents,mode,crossover_fallback_to_immigrant\n";
-        let mode_str = format!("{:?}", self.config.mode).to_lowercase();
-        let row = format!(
-            "{},{},{},{},{},{},{},{},{}\n",
-            self.header.run_id,
-            self.header.run_seed,
-            self.config.pop_size,
-            self.config.checkpoint_every,
-            self.config.crossover_prob,
-            self.config.mutate_prob,
-            self.config.crossover_parents,
-            mode_str,
-            self.config.crossover_fallback_to_immigrant
-        );
-        let mut content = String::with_capacity(headers.len() + row.len());
-        content.push_str(headers);
-        content.push_str(&row);
-        std::fs::write(&path, content).map_err(|source| {
-            crate::utils::error::EngineError::Io {
-                path: path.display().to_string(),
-                source,
-            }
-        })?;
-        Ok(())
-    }
-
     /// Append a step's metrics for all live nets to our in-memory CSV buffer.
     fn append_metrics_csv(&mut self, step: usize) -> Result<()> {
         if !self.config.csv_export {
@@ -1701,12 +1680,17 @@ impl RaceEngine {
         for hash in &self.state.live_hashes() {
             if let Some(net_state) = self.state.net(hash) {
                 if let Some(m) = &net_state.last_metrics {
+                    let origin = net_state.created_from.clone().unwrap_or_default();
                     let mut row = format!(
-                        "{},{},{},{},{}",
+                        "{},{},{},{},{},{},{}",
                         step,
                         hash,
+                        csv_field(&origin),
+                        net_state.entered_at_step,
                         m.train_loss,
-                        m.eval_loss.map(|val| val.to_string()).unwrap_or_else(|| "nan".to_string()),
+                        m.eval_loss
+                            .map(|val| val.to_string())
+                            .unwrap_or_else(|| "nan".to_string()),
                         m.fitness
                     );
                     for &val in &m.informative {
@@ -1728,17 +1712,19 @@ impl RaceEngine {
         }
         let path = self.run_dir.join("metrics.csv");
         let exists = path.exists();
-        
+
         use std::fs::OpenOptions;
         use std::io::Write;
-        
+
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| crate::utils::error::EngineError::Io {
-                path: parent.display().to_string(),
-                source,
+            std::fs::create_dir_all(parent).map_err(|source| {
+                crate::utils::error::EngineError::Io {
+                    path: parent.display().to_string(),
+                    source,
+                }
             })?;
         }
-        
+
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1747,25 +1733,29 @@ impl RaceEngine {
                 path: path.display().to_string(),
                 source,
             })?;
-            
+
         if !exists {
-            let mut headers = "step,hash,train_loss,eval_loss,fitness".to_string();
+            let mut headers =
+                "step,hash,origin,entered_at_step,train_loss,eval_loss,fitness".to_string();
             for m in &self.metrics {
                 headers.push(',');
                 headers.push_str(m.label());
             }
             headers.push('\n');
-            file.write_all(headers.as_bytes()).map_err(|source| crate::utils::error::EngineError::Io {
+            file.write_all(headers.as_bytes()).map_err(|source| {
+                crate::utils::error::EngineError::Io {
+                    path: path.display().to_string(),
+                    source,
+                }
+            })?;
+        }
+
+        file.write_all(self.metrics_csv_buffer.as_bytes())
+            .map_err(|source| crate::utils::error::EngineError::Io {
                 path: path.display().to_string(),
                 source,
             })?;
-        }
-        
-        file.write_all(self.metrics_csv_buffer.as_bytes()).map_err(|source| crate::utils::error::EngineError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        
+
         self.metrics_csv_buffer.clear();
         Ok(())
     }
@@ -1777,19 +1767,27 @@ impl RaceEngine {
         if !path.exists() {
             return Ok(());
         }
-        let raw = std::fs::read_to_string(&path).map_err(|source| crate::utils::error::EngineError::Io {
-            path: path.display().to_string(),
-            source,
+        let raw = std::fs::read_to_string(&path).map_err(|source| {
+            crate::utils::error::EngineError::Io {
+                path: path.display().to_string(),
+                source,
+            }
         })?;
-        let v: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| crate::utils::error::EngineError::Json(format!("checkpoints parse: {e}")))?;
+        let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+            crate::utils::error::EngineError::Json(format!("checkpoints parse: {e}"))
+        })?;
         let mut checkpoints = Vec::new();
         if let Some(arr) = v.as_array() {
             for entry in arr {
                 let step = entry.get("step").and_then(|f| f.as_u64()).unwrap_or(0) as usize;
-                let pop_mean_fitness =
-                    entry.get("pop_mean_fitness").and_then(|f| f.as_f64()).unwrap_or(0.0) as f32;
-                checkpoints.push(Checkpoint { step, pop_mean_fitness });
+                let pop_mean_fitness = entry
+                    .get("pop_mean_fitness")
+                    .and_then(|f| f.as_f64())
+                    .unwrap_or(0.0) as f32;
+                checkpoints.push(Checkpoint {
+                    step,
+                    pop_mean_fitness,
+                });
             }
         }
         self.checkpoints = checkpoints;
@@ -1804,7 +1802,8 @@ impl RaceEngine {
     /// It exists so a future iter can re-serialize the header if/when it adds a
     /// mid-run config change (for example a live ``max_steps`` or
     /// ``stagnation_window`` adjustment) without rebuilding the whole engine.
-    pub fn refresh_header(&mut self) -> Result<()> {        let cfg = RunConfig {
+    pub fn refresh_header(&mut self) -> Result<()> {
+        let cfg = RunConfig {
             run_id: self.header.run_id.clone(),
             run_seed: self.header.run_seed,
             fitness_label: self.header.fitness_label.clone(),
@@ -1818,10 +1817,15 @@ impl RaceEngine {
             activation_pool: self.config.activation_pool.clone(),
             standardize_op_pool: self.config.standardize_op_pool.clone(),
             informative_metrics: self.metrics.clone(),
-            max_steps: self.config.max_steps,                grace_steps: None,
-                divergence_threshold: None,
+            max_steps: self.config.max_steps,
             train_eval_split_ratio: Some(self.stream.train_eval_split_ratio()),
             held_out_eval_rows: Some(self.stream.held_out_eval_rows()),
+            config: ConfigSnapshot::from_config(
+                &self.config,
+                self.stream.batch_size(),
+                self.stream.eval_batch_size(),
+            ),
+            trainer: self.trainer.describe(),
         };
         let header = RunHeader::from_race_options(cfg);
         write_engine_json(&self.run_dir, &header)
@@ -1851,19 +1855,21 @@ mod tests {
     }
 
     fn tiny_topology(seed: usize) -> Topology {
-        let mut topo = Topology::new(seed, Some(TopologyOptions {
-            topology_seed: seed,
-            min_hidden_num_nodes: 1,
-            max_hidden_num_nodes: 1,
-            min_hidden_inputs_per_node: 1,
-            max_hidden_inputs_per_node: 1,
-            min_hidden_outputs_per_node: 1,
-            max_hidden_outputs_per_node: 1,
-            input_dim: Some(2),
-            hidden_dim: Some(4),
-            output_dim: Some(2),
-            dropout_prob: 0.0,
-        }));
+        let mut topo = Topology::new(
+            seed,
+            Some(TopologyOptions {
+                topology_seed: seed,
+                min_hidden_num_nodes: 1,
+                max_hidden_num_nodes: 1,
+                min_hidden_inputs_per_node: 1,
+                max_hidden_inputs_per_node: 1,
+                min_hidden_outputs_per_node: 1,
+                max_hidden_outputs_per_node: 1,
+                input_dim: Some(2),
+                output_dim: Some(2),
+                dropout_prob: 0.0,
+            }),
+        );
         topo.nodes.push(Node::new_input(0, 2));
         topo.nodes.push(Node::new_hidden(1, 2, 4));
         topo.nodes.push(Node::new_output(2, 4, 2));
@@ -1927,7 +1933,7 @@ mod tests {
             data_dir,
             config,
             fitness: fitness(),
-            trainer: Box::new(crate::trainer::TabularTrainer::new(loss_fn())),
+            trainer: crate::trainer::TabularTrainer::new(loss_fn()),
             seed: Some(seed),
             run_dir: Some(run_dir.to_path_buf()),
         })
@@ -1954,57 +1960,6 @@ mod tests {
     }
 
     #[test]
-    fn divergence_is_zero_when_empty() {
-        let dir = std::env::temp_dir().join("race_div_empty_test");
-        let engine = engine(&dir, 42).unwrap();
-        assert_eq!(engine.divergence(), 0.0);
-    }
-
-    #[test]
-    fn divergence_is_zero_for_single_net() {
-        let dir = std::env::temp_dir().join("race_div_one_test");
-        let mut engine = engine(&dir, 42).unwrap();
-        engine.seed_population_internal(vec![tiny_topology(7)], Some(0.5)).unwrap();
-        assert_eq!(engine.divergence(), 0.0, "one net ⇒ no spread");
-    }
-
-    #[test]
-    fn divergence_is_zero_when_all_smoothed_fitness_equal() {
-        let dir = std::env::temp_dir().join("race_div_equal_test");
-        let mut engine = engine(&dir, 42).unwrap();
-        engine.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5)).unwrap();
-        // Manually fill both rolling buffers with the same fitness to simulate
-        // a spread-less population.
-        if let Some(buf) = engine.rolling_fitness.get_mut(&engine.state.live_hashes()[0]) {
-            buf.push(0.5);
-            buf.push(0.5);
-        }
-        if let Some(buf) = engine.rolling_fitness.get_mut(&engine.state.live_hashes()[1]) {
-            buf.push(0.5);
-            buf.push(0.5);
-        }
-        assert_eq!(engine.divergence(), 0.0, "equal smoothed fitness ⇒ no spread");
-    }
-
-    #[test]
-    fn divergence_spikes_with_spread() {
-        let dir = std::env::temp_dir().join("race_div_spread_test");
-        let mut engine = engine(&dir, 42).unwrap();
-        engine.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5)).unwrap();
-        // Fill buffers with different fitnesses to simulate a spread.
-        if let Some(buf) = engine.rolling_fitness.get_mut(&engine.state.live_hashes()[0]) {
-            buf.push(0.9);
-        }
-        if let Some(buf) = engine.rolling_fitness.get_mut(&engine.state.live_hashes()[1]) {
-            buf.push(0.1);
-        }
-        let div = engine.divergence();
-        assert!(div > 0.0, "different smoothed fitness ⇒ spread ({div}))");
-        // /max form: (0.9-0.1)/0.9 ≈ 0.889, bounded ≤ 1.
-        assert!((div - 0.8888).abs() < 1e-4, "expected (0.9-0.1)/0.9 ≈ 0.889, got {div}");
-    }
-
-    #[test]
     fn step_clock_is_zero_when_empty() {
         let dir = std::env::temp_dir().join("race_clock_empty_test");
         let engine = engine(&dir, 42).unwrap();
@@ -2015,7 +1970,9 @@ mod tests {
     fn step_clock_reads_from_live_net_after_populate() {
         let dir = std::env::temp_dir().join("race_clock_pop_test");
         let mut engine = engine(&dir, 42).unwrap();
-        engine.seed_population_internal(vec![tiny_topology(7)], None).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7)], None)
+            .unwrap();
         // After populate, all nets are at step 0.
         assert_eq!(engine.step_clock(), 0);
     }
@@ -2024,7 +1981,9 @@ mod tests {
     fn fittest_net_is_deterministic_given_same_state() {
         let dir = std::env::temp_dir().join("race_fittest_test");
         let mut engine = engine(&dir, 42).unwrap();
-        engine.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5)).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
         // Both have empty rolling buffers ⇒ smoothed fitness 0 ⇒ either is fittest,
         // but the choice is deterministic for the same engine state.
         let h1 = engine.fittest_net_hash().unwrap();
@@ -2075,14 +2034,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn catch_up_replays_steps_zero_to_clock() {
         let dir = std::env::temp_dir().join("race_catchup_test");
         let mut engine = engine(&dir, 42).unwrap();
         engine.config.crossover_prob = 0.0;
         engine.config.mutate_prob = 0.0;
-        engine.seed_population_internal(vec![tiny_topology(7)], Some(0.0)).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7)], Some(0.0))
+            .unwrap();
         let clock = 5;
         let mut child = engine.generate_child(clock, 0).unwrap();
         assert!(
@@ -2114,8 +2074,12 @@ mod tests {
         engine_b.config.crossover_prob = 0.0;
         engine_a.config.mutate_prob = 0.0;
         engine_b.config.mutate_prob = 0.0;
-        engine_a.seed_population_internal(vec![tiny_topology(7)], Some(0.0)).unwrap();
-        engine_b.seed_population_internal(vec![tiny_topology(7)], Some(0.0)).unwrap();
+        engine_a
+            .seed_population_internal(vec![tiny_topology(7)], Some(0.0))
+            .unwrap();
+        engine_b
+            .seed_population_internal(vec![tiny_topology(7)], Some(0.0))
+            .unwrap();
         let clock = 5;
         let mut child_a = engine_a.generate_child(clock, 0).unwrap();
         let mut child_b = engine_b.generate_child(clock, 0).unwrap();
@@ -2133,7 +2097,9 @@ mod tests {
     fn step_one_net_advances_the_net_step_and_records_metrics() {
         let dir = std::env::temp_dir().join("race_step_one_test");
         let mut engine = engine(&dir, 42).unwrap();
-        engine.seed_population_internal(vec![tiny_topology(7)], None).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7)], None)
+            .unwrap();
         let hash = engine.state.live_hashes()[0].clone();
         engine.step_one_net(&hash, 0).unwrap();
         let state = engine.state.net(&hash).unwrap();
@@ -2149,7 +2115,9 @@ mod tests {
         let dir = std::env::temp_dir().join("race_step_one_file_test");
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = engine(&dir, 42).unwrap();
-        engine.seed_population_internal(vec![tiny_topology(7)], None).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7)], None)
+            .unwrap();
         let hash = engine.state.live_hashes()[0].clone();
         engine.step_one_net(&hash, 0).unwrap();
         engine.write_live_frontier_states().unwrap();
@@ -2163,7 +2131,9 @@ mod tests {
 
     fn seed_two_parents(dir: &std::path::Path, seed: u64) -> RaceEngine {
         let mut engine = engine(dir, seed).unwrap();
-        engine.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5)).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
         engine
     }
 
@@ -2175,7 +2145,10 @@ mod tests {
         let mut b = seed_two_parents(&dir_b, 123);
         let ca = a.generate_child(3, 0).unwrap();
         let cb = b.generate_child(3, 0).unwrap();
-        assert_eq!(ca.state.hash, cb.state.hash, "same seed + clock ⇒ same child topology");
+        assert_eq!(
+            ca.state.hash, cb.state.hash,
+            "same seed + clock ⇒ same child topology"
+        );
         assert_eq!(ca.state.net_seed, cb.state.net_seed);
         assert_eq!(ca.state.created_from, cb.state.created_from);
     }
@@ -2203,7 +2176,11 @@ mod tests {
         no.config.crossover_prob = 0.0;
         no.config.mutate_prob = 0.0;
         let c = no.generate_child(1, 0).unwrap();
-        assert_eq!(c.state.created_from.as_deref(), Some("random"), "no '+mut' suffix");
+        assert_eq!(
+            c.state.created_from.as_deref(),
+            Some("random"),
+            "no '+mut' suffix"
+        );
 
         let dir_yes = std::env::temp_dir().join("race_child_mut1");
         let mut yes = seed_two_parents(&dir_yes, 21);
@@ -2233,7 +2210,6 @@ mod tests {
                 min_hidden_outputs_per_node: 1,
                 max_hidden_outputs_per_node: 1,
                 input_dim: Some(2),
-                hidden_dim: Some(4),
                 output_dim: Some(2),
                 dropout_prob: 0.0,
             }),
@@ -2241,8 +2217,14 @@ mod tests {
         topo.nodes.push(Node::new_input(0, 2));
         topo.nodes.push(Node::new_output(1, 2, 2));
         let conn = |from: (usize, usize), to: (usize, usize)| crate::graph::topology::Connection {
-            from: crate::graph::topology::Port { node: from.0, index: from.1 },
-            to: crate::graph::topology::Port { node: to.0, index: to.1 },
+            from: crate::graph::topology::Port {
+                node: from.0,
+                index: from.1,
+            },
+            to: crate::graph::topology::Port {
+                node: to.0,
+                index: to.1,
+            },
         };
         topo.connections.push(conn((0, 0), (1, 0)));
         topo.connections.push(conn((0, 1), (1, 1)));
@@ -2259,7 +2241,9 @@ mod tests {
         // fittest (cloning would reinforce the leader and starve diversity).
         let dir = std::env::temp_dir().join("race_child_fallback");
         let mut engine = engine(&dir, 55).unwrap();
-        engine.seed_population_internal(vec![flat_topology(7), flat_topology(8)], Some(0.5)).unwrap();
+        engine
+            .seed_population_internal(vec![flat_topology(7), flat_topology(8)], Some(0.5))
+            .unwrap();
         engine.config.crossover_prob = 1.0;
         engine.config.mutate_prob = 0.0;
         let child = engine.generate_child(2, 0).unwrap();
@@ -2279,7 +2263,9 @@ mod tests {
         let dir = std::env::temp_dir().join("race_resume_parity");
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = engine(&dir, 99).unwrap();
-        engine.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5)).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
         let hashes: Vec<String> = engine.state.live_hashes();
 
         // Drive both nets 4 steps by hand (deterministic stream).
@@ -2309,7 +2295,7 @@ mod tests {
                 c
             },
             fitness(),
-            Box::new(crate::trainer::TabularTrainer::new(loss_fn())),
+            crate::trainer::TabularTrainer::new(loss_fn()),
         )
         .unwrap();
         assert_eq!(resumed.state.live_count(), 2, "both live nets restored");
@@ -2331,7 +2317,8 @@ mod tests {
         let dir_a = std::env::temp_dir().join("race_twin_uninterrupted");
         let _ = std::fs::remove_dir_all(&dir_a);
         let mut full = engine(&dir_a, 123).unwrap();
-        full.seed_population_internal(vec![tiny_topology(7)], Some(0.5)).unwrap();
+        full.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+            .unwrap();
         let h_full = full.state.live_hashes()[0].clone();
         for clock in 0..5 {
             full.step_one_net(&h_full, clock).unwrap();
@@ -2342,7 +2329,8 @@ mod tests {
         let dir_b = std::env::temp_dir().join("race_twin_interrupted");
         let _ = std::fs::remove_dir_all(&dir_b);
         let mut part = engine(&dir_b, 123).unwrap();
-        part.seed_population_internal(vec![tiny_topology(7)], Some(0.5)).unwrap();
+        part.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+            .unwrap();
         let h_part = part.state.live_hashes()[0].clone();
         for clock in 0..3 {
             part.step_one_net(&h_part, clock).unwrap();
@@ -2360,7 +2348,7 @@ mod tests {
                 c
             },
             fitness(),
-            Box::new(crate::trainer::TabularTrainer::new(loss_fn())),
+            crate::trainer::TabularTrainer::new(loss_fn()),
         )
         .unwrap();
         // After resume the hash is the same (same topology), so step 3/4
@@ -2381,10 +2369,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = engine(&dir, 99).unwrap();
         engine
-            .seed_population_internal(
-                (0..4).map(tiny_topology).collect(),
-                Some(0.5),
-            )
+            .seed_population_internal((0..4).map(tiny_topology).collect(), Some(0.5))
             .unwrap();
         // Three sequential immigrant rounds at the same clock: each culls one
         // fitness-inverse-selected net and inserts a random immigrant. If the
@@ -2405,10 +2390,12 @@ mod tests {
     fn resume_checkpoint_ledger_gate_parity() {
         let dir = std::env::temp_dir().join("race_checkpoint_resume_parity");
         let _ = std::fs::remove_dir_all(&dir);
-        
+
         let mut engine = engine(&dir, 42).unwrap();
         engine.config.checkpoint_every = 2;
-        engine.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5)).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
 
         // Step 1 & 2 to create a checkpoint at step 2
         let hashes = engine.state.live_hashes();
@@ -2447,7 +2434,7 @@ mod tests {
                 c
             },
             fitness(),
-            Box::new(crate::trainer::TabularTrainer::new(loss_fn())),
+            crate::trainer::TabularTrainer::new(loss_fn()),
         )
         .unwrap();
 
@@ -2462,7 +2449,9 @@ mod tests {
         let dir = std::env::temp_dir().join("race_resume_pop_validation");
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = engine(&dir, 99).unwrap();
-        engine.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5)).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
         let hashes = engine.state.live_hashes();
 
         // Write both as live
@@ -2480,7 +2469,7 @@ mod tests {
             tiny_dataset_dir("pop_validation"),
             config,
             fitness(),
-            Box::new(crate::trainer::TabularTrainer::new(loss_fn())),
+            crate::trainer::TabularTrainer::new(loss_fn()),
         );
         assert!(resumed.is_err());
         let err_msg = resumed.err().unwrap().to_string();

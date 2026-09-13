@@ -33,22 +33,29 @@ use crate::trainer::Trainer;
 /// - `run_dir` — `None` = `results/<run_id>` with a timestamp id; give a
 ///   path to place the run anywhere. The chosen dir is readable via
 ///   `RaceEngine::run_dir()` after construction.
-pub struct RunSpec {
+pub struct RunSpec<T: Trainer + 'static = Box<dyn Trainer>> {
     pub data_dir: std::path::PathBuf,
     pub config: RaceConfig,
     pub fitness: Fitness,
-    pub trainer: Box<dyn Trainer>,
+    pub trainer: T,
     pub seed: Option<u64>,
     pub run_dir: Option<std::path::PathBuf>,
 }
 
-impl RunSpec {
+impl<T: Trainer + 'static> RunSpec<T> {
     /// Convenience: build a spec with the trainer auto-boxed. Accepts any
-    /// `T: Trainer + 'static` so callers can write
+    /// `U: Trainer + 'static` so callers can write
     /// `.with_trainer(TabularTrainer::new(loss).with_learning_rate(1e-3))`
     /// instead of `trainer: Box::new(...)`.
-    pub fn with_trainer<T: Trainer + 'static>(self, trainer: T) -> Self {
-        Self { trainer: Box::new(trainer), ..self }
+    pub fn with_trainer<U: Trainer + 'static>(self, trainer: U) -> RunSpec<Box<dyn Trainer>> {
+        RunSpec {
+            data_dir: self.data_dir,
+            config: self.config,
+            fitness: self.fitness,
+            trainer: Box::new(trainer),
+            seed: self.seed,
+            run_dir: self.run_dir,
+        }
     }
 }
 
@@ -62,17 +69,34 @@ impl RunSpec {
 /// warmup, multi-minibatch, RL, image, NLP — the engine only sees the
 /// [`Trainer`] contract).
 pub struct DefaultTrainerBuilder {
-    loss: Option<Box<dyn Fn(&flodl::Variable, &flodl::Variable) -> flodl::tensor::Result<flodl::Variable> + Send + Sync + 'static>>,
+    loss: Option<
+        Box<
+            dyn Fn(&flodl::Variable, &flodl::Variable) -> flodl::tensor::Result<flodl::Variable>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >,
     learning_rate: f32,
     grad_clip: f32,
 }
 
 impl DefaultTrainerBuilder {
     pub fn new() -> Self {
-        Self { loss: None, learning_rate: 1e-3, grad_clip: 1.0 }
+        Self {
+            loss: None,
+            learning_rate: 1e-3,
+            grad_clip: 1.0,
+        }
     }
 
-    pub fn loss(mut self, loss: impl Fn(&flodl::Variable, &flodl::Variable) -> flodl::tensor::Result<flodl::Variable> + Send + Sync + 'static) -> Self {
+    pub fn loss(
+        mut self,
+        loss: impl Fn(&flodl::Variable, &flodl::Variable) -> flodl::tensor::Result<flodl::Variable>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
         self.loss = Some(Box::new(loss));
         self
     }
@@ -91,8 +115,14 @@ impl DefaultTrainerBuilder {
     /// loss has no training signal. The default loss fallback is
     /// cross-entropy (so `Default` stays usable for tests that don't care).
     pub fn build(self) -> Box<dyn Trainer> {
-        let loss = self.loss.unwrap_or_else(|| Box::new(|pred, y| crate::utils::score::cross_entropy_onehot_loss(pred, y)));
-        Box::new(crate::trainer::TabularTrainer::new(loss).with_learning_rate(self.learning_rate).with_grad_clip(self.grad_clip))
+        let loss = self.loss.unwrap_or_else(|| {
+            Box::new(|pred, y| crate::utils::score::cross_entropy_onehot_loss(pred, y))
+        });
+        Box::new(
+            crate::trainer::TabularTrainer::new(loss)
+                .with_learning_rate(self.learning_rate)
+                .with_grad_clip(self.grad_clip),
+        )
     }
 }
 
@@ -120,7 +150,10 @@ impl StreamShape {
     /// No override — use the engine's default stream shape (batch_size from
     /// the trainer's default + eval_batch_size == batch_size).
     pub fn none() -> Self {
-        Self { batch_size: 16, eval_batch_size: 16 }
+        Self {
+            batch_size: 16,
+            eval_batch_size: 16,
+        }
     }
 
     pub fn with_batch_size(mut self, n: usize) -> Self {
@@ -135,6 +168,9 @@ impl StreamShape {
 
     /// Convenience for the common case: same size for train + eval.
     pub fn uniform(n: usize) -> Self {
-        Self { batch_size: n, eval_batch_size: n }
+        Self {
+            batch_size: n,
+            eval_batch_size: n,
+        }
     }
 }
