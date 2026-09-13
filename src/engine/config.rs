@@ -100,7 +100,7 @@ pub struct RaceConfig {
     pub checkpoint_every: usize,
     /// Independent crossover rolls per step. Each roll fires with
     /// `crossover_prob`; a firing roll produces one checkpoint-gated child.
-    pub cross_rolls: usize,
+    pub crossover_rolls: usize,
     /// Independent mutation rolls per step. Each roll fires with
     /// `mutate_prob`; a firing roll culls one fitness-inverse-selected net
     /// and inserts a fully-random immigrant (no checkpoint gate).
@@ -226,7 +226,7 @@ impl RaceConfig {
         RaceConfig {
             pop_size: 5,
             checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
-            cross_rolls: 1,
+            crossover_rolls: 1,
             mutate_rolls: 1,
             check: CheckMode::default(),
             crossover_fallback_to_immigrant: false,
@@ -284,8 +284,8 @@ impl RaceConfigBuilder {
         self.cfg.checkpoint_every = n.max(1);
         self
     }
-    pub fn set_cross_rolls(mut self, n: usize) -> Self {
-        self.cfg.cross_rolls = n;
+    pub fn set_crossover_rolls(mut self, n: usize) -> Self {
+        self.cfg.crossover_rolls = n;
         self
     }
     pub fn set_mutate_rolls(mut self, n: usize) -> Self {

@@ -38,7 +38,7 @@ pub struct ConfigSnapshot {
     /// Population size the race held constant.
     pub pop_size: usize,
     pub checkpoint_every: usize,
-    pub cross_rolls: usize,
+    pub crossover_rolls: usize,
     pub mutate_rolls: usize,
     /// Checkpoint gate strictness (`"hard"` | `"soft"`).
     pub check: String,
@@ -76,7 +76,7 @@ impl ConfigSnapshot {
         ConfigSnapshot {
             pop_size: cfg.pop_size,
             checkpoint_every: cfg.checkpoint_every,
-            cross_rolls: cfg.cross_rolls,
+            crossover_rolls: cfg.crossover_rolls,
             mutate_rolls: cfg.mutate_rolls,
             check: format!("{:?}", cfg.check).to_lowercase(),
             crossover_prob: cfg.crossover_prob,

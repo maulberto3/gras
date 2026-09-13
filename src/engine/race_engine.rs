@@ -669,11 +669,11 @@ impl RaceEngine {
         // `None` mode: one compact start line, then silence until stop.
         if self.verbose_detail() {
             info!(
-                "race start: run={} seed={} checkpoint_every={} cross_rolls={} mutate_rolls={} K={} pop={}",
+                "race start: run={} seed={} checkpoint_every={} crossover_rolls={} mutate_rolls={} K={} pop={}",
                 self.header.run_id,
                 self.header.run_seed,
                 self.config.checkpoint_every,
-                self.config.cross_rolls,
+                self.config.crossover_rolls,
                 self.config.mutate_rolls,
                 SMOOTHING_WINDOW,
                 self.config.pop_size,
@@ -737,7 +737,7 @@ impl RaceEngine {
             let mut mutate_fired = 0usize;
             let culls_before = self.culls;
             // 3a. crossover rolls: checkpoint-gated children.
-            for roll in 0..self.config.cross_rolls {
+            for roll in 0..self.config.crossover_rolls {
                 if self.state.live_count() < 2 {
                     break; // not enough population to evolve
                 }
@@ -1944,7 +1944,7 @@ mod tests {
         let cfg = RaceConfig::defaults();
         assert_eq!(cfg.pop_size, 5);
         assert_eq!(cfg.checkpoint_every, DEFAULT_CHECKPOINT_EVERY);
-        assert_eq!(cfg.cross_rolls, 1);
+        assert_eq!(cfg.crossover_rolls, 1);
         assert_eq!(cfg.mutate_rolls, 1);
         assert_eq!(cfg.check, crate::engine::config::CheckMode::Hard);
         assert_eq!(cfg.checkpoint_every, DEFAULT_CHECKPOINT_EVERY);
