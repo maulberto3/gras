@@ -218,7 +218,7 @@ First budget hit cleanly stops the race:
 |--------|---------|----------------|-------------|
 | `pop_size` | 5 | `.set_pop_size(n)` | Number of active networks in population |
 | `checkpoint_every` | 10 | `.set_checkpoint_every(n)` | Step cadence of ledger checkpoints |
-| `cross_rolls` | 1 | `.set_cross_rolls(n)` | Crossover attempts rolled per step |
+| `crossover_rolls` | 1 | `.set_crossover_rolls(n)` | Crossover attempts rolled per step |
 | `mutate_rolls` | 1 | `.set_mutate_rolls(n)` | Immigrant rolls processed per step |
 | `crossover_prob` | 0.5 | `.set_crossover_prob(v)` | Crossover execution probability |
 | `mutate_prob` | 0.2 | `.set_mutate_prob(v)` | Mutation execution probability |
