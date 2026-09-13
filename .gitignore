@@ -6,9 +6,12 @@
 
 .vscode
 
+GEMINI.md
 NOTES.md
 NAS_GUIDE.md
 WORKFLOW.md
+PROD_REFACTOR_WINS.md
+RACE_REVAMP.md
 
 /data
 
@@ -18,11 +21,19 @@ saved/
 
 results/
 
+# example run output (datasets live in the ignored /data root above)
+/examples/*/run/
+
 trash/
-
 proptest-regressions/
-
 proptest-regressions/topology.txt
+
+# flamegraph output (cargo flamegraph writes to cwd by default)
+/flamegraph.svg
+
+# perf intermediates from cargo flamegraph (written in cwd)
+/perf.data
+/perf.data.old
 
 # Untracked user-specific files
 kaggle_guide.rs

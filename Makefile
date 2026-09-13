@@ -17,7 +17,7 @@ clean:
 	cargo cache --autoclean && cargo clean
 
 lint:
-	source env_setup.sh && cargo fmt && cargo clippy -- -D warnings
+	source env_setup.sh && cargo fmt && cargo clippy --all-targets -- -D warnings
 
 test:
 	source env_setup.sh && cargo test
@@ -44,10 +44,11 @@ build:
 # ⚡ Performance & Profiling
 ################################################################################
 benc:
-	clear && source env_setup.sh && cargo bench --bench mine
+	clear && source env_setup.sh && cargo bench --bench stream
 
 prof:
-	clear && source env_setup.sh && cargo run --release --example flamegraph
+	clear && source env_setup.sh && mkdir -p results/prof && \
+	cargo flamegraph --profile profiling -o results/prof/flamegraph.svg --example flamegraph -- --steps 300
 
 samp:
 	# To grant temporary access before using samply
