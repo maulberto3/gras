@@ -8,12 +8,12 @@
 //! (Named "tabular" because the shared-batch, one-step-clock shape fits
 //! small structured datasets; image/RL/NLP schemes subclass the same trait.)
 
+use crate::graph::network::Network;
+use crate::trainer::{StepContext, StepReport, Trainer};
+use crate::utils::race_steps::{eval_one_step, seed_step_randomness, train_one_step};
 use flodl::nn::optim::Optimizer;
 use flodl::tensor::Result;
 use flodl::{Tensor, Variable};
-use crate::graph::network::Network;
-use crate::utils::race_steps::{eval_one_step, seed_step_randomness, train_one_step};
-use crate::trainer::{StepContext, StepReport, Trainer};
 
 /// Classic tabular scheme: one `train_one_step` on the step's shared train
 /// batch, then one `eval_one_step` on the step's shared eval batch. Seeding
@@ -32,6 +32,10 @@ pub struct TabularTrainer {
     pub learning_rate: f32,
     /// Gradient-norm clip applied per optimizer step (0 = off).
     pub grad_clip: f32,
+    /// Custom training batch size requested from the engine stream.
+    pub batch_size: usize,
+    /// Custom evaluation batch size requested from the engine stream.
+    pub eval_batch_size: usize,
 }
 
 impl TabularTrainer {
@@ -56,6 +60,18 @@ impl TabularTrainer {
         self.grad_clip = clip;
         self
     }
+
+    /// Set the training batch size (default 16).
+    pub fn with_batch_size(mut self, size: usize) -> Self {
+        self.batch_size = size;
+        self
+    }
+
+    /// Set the evaluation batch size (default 16).
+    pub fn with_eval_batch_size(mut self, size: usize) -> Self {
+        self.eval_batch_size = size;
+        self
+    }
 }
 
 impl Default for TabularTrainer {
@@ -63,11 +79,11 @@ impl Default for TabularTrainer {
         Self {
             // Fallback loss (plain cross-entropy) so `Default` stays
             // available; real runs construct via `TabularTrainer::new(loss)`.
-            loss_fn: Box::new(|pred, y| {
-                crate::utils::score::cross_entropy_onehot_loss(pred, y)
-            }),
+            loss_fn: Box::new(|pred, y| crate::utils::score::cross_entropy_onehot_loss(pred, y)),
             learning_rate: crate::engine::config::DEFAULT_LR,
             grad_clip: 1.0,
+            batch_size: 16,
+            eval_batch_size: 16,
         }
     }
 }
@@ -135,7 +151,7 @@ impl Trainer for RlTrainer {
         let fitness = 0.0_f32; // TODO: your reward → fitness mapping
         Ok(StepReport {
             train_loss: 0.0,
-            eval_loss: None,       // RL usually has no held-out eval
+            eval_loss: None, // RL usually has no held-out eval
             fitness,
             informative: Vec::new(),
         })
@@ -271,9 +287,32 @@ impl Trainer for TabularTrainer {
         Some(&*self.loss_fn)
     }
 
+    fn stream_shape(&self) -> Option<crate::trainer::StreamShape> {
+        Some(crate::trainer::StreamShape {
+            batch_size: self.batch_size,
+            eval_batch_size: self.eval_batch_size,
+        })
+    }
+
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
         use flodl::nn::Module;
-        Box::new(flodl::nn::Adam::new(&net.parameters(), self.learning_rate as f64))
+        Box::new(flodl::nn::Adam::new(
+            &net.parameters(),
+            self.learning_rate as f64,
+        ))
+    }
+
+    /// Record this scheme's training recipe in `engine.json` (see
+    /// [`Trainer::describe`]).
+    fn describe(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "trainer": "tabular",
+            "optimizer": "adam",
+            "learning_rate": self.learning_rate,
+            "grad_clip": self.grad_clip,
+            "batch_size": self.batch_size,
+            "eval_batch_size": self.eval_batch_size,
+        }))
     }
 
     fn train_step(
@@ -287,8 +326,12 @@ impl Trainer for TabularTrainer {
         // stream for the step's batches, loss + fitness + metrics for
         // scoring. (A scheme that doesn't fit that mold simply ignores the
         // handles it doesn't need — they're Options.)
-        let data = ctx.data.expect("TabularTrainer requires the run's shared data (stream + dataset)");
-        let fitness = ctx.fitness.expect("TabularTrainer requires a fitness function");
+        let data = ctx
+            .data
+            .expect("TabularTrainer requires the run's shared data (stream + dataset)");
+        let fitness = ctx
+            .fitness
+            .expect("TabularTrainer requires a fitness function");
         let loss_fn: crate::trainer::LossFn<'_> = &*self.loss_fn; // our own loss
 
         // Same seeding the engine did inline: net seed + step clock, hashed

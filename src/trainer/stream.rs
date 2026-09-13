@@ -1,5 +1,4 @@
-//! The deterministic shared batch stream — Iter 1 of the step-race revamp
-//! (see RACE_REVAMP.md).
+//! The deterministic shared batch stream for the step-race engine.
 //!
 //! Two pieces:
 //! - [`PoolSplit`]: the static, seeded train/eval pool split (D12), fixed at
@@ -13,11 +12,11 @@
 //! There is no epoch concept here (D14): the stream is infinite, and train +
 //! eval both happen per step.
 
-use flodl::tensor::Result;
 use flodl::Tensor;
+use flodl::tensor::Result;
 
-use crate::utils::seed::derive_seed;
 use crate::utils::data::Dataset;
+use crate::utils::seed::derive_seed;
 
 /// Per-step eval batches are derived from `run_seed + EVAL_STREAM_OFFSET`,
 /// never `run_seed` itself — same contract shape as the legacy
@@ -42,7 +41,12 @@ impl PoolSplit {
     /// deterministic shuffle. Ratios must sum to ~1.0 (same contract as
     /// `data::split_indices`). Pure function of `(len, train_eval_split_ratio, seed)`.
     pub fn new(len: usize, train_eval_split_ratio: f32, seed: u64) -> Self {
-        let (train, eval) = crate::utils::data::split_indices(len, 1.0 - train_eval_split_ratio, train_eval_split_ratio, seed);
+        let (train, eval) = crate::utils::data::split_indices(
+            len,
+            1.0 - train_eval_split_ratio,
+            train_eval_split_ratio,
+            seed,
+        );
         PoolSplit { train, eval }
     }
 
@@ -217,9 +221,7 @@ mod tests {
     #[test]
     fn stream_batch_is_pure_function_of_seed_and_step() {
         let ds = small_dataset();
-        let mk = |seed| {
-            BatchStream::new(seed, 8, PoolSplit::of(&ds, 0.25, seed))
-        };
+        let mk = |seed| BatchStream::new(seed, 8, PoolSplit::of(&ds, 0.25, seed));
         let s = mk(99);
         // Same (seed, step) ⇒ identical batch, however many times it's asked.
         let (x1, y1) = s.train_batch(&ds, 5).unwrap();
@@ -255,6 +257,10 @@ mod tests {
         let s = BatchStream::new(99, 8, PoolSplit::of(&ds, 0.25, 99));
         let (x0, _) = s.train_batch(&ds, 0).unwrap();
         let (x6, _) = s.train_batch(&ds, 6).unwrap();
-        assert_eq!(x0.to_f32_vec().unwrap(), x6.to_f32_vec().unwrap(), "step 6 wraps to the lap-1 start");
+        assert_eq!(
+            x0.to_f32_vec().unwrap(),
+            x6.to_f32_vec().unwrap(),
+            "step 6 wraps to the lap-1 start"
+        );
     }
 }
