@@ -1,7 +1,7 @@
 //! Bring your own trainer — a custom `Trainer` for the step-race engine.
 //!
 //! The engine is **training-agnostic**: it orchestrates the population
-//! (step clock, divergence culling, checkpoint gates, stop criteria) and
+//! (step clock, smoothed-fitness culling, checkpoint gates, stop criteria) and
 //! hands each net to *your* training scheme once per step clock. This
 //! example implements `WarmupSgdTrainer`, a scheme that deviates from the
 //! default `TabularTrainer` in three ways at once:
@@ -30,17 +30,17 @@
 
 use std::path::Path;
 
-use flodl::nn::optim::Optimizer;
-use flodl::nn::Module;
 use flodl::Tensor;
+use flodl::nn::Module;
+use flodl::nn::optim::Optimizer;
 
+use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{RaceConfig, RaceEngine};
 use gras::graph::network::Network;
 use gras::graph::topology::TopologyOptions;
 use gras::trainer::{StepContext, StepReport, Trainer};
 use gras::utils::{data, score};
-use gras::Variable;
 
 // ── 1. The custom trainer ────────────────────────────────────────────────────
 
@@ -77,7 +77,10 @@ struct WarmupSgdTrainer {
 
 impl WarmupSgdTrainer {
     fn new(
-        loss_fn: impl Fn(&Variable, &Variable) -> flodl::tensor::Result<Variable> + Send + Sync + 'static,
+        loss_fn: impl Fn(&Variable, &Variable) -> flodl::tensor::Result<Variable>
+        + Send
+        + Sync
+        + 'static,
         peak_lr: f32,
         momentum: f32,
     ) -> Self {
@@ -108,6 +111,21 @@ impl Trainer for WarmupSgdTrainer {
             batch_size: 2,
             eval_batch_size: 3,
         })
+    }
+
+    // OPTIONAL: record the scheme's hyperparameters in `engine.json` so the run
+    // is reproducible without reading this file. Free-form JSON — the engine
+    // persists it verbatim and never interprets it.
+    fn describe(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "trainer": "warmup-sgd",
+            "optimizer": "sgd",
+            "peak_lr": self.peak_lr,
+            "momentum": self.momentum,
+            "grad_clip": self.grad_clip,
+            "warmup_steps": self.warmup_steps,
+            "eval_every": self.eval_every,
+        }))
     }
 
     // Called by the engine at every net birth (initial population, crossover
@@ -188,7 +206,12 @@ fn main() {
 
     // Data — XOR: 4 rows, 2 features, 2 one-hot classes. Persisted so the
     // engine's deterministic-split contract holds even for tiny data.
-    let data_dir = Path::new("results/examples/custom_trainer");
+    // Dataset: the repo's `data/` root (generated on first run). Run output:
+    // beside this file, `examples/custom_trainer/run/`. Both are anchored to
+    // the crate root so the working directory doesn't matter.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let data_dir = root.join("data/xor");
+    let run_dir = root.join("examples/custom_trainer/run");
     if !data_dir.exists() {
         let xs = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]];
         let ys = [[1.0, 0.0], [0.0, 1.0], [0.0, 1.0], [1.0, 0.0]]; // XOR one-hot
@@ -198,22 +221,16 @@ fn main() {
             inputs: Tensor::from_f32(&flat_x, &[4, 2], gras::auto_device()).unwrap(),
             targets: Tensor::from_f32(&flat_y, &[4, 2], gras::auto_device()).unwrap(),
         };
-        data::save_dataset(data_dir, &ds).unwrap();
+        data::save_dataset(&data_dir, &ds).unwrap();
     }
-    let peeked = data::resolve_dataset(data_dir).unwrap();
+    let peeked = data::resolve_dataset(&data_dir).unwrap();
     let _ = &peeked; // dims only; the engine loads the real copy from data_dir
     drop(peeked);
 
     // Loss + fitness — the loss is OURS (this trainer's business); fitness
     // is engine business (drives cull/insert ranking).
-    let loss_fn = |pred: &Variable, y: &Variable| {
-        score::cross_entropy_onehot_loss(pred, y)
-    };
-    let fitness = Fitness::new(
-        score::accuracy_score,
-        Direction::Maximize,
-        "accuracy",
-    );
+    let loss_fn = |pred: &Variable, y: &Variable| score::cross_entropy_onehot_loss(pred, y);
+    let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
     let metrics = vec![Metric("accuracy".into())];
 
     // Topology — 2 features in, 2 one-hot classes out.
@@ -235,13 +252,12 @@ fn main() {
 
     // Run — the ONLY difference from a default run is the trainer argument:
     let run_seed = 42u64;
-    let run_dir = Path::new("results/examples").join(format!("custom-trainer-{run_seed}"));
     let mut engine = RaceEngine::new(gras::engine::RunSpec {
         data_dir: data_dir.to_path_buf(),
         config,
         fitness,
         // Our scheme instead of TabularTrainer — that's the whole swap.
-        trainer: Box::new(WarmupSgdTrainer::new(loss_fn, 0.05, 0.9)),
+        trainer: WarmupSgdTrainer::new(loss_fn, 0.05, 0.9),
         seed: Some(run_seed),
         run_dir: Some(run_dir),
     })

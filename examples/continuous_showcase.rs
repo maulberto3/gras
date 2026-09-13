@@ -8,11 +8,11 @@
 
 use std::path::Path;
 
+use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{RaceConfig, RaceEngine};
 use gras::graph::topology::TopologyOptions;
 use gras::utils::{data, score};
-use gras::Variable;
 
 fn main() {
     use std::io::Write;
@@ -23,13 +23,19 @@ fn main() {
     // 1. Data — synthetic sine wave, persisted for the engine's deterministic
     //    split contract. Single-output targets (y = sin(2πx)). The ENGINE
     //    loads it from data_dir; we only peek at the dims here.
-    let data_dir = Path::new("results/examples/continuous");
+    //    Reuses the repo's existing `data/sine` dataset (generated on first run
+    //    if absent); run output sits beside this file, in
+    //    `examples/continuous/run/`. Both are anchored to the crate root, so
+    //    the working directory doesn't matter.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let data_dir = root.join("data/sine");
+    let run_dir = root.join("examples/continuous/run");
     if !data_dir.exists() {
-        let (inputs, targets) = data::make_sine(256);
+        let (inputs, targets) = data::make_sine(512); // matches data/sine's shape
         let ds = data::Dataset { inputs, targets };
-        data::save_dataset(data_dir, &ds).unwrap();
+        data::save_dataset(&data_dir, &ds).unwrap();
     }
-    let peeked = data::resolve_dataset(data_dir).unwrap();
+    let peeked = data::resolve_dataset(&data_dir).unwrap();
     let (d_in, d_out) = (
         peeked.inputs.shape()[1] as usize,
         peeked.targets.shape()[1] as usize,
@@ -37,11 +43,7 @@ fn main() {
     drop(peeked);
 
     // 2. Fitness — MSE under Minimize (lower = better).
-    let fitness = Fitness::new(
-        score::mse_loss_score,
-        Direction::Minimize,
-        "mse",
-    );
+    let fitness = Fitness::new(score::mse_loss_score, Direction::Minimize, "mse");
     let metrics = vec![Metric("mae".into())];
 
     // 3. Topology — 1 input feature, 1 output value.
@@ -61,7 +63,6 @@ fn main() {
     // 5. Run — one RunSpec: data_dir + config + fitness + trainer + seed.
     //    The MSE loss lives inside the trainer (training business).
     let run_seed = 42u64;
-    let run_dir = Path::new("results/examples").join(format!("continuous-{run_seed}"));
     let loss_fn = |pred: &Variable, y: &Variable| {
         // MSE loss tensor (for backward): mean of squared difference.
         let diff = pred.data().sub(&y.data())?;
@@ -72,7 +73,7 @@ fn main() {
         data_dir: data_dir.to_path_buf(),
         config,
         fitness,
-        trainer: Box::new(gras::TabularTrainer::new(loss_fn)),
+        trainer: gras::TabularTrainer::new(loss_fn),
         seed: Some(run_seed),
         run_dir: Some(run_dir),
     })

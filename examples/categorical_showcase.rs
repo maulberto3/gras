@@ -2,7 +2,7 @@
 //! for MNIST-shaped synthetic data.
 //!
 //! Demonstrates: `RaceConfig` builder, accuracy fitness (Maximize),
-//! informative metrics, divergence-driven culling.
+//! informative metrics, per-step evolve rolls.
 //!
 //! Run: `source env_setup.sh && cargo run --example categorical_showcase`
 
@@ -21,12 +21,18 @@ fn main() {
     // 1. Data — synthetic classification, persisted so the engine's
     //    reproducibility contract (deterministic split from run_seed) holds.
     //    The ENGINE loads it from data_dir; we only peek at the dims here.
-    let data_dir = Path::new("results/examples/categorical");
+    //    The dataset lives in the repo's `data/` root (generated on first run);
+    //    run output sits beside this file, in `examples/categorical/run/`.
+    //    Both are anchored to the crate root, so the working directory
+    //    doesn't matter.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let data_dir = root.join("data/categorical");
+    let run_dir = root.join("examples/categorical/run");
     if !data_dir.exists() {
         let ds = data::synthetic_classification(1024, 16, 4, 42, gras::auto_device()).unwrap();
-        data::save_dataset(data_dir, &ds).unwrap();
+        data::save_dataset(&data_dir, &ds).unwrap();
     }
-    let peeked = data::resolve_dataset(data_dir).unwrap();
+    let peeked = data::resolve_dataset(&data_dir).unwrap();
     let (d_in, d_out) = (
         peeked.inputs.shape()[1] as usize,
         peeked.targets.shape()[1] as usize,
@@ -35,11 +41,7 @@ fn main() {
 
     // 2. Fitness — accuracy, maximize. Informative metrics ride along but
     //    never drive ranking/culling.
-    let fitness = Fitness::new(
-        score::accuracy_score,
-        Direction::Maximize,
-        "accuracy",
-    );
+    let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
     let metrics = vec![Metric("f1".into())];
 
     // 3. Config — budgets inactive unless set; here a step budget only.
@@ -57,14 +59,11 @@ fn main() {
 
     // 4. Run — one RunSpec; the cross-entropy loss lives inside the trainer.
     let run_seed = 42u64;
-    let run_dir = Path::new("results/examples").join(format!("categorical-{run_seed}"));
     let mut engine = RaceEngine::new(gras::engine::RunSpec {
         data_dir: data_dir.to_path_buf(),
         config,
         fitness,
-        trainer: Box::new(gras::TabularTrainer::new(
-            score::cross_entropy_onehot_loss,
-        )),
+        trainer: gras::TabularTrainer::new(score::cross_entropy_onehot_loss),
         seed: Some(run_seed),
         run_dir: Some(run_dir),
     })
