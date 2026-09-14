@@ -30,6 +30,7 @@ pub use engine::fitness;
 pub use evolution::{crossover, mutation, pools, selection};
 pub use graph::{network, node, topology};
 pub use utils::data;
+pub use utils::markdown;
 
 // ── engine — the step-race loop ──────────────────────────────────────
 pub use engine::{
