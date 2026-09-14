@@ -60,8 +60,8 @@ fn main() {
         "gras stream bench — CPU, {FEATURES} features -> {CLASSES} classes, batch {BATCH}\n"
     );
     println!(
-        "{:>7}  {:>7}  {:>11}  {:>10}  {:>11}  {:>10}  {:>9}",
-        "rows", "pool", "train_batch", "eval_batch", "train_step", "eval_step", "stream %"
+        "{:>7}  {:>7}  {:>11}  {:>10}  {:>11}  {:>10}  {:>9}  {:>10}",
+        "rows", "pool", "train_batch", "eval_batch", "train_step", "eval_step", "stream %", "era_eval"
     );
 
     // One net for the whole run: the architecture mix matches a real run's
@@ -85,6 +85,18 @@ fn main() {
             black_box(stream.eval_batch(&ds, 7).unwrap());
         });
 
+        // Eval-era rotation: the eval permutation re-shuffles per checkpoint
+        // era (era = step / checkpoint_every). Measure the added cost of
+        // crossing an era boundary (era change re-derives the permutation)
+        // vs a same-era step (permutation walk only). If the rotation is
+        // cheap, the anti-memorization feature is free at stream level.
+        let era_step = stream.checkpoint_every() as u64;
+        let era_switch_us = per_call(300, || {
+            // Same step twice: once pre-boundary, once at the boundary.
+            black_box(stream.eval_batch(&ds, era_step - 1).unwrap());
+            black_box(stream.eval_batch(&ds, era_step).unwrap());
+        });
+
         // The actual training work, on pre-drawn batches.
         let mut net = Network::build(&topo, device).unwrap();
         let mut optimizer: Box<dyn Optimizer> = Box::new(flodl::nn::Adam::new(
@@ -105,21 +117,21 @@ fn main() {
         });
 
         let stream_us = train_batch_us + eval_batch_us;
-        let step_us = stream_us + train_step_us + eval_step_us;
-        println!(
-            "{rows:>7}  {:>7}  {:>10.1}µ  {:>9.1}µ  {:>10.1}µ  {:>9.1}µ  {:>8.1}%",
+        let step_us = stream_us + train_step_us + eval_step_us;    println!(
+        "{rows:>7}  {:>7}  {:>10.1}µ  {:>9.1}µ  {:>10.1}µ  {:>9.1}µ  {:>8.1}%  {:>9.1}µ",
             ds.len() * 4 / 5, // train pool = 1 - 0.2 split ratio
             train_batch_us,
             eval_batch_us,
             train_step_us,
             eval_step_us,
             100.0 * stream_us / step_us,
+            era_switch_us / 2.0, // per-eval-batch cost incl. era crossing
         );
     }
 
     println!(
         "\nRead: a high `stream %` that grows with `rows` = BatchStream is the bottleneck \
          (cache the permutation).\n      A low, flat share = libtorch forward/backward dominates \
-         and the stream work is not worth it."
+         and the stream work is not worth it.\n      `era_eval` = eval batch cost across a checkpoint-era \n         boundary (rotation included) — if ~equal to `eval_batch`, era rotation is free."
     );
 }
