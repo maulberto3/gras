@@ -52,7 +52,10 @@ fn main() {
     let mut net = Network::build(&topo, device).expect("Failed to build network");
 
     // Resolve dataset
-    let dataset = data::resolve_dataset(&data_dir).expect("Failed to load dataset");
+    let dataset = data::resolve_dataset(&data_dir)
+        .expect("Failed to load dataset")
+        .to_device(device)
+        .expect("Failed to move dataset to device");
 
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
     let loss_fn =

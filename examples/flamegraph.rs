@@ -79,13 +79,13 @@ fn main() {
         .set_topology_options(topo_opts)
         .set_log_level(LogLevel::None)
         // No checkpoint inside the run ⇒ no nets/*.json or checkpoints.json
-        // writes, and no metrics.csv flush, to pollute the profile.
+        // writes, and no history.csv flush, to pollute the profile.
         .set_checkpoint_every(steps + 1);
 
     if evolve {
-        builder = builder.set_cross_rolls(1).set_mutate_rolls(1);
+        builder = builder.set_crossover_rolls(1).set_mutate_rolls(1);
     } else {
-        builder = builder.set_cross_rolls(0).set_mutate_rolls(0);
+        builder = builder.set_crossover_rolls(0).set_mutate_rolls(0);
     }
     let config = builder.set_csv_export(false).build();
 
