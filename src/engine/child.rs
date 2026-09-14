@@ -115,50 +115,75 @@ impl RaceEngine {
         ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
         let scores: Vec<f32> = ranked.iter().map(|(_, s)| *s).collect();
 
-        // 2. Roulette-select parents (1 or 2 per config). One-shot draws over
-        //    the rank wheel; two draws may repeat the same parent — that is
-        //    allowed and degrades to a self-cross (a crossover no-op).
-        let n_parents = self.config.crossover_parents.clamp(1, 2);
-        let parent_positions: Vec<usize> = (0..n_parents)
-            .filter_map(|_| {
-                crate::evolution::selection::SelectionMethod::Roulette
-                    .apply(&scores, direction, rng, 0)
-                    .into_iter()
-                    .next()
-            })
-            .collect();
-        let parent_hashes: Vec<String> = parent_positions
-            .iter()
-            .map(|&p| ranked[p].0.clone())
-            .collect();
-
         // 3. Crossover: up to 3 attempts; a no-op (incompatible dims) retries
-        //    with fresh parents. After 3 failures, fall back to cloning the
-        //    fittest parent; if even that path errors, a random child.
+        //    with FRESH roulette-drawn parents (the draw lives inside the
+        //    attempt loop — see below).
         let mut child_topo = None;
         let mut cx_note = String::new();
+        // Operator pool: resolved once per child (not per attempt) so a
+        // single child's retries vary the PARENTS, not the op. Draw is
+        // uniform over the pool; empty config pool ⇒ both ops (engine
+        // convention). Uniform uses its own swap_prob — no more magic 0.5.
+        let ops = self
+            .config
+            .resolved_crossover_ops()
+            .map_err(|e| flodl::tensor::TensorError::new(&e))?;
+        let op = ops[rng.usize(..ops.len())];
+        // Parent count is a property of the OPERATOR, not a config knob:
+        // every CrossoverOp is binary today ⇒ n_parents = op.required_parents().
+        // The old set_crossover_parents knob is gone — redundant surface.
+        let n_parents = op.required_parents();
+        // Up to 3 attempts. The FULL attempt is retried — new roulette parent
+        // draws each pass, not the same pair with new op randomness. A pair
+        // with no compatible pivot (one_point) or mismatched hidden counts
+        // (uniform) can never succeed, so retrying only the operator would
+        // burn all 3 attempts on a doomed pairing. Parents persist past the
+        // loop only if the LAST attempt used them (for lineage metadata).
+        let mut parent_hashes: Vec<String> = Vec::new();
         for _ in 0..3 {
-            let mut pa = self.load_parent_topology(&parent_hashes[0])?;
+            // 2. Roulette-select parents — INSIDE the attempt loop: a failed
+            //    pairing gets fresh parents, per the design contract.
+            let parent_positions: Vec<usize> = (0..n_parents)
+                .filter_map(|_| {
+                    crate::evolution::selection::SelectionMethod::Roulette
+                        .apply(&scores, direction, rng, 0)
+                        .into_iter()
+                        .next()
+                })
+                .collect();
+            let attempt_parents: Vec<String> = parent_positions
+                .iter()
+                .map(|&p| ranked[p].0.clone())
+                .collect();
+            let mut pa = self.load_parent_topology(&attempt_parents[0])?;
             if n_parents == 2 {
-                let mut pb = self.load_parent_topology(&parent_hashes[1])?;
-                let cx = match rng.f32() < 0.5 {
-                    true => Topology::cx_one_point(&mut pa, &mut pb, rng),
-                    false => {
-                        let swap = 0.5f32;
-                        Topology::cx_uniform(&mut pa, &mut pb, swap, rng)
+                let mut pb = self.load_parent_topology(&attempt_parents[1])?;
+                let cx = match op {
+                    crate::engine::config::CrossoverOp::OnePoint => {
+                        Topology::cx_one_point(&mut pa, &mut pb, rng)
+                    }
+                    crate::engine::config::CrossoverOp::Uniform => {
+                        const UNIFORM_SWAP_PROB: f32 = 0.5;
+                        Topology::cx_uniform(&mut pa, &mut pb, UNIFORM_SWAP_PROB, rng)
                     }
                 };
                 if cx {
                     child_topo = Some(pa);
-                    cx_note = "crossover".to_string();
+                    cx_note = match op {
+                        crate::engine::config::CrossoverOp::OnePoint => "crossover-one-point",
+                        crate::engine::config::CrossoverOp::Uniform => "crossover-uniform",
+                    }
+                    .to_string();
+                    parent_hashes = attempt_parents;
                     break;
                 }
-                // No-op — retry with fresh roulette draws next loop pass.
+                // No-op — next loop pass draws a fresh parent pair.
             } else {
                 // Single-parent mode: the child is the parent with a new seed
                 // (asexual reproduction; crossover needs two).
                 child_topo = Some(pa);
                 cx_note = "clone".to_string();
+                parent_hashes = attempt_parents;
                 break;
             }
         }
@@ -172,7 +197,7 @@ impl RaceEngine {
                 // never stalls either way (pop size stays constant).
                 if self.verbose_detail() {
                     info!(
-                        "step {} │ crossover produced no child after 3 attempts (incompatible dims) → random topology fallback",
+                        "step {} │ crossover produced no child after 3 attempts (fresh parents each, incompatible dims) → random topology fallback",
                         clock,
                     );
                 }

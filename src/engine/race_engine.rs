@@ -17,7 +17,7 @@
 //!    child replaces the worst net only if it clears every gate, otherwise the
 //!    attempt is discarded and the population is unchanged. Immigrant rolls: a
 //!    random entrant replaces an inverse-fitness victim (pop stays constant).
-//! 5. Stop criteria checked (max_steps, wall-clock, max_culls, target_score,
+//! 5. Stop criteria checked (max_steps, target_score, fitness_std,
 //!    custom stop) — log which fired.
 //! 6. Repeat — the loop's clock is the nets' recorded steps (every net is at
 //!    the same step after the group steps, so reading any live net's step
@@ -42,7 +42,7 @@
 //!   leaves `engine.json` + the culled nets' JSONs on disk; resume
 //!   reconstructs the live frontier from those + replays each net's stream.
 //!   There is no per-step file write during the run, and no separate
-//!   `metrics.csv` or `culled.log` artifact.
+//!   `history.csv` or `culled.log` artifact.
 
 use flodl::nn::Optimizer;
 use flodl::tensor::Result;
@@ -57,15 +57,15 @@ use crate::state::{
 };
 use crate::trainer::Trainer;
 use crate::trainer::stream::{BatchStream, PoolSplit};
-// Used only by the debug contract probe in `step_one_net`; gated to match it,
-// or a release build reports this import as unused.
-#[cfg(debug_assertions)]
+// Used by the debug contract probe in `step_one_net` and by the checkpoint
+// surprise exam (`run_checkpoint_exam`) — the exam runs in release too, so
+// this import is NOT debug-gated.
 use crate::utils::race_steps::eval_one_step;
 
 // ── Display helpers ─────────────────────────────────────────────────────────
 
 /// Format a float to 2 decimals for the **console log only**. Artifacts
-/// (`engine.json`, `nets/<hash>.json`, `metrics.csv`, `checkpoints.json`) are
+/// (`engine.json`, `nets/<hash>.json`, `history.csv`, `checkpoints.json`) are
 /// always written from the raw `f32` — serde and `Display` emit the shortest
 /// decimal that round-trips, i.e. full precision. Never route anything
 /// persisted through this function.
@@ -92,6 +92,18 @@ fn csv_field(s: &str) -> String {
     }
 }
 
+/// Population standard deviation of smoothed fitness — the fitness-std stop
+/// criterion's signal. Empty/one-element input reads 0.0 (a single net cannot
+/// disagree with itself; the warmup guard covers the early-run case).
+fn population_std(values: &[f32]) -> f32 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32;
+    var.sqrt()
+}
+
 use super::child::RaceChild;
 use super::config::{RaceConfig, RaceSnapshot, StopReason};
 use super::smoothing::{SMOOTHING_WINDOW, RollingBuffer, rolling_mean};
@@ -99,10 +111,15 @@ use super::smoothing::{SMOOTHING_WINDOW, RollingBuffer, rolling_mean};
 /// One entry in the checkpoint ledger: the population-mean smoothed fitness
 /// recorded at a checkpoint step. A crossover child must BEAT this value at
 /// every checkpoint it passes through during catch-up, or it is discarded.
+/// `exam_mean_fitness` is the population's mean score on that era's
+/// surprise-exam batch (rows never seen in training or per-step eval) — an
+/// anti-memorization diagnostic recorded alongside the gate bar.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Checkpoint {
     pub step: usize,
     pub pop_mean_fitness: f32,
+    /// Mean exam fitness across all live nets at this checkpoint.
+    pub exam_mean_fitness: f32,
 }
 
 // ── RaceEngine ───────────────────────────────────────────────────────────────
@@ -175,8 +192,11 @@ pub struct RaceEngine {
     /// so the framed table can show what changed this step. `None` until the
     /// first table render (the table itself starts at step 2 for this reason).
     pub(crate) minimal_prev_means: Option<(f32, f32, f32)>,
-    /// Buffer metrics rows in memory to minimize slow disk I/O writes.
-    pub(crate) metrics_csv_buffer: String,
+    /// Buffer history rows in memory to minimize slow disk I/O writes. One
+    /// unified event log (`history.csv`): per-step live-net metric rows AND
+    /// evolution attempt rows (inserted or rejected), distinguished by the
+    /// leading `type` column.
+    pub(crate) history_csv_buffer: String,
 }
 
 // ── Construction ─────────────────────────────────────────────────────────────
@@ -231,7 +251,8 @@ impl RaceEngine {
             run_dir,
         } = spec;
         let trainer: Box<dyn Trainer> = Box::new(trainer);
-        let dataset = crate::utils::data::resolve_dataset(&data_dir)?;
+        let dataset = crate::utils::data::resolve_dataset(&data_dir)?
+            .to_device(config.device())?;
         // Random seed when omitted: time ^ fastrand (recorded in engine.json).
         let run_seed = seed.unwrap_or_else(|| {
             let t = std::time::SystemTime::now()
@@ -330,7 +351,8 @@ impl RaceEngine {
         let split = PoolSplit::of(&dataset, train_eval_split_ratio, run_seed);
         let batch_stream = BatchStream::new(run_seed, batch_size, split)
             .with_eval_batch_size(eval_batch_size)
-            .with_held_out_eval_rows(held_out_eval_rows);
+            .with_held_out_eval_rows(held_out_eval_rows)
+            .with_checkpoint_every(config.checkpoint_every);
 
         let log_level = config.log_level;
         let meta_ctx = crate::engine::config::RunMetaCtx {
@@ -350,9 +372,6 @@ impl RaceEngine {
             header,
             dataset,
             config: RaceConfig {
-                // fill in the crossover_fallback_to_immigrant field with the
-                // value from the user's config (default false)
-                crossover_fallback_to_immigrant: config.crossover_fallback_to_immigrant,
                 ..config
             },
             meta_ctx,
@@ -360,7 +379,7 @@ impl RaceEngine {
             fitness,
             metrics,
             state: RaceState::new(),
-            metrics_csv_buffer: String::new(),
+            history_csv_buffer: String::new(),
             networks: HashMap::new(),
             optimizers: HashMap::new(),
             rolling_fitness: HashMap::new(),
@@ -418,6 +437,20 @@ impl RaceEngine {
         self.state.live_count()
     }
 
+    /// Cumulative culls so far (tombstones written + slots freed).
+    pub fn cull_count(&self) -> usize {
+        self.culls
+    }
+
+    /// Cumulative successful insertions (crossover survivors + immigrants).
+    /// NOTE: `children_born_at_clock` counts every *generated* child,
+    /// including gate-rejected crossover attempts — this accessor counts only
+    /// the ones that actually joined. Should equal `cull_count()` (every
+    /// insertion pairs with one cull; pop stays at pop_size).
+    pub fn insert_count(&self) -> usize {
+        self.culls
+    }
+
     /// Expose the underlying population state.
     pub fn state(&self) -> &RaceState {
         &self.state
@@ -463,7 +496,8 @@ impl RaceEngine {
     ) -> Result<Self> {
         let trainer: Box<dyn Trainer> = Box::new(trainer);
         let header = crate::state::load_engine_json(&run_dir)?;
-        let dataset = crate::utils::data::resolve_dataset(&data_dir)?;
+        let dataset = crate::utils::data::resolve_dataset(&data_dir)?
+            .to_device(config.device())?;
         let metrics = config.metrics.clone();
         let run_seed = header.run_seed;
         // On resume, stream shape comes from the run header (data integrity),
@@ -479,8 +513,9 @@ impl RaceEngine {
             None => (16, 16), // conservative default when no stream_shape override
         };
         let split = PoolSplit::of(&dataset, header_stream_ratio, run_seed);
-        let stream =
-            BatchStream::new(run_seed, batch_size, split).with_eval_batch_size(eval_batch_size);
+        let stream = BatchStream::new(run_seed, batch_size, split)
+            .with_eval_batch_size(eval_batch_size)
+            .with_checkpoint_every(config.checkpoint_every);
 
         let log_level = config.log_level;
         let meta_ctx = crate::engine::config::RunMetaCtx {
@@ -505,7 +540,7 @@ impl RaceEngine {
             fitness,
             metrics,
             state: RaceState::new(),
-            metrics_csv_buffer: String::new(),
+            history_csv_buffer: String::new(),
             networks: HashMap::new(),
             optimizers: HashMap::new(),
             rolling_fitness: HashMap::new(),
@@ -621,9 +656,13 @@ impl RaceEngine {
         topologies: Vec<crate::graph::topology::Topology>,
         initial_fitness: Option<f32>,
     ) -> Result<()> {
-        for topo in topologies {
-            let net = Network::build(&topo, self.config.device())?;
-            let mut state = NetState::new(&topo, 0, None)?;
+        for ordinal in 0..topologies.len() {
+            let topo = &topologies[ordinal];
+            let net = Network::build(topo, self.config.device())?;
+            // Lineage: founders are labeled `founder-<ordinal>` — a readable
+            // "part of the original population" marker, distinct from
+            // `random`/`crossover-*` origins children carry.
+            let mut state = NetState::new(topo, 0, Some(format!("founder-{ordinal}")))?;
             state.stamp_meta(&net, &self.meta_ctx);
             let hash = state.hash.clone();
             let opt = self.trainer.make_optimizer(&net);
@@ -666,6 +705,51 @@ impl RaceEngine {
     /// `tests::race_determinism`).
     pub fn run(&mut self) -> Result<StopReason> {
         self.apply_eval_defaults();
+        // Keep the stream's eval-rotation cadence in lockstep with the gate
+        // cadence — a post-construction config edit (tests, tooling) must not
+        // desync era numbering between the replay and the gate ledger.
+        self.stream.set_checkpoint_every(self.config.checkpoint_every);
+        // Run-start config resolution line: everything that shapes the search,
+        // logged once so the log is self-describing (empty pools ⇒ all ops).
+        if self.verbose_detail() {
+            let ops = self
+                .config
+                .resolved_crossover_ops()
+                .map(|ops| {
+                    ops.iter()
+                        .map(|o| match o {
+                            crate::engine::config::CrossoverOp::OnePoint => "one_point",
+                            crate::engine::config::CrossoverOp::Uniform => "uniform",
+                        })
+                        .collect::<Vec<&str>>()
+                        .join(",")
+                })
+                .unwrap_or_else(|e| format!("INVALID({e})"));
+            let acts = if self.config.activation_pool.is_empty() {
+                "all".to_string()
+            } else {
+                self.config.activation_pool.join(",")
+            };
+            let combines = if self.config.combine_op_pool.is_empty() {
+                "default-safe(add,mean,max,min)".to_string()
+            } else {
+                self.config.combine_op_pool.join(",")
+            };
+            let std_ops = if self.config.standardize_op_pool.is_empty() {
+                "all".to_string()
+            } else {
+                self.config.standardize_op_pool.join(",")
+            };
+            info!(
+                "search space: crossover_ops=[{}] │ activations=[{}] │ combine=[{}] │ standardize=[{}] │ cull_policy={:?} │ elite_count={}",
+                ops,
+                acts,
+                combines,
+                std_ops,
+                self.config.crossover_cull_policy,
+                self.config.elite_count,
+            );
+        }
         // `None` mode: one compact start line, then silence until stop.
         if self.verbose_detail() {
             info!(
@@ -703,9 +787,16 @@ impl RaceEngine {
             // ── 2. record checkpoint (every `checkpoint_every` steps) ───────
             if clock > 0 && clock % self.config.checkpoint_every == 0 {
                 let mean = self.population_mean_smoothed_fitness();
+                // Surprise exam: score every live net on this era's gating-pool
+                // batch — rows never touched by training or per-step eval. This
+                // is diagnostic (recorded in the ledger), not ranking input, so
+                // it cannot perturb selection or the replay contract.
+                let era = (clock / self.config.checkpoint_every) as u64;
+                let exam_mean = self.run_checkpoint_exam(era)?;
                 self.checkpoints.push(Checkpoint {
                     step: clock,
                     pop_mean_fitness: mean,
+                    exam_mean_fitness: exam_mean,
                 });
                 if let Err(e) = self.write_checkpoints() {
                     log::warn!("checkpoint ledger write failed: {e}");
@@ -721,10 +812,12 @@ impl RaceEngine {
                 }
                 if self.verbose_detail() {
                     info!(
-                        "step {} │ checkpoint │ pop_mean_fitness {} {:.4} (ledger: {} entries)",
+                        "step {} │ checkpoint │ pop_mean_fitness {} {:.4} │ exam_mean_fitness {} {:.4} (ledger: {} entries)",
                         clock,
                         self.fitness.direction().arrow(),
                         mean,
+                        self.fitness.direction().arrow(),
+                        exam_mean,
                         self.checkpoints.len(),
                     );
                 }
@@ -745,10 +838,31 @@ impl RaceEngine {
                     continue;
                 }
                 cross_fired += 1;
-                if self.evolve_crossover_child(clock, roll)? {
-                    cross_survived += 1;
-                } else {
-                    cross_discarded += 1;
+                // cx_retry_full: on a gate rejection, retry the FULL attempt
+                // (fresh parents, fresh generate + gate replay) up to
+                // `crossover_retries` extra times. Compute spent per attempt
+                // is the price of a chance at a child that clears the bars.
+                let max_attempts = 1 + self.config.crossover_retries;
+                let mut attempt = 0usize;
+                loop {
+                    attempt += 1;
+                    if self.evolve_crossover_child(clock, roll, attempt)? {
+                        cross_survived += 1;
+                        break;
+                    }
+                    if attempt >= max_attempts {
+                        cross_discarded += 1;
+                        break;
+                    }
+                    if self.verbose_detail() {
+                        info!(
+                            "step {} │ crossover roll {} retry {}/{} (gate rejected prior attempt)",
+                            clock,
+                            roll,
+                            attempt,
+                            max_attempts - 1,
+                        );
+                    }
                 }
             }
             // 3b. mutation rolls: random immigrants (no gate).
@@ -776,21 +890,52 @@ impl RaceEngine {
             };
             // Evolve rollup — plain-language, no roll ordinals. "discarded"
             // = a crossover child was rejected by the checkpoint gate (the
-            // population did NOT shrink; only the attempt was dropped).
+            // population did NOT shrink; only the attempt was dropped). Rolls
+            // that did NOT fire are also shown, so a quiet step is explained:
+            // "fired 0/2» means the probability roll said no (normal), while
+            // "fired 2 → 0 inserted" means the gate said no (selection).
             if self.verbose_detail() {
+                let cross_total = self.config.crossover_rolls;
+                let mutate_total = self.config.mutate_rolls;
                 info!(
-                    "step {} │ evolve │ crossover fired {} → {} inserted, {} discarded by gate │ mutation → {} immigrant(s) │ pop now {}",
+                    "step {} │ evolve │ crossover fired {}/{} → {} inserted, {} discarded by gate │ mutation fired {}/{} → {} immigrant(s) inserted (no gate) │ pop now {}",
                     clock,
                     cross_fired,
+                    cross_total,
                     cross_survived,
                     cross_discarded,
                     mutate_fired,
+                    mutate_total,
+                    mutate_fired,
                     self.state.live_count(),
                 );
+                // Per-roll detail in Full mode: say WHY each roll stayed cold.
+                if self.log_level == crate::engine::config::LogLevel::Full {
+                    if cross_fired < cross_total {
+                        info!(
+                            "step {} │ evolve │ crossover: {} roll(s) did not fire (probability roll, p={:.2}){}",
+                            clock,
+                            cross_total - cross_fired,
+                            self.config.crossover_prob,
+                            if self.state.live_count() < 2 { " — also pop < 2 blocks crossover" } else { "" },
+                        );
+                    }
+                    if mutate_fired < mutate_total {
+                        info!(
+                            "step {} │ evolve │ mutation: {} roll(s) did not fire (probability roll, p={:.2})",
+                            clock,
+                            mutate_total - mutate_fired,
+                            self.config.mutate_prob,
+                        );
+                    }
+                }
             }
 
             // ── 4. stop criteria ────────────────────────────────────────────
             if let Some(reason) = self.check_stop(clock) {
+                // The champion markdown dump is an ARTIFACT, not a log line —
+                // it must land on disk at every log level, even `None`.
+                self.write_champion_markdown()?;
                 // `None` mode stays silent until the caller's final stop print.
                 if self.verbose_detail() {
                     info!("── stop ──");
@@ -810,15 +955,112 @@ impl RaceEngine {
     /// the resume command to continue from here.
     fn log_stop_summary(&self, clock: usize) -> Result<()> {
         let live = self.state.live_hashes();
-        for h in &live {
-            info!("  wrote nets/{h}.json (frontier snapshot)");
-        }
+        info!(
+            "  wrote {} frontier snapshot(s) → nets/<hash>.json (one per live net)",
+            live.len(),
+        );
         info!(
             "  {} live net(s) at step {} → resume with: --resume {}",
             live.len(),
             clock,
             self.run_dir.display(),
         );
+
+        // Final elite report: the top-k nets by smoothed fitness, with their
+        // metadata — the run's champions at stop time. Elite = rank, not
+        // identity, so this is "who holds the top-k right now".
+        let k = self.config.elite_count.max(1); // report at least the champion
+        let mut ranked: Vec<(String, f32, usize, Option<f32>)> = live // (hash, smoothed, step, eval_loss)
+            .iter()
+            .filter_map(|h| {
+                let buf = self.rolling_fitness.get(h)?;
+                if buf.is_empty() {
+                    return None;
+                }
+                let step = self
+                    .state
+                    .net(h)
+                    .and_then(|s| s.last_metrics.as_ref())
+                    .map(|m| m.step)
+                    .unwrap_or(0);
+                let eval_loss = self
+                    .state
+                    .net(h)
+                    .and_then(|s| s.last_metrics.as_ref())
+                    .and_then(|m| m.eval_loss);
+                Some((h.clone(), rolling_mean(buf), step, eval_loss))
+            })
+            .collect();
+        let direction = self.fitness.direction();
+        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
+        let arrow = direction.arrow();
+        info!("  ── final elites (top-{k}, fitness{arrow} smoothed) ──");
+        for (rank, (h, fit, step, eval_loss)) in ranked.iter().take(k).enumerate() {
+            let meta = self.state.net(h).map(|s| {
+                format!(
+                    "origin={} born@{} params={}",
+                    s.created_from.clone().unwrap_or_else(|| "?".into()),
+                    s.entered_at_step,
+                    s.meta.params.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                )
+            });
+            info!(
+                "  #{} {} fitness{arrow} {:.4} │ eval_loss {:?} │ last_step {} │ {}",
+                rank + 1,
+                &h[..8.min(h.len())],
+                fit,
+                eval_loss,
+                step,
+                meta.unwrap_or_default(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Write the champion's (elite rank #1) topology markdown to the run dir.
+    /// UNCONDITIONAL — called at stop regardless of log level: the `.md` file
+    /// is a run artifact (like `nets/<hash>.json` and `history.csv`), not a
+    /// log line. Prints a confirmation only when per-step detail is on.
+    fn write_champion_markdown(&self) -> Result<()> {
+        let live = self.state.live_hashes();
+        let mut ranked: Vec<(String, f32)> = live // (hash, smoothed fitness)
+            .iter()
+            .filter_map(|h| {
+                let buf = self.rolling_fitness.get(h)?;
+                if buf.is_empty() {
+                    return None;
+                }
+                Some((h.clone(), rolling_mean(buf)))
+            })
+            .collect();
+        let direction = self.fitness.direction();
+        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
+        let Some((champ, _)) = ranked.first() else {
+            return Ok(()); // nothing ever scored — no champion to dump
+        };
+        let Some(state) = self.state.net(champ) else {
+            return Ok(());
+        };
+        let Ok(topo) = state.topology() else {
+            return Ok(());
+        };
+        let short = &champ[..8.min(champ.len())];
+        let path = self.run_dir.join(format!("elite-{short}.md"));
+        let md = crate::utils::markdown::topology_markdown(&topo, None);
+        match std::fs::write(&path, &md) {
+            Ok(()) => {
+                if self.verbose_detail() {
+                    info!("  champion topology → {} (markdown, ready to view)", path.display());
+                }
+            }
+            Err(source) => log::warn!(
+                "elite markdown write failed: {}",
+                crate::utils::error::EngineError::Io {
+                    path: path.display().to_string(),
+                    source,
+                }
+            ),
+        }
         Ok(())
     }
 
@@ -1198,7 +1440,7 @@ impl RaceEngine {
             .insert(child.state.hash.clone(), child.optimizer);
         if self.verbose_detail() {
             info!(
-                "step {} │ inserted {} {} │ caught-up {} (parity ok) → json",
+                "step {} │ inserted {} {} │ caught-up {} → json",
                 clock, child.state.hash, lineage, clock,
             );
         }
@@ -1209,7 +1451,8 @@ impl RaceEngine {
     /// gate), and on success cull the current worst net + insert the child.
     /// A failed child culls nothing — the gate IS the cull.
     /// Returns `true` when the child survived the gate and was inserted.
-    fn evolve_crossover_child(&mut self, clock: usize, _roll: usize) -> Result<bool> {
+    /// `attempt` is the 1-based retry ordinal (for history.csv).
+    fn evolve_crossover_child(&mut self, clock: usize, _roll: usize, attempt: usize) -> Result<bool> {
         let idx = self.next_child_ordinal(clock);
         let mut child = self.generate_child(clock, idx)?;
         if self.state.net(&child.state.hash).is_some() {
@@ -1241,8 +1484,8 @@ impl RaceEngine {
             .collect();
         let checkpoint_count = relevant.len();
         let mut failed_gate: Option<(usize, usize, f32, f32)> = None; // (i+1, chk.step, child, mean)
-        match self.config.check {
-            crate::engine::config::CheckMode::Hard => {
+        match self.config.crossover_gating {
+            crate::engine::config::CrossoverGating::Hard => {
                 // Evaluate gate-by-gate: replay to each checkpoint, compare.
                 for (i, chk) in &relevant {
                     self.catch_up_range(&mut child, replayed_to, chk.step)?;
@@ -1264,7 +1507,7 @@ impl RaceEngine {
                     }
                 }
             }
-            crate::engine::config::CheckMode::Soft => {
+            crate::engine::config::CrossoverGating::Soft => {
                 // One aggregate bar: beat the mean of the checkpoint means.
                 // Replay straight to the last relevant checkpoint, compare once.
                 if let Some((_, last)) = relevant.last() {
@@ -1297,9 +1540,9 @@ impl RaceEngine {
                     "step {} │ crossover child {} rejected by {} gate {}/{} ({}{:.4} vs bar {:.4}) → discarded at step {}, pop unchanged",
                     clock,
                     &child.state.hash[..8],
-                    match self.config.check {
-                        crate::engine::config::CheckMode::Hard => "hard",
-                        crate::engine::config::CheckMode::Soft => "soft",
+                    match self.config.crossover_gating {
+                        crate::engine::config::CrossoverGating::Hard => "hard",
+                        crate::engine::config::CrossoverGating::Soft => "soft",
                     },
                     gate_i,
                     checkpoint_count,
@@ -1309,6 +1552,21 @@ impl RaceEngine {
                     gate_step,
                 );
             }
+            // Record the rejected attempt (cx_retry_full measurement).
+            self.record_attempt(
+                clock,
+                "crossover",
+                attempt,
+                Some(&child.state.hash),
+                Some(child.state.net_seed),
+                &child.state.created_from.clone().unwrap_or_default(),
+                "rejected_gate",
+                Some(gate_i),
+                Some(child_fit),
+                Some(bar),
+                None,
+                None,
+            );
             // Drop the child's provisional buffers — it never joined.
             self.rolling_fitness.remove(&child.state.hash);
             self.rolling_train.remove(&child.state.hash);
@@ -1319,9 +1577,132 @@ impl RaceEngine {
         let _ = child_fit_at_gate;
         // Passed every gate — finish the replay to the clock and insert.
         self.catch_up_range(&mut child, replayed_to, clock)?;
-        self.cull_worst(clock, "crossover")?;
+        // Slot eviction per CrossCullPolicy (crossover-only — the immigrant
+        // channel has its own fitness-inverse victim selection): Worst =
+        // merit-based (default); Random = uniform (diversity-first). In both
+        // cases the elite guard excludes the top-k nets from victim status.
+        // The victim is resolved BEFORE recording, so the attempt row can
+        // carry its identity (fills the previously-empty `victim` column).
+        let victim_for_log: Option<String> = match self.config.crossover_cull_policy {
+            crate::engine::config::CrossCullPolicy::Worst => {
+                self.worst_nets_by_smoothed_fitness(1)?.pop()
+            }
+            crate::engine::config::CrossCullPolicy::Random => {
+                Some(self.select_random_victim(clock)?)
+            }
+        };
+        // Record the admitted attempt (cx_retry_full measurement) — before
+        // the cull/insert, while both victim and child states are readable.
+        let victim_net_seed = victim_for_log
+            .as_ref()
+            .and_then(|v| self.state.net(v))
+            .map(|s| s.net_seed);
+        self.record_attempt(
+            clock,
+            "crossover",
+            attempt,
+            Some(&child.state.hash),
+            Some(child.state.net_seed),
+            &child.state.created_from.clone().unwrap_or_default(),
+            "inserted",
+            None,
+            Some(child_fit_at_gate),
+            None,
+            victim_for_log.as_deref(),
+            victim_net_seed,
+        );
+        match self.config.crossover_cull_policy {
+            crate::engine::config::CrossCullPolicy::Worst => {
+                if let Some(victim) = &victim_for_log {
+                    self.cull_net(victim, clock, "crossover")?;
+                }
+            }
+            crate::engine::config::CrossCullPolicy::Random => {
+                if let Some(victim) = &victim_for_log {
+                    self.cull_net(victim, clock, "crossover-random")?;
+                }
+            }
+        }
         self.insert_child(child, clock);
         Ok(true)
+    }
+
+    /// Append one evolution-event row to the history.csv buffer (cx_retry_full
+    /// measurement). Every crossover/mutation attempt is recorded — inserted or
+    /// rejected — so gate-failure rate, operator yield, and retry economics are
+    /// queryable after the run. Buffered, flushed at the same points as the
+    /// per-step metric rows (they share the unified history.csv).
+    fn record_attempt(
+        &mut self,
+        step: usize,
+        branch: &str,
+        attempt: usize,
+        child_hash: Option<&str>,
+        child_net_seed: Option<usize>,
+        origin: &str,
+        outcome: &str,
+        gate_index: Option<usize>,
+        child_fitness: Option<f32>,
+        bar: Option<f32>,
+        victim: Option<&str>,
+        victim_net_seed: Option<usize>,
+    ) {
+        if !self.config.csv_export {
+            return;
+        }
+        // Attempt rows align with the unified header: type,step,hash,net_seed,
+        // origin, then empty metric columns (entered_at_step/train_loss/
+        // eval_loss/... — attempts have no per-step training state), then the
+        // attempt tail (branch,attempt,outcome,gate_index,child_fitness,bar,
+        // victim,victim_net_seed,pop).
+        // FULL hashes + net_seed here (no truncation): (hash, net_seed) is the
+        // unique individual key — the same topology hash can legitimately
+        // appear in multiple attempt rows (regenerated children) and across
+        // eras, so the log must not manufacture collisions.
+        // entered_at_step + 3 metric cols + informative cols = empty slots.
+        let empty_metrics = ",".repeat(4 + self.metrics.len());
+        let row = format!(
+            "attempt,{},{},{},{},{},\"{}\",{},{},{},{},{},{},{},{}\n",
+            step,
+            child_hash.unwrap_or_default(),
+            child_net_seed.map(|s| s.to_string()).unwrap_or_default(),
+            csv_field(origin),
+            empty_metrics,
+            branch,
+            attempt,
+            outcome,
+            gate_index.map(|g| g.to_string()).unwrap_or_default(),
+            child_fitness.map(|v| v.to_string()).unwrap_or_default(),
+            bar.map(|v| v.to_string()).unwrap_or_default(),
+            victim.unwrap_or_default(),
+            victim_net_seed.map(|s| s.to_string()).unwrap_or_default(),
+            self.state.live_count(),
+        );
+        self.history_csv_buffer.push_str(&row);
+    }
+
+    /// Uniformly random **cullable** live net — the `CrossCullPolicy::Random`
+    /// victim for a crossover replacement. Deterministic: derived from
+    /// `(run_seed, clock)` so replays and resume pick the same victim. Elite
+    /// nets are excluded from the draw (a crossover child can never evict an
+    /// elite, even under the Random policy).
+    fn select_random_victim(&self, clock: usize) -> Result<String> {
+        let elite = self.elite_hashes();
+        let hashes: Vec<String> = self
+            .state
+            .live_hashes()
+            .into_iter()
+            .filter(|h| !elite.contains(h))
+            .collect();
+        if hashes.is_empty() {
+            return Err(crate::utils::error::EngineError::InvalidOptions(
+                "random cull: no cullable (non-elite) live net".into(),
+            )
+            .into());
+        }
+        let seed = crate::utils::seed::derive_seed(self.header.run_seed, clock.wrapping_mul(7919));
+        let idx = fastrand::Rng::with_seed(seed).usize(..hashes.len());
+        Ok(hashes[idx].clone())
     }
 
     /// One evolution roll of the mutation branch: cull a net selected
@@ -1334,8 +1715,9 @@ impl RaceEngine {
     /// still needs a slot, and a random cull is the only honest option when
     /// nothing distinguishes the population yet.
     fn evolve_random_immigrant(&mut self, clock: usize, roll: usize) -> Result<()> {
-        // Pick a victim: fitness-inverse when possible, worst-net when
-        // buffers are cold, first-live as last resort.
+        // Pick a victim: fitness-inverse among NON-ELITE nets when possible
+        // (the elite guard makes the top-k immune to mutation culls too),
+        // worst-net when buffers are cold, first-live as last resort.
         let victim = self.select_inverse_proportional()?.unwrap_or_else(|| {
             // No fitness verdict available — fall back to worst-net, then
             // first-live as last resort.
@@ -1353,12 +1735,27 @@ impl RaceEngine {
         let _ = roll; // roll index kept for determinism only, not logged
         if self.verbose_detail() {
             info!(
-                "step {} │ inserted {} immigrant (no gate) → caught up to step {}",
+                "step {} │ mutation │ inserted {} random immigrant (no gate) → caught up to step {}",
                 clock,
                 &child.state.hash[..8],
                 clock,
             );
         }
+        let victim_net_seed = self.state.net(&victim).map(|s| s.net_seed);
+        self.record_attempt(
+            clock,
+            "mutation",
+            1,
+            Some(&child.state.hash),
+            Some(child.state.net_seed),
+            &child.state.created_from.clone().unwrap_or_default(),
+            "inserted",
+            None,
+            child.state.last_metrics.as_ref().map(|m| m.fitness),
+            None,
+            Some(&victim),
+            victim_net_seed,
+        );
         self.insert_child(child, clock);
         Ok(())
     }
@@ -1368,16 +1765,6 @@ impl RaceEngine {
         let idx = *self.children_born_at_clock.entry(clock).or_insert(0);
         *self.children_born_at_clock.get_mut(&clock).unwrap() = idx + 1;
         idx
-    }
-
-    /// Cull the current worst net (smoothed fitness) — the slot a surviving
-    /// crossover child takes.
-    fn cull_worst(&mut self, clock: usize, reason: &str) -> Result<()> {
-        let worst = self.worst_nets_by_smoothed_fitness(1)?;
-        for hash in worst {
-            self.cull_net(&hash, clock, reason)?;
-        }
-        Ok(())
     }
 
     /// Cull one net: final state snapshot to disk, drop from all live maps.
@@ -1428,20 +1815,56 @@ impl RaceEngine {
         values.iter().sum::<f32>() / values.len() as f32
     }
 
+    /// Run the checkpoint "surprise exam": score every live net on the given
+    /// era's gating-pool batch (rows never used for training or per-step
+    /// eval). Returns the population's mean exam fitness — a generalization
+    /// diagnostic recorded in the checkpoint ledger, never used for ranking,
+    /// culling, or gating (so the replay contract is untouched). Nets are
+    /// scored in eval mode (no gradients); a net whose eval-mode forward has
+    /// side effects would violate the Trainer contract anyway.
+    fn run_checkpoint_exam(&mut self, era: u64) -> Result<f32> {
+        let exam_batch = self.stream.exam_batch(&self.dataset, era)?;
+        let direction = self.fitness.direction();
+        let mut scores: Vec<f32> = Vec::new();
+        // Collect hashes first to avoid borrowing self.networks while calling
+        // eval_one_step (which needs &mut Network).
+        let hashes = self.state.live_hashes();
+        for hash in &hashes {
+            if let Some(net) = self.networks.get_mut(hash) {
+                if let Some(loss) = self.trainer.loss() {
+                    if let Ok(report) =
+                        eval_one_step(net, loss, &self.fitness, &self.metrics, &exam_batch)
+                    {
+                        scores.push(report.fitness);
+                    }
+                }
+            }
+        }
+        let _ = direction; // direction-aware comparison happens upstream if needed
+        if scores.is_empty() {
+            return Ok(0.0);
+        }
+        Ok(scores.iter().sum::<f32>() / scores.len() as f32)
+    }
+
     /// Select a live net inversely-proportionate to smoothed fitness (worst
-    /// nets most likely). Returns `None` for an empty or single-net pop
-    /// (nothing to sacrifice).
+    /// nets most likely). Elite nets (top-`config.elite_count`) are excluded
+    /// entirely — they can never be mutation victims. Returns `None` when no
+    /// cullable candidate remains (empty/single-net pop, or all elite).
     fn select_inverse_proportional(&self) -> Result<Option<String>> {
         let hashes = self.state.live_hashes();
         if hashes.len() < 2 {
             return Ok(None);
         }
         let direction = self.fitness.direction();
-        // Inverse fitness: worst nets get the biggest weight. Shift by the
-        // population min so weights are non-negative and the worst net has
-        // the largest share.
+        let elite = self.elite_hashes();
+        // Inverse fitness: weight = (adjusted best) − (adjusted value) ≥ 0 —
+        // the worst net gets the largest weight, the best gets zero. (The
+        // previous `value − worst` weighting was inverted: it targeted the
+        // FITTEST net — fixed; the confused "wait, inverted" comment is gone.)
         let scored: Vec<(String, f32)> = hashes
             .iter()
+            .filter(|h| !elite.contains(h))
             .filter(|h| {
                 self.rolling_fitness
                     .get(*h)
@@ -1458,27 +1881,21 @@ impl RaceEngine {
         if scored.len() < 2 {
             return Ok(None);
         }
-        let worst = scored
-            .iter()
-            .min_by(|a, b| direction.cmp(a.1, b.1))
-            .map(|(_, v)| *v)
-            .unwrap_or(0.0);
-        // weight = (direction-adjusted worst) - (direction-adjusted value):
-        // for Maximize, worst is the min ⇒ weight = worst − value ≥ 0, worst
-        // net gets weight 0... wait, inverted: we want the WORST net to have
-        // the LARGEST weight, so weight = value − worst in adjusted space.
         let adjusted = |v: f32| match direction {
             crate::engine::fitness::Direction::Maximize => v,
             crate::engine::fitness::Direction::Minimize => -v,
         };
-        let adj_worst = adjusted(worst);
+        let adj_best = scored
+            .iter()
+            .map(|(_, v)| adjusted(*v))
+            .fold(f32::NEG_INFINITY, f32::max);
         let weights: Vec<(String, f32)> = scored
             .into_iter()
-            .map(|(h, v)| (h, adjusted(v) - adj_worst))
+            .map(|(h, v)| (h, adj_best - adjusted(v)))
             .collect();
         let total: f32 = weights.iter().map(|(_, w)| w).sum();
         if total <= 0.0 {
-            // All-equal population: uniform draw.
+            // All-equal (non-elite) population: uniform draw.
             let i = fastrand::usize(0..weights.len());
             return Ok(weights.into_iter().nth(i).map(|(h, _)| h));
         }
@@ -1490,6 +1907,34 @@ impl RaceEngine {
             }
         }
         Ok(weights.last().map(|(h, _)| h.clone()))
+    }
+
+    /// The elite set: the top `config.elite_count` live nets by smoothed
+    /// fitness (direction-aware). Protected from ALL culls — crossover (any
+    /// policy) and mutation alike. Always leaves at least one cullable net:
+    /// the effective guard size is `min(elite_count, live − 1)`.
+    fn elite_hashes(&self) -> Vec<String> {
+        let k = self
+            .config
+            .elite_count
+            .min(self.state.live_count().saturating_sub(1));
+        if k == 0 {
+            return Vec::new();
+        }
+        let direction = self.fitness.direction();
+        let mut ranked: Vec<(String, f32)> = self
+            .state
+            .live_hashes()
+            .iter()
+            .filter_map(|h| {
+                self.rolling_fitness
+                    .get(h)
+                    .filter(|b| !b.is_empty())
+                    .map(|b| (h.clone(), rolling_mean(b)))
+            })
+            .collect();
+        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
+        ranked.into_iter().take(k).map(|(h, _)| h).collect()
     }
 
     // ── Selection helpers ───────────────────────────────────────────────────
@@ -1566,23 +2011,23 @@ impl RaceEngine {
                 return Some(StopReason::MaxSteps);
             }
         }
-        // wall-clock.
-        if let Some(seconds) = self.config.wall_clock_seconds {
-            if self.started_at_wall.elapsed().as_secs() >= seconds {
-                return Some(StopReason::WallClock);
-            }
-        }
-        // max_culls.
-        if let Some(max) = self.config.max_culls {
-            if self.culls >= max {
-                return Some(StopReason::MaxCulls);
-            }
-        }
         // target_score.
         if let Some(target) = self.config.target_score {
             let best = self.best_smoothed_fitness();
             if self.fitness.direction().is_better(best, target) {
                 return Some(StopReason::TargetScore);
+            }
+        }
+        // fitness_std: population convergence/stagnation detector. Fires
+        // only after `fitness_std_min_steps` (warmup guard — an early
+        // "everyone equally bad" phase also reads low std and must not
+        // trigger it).
+        if let Some(threshold) = self.config.fitness_std_threshold {
+            if step >= self.config.fitness_std_min_steps {
+                let std = population_std(&self.smoothed_fitness_values());
+                if std < threshold {
+                    return Some(StopReason::FitnessStd);
+                }
             }
         }
         // Custom stop (Iter 5 pluggable contract): consulted **in addition**
@@ -1647,6 +2092,10 @@ impl RaceEngine {
                         "pop_mean_fitness".into(),
                         serde_json::Value::from(c.pop_mean_fitness),
                     );
+                    m.insert(
+                        "exam_mean_fitness".into(),
+                        serde_json::Value::from(c.exam_mean_fitness),
+                    );
                     m
                 })
             })
@@ -1672,7 +2121,9 @@ impl RaceEngine {
         Ok(())
     }
 
-    /// Append a step's metrics for all live nets to our in-memory CSV buffer.
+    /// Append a step's metrics for all live nets to the history buffer.
+    /// Rows are typed `metric` in the unified history.csv (evolution events
+    /// are typed `attempt` — see `record_attempt`).
     fn append_metrics_csv(&mut self, step: usize) -> Result<()> {
         if !self.config.csv_export {
             return Ok(());
@@ -1682,9 +2133,10 @@ impl RaceEngine {
                 if let Some(m) = &net_state.last_metrics {
                     let origin = net_state.created_from.clone().unwrap_or_default();
                     let mut row = format!(
-                        "{},{},{},{},{},{},{}",
+                        "metric,{},{},{},{},{},{},{},{}",
                         step,
                         hash,
+                        net_state.net_seed,
                         csv_field(&origin),
                         net_state.entered_at_step,
                         m.train_loss,
@@ -1698,19 +2150,21 @@ impl RaceEngine {
                         row.push_str(&val.to_string());
                     }
                     row.push('\n');
-                    self.metrics_csv_buffer.push_str(&row);
+                    self.history_csv_buffer.push_str(&row);
                 }
             }
         }
         Ok(())
     }
 
-    /// Flush the buffered metrics CSV rows from memory to disk.
+    /// Flush the buffered history rows to `history.csv` — the unified event
+    /// log (per-step `metric` rows + evolution `attempt` rows). Same cadence:
+    /// checkpoints + stop, gated by `csv_export`.
     fn flush_metrics_csv(&mut self) -> Result<()> {
-        if !self.config.csv_export || self.metrics_csv_buffer.is_empty() {
+        if !self.config.csv_export || self.history_csv_buffer.is_empty() {
             return Ok(());
         }
-        let path = self.run_dir.join("metrics.csv");
+        let path = self.run_dir.join("history.csv");
         let exists = path.exists();
 
         use std::fs::OpenOptions;
@@ -1735,12 +2189,19 @@ impl RaceEngine {
             })?;
 
         if !exists {
-            let mut headers =
-                "step,hash,origin,entered_at_step,train_loss,eval_loss,fitness".to_string();
+            // Unified header: the `type` column discriminates the row shape
+            // (`metric` = per-step live-net snapshot; `attempt` = evolution
+            // event). Downstream columns overlap where they can; a reader
+            // filters by type first.
+            // `net_seed` completes the individual identity: (hash, net_seed)
+            // uniquely distinguishes re-born individuals that share a
+            // topology hash across eras.
+            let mut headers = "type,step,hash,net_seed,origin,entered_at_step,train_loss,eval_loss,fitness".to_string();
             for m in &self.metrics {
                 headers.push(',');
                 headers.push_str(m.label());
             }
+            headers.push_str(",branch,attempt,outcome,gate_index,child_fitness,bar,victim,victim_net_seed,pop_size");
             headers.push('\n');
             file.write_all(headers.as_bytes()).map_err(|source| {
                 crate::utils::error::EngineError::Io {
@@ -1750,13 +2211,13 @@ impl RaceEngine {
             })?;
         }
 
-        file.write_all(self.metrics_csv_buffer.as_bytes())
+        file.write_all(self.history_csv_buffer.as_bytes())
             .map_err(|source| crate::utils::error::EngineError::Io {
                 path: path.display().to_string(),
                 source,
             })?;
 
-        self.metrics_csv_buffer.clear();
+        self.history_csv_buffer.clear();
         Ok(())
     }
 
@@ -1784,9 +2245,14 @@ impl RaceEngine {
                     .get("pop_mean_fitness")
                     .and_then(|f| f.as_f64())
                     .unwrap_or(0.0) as f32;
+                let exam_mean_fitness = entry
+                    .get("exam_mean_fitness")
+                    .and_then(|f| f.as_f64())
+                    .unwrap_or(0.0) as f32;
                 checkpoints.push(Checkpoint {
                     step,
                     pop_mean_fitness,
+                    exam_mean_fitness,
                 });
             }
         }
@@ -1946,17 +2412,143 @@ mod tests {
         assert_eq!(cfg.checkpoint_every, DEFAULT_CHECKPOINT_EVERY);
         assert_eq!(cfg.crossover_rolls, 1);
         assert_eq!(cfg.mutate_rolls, 1);
-        assert_eq!(cfg.check, crate::engine::config::CheckMode::Hard);
+        assert_eq!(
+            cfg.crossover_gating,
+            crate::engine::config::CrossoverGating::Hard
+        );
+        assert_eq!(
+            cfg.crossover_cull_policy,
+            crate::engine::config::CrossCullPolicy::Worst
+        );
         assert_eq!(cfg.checkpoint_every, DEFAULT_CHECKPOINT_EVERY);
         // batch_size and held_out_eval_rows now live on RunSpec::stream
         // (engine infrastructure), not on RaceConfig — verified by the
         // stream_shape / stream_info contract instead.
         assert_eq!(cfg.max_steps, None, "budgets inactive by default");
-        assert!(cfg.wall_clock_seconds.is_none());
-        assert!(cfg.max_culls.is_none());
         assert!(cfg.target_score.is_none());
+        assert!(cfg.fitness_std_threshold.is_none());
         assert!(cfg.hidden_dim_pool.is_some());
         assert_eq!(cfg.pop_size, 5);
+    }
+
+    #[test]
+    fn select_random_victim_is_deterministic_and_alive() {
+        let dir = std::env::temp_dir().join("race_random_victim");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut engine = engine(&dir, 42).unwrap();
+        engine.config.crossover_cull_policy = crate::engine::config::CrossCullPolicy::Random;
+        engine
+            .seed_population_internal(vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)], Some(0.5))
+            .unwrap();
+        let live = engine.state.live_hashes();
+        // Deterministic: same clock ⇒ same victim.
+        let v1 = engine.select_random_victim(3).unwrap();
+        let v2 = engine.select_random_victim(3).unwrap();
+        assert_eq!(v1, v2, "victim is a pure function of (run_seed, clock)");
+        // And the victim is always a live net.
+        assert!(live.contains(&v1));
+        // Different clock ⇒ (very likely) a different draw is possible; at
+        // minimum the draw stays in-bounds, which the contains() assert covers.
+        let _ = engine.select_random_victim(4).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn elite_guard_protects_top_k_from_all_culls() {
+        let dir = std::env::temp_dir().join("race_elite_guard");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut engine = engine(&dir, 42).unwrap();
+        engine.config.elite_count = 1;
+        engine.config.crossover_cull_policy = crate::engine::config::CrossCullPolicy::Random;
+        engine
+            .seed_population_internal(
+                vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+                Some(0.5),
+            )
+            .unwrap();
+        // Give the nets distinct fitness verdicts: seed buffers with fake
+        // smoothed scores so ranking is well-defined. Map hash → score so the
+        // expected elite can be derived without assuming hash order.
+        let hashes = engine.state.live_hashes();
+        let mut scores: Vec<(String, f32)> = Vec::new();
+        for (i, h) in hashes.iter().enumerate() {
+            let s = 0.1 + i as f32 * 0.3;
+            engine.rolling_fitness.get_mut(h).unwrap().push(s);
+            scores.push((h.clone(), s));
+        }
+        // NOTE: the test harness fitness is Minimize (mse) — the fittest net
+        // has the LOWEST score, so the elite is the minimum, not the maximum.
+        scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let expected_elite = scores[0].0.clone();
+        let elite = engine.elite_hashes();
+        assert_eq!(elite.len(), 1, "guard of 1 protects exactly one net");
+        assert_eq!(
+            elite[0], expected_elite,
+            "the fittest net (highest seeded score) is the elite"
+        );
+        // Random victim draw NEVER lands on the elite.
+        for clock in 0..20 {
+            let v = engine.select_random_victim(clock).unwrap();
+            assert_ne!(v, elite[0], "elite must never be a crossover victim");
+        }
+        // Mutation roulette also skips the elite: worst-net weight is largest,
+        // elite is excluded entirely.
+        if let Some(victim) = engine.select_inverse_proportional().unwrap() {
+            assert_ne!(victim, elite[0], "elite must never be a mutation victim");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mutation_targets_worst_most_often() {
+        // Regression test for the inverted-weights bug: with 3 nets of very
+        // different fitness, the fitness-inverse roulette must pick the WORST
+        // net most often, never the best.
+        let dir = std::env::temp_dir().join("race_mutation_targets_worst");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut engine = engine(&dir, 42).unwrap();
+        engine
+            .seed_population_internal(
+                vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+                Some(0.5),
+            )
+            .unwrap();
+        let hashes = engine.state.live_hashes();
+        // Minimize direction: lowest score = fittest (best), highest = worst.
+        let mut worst = hashes[0].clone();
+        let mut best = hashes[0].clone();
+        let (mut min_s, mut max_s) = (f32::INFINITY, f32::NEG_INFINITY);
+        for h in &hashes {
+            let s = 0.1 + hashes.iter().position(|x| x == h).unwrap() as f32 * 0.3;
+            engine.rolling_fitness.get_mut(h).unwrap().push(s);
+            if s < min_s {
+                min_s = s;
+                best = h.clone();
+            }
+            if s > max_s {
+                max_s = s;
+                worst = h.clone();
+            }
+        }
+        let mut worst_picks = 0usize;
+        let mut best_picks = 0usize;
+        for _ in 0..200 {
+            if let Some(v) = engine.select_inverse_proportional().unwrap() {
+                if v == worst {
+                    worst_picks += 1;
+                }
+                if v == best {
+                    best_picks += 1;
+                }
+            }
+        }
+        assert!(
+            worst_picks > best_picks * 5,
+            "worst net picked {} times vs best {} — roulette must favor the worst",
+            worst_picks,
+            best_picks
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2393,6 +2985,9 @@ mod tests {
 
         let mut engine = engine(&dir, 42).unwrap();
         engine.config.checkpoint_every = 2;
+        // Keep the stream's rotation cadence in sync, exactly as run() does —
+        // this test steps nets manually, bypassing run().
+        engine.stream.set_checkpoint_every(engine.config.checkpoint_every);
         engine
             .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
@@ -2406,9 +3001,11 @@ mod tests {
             // Trigger checkpoint write in engine.run() equivalent
             if clock > 0 && clock % engine.config.checkpoint_every == 0 {
                 let mean = engine.population_mean_smoothed_fitness();
+                let exam = engine.run_checkpoint_exam((clock / engine.config.checkpoint_every) as u64).unwrap();
                 engine.checkpoints.push(Checkpoint {
                     step: clock,
                     pop_mean_fitness: mean,
+                    exam_mean_fitness: exam,
                 });
                 engine.write_checkpoints().unwrap();
             }
@@ -2441,6 +3038,7 @@ mod tests {
         assert_eq!(resumed.checkpoints.len(), 1, "ledger reloaded");
         assert_eq!(resumed.checkpoints[0].step, 2);
         assert_eq!(resumed.checkpoints[0].pop_mean_fitness, expected_mean);
+        assert!(!resumed.checkpoints[0].exam_mean_fitness.is_nan(), "exam reading persisted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2476,5 +3074,66 @@ mod tests {
         assert!(err_msg.contains("resume: expected 3 live nets"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn population_std_math() {
+        assert_eq!(population_std(&[]), 0.0);
+        assert_eq!(population_std(&[0.5]), 0.0, "single net cannot disagree");
+        let std = population_std(&[0.0, 2.0]);
+        assert!((std - 1.0).abs() < 1e-6, "std of [0,2] is 1, got {std}");
+    }
+
+    #[test]
+    fn fitness_std_stop_fires_below_threshold() {
+        let mut engine = engine(&std::env::temp_dir().join("gras-fstd-fire"), 5).unwrap();
+        engine.config.fitness_std_threshold = Some(10.0); // huge ⇒ any std fires
+        engine.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        for h in engine.state.live_hashes() {
+            engine
+                .rolling_fitness
+                .entry(h)
+                .or_default()
+                .push(0.5);
+        }
+        assert_eq!(engine.check_stop(100), Some(StopReason::FitnessStd));
+    }
+
+    #[test]
+    fn fitness_std_stop_held_by_warmup_guard() {
+        let mut engine = engine(&std::env::temp_dir().join("gras-fstd-warm"), 5).unwrap();
+        engine.config.fitness_std_threshold = Some(10.0);
+        engine.config.fitness_std_min_steps = 50; // not eligible before step 50
+        engine.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        for h in engine.state.live_hashes() {
+            engine.rolling_fitness.entry(h).or_default().push(0.5);
+        }
+        assert_eq!(engine.check_stop(10), None, "warmup guard holds the stop");
+    }
+
+    #[test]
+    fn two_stop_criteria_rejected_at_build() {
+        let mut cfg = RaceConfig::defaults();
+        cfg.max_steps = Some(10);
+        cfg.target_score = Some(0.9);
+        let err = crate::engine::config::RaceConfigBuilder::validate_single_stop(&cfg)
+            .unwrap_err();
+        assert!(err.contains("at most ONE stop criterion"), "{err}");
+        assert!(err.contains("max_steps") && err.contains("target_score"), "{err}");
+        // And a single criterion passes:
+        let mut ok = RaceConfig::defaults();
+        ok.max_steps = Some(10);
+        assert!(crate::engine::config::RaceConfigBuilder::validate_single_stop(&ok).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid RaceConfig")]
+    fn build_panics_on_two_stop_criteria() {
+        RaceConfig::builder()
+            .set_max_steps(10)
+            .set_target_score(0.9)
+            .build();
     }
 }

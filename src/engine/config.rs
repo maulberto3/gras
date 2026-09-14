@@ -9,9 +9,11 @@ use crate::graph::topology::TopologyOptions;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
     MaxSteps,
-    WallClock,
-    MaxCulls,
     TargetScore,
+    /// Population smoothed-fitness std fell below `fitness_std_threshold`:
+    /// the nets have converged to (near-)identical quality — further steps
+    /// are unlikely to differentiate them.
+    FitnessStd,
     /// A user-supplied `custom_stop` closure returned true (Iter 5 pluggable
     /// contract; consulted after all built-ins).
     CustomStop,
@@ -59,7 +61,7 @@ pub enum LogLevel {
 
 /// How strict the checkpoint gate is for a crossover child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum CheckMode {
+pub enum CrossoverGating {
     /// **Hard** — the child's smoothed fitness must beat the population's
     /// mean at **every** checkpoint it passes through. Brutal: forces
     /// children that truly outperform the pop at each historical point.
@@ -70,6 +72,48 @@ pub enum CheckMode {
     /// checkpoint. A child that dips under one early gate but recovers can
     /// still survive.
     Soft,
+}
+
+/// Who gets evicted when a crossover child passes the gate and takes a slot.
+/// **Crossover-only** — the mutation/immigrant channel has its own
+/// fitness-inverse victim selection and never consults this policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CrossCullPolicy {
+    /// **Worst** (default) — evict the current worst net by smoothed fitness.
+    /// Strictly merit-based: the elite is never touched (short of stagnation),
+    /// and every admitted child strictly improves the population's floor.
+    /// Risk: the population can ossify around one strong lineage.
+    #[default]
+    Worst,
+    /// **Random** — evict a uniformly random live net (possibly a good one).
+    /// Gives every net a finite expected lifetime regardless of rank, which
+    /// keeps slots turning over and prevents a long-lived leader from
+    /// starving diversity. Risk: a strong net can be lost to bad luck.
+    Random,
+}
+
+/// The two-parent crossover operators. Drawn from `RaceConfig::crossover_ops_pool`
+/// (empty ⇒ both) per attempt; recombines two parent topologies in place and
+/// the engine keeps parent A's post-swap body as the child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrossoverOp {
+    /// Swap the hidden-node tail after a matching pivot node.
+    OnePoint,
+    /// Per-node independent swap (requires equal hidden-node counts).
+    Uniform,
+}
+
+impl CrossoverOp {
+    /// How many parent topologies this operator combines. All current
+    /// operators are binary — the asexual "clone" path lives in the
+    /// `mutate_prob` roll family, not here — so both return 2. The engine
+    /// derives parent count from this, keeping the config surface free of a
+    /// redundant knob.
+    pub fn required_parents(&self) -> usize {
+        match self {
+            CrossoverOp::OnePoint | CrossoverOp::Uniform => 2,
+        }
+    }
 }
 
 /// The training paradigm / problem space the run targets.
@@ -105,17 +149,47 @@ pub struct RaceConfig {
     /// `mutate_prob`; a firing roll culls one fitness-inverse-selected net
     /// and inserts a fully-random immigrant (no checkpoint gate).
     pub mutate_rolls: usize,
-    /// Checkpoint gate strictness for crossover children (see [`CheckMode`]).
-    pub check: CheckMode,
+    /// Checkpoint gate strictness for crossover children (see
+    /// [`CrossoverGating`]).
+    pub crossover_gating: CrossoverGating,
+    /// Extra retries per crossover roll when the gate rejects the child
+    /// (`cx_retry_full`). Each retry draws fresh parents and re-runs the full
+    /// generate + gate pipeline; the original attempt plus every retry is
+    /// recorded in `history.csv`. `0` (default) = one attempt per roll,
+    /// gate failure discards the roll (legacy behavior).
+    pub crossover_retries: usize,
+    /// Who a surviving crossover child evicts (see [`CrossCullPolicy`]).
+    /// Crossover-only: mutation immigrants always evict via the
+    /// fitness-inverse roulette, regardless of this setting.
+    pub crossover_cull_policy: CrossCullPolicy,
+    /// Elite guard: the top-k live nets (by smoothed fitness) are immune to
+    /// ALL culls — crossover (any policy) and mutation alike. `0` disables
+    /// the guard (nothing is protected). The effective guard is clamped to
+    /// `live_count − 1` so a cullable victim always exists. Elites still age
+    /// out of the set when their smoothed fitness drops out of the top-k —
+    /// "elite" is a rank, not an identity.
+    pub elite_count: usize,
+    /// Crossover operator pool — which recombination operators the two-parent
+    /// path may use (`"one_point"` | `"uniform"`). Drawn uniformly per
+    /// attempt. Empty ⇒ both operators (the `empty ⇒ all` convention shared
+    /// with the activation/combine/standardize pools).
+    pub crossover_ops_pool: Vec<String>,
     /// Max steps before stopping (None = no limit).
     pub max_steps: Option<usize>,
-    /// Wall-clock limit in seconds (None = no limit).
-    pub wall_clock_seconds: Option<u64>,
-    /// Max culls before stopping (None = no limit).
-    pub max_culls: Option<usize>,
     /// Target fitness: stop when the best smoothed fitness reaches this
     /// (None = no target stop). Compared under the fitness direction.
     pub target_score: Option<f32>,
+    /// Convergence stop: stop when the population's smoothed-fitness std
+    /// falls below this (None = disabled). Low std = the nets agree — they
+    /// are all equally good (converged) or equally stuck (stagnated); either
+    /// way the race has stopped differentiating them. Guarded by
+    /// `fitness_std_min_steps` so an early "everyone equally bad" phase
+    /// cannot trigger it.
+    pub fitness_std_threshold: Option<f32>,
+    /// Minimum step before the fitness-std stop may fire. Default 0 = no
+    /// warmup (eligible immediately) — but the threshold defaults to None,
+    /// so the criterion is fully off unless explicitly enabled.
+    pub fitness_std_min_steps: usize,
     // NOTE: the shared batch stream (batch size, split ratio, eval rows) is
     // NOT a RaceConfig knob. It is engine infrastructure, rebuilt each run
     // from the trainer's optional stream_shape() request + the dataset's
@@ -143,10 +217,6 @@ pub struct RaceConfig {
     /// Probability the child gets mutated (yes/no per child). Formerly
     /// `evolve_prob` — renamed to match DEAP-style per-op probabilities.
     pub mutate_prob: f32,
-    /// How many parents the evolved path may try to combine (1 or 2).
-    pub crossover_parents: usize,
-    /// Whether to fall back to random immigrant if crossover fails.
-    pub crossover_fallback_to_immigrant: bool,
     /// Pluggable stop criterion **in addition** to the built-ins (Iter 5
     /// contract). When `None`, only the built-ins apply.
     pub custom_stop: StopFn,
@@ -158,7 +228,8 @@ pub struct RaceConfig {
     pub metrics: Vec<Metric>,
     /// The training paradigm / problem space target.
     pub mode: RunMode,
-    /// Whether to write the lossless long-form per-step log (`metrics.csv`).
+    /// Whether to write the lossless unified event log (`history.csv`: per-step
+    /// live-net metric rows + evolution attempt rows, typed by the `type` column).
     /// All run settings live in `engine.json`; there is no `options.csv`.
     pub csv_export: bool,
 }
@@ -228,12 +299,15 @@ impl RaceConfig {
             checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
             crossover_rolls: 1,
             mutate_rolls: 1,
-            check: CheckMode::default(),
-            crossover_fallback_to_immigrant: false,
+            crossover_gating: CrossoverGating::default(),
+            crossover_retries: 0,
+            crossover_cull_policy: CrossCullPolicy::default(),
+            elite_count: 0,
+            crossover_ops_pool: Vec::new(),
             max_steps: None,
-            wall_clock_seconds: None,
-            max_culls: None,
             target_score: None,
+            fitness_std_threshold: None,
+            fitness_std_min_steps: 0,
             hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
             hidden_dim_stride: 16,
             combine_op_pool: Vec::new(),
@@ -242,7 +316,6 @@ impl RaceConfig {
             topology_options: crate::graph::topology::TopologyOptions::default(),
             crossover_prob: 0.5,
             mutate_prob: 0.2,
-            crossover_parents: 2,
             custom_stop: None,
             metrics: Vec::new(),
             log_level: LogLevel::default(),
@@ -292,26 +365,64 @@ impl RaceConfigBuilder {
         self.cfg.mutate_rolls = n;
         self
     }
-    /// Gate strictness: `CheckMode::Hard` = beat every checkpoint mean;
-    /// `CheckMode::Soft` = beat the mean of the checkpoint means.
-    pub fn set_check(mut self, mode: CheckMode) -> Self {
-        self.cfg.check = mode;
+    /// Gate strictness for crossover children: `CrossoverGating::Hard` = beat
+    /// every checkpoint mean; `CrossoverGating::Soft` = beat the mean of the
+    /// checkpoint means.
+    pub fn set_crossover_gating(mut self, mode: CrossoverGating) -> Self {
+        self.cfg.crossover_gating = mode;
         self
+    }
+    /// Set how many extra full retries a crossover roll gets after a gate
+    /// rejection (each retry re-selects parents and re-runs generate + gate).
+    /// `0` = no retries (legacy: a rejected child discards the roll).
+    pub fn set_crossover_retries(mut self, n: usize) -> Self {
+        self.cfg.crossover_retries = n;
+        self
+    }
+    /// Crossover replacement policy: `CrossCullPolicy::Worst` = evict the
+    /// worst net by smoothed fitness (default); `CrossCullPolicy::Random` =
+    /// evict a uniformly random live net (diversity-first, elite can be lost).
+    /// Applies ONLY to crossover children — mutation immigrants always evict
+    /// via the fitness-inverse roulette.
+    pub fn set_crossover_cull_policy(mut self, policy: CrossCullPolicy) -> Self {
+        self.cfg.crossover_cull_policy = policy;
+        self
+    }
+    /// Elite guard: top-k nets by smoothed fitness are immune to ALL culls
+    /// (crossover and mutation). `0` = no guard (default). Elites hold rank,
+    /// not identity — a declining net falls out of the set naturally.
+    pub fn set_elite_count(mut self, n: usize) -> Self {
+        self.cfg.elite_count = n;
+        self
+    }
+    /// Crossover operator pool (`"one_point"` | `"uniform"`). Drawn uniformly
+    /// per crossover attempt. Empty (default) ⇒ both operators.
+    pub fn set_crossover_ops_pool(mut self, ops: Vec<String>) -> Self {
+        self.cfg.crossover_ops_pool = ops;
+        self
+    }
+    /// Same as [`Self::set_crossover_ops_pool`] with string slices.
+    pub fn set_crossover_ops_pool_from_strs(self, ops: &[&str]) -> Self {
+        self.set_crossover_ops_pool(ops.iter().map(|s| s.to_string()).collect())
     }
     pub fn set_max_steps(mut self, n: usize) -> Self {
         self.cfg.max_steps = Some(n);
         self
     }
-    pub fn set_wall_clock_seconds(mut self, s: u64) -> Self {
-        self.cfg.wall_clock_seconds = Some(s);
-        self
-    }
-    pub fn set_max_culls(mut self, n: usize) -> Self {
-        self.cfg.max_culls = Some(n);
-        self
-    }
     pub fn set_target_score(mut self, v: f32) -> Self {
         self.cfg.target_score = Some(v);
+        self
+    }
+    /// Convergence stop: fire when the population's smoothed-fitness std
+    /// drops below `v`. Only ONE stop criterion may be active.
+    pub fn set_fitness_std_threshold(mut self, v: f32) -> Self {
+        self.cfg.fitness_std_threshold = Some(v);
+        self
+    }
+    /// Warmup for the fitness-std stop: earliest step it may fire (default
+    /// 0 = eligible immediately; the threshold being None keeps it off).
+    pub fn set_fitness_std_min_steps(mut self, n: usize) -> Self {
+        self.cfg.fitness_std_min_steps = n;
         self
     }
     pub fn set_hidden_range(mut self, min: usize, max: usize) -> Self {
@@ -392,19 +503,7 @@ impl RaceConfigBuilder {
         self.cfg.mutate_prob = v;
         self
     }
-    pub fn set_crossover_parents(mut self, n: usize) -> Self {
-        self.cfg.crossover_parents = n;
-        self
-    }
     // Propagation strategy when a crossover roll fires but produces no
-    // checkpoint-passing child: by default the attempt is discarded; flip
-    // this on to back-fill one random immigrant (same path as a
-    // mutation-roll insertion, no checkpoint gate) per failed crossover
-    // roll.
-    pub fn set_crossover_fallback_to_immigrant(mut self, on: bool) -> Self {
-        self.cfg.crossover_fallback_to_immigrant = on;
-        self
-    }
     pub fn set_metrics(mut self, metrics: Vec<Metric>) -> Self {
         self.cfg.metrics = metrics;
         self
@@ -427,13 +526,44 @@ impl RaceConfigBuilder {
         self.cfg.mode = mode;
         self
     }
-    /// Set whether to write the lossless long-form per-step log (`metrics.csv`).
+    /// Set whether to write the lossless unified event log (`history.csv`).
     pub fn set_csv_export(mut self, enabled: bool) -> Self {
         self.cfg.csv_export = enabled;
         self
     }
+    /// Enforce the one-stop-criterion rule: at most ONE stop budget may be
+    /// active (`max_steps`, `wall_clock_seconds`, `max_culls`,
+    /// `target_score`, `fitness_std_threshold`). A config with two set is a
+    /// bug masquerading as flexibility — the second one to fire would
+    /// silently mask the first's meaning in the stop log. Errors here, at
+    /// build time, not deep in a step.
+    pub(crate) fn validate_single_stop(cfg: &RaceConfig) -> Result<(), String> {
+        let mut set: Vec<&str> = Vec::new();
+        if cfg.max_steps.is_some() {
+            set.push("max_steps");
+        }
+        if cfg.target_score.is_some() {
+            set.push("target_score");
+        }
+        if cfg.fitness_std_threshold.is_some() {
+            set.push("fitness_std_threshold");
+        }
+        if set.len() > 1 {
+            return Err(format!(
+                "at most ONE stop criterion may be set, found {}: {}. \
+                 Pick the one that means what you intend.",
+                set.len(),
+                set.join(", "),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn build(self) -> RaceConfig {
-        self.cfg
+        let cfg = self.cfg;
+        Self::validate_single_stop(&cfg)
+            .unwrap_or_else(|e| panic!("invalid RaceConfig: {e}"));
+        cfg
     }
 }
 
@@ -475,6 +605,26 @@ impl RaceConfig {
             "min" => Min,
             other => return Err(format!("unknown combine op '{other}'")),
         })
+    }
+
+    /// Resolve the crossover operator pool: the configured labels validated,
+    /// or **both operators** when empty (the `empty ⇒ all` convention shared
+    /// with the activation/combine/standardize pools). Unknown labels error
+    /// so a typo surfaces at run start, not deep in a step.
+    pub fn resolved_crossover_ops(&self) -> Result<Vec<CrossoverOp>, String> {
+        if self.crossover_ops_pool.is_empty() {
+            return Ok(vec![CrossoverOp::OnePoint, CrossoverOp::Uniform]);
+        }
+        self.crossover_ops_pool
+            .iter()
+            .map(|s| match s.to_lowercase().as_str() {
+                "one_point" | "onepoint" => Ok(CrossoverOp::OnePoint),
+                "uniform" => Ok(CrossoverOp::Uniform),
+                other => Err(format!(
+                    "unknown crossover op '{other}' (use \"one_point\" or \"uniform\")"
+                )),
+            })
+            .collect()
     }
 
     /// Parse a standardize-op label (the `Display` form).
