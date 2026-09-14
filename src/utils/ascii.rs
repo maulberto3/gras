@@ -99,14 +99,37 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
             .count()
     };
 
-    let rows_per_node = 4usize;
+    // Per-node box height, driven by port count and normalized within the
+    // net (the same relative-sizing spirit as the wire-lane tiers below):
+    // the node with the fewest ports gets the base height, the node with the
+    // most ports gets base + MAX_EXTRA, everything in between scales
+    // linearly. Box size thus carries information — a tall box is a wide
+    // fan-in/fan-out node. Rows 0..3 are structural (label / inputs /
+    // outputs / padding) and must not move: wire drops anchor at +1 and +2.
+    let base_rows = 4usize;
+    const MAX_EXTRA: usize = 4;
+    let ports = |n: &AsciiNode| n.num_inputs.max(n.num_outputs);
+    let min_ports = nodes.iter().map(ports).min().unwrap_or(0);
+    let max_ports = nodes.iter().map(ports).max().unwrap_or(0);
+    let extra_rows = |n: &AsciiNode| -> usize {
+        if max_ports == min_ports {
+            0
+        } else {
+            (ports(n) - min_ports) * MAX_EXTRA / (max_ports - min_ports)
+        }
+    };
+    let node_rows: Vec<usize> = nodes
+        .iter()
+        .map(|n| base_rows + extra_rows(n))
+        .collect();
+
     let mut block_row = vec![0usize; nodes.len()];
     let mut gap_row = vec![0usize; nodes.len().saturating_sub(1)];
     let mut row = 0usize;
 
     for i in 0..nodes.len() {
         block_row[i] = row;
-        row += rows_per_node;
+        row += node_rows[i];
         if i + 1 < nodes.len() {
             gap_row[i] = row;
             row += out_deg(i) + in_deg(i + 1);

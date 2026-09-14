@@ -10,40 +10,37 @@ pub fn topology_mermaid(graph: &Topology) -> String {
     let mut out = String::new();
     out.push_str("```mermaid\ngraph LR\n");
 
-    // Node definitions
+    // Per-net hidden-dim range for edge-thickness normalization (min/max
+    // interpolate, same spirit as the planned ASCII box sizing).
+    let dims: Vec<usize> = graph.nodes.iter().filter_map(|n| n.hidden_dim).collect();
+    let (min_dim, max_dim) = (
+        dims.iter().min().copied().unwrap_or(1),
+        dims.iter().max().copied().unwrap_or(1),
+    );
+    let dim_range = (max_dim.saturating_sub(min_dim)).max(1);
+
+    // Node definitions — COMPACT one-line labels. Mermaid auto-sizes each
+    // box to fit its label, so multi-line labels balloon every box; one
+    // short line keeps boxes small and roughly uniform. Full detail lives
+    // in the Nodes table above.
     for node in &graph.nodes {
         let label = match node.kind {
             NodeKind::Input => {
-                let dim = node.hidden_dim.unwrap_or(8);
                 format!(
-                    "n{}[\"Input<br/>{}→{}\"]",
+                    "n{}[\"in {}\"]",
                     node.id,
-                    graph.options.input_dim.unwrap_or(1),
-                    dim
+                    graph.options.input_dim.unwrap_or(1)
                 )
             }
             NodeKind::Hidden => {
                 let dim = node.hidden_dim.unwrap_or(8);
                 let act = format!("{:#?}", node.activation).to_lowercase();
-                let combine = node
-                    .combine_op
-                    .map(|c| format!("{:#?}", c).to_lowercase())
-                    .unwrap_or_default();
-                let std_label = node
-                    .standardize
-                    .map(|s| format!("{:#?}", s).to_lowercase())
-                    .unwrap_or_default();
-                format!(
-                    "n{}[\"H{}<br/>{}<br/>{}<br/>{}<br/>{}\"]",
-                    node.id, node.id, dim, act, combine, std_label
-                )
+                format!("n{}[\"H{} {} {}\"]", node.id, node.id, act, dim)
             }
             NodeKind::Output => {
-                let dim = node.hidden_dim.or(graph.options.output_dim).unwrap_or(1);
                 format!(
-                    "n{}[\"Output<br/>{}→{}\"]",
+                    "n{}[\"out {}\"]",
                     node.id,
-                    dim,
                     graph.options.output_dim.unwrap_or(1)
                 )
             }
@@ -51,23 +48,40 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         out.push_str(&format!("    {}\n", label));
     }
 
-    // Edges — stroke-width scaled by port count
-    // Thinnest edges: 0.5px, thickest: 5.0px, proportional in between
+    // Node borders — stroke-width driven by the node's hidden_dim (per-net
+    // normalized: min dims get the thinnest border, max the thickest). One
+    // inline `style` line per node; Mermaid renders it as the box outline.
+    const MIN_BORDER: f32 = 0.5;
+    const MAX_BORDER: f32 = 5.0;
+    for node in &graph.nodes {
+        let dim = node.hidden_dim.unwrap_or(min_dim);
+        let t = dim.saturating_sub(min_dim) as f32 / dim_range as f32;
+        let width = MIN_BORDER + (MAX_BORDER - MIN_BORDER) * t.clamp(0.0, 1.0);
+        out.push_str(&format!(
+            "    style n{} stroke-width:{:.1}px\n",
+            node.id, width
+        ));
+    }
+
+    // Edges — stroke-width scaled by HOP DISTANCE (to.node − from.node):
+    // the farther a wire travels, the thicker it renders, so long-range
+    // skips (the interesting structural feature) are thick trunks while
+    // immediate neighbor-to-neighbor wires stay thin. Normalized per net:
+    // 1 hop = thinnest, max hop in this graph = thickest.
     const MIN_WIDTH: f32 = 0.5;
     const MAX_WIDTH: f32 = 5.0;
+    let max_hop = graph
+        .connections
+        .iter()
+        .map(|c| c.to.node.saturating_sub(c.from.node))
+        .max()
+        .unwrap_or(1)
+        .max(1);
     for (idx, conn) in graph.connections.iter().enumerate() {
         out.push_str(&format!("    n{} --> n{}\n", conn.from.node, conn.to.node));
-        // Target node port count (more ports = thicker line)
-        let port_count = graph
-            .nodes
-            .iter()
-            .find(|n| n.id == conn.to.node)
-            .map(|n| n.num_inputs as f32)
-            .unwrap_or(1.0);
-        let max_ports = graph.options.max_hidden_inputs_per_node.max(1) as f32;
-        // Linear interpolation: MIN_WIDTH at 0 ports, MAX_WIDTH at max_ports
-        let t = (port_count / max_ports).clamp(0.0, 1.0);
-        let width = MIN_WIDTH + (MAX_WIDTH - MIN_WIDTH) * t;
+        let hop = conn.to.node.saturating_sub(conn.from.node).max(1);
+        let t = (hop - 1) as f32 / (max_hop - 1).max(1) as f32;
+        let width = MIN_WIDTH + (MAX_WIDTH - MIN_WIDTH) * t.clamp(0.0, 1.0);
         out.push_str(&format!(
             "    linkStyle {} stroke-width:{:.1}px\n",
             idx, width
