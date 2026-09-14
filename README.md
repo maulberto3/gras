@@ -173,9 +173,9 @@ fn main() -> flodl::tensor::Result<()> {
         .set_standardize_ops(&["Identity"])
         
         // --- Gating, Mode & Sidecar exports ---
-        .set_check(gras::engine::config::CheckMode::Soft) // Checkpoint gate strictness
+        .set_crossover_gating(gras::engine::config::CrossoverGating::Soft) // Checkpoint gate strictness for crossover children
         .set_mode(RunMode::Tabular)                       // Paradigm mode
-        .set_csv_export(true)                             // Writes the metrics.csv long-form trace
+        .set_csv_export(true)                             // Writes the history.csv unified event log (metric + attempt rows)
         
         // --- Structural Constraints ---
         .set_min_hidden_num_nodes(5)
@@ -208,9 +208,11 @@ First budget hit cleanly stops the race:
 | Option | Default | Builder method | Description |
 |--------|---------|----------------|-------------|
 | `max_steps` | None | `.set_max_steps(n)` | Total global step budget limit |
-| `wall_clock_seconds` | None | `.set_wall_clock_seconds(s)` | Total execution duration limit |
-| `max_culls` | None | `.set_max_culls(n)` | Cumulative cull limit |
 | `target_score` | None | `.set_target_score(v)` | Stop once best network hits this fitness |
+| `fitness_std_threshold` | None | `.set_fitness_std_threshold(v)` | Convergence stop: fire when population smoothed-fitness std < v (all nets equally good or equally stuck) |
+| `fitness_std_min_steps` | 0 | `.set_fitness_std_min_steps(n)` | Warmup for the std stop — earliest step it may fire (protects the early "everyone equally bad" phase) |
+
+**One stop criterion at a time.** At most ONE of `max_steps` / `target_score` / `fitness_std_threshold` may be set — `build()` errors otherwise. Two active budgets would silently mask each other in the stop log; pick the one that means what you intend.
 
 ### 2. Genetic Evolution Parameters
 
@@ -219,11 +221,10 @@ First budget hit cleanly stops the race:
 | `pop_size` | 5 | `.set_pop_size(n)` | Number of active networks in population |
 | `checkpoint_every` | 10 | `.set_checkpoint_every(n)` | Step cadence of ledger checkpoints |
 | `crossover_rolls` | 1 | `.set_crossover_rolls(n)` | Crossover attempts rolled per step |
+| `crossover_retries` | 0 | `.set_crossover_retries(n)` | Extra full retries per crossover roll after a gate rejection (fresh parents + generate + gate each retry; every attempt recorded in `history.csv`) |
 | `mutate_rolls` | 1 | `.set_mutate_rolls(n)` | Immigrant rolls processed per step |
 | `crossover_prob` | 0.5 | `.set_crossover_prob(v)` | Crossover execution probability |
 | `mutate_prob` | 0.2 | `.set_mutate_prob(v)` | Mutation execution probability |
-| `crossover_parents` | 2 | `.set_crossover_parents(n)` | Number of parents to combine |
-| `crossover_fallback` | false | `.set_crossover_fallback_to_immigrant(b)`| Immigrant fallback if crossover fails |
 
 ---
 
@@ -263,9 +264,17 @@ Each run creates a dedicated run directory containing:
 results/<timestamp>/
 ├── engine.json         # Run identity + the COMPLETE config snapshot (every knob)
 ├── checkpoints.json    # The evolution gate ledger history
-├── metrics.csv         # Long-form per-step trace, one row per (step × net):
-│                       #   step, hash, origin, entered_at_step, train_loss,
+├── history.csv         # Unified event log, typed by the `type` column.
+│                       #   Individual identity = (hash, net_seed): the same
+│                       #   topology hash can reappear across eras (re-born or
+│                       #   regenerated children); net_seed disambiguates.
+│                       #   `metric` rows (one per step × live net): step, hash,
+│                       #   net_seed, origin, entered_at_step, train_loss,
 │                       #   eval_loss, fitness, <informative metrics...>
+│                       #   `attempt` rows (one per evolution event): branch,
+│                       #   attempt, outcome (inserted / rejected_gate),
+│                       #   gate_index, child_fitness, bar, victim,
+│                       #   victim_net_seed, pop_size
 └── nets/
     ├── <hash>.json         # Live net: topology, net_seed, step, last_metrics, meta
     └── <culled_hash>.json  # Tombstone: is_alive=false, culled_at_step, cull_reason,
@@ -275,9 +284,10 @@ results/<timestamp>/
 **Precision.** Every numeric field in these artifacts is the raw `f32` (serde /
 `Display` round-trip, i.e. full precision). Only the console log rounds —
 per-step metrics to 2 decimals, as `mean ± std`. There is no `options.csv`: run
-settings live in `engine.json`, and the per-step history lives in `metrics.csv`,
-which covers **every net that ever lived** (culled ones included) — not just the
-surviving frontier.
+settings live in `engine.json`, and the unified history lives in `history.csv`,
+which covers **every net that ever lived** (culled ones included, via `metric`
+rows) **and every evolution attempt** (inserted or gate-rejected, via `attempt`
+rows) — not just the surviving frontier.
 
 ### Solo-Net Recovery Tooling (`examples/train_by_hash.rs`)
 Old engines required complex analysis to train an interesting candidate further. In `gras`, simply point our training tool to any run directory and network hash. It will automatically load the blueprint, rebuild the network, replay the batch stream deterministically to restore its weights, and continue training solo:
