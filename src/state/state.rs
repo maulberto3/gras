@@ -7,7 +7,7 @@
 //!   survives. Contains everything needed to hand that net back to the stream
 //!   later (topology JSON, weight-init seed, current step, lineage placeholder).
 //!
-//! No per-gen snapshots, no default `metrics.csv` (each net state file carries
+//! No per-gen snapshots, no default `history.csv` (each net state file carries
 //! its own metrics snapshot), no default `culled.log` (a net that stops being
 //! stepped simply stops being updated; an explicit tombstone log can be added
 //! later if an audit trail is wanted).
@@ -34,6 +34,7 @@ use crate::utils::seed::topo_hash;
 /// to reproduce the run — no parallel `options.csv` is written. To add a knob,
 /// add it to this struct and to [`ConfigSnapshot::from_config`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct ConfigSnapshot {
     /// Population size the race held constant.
     pub pop_size: usize,
@@ -41,15 +42,23 @@ pub struct ConfigSnapshot {
     pub crossover_rolls: usize,
     pub mutate_rolls: usize,
     /// Checkpoint gate strictness (`"hard"` | `"soft"`).
-    pub check: String,
+    pub crossover_gating: String,
+    /// Extra gate-aware retries per crossover roll (0 = none).
+    pub crossover_retries: usize,
+    /// Crossover replacement policy (`"worst"` | `"random"`). Crossover-only:
+    /// mutation immigrants always evict via fitness-inverse roulette.
+    pub crossover_cull_policy: String,
+    /// Elite guard size: top-k nets by smoothed fitness immune to all culls.
+    pub elite_count: usize,
+    /// Crossover operator pool (`"one_point"`/`"uniform"`); empty ⇒ both.
+    pub crossover_ops_pool: Vec<String>,
     pub crossover_prob: f32,
     pub mutate_prob: f32,
-    pub crossover_parents: usize,
-    pub crossover_fallback_to_immigrant: bool,
     /// Stop budgets as configured (`None` = no limit).
-    pub wall_clock_seconds: Option<u64>,
-    pub max_culls: Option<usize>,
     pub target_score: Option<f32>,
+    /// Convergence stop threshold (None = off) + warmup min-steps.
+    pub fitness_std_threshold: Option<f32>,
+    pub fitness_std_min_steps: usize,
     /// Whether a pluggable `custom_stop` closure was installed. The closure is
     /// code, not data, so only its presence is recordable.
     pub has_custom_stop: bool,
@@ -78,14 +87,16 @@ impl ConfigSnapshot {
             checkpoint_every: cfg.checkpoint_every,
             crossover_rolls: cfg.crossover_rolls,
             mutate_rolls: cfg.mutate_rolls,
-            check: format!("{:?}", cfg.check).to_lowercase(),
+            crossover_gating: format!("{:?}", cfg.crossover_gating).to_lowercase(),
+            crossover_retries: cfg.crossover_retries,
+            crossover_cull_policy: format!("{:?}", cfg.crossover_cull_policy).to_lowercase(),
+            elite_count: cfg.elite_count,
+            crossover_ops_pool: cfg.crossover_ops_pool.clone(),
             crossover_prob: cfg.crossover_prob,
             mutate_prob: cfg.mutate_prob,
-            crossover_parents: cfg.crossover_parents,
-            crossover_fallback_to_immigrant: cfg.crossover_fallback_to_immigrant,
-            wall_clock_seconds: cfg.wall_clock_seconds,
-            max_culls: cfg.max_culls,
             target_score: cfg.target_score,
+            fitness_std_threshold: cfg.fitness_std_threshold,
+            fitness_std_min_steps: cfg.fitness_std_min_steps,
             has_custom_stop: cfg.custom_stop.is_some(),
             log_level: format!("{:?}", cfg.log_level).to_lowercase(),
             mode: format!("{:?}", cfg.mode).to_lowercase(),
