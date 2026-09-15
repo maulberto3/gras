@@ -48,7 +48,10 @@ benc:
 
 prof:
 	clear && source env_setup.sh && mkdir -p results/prof && \
-	cargo flamegraph --profile profiling -o results/prof/flamegraph.svg --example flamegraph -- --steps 300
+	cargo flamegraph --profile profiling -o results/prof/flamegraph.svg --bench flamegraph -- --steps 300
+
+mem:
+	clear && source env_setup.sh && cargo bench --bench memgraph -- --steps 300 --evolve
 
 samp:
 	# To grant temporary access before using samply
