@@ -116,6 +116,13 @@ pub enum Activation {
     Sin,
     /// cos(x) -- periodic, bounded in (-1, 1).
     Cos,
+    /// softmax(x) over the feature dim -- outputs sum to 1 per sample.
+    /// Gating-style transform: turns a node into a competitive mixer over
+    /// its channels (winner-take-most signal reweighting).
+    Softmax,
+    /// log(softmax(x)) over the feature dim -- numerically stable log of
+    /// Softmax. Pairs with NLL-style downstream losses; strictly negative.
+    LogSoftmax,
 }
 
 impl Activation {
@@ -138,6 +145,10 @@ impl Activation {
             Activation::HardSigmoid => x.hardsigmoid(),
             Activation::Sin => x.sin(),
             Activation::Cos => x.cos(),
+            // Dim -1 = feature dim: matches LayerNorm's axis convention, so a
+            // node's normalization/activation both operate per-sample.
+            Activation::Softmax => x.softmax(-1),
+            Activation::LogSoftmax => x.log_softmax(-1),
         }
     }
 }
@@ -150,10 +161,20 @@ pub enum StandardizeOp {
     Identity,
     /// Layer normalization over the feature dimension.
     LayerNorm,
+    /// RMS normalization over the feature dimension -- scales by the root
+    /// mean square (no mean subtraction, no learnable params). Cheaper than
+    /// LayerNorm, often equal quality on tabular. Stateless: replay-safe.
+    RmsNorm,
+    /// Instance normalization over the feature dimension -- per-sample z-score
+    /// (the affine/running-stats variant is deliberately NOT used: learnable
+    /// params + stateful stats would break the replay contract). Stateless:
+    /// replay-safe.
+    InstanceNorm,
 }
 
 impl StandardizeOp {
-    /// Apply this standardize op. LayerNorm = z-score, no learnable params.
+    /// Apply this standardize op. All variants are pure `f(x)` — stateless,
+    /// no learnable params — so the replay/catch-up contract holds.
     pub fn apply(&self, x: &Variable) -> flodl::tensor::Result<Variable> {
         match self {
             StandardizeOp::Identity => Ok(x.clone()),
@@ -165,6 +186,23 @@ impl StandardizeOp {
                 let std = var.add_scalar(1e-5)?.sqrt()?; // [batch, 1]
                 let normed = centered.div(&std)?;
                 Ok(normed)
+            }
+            StandardizeOp::RmsNorm => {
+                // x / sqrt(mean(x²) + eps) — no centering, scale-only
+                let ms = x.mul(x)?.mean_dim(-1, true)?; // [batch, 1]
+                let rms = ms.add_scalar(1e-5)?.sqrt()?;
+                Ok(x.div(&rms)?)
+            }
+            StandardizeOp::InstanceNorm => {
+                // LayerNorm without the centering-vs-variance asymmetry... it
+                // IS the z-score here, per-sample over the feature dim. The
+                // flodl nn::instance_norm module carries running stats (state!) —
+                // hand-rolled instead, matching LayerNorm's pure-f(x) shape.
+                let mean = x.mean_dim(-1, true)?;
+                let centered = x.sub(&mean)?;
+                let var = centered.mul(&centered)?.mean_dim(-1, true)?;
+                let std = var.add_scalar(1e-5)?.sqrt()?;
+                Ok(centered.div(&std)?)
             }
         }
     }
@@ -270,6 +308,46 @@ mod tests {
     use super::*;
     use crate::graph::topology::{Topology, TopologyOptions};
     use proptest::prelude::*;
+
+    #[test]
+    fn new_pool_ops_are_numerically_sound() {
+        // [batch=2, features=4] input with known structure.
+        let x = flodl::Tensor::from_f32(
+            &[1.0, 2.0, 3.0, 4.0, -1.0, 0.0, 1.0, 2.0],
+            &[2, 4],
+            flodl::Device::CPU,
+        )
+        .unwrap();
+        let x = flodl::Variable::new(x, false);
+
+        // Softmax over features: rows sum to 1, all positive.
+        let s = Activation::Softmax.apply(&x).unwrap();
+        let sums = s.data().sum().unwrap().item().unwrap() as f32;
+        assert!((sums - 2.0).abs() < 1e-4, "softmax rows must sum to 1 each (got {sums})");
+
+        // LogSoftmax: log of softmax — strictly non-positive, exp sums to 1.
+        let ls = Activation::LogSoftmax.apply(&x).unwrap();
+        let recon = ls.data().exp().unwrap().sum().unwrap().item().unwrap() as f32;
+        assert!((recon - 2.0).abs() < 1e-4, "exp(log_softmax) must sum to 1 per row (got {recon})");
+
+        // RMSNorm: per-row RMS of output ≈ 1.
+        let r = StandardizeOp::RmsNorm.apply(&x).unwrap();
+        let ms = r
+            .data()
+            .mul(&r.data())
+            .unwrap()
+            .mean()
+            .unwrap()
+            .item()
+            .unwrap() as f32;
+        let rms = ms.sqrt();
+        assert!((rms - 1.0).abs() < 1e-3, "rmsnorm output RMS ≈ 1 (got {rms})");
+
+        // InstanceNorm (hand-rolled, stateless): per-row mean 0, std 1.
+        let i = StandardizeOp::InstanceNorm.apply(&x).unwrap();
+        let m = i.data().mean().unwrap().item().unwrap() as f32;
+        assert!(m.abs() < 1e-5, "instancenorm per-row mean ≈ 0 (got {m})");
+    }
 
     /// Arbitrary valid node metadata (port counts, kind, id).
     fn node_strategy() -> impl Strategy<Value = Node> {
