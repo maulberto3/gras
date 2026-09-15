@@ -43,6 +43,34 @@ pub struct RunSpec<T: Trainer + 'static = Box<dyn Trainer>> {
 }
 
 impl<T: Trainer + 'static> RunSpec<T> {
+    /// Convenience constructor: every path field coerces via `Into<PathBuf>`,
+    /// so callers can pass `&str`, `String`, `&Path`, or `PathBuf` directly —
+    /// no `.to_path_buf()` / `.clone()` noise:
+    ///
+    /// ```ignore
+    /// RunSpec::new("data/mnist/train", config, fitness, trainer, Some(42), run_dir)
+    /// ```
+    ///
+    /// `run_dir` takes `Option<P>` where `P: Into<PathBuf>`; pass
+    /// `None::<&str>` for the default `results/<timestamp>` location.
+    pub fn new<P: Into<std::path::PathBuf>>(
+        data_dir: impl Into<std::path::PathBuf>,
+        config: RaceConfig,
+        fitness: Fitness,
+        trainer: T,
+        seed: Option<u64>,
+        run_dir: Option<P>,
+    ) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            config,
+            fitness,
+            trainer,
+            seed,
+            run_dir: run_dir.map(|p| p.into()),
+        }
+    }
+
     /// Convenience: build a spec with the trainer auto-boxed. Accepts any
     /// `U: Trainer + 'static` so callers can write
     /// `.with_trainer(TabularTrainer::new(loss).with_learning_rate(1e-3))`

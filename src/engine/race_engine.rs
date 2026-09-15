@@ -17,7 +17,7 @@
 //!    child replaces the worst net only if it clears every gate, otherwise the
 //!    attempt is discarded and the population is unchanged. Immigrant rolls: a
 //!    random entrant replaces an inverse-fitness victim (pop stays constant).
-//! 5. Stop criteria checked (max_steps, target_score, fitness_std,
+//! 5. Stop criteria checked (max_steps, max_target_fitness, custom_stop) —
 //!    custom stop) — log which fired.
 //! 6. Repeat — the loop's clock is the nets' recorded steps (every net is at
 //!    the same step after the group steps, so reading any live net's step
@@ -92,18 +92,6 @@ fn csv_field(s: &str) -> String {
     }
 }
 
-/// Population standard deviation of smoothed fitness — the fitness-std stop
-/// criterion's signal. Empty/one-element input reads 0.0 (a single net cannot
-/// disagree with itself; the warmup guard covers the early-run case).
-fn population_std(values: &[f32]) -> f32 {
-    if values.len() < 2 {
-        return 0.0;
-    }
-    let mean = values.iter().sum::<f32>() / values.len() as f32;
-    let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32;
-    var.sqrt()
-}
-
 use super::child::RaceChild;
 use super::config::{RaceConfig, RaceSnapshot, StopReason};
 use super::smoothing::{SMOOTHING_WINDOW, RollingBuffer, rolling_mean};
@@ -144,7 +132,7 @@ pub struct RaceEngine {
     /// Run-level context stamped into each net's meta block.
     pub(crate) meta_ctx: crate::engine::config::RunMetaCtx,
     pub(crate) stream: BatchStream,
-    pub(crate) dataset: crate::utils::data::Dataset,
+    pub(crate) dataset: crate::utils::tabular_data::Dataset,
     pub(crate) fitness: Fitness,
     pub(crate) metrics: Vec<Metric>,
     /// The caller-supplied training scheme. The engine never trains — it only
@@ -251,7 +239,7 @@ impl RaceEngine {
             run_dir,
         } = spec;
         let trainer: Box<dyn Trainer> = Box::new(trainer);
-        let dataset = crate::utils::data::resolve_dataset(&data_dir)?
+        let dataset = crate::utils::tabular_data::resolve_dataset(&data_dir)?
             .to_device(config.device())?;
         // Random seed when omitted: time ^ fastrand (recorded in engine.json).
         let run_seed = seed.unwrap_or_else(|| {
@@ -425,10 +413,19 @@ impl RaceEngine {
     /// the group steps, every live net is at the same step, so any live net
     /// gives the clock. Returns 0 when the population is empty.
     pub fn step_clock(&self) -> usize {
+        // The population clock is the MAX step across live nets — the step the
+        // original population has reached. Reading an arbitrary net (e.g. the
+        // first hash) is wrong: a crossover child inserted mid-evolve is
+        // caught up to `clock` while the population sits at `clock + 1`, so a
+        // first-hash read can return the child's step and REPEAT the whole
+        // iteration (duplicate rollup lines, extra training, budget skew).
+        // Max is order-independent: children trail by one, originals define
+        // the clock.
         self.state
             .live_hashes()
-            .first()
-            .and_then(|h| self.state.net(h).map(|s| s.step))
+            .iter()
+            .filter_map(|h| self.state.net(h).map(|s| s.step))
+            .max()
             .unwrap_or(0)
     }
 
@@ -496,7 +493,7 @@ impl RaceEngine {
     ) -> Result<Self> {
         let trainer: Box<dyn Trainer> = Box::new(trainer);
         let header = crate::state::load_engine_json(&run_dir)?;
-        let dataset = crate::utils::data::resolve_dataset(&data_dir)?
+        let dataset = crate::utils::tabular_data::resolve_dataset(&data_dir)?
             .to_device(config.device())?;
         let metrics = config.metrics.clone();
         let run_seed = header.run_seed;
@@ -933,6 +930,16 @@ impl RaceEngine {
 
             // ── 4. stop criteria ────────────────────────────────────────────
             if let Some(reason) = self.check_stop(clock) {
+                // Post-race pruner (pop_pruner): the stop reason becomes a
+                // TRANSITION, not an exit — cull everything except the top
+                // `elite_count` nets (min 1) and keep training them solo for
+                // `pruner.steps` more steps. Evolution and stop criteria are
+                // phase-locked OFF: they are evolution-phase concerns and the
+                // surviving nets race no one.
+                if let Some(pruner) = self.config.pop_pruner {
+                    let reason = self.run_pruner_phase(reason, clock, pruner)?;
+                    return Ok(reason);
+                }
                 // The champion markdown dump is an ARTIFACT, not a log line —
                 // it must land on disk at every log level, even `None`.
                 self.write_champion_markdown()?;
@@ -947,6 +954,123 @@ impl RaceEngine {
                 return Ok(reason);
             }
         }
+    }
+
+    /// Post-race pruner phase (Hard method): cull all but the top
+    /// `elite_count` live nets, then keep training the survivors for
+    /// `pruner.steps` extra steps with evolution and stop criteria off.
+    ///
+    /// The survivors continue through the SAME per-net step path (`step_one_net`)
+    /// with the SAME trainer, optimizer state, and shared stream — only the
+    /// orchestration differs: no evolve rolls fire (the race is over), and
+    /// `check_stop` is not consulted (its signals are population-level and
+    /// meaningless on 1–2 nets; std on a 1-net population is literally 0).
+    /// Every solo step is recorded exactly like a race step — history.csv
+    /// metric rows and the survivors' `nets/<hash>.json` step counters — so
+    /// the post-race extension is a visible, replayable part of the run.
+    fn run_pruner_phase(
+        &mut self,
+        reason: StopReason,
+        clock: usize,
+        pruner: crate::engine::config::PopPruner,
+    ) -> Result<StopReason> {
+        // Keep the top-k elites (k = max(1, elite_count)) — the same ranking
+        // the elite guard uses, so "who survives" is exactly "who was elite".
+        let keep = {
+            let k = self.config.elite_count.max(1).min(self.state.live_count());
+            let direction = self.fitness.direction();
+            let mut ranked: Vec<(String, f32)> = self
+                .state
+                .live_hashes()
+                .iter()
+                .filter_map(|h| {
+                    self.rolling_fitness
+                        .get(h)
+                        .filter(|b| !b.is_empty())
+                        .map(|b| (h.clone(), rolling_mean(b)))
+                })
+                .collect();
+            ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
+            ranked.into_iter().take(k).map(|(h, _)| h).collect::<Vec<_>>()
+        };
+        let victims: Vec<String> = self
+            .state
+            .live_hashes()
+            .into_iter()
+            .filter(|h| !keep.contains(h))
+            .collect();
+        if self.verbose_detail() {
+            info!(
+                "── pruner phase ── race stop: {:?} at step {} → keeping top-{} ({}), culling {} → solo training for {} steps",
+                reason,
+                clock,
+                keep.len(),
+                keep.iter().map(|h| h[..8].to_string()).collect::<Vec<_>>().join(","),
+                victims.len(),
+                pruner.steps,
+            );
+        }
+        for v in &victims {
+            // Attempt row first (victim identity readable), then the cull —
+            // same discipline as the crossover insert path.
+            let victim_seed = self.state.net(v).map(|s| s.net_seed);
+            self.record_attempt(
+                clock,
+                "pruner",
+                0,
+                None,
+                None,
+                "pruned",
+                "pruned",
+                None,
+                None,
+                None,
+                Some(v.as_str()),
+                victim_seed,
+            );
+            self.cull_net(v, clock, "pruned")?;
+        }
+        if !victims.is_empty() {
+            self.flush_metrics_csv()?;
+            self.write_live_frontier_states()?;
+        }
+        if pruner.steps == 0 {
+            self.write_champion_markdown()?;
+            if self.verbose_detail() {
+                info!("  pruner phase: 0 steps configured — nothing further to train");
+            }
+            return Ok(reason);
+        }
+        // Solo extension: the same group-step shape, minus evolution and stop
+        // checks. Optimizer state is intact (nothing rebuilt) — the elites
+        // simply keep learning at the same LR/hyperparams.
+        for offset in 0..pruner.steps {
+            let step = clock + 1 + offset;
+            let hashes = self.state.live_hashes();
+            if hashes.is_empty() {
+                break;
+            }
+            for hash in &hashes {
+                self.step_one_net(hash, step)?;
+            }
+            self.append_metrics_csv(step)?;
+            if self.log_level != crate::engine::config::LogLevel::None {
+                self.log_step_rollup(step);
+            }
+        }
+        let final_step = clock + pruner.steps;
+        self.write_champion_markdown()?;
+        if self.verbose_detail() {
+            info!(
+                "── pruner phase complete ── trained to step {} ({} solo step(s))",
+                final_step,
+                pruner.steps,
+            );
+            self.log_stop_summary(final_step)?;
+        }
+        self.write_live_frontier_states()?;
+        self.flush_metrics_csv()?;
+        Ok(reason)
     }
 
     // ── One net's step ──────────────────────────────────────────────────────
@@ -1373,6 +1497,7 @@ impl RaceEngine {
             .map(|h| rolling_mean(self.rolling_fitness.get(h).unwrap()))
             .collect()
     }
+
 
     /// The best smoothed fitness in the live population (under the fitness
     /// direction).
@@ -2004,35 +2129,29 @@ impl RaceEngine {
 
     /// Check stop criteria at the given step. Returns `Some(reason)` if one
     /// fires, `None` if the run should continue.
+    ///
+    /// Any combination of budgets may be set — they RACE each other: at each
+    /// step every set criterion is evaluated in priority order (`max_steps`
+    /// → `max_target_fitness`) and the FIRST to fire ends the run. With only
+    /// one set, that criterion is the only racer. `custom_stop` joins the
+    /// race too, always evaluated last.
     fn check_stop(&mut self, step: usize) -> Option<StopReason> {
-        // max_steps first (explicit budget).
+        // 1. Explicit step budget (fires only if set).
         if let Some(max) = self.config.max_steps {
             if step >= max {
                 return Some(StopReason::MaxSteps);
             }
         }
-        // target_score.
-        if let Some(target) = self.config.target_score {
+        // 2. Best smoothed fitness reached the target (fires only if set).
+        if let Some(target) = self.config.max_target_fitness {
             let best = self.best_smoothed_fitness();
             if self.fitness.direction().is_better(best, target) {
                 return Some(StopReason::TargetScore);
             }
         }
-        // fitness_std: population convergence/stagnation detector. Fires
-        // only after `fitness_std_min_steps` (warmup guard — an early
-        // "everyone equally bad" phase also reads low std and must not
-        // trigger it).
-        if let Some(threshold) = self.config.fitness_std_threshold {
-            if step >= self.config.fitness_std_min_steps {
-                let std = population_std(&self.smoothed_fitness_values());
-                if std < threshold {
-                    return Some(StopReason::FitnessStd);
-                }
-            }
-        }
-        // Custom stop (Iter 5 pluggable contract): consulted **in addition**
-        // to the built-ins, always last, so a user policy can stop the run on
-        // criteria the built-ins don't model.
+        // 3. Custom stop: joins the race **in addition** to the built-ins, so
+        // a user policy can stop the run on criteria the built-ins don't
+        // model.
         if let Some(stop) = self.config.custom_stop.as_ref() {
             if stop(&self.snapshot(step)) {
                 return Some(StopReason::CustomStop);
@@ -2311,12 +2430,12 @@ mod tests {
     use crate::graph::node::Node;
     use crate::graph::topology::Topology;
     use crate::graph::topology::TopologyOptions;
-    use crate::utils::data::synthetic_classification;
+    use crate::utils::tabular_data::synthetic_classification;
     use flodl::{Device, Variable};
 
     use crate::engine::config::DEFAULT_CHECKPOINT_EVERY;
 
-    fn tiny_dataset() -> crate::utils::data::Dataset {
+    fn tiny_dataset() -> crate::utils::tabular_data::Dataset {
         synthetic_classification(64, 2, 2, 7, Device::CPU).unwrap()
     }
 
@@ -2383,7 +2502,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gras-test-{tag}-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        crate::utils::data::save_dataset(&dir, &tiny_dataset()).unwrap();
+        crate::utils::tabular_data::save_dataset(&dir, &tiny_dataset()).unwrap();
         dir
     }
 
@@ -2425,8 +2544,7 @@ mod tests {
         // (engine infrastructure), not on RaceConfig — verified by the
         // stream_shape / stream_info contract instead.
         assert_eq!(cfg.max_steps, None, "budgets inactive by default");
-        assert!(cfg.target_score.is_none());
-        assert!(cfg.fitness_std_threshold.is_none());
+        assert!(cfg.max_target_fitness.is_none());
         assert!(cfg.hidden_dim_pool.is_some());
         assert_eq!(cfg.pop_size, 5);
     }
@@ -3076,64 +3194,161 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn population_std_math() {
-        assert_eq!(population_std(&[]), 0.0);
-        assert_eq!(population_std(&[0.5]), 0.0, "single net cannot disagree");
-        let std = population_std(&[0.0, 2.0]);
-        assert!((std - 1.0).abs() < 1e-6, "std of [0,2] is 1, got {std}");
-    }
-
-    #[test]
-    fn fitness_std_stop_fires_below_threshold() {
-        let mut engine = engine(&std::env::temp_dir().join("gras-fstd-fire"), 5).unwrap();
-        engine.config.fitness_std_threshold = Some(10.0); // huge ⇒ any std fires
-        engine.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-            .unwrap();
+    /// Seed every live net with a RAW last-step fitness of `v`.
+    fn seed_raw_fitness(engine: &mut RaceEngine, v: f32) {
         for h in engine.state.live_hashes() {
-            engine
-                .rolling_fitness
-                .entry(h)
-                .or_default()
-                .push(0.5);
-        }
-        assert_eq!(engine.check_stop(100), Some(StopReason::FitnessStd));
-    }
-
-    #[test]
-    fn fitness_std_stop_held_by_warmup_guard() {
-        let mut engine = engine(&std::env::temp_dir().join("gras-fstd-warm"), 5).unwrap();
-        engine.config.fitness_std_threshold = Some(10.0);
-        engine.config.fitness_std_min_steps = 50; // not eligible before step 50
-        engine.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            engine.state.record_step(
+                &h,
+                crate::state::state::NetMetrics {
+                    step: 0,
+                    train_loss: 0.0,
+                    eval_loss: None,
+                    fitness: v,
+                    informative: vec![],
+                },
+            )
             .unwrap();
-        for h in engine.state.live_hashes() {
-            engine.rolling_fitness.entry(h).or_default().push(0.5);
         }
-        assert_eq!(engine.check_stop(10), None, "warmup guard holds the stop");
     }
 
     #[test]
-    fn two_stop_criteria_rejected_at_build() {
-        let mut cfg = RaceConfig::defaults();
-        cfg.max_steps = Some(10);
-        cfg.target_score = Some(0.9);
-        let err = crate::engine::config::RaceConfigBuilder::validate_single_stop(&cfg)
-            .unwrap_err();
-        assert!(err.contains("at most ONE stop criterion"), "{err}");
-        assert!(err.contains("max_steps") && err.contains("target_score"), "{err}");
-        // And a single criterion passes:
-        let mut ok = RaceConfig::defaults();
-        ok.max_steps = Some(10);
-        assert!(crate::engine::config::RaceConfigBuilder::validate_single_stop(&ok).is_ok());
+    fn stop_criteria_race_first_fire_wins() {
+        // Two criteria set → both are live; whichever fires first ends the run.
+        // max_steps fires at step 20 while target (2.0) is unreachable — the
+        // step budget must win at its own step because it is checked first.
+        let run_dir = std::env::temp_dir().join("gras-race-steps");
+        let mut eng = engine(&run_dir, 5).unwrap();
+        eng.config.max_steps = Some(20);
+        eng.config.max_target_fitness = Some(-1.0); // unreachable under Minimize (fires when best < target)
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        seed_raw_fitness(&mut eng, 0.5);
+        assert_eq!(eng.check_stop(19), None, "neither has fired yet");
+        assert_eq!(eng.check_stop(20), Some(StopReason::MaxSteps));
+
+        // Reverse the race: target fires first while the step budget is far.
+        let run_dir = std::env::temp_dir().join("gras-race-target");
+        let mut eng = engine(&run_dir, 5).unwrap();
+        eng.config.max_steps = Some(1000);
+        eng.config.max_target_fitness = Some(0.6); // Minimize: fires once best smoothed (0.5) < 0.6
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        seed_raw_fitness(&mut eng, 0.5);
+        assert_eq!(eng.check_stop(10), Some(StopReason::TargetScore));
     }
 
     #[test]
-    #[should_panic(expected = "invalid RaceConfig")]
-    fn build_panics_on_two_stop_criteria() {
-        RaceConfig::builder()
-            .set_max_steps(10)
-            .set_target_score(0.9)
-            .build();
+    fn single_stop_criterion_still_works() {
+        let run_dir = std::env::temp_dir().join("gras-race-single");
+        let mut eng = engine(&run_dir, 5).unwrap();
+        eng.config.max_steps = Some(7);
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        seed_raw_fitness(&mut eng, 0.5);
+        assert_eq!(eng.check_stop(6), None);
+        assert_eq!(eng.check_stop(7), Some(StopReason::MaxSteps));
+    }
+
+    // ── Post-race pruner (pop_pruner) ─────────────────────────────────────
+
+    fn pruned_engine(run_dir: &std::path::Path, seed: u64, keep: usize, solo: usize) -> RaceEngine {
+        let data_dir = tiny_dataset_dir("pruner");
+        let config = RaceConfig {
+            pop_size: 0,
+            elite_count: keep,
+            max_steps: Some(2),
+            pop_pruner: Some(crate::engine::config::PopPruner {
+                method: crate::engine::config::PopPrunerMethod::Hard,
+                steps: solo,
+            }),
+            ..RaceConfig::defaults()
+        };
+        RaceEngine::new(crate::engine::run_spec::RunSpec {
+            data_dir,
+            config,
+            fitness: fitness(),
+            trainer: crate::trainer::TabularTrainer::new(loss_fn()),
+            seed: Some(seed),
+            run_dir: Some(run_dir.to_path_buf()),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn pruner_disabled_stops_at_max_steps() {
+        let run_dir = std::env::temp_dir().join("gras-pruner-off");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let mut eng = engine(&run_dir, 42).unwrap();
+        eng.config.max_steps = Some(2);
+        eng.config.pop_pruner = None;
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)], Some(0.5))
+            .unwrap();
+        let reason = eng.run().unwrap();
+        assert_eq!(reason, StopReason::MaxSteps);
+        assert_eq!(eng.state.live_count(), 3, "pruner off: nobody is culled at stop");
+    }
+
+    #[test]
+    fn pruner_hard_culls_to_elites_and_trains_solo_steps() {
+        let run_dir = std::env::temp_dir().join("gras-pruner-hard");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let mut eng = pruned_engine(&run_dir, 42, 1, 3);
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)], Some(0.5))
+            .unwrap();
+        let reason = eng.run().unwrap();
+        assert_eq!(reason, StopReason::MaxSteps);
+        // Race steps 0..=2 (stop checks fire AFTER the step at max_steps) +
+        // 3 solo steps — the elites trained THROUGH the phase.
+        let live = eng.state.live_hashes();
+        assert_eq!(live.len(), 1, "Hard pruner keeps only the top-1");
+        let survivor = eng.state.net(&live[0]).unwrap();
+        assert_eq!(survivor.step, 3 + 3, "survivor advanced through solo phase");
+        // History recorded the pruner phase too (culls marked `pruned`).
+        let history = std::fs::read_to_string(run_dir.join("history.csv")).unwrap();
+        assert!(history.contains("pruner"), "culls are recorded as pruner attempt rows");
+        for solo_step in [3usize, 4, 5] {
+            assert!(
+                history.contains(&format!("metric,{solo_step},")),
+                "solo step {solo_step} appears as a metric row"
+            );
+        }
+    }
+
+    #[test]
+    fn pruner_keeps_top_elite_count_nets() {
+        let run_dir = std::env::temp_dir().join("gras-pruner-two");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let mut eng = pruned_engine(&run_dir, 42, 2, 1);
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8), tiny_topology(9), tiny_topology(10)], Some(0.5))
+            .unwrap();
+        eng.run().unwrap();
+        assert_eq!(eng.state.live_count(), 2, "elite_count=2 keeps two nets racing");
+    }
+
+    #[test]
+    fn pruner_is_deterministic() {
+        let (dir_a, dir_b) = (
+            std::env::temp_dir().join("gras-pruner-det-a"),
+            std::env::temp_dir().join("gras-pruner-det-b"),
+        );
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let mut a = pruned_engine(&dir_a, 7, 1, 2);
+        let mut b = pruned_engine(&dir_b, 7, 1, 2);
+        let pop = vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)];
+        a.seed_population_internal(pop.clone(), Some(0.5)).unwrap();
+        b.seed_population_internal(pop, Some(0.5)).unwrap();
+        a.run().unwrap();
+        b.run().unwrap();
+        assert_eq!(
+            a.state.live_hashes(),
+            b.state.live_hashes(),
+            "same seed ⇒ same survivor"
+        );
+        let ha = a.state.net(&a.state.live_hashes()[0]).unwrap();
+        let hb = b.state.net(&b.state.live_hashes()[0]).unwrap();
+        assert_eq!(ha.step, hb.step);
+        assert_eq!(ha.last_metrics.as_ref().map(|m| m.fitness), hb.last_metrics.as_ref().map(|m| m.fitness),
+            "same seed ⇒ identical solo trajectory");
     }
 }

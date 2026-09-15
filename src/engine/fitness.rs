@@ -229,7 +229,7 @@ mod tests {
         let pred = net.forward(&x).unwrap();
         let pa = pred.data().argmax(1, false).unwrap().to_i64_vec().unwrap();
         let y = Variable::new(
-            crate::utils::data::one_hot(
+            crate::utils::tabular_data::one_hot(
                 &pa.iter().map(|&v| v as usize).collect::<Vec<_>>(),
                 2,
                 flodl::Device::CPU,

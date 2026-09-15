@@ -11,6 +11,12 @@ use flodl::nn::Optimizer;
 use flodl::tensor::Result;
 use log::{debug, info};
 
+/// Parent-pairing attempts before falling back to a random topology.
+/// Distinct from `crossover_rolls` (rolls per step) and `crossover_retries`
+/// (gate-rejection retries) — this bounds only the draw of fresh parent
+/// PAIRS when no compatible pairing is found.
+const MAX_PARENT_PAIRINGS: usize = 3;
+
 use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
 use crate::graph::topology::Topology;
@@ -140,7 +146,7 @@ impl RaceEngine {
         // burn all 3 attempts on a doomed pairing. Parents persist past the
         // loop only if the LAST attempt used them (for lineage metadata).
         let mut parent_hashes: Vec<String> = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..MAX_PARENT_PAIRINGS {
             // 2. Roulette-select parents — INSIDE the attempt loop: a failed
             //    pairing gets fresh parents, per the design contract.
             let parent_positions: Vec<usize> = (0..n_parents)
@@ -191,14 +197,15 @@ impl RaceEngine {
         let mut child_topo = match child_topo {
             Some(t) => t,
             None => {
-                // 3 attempts failed → fresh random topology, NOT a clone of
-                // the fittest: cloning reinforces the leader and starves
-                // diversity; a random entrant brings new blood. The race
-                // never stalls either way (pop size stays constant).
+                // MAX_PARENT_PAIRINGS exhausted → fresh random topology, NOT a
+                // clone of the fittest: cloning reinforces the leader and
+                // starves diversity; a random entrant brings new blood. The
+                // race never stalls either way (pop size stays constant).
                 if self.verbose_detail() {
                     info!(
-                        "step {} │ crossover produced no child after 3 attempts (fresh parents each, incompatible dims) → random topology fallback",
+                        "step {} │ crossover produced no child after {} parent-pairing attempts (no compatible pivot/dims) → random topology fallback",
                         clock,
+                        MAX_PARENT_PAIRINGS,
                     );
                 }
                 return self.random_child(clock, child_idx);

@@ -10,10 +10,6 @@ use crate::graph::topology::TopologyOptions;
 pub enum StopReason {
     MaxSteps,
     TargetScore,
-    /// Population smoothed-fitness std fell below `fitness_std_threshold`:
-    /// the nets have converged to (near-)identical quality — further steps
-    /// are unlikely to differentiate them.
-    FitnessStd,
     /// A user-supplied `custom_stop` closure returned true (Iter 5 pluggable
     /// contract; consulted after all built-ins).
     CustomStop,
@@ -176,20 +172,9 @@ pub struct RaceConfig {
     pub crossover_ops_pool: Vec<String>,
     /// Max steps before stopping (None = no limit).
     pub max_steps: Option<usize>,
-    /// Target fitness: stop when the best smoothed fitness reaches this
+    /// Max target fitness: stop when the best smoothed fitness reaches this
     /// (None = no target stop). Compared under the fitness direction.
-    pub target_score: Option<f32>,
-    /// Convergence stop: stop when the population's smoothed-fitness std
-    /// falls below this (None = disabled). Low std = the nets agree — they
-    /// are all equally good (converged) or equally stuck (stagnated); either
-    /// way the race has stopped differentiating them. Guarded by
-    /// `fitness_std_min_steps` so an early "everyone equally bad" phase
-    /// cannot trigger it.
-    pub fitness_std_threshold: Option<f32>,
-    /// Minimum step before the fitness-std stop may fire. Default 0 = no
-    /// warmup (eligible immediately) — but the threshold defaults to None,
-    /// so the criterion is fully off unless explicitly enabled.
-    pub fitness_std_min_steps: usize,
+    pub max_target_fitness: Option<f32>,
     // NOTE: the shared batch stream (batch size, split ratio, eval rows) is
     // NOT a RaceConfig knob. It is engine infrastructure, rebuilt each run
     // from the trainer's optional stream_shape() request + the dataset's
@@ -232,6 +217,11 @@ pub struct RaceConfig {
     /// live-net metric rows + evolution attempt rows, typed by the `type` column).
     /// All run settings live in `engine.json`; there is no `options.csv`.
     pub csv_export: bool,
+    /// Post-race pruner. When a stop criterion fires and this is `Some`, the
+    /// engine culls every net except the elite and trains the champion solo
+    /// for `steps` more steps (evolution off, stop criteria off — they are
+    /// evolution-phase concerns). `None` (default) = stop ends the run.
+    pub pop_pruner: Option<PopPruner>,
 }
 
 /// Type alias for the pluggable Iter-5 stop closure.
@@ -240,6 +230,27 @@ pub struct RaceConfig {
 /// it inside its single `RaceConfig`; `RaceConfig` therefore derives neither
 /// `Clone` nor `Debug`.
 pub type StopFn = Option<Box<dyn Fn(&RaceSnapshot) -> bool + Send + Sync + 'static>>;
+
+/// Post-race pruner strategy. `Hard` = when a stop criterion fires, cull the
+/// whole population except the elite and keep training the champion alone
+/// for a fixed number of extra steps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PopPrunerMethod {
+    /// On stop: keep only the elite, train it solo for `pop_pruner_steps`.
+    #[default]
+    Hard,
+}
+
+/// Post-race pruner knob pair. `None` = the pruner is off (a stop reason
+/// ends the run as before). `Some(method)` = after the stop fires, enter the
+/// pruner phase: everything but the elite is culled (recorded as normal
+/// culls) and the elite trains alone for `steps` more steps — outside the
+/// evolution machinery (no crossover, no mutation, no stop checks).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PopPruner {
+    pub method: PopPrunerMethod,
+    pub steps: usize,
+}
 
 /// The run-level context stamped into every net's `meta` block (see
 /// [`crate::state::NetMeta`]). Built once from the header + config at engine
@@ -305,9 +316,7 @@ impl RaceConfig {
             elite_count: 0,
             crossover_ops_pool: Vec::new(),
             max_steps: None,
-            target_score: None,
-            fitness_std_threshold: None,
-            fitness_std_min_steps: 0,
+            max_target_fitness: None,
             hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
             hidden_dim_stride: 16,
             combine_op_pool: Vec::new(),
@@ -321,6 +330,7 @@ impl RaceConfig {
             log_level: LogLevel::default(),
             mode: RunMode::Tabular,
             csv_export: true,
+            pop_pruner: None,
         }
     }
 
@@ -330,6 +340,7 @@ impl RaceConfig {
     pub fn builder() -> RaceConfigBuilder {
         RaceConfigBuilder {
             cfg: RaceConfig::defaults(),
+            pending_pruner: None,
         }
     }
 }
@@ -346,6 +357,11 @@ impl Default for RaceConfig {
 /// the config after `build()`.
 pub struct RaceConfigBuilder {
     cfg: RaceConfig,
+    /// Steps stored by `set_pop_pruner_method` while the pruner switch is
+    /// still off — replayed by `build()` if `set_pop_pruner(true)` comes
+    /// later. Lets users write `.set_pop_pruner_method(Hard, 50)` before or
+    /// after `.set_pop_pruner(true)`.
+    pending_pruner: Option<(PopPrunerMethod, usize)>,
 }
 
 impl RaceConfigBuilder {
@@ -405,24 +421,41 @@ impl RaceConfigBuilder {
     pub fn set_crossover_ops_pool_from_strs(self, ops: &[&str]) -> Self {
         self.set_crossover_ops_pool(ops.iter().map(|s| s.to_string()).collect())
     }
-    pub fn set_max_steps(mut self, n: usize) -> Self {
-        self.cfg.max_steps = Some(n);
+    /// Accepts a bare value or an `Option` (`impl Into<Option<usize>>`), so a
+    /// CLI can forward its flag directly: `.set_max_steps(cli.max_steps)`.
+    pub fn set_max_steps(mut self, n: impl Into<Option<usize>>) -> Self {
+        self.cfg.max_steps = n.into();
         self
     }
-    pub fn set_target_score(mut self, v: f32) -> Self {
-        self.cfg.target_score = Some(v);
+    /// Max target fitness: stop when the best smoothed fitness reaches `v`.
+    /// Only ONE stop criterion may be active.
+    /// Accepts a bare value or an `Option` — see `set_max_steps`.
+    pub fn set_max_target_fitness(mut self, v: impl Into<Option<f32>>) -> Self {
+        self.cfg.max_target_fitness = v.into();
         self
     }
-    /// Convergence stop: fire when the population's smoothed-fitness std
-    /// drops below `v`. Only ONE stop criterion may be active.
-    pub fn set_fitness_std_threshold(mut self, v: f32) -> Self {
-        self.cfg.fitness_std_threshold = Some(v);
+    /// Post-race pruner switch: `true` = when a stop criterion fires, cull
+    /// everything except the top-`elite_count` nets (default 1: the champion)
+    /// and keep training them for `steps` more steps (evolution off, stop
+    /// criteria off). `false` (default) = the stop reason ends the run.
+    pub fn set_pop_pruner(mut self, enabled: bool) -> Self {
+        self.cfg.pop_pruner = enabled.then(|| {
+            let (method, steps) = self
+                .pending_pruner
+                .take()
+                .unwrap_or((PopPrunerMethod::Hard, 0));
+            PopPruner { method, steps }
+        });
         self
     }
-    /// Warmup for the fitness-std stop: earliest step it may fire (default
-    /// 0 = eligible immediately; the threshold being None keeps it off).
-    pub fn set_fitness_std_min_steps(mut self, n: usize) -> Self {
-        self.cfg.fitness_std_min_steps = n;
+    /// Pruner strategy + extra-training step count (the `50` in
+    /// `Hard, 50`). Takes effect only when [`Self::set_pop_pruner`](`true`)
+    /// is also called — either call order works.
+    pub fn set_pop_pruner_method(mut self, method: PopPrunerMethod, steps: usize) -> Self {
+        match self.cfg.pop_pruner.as_mut() {
+            Some(pruner) => *pruner = PopPruner { method, steps },
+            None => self.pending_pruner = Some((method, steps)),
+        }
         self
     }
     pub fn set_hidden_range(mut self, min: usize, max: usize) -> Self {
@@ -491,10 +524,6 @@ impl RaceConfigBuilder {
         self.cfg.topology_options.output_dim = Some(n);
         self
     }
-    pub fn set_topology_seed(mut self, n: usize) -> Self {
-        self.cfg.topology_options.topology_seed = n;
-        self
-    }
     pub fn set_crossover_prob(mut self, v: f32) -> Self {
         self.cfg.crossover_prob = v;
         self
@@ -531,36 +560,23 @@ impl RaceConfigBuilder {
         self.cfg.csv_export = enabled;
         self
     }
-    /// Enforce the one-stop-criterion rule: at most ONE stop budget may be
-    /// active (`max_steps`, `wall_clock_seconds`, `max_culls`,
-    /// `target_score`, `fitness_std_threshold`). A config with two set is a
-    /// bug masquerading as flexibility — the second one to fire would
-    /// silently mask the first's meaning in the stop log. Errors here, at
-    /// build time, not deep in a step.
+    /// Validate the stop-criteria surface. Multiple budgets may coexist —
+    /// first to fire wins (see `check_stop`). Kept as a hook for future
+    /// invariant checks.
     pub(crate) fn validate_single_stop(cfg: &RaceConfig) -> Result<(), String> {
-        let mut set: Vec<&str> = Vec::new();
-        if cfg.max_steps.is_some() {
-            set.push("max_steps");
-        }
-        if cfg.target_score.is_some() {
-            set.push("target_score");
-        }
-        if cfg.fitness_std_threshold.is_some() {
-            set.push("fitness_std_threshold");
-        }
-        if set.len() > 1 {
-            return Err(format!(
-                "at most ONE stop criterion may be set, found {}: {}. \
-                 Pick the one that means what you intend.",
-                set.len(),
-                set.join(", "),
-            ));
-        }
+        let _ = cfg;
         Ok(())
     }
 
-    pub fn build(self) -> RaceConfig {
+    pub fn build(mut self) -> RaceConfig {
         let cfg = self.cfg;
+        // Params set by `set_pop_pruner_method` while the switch was still off:
+        // surfaced loudly (a silent no-op would hide the misconfig).
+        if let Some((method, steps)) = self.pending_pruner.take() {
+            log::warn!(
+                "set_pop_pruner_method({method:?}, {steps}) was called without set_pop_pruner(true) — pruner is OFF"
+            );
+        }
         Self::validate_single_stop(&cfg)
             .unwrap_or_else(|e| panic!("invalid RaceConfig: {e}"));
         cfg
@@ -588,6 +604,8 @@ impl RaceConfig {
             "hardsigmoid" => HardSigmoid,
             "sin" => Sin,
             "cos" => Cos,
+            "softmax" => Softmax,
+            "log_softmax" | "logsoftmax" => LogSoftmax,
             other => return Err(format!("unknown activation '{other}'")),
         })
     }
@@ -633,6 +651,8 @@ impl RaceConfig {
         Ok(match s.to_lowercase().as_str() {
             "identity" => Identity,
             "layernorm" => LayerNorm,
+            "rmsnorm" | "rms_norm" => RmsNorm,
+            "instancenorm" | "instance_norm" => InstanceNorm,
             other => return Err(format!("unknown standardize op '{other}'")),
         })
     }
