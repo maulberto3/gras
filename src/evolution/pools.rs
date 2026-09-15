@@ -24,6 +24,8 @@ pub fn all_activations() -> Vec<Activation> {
         Activation::HardSigmoid,
         Activation::Sin,
         Activation::Cos,
+        Activation::Softmax,
+        Activation::LogSoftmax,
     ]
 }
 
@@ -42,5 +44,10 @@ pub fn all_combine_ops() -> Vec<CombineOp> {
 
 /// All built-in standardize ops.
 pub fn all_standardize_ops() -> Vec<StandardizeOp> {
-    vec![StandardizeOp::Identity, StandardizeOp::LayerNorm]
+    vec![
+        StandardizeOp::Identity,
+        StandardizeOp::LayerNorm,
+        StandardizeOp::RmsNorm,
+        StandardizeOp::InstanceNorm,
+    ]
 }
