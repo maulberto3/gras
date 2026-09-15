@@ -29,7 +29,7 @@ pub mod utils;
 pub use engine::fitness;
 pub use evolution::{crossover, mutation, pools, selection};
 pub use graph::{network, node, topology};
-pub use utils::data;
+pub use utils::tabular_data;
 pub use utils::markdown;
 
 // ── engine — the step-race loop ──────────────────────────────────────
@@ -56,7 +56,7 @@ pub use trainer::{
 };
 
 // ── data ─────────────────────────────────────────────────────────────
-pub use utils::data::{
+pub use utils::tabular_data::{
     DataFormat, Dataset, load_csv_dataset, load_dataset, load_dataset_auto, load_tensor, make_sine,
     make_xor, one_hot, resolve_dataset, save_csv_dataset, save_dataset, save_dataset_as,
     save_tensor,
