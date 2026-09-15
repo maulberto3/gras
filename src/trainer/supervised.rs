@@ -36,6 +36,11 @@ pub struct TabularTrainer {
     pub batch_size: usize,
     /// Custom evaluation batch size requested from the engine stream.
     pub eval_batch_size: usize,
+    /// Optional LR schedule: pure function of the step clock. `None` = fixed
+    /// LR. Wrapped as a closure so any flodl scheduler (or hand math) fits:
+    /// `.with_lr_schedule(move |s| CosineScheduler::new(base, min, total).lr(s))`.
+    /// MUST be a pure function of `step` — see `Trainer::scheduled_lr`.
+    pub lr_schedule: Option<Box<dyn Fn(usize) -> f64 + Send + Sync>>,
 }
 
 impl TabularTrainer {
@@ -72,6 +77,24 @@ impl TabularTrainer {
         self.eval_batch_size = size;
         self
     }
+
+    /// Set an LR schedule: a pure function of the step clock returning the
+    /// learning rate for that step. Wrap any flodl scheduler:
+    ///
+    /// ```ignore
+    /// .with_lr_schedule(move |s| CosineScheduler::new(1e-3, 1e-6, total).lr(s))
+    /// ```
+    ///
+    /// The closure must be deterministic in `step` alone (replay/catch-up
+    /// contract — see `Trainer::scheduled_lr`). `None` (default) keeps the
+    /// optimizer's fixed LR.
+    pub fn with_lr_schedule(
+        mut self,
+        schedule: impl Fn(usize) -> f64 + Send + Sync + 'static,
+    ) -> Self {
+        self.lr_schedule = Some(Box::new(schedule));
+        self
+    }
 }
 
 impl Default for TabularTrainer {
@@ -84,6 +107,7 @@ impl Default for TabularTrainer {
             grad_clip: 1.0,
             batch_size: 16,
             eval_batch_size: 16,
+            lr_schedule: None,
         }
     }
 }
@@ -287,6 +311,10 @@ impl Trainer for TabularTrainer {
         Some(&*self.loss_fn)
     }
 
+    fn scheduled_lr(&self, step: usize) -> Option<f64> {
+        self.lr_schedule.as_ref().map(|f| f(step))
+    }
+
     fn stream_shape(&self) -> Option<crate::trainer::StreamShape> {
         Some(crate::trainer::StreamShape {
             batch_size: self.batch_size,
@@ -312,6 +340,7 @@ impl Trainer for TabularTrainer {
             "grad_clip": self.grad_clip,
             "batch_size": self.batch_size,
             "eval_batch_size": self.eval_batch_size,
+            "lr_schedule": self.lr_schedule.is_some(),
         }))
     }
 
@@ -342,6 +371,11 @@ impl Trainer for TabularTrainer {
             .fold(0u64, |a, b| a.wrapping_add(b as u64));
         seed_step_randomness(ctx.net_seed, step as u64, h);
         let batch: (Tensor, Tensor) = data.train_batch(step as u64)?;
+        // LR schedule first (pure function of step — replay-safe), then the
+        // seeded train step.
+        if let Some(lr) = self.scheduled_lr(step) {
+            optimizer.set_lr(lr);
+        }
         let train_loss = train_one_step(net, optimizer, loss_fn, &batch, self.grad_clip)?;
 
         // Eval on the step's shared eval batch (held-out stream), never the

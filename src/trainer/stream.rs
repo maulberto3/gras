@@ -25,7 +25,7 @@
 use flodl::Tensor;
 use flodl::tensor::Result;
 
-use crate::utils::data::Dataset;
+use crate::utils::tabular_data::Dataset;
 use crate::utils::seed::derive_seed;
 
 /// Per-step eval batches are derived from `run_seed + EVAL_STREAM_OFFSET`,
@@ -60,7 +60,7 @@ impl PoolSplit {
     /// deterministic shuffle. The eval ratio is divided into two halves: the
     /// per-step eval pool and the gating (surprise-exam) pool.
     pub fn new(len: usize, train_eval_split_ratio: f32, seed: u64) -> Self {
-        let (train, rest) = crate::utils::data::split_indices(
+        let (train, rest) = crate::utils::tabular_data::split_indices(
             len,
             1.0 - train_eval_split_ratio,
             train_eval_split_ratio,
@@ -302,7 +302,7 @@ mod tests {
 
     fn small_dataset() -> Dataset {
         // 64 rows, 2 features, 2 classes — deterministic, tiny.
-        crate::utils::data::synthetic_classification(64, 2, 2, 7, Device::CPU).unwrap()
+        crate::utils::tabular_data::synthetic_classification(64, 2, 2, 7, Device::CPU).unwrap()
     }
 
     #[test]

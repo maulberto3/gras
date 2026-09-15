@@ -3,7 +3,7 @@
 
 use crate::graph::network::Network;
 use crate::trainer::stream::BatchStream;
-use crate::utils::data::Dataset;
+use crate::utils::tabular_data::Dataset;
 
 /// The evaluation/metrics report returned by `Trainer::train_step` or
 /// `Trainer::eval_step` at the end of each clock-step.
@@ -113,6 +113,19 @@ pub trait Trainer: Send {
         None
     }
 
+    /// Optional LR schedule: the learning rate to use at `step`, or `None`
+    /// for the optimizer's own (fixed) LR. Applied by the trainer itself at
+    /// the top of `train_step` via `optimizer.set_lr(lr)`.
+    ///
+    /// **Replay contract:** the schedule MUST be a pure function of `step`.
+    /// Catch-up children replay past steps through `train_step`, so a pure
+    /// schedule hands them the exact LR the population saw. A stateful
+    /// schedule (e.g. metrics-driven plateau decay) would advance its state
+    /// on every replay and silently break determinism.
+    fn scheduled_lr(&self, _step: usize) -> Option<f64> {
+        None
+    }
+
     /// The optional batch-shape override requested by the trainer.
     fn stream_shape(&self) -> Option<StreamShape> {
         None
@@ -146,6 +159,9 @@ pub trait Trainer: Send {
 impl Trainer for Box<dyn Trainer> {
     fn loss(&self) -> Option<crate::trainer::LossFn<'_>> {
         self.as_ref().loss()
+    }
+    fn scheduled_lr(&self, step: usize) -> Option<f64> {
+        self.as_ref().scheduled_lr(step)
     }
     fn stream_shape(&self) -> Option<StreamShape> {
         self.as_ref().stream_shape()
