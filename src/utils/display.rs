@@ -45,6 +45,8 @@ impl Display for Activation {
             Activation::HardSigmoid => "hardsigmoid",
             Activation::Sin => "sin",
             Activation::Cos => "cos",
+            Activation::Softmax => "softmax",
+            Activation::LogSoftmax => "log_softmax",
         };
         write!(f, "{name}")
     }
@@ -104,6 +106,8 @@ impl Display for crate::graph::node::StandardizeOp {
         let name = match self {
             crate::graph::node::StandardizeOp::Identity => "identity",
             crate::graph::node::StandardizeOp::LayerNorm => "layernorm",
+            crate::graph::node::StandardizeOp::RmsNorm => "rmsnorm",
+            crate::graph::node::StandardizeOp::InstanceNorm => "instancenorm",
         };
         write!(f, "{name}")
     }

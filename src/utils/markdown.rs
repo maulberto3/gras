@@ -147,5 +147,22 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("\n## Graph\n\n");
     out.push_str(&topology_mermaid(graph));
 
+    // ── Legend — plain-words reasoning guide for every visual above ──
+    // Each visual channel (border, wire, label) encodes one structural
+    // fact; the legend says which, so a reader never has to guess.
+    out.push_str("\n## How to read this\n\n");
+    out.push_str("| You see | It means | How to reason about it |\n");
+    out.push_str("|---|---|---|");
+    out.push_str("\n| **Box border thickness** | the node's `hidden_dim` | A thick border = that node carries a lot of information (wide layer). Thin = narrow layer. Compare borders *within this one net* — they are scaled to this net's min→max dim, not a global scale. |");
+    out.push_str("\n| **Wire thickness** | hop distance of the connection | A thick wire skips far (e.g. H1 → out, jumping over intermediate layers) — a long-range shortcut. Thin wires connect neighbors. Skip-heavy nets mix features from different depths; neighbor-only nets process locally, layer by layer. |");
+    out.push_str("\n| **Box label** | `H<id> <activation> <dim>` | The node's id, its activation function, and its width. E.g. `H3 gelu 48` = hidden node 3, GELU, 48 units. |");
+    out.push_str("\n| **`in <n>` / `out <n>`** | dataset shape | Fixed by the problem: number of features in, classes out. |");
+    out.push_str("\n| **Nodes table → `Sources`** | which outputs feed each node | `n1_o2, n3_o0` = this node reads output 2 of node 1 and output 0 of node 3. Empty (`*`) = orphaned port (nothing connects there). |");
+    out.push_str("\n| **Nodes table → `Combine`** | how a node merges its inputs | `Mean`/`Min`/`Max` — what happens when several wires arrive at one box. |");
+    out.push_str("\n| **Nodes table → `Std`** | per-node standardization | Whether inputs are normalized before combining. |");
+    out.push_str("\n| **Edge list → `<<<<`** | long jump | Same fact as thick wires, in text form: this connection skips over nodes. |");
+    out.push_str("\n| **Wiring diagram → `▶ ◀ *`** | port connection state | ▶ = this output is wired somewhere, ◀ = this input receives something, * = orphaned (unused port — often harmless, sometimes a search artifact). |");
+    out.push_str("\n");
+
     out
 }
