@@ -8,8 +8,11 @@
 //!
 //! Run:
 //! ```bash
-//! cargo bench --bench stream        # or: make benc
-//! cargo flamegraph --bench stream   # symbols come from [profile.bench]
+//! cargo bench --bench stream        # or: make benc — the numbers
+//!
+//! # The flamegraph (graph instead of numbers) — see SETUP.md §4 for the
+//! # full tool setup (perf, paranoid flag, WSL2 quirks):
+//! cargo flamegraph --profile profiling --example flamegraph -- --steps 300 [--evolve]
 //! ```
 //!
 //! No external bench framework: `harness = false` with manual timing and
@@ -31,7 +34,7 @@ use gras::engine::population::initial_population;
 use gras::graph::network::Network;
 use gras::trainer::stream::{BatchStream, PoolSplit};
 use gras::utils::race_steps::{eval_one_step, train_one_step};
-use gras::utils::{data, score};
+use gras::utils::{tabular_data, score};
 
 const SEED: u64 = 42;
 const FEATURES: usize = 64;
@@ -73,7 +76,7 @@ fn main() {
     let topo = initial_population(&config, SEED).remove(0);
 
     for rows in ROW_COUNTS {
-        let ds = data::synthetic_classification(rows, FEATURES, CLASSES, SEED, device).unwrap();
+        let ds = tabular_data::synthetic_classification(rows, FEATURES, CLASSES, SEED, device).unwrap();
         let stream = BatchStream::new(SEED, BATCH, PoolSplit::of(&ds, 0.2, SEED));
 
         // The stream: one train + one eval batch materialization per net per
