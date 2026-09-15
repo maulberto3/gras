@@ -55,10 +55,7 @@ pub struct ConfigSnapshot {
     pub crossover_prob: f32,
     pub mutate_prob: f32,
     /// Stop budgets as configured (`None` = no limit).
-    pub target_score: Option<f32>,
-    /// Convergence stop threshold (None = off) + warmup min-steps.
-    pub fitness_std_threshold: Option<f32>,
-    pub fitness_std_min_steps: usize,
+    pub max_target_fitness: Option<f32>,
     /// Whether a pluggable `custom_stop` closure was installed. The closure is
     /// code, not data, so only its presence is recordable.
     pub has_custom_stop: bool,
@@ -77,6 +74,10 @@ pub struct ConfigSnapshot {
     pub device: String,
     /// Whether the lossless per-step `metrics.csv` was written.
     pub csv_export: bool,
+    /// Post-race pruner: `(method, extra_steps)`. `None` = off. `#[serde(default)]`
+    /// so legacy `engine.json` headers load cleanly.
+    #[serde(default)]
+    pub pop_pruner: Option<(String, usize)>,
 }
 
 impl ConfigSnapshot {
@@ -94,9 +95,7 @@ impl ConfigSnapshot {
             crossover_ops_pool: cfg.crossover_ops_pool.clone(),
             crossover_prob: cfg.crossover_prob,
             mutate_prob: cfg.mutate_prob,
-            target_score: cfg.target_score,
-            fitness_std_threshold: cfg.fitness_std_threshold,
-            fitness_std_min_steps: cfg.fitness_std_min_steps,
+            max_target_fitness: cfg.max_target_fitness,
             has_custom_stop: cfg.custom_stop.is_some(),
             log_level: format!("{:?}", cfg.log_level).to_lowercase(),
             mode: format!("{:?}", cfg.mode).to_lowercase(),
@@ -105,6 +104,7 @@ impl ConfigSnapshot {
             smoothing_window: SMOOTHING_WINDOW,
             device: if cfg!(feature = "cuda") { "cuda:0" } else { "cpu" }.to_string(),
             csv_export: cfg.csv_export,
+            pop_pruner: cfg.pop_pruner.map(|p| (format!("{:?}", p.method).to_lowercase(), p.steps)),
         }
     }
 }
