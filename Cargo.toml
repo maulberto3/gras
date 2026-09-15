@@ -28,6 +28,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+[dev-dependencies]
+comfy-table = "7"
+proptest = "1.11.0"
+dhat = "0.3"
+
 [profile.dev]
 opt-level = 0
 debug = true
@@ -59,8 +64,18 @@ debug = true
 name = "stream"
 harness = false
 
-[dev-dependencies]
-comfy-table = "7"
-proptest = "1.11.0"
-ureq = "3"
-zip = "2"
+# Profiling workload (cargo flamegraph target) — lives with the benches:
+# it answers the same performance questions, just with a graph.
+[[bench]]
+name = "flamegraph"
+harness = false
+
+# Heap-profiled flamegraph workload (dhat-based; CPU/Rust heap — libtorch's
+# C++ arena and CUDA memory are not visible to it).
+[[bench]]
+name = "memgraph"
+harness = false
+# `dhat-heap` is a bench-local virtual feature (no [features] entry); the
+# check linter can't know that, so register it as a known-by-name cfg.
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("dhat-heap"))'] }

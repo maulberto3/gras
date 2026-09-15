@@ -41,22 +41,22 @@ Sets `LIBTORCH_PATH`, `CUDA_HOME`, `LD_LIBRARY_PATH`, `LIBRARY_PATH`,
 
 ## 3. Build / test / run
 
-`gras` is a library + 7 examples — **there is no binary target**, so plain
+`gras` is a library + 8 examples — **there is no binary target**, so plain
 `cargo run` fails. `$GRAS_FEATURES` is `--features cuda` on CUDA, empty on CPU.
 
 ```bash
 cargo build $GRAS_FEATURES --all-targets
 cargo test  $GRAS_FEATURES
-cargo run   $GRAS_FEATURES --example mnist_race
-cargo run   $GRAS_FEATURES --example resume_race
-cargo run   $GRAS_FEATURES --example flamegraph -- --steps 300
+cargo run   $GRAS_FEATURES --release --example mnist -- --steps 100
+cargo run   $GRAS_FEATURES --example train_by_hash -- [RUN_DIR] [NET_HASH]
+cargo run   $GRAS_FEATURES --bench flamegraph -- --steps 300
 cargo bench $GRAS_FEATURES --bench stream
 ```
 
 Verify CUDA actually runs:
 
 ```bash
-source env_setup.sh cuda && cargo run $GRAS_FEATURES --example mnist_race -- --steps 1
+source env_setup.sh cuda && cargo run $GRAS_FEATURES --release -F cuda --example mnist -- --steps 1
 grep '"device"' results/*/engine.json     # expect "cuda:0"
 ```
 
@@ -66,31 +66,38 @@ Clean one target without touching the other: `rm -rf target_cpu/` or `target_cud
 
 | Piece | Use |
 |---|---|
-| `benches/stream.rs` — stream vs train/eval numbers, no profiler needed | `cargo bench --bench stream`, or `make benc` |
-| `examples/flamegraph.rs` — the profiling workload | default = bare group step; `--evolve` adds catch-up replay |
+| `benches/stream.rs` — stream vs train/eval numbers, no profiler needed | `cargo bench --bench stream`, or `make benc` — **start here** |
+| `benches/flamegraph.rs` — the profiling workload | default = bare group step; `--evolve` adds catch-up replay |
 | `[profile.profiling]` / `[profile.bench]` — debug symbols | already in `Cargo.toml` |
 | `make prof` | the capture command below |
 
+The full flow, in order:
+
 ```bash
-# capture tools. WSL2: `uname -r` is a Microsoft kernel with NO Ubuntu package,
-# so do not install linux-tools-$(uname -r) — it fails with "Unable to locate
-# package linux-tools-<ver>-microsoft-standard-WSL2". The generic tools work.
+# 1. capture tools. WSL2: `uname -r` is a Microsoft kernel with NO Ubuntu package,
+#    so do not install linux-tools-$(uname -r) — it fails with "Unable to locate
+#    package linux-tools-<ver>-microsoft-standard-WSL2". The generic tools work.
 sudo apt install -y linux-tools-common linux-tools-generic
 cargo install flamegraph
 
-# WSL2: /usr/bin/perf is a wrapper that refuses the Microsoft kernel version.
-# Point `perf` at the generic binary the package actually installed.
+# 2. WSL2 only: /usr/bin/perf is a wrapper that refuses the Microsoft kernel
+#    version. Point `perf` at the generic binary the package actually installed.
 sudo ln -sf "$(ls -d /usr/lib/linux-tools/*/perf | tail -1)" /usr/local/bin/perf
 perf --version
 
-# allow unprivileged sampling (use 0, not 1)
+# 3. allow unprivileged sampling (use 0, not 1)
 echo 0 | sudo tee /proc/sys/kernel/perf_event_paranoid
 
-# capture → results/prof/flamegraph.svg
+# 4. sanity-check that sampling works BEFORE trusting any graph:
+perf stat -e cpu-clock true     # software event — works without a PMU
+perf stat -e cycles true        # hardware event — WSL2 usually has no PMU
+# If BOTH fail, this machine cannot sample → skip to the fallback below.
+
+# 5. capture → results/prof/flamegraph.svg
 source env_setup.sh
 make prof
 cargo flamegraph --profile profiling -o results/prof/flamegraph.svg \
-  --example flamegraph -- --steps 300 --evolve
+  --bench flamegraph -- --steps 300 --evolve
 ```
 
 Without `-o`, `cargo flamegraph` writes `flamegraph.svg` (and the intermediate
@@ -98,6 +105,11 @@ Without `-o`, `cargo flamegraph` writes `flamegraph.svg` (and the intermediate
 
 `--evolve` adds checkpoint catch-up replay to the profile; omit it to profile
 the bare group step.
+
+**No-PMU fallback** (numbers instead of a graph — works everywhere, incl. WSL2):
+```bash
+cargo bench --bench stream     # or: make benc
+```
 
 Check sampling works before trusting a graph:
 
@@ -112,6 +124,36 @@ without a profiler:
 ```bash
 cargo bench --bench stream     # or: make benc
 ```
+
+### Memory profiling (dhat — Rust heap)
+
+CPU profiles answer "where does time go"; the memory bench answers "where do
+bytes go" — churn (total allocated), peak live, and per-call-site attribution.
+No system install: it's a dev-dependency, same flow as the benches.
+
+```bash
+source env_setup.sh
+cargo bench --bench memgraph -- --steps 300            # headline numbers on stdout
+cargo bench --bench memgraph -- --steps 300 --evolve   # + evolution churn
+cargo bench --bench memgraph -- --steps 300            # writes dhat-heap.json
+```
+
+Then load `dhat-heap.json` into the interactive tree:
+<https://nnethercote.github.io/dh_view/dh_view.html> — same flamegraph idea,
+but allocation bytes instead of samples.
+
+**Scope:** dhat sees the **Rust heap only**. libtorch's C++ tensor arena and
+CUDA memory are invisible; for those use `heaptrack` (intercepts malloc at the
+system level, works out of the box on Linux):
+```bash
+sudo apt install -y heaptrack heaptrack-gui
+heaptrack cargo bench --bench flamegraph -- --steps 300
+heaptrack_gui heaptrack.*.gz
+```
+
+**Read the numbers:** high churn + low peak/churn % = allocation churn (the
+autograd graph rebuild case — flodl arena work); churn ≈ peak = live tensors
+dominate, nothing to tune.
 
 ## 5. Where things live
 

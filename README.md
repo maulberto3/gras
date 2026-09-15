@@ -105,20 +105,29 @@ cargo build $GRAS_FEATURES
 
 ---
 
-## Quick Start Showcase (`examples/mnist_race.rs`)
+## Quick Start Showcase (`examples/mnist.rs`)
 
-We ship a complete, first-class documented showcase example under `examples/mnist_race.rs` illustrating the full capability of the library and config builder.
+We ship a complete, first-class documented showcase example under `examples/mnist.rs` illustrating the full capability of the library and config builder.
 
 ```bash
 # Run the MNIST race showcase on CPU
-source env_setup.sh && cargo run --example mnist_race --release
+source env_setup.sh && cargo run --release --example mnist -- --pop 15 --steps 200 --checkpoint-every 10
 
 # Run on GPU (if CUDA features are enabled)
-source env_setup.sh cuda && cargo run --example mnist_race --release $GRAS_FEATURES
-
-# Custom CLI arguments
-source env_setup.sh && cargo run --example mnist_race --release -- --pop 15 --steps 200 --checkpoint-every 10
+source env_setup.sh cuda && cargo run --release -F cuda --example mnist -- --seed 16 --steps 100
 ```
+
+### CLI Options Showcase
+
+The example supports quick CLI configuration parameters:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--seed N` | random (recorded) | Run seed for 100% reproducible execution |
+| `--pop N` | 20 | Population size (active live networks in the race) |
+| `--steps N` | 10 | Maximum step budget for the race |
+| `--checkpoint-every N` | 10 | Cadence (in steps) of checkpoint gate logs |
+| `--log-level L` | "summ" | Verbosity level (`summ`, `minimal`, `full`, `none`) |
 
 ### CLI Options Showcase
 
@@ -208,11 +217,11 @@ First budget hit cleanly stops the race:
 | Option | Default | Builder method | Description |
 |--------|---------|----------------|-------------|
 | `max_steps` | None | `.set_max_steps(n)` | Total global step budget limit |
-| `target_score` | None | `.set_target_score(v)` | Stop once best network hits this fitness |
-| `fitness_std_threshold` | None | `.set_fitness_std_threshold(v)` | Convergence stop: fire when population smoothed-fitness std < v (all nets equally good or equally stuck) |
-| `fitness_std_min_steps` | 0 | `.set_fitness_std_min_steps(n)` | Warmup for the std stop — earliest step it may fire (protects the early "everyone equally bad" phase) |
+| `max_target_fitness` | None | `.set_max_target_fitness(v)` | Stop once best network hits this fitness |
 
-**One stop criterion at a time.** At most ONE of `max_steps` / `target_score` / `fitness_std_threshold` may be set — `build()` errors otherwise. Two active budgets would silently mask each other in the stop log; pick the one that means what you intend.
+**Stop criteria race each other.** Any combination of `max_steps` / `max_target_fitness` may be set — at every step all set criteria are evaluated in priority order (steps → target) and the **first to fire** ends the run; the stop log names which one fired. With only one set, that criterion is simply the only racer. (`custom_stop` joins the race too, always evaluated last.)
+
+**Post-race pruner (optional).** With `.set_pop_pruner(true)` + `.set_pop_pruner_method(PopPrunerMethod::Hard, steps)`, a stop reason becomes a **transition** instead of an exit: the engine culls every net except the top-`elite_count` (default 1: the champion; each cull is recorded as a `pruner` attempt row + a `pruned` tombstone) and keeps training the survivors for `steps` more steps — same trainer, optimizer state, LR, and shared stream; evolution and stop criteria are off (they are evolution-phase concerns). Every solo step lands in `history.csv` and the survivors' net JSONs like a race step.
 
 ### 2. Genetic Evolution Parameters
 
@@ -289,12 +298,48 @@ which covers **every net that ever lived** (culled ones included, via `metric`
 rows) **and every evolution attempt** (inserted or gate-rejected, via `attempt`
 rows) — not just the surviving frontier.
 
+### Stop summary & champion topology
+
+At stop (any log level), the run writes two extra things:
+
+- **`elite-<hash>.md`** — the champion's (elite rank #1) full topology as
+  Markdown: nodes table, edge list, ASCII wiring diagram, and a Mermaid
+  flowchart. Written unconditionally — it's an artifact, not a log line. In
+  the Mermaid diagram, **box borders scale with the node's `hidden_dim`** and
+  **wire thickness scales with hop distance** (long-range skips render thick).
+- A condensed stop report: frontier snapshot count, the resume command, and
+  the final elite list (top-k by smoothed fitness with origin, birth step,
+  and parameter count).
+
 ### Solo-Net Recovery Tooling (`examples/train_by_hash.rs`)
 Old engines required complex analysis to train an interesting candidate further. In `gras`, simply point our training tool to any run directory and network hash. It will automatically load the blueprint, rebuild the network, replay the batch stream deterministically to restore its weights, and continue training solo:
 
 ```bash
 cargo run --example train_by_hash [RUN_DIR] [NET_HASH]
 ```
+
+---
+
+## Profiling
+
+Numbers-first (no profiler needed — works everywhere, incl. WSL2 without a PMU):
+```bash
+cargo bench --bench stream        # stream vs train/eval cost split
+```
+
+Flamegraph (native Linux, `perf` required — full setup in **SETUP.md §4**):
+```bash
+sudo apt install -y linux-tools-common linux-tools-generic   # generic perf (WSL2-safe)
+cargo install flamegraph
+echo 0 | sudo tee /proc/sys/kernel/perf_event_paranoid        # allow sampling
+
+source env_setup.sh
+cargo flamegraph --profile profiling --bench flamegraph -- --steps 300          # bare group step
+cargo flamegraph --profile profiling --bench flamegraph -- --steps 300 --evolve # + catch-up replay
+```
+The example runs a bounded, self-contained race with logging and file I/O off,
+so the profile shows compute, not formatting. `--evolve` answers the evolution
+path; the default answers the batch-stream question.
 
 ---
 
