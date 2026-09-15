@@ -10,7 +10,7 @@ use std::path::Path;
 
 use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{RaceConfig, RaceEngine};
-use gras::utils::{data, score};
+use gras::utils::{tabular_data, score};
 
 fn main() {
     use std::io::Write;
@@ -29,10 +29,10 @@ fn main() {
     let data_dir = root.join("data/categorical");
     let run_dir = root.join("examples/categorical/run");
     if !data_dir.exists() {
-        let ds = data::synthetic_classification(1024, 16, 4, 42, gras::auto_device()).unwrap();
-        data::save_dataset(&data_dir, &ds).unwrap();
+        let ds = tabular_data::synthetic_classification(1024, 16, 4, 42, gras::auto_device()).unwrap();
+        tabular_data::save_dataset(&data_dir, &ds).unwrap();
     }
-    let peeked = data::resolve_dataset(&data_dir).unwrap();
+    let peeked = tabular_data::resolve_dataset(&data_dir).unwrap();
     let (d_in, d_out) = (
         peeked.inputs.shape()[1] as usize,
         peeked.targets.shape()[1] as usize,

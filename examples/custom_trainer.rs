@@ -40,7 +40,7 @@ use gras::engine::{RaceConfig, RaceEngine};
 use gras::graph::network::Network;
 use gras::graph::topology::TopologyOptions;
 use gras::trainer::{StepContext, StepReport, Trainer};
-use gras::utils::{data, score};
+use gras::utils::{tabular_data, score};
 
 // ── 1. The custom trainer ────────────────────────────────────────────────────
 
@@ -217,13 +217,13 @@ fn main() {
         let ys = [[1.0, 0.0], [0.0, 1.0], [0.0, 1.0], [1.0, 0.0]]; // XOR one-hot
         let flat_x: Vec<f32> = xs.iter().flat_map(|r| r.iter().copied()).collect();
         let flat_y: Vec<f32> = ys.iter().flat_map(|r| r.iter().copied()).collect();
-        let ds = data::Dataset {
+        let ds = tabular_data::Dataset {
             inputs: Tensor::from_f32(&flat_x, &[4, 2], gras::auto_device()).unwrap(),
             targets: Tensor::from_f32(&flat_y, &[4, 2], gras::auto_device()).unwrap(),
         };
-        data::save_dataset(&data_dir, &ds).unwrap();
+        tabular_data::save_dataset(&data_dir, &ds).unwrap();
     }
-    let peeked = data::resolve_dataset(&data_dir).unwrap();
+    let peeked = tabular_data::resolve_dataset(&data_dir).unwrap();
     let _ = &peeked; // dims only; the engine loads the real copy from data_dir
     drop(peeked);
 

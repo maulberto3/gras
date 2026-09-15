@@ -16,8 +16,8 @@ use gras::graph::network::Network;
 use gras::graph::topology::Topology;
 use gras::state::{load_engine_json, load_net_state};
 use gras::trainer::TabularTrainer;
-use gras::utils::{data, score};
-use std::path::{Path, PathBuf};
+use gras::utils::{tabular_data, score};
+use std::path::PathBuf;
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -52,7 +52,7 @@ fn main() {
     let mut net = Network::build(&topo, device).expect("Failed to build network");
 
     // Resolve dataset
-    let dataset = data::resolve_dataset(&data_dir)
+    let dataset = tabular_data::resolve_dataset(&data_dir)
         .expect("Failed to load dataset")
         .to_device(device)
         .expect("Failed to move dataset to device");
@@ -164,8 +164,8 @@ fn setup_demo_run() -> (PathBuf, String, PathBuf) {
     std::fs::create_dir_all(&data_dir).unwrap();
 
     // Use a small input_dim (8) and output_dim (2) for rapid and reliable test execution
-    let ds = data::synthetic_classification(128, 8, 2, 42, gras::auto_device()).unwrap();
-    data::save_dataset(&data_dir, &ds).unwrap();
+    let ds = tabular_data::synthetic_classification(128, 8, 2, 42, gras::auto_device()).unwrap();
+    tabular_data::save_dataset(&data_dir, &ds).unwrap();
 
     let mut topo_opts = gras::graph::topology::TopologyOptions::default();
     topo_opts.input_dim = Some(8);

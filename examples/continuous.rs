@@ -12,7 +12,7 @@ use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{RaceConfig, RaceEngine};
 use gras::graph::topology::TopologyOptions;
-use gras::utils::{data, score};
+use gras::utils::{tabular_data, score};
 
 fn main() {
     use std::io::Write;
@@ -31,11 +31,11 @@ fn main() {
     let data_dir = root.join("data/sine");
     let run_dir = root.join("examples/continuous/run");
     if !data_dir.exists() {
-        let (inputs, targets) = data::make_sine(512); // matches data/sine's shape
-        let ds = data::Dataset { inputs, targets };
-        data::save_dataset(&data_dir, &ds).unwrap();
+        let (inputs, targets) = tabular_data::make_sine(512); // matches data/sine's shape
+        let ds = tabular_data::Dataset { inputs, targets };
+        tabular_data::save_dataset(&data_dir, &ds).unwrap();
     }
-    let peeked = data::resolve_dataset(&data_dir).unwrap();
+    let peeked = tabular_data::resolve_dataset(&data_dir).unwrap();
     let (d_in, d_out) = (
         peeked.inputs.shape()[1] as usize,
         peeked.targets.shape()[1] as usize,
