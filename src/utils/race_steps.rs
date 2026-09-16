@@ -27,6 +27,26 @@ pub fn seed_step_randomness(net_seed: u64, step: u64, call_index: u64) {
     fastrand::seed(mixed);
 }
 
+/// Deterministic train step: seeds the per-(net, step) RNG stream, then runs
+/// [`train_one_step`]. The seeding MUST precede the forward/backward pass for
+/// the replay/catch-up contract to hold (dropout masks identical across
+/// replays) — bundling both into one call makes that ordering impossible to
+/// get wrong at the call site. Custom schemes that manage their own RNG can
+/// call [`train_one_step`] directly.
+pub fn deterministic_train_step(
+    net_seed: u64,
+    step: u64,
+    call_index: u64,
+    net: &mut Network,
+    optimizer: &mut dyn Optimizer,
+    loss_fn: &dyn Fn(&Variable, &Variable) -> Result<Variable>,
+    batch: &(Tensor, Tensor),
+    grad_clip: f32,
+) -> Result<f32> {
+    seed_step_randomness(net_seed, step, call_index);
+    train_one_step(net, optimizer, loss_fn, batch, grad_clip)
+}
+
 /// One train step: forward + loss + backward + optimizer step on a single
 /// batch. Returns the batch's training loss.
 pub fn train_one_step(
@@ -79,9 +99,11 @@ pub fn eval_one_step(
     net.train();
 
     let score = fitness.score(&pred, &y)?;
+    // Each metric scores itself: built-ins via `score_by_label`, custom ones
+    // via their own closure (see `Metric::score`).
     let informative_vals = informative
         .iter()
-        .map(|m| crate::utils::score::score_by_label(m.label(), &pred, &y))
+        .map(|m| m.score(&pred, &y))
         .collect::<Result<Vec<f32>>>()?;
 
     Ok(EvalReport {

@@ -268,7 +268,25 @@ pub fn load_dataset(dir: &Path) -> Result<Dataset> {
 /// 1. `{dir}/flodl_data/inputs.bin` (cached .bin)
 /// 2. `{dir}/inputs.bin` (direct .bin)
 /// 3. `{dir}/inputs.csv` → convert → cache in `{dir}/flodl_data/`
+///
+/// Single-pool contract: `inputs.csv|bin` + `targets.csv|bin` in ONE pool —
+/// the engine splits it internally (train/eval/gating). For a directory with
+/// explicit `train/` + `test/` splits, use [`resolve_train_test_datasets`].
+///
+/// Errors loudly if the directory holds no recognizable dataset — there is
+/// deliberately NO synthetic fallback: silent made-up data corrupts runs.
 pub fn resolve_dataset(dir: &Path) -> Result<Dataset> {
+    resolve_inputs_targets_datasets(dir)
+}
+
+/// Resolve a **single-pool** dataset directory: `inputs.csv|bin` +
+/// `targets.csv|bin` living side by side (the Kaggle-style layout —
+/// `data/kaggle_ev_s6e9/`). First CSV load converts to `.bin` under
+/// `<dir>/flodl_data/` and caches. The engine then splits the pool
+/// internally into train/eval/gating (90/10-style seeded split).
+///
+/// Errors loudly if nothing recognizable is present — no synthetic fallback.
+pub fn resolve_inputs_targets_datasets(dir: &Path) -> Result<Dataset> {
     let cache_dir = dir.join("flodl_data");
 
     // Priority 1: cached .bin
@@ -294,10 +312,66 @@ pub fn resolve_dataset(dir: &Path) -> Result<Dataset> {
         path: dir.display().to_string(),
         source: std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("no inputs.bin or inputs.csv found in {}", dir.display()),
+            format!(
+                "no dataset found in {} — expected inputs.csv|bin + targets.csv|bin (or train/ + test/ subdirs for resolve_train_test_datasets)",
+                dir.display()
+            ),
         ),
     }
     .into())
+}
+
+/// Resolve a **two-split** dataset directory: `train/` and `test/` subdirs,
+/// each holding `inputs.csv|bin` + `targets.csv|bin` (the MNIST-style layout
+/// — `data/mnist/{train,test}/` as produced by `mnist_data.rs`). CSV splits
+/// are converted to `.bin` and cached in each split's own `flodl_data/`.
+///
+/// Returns `(train, test)` as two independent datasets: the engine trains on
+/// the train pool and evaluates on the test pool — no internal reshuffle of
+/// rows between them, so eval rows are genuinely unseen by training.
+///
+/// Errors loudly if either split is missing or unreadable — no synthetic
+/// fallback, a half-present dataset must stop the run before it starts.
+pub fn resolve_train_test_datasets(dir: &Path) -> Result<(Dataset, Dataset)> {
+    let train_dir = dir.join("train");
+    let test_dir = dir.join("test");
+    for sub in [&train_dir, &test_dir] {
+        if !sub.exists() {
+            return Err(DataError::Io {
+                path: sub.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "missing '{}/' split in {} — resolve_train_test_datasets expects {}/train/ and {}/test/ each with inputs.csv|bin + targets.csv|bin",
+                        sub.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+                        dir.display(),
+                        dir.display(),
+                        dir.display()
+                    ),
+                ),
+            }
+            .into());
+        }
+    }
+    let train = resolve_inputs_targets_datasets(&train_dir)?;
+    let test = resolve_inputs_targets_datasets(&test_dir)?;
+    // Feature/target dims must agree across splits — a train/test dim
+    // mismatch would only surface later as a cryptic shape error mid-step.
+    let (ti, tt) = (train.inputs.shape()[1], test.inputs.shape()[1]);
+    if ti != tt {
+        return Err(DataError::Csv(format!(
+            "feature dim mismatch: train inputs have {ti} columns, test inputs have {tt}"
+        ))
+        .into());
+    }
+    let (ti, tt) = (train.targets.shape()[1], test.targets.shape()[1]);
+    if ti != tt {
+        return Err(DataError::Csv(format!(
+            "target dim mismatch: train targets have {ti} columns, test targets have {tt}"
+        ))
+        .into());
+    }
+    Ok((train, test))
 }
 
 /// Load a dataset from CSV files (`inputs.csv` + `targets.csv`).

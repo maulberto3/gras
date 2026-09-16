@@ -31,11 +31,21 @@ pub fn topology_mermaid(graph: &Topology) -> String {
                     node.id,
                     graph.options.input_dim.unwrap_or(1)
                 )
-            }
-            NodeKind::Hidden => {
+            }            NodeKind::Hidden => {
                 let dim = node.hidden_dim.unwrap_or(8);
                 let act = format!("{:#?}", node.activation).to_lowercase();
-                format!("n{}[\"H{} {} {}\"]", node.id, node.id, act, dim)
+                // Full op signature in the label: combine + std + activation + dim.
+                // Kept one-line — Mermaid auto-sizes boxes, so a slightly wider
+                // label is free, but a second line would balloon every box.
+                let combine = node
+                    .combine_op
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "add".into());
+                let std = node
+                    .standardize
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "identity".into());
+                format!("n{}[\"H{} {}·{}·{} {}\"]", node.id, node.id, combine, std, act, dim)
             }
             NodeKind::Output => {
                 format!(
