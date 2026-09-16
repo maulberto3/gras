@@ -58,19 +58,21 @@ pub use trainer::{
 // ── data ─────────────────────────────────────────────────────────────
 pub use utils::tabular_data::{
     DataFormat, Dataset, load_csv_dataset, load_dataset, load_dataset_auto, load_tensor, make_sine,
-    make_xor, one_hot, resolve_dataset, save_csv_dataset, save_dataset, save_dataset_as,
-    save_tensor,
+    make_xor, one_hot, resolve_dataset, resolve_inputs_targets_datasets,
+    resolve_train_test_datasets, save_csv_dataset, save_dataset, save_dataset_as, save_tensor,
 };
 
 // ── scoring helpers ──────────────────────────────────────────────────
 pub use utils::score::{
-    accuracy_score, argmax_classes, cross_entropy_onehot, cross_entropy_onehot_loss, f1_from_vecs,
-    f1_score, l1_loss_score, mse_loss_score, precision_from_vecs, precision_score, r2_score,
-    rmse_score,
+    accuracy_score, argmax_classes, cross_entropy_onehot, cross_entropy_onehot_loss,
+    f1_from_vecs, f1_score, l1_loss_score, label_smoothing_cross_entropy_loss, mse_loss_score,
+    precision_from_vecs, precision_score, r2_score, rmse_score,
 };
 
 // ── step primitives ──────────────────────────────────────────────────
-pub use utils::race_steps::{eval_one_step, seed_step_randomness, train_one_step};
+pub use utils::race_steps::{
+    deterministic_train_step, eval_one_step, seed_step_randomness, train_one_step,
+};
 
 // ── flodl — the tensor backend ───────────────────────────────────────
 pub use flodl::{DType, Device, Variable};
