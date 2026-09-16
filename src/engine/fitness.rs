@@ -102,19 +102,80 @@ pub struct FitnessLabel(pub String);
 /// An informative (non-ranking) metric configured for a run — e.g. "accuracy",
 /// "f1". Carries only its label; the actual per-step values live in
 /// `NetMetrics::informative` (same order as the run's `Vec<Metric>`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Metric(pub String);
+///
+/// Two flavors:
+/// - **Built-in** (`Metric("f1")` / `"f1".into()`): scored by
+///   `score_by_label` — the known-labels dispatcher in `utils/score`.
+/// - **Custom** (`Metric::custom("my_metric", |pred, y| ...)`): your own
+///   closure scores it; the label is used for history.csv/logs. The closure
+///   is code, not data, so engine.json records only the label.
+#[derive(Clone, Default)]
+pub struct Metric {
+    pub label: String,
+    custom: Option<std::sync::Arc<dyn Fn(&Variable, &Variable) -> Result<f32> + Send + Sync>>,
+}
 
 impl Metric {
-    /// Label for logs.
+    /// Built-in metric by label (scored via `score_by_label`).
+    pub fn new(label: impl Into<String>) -> Self {
+        Metric {
+            label: label.into(),
+            custom: None,
+        }
+    }
+
+    /// Custom informative metric: a label + your own scoring closure
+    /// `(pred, target) -> f32`. Recorded by label in engine.json/history.csv,
+    /// scored by the closure at eval time.
+    pub fn custom<F>(label: impl Into<String>, score_fn: F) -> Self
+    where
+        F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
+    {
+        Metric {
+            label: label.into(),
+            custom: Some(std::sync::Arc::new(score_fn)),
+        }
+    }
+
+    /// Label for logs / engine.json / history.csv header.
     pub fn label(&self) -> &str {
-        &self.0
+        &self.label
+    }
+
+    /// Score this metric: the custom closure when present, otherwise the
+    /// built-in `score_by_label` dispatcher (unknown labels error loudly —
+    /// a typo in the run config must surface immediately).
+    pub fn score(&self, pred: &Variable, y: &Variable) -> Result<f32> {
+        match &self.custom {
+            Some(f) => f(pred, y),
+            None => crate::utils::score::score_by_label(&self.label, pred, y),
+        }
     }
 }
 
-impl Default for Metric {
-    fn default() -> Self {
-        Metric("accuracy".to_string())
+impl PartialEq for Metric {
+    fn eq(&self, other: &Self) -> bool {
+        self.label == other.label // closures don't compare; identity is the label
+    }
+}
+
+impl std::fmt::Debug for Metric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Metric")
+            .field("label", &self.label)
+            .field("custom", &self.custom.is_some())
+            .finish()
+    }
+}
+
+impl From<&str> for Metric {
+    fn from(s: &str) -> Self {
+        Metric::new(s)
+    }
+}
+impl From<String> for Metric {
+    fn from(s: String) -> Self {
+        Metric::new(s)
     }
 }
 

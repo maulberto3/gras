@@ -943,6 +943,8 @@ impl RaceEngine {
                 // The champion markdown dump is an ARTIFACT, not a log line —
                 // it must land on disk at every log level, even `None`.
                 self.write_champion_markdown()?;
+                self.write_champion_safetensors()?;
+                self.write_worst_artifacts()?;
                 // `None` mode stays silent until the caller's final stop print.
                 if self.verbose_detail() {
                     info!("── stop ──");
@@ -1036,6 +1038,8 @@ impl RaceEngine {
         }
         if pruner.steps == 0 {
             self.write_champion_markdown()?;
+            self.write_champion_safetensors()?;
+            self.write_worst_artifacts()?;
             if self.verbose_detail() {
                 info!("  pruner phase: 0 steps configured — nothing further to train");
             }
@@ -1060,6 +1064,8 @@ impl RaceEngine {
         }
         let final_step = clock + pruner.steps;
         self.write_champion_markdown()?;
+        self.write_champion_safetensors()?;
+        self.write_worst_artifacts()?;
         if self.verbose_detail() {
             info!(
                 "── pruner phase complete ── trained to step {} ({} solo step(s))",
@@ -1146,22 +1152,13 @@ impl RaceEngine {
     /// is a run artifact (like `nets/<hash>.json` and `history.csv`), not a
     /// log line. Prints a confirmation only when per-step detail is on.
     fn write_champion_markdown(&self) -> Result<()> {
-        let live = self.state.live_hashes();
-        let mut ranked: Vec<(String, f32)> = live // (hash, smoothed fitness)
-            .iter()
-            .filter_map(|h| {
-                let buf = self.rolling_fitness.get(h)?;
-                if buf.is_empty() {
-                    return None;
-                }
-                Some((h.clone(), rolling_mean(buf)))
-            })
-            .collect();
-        let direction = self.fitness.direction();
-        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
+        let ranked = self.rank_live();
         let Some((champ, _)) = ranked.first() else {
             return Ok(()); // nothing ever scored — no champion to dump
         };
+        if !self.config.elite_save_topology {
+            return Ok(());
+        }
         let Some(state) = self.state.net(champ) else {
             return Ok(());
         };
@@ -1184,6 +1181,106 @@ impl RaceEngine {
                     source,
                 }
             ),
+        }
+        Ok(())
+    }
+
+    /// Write the champion's (elite rank #1) weights as `.safetensors` to the
+    /// run dir. UNCONDITIONAL — same artifact discipline as
+    /// [`Self::write_champion_markdown`]: lands on disk at every log level.
+    /// Exports the champion's live in-memory `Network` — byte-faithful
+    /// coefficients, exactly what the race left it with.
+    fn write_champion_safetensors(&self) -> Result<()> {
+        let ranked = self.rank_live();
+        let Some((champ, _)) = ranked.first() else {
+            return Ok(()); // nothing ever scored — no champion to dump
+        };
+        if !self.config.elite_save_safetensors {
+            return Ok(());
+        }
+        let short = &champ[..8.min(champ.len())];
+        let path = self.run_dir.join(format!("elite-{short}.safetensors"));
+        // The champion's live Network is still in memory at stop — export
+        // it directly, no rebuild/replay needed. Its coefficients are the
+        // exact ones the race left it with (byte-faithful by construction).
+        match self.networks.get(champ.as_str()) {
+            Some(net) => {
+                if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
+                    log::warn!("elite safetensors export failed: {e}");
+                } else if self.verbose_detail() {
+                    info!("  champion weights → {} (safetensors)", path.display());
+                }
+            }
+            None => log::warn!("elite safetensors export failed: live network missing"),
+        }
+        Ok(())
+    }
+
+    /// Rank live nets by smoothed fitness, best first. Shared by the elite
+    /// artifact writers and (with `.last()`) the worst-net dump.
+    fn rank_live(&self) -> Vec<(String, f32)> {
+        let mut ranked: Vec<(String, f32)> = self
+            .state
+            .live_hashes()
+            .iter()
+            .filter_map(|h| {
+                let buf = self.rolling_fitness.get(h)?;
+                if buf.is_empty() {
+                    return None;
+                }
+                Some((h.clone(), rolling_mean(buf)))
+            })
+            .collect();
+        let direction = self.fitness.direction();
+        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
+        ranked
+    }
+
+    /// When any `worst_save_*` flag is set: save the WORST live net's
+    /// artifacts too — `worst-<hash>.md` (topology markdown) and/or
+    /// `worst-<hash>.safetensors` (weights), each behind its own flag. Same
+    /// artifact discipline as the elite dumps: unconditional on log level,
+    /// called right after them at every stop path. The anti-champion is the
+    /// net the search avoided — its topology is often the cheapest way to see
+    /// what the fitness signal rejected.
+    fn write_worst_artifacts(&self) -> Result<()> {
+        if !self.config.worst_save_topology && !self.config.worst_save_safetensors {
+            return Ok(());
+        }
+        let ranked = self.rank_live();
+        let Some((worst, _)) = ranked.last() else {
+            return Ok(()); // nothing ever scored — nothing to dump
+        };
+        let short = &worst[..8.min(worst.len())];
+        if self.config.worst_save_topology {
+            if let Some(state) = self.state.net(worst) {
+                if let Ok(topo) = state.topology() {
+                    let path = self.run_dir.join(format!("worst-{short}.md"));
+                    let md = crate::utils::markdown::topology_markdown(&topo, None);
+                    if let Err(source) = std::fs::write(&path, &md) {
+                        log::warn!(
+                            "worst markdown write failed: {}",
+                            crate::utils::error::EngineError::Io {
+                                path: path.display().to_string(),
+                                source,
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        if self.config.worst_save_safetensors {
+            let path = self.run_dir.join(format!("worst-{short}.safetensors"));
+            match self.networks.get(worst.as_str()) {
+                Some(net) => {
+                    if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
+                        log::warn!("worst safetensors export failed: {e}");
+                    } else if self.verbose_detail() {
+                        info!("  worst-net artifacts → worst-{short}.md / .safetensors");
+                    }
+                }
+                None => log::warn!("worst safetensors export failed: live network missing"),
+            }
         }
         Ok(())
     }
@@ -1609,8 +1706,8 @@ impl RaceEngine {
             .collect();
         let checkpoint_count = relevant.len();
         let mut failed_gate: Option<(usize, usize, f32, f32)> = None; // (i+1, chk.step, child, mean)
-        match self.config.crossover_gating {
-            crate::engine::config::CrossoverGating::Hard => {
+        match self.config.crossover_gate {
+            crate::engine::config::CrossoverGate::Hard => {
                 // Evaluate gate-by-gate: replay to each checkpoint, compare.
                 for (i, chk) in &relevant {
                     self.catch_up_range(&mut child, replayed_to, chk.step)?;
@@ -1632,7 +1729,7 @@ impl RaceEngine {
                     }
                 }
             }
-            crate::engine::config::CrossoverGating::Soft => {
+            crate::engine::config::CrossoverGate::Soft => {
                 // One aggregate bar: beat the mean of the checkpoint means.
                 // Replay straight to the last relevant checkpoint, compare once.
                 if let Some((_, last)) = relevant.last() {
@@ -1665,9 +1762,9 @@ impl RaceEngine {
                     "step {} │ crossover child {} rejected by {} gate {}/{} ({}{:.4} vs bar {:.4}) → discarded at step {}, pop unchanged",
                     clock,
                     &child.state.hash[..8],
-                    match self.config.crossover_gating {
-                        crate::engine::config::CrossoverGating::Hard => "hard",
-                        crate::engine::config::CrossoverGating::Soft => "soft",
+                    match self.config.crossover_gate {
+                        crate::engine::config::CrossoverGate::Hard => "hard",
+                        crate::engine::config::CrossoverGate::Soft => "soft",
                     },
                     gate_i,
                     checkpoint_count,
@@ -2130,11 +2227,9 @@ impl RaceEngine {
     /// Check stop criteria at the given step. Returns `Some(reason)` if one
     /// fires, `None` if the run should continue.
     ///
-    /// Any combination of budgets may be set — they RACE each other: at each
-    /// step every set criterion is evaluated in priority order (`max_steps`
-    /// → `max_target_fitness`) and the FIRST to fire ends the run. With only
-    /// one set, that criterion is the only racer. `custom_stop` joins the
-    /// race too, always evaluated last.
+    /// `max_steps` and `max_target_fitness` are mutually exclusive (enforced
+    /// at `build()` — exactly one may be set). `custom_stop` is independent
+    /// and always evaluated last, joining whichever built-in was chosen.
     fn check_stop(&mut self, step: usize) -> Option<StopReason> {
         // 1. Explicit step budget (fires only if set).
         if let Some(max) = self.config.max_steps {
@@ -2532,8 +2627,8 @@ mod tests {
         assert_eq!(cfg.crossover_rolls, 1);
         assert_eq!(cfg.mutate_rolls, 1);
         assert_eq!(
-            cfg.crossover_gating,
-            crate::engine::config::CrossoverGating::Hard
+            cfg.crossover_gate,
+            crate::engine::config::CrossoverGate::Hard
         );
         assert_eq!(
             cfg.crossover_cull_policy,

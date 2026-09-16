@@ -57,7 +57,7 @@ pub enum LogLevel {
 
 /// How strict the checkpoint gate is for a crossover child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum CrossoverGating {
+pub enum CrossoverGate {
     /// **Hard** — the child's smoothed fitness must beat the population's
     /// mean at **every** checkpoint it passes through. Brutal: forces
     /// children that truly outperform the pop at each historical point.
@@ -146,8 +146,8 @@ pub struct RaceConfig {
     /// and inserts a fully-random immigrant (no checkpoint gate).
     pub mutate_rolls: usize,
     /// Checkpoint gate strictness for crossover children (see
-    /// [`CrossoverGating`]).
-    pub crossover_gating: CrossoverGating,
+    /// [`CrossoverGate`]).
+    pub crossover_gate: CrossoverGate,
     /// Extra retries per crossover roll when the gate rejects the child
     /// (`cx_retry_full`). Each retry draws fresh parents and re-runs the full
     /// generate + gate pipeline; the original attempt plus every retry is
@@ -159,11 +159,12 @@ pub struct RaceConfig {
     /// fitness-inverse roulette, regardless of this setting.
     pub crossover_cull_policy: CrossCullPolicy,
     /// Elite guard: the top-k live nets (by smoothed fitness) are immune to
-    /// ALL culls — crossover (any policy) and mutation alike. `0` disables
-    /// the guard (nothing is protected). The effective guard is clamped to
-    /// `live_count − 1` so a cullable victim always exists. Elites still age
-    /// out of the set when their smoothed fitness drops out of the top-k —
-    /// "elite" is a rank, not an identity.
+    /// ALL culls — crossover (any policy) and mutation alike. Minimum 1 (the
+    /// champion is always guarded; the setter clamps lower values up).
+    /// The effective guard is clamped to `live_count − 1` so a cullable
+    /// victim always exists. Elites still age out of the set when their
+    /// smoothed fitness drops out of the top-k — "elite" is a rank, not an
+    /// identity.
     pub elite_count: usize,
     /// Crossover operator pool — which recombination operators the two-parent
     /// path may use (`"one_point"` | `"uniform"`). Drawn uniformly per
@@ -217,11 +218,29 @@ pub struct RaceConfig {
     /// live-net metric rows + evolution attempt rows, typed by the `type` column).
     /// All run settings live in `engine.json`; there is no `options.csv`.
     pub csv_export: bool,
+    /// At stop, save the elite's topology markdown (`elite-<hash>.md`).
+    /// Default true — the champion's blueprint is the run's headline artifact.
+    pub elite_save_topology: bool,
+    /// At stop, save the elite's weights as safetensors
+    /// (`elite-<hash>.safetensors`). Default true.
+    pub elite_save_safetensors: bool,
+    /// At stop, additionally save the WORST live net's artifacts
+    /// (`worst-<hash>.md` + `.safetensors`). Default false — the
+    /// anti-champion is a debugging/curiosity artifact.
+    pub worst_save_topology: bool,
+    /// At stop, additionally save the worst net's weights
+    /// (`worst-<hash>.safetensors`). Default false.
+    pub worst_save_safetensors: bool,
     /// Post-race pruner. When a stop criterion fires and this is `Some`, the
     /// engine culls every net except the elite and trains the champion solo
     /// for `steps` more steps (evolution off, stop criteria off — they are
     /// evolution-phase concerns). `None` (default) = stop ends the run.
     pub pop_pruner: Option<PopPruner>,
+    /// Human label for the experiment, recorded verbatim in `engine.json`
+    /// (`"run_name"`). Purely informative — it does NOT affect the results
+    /// folder name (that stays `results/<run_id>` unless `RunSpec.run_dir`
+    /// is set) — it exists so analysis scripts can group runs by experiment.
+    pub run_name: Option<String>,
 }
 
 /// Type alias for the pluggable Iter-5 stop closure.
@@ -310,10 +329,10 @@ impl RaceConfig {
             checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
             crossover_rolls: 1,
             mutate_rolls: 1,
-            crossover_gating: CrossoverGating::default(),
+            crossover_gate: CrossoverGate::default(),
             crossover_retries: 0,
             crossover_cull_policy: CrossCullPolicy::default(),
-            elite_count: 0,
+            elite_count: 1,
             crossover_ops_pool: Vec::new(),
             max_steps: None,
             max_target_fitness: None,
@@ -330,7 +349,12 @@ impl RaceConfig {
             log_level: LogLevel::default(),
             mode: RunMode::Tabular,
             csv_export: true,
+            elite_save_topology: true,
+            elite_save_safetensors: true,
+            worst_save_topology: false,
+            worst_save_safetensors: false,
             pop_pruner: None,
+            run_name: None,
         }
     }
 
@@ -357,11 +381,10 @@ impl Default for RaceConfig {
 /// the config after `build()`.
 pub struct RaceConfigBuilder {
     cfg: RaceConfig,
-    /// Steps stored by `set_pop_pruner_method` while the pruner switch is
-    /// still off — replayed by `build()` if `set_pop_pruner(true)` comes
-    /// later. Lets users write `.set_pop_pruner_method(Hard, 50)` before or
-    /// after `.set_pop_pruner(true)`.
-    pending_pruner: Option<(PopPrunerMethod, usize)>,
+    /// Pruner params stored by `set_pruner_method`/`set_pruner_steps` while
+    /// the pruner switch is still off — replayed by `build()` if
+    /// `set_pruner_pop(true)` comes later. Either call order works.
+    pending_pruner: Option<PopPruner>,
 }
 
 impl RaceConfigBuilder {
@@ -369,7 +392,7 @@ impl RaceConfigBuilder {
         self.cfg.pop_size = n;
         self
     }
-    pub fn set_checkpoint_every(mut self, n: usize) -> Self {
+    pub fn set_crossover_gate_checkpoint_every(mut self, n: usize) -> Self {
         self.cfg.checkpoint_every = n.max(1);
         self
     }
@@ -381,11 +404,11 @@ impl RaceConfigBuilder {
         self.cfg.mutate_rolls = n;
         self
     }
-    /// Gate strictness for crossover children: `CrossoverGating::Hard` = beat
-    /// every checkpoint mean; `CrossoverGating::Soft` = beat the mean of the
+    /// Gate strictness for crossover children: `CrossoverGate::Hard` = beat
+    /// every checkpoint mean; `CrossoverGate::Soft` = beat the mean of the
     /// checkpoint means.
-    pub fn set_crossover_gating(mut self, mode: CrossoverGating) -> Self {
-        self.cfg.crossover_gating = mode;
+    pub fn set_crossover_gate(mut self, mode: CrossoverGate) -> Self {
+        self.cfg.crossover_gate = mode;
         self
     }
     /// Set how many extra full retries a crossover roll gets after a gate
@@ -405,10 +428,12 @@ impl RaceConfigBuilder {
         self
     }
     /// Elite guard: top-k nets by smoothed fitness are immune to ALL culls
-    /// (crossover and mutation). `0` = no guard (default). Elites hold rank,
+    /// (crossover and mutation). Minimum 1 — the champion is always guarded
+    /// (a race with zero protected nets would let a cull evict the best net
+    /// at any moment, contradicting the elite concept). Elites hold rank,
     /// not identity — a declining net falls out of the set naturally.
     pub fn set_elite_count(mut self, n: usize) -> Self {
-        self.cfg.elite_count = n;
+        self.cfg.elite_count = n.max(1);
         self
     }
     /// Crossover operator pool (`"one_point"` | `"uniform"`). Drawn uniformly
@@ -421,15 +446,16 @@ impl RaceConfigBuilder {
     pub fn set_crossover_ops_pool_from_strs(self, ops: &[&str]) -> Self {
         self.set_crossover_ops_pool(ops.iter().map(|s| s.to_string()).collect())
     }
-    /// Accepts a bare value or an `Option` (`impl Into<Option<usize>>`), so a
-    /// CLI can forward its flag directly: `.set_max_steps(cli.max_steps)`.
+    /// Explicit step budget. Mutually exclusive with
+    /// [`Self::set_max_target_fitness`] — exactly one stop criterion.
+    /// Accepts a bare value or an `Option` (`impl Into<Option<usize>>`).
     pub fn set_max_steps(mut self, n: impl Into<Option<usize>>) -> Self {
         self.cfg.max_steps = n.into();
         self
     }
     /// Max target fitness: stop when the best smoothed fitness reaches `v`.
-    /// Only ONE stop criterion may be active.
-    /// Accepts a bare value or an `Option` — see `set_max_steps`.
+    /// Mutually exclusive with [`Self::set_max_steps`] — exactly one stop
+    /// criterion. Accepts a bare value or an `Option`.
     pub fn set_max_target_fitness(mut self, v: impl Into<Option<f32>>) -> Self {
         self.cfg.max_target_fitness = v.into();
         self
@@ -438,89 +464,112 @@ impl RaceConfigBuilder {
     /// everything except the top-`elite_count` nets (default 1: the champion)
     /// and keep training them for `steps` more steps (evolution off, stop
     /// criteria off). `false` (default) = the stop reason ends the run.
-    pub fn set_pop_pruner(mut self, enabled: bool) -> Self {
+    pub fn set_pruner_pop(mut self, enabled: bool) -> Self {
         self.cfg.pop_pruner = enabled.then(|| {
-            let (method, steps) = self
-                .pending_pruner
-                .take()
-                .unwrap_or((PopPrunerMethod::Hard, 0));
-            PopPruner { method, steps }
+            self.pending_pruner.take().unwrap_or(PopPruner {
+                method: PopPrunerMethod::Hard,
+                steps: 0,
+            })
         });
         self
     }
-    /// Pruner strategy + extra-training step count (the `50` in
-    /// `Hard, 50`). Takes effect only when [`Self::set_pop_pruner`](`true`)
-    /// is also called — either call order works.
-    pub fn set_pop_pruner_method(mut self, method: PopPrunerMethod, steps: usize) -> Self {
+    /// Pruner strategy (`Hard` = keep the elites, plain solo training).
+    /// Takes effect only when [`Self::set_pruner_pop`](`true`) is also
+    /// called — either call order works.
+    pub fn set_pruner_method(mut self, method: PopPrunerMethod) -> Self {
         match self.cfg.pop_pruner.as_mut() {
-            Some(pruner) => *pruner = PopPruner { method, steps },
-            None => self.pending_pruner = Some((method, steps)),
+            Some(pruner) => pruner.method = method,
+            None => {
+                let mut p = self.pending_pruner.take().unwrap_or(PopPruner {
+                    method: PopPrunerMethod::Hard,
+                    steps: 0,
+                });
+                p.method = method;
+                self.pending_pruner = Some(p);
+            }
         }
         self
     }
-    pub fn set_hidden_range(mut self, min: usize, max: usize) -> Self {
+    /// Extra solo-training step count after the stop fires (the `50` in
+    /// `Hard` + 50). Takes effect only when [`Self::set_pruner_pop`](`true`)
+    /// is also called — either call order works.
+    pub fn set_pruner_steps(mut self, steps: usize) -> Self {
+        match self.cfg.pop_pruner.as_mut() {
+            Some(pruner) => pruner.steps = steps,
+            None => {
+                let mut p = self.pending_pruner.take().unwrap_or(PopPruner {
+                    method: PopPrunerMethod::Hard,
+                    steps: 0,
+                });
+                p.steps = steps;
+                self.pending_pruner = Some(p);
+            }
+        }
+        self
+    }
+    pub fn set_network_hidden_dim_range(mut self, min: usize, max: usize) -> Self {
         self.cfg.hidden_dim_pool = Some(min..=max);
         self
     }
-    pub fn set_hidden_dim_stride(mut self, n: usize) -> Self {
+    pub fn set_network_hidden_dim_stride(mut self, n: usize) -> Self {
         self.cfg.hidden_dim_stride = n;
         self
     }
-    pub fn set_combine_op_pool(mut self, pool: Vec<String>) -> Self {
+    pub fn set_network_combine_op_pool(mut self, pool: Vec<String>) -> Self {
         self.cfg.combine_op_pool = pool;
         self
     }
-    pub fn set_combine_ops(self, ops: &[&str]) -> Self {
-        self.set_combine_op_pool(ops.iter().map(|s| s.to_string()).collect())
+    pub fn set_network_combine_ops(self, ops: &[&str]) -> Self {
+        self.set_network_combine_op_pool(ops.iter().map(|s| s.to_string()).collect())
     }
-    pub fn set_activation_pool(mut self, pool: Vec<String>) -> Self {
+    pub fn set_network_activation_pool(mut self, pool: Vec<String>) -> Self {
         self.cfg.activation_pool = pool;
         self
     }
-    pub fn set_activations(self, ops: &[&str]) -> Self {
-        self.set_activation_pool(ops.iter().map(|s| s.to_string()).collect())
+    pub fn set_network_activations(self, ops: &[&str]) -> Self {
+        self.set_network_activation_pool(ops.iter().map(|s| s.to_string()).collect())
     }
-    pub fn set_standardize_op_pool(mut self, pool: Vec<String>) -> Self {
+    pub fn set_network_standardize_op_pool(mut self, pool: Vec<String>) -> Self {
         self.cfg.standardize_op_pool = pool;
         self
     }
-    pub fn set_standardize_ops(self, ops: &[&str]) -> Self {
-        self.set_standardize_op_pool(ops.iter().map(|s| s.to_string()).collect())
+    pub fn set_network_standardize_ops(self, ops: &[&str]) -> Self {
+        self.set_network_standardize_op_pool(ops.iter().map(|s| s.to_string()).collect())
     }
     pub fn set_topology_options(mut self, opts: TopologyOptions) -> Self {
         self.cfg.topology_options = opts;
         self
     }
     // ── individual topology fields (direct, no need to build a full TopologyOptions)
-    pub fn set_min_hidden_num_nodes(mut self, n: usize) -> Self {
+    pub fn set_topology_min_hidden_num_nodes(mut self, n: usize) -> Self {
         self.cfg.topology_options.min_hidden_num_nodes = n;
         self
     }
-    pub fn set_max_hidden_num_nodes(mut self, n: usize) -> Self {
+    pub fn set_topology_max_hidden_num_nodes(mut self, n: usize) -> Self {
         self.cfg.topology_options.max_hidden_num_nodes = n;
         self
     }
-    pub fn set_min_hidden_inputs_per_node(mut self, n: usize) -> Self {
+    pub fn set_topology_min_inputs_per_node(mut self, n: usize) -> Self {
         self.cfg.topology_options.min_hidden_inputs_per_node = n;
         self
     }
-    pub fn set_max_hidden_inputs_per_node(mut self, n: usize) -> Self {
+    pub fn set_topology_max_inputs_per_node(mut self, n: usize) -> Self {
         self.cfg.topology_options.max_hidden_inputs_per_node = n;
         self
     }
-    pub fn set_min_hidden_outputs_per_node(mut self, n: usize) -> Self {
+    pub fn set_topology_min_outputs_per_node(mut self, n: usize) -> Self {
         self.cfg.topology_options.min_hidden_outputs_per_node = n;
         self
     }
-    pub fn set_max_hidden_outputs_per_node(mut self, n: usize) -> Self {
+    pub fn set_topology_max_outputs_per_node(mut self, n: usize) -> Self {
         self.cfg.topology_options.max_hidden_outputs_per_node = n;
         self
     }
-    pub fn set_input_dim(mut self, n: usize) -> Self {
+    pub fn set_network_input_dim(mut self, n: usize) -> Self {
         self.cfg.topology_options.input_dim = Some(n);
         self
     }
-    pub fn set_output_dim(mut self, n: usize) -> Self {
+    pub fn set_network_output_dim(mut self, n: usize) -> Self {
         self.cfg.topology_options.output_dim = Some(n);
         self
     }
@@ -532,9 +581,25 @@ impl RaceConfigBuilder {
         self.cfg.mutate_prob = v;
         self
     }
-    // Propagation strategy when a crossover roll fires but produces no
-    pub fn set_metrics(mut self, metrics: Vec<Metric>) -> Self {
-        self.cfg.metrics = metrics;
+    /// Extra informative (non-ranking) metrics recorded in history.csv.
+    /// Accepts anything that converts into a [`Metric`]: a plain label
+    /// (`"f1"`), a `Metric::new(label)`, or a `Metric::custom(label, closure)`
+    /// with your own scoring function. These NEVER affect selection/culling —
+    /// the ranking fitness is set separately via `Fitness`.
+    pub fn set_additional_metrics<I, M>(mut self, metrics: I) -> Self
+    where
+        I: IntoIterator<Item = M>,
+        M: Into<Metric>,
+    {
+        self.cfg.metrics = metrics.into_iter().map(|m| m.into()).collect();
+        self
+    }
+
+    /// Human label for the experiment, written to `engine.json` as
+    /// `"run_name"`. Informational only — the results folder name is
+    /// unchanged (`results/<run_id>` unless `RunSpec.run_dir` is given).
+    pub fn set_run_name(mut self, name: impl Into<String>) -> Self {
+        self.cfg.run_name = Some(name.into());
         self
     }
     /// Per-step log verbosity: `Summ` (compact one-line rollup) or `Full`
@@ -546,7 +611,7 @@ impl RaceConfigBuilder {
     /// Dropout probability stamped into every new net's topology by the engine
     /// (immigrants + crossover children; the initial population carries its own
     /// `topology_options.dropout_prob` from config construction).
-    pub fn set_dropout_prob(mut self, p: f32) -> Self {
+    pub fn set_network_dropout_prob(mut self, p: f32) -> Self {
         self.cfg.topology_options.dropout_prob = p;
         self
     }
@@ -560,21 +625,53 @@ impl RaceConfigBuilder {
         self.cfg.csv_export = enabled;
         self
     }
-    /// Validate the stop-criteria surface. Multiple budgets may coexist —
-    /// first to fire wins (see `check_stop`). Kept as a hook for future
-    /// invariant checks.
+    /// At stop, save the elite's topology markdown (`elite-<hash>.md`).
+    /// Default true.
+    pub fn set_elite_save_topology(mut self, enabled: bool) -> Self {
+        self.cfg.elite_save_topology = enabled;
+        self
+    }
+    /// At stop, save the elite's weights as safetensors
+    /// (`elite-<hash>.safetensors`). Default true.
+    pub fn set_elite_save_safetensors(mut self, enabled: bool) -> Self {
+        self.cfg.elite_save_safetensors = enabled;
+        self
+    }
+    /// At stop, ALSO save the WORST live net's topology markdown
+    /// (`worst-<hash>.md`), right after the elite's. Useful for diffing what
+    /// the search avoided. Default false.
+    pub fn set_worst_save_topology(mut self, enabled: bool) -> Self {
+        self.cfg.worst_save_topology = enabled;
+        self
+    }
+    /// At stop, ALSO save the worst net's weights as safetensors
+    /// (`worst-<hash>.safetensors`). Default false.
+    pub fn set_worst_save_safetensors(mut self, enabled: bool) -> Self {
+        self.cfg.worst_save_safetensors = enabled;
+        self
+    }
+    /// Validate the stop-criteria surface: `max_steps` and
+    /// `max_target_fitness` are **exclusive** — at most one may be set. Both
+    /// would fight for different things (a budget vs. a quality bar), and
+    /// whichever fires first would silently mask the other.
     pub(crate) fn validate_single_stop(cfg: &RaceConfig) -> Result<(), String> {
-        let _ = cfg;
+        if cfg.max_steps.is_some() && cfg.max_target_fitness.is_some() {
+            return Err(
+                "max_steps and max_target_fitness are mutually exclusive — set only one stop criterion".into(),
+            );
+        }
         Ok(())
     }
 
     pub fn build(mut self) -> RaceConfig {
         let cfg = self.cfg;
-        // Params set by `set_pop_pruner_method` while the switch was still off:
+        // Params set by the pruner setters while the switch was still off:
         // surfaced loudly (a silent no-op would hide the misconfig).
-        if let Some((method, steps)) = self.pending_pruner.take() {
+        if let Some(p) = self.pending_pruner.take() {
             log::warn!(
-                "set_pop_pruner_method({method:?}, {steps}) was called without set_pop_pruner(true) — pruner is OFF"
+                "set_pruner_method({:?})/set_pruner_steps({}) were called without set_pruner_pop(true) — pruner is OFF",
+                p.method,
+                p.steps
             );
         }
         Self::validate_single_stop(&cfg)
