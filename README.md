@@ -107,31 +107,15 @@ cargo build $GRAS_FEATURES
 
 ## Quick Start Showcase (`examples/mnist.rs`)
 
-We ship a complete, first-class documented showcase example under `examples/mnist.rs` illustrating the full capability of the library and config builder.
+We ship a complete, first-class documented showcase example under `examples/mnist.rs` illustrating the full capability of the library and config builder. Examples are CLI-free — every knob is a named constant at the top of the file; edit and run:
 
 ```bash
 # Run the MNIST race showcase on CPU
-source env_setup.sh && cargo run --release --example mnist -- --pop 15 --steps 200 --checkpoint-every 10
+source env_setup.sh && cargo run --release --example mnist
 
 # Run on GPU (if CUDA features are enabled)
-source env_setup.sh cuda && cargo run --release -F cuda --example mnist -- --seed 16 --steps 100
+source env_setup.sh cuda && cargo run --release -F cuda --example mnist
 ```
-
-### CLI Options Showcase
-
-The example supports quick CLI configuration parameters:
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--seed N` | random (recorded) | Run seed for 100% reproducible execution |
-| `--pop N` | 20 | Population size (active live networks in the race) |
-| `--steps N` | 10 | Maximum step budget for the race |
-| `--checkpoint-every N` | 10 | Cadence (in steps) of checkpoint gate logs |
-| `--log-level L` | "summ" | Verbosity level (`summ`, `minimal`, `full`, `none`) |
-
-### CLI Options Showcase
-
-The example supports quick CLI configuration parameters:
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -148,12 +132,12 @@ The example supports quick CLI configuration parameters:
 ```rust
 use gras::engine::{Direction, Fitness, RaceConfig, RaceEngine, RunMode};
 use gras::trainer::TabularTrainer;
-use gras::utils::{data, score};
+use gras::utils::{tabular_data, score};
 
 fn main() -> flodl::tensor::Result<()> {
-    // 1. Resolve dataset
-    let data_dir = std::path::Path::new("data/mnist/train");
-    let dataset = data::resolve_dataset(data_dir)?;
+    // 1. Resolve dataset — the dir must exist (no synthetic fallback)
+    let data_dir = std::path::Path::new("data/mnist"); // train/ + test/ splits
+    let (train, test) = tabular_data::resolve_train_test_datasets(data_dir)?;
 
     // 2. Define Ranking Fitness (engine culling metric)
     let fitness = Fitness::new(
@@ -162,33 +146,32 @@ fn main() -> flodl::tensor::Result<()> {
         "accuracy",
     );
 
-    // 3. Define Supervised Trainer (Adam, linear gradient clipping)
-    let loss_fn = |pred: &gras::Variable, y: &gras::Variable| {
-        score::cross_entropy_onehot_loss(pred, y)
-    };
-    let trainer = TabularTrainer::new(loss_fn)
-        .with_learning_rate(1e-3)
-        .with_grad_clip(1.0);
+    // 3. Define Supervised Trainer (Adam, gradient clipping)
+    let trainer = TabularTrainer::new(|pred, y| {
+        score::label_smoothing_cross_entropy_loss(pred, y, 0.1)
+    })
+    .with_learning_rate(1e-3)
+    .with_grad_clip(1.0);
 
     // 4. Configure the Race
     let config = RaceConfig::builder()
         .set_pop_size(10)
         .set_max_steps(100)
-        .set_checkpoint_every(10)
-        
-        // --- Operation Pools (Pristine, Boilerplate-free String slice API!) ---
-        .set_combine_ops(&["Mean", "Min", "Max"])
-        .set_activations(&["ReLU", "SELU", "GELU"])
-        .set_standardize_ops(&["Identity"])
-        
+        .set_crossover_gate_checkpoint_every(10)
+
+        // --- Operation Pools (boilerplate-free &[&str] API) ---
+        .set_network_combine_ops(&["Mean", "Min", "Max"])
+        .set_network_activations(&["ReLU", "SELU", "GELU"])
+        .set_network_standardize_ops(&["Identity"])
+
         // --- Gating, Mode & Sidecar exports ---
-        .set_crossover_gating(gras::engine::config::CrossoverGating::Soft) // Checkpoint gate strictness for crossover children
+        .set_crossover_gate(gras::engine::config::CrossoverGate::Soft) // Checkpoint gate strictness for crossover children
         .set_mode(RunMode::Tabular)                       // Paradigm mode
         .set_csv_export(true)                             // Writes the history.csv unified event log (metric + attempt rows)
-        
+
         // --- Structural Constraints ---
-        .set_min_hidden_num_nodes(5)
-        .set_max_hidden_num_nodes(10)
+        .set_topology_min_hidden_num_nodes(5)
+        .set_topology_max_hidden_num_nodes(10)
         .build();
 
     // 5. Build and Run the RaceEngine
@@ -219,21 +202,22 @@ First budget hit cleanly stops the race:
 | `max_steps` | None | `.set_max_steps(n)` | Total global step budget limit |
 | `max_target_fitness` | None | `.set_max_target_fitness(v)` | Stop once best network hits this fitness |
 
-**Stop criteria race each other.** Any combination of `max_steps` / `max_target_fitness` may be set — at every step all set criteria are evaluated in priority order (steps → target) and the **first to fire** ends the run; the stop log names which one fired. With only one set, that criterion is simply the only racer. (`custom_stop` joins the race too, always evaluated last.)
+**Stop criteria are mutually exclusive.** Set exactly ONE of `max_steps` or `max_target_fitness` — both would fight for different things (a step budget vs. a quality bar), so the engine rejects a config with both (`build()` panics with a clear message). `custom_stop` is independent and always evaluated last, joining whichever criterion you picked.
 
-**Post-race pruner (optional).** With `.set_pop_pruner(true)` + `.set_pop_pruner_method(PopPrunerMethod::Hard, steps)`, a stop reason becomes a **transition** instead of an exit: the engine culls every net except the top-`elite_count` (default 1: the champion; each cull is recorded as a `pruner` attempt row + a `pruned` tombstone) and keeps training the survivors for `steps` more steps — same trainer, optimizer state, LR, and shared stream; evolution and stop criteria are off (they are evolution-phase concerns). Every solo step lands in `history.csv` and the survivors' net JSONs like a race step.
+**Post-race pruner (optional).** With `.set_pruner_pop(true)` + `.set_pruner_method(PopPrunerMethod::Hard)` + `.set_pruner_steps(steps)`, a stop reason becomes a **transition** instead of an exit: the engine culls every net except the top-`elite_count` (default 1: the champion; each cull is recorded as a `pruner` attempt row + a `pruned` tombstone) and keeps training the survivors for `steps` more steps — same trainer, optimizer state, LR, and shared stream; evolution and stop criteria are off (they are evolution-phase concerns). Every solo step lands in `history.csv` and the survivors' net JSONs like a race step.
 
 ### 2. Genetic Evolution Parameters
 
 | Option | Default | Builder method | Description |
 |--------|---------|----------------|-------------|
 | `pop_size` | 5 | `.set_pop_size(n)` | Number of active networks in population |
-| `checkpoint_every` | 10 | `.set_checkpoint_every(n)` | Step cadence of ledger checkpoints |
+| `checkpoint_every` | 10 | `.set_crossover_gate_checkpoint_every(n)` | Step cadence of gate checkpoints (feeds the crossover gate bars) |
 | `crossover_rolls` | 1 | `.set_crossover_rolls(n)` | Crossover attempts rolled per step |
 | `crossover_retries` | 0 | `.set_crossover_retries(n)` | Extra full retries per crossover roll after a gate rejection (fresh parents + generate + gate each retry; every attempt recorded in `history.csv`) |
 | `mutate_rolls` | 1 | `.set_mutate_rolls(n)` | Immigrant rolls processed per step |
 | `crossover_prob` | 0.5 | `.set_crossover_prob(v)` | Crossover execution probability |
 | `mutate_prob` | 0.2 | `.set_mutate_prob(v)` | Mutation execution probability |
+| `elite_count` | 1 | `.set_elite_count(k)` | Elite guard size: top-k nets immune to ALL culls (minimum 1 — the champion is always guarded). Elites hold rank, not identity |
 
 ---
 
@@ -262,6 +246,28 @@ Contract rules enforced at runtime:
 2. **In-place updates** — The engine owns the networks in memory; you borrow, apply gradients, and return.
 
 We ship `TabularTrainer` out of the box as a reference recipe, and `examples/custom_trainer.rs` showcases momentum, linear warmup schedules, and delayed evaluation strategies.
+
+---
+
+## Data Contract — Two Resolvers
+
+Point the engine at a data directory; one of two layouts must be present
+(**no synthetic fallback** — a missing/invalid dataset fails loudly at start,
+never silently trains on made-up data):
+
+**1. `resolve_train_test_datasets(dir)` — explicit splits (MNIST-style).**
+The directory holds `train/` and `test/` subdirs, each with `inputs.csv|bin`
++ `targets.csv|bin` (what `data/mnist_data.rs` produces). Train rows come
+only from `train/`, eval rows only from `test/` — eval is genuinely unseen.
+
+**2. `resolve_inputs_targets_datasets(dir)` — single pool (Kaggle-style).**
+The directory holds `inputs.csv|bin` + `targets.csv|bin` side by side. The
+engine splits the pool internally with a seeded shuffle into
+train/eval/gating pools. (`resolve_dataset` is an alias for this.)
+
+CSV is converted to the native `.bin` format on first load and cached under
+`<dir>/flodl_data/` — subsequent runs load bins directly. See
+`data/kaggle_ev_s6e9/DATA.md` for a worked external-data recipe.
 
 ---
 
@@ -300,13 +306,24 @@ rows) — not just the surviving frontier.
 
 ### Stop summary & champion topology
 
-At stop (any log level), the run writes two extra things:
+At stop (any log level), the run writes extra things:
 
 - **`elite-<hash>.md`** — the champion's (elite rank #1) full topology as
   Markdown: nodes table, edge list, ASCII wiring diagram, and a Mermaid
   flowchart. Written unconditionally — it's an artifact, not a log line. In
-  the Mermaid diagram, **box borders scale with the node's `hidden_dim`** and
-  **wire thickness scales with hop distance** (long-range skips render thick).
+  the Mermaid diagram, each hidden node's label carries its full op signature
+  (`combine·std·activation dim`, e.g. `H1 add·layernorm·gelu 32`), **box
+  borders scale with the node's `hidden_dim`** and **wire thickness scales
+  with hop distance** (long-range skips render thick).
+- **`elite-<hash>.safetensors`** — the champion's trained weights in the
+  Hugging Face safetensors format (PyTorch loads it natively:
+  `safetensors.torch.load_file`). One `node<N>.weight`/`node<N>.bias` pair
+  per graph node. Also unconditional. For any OTHER net (tombstones
+  included), export via the example:
+  `cargo run --example export_champion -- <run_dir> <full-hash> <data_dir>`
+  (rebuilds + replays the net's history through the deterministic stream).
+  No training ever happens in Python — the format is weights-out for
+  external verification/reuse only.
 - A condensed stop report: frontier snapshot count, the resume command, and
   the final elite list (top-k by smoothed fitness with origin, birth step,
   and parameter count).
