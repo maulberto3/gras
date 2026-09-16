@@ -10,7 +10,7 @@
 
 use crate::graph::network::Network;
 use crate::trainer::{StepContext, StepReport, Trainer};
-use crate::utils::race_steps::{eval_one_step, seed_step_randomness, train_one_step};
+use crate::utils::race_steps::{deterministic_train_step, eval_one_step};
 use flodl::nn::optim::Optimizer;
 use flodl::tensor::Result;
 use flodl::{Tensor, Variable};
@@ -170,7 +170,7 @@ impl Trainer for RlTrainer {
     ) -> Result<StepReport> {
         // TODO: run one env step / policy update. Seed per (net, step) for
         // catch-up parity:
-        //   crate::utils::race_steps::seed_step_randomness(ctx.net_seed, step as u64, 0);
+        //   crate::utils::race_steps::deterministic_train_step(ctx.net_seed, step as u64, 0, net, optimizer, &loss_fn, &batch, grad_clip)?;
         // Score fitness from your reward signal (not from ctx.fitness):
         let fitness = 0.0_f32; // TODO: your reward → fitness mapping
         Ok(StepReport {
@@ -233,7 +233,7 @@ impl Trainer for ImageTrainer {
     ) -> Result<StepReport> {
         // TODO: draw `ctx.data.train_batch(step)`, augment, train.
         // Seed per (net, step):
-        //   crate::utils::race_steps::seed_step_randomness(ctx.net_seed, step as u64, 0);
+        //   crate::utils::race_steps::deterministic_train_step(ctx.net_seed, step as u64, 0, net, optimizer, &loss_fn, &batch, grad_clip)?;
         let fitness = 0.0_f32; // TODO
         Ok(StepReport {
             train_loss: 0.0,
@@ -293,7 +293,7 @@ impl Trainer for NlpTrainer {
     ) -> Result<StepReport> {
         // TODO: draw sequences, train one step, score.
         // Seed per (net, step):
-        //   crate::utils::race_steps::seed_step_randomness(ctx.net_seed, step as u64, 0);
+        //   crate::utils::race_steps::deterministic_train_step(ctx.net_seed, step as u64, 0, net, optimizer, &loss_fn, &batch, grad_clip)?;
         let fitness = 0.0_f32; // TODO
         Ok(StepReport {
             train_loss: 0.0,
@@ -363,20 +363,28 @@ impl Trainer for TabularTrainer {
             .expect("TabularTrainer requires a fitness function");
         let loss_fn: crate::trainer::LossFn<'_> = &*self.loss_fn; // our own loss
 
-        // Same seeding the engine did inline: net seed + step clock, hashed
-        // with the net's hash so each net sees distinct dropout at one step.
+        // call_index = hash of the net's name, so each net sees distinct
+        // dropout at one step (live nets vs catching-up children too).
         let h: u64 = ctx
             .net_hash
             .bytes()
             .fold(0u64, |a, b| a.wrapping_add(b as u64));
-        seed_step_randomness(ctx.net_seed, step as u64, h);
         let batch: (Tensor, Tensor) = data.train_batch(step as u64)?;
         // LR schedule first (pure function of step — replay-safe), then the
-        // seeded train step.
+        // deterministic train step (seeds the RNG, then forward/backward).
         if let Some(lr) = self.scheduled_lr(step) {
             optimizer.set_lr(lr);
         }
-        let train_loss = train_one_step(net, optimizer, loss_fn, &batch, self.grad_clip)?;
+        let train_loss = deterministic_train_step(
+            ctx.net_seed,
+            step as u64,
+            h,
+            net,
+            optimizer,
+            loss_fn,
+            &batch,
+            self.grad_clip,
+        )?;
 
         // Eval on the step's shared eval batch (held-out stream), never the
         // train batch — this must mirror catch-up exactly.
