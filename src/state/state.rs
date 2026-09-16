@@ -42,7 +42,7 @@ pub struct ConfigSnapshot {
     pub crossover_rolls: usize,
     pub mutate_rolls: usize,
     /// Checkpoint gate strictness (`"hard"` | `"soft"`).
-    pub crossover_gating: String,
+    pub crossover_gate: String,
     /// Extra gate-aware retries per crossover roll (0 = none).
     pub crossover_retries: usize,
     /// Crossover replacement policy (`"worst"` | `"random"`). Crossover-only:
@@ -78,6 +78,9 @@ pub struct ConfigSnapshot {
     /// so legacy `engine.json` headers load cleanly.
     #[serde(default)]
     pub pop_pruner: Option<(String, usize)>,
+    /// Human label for the experiment (`set_run_name`), verbatim. Purely
+    /// informative — never affects the results folder name.
+    pub run_name: Option<String>,
 }
 
 impl ConfigSnapshot {
@@ -88,7 +91,7 @@ impl ConfigSnapshot {
             checkpoint_every: cfg.checkpoint_every,
             crossover_rolls: cfg.crossover_rolls,
             mutate_rolls: cfg.mutate_rolls,
-            crossover_gating: format!("{:?}", cfg.crossover_gating).to_lowercase(),
+            crossover_gate: format!("{:?}", cfg.crossover_gate).to_lowercase(),
             crossover_retries: cfg.crossover_retries,
             crossover_cull_policy: format!("{:?}", cfg.crossover_cull_policy).to_lowercase(),
             elite_count: cfg.elite_count,
@@ -105,6 +108,7 @@ impl ConfigSnapshot {
             device: if cfg!(feature = "cuda") { "cuda:0" } else { "cpu" }.to_string(),
             csv_export: cfg.csv_export,
             pop_pruner: cfg.pop_pruner.map(|p| (format!("{:?}", p.method).to_lowercase(), p.steps)),
+            run_name: cfg.run_name.clone(),
         }
     }
 }
@@ -862,7 +866,7 @@ mod tests {
             combine_op_pool: vec!["Mean".into(), "Min".into()],
             activation_pool: vec!["ReLU".into(), "SELU".into()],
             standardize_op_pool: vec!["Identity".into()],
-            informative_metrics: vec![Metric("dummy".to_string())],
+            informative_metrics: vec![Metric::new("dummy")],
             max_steps: Some(10_000),
             train_eval_split_ratio: Some(0.2),
             held_out_eval_rows: Some(256),
