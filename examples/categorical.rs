@@ -42,7 +42,7 @@ fn main() {
     // 2. Fitness — accuracy, maximize. Informative metrics ride along but
     //    never drive ranking/culling.
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
-    let metrics = vec![Metric("f1".into())];
+    let metrics = vec![Metric::new("f1")];
 
     // 3. Config — budgets inactive unless set; here a step budget only.
     //    Topology dims must match the dataset (16 features → 4 classes).
@@ -52,9 +52,9 @@ fn main() {
     let config = RaceConfig::builder()
         .set_pop_size(6)
         .set_max_steps(50)
-        .set_hidden_range(4, 8)
+        .set_network_hidden_dim_range(4, 8)
         .set_topology_options(topo_opts)
-        .set_metrics(metrics.clone())
+        .set_additional_metrics(metrics.clone())
         .build();
 
     // 4. Run — one RunSpec; the cross-entropy loss lives inside the trainer.

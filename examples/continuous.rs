@@ -44,7 +44,7 @@ fn main() {
 
     // 2. Fitness — MSE under Minimize (lower = better).
     let fitness = Fitness::new(score::mse_loss_score, Direction::Minimize, "mse");
-    let metrics = vec![Metric("mae".into())];
+    let metrics = vec![Metric::new("mae")];
 
     // 3. Topology — 1 input feature, 1 output value.
     let mut topo_opts = TopologyOptions::default();
@@ -55,9 +55,9 @@ fn main() {
     let config = RaceConfig::builder()
         .set_pop_size(6)
         .set_max_steps(50)
-        .set_hidden_range(4, 8)
+        .set_network_hidden_dim_range(4, 8)
         .set_topology_options(topo_opts)
-        .set_metrics(metrics.clone())
+        .set_additional_metrics(metrics.clone())
         .build();
 
     // 5. Run — one RunSpec: data_dir + config + fitness + trainer + seed.

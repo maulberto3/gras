@@ -231,7 +231,7 @@ fn main() {
     // is engine business (drives cull/insert ranking).
     let loss_fn = |pred: &Variable, y: &Variable| score::cross_entropy_onehot_loss(pred, y);
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
-    let metrics = vec![Metric("accuracy".into())];
+    let metrics = vec![Metric::new("accuracy")];
 
     // Topology — 2 features in, 2 one-hot classes out.
     let mut topo_opts = TopologyOptions::default();
@@ -245,9 +245,9 @@ fn main() {
     let config = RaceConfig::builder()
         .set_pop_size(4)
         .set_max_steps(30)
-        .set_checkpoint_every(5)
+        .set_crossover_gate_checkpoint_every(5)
         .set_topology_options(topo_opts)
-        .set_metrics(metrics.clone())
+        .set_additional_metrics(metrics.clone())
         .build();
 
     // Run — the ONLY difference from a default run is the trainer argument:
