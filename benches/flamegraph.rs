@@ -75,12 +75,12 @@ fn main() {
     let mut builder = RaceConfig::builder()
         .set_pop_size(POP)
         .set_max_steps(steps)
-        .set_hidden_range(4, 16)
+        .set_network_hidden_dim_range(4, 16)
         .set_topology_options(topo_opts)
         .set_log_level(LogLevel::None)
         // No checkpoint inside the run ⇒ no nets/*.json or checkpoints.json
         // writes, and no history.csv flush, to pollute the profile.
-        .set_checkpoint_every(steps + 1);
+        .set_crossover_gate_checkpoint_every(steps + 1);
 
     if evolve {
         builder = builder.set_crossover_rolls(1).set_mutate_rolls(1);
