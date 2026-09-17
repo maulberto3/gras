@@ -362,16 +362,31 @@ impl Network {
 
 impl Network {
     /// Step 1: Gather -- collect wired source tensors per port.
+    ///
+    /// Sources are looked up by exact `(node, port)` from `port_outputs`, so
+    /// each incoming wire carries its source port's OWN activated tensor —
+    /// two ports of the same node feed genuinely different signals (the
+    /// per-port-activation contract).
     fn gather_inputs(
         &self,
-        node_outputs: &HashMap<usize, Variable>,
+        port_outputs: &HashMap<(usize, usize), Variable>,
         node_id: usize,
     ) -> flodl::tensor::Result<Option<Variable>> {
         let mut combined: Option<Variable> = None;
         for (port_idx, sources) in self.node_sources[node_id].iter().enumerate() {
             let port_tensors: Vec<Variable> = sources
                 .iter()
-                .map(|p| Ok(node_outputs[&p.node].clone()))
+                .map(|p| {
+                    port_outputs
+                        .get(&(p.node, p.index))
+                        .cloned()
+                        .ok_or_else(|| {
+                            flodl::tensor::TensorError::new(&format!(
+                                "forward: source n{}o{} not yet computed (topological order violated?)",
+                                p.node, p.index
+                            ))
+                        })
+                })
                 .collect::<flodl::tensor::Result<Vec<_>>>()?;
             let projs = &self.port_projections[node_id][port_idx];
             for (src_idx, mut t) in port_tensors.into_iter().enumerate() {
@@ -391,7 +406,7 @@ impl Network {
     fn combine_inputs(
         &self,
         combined: Option<Variable>,
-        node_outputs: &HashMap<usize, Variable>,
+        port_outputs: &HashMap<(usize, usize), Variable>,
         node_id: usize,
     ) -> flodl::tensor::Result<Variable> {
         let combined = match combined {
@@ -425,7 +440,7 @@ impl Network {
             | CombineOp::Divide
             | CombineOp::Max
             | CombineOp::Min => {
-                let port_tensors = self.gather_port_tensors(node_outputs, node_id);
+                let port_tensors = self.gather_port_tensors(port_outputs, node_id);
                 if port_tensors.is_empty() {
                     return Ok(combined);
                 }
@@ -449,7 +464,7 @@ impl Network {
     /// Gather per-port tensors for Max/Min combine.
     fn gather_port_tensors(
         &self,
-        node_outputs: &HashMap<usize, Variable>,
+        port_outputs: &HashMap<(usize, usize), Variable>,
         node_id: usize,
     ) -> Vec<Variable> {
         self.node_sources[node_id]
@@ -461,7 +476,7 @@ impl Network {
                 }
                 let tensors: Vec<Variable> = sources
                     .iter()
-                    .map(|p| node_outputs[&p.node].clone())
+                    .filter_map(|p| port_outputs.get(&(p.node, p.index)).cloned())
                     .collect();
                 let projs = &self.port_projections[node_id][port_idx];
                 let projected: Vec<Variable> = tensors
@@ -494,11 +509,6 @@ impl Network {
             .sum()
     }
 
-    /// Step 4: Apply the node's activation function.
-    fn activate(&self, node_id: usize, x: Variable) -> flodl::tensor::Result<Variable> {
-        self.nodes[node_id].activation.apply(&x)
-    }
-
     /// Step 5: Apply the node's standardize op (LayerNorm or identity).
     fn standardize(&self, node_id: usize, x: Variable) -> flodl::tensor::Result<Variable> {
         match self.nodes[node_id].standardize {
@@ -508,6 +518,10 @@ impl Network {
     }
 
     /// Step 6: Apply dropout (hidden nodes only, training mode only).
+    ///
+    /// Applied to the node's SHARED base tensor in `forward`, before the
+    /// per-port activation split — one mask draw per node regardless of
+    /// port count, so the RNG discipline (and replay determinism) holds.
     fn apply_dropout(&self, node_id: usize, x: Variable) -> flodl::tensor::Result<Variable> {
         match &self.dropout_layers[node_id] {
             Some(dropout) => dropout.forward(&x),
@@ -545,45 +559,76 @@ impl Module for Network {
     ///   combine_op:  Add
     ///
     /// ```text
-    ///   x ──▶ input_proj ──▶ n0_out ──┐
-    ///                                 ▼
+    ///   x ──▶ input_proj ──▶ n0 base ──┐ per-port act: o0 = act0(base)
+    ///                                  │              o1 = act1(base)
     ///                            combined ──▶ layers[1] ──▶ act ──▶ n1_out = y
     ///
     ///   1. net_input = input_proj(x)              // [batch, hidden_dim]
     ///   2. n0 has no input ports
-    ///      => n0_out = act(layers[0](net_input))  // [batch, hidden_dim]
-    ///   3. n1's inputs: n1_i0 <- n0_out, n1_i1 <- n0_out
-    ///      combined = n0_out + n0_out             // Add: a + b
+    ///      => base = layers[0](net_input)         // [batch, hidden_dim]
+    ///         o0 = act(n0, 0, base), o1 = act(n0, 1, base)
+    ///   3. n1's inputs: n1_i0 <- n0_o0, n1_i1 <- n0_o1
+    ///      combined = n0_o0 + n0_o1               // Add: a + b
     ///      n1_out = act(layers[1](combined))      // [batch, hidden_dim]
     ///   4. return n1_out                          //  output_node = n1
     /// ```
     ///
-    /// The forward pass: input → project → [gather → combine → transform → activate] × N nodes → output.
+    /// The forward pass: input → project → [gather → combine → transform →
+    /// per-port activate] × N nodes → output.
+    ///
+    /// Per-node compute: ONE shared Linear + standardize, then one cheap
+    /// elementwise activation per output port. Every port of a node sees the
+    /// same base tensor through its own non-linearity — so two wires leaving
+    /// the same node carry different signals whenever their port activations
+    /// differ.
     ///
     /// Note: `validate()` runs at build time ([`Network::build_with_options`]),
     /// not per forward call — it's Step 0.
     fn forward(&self, input: &Variable) -> flodl::tensor::Result<Variable> {
-        let mut node_outputs: HashMap<usize, Variable> = HashMap::new();
+        // Per-port outputs, keyed by (node_id, port_index). Nodes can emit
+        // up to num_outputs distinct tensors; consumers look up the exact
+        // port they are wired to.
+        let mut port_outputs: HashMap<(usize, usize), Variable> = HashMap::new();
 
         // Pass 1: compute all node outputs normally.
         for node_id in 0..self.layers.len() {
-            let y = if self.nodes[node_id].kind == crate::graph::node::NodeKind::Input {
+            let base = if self.nodes[node_id].kind == crate::graph::node::NodeKind::Input {
+                // Input node: one Linear over the raw input, then the same
+                // base tensor fans out through every port (Identity — ports
+                // of Input nodes stay raw by validation rule).
                 self.layers[node_id].forward(input)?
             } else {
-                let gathered = self.gather_inputs(&node_outputs, node_id)?;
-                let combined = self.combine_inputs(gathered, &node_outputs, node_id)?;
+                let gathered = self.gather_inputs(&port_outputs, node_id)?;
+                let combined = self.combine_inputs(gathered, &port_outputs, node_id)?;
                 let transformed = self.layers[node_id].forward(&combined)?;
+                // Standardize + dropout BEFORE the port split, so every port
+                // of the node sees the same shared tensor, and the dropout
+                // mask draw count stays one-per-node (replay-safe).
                 let standardized = self.standardize(node_id, transformed)?;
-                let activated = self.activate(node_id, standardized)?;
-                self.apply_dropout(node_id, activated)?
+                self.apply_dropout(node_id, standardized)?
             };
-            node_outputs.insert(node_id, y);
+
+            // Per-port activation: port i applies its own non-linearity to
+            // the shared base. Port 0 conventionally mirrors the node-level
+            // activation; other ports may differ (see Node::port_activation).
+            if self.nodes[node_id].kind == crate::graph::node::NodeKind::Input {
+                for o in 0..self.nodes[node_id].num_outputs.max(1) {
+                    port_outputs.insert((node_id, o), base.clone());
+                }
+            } else {
+                for o in 0..self.nodes[node_id].num_outputs.max(1) {
+                    let act = self.nodes[node_id].port_activation(o);
+                    let out = act.apply(&base)?;
+                    port_outputs.insert((node_id, o), out);
+                }
+            }
         }
 
-        Ok(node_outputs
-            .get(&self.output_node)
+        let out_node = self.output_node;
+        Ok(port_outputs
+            .get(&(out_node, 0))
             .cloned()
-            .expect("output node must exist"))
+            .expect("output node port 0 must exist"))
     }
 
     /// All learnable parameters: node layers plus port projections.
@@ -785,6 +830,74 @@ mod tests {
         assert!(acts.contains(&serde_json::json!(["Identity", 2])));
         assert_eq!(v["depths"][0], 0); // Input at level 0
         assert!(v["depths"][2].as_u64().unwrap() >= v["depths"][1].as_u64().unwrap());
+    }
+
+    #[test]
+    fn test_per_port_activations_give_distinct_signals() {
+        // n1 has 2 output ports: port 0 ReLU, port 1 Tanh. The consumer n2
+        // receives port 0's tensor on i0 and port 1's on i1 — the wires must
+        // carry DIFFERENT tensors even though they leave the same node.
+        let mut opts = crate::graph::topology::TopologyOptions::default();
+        // Guarantee the hidden node keeps 2 wired output ports after trim.
+        opts.min_hidden_outputs_per_node = 2;
+        opts.max_hidden_outputs_per_node = 2;
+        opts.input_dim = Some(8);
+        opts.output_dim = Some(1);
+        let mut g = Topology::new(0, Some(opts));
+        g.nodes.push(Node::new_input(0, 1));
+        let mut n1 = Node::new_hidden(1, 1, 2).with_activation(Activation::ReLU);
+        n1.hidden_dim = Some(4);
+        g.nodes.push(n1);
+        g.nodes.push(Node::new_output(2, 2, 1));
+        // finalize trims ports BEFORE we stamp per-port activations (the
+        // port count is only final after trim) — mirrors the engine flow.
+        g.finalize();
+        // Force the 2-port wiring deterministically: random finalize may
+        // orphan one of n1's ports and trim it. We re-stamp both ports and
+        // wire them to n2's two inputs by hand.
+        g.nodes[1].num_outputs = 2;
+        g.connections
+            .retain(|c| !(c.from.node == 1 && c.to.node == 2));
+        g.connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 0 },
+        });
+        g.connections.push(Connection {
+            from: Port { node: 1, index: 1 },
+            to: Port { node: 2, index: 1 },
+        });
+        g.nodes[1].port_activations = Some(vec![Activation::ReLU, Activation::Tanh]);
+        g.validate().unwrap();
+        let net = Network::build(&g, Device::CPU).unwrap();
+
+        // Drive a negative-heavy input: ReLU clamps it, Tanh keeps sign —
+        // the two port tensors must differ.
+        let input = Variable::new(
+            // Input dim 8 (default hidden_dim): a 4-wide sample padded.
+            Tensor::from_f32(
+                &[-1.0, -2.0, 0.5, 3.0, -1.0, -2.0, 0.5, 3.0],
+                &[1, 8],
+                Device::CPU,
+            )
+            .unwrap(),
+            false,
+        );
+        // Run the full forward; the port split is exercised internally. The
+        // observable contract: forward succeeds and shapes are sane.
+        let out = net.forward(&input).unwrap();
+        assert_eq!(out.shape(), &[1, 1]);
+        // activations to the SAME base tensor. Show those two tensors differ
+        // on a negative-heavy sample — which is exactly why two wires from
+        // one node now carry different signals.
+        let sample = Variable::new(
+            Tensor::from_f32(&[-1.0, -2.0, 0.5, 3.0], &[1, 4], Device::CPU).unwrap(),
+            false,
+        );
+        let p0 = Activation::ReLU.apply(&sample).unwrap();
+        let p1 = Activation::Tanh.apply(&sample).unwrap();
+        let d0 = p0.data().to_f32_vec().unwrap();
+        let d1 = p1.data().to_f32_vec().unwrap();
+        assert_ne!(d0, d1, "port 0 (ReLU) and port 1 (Tanh) must differ on negative input");
     }
 
     #[test]

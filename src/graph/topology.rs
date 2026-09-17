@@ -254,6 +254,37 @@ impl Topology {
         }
     }
 
+    /// Assign per-output-port activations to every hidden node from `pool`.
+    ///
+    /// Port 0 mirrors the node-level `activation` (the node's "main"
+    /// signal); ports 1..n draw independently from `pool`. Draws come from
+    /// the topology's own seeded RNG, in node order then port order — same
+    /// `topology_seed` ⇒ same assignment (the determinism contract).
+    ///
+    /// Input nodes are skipped: their ports stay raw (Identity) by rule.
+    /// Output nodes keep their node-level activation on port 0, but extra
+    /// ports (if any) join the pool too — the graph output reads port 0.
+    ///
+    /// Called after wiring (`finalize`), because `num_outputs` is only final
+    /// once `trim_orphaned_ports` has compacted the ports. Idempotent per
+    /// RNG state: it redraws on every call, so call it once per finalized
+    /// topology (generation sites: `random_child`, crossover finalize).
+    pub fn assign_port_activations(&mut self, pool: &[Activation]) {
+        if pool.is_empty() {
+            return;
+        }
+        for node in &mut self.nodes {
+            if node.kind == NodeKind::Input || node.num_outputs <= 1 {
+                continue;
+            }
+            let mut ports = vec![node.activation];
+            for _ in 1..node.num_outputs {
+                ports.push(pool[self.rng.usize(0..pool.len())]);
+            }
+            node.port_activations = Some(ports);
+        }
+    }
+
     /// Assign every hidden node a **random activation** drawn from `pool`
     /// (Input/Output nodes keep [`Activation::Identity`]).
     /// Refresh the port labels  — one string per port (`n1_i0`, `n2_o3`,
@@ -357,7 +388,15 @@ impl Topology {
         // Step 7: rescue_outputs — wire orphaned outputs to later nodes (dedup inline)
         self.rewire_orphaned_outputs();
 
-        // Step 7b: trim_ports — remove orphaned input/output ports from the topology
+        // Step 7b: dedup_value_wires — collapse same-(source→target) wires
+        // whose source ports carry identical activations (same tensor twice
+        // into one node is pure redundancy — it only scales the sum).
+        // MUST run BEFORE trim_orphaned_ports: dedup can strand ports (their
+        // only wire was removed), and trim is what compacts those away. The
+        // reverse order left post-dedup orphans in the finalized graph.
+        self.dedup_value_wires();
+
+        // Step 7c: trim_ports — remove orphaned input/output ports from the topology
         self.trim_orphaned_ports();
 
         // Step 8: verify — validate the final wiring
@@ -549,6 +588,25 @@ impl Topology {
                 return Err(TopologyError::InvalidOptions(format!(
                     "node n{i} has hidden_dim 0"
                 )));
+            }
+            // Per-port activations: length must match the port count, and
+            // Input nodes keep their ports raw (Identity) — activating the
+            // raw data before any learning is a topology-authoring bug.
+            if let Some(ports) = &node.port_activations {
+                if ports.len() != node.num_outputs {
+                    return Err(TopologyError::InvalidOptions(format!(
+                        "node n{i} has {} port activations but {} output ports",
+                        ports.len(),
+                        node.num_outputs
+                    )));
+                }
+                if node.kind == NodeKind::Input
+                    && ports.iter().any(|a| *a != Activation::Identity)
+                {
+                    return Err(TopologyError::InvalidOptions(format!(
+                        "node n{i} is an Input node — its ports must stay Identity"
+                    )));
+                }
             }
         }
 
@@ -938,12 +996,53 @@ impl Topology {
                     .filter(|&&v| v != usize::MAX)
                     .count()
                     .max(1);
+                // Compact port_activations alongside the port remap — the
+                // vec must always match num_outputs (validate() enforces it).
+                // The Input node's ports are all Identity anyway.
+                if let Some(ports) = &mut node.port_activations {
+                    let mut compacted: Vec<crate::graph::node::Activation> = out_remap[i]
+                        .iter()
+                        .filter(|&&v| v != usize::MAX)
+                        .filter_map(|&old| ports.get(old).copied())
+                        .collect();
+                    compacted.resize(node.num_outputs, compacted.last().copied().unwrap_or(crate::graph::node::Activation::Identity));
+                    *ports = compacted;
+                }
             }
             let connected_in = in_remap[i].iter().filter(|&&v| v != usize::MAX).count();
             if connected_in > 0 {
                 node.num_inputs = connected_in;
             }
         }
+    }
+
+    /// Collapse value-duplicate wires: within each (from.node → to.node)
+    /// group, keep the first wire per distinct source-port activation and
+    /// drop the rest. Two wires from the same node into the same target
+    /// carry the same signal exactly when their source ports' activations
+    /// are equal (per-port activation contract) — the duplicate only
+    /// rescales the target's combine sum, adding zero information while
+    /// burning a projection. Port-level identity (from.index) is irrelevant:
+    /// what matters is the VALUE that flows.
+    ///
+    /// Runs after trim_orphaned_ports, so surviving wires keep their
+    /// compacted indices and no port is left dangling. The Input node is
+    /// NOT exempt: all its ports are Identity by rule, so two Input wires
+    /// into the same target always carry the identical tensor — pure
+    /// duplication. Fan-out to *different* targets is keyed by `to.node`
+    /// and is never collapsed.
+    fn dedup_value_wires(&mut self) {
+        let mut kept: Vec<(usize, usize, crate::graph::node::Activation)> = Vec::new();
+        self.connections.retain(|c| {
+            let act = self.nodes[c.from.node].port_activation(c.from.index);
+            let key = (c.from.node, c.to.node, act);
+            if kept.contains(&key) {
+                false
+            } else {
+                kept.push(key);
+                true
+            }
+        });
     }
 
     /// Serialize the whole blueprint (options, nodes, labels, connections) to
@@ -1227,6 +1326,175 @@ mod tests {
         let mut graph = Topology::new(1, None);
         graph.create_random_hidden_node();
         assert_eq!(graph.nodes.len(), 1);
+    }
+
+    #[test]
+    fn test_assign_port_activations_deterministic() {
+        // Same seed ⇒ same per-port assignment, twice.
+        let build = || {
+            let mut g = Topology::new(0, Some(TopologyOptions::default()));
+            g.create_random_hidden_nodes(3);
+            g.refresh_labels();
+            g.finalize();
+            g.assign_port_activations(&[
+                Activation::ReLU,
+                Activation::Tanh,
+                Activation::Sin,
+            ]);
+            g
+        };
+        let a = build();
+        let b = build();
+        for (na, nb) in a.nodes.iter().zip(&b.nodes) {
+            assert_eq!(na.port_activations, nb.port_activations);
+        }
+        // Ports >= 1 actually drew from the pool; port 0 mirrors the node.
+        let pool = [Activation::ReLU, Activation::Tanh, Activation::Sin];
+        for node in &a.nodes {
+            if let Some(ports) = &node.port_activations {
+                assert_eq!(ports.len(), node.num_outputs);
+                assert_eq!(ports[0], node.activation);
+                for p in &ports[1..] {
+                    assert!(pool.contains(p), "port activation {p:?} not from pool");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dedup_value_wires_collapses_same_activation() {
+        // Two hidden nodes: n1 (2 outs) → n2. With equal per-port
+        // activations the second wire is value-duplicate and must be
+        // dropped; with different activations both survive.
+        let build = |port_acts: Option<Vec<Activation>>| {
+            let mut g = Topology::new(0, Some(TopologyOptions::default()));
+            g.nodes.push(Node::new_input(0, 1));
+            let mut n1 = Node::new_hidden(1, 1, 2);
+            n1.activation = Activation::ReLU;
+            n1.port_activations = port_acts;
+            g.nodes.push(n1);
+            g.nodes.push(Node::new_hidden(2, 2, 1));
+            g.nodes.push(Node::new_output(3, 1, 1));
+            g.connections.push(Connection {
+                from: Port { node: 0, index: 0 },
+                to: Port { node: 1, index: 0 },
+            });
+            g.connections.push(Connection {
+                from: Port { node: 1, index: 0 },
+                to: Port { node: 2, index: 0 },
+            });
+            g.connections.push(Connection {
+                from: Port { node: 1, index: 1 },
+                to: Port { node: 2, index: 1 },
+            });
+            g
+        };
+        // Ports 0 and 1 BOTH carry ReLU ⇒ duplicate value ⇒ dedup to 1 wire.
+        let mut dup = build(Some(vec![Activation::ReLU, Activation::ReLU]));
+        dup.dedup_value_wires();
+        let n1_to_n2 = dup
+            .connections
+            .iter()
+            .filter(|c| c.from.node == 1 && c.to.node == 2)
+            .count();
+        assert_eq!(n1_to_n2, 1, "same-activation wires into one target must dedup");
+        // Port 0 ReLU, port 1 Tanh ⇒ distinct values ⇒ both survive.
+        let mut distinct = build(Some(vec![Activation::ReLU, Activation::Tanh]));
+        distinct.dedup_value_wires();
+        let n1_to_n2 = distinct
+            .connections
+            .iter()
+            .filter(|c| c.from.node == 1 && c.to.node == 2)
+            .count();
+        assert_eq!(n1_to_n2, 2, "distinct-activation wires must survive");
+    }
+
+    #[test]
+    fn test_dedup_value_wires_collapses_input_duplicates() {
+        // All Input ports are Identity ⇒ two Input wires into the SAME
+        // target are value-duplicates and must collapse; Input wires into
+        // DIFFERENT targets are distinct (different to.node) and survive.
+        let mut g = Topology::new(0, Some(TopologyOptions::default()));
+        g.nodes.push(Node::new_input(0, 2));
+        g.nodes.push(Node::new_hidden(1, 2, 1));
+        g.nodes.push(Node::new_hidden(2, 1, 1));
+        g.nodes.push(Node::new_output(3, 1, 1));
+        g.connections.push(Connection {
+            from: Port { node: 0, index: 0 },
+            to: Port { node: 1, index: 0 },
+        });
+        g.connections.push(Connection {
+            from: Port { node: 0, index: 1 },
+            to: Port { node: 1, index: 1 },
+        });
+        g.connections.push(Connection {
+            from: Port { node: 0, index: 0 },
+            to: Port { node: 2, index: 0 },
+        });
+        g.dedup_value_wires();
+        let into_n1 = g
+            .connections
+            .iter()
+            .filter(|c| c.from.node == 0 && c.to.node == 1)
+            .count();
+        let into_n2 = g
+            .connections
+            .iter()
+            .filter(|c| c.from.node == 0 && c.to.node == 2)
+            .count();
+        assert_eq!(into_n1, 1, "two Identity Input wires into one target must dedup");
+        assert_eq!(into_n2, 1, "Input wire into a different target must survive");
+    }
+
+    #[test]
+    fn test_trim_orphaned_ports_compacts_port_activations() {
+        // An orphaned output port must compact port_activations along with
+        // num_outputs — otherwise finalize's validate() rejects the length
+        // mismatch ("N port activations but M output ports").
+        let mut g = Topology::new(0, Some(TopologyOptions::default()));
+        g.nodes.push(Node::new_input(0, 1));
+        let mut n1 = Node::new_hidden(1, 1, 3);
+        n1.activation = Activation::ReLU;
+        n1.port_activations = Some(vec![Activation::ReLU, Activation::Tanh, Activation::Sigmoid]);
+        g.nodes.push(n1);
+        g.nodes.push(Node::new_output(2, 1, 1));
+        // Only ports 0 and 2 are wired; port 1 is orphaned and must be trimmed.
+        g.connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 0 },
+        });
+        g.finalize();
+        let n1 = &g.nodes[1];
+        // Core invariant: port_activations always matches num_outputs after
+        // trim — this is what validate() enforces and what the production
+        // panic ("N port activations but M output ports") violated.
+        let ports = n1.port_activations.as_ref().unwrap();
+        assert_eq!(
+            ports.len(),
+            n1.num_outputs,
+            "port_activations must be compacted with ports"
+        );
+        // Port 0 is wired explicitly, so it survives with its activation.
+        assert!(n1.num_outputs >= 1);
+        assert_eq!(ports[0], Activation::ReLU);
+    }
+
+    #[test]
+    fn test_validate_rejects_port_activation_mismatch() {
+        let mut g = Topology::new(0, Some(TopologyOptions::default()));
+        g.nodes.push(Node::new_input(0, 1));
+        let mut n1 = Node::new_hidden(1, 1, 2);
+        n1.port_activations = Some(vec![Activation::ReLU]); // 1 entry, 2 ports
+        g.nodes.push(n1);
+        g.nodes.push(Node::new_output(2, 1, 1));
+        assert!(g.validate().is_err());
+        // Input node with a non-Identity port is also rejected.
+        let mut g2 = Topology::new(0, Some(TopologyOptions::default()));
+        let mut input = Node::new_input(0, 1);
+        input.port_activations = Some(vec![Activation::ReLU]);
+        g2.nodes.push(input);
+        g2.nodes.push(Node::new_output(1, 1, 1));
+        assert!(g2.validate().is_err());
     }
 
     #[test]
@@ -1846,6 +2114,80 @@ mod tests {
                 "scaffold must leave exactly one Output node"
             );
             prop_assert!(graph.validate().is_ok());
+        }
+    }
+}
+
+#[cfg(test)]
+mod finalize_order_tests {
+    use super::*;
+
+    #[test]
+    fn finalize_leaves_no_orphaned_input_output_ports() {
+        // Regression: dedup_value_wires used to run AFTER trim_orphaned_ports,
+        // stranding ports whose only wire got value-deduped (visible in
+        // mermaid as `identity (orphan)` stubs on the Input node).
+        for seed in 0..40 {
+            let mut g = Topology::new(seed, Some(TopologyOptions::default()));
+            g.finalize();
+            let in_id = g.nodes.iter().find(|n| n.kind == NodeKind::Input).unwrap().id;
+            let out_id = g.nodes.iter().find(|n| n.kind == NodeKind::Output).unwrap().id;
+            for p in 0..g.nodes[in_id].num_outputs {
+                assert!(
+                    g.connections.iter().any(|c| c.from.node == in_id && c.from.index == p),
+                    "seed {seed}: input port o{p} orphaned after finalize"
+                );
+            }
+            for n in &g.nodes {
+                for p in 0..n.num_inputs {
+                    assert!(
+                        g.connections.iter().any(|c| c.to.node == n.id && c.to.index == p),
+                        "seed {seed}: node n{} input port i{p} orphaned after finalize",
+                        n.id
+                    );
+                }
+                if n.id != out_id {
+                    for p in 0..n.num_outputs {
+                        assert!(
+                            g.connections.iter().any(|c| c.from.node == n.id && c.from.index == p),
+                            "seed {seed}: node n{} output port o{p} orphaned after finalize",
+                            n.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fanout_bounds_tests {
+    use super::*;
+
+    #[test]
+    fn finalize_respects_max_inputs_per_node() {
+        // The setters bound CREATION; verify finalize never grows a node's
+        // declared input count past the configured maximum (fan-in rescue
+        // passes may add wires, but only onto declared ports).
+        for seed in 0..60 {
+            let mut opts = TopologyOptions::default();
+            opts.min_hidden_inputs_per_node = 2;
+            opts.max_hidden_inputs_per_node = 3;
+            opts.min_hidden_outputs_per_node = 2;
+            opts.max_hidden_outputs_per_node = 3;
+            let mut g = Topology::new(seed, Some(opts));
+            g.create_random_hidden_nodes(5);
+            g.finalize();
+            for n in &g.nodes {
+                if n.kind == NodeKind::Hidden {
+                    assert!(
+                        n.num_inputs <= 3,
+                        "seed {seed}: n{} has {} inputs (max 3)",
+                        n.id,
+                        n.num_inputs
+                    );
+                }
+            }
         }
     }
 }

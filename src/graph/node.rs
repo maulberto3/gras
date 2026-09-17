@@ -223,6 +223,16 @@ pub struct Node {
     pub hidden_dim: Option<usize>,
     /// Activation applied after this node's linear transform.
     pub activation: Activation,
+    /// Per-output-port activations. `None` = every port inherits
+    /// `activation` (the node-level default). When set, the vec has exactly
+    /// `num_outputs` entries and entry `i` REPLACES the node-level
+    /// activation for port `i`'s outgoing wire — so two ports of the same
+    /// node can carry genuinely different signals (the whole point: wires
+    /// from the same node stop being redundant copies of one tensor).
+    /// Port 0 conventionally mirrors the node-level activation; generation
+    /// assigns ports 1..n from the run's activation pool.
+    #[serde(default)]
+    pub port_activations: Option<Vec<Activation>>,
     /// Per-node combine override: how this node merges its incoming tensors
     /// (`None` = inherit the graph's `combine_op`). `#[serde(default)]` keeps
     /// older topology JSON (no field) loadable.
@@ -251,6 +261,7 @@ impl Node {
             kind: NodeKind::Input,
             hidden_dim: None,
             activation: Activation::Identity,
+            port_activations: None,
             combine_op: None,
             standardize: None,
         }
@@ -265,6 +276,7 @@ impl Node {
             kind: NodeKind::Hidden,
             hidden_dim: None,
             activation: Activation::Identity,
+            port_activations: None,
             combine_op: None,
             standardize: None,
         }
@@ -279,6 +291,7 @@ impl Node {
             kind: NodeKind::Output,
             hidden_dim: None,
             activation: Activation::Identity,
+            port_activations: None,
             combine_op: None,
             standardize: None,
         }
@@ -300,6 +313,28 @@ impl Node {
     pub fn with_hidden_dim(mut self, hidden_dim: usize) -> Self {
         self.hidden_dim = Some(hidden_dim);
         self
+    }
+
+    /// Set per-port activations (builder style). The slice must be empty or
+    /// exactly `num_outputs` long; `validate()` enforces the same invariant
+    /// on whole graphs. Empty = inherit node-level activation everywhere.
+    pub fn with_port_activations(mut self, ports: Vec<Activation>) -> Self {
+        self.port_activations = if ports.is_empty() {
+            None
+        } else {
+            Some(ports)
+        };
+        self
+    }
+
+    /// The activation carried by output port `i`: the per-port override when
+    /// set, else the node-level activation. Input nodes are excluded by the
+    /// caller — their ports always run Identity (raw data fan-out).
+    pub fn port_activation(&self, i: usize) -> Activation {
+        self.port_activations
+            .as_ref()
+            .and_then(|v| v.get(i).copied())
+            .unwrap_or(self.activation)
     }
 }
 
@@ -363,6 +398,7 @@ mod tests {
                 },
                 hidden_dim: None,
                 activation: Activation::Identity,
+                port_activations: None,
                 combine_op: None,
                 standardize: None,
             },
