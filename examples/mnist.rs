@@ -26,10 +26,10 @@ const RUN_SEED: Option<u64> = Some(16); // None = random, recorded in engine.jso
 const DATA_DIR: &str = "data/mnist/train"; // any gras-format dataset works — dims are auto-peeked
 // const MAX_STEPS: usize = 50; // stop criterion — total global step budget
 const MAX_TARGET_FITNESS: Option<f32> = Some(0.5); // e.g. Some(0.95): stop once best smoothed fitness crosses it
-const POP_SIZE: usize = 20; // live networks in the race
+const POP_SIZE: usize = 100; // live networks in the race
 const CHECKPOINT_EVERY: usize = 10; // steps between checkpoint gate recordings
 const POP_PRUNER: bool = true; // on stop: keep the elites, train them solo
-const PRUNER_STEPS: usize = 10; // extra solo steps for the pruner phase
+const PRUNER_STEPS: usize = 50; // extra solo steps for the pruner phase
 const LOG_LEVEL: gras::engine::config::LogLevel = gras::engine::config::LogLevel::Summ;
 const RUN_NAME: &str = "mnist"; // recorded in engine.json ("run_name") — purely informational
 
@@ -87,7 +87,7 @@ fn main() {
         .set_log_level(LOG_LEVEL) // Log level verbosity
         .set_additional_metrics(vec![
             Metric::from("f1"),        // built-in label — scored by the score_by_label dispatcher
-            Metric::from("precision"), // another built-in
+            // Metric::from("precision"), // another built-in
             // Metric::custom("top1_margin", |pred: &Variable, y: &Variable| {
             //     // Custom closure metric: confidence margin between the top-1
             //     // logit and the runner-up — one extra history.csv column.
@@ -110,14 +110,14 @@ fn main() {
         // --- Evolutionary Probabilities & Rolls ---
         .set_elite_count(1) // Elite guard: top-k nets by smoothed fitness are immune to ALL culls (crossover AND mutation). Minimum 1 — the champion is always guarded. Elites hold rank, not identity — a declining net falls out naturally.
         .set_crossover_prob(0.5) // Probability of a crossover roll firing per step
-        .set_crossover_rolls(20) // Number of crossover attempts/rolls per step
+        .set_crossover_rolls(POP_SIZE) // Number of crossover attempts/rolls per step
         .set_crossover_cull_policy(gras::engine::config::CrossCullPolicy::Worst) // Who a surviving CROSSOVER child evicts: CrossCullPolicy::Worst (worst by smoothed fitness) or CrossCullPolicy::Random (uniform, diversity-first). Mutation immigrants always evict via fitness-inverse roulette — not this knob.
         .set_crossover_gate_checkpoint_every(CHECKPOINT_EVERY) // Steps between checkpoint gate recordings
         .set_crossover_gate(gras::engine::config::CrossoverGate::Soft) // Gate strictness for crossover children: CrossoverGate::Hard (beat every checkpoint bar) or CrossoverGate::Soft (beat the mean of the bars)
         .set_crossover_retries(3) // cx_retry_full: on a gate rejection, retry the full attempt (fresh parents + generate + gate) up to 2 extra times. Every attempt (inserted or rejected) is recorded in history.csv
         // .set_crossover_ops_pool(vec!["one_point".into(), "uniform".into()]) // Crossover operators drawn per attempt. Empty (default) ⇒ both. The chosen op is logged per child in its lineage note (crossover-one-point / crossover-uniform).
         .set_mutate_prob(0.5) // Probability of an immigrant roll firing per step
-        .set_mutate_rolls(10) // Number of random immigrant substitution rolls per step
+        .set_mutate_rolls((POP_SIZE / 5) as usize) // Number of random immigrant substitution rolls per step
         // --- Post-race pruner (runs AFTER any stop criterion fires) ---
         .set_pruner_pop(POP_PRUNER) // true = on stop, cull all but the top-elite_count nets and train them solo for PRUNER_STEPS more steps (evolution + stop criteria off)
         .set_pruner_method(gras::engine::config::PopPrunerMethod::Hard) // Strategy (Hard = keep the elites, plain solo training)
@@ -125,11 +125,11 @@ fn main() {
         // config.custom_stop = Some(Box::new(|snapshot| snapshot.step > 50)); // Rarely-used: custom stop closure joining the stop race (RaceSnapshot: step, live_count, best/worst/mean smoothed fitness, culls, elapsed_seconds)
         // --- Topology Search Boundaries ---
         .set_topology_min_hidden_num_nodes(2) // Minimum hidden layers/nodes
-        .set_topology_max_hidden_num_nodes(10) // Maximum hidden layers/nodes
+        .set_topology_max_hidden_num_nodes(15) // Maximum hidden layers/nodes
         .set_topology_min_inputs_per_node(2) // Minimum input fan-in per node
-        .set_topology_max_inputs_per_node(10) // Maximum input fan-in per node
+        .set_topology_max_inputs_per_node(15) // Maximum input fan-in per node
         .set_topology_min_outputs_per_node(2) // Minimum output fan-out per node
-        .set_topology_max_outputs_per_node(10) // Maximum output fan-out per node
+        .set_topology_max_outputs_per_node(15) // Maximum output fan-out per node
         // --- Network Search Boundaries ---
         .set_network_input_dim(d_in) // Input dimension (features) from the dataset
         .set_network_output_dim(d_out) // Output dimension (classes) from the dataset
