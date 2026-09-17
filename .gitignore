@@ -40,6 +40,8 @@ kaggle_guide.rs
 
 Makefile
 kaggle_ev_s6e9.rs
+kaggle_kagiculture/
+kaggle_kagiculture.rs
 examples/main.rs
 
 AGENTS.md
