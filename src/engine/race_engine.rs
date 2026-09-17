@@ -189,6 +189,22 @@ pub struct RaceEngine {
 
 // ── Construction ─────────────────────────────────────────────────────────────
 
+/// One evolution roll's outcome, formatted for the single per-roll log line.
+/// `survived`: crossover-only — did the child clear the checkpoint gate
+/// (retries stop on survival; the last attempt's outcome is the one logged).
+pub(crate) struct RollOutcome {
+    pub survived: bool,
+    pub detail: String,
+}
+impl RollOutcome {
+    pub fn survived(detail: impl Into<String>) -> Self {
+        Self { survived: true, detail: detail.into() }
+    }
+    pub fn spent(detail: impl Into<String>) -> Self {
+        Self { survived: false, detail: detail.into() }
+    }
+}
+
 /// Per-step evolve counters, reused by the `Minimal` table. Reset each step.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct StepEvolve {
@@ -821,17 +837,35 @@ impl RaceEngine {
             }
 
             // ── 3. evolve — always, two independent roll groups ─────────────
+            // ONE log line per roll, logged here from the loop — outcome
+            // details travel up from the evolve helpers as plain strings.
+            // 15 rolls ⇒ 15 lines, each starting with its group name.
             let mut cross_fired = 0usize;
             let mut cross_survived = 0usize;
             let mut cross_discarded = 0usize;
             let mut mutate_fired = 0usize;
             let culls_before = self.culls;
+            let cross_total = self.config.crossover_rolls;
+            let mutate_total = self.config.mutate_rolls;
             // 3a. crossover rolls: checkpoint-gated children.
-            for roll in 0..self.config.crossover_rolls {
+            for roll in 0..cross_total {
                 if self.state.live_count() < 2 {
+                    info!(
+                        "step {} │ crossover roll {}/{} skipped (pop < 2)",
+                        clock,
+                        roll + 1,
+                        cross_total,
+                    );
                     break; // not enough population to evolve
                 }
                 if fastrand::f32() >= self.config.crossover_prob {
+                    info!(
+                        "step {} │ crossover roll {}/{} did not fire (p={:.2})",
+                        clock,
+                        roll + 1,
+                        cross_total,
+                        self.config.crossover_prob,
+                    );
                     continue;
                 }
                 cross_fired += 1;
@@ -841,37 +875,61 @@ impl RaceEngine {
                 // is the price of a chance at a child that clears the bars.
                 let max_attempts = 1 + self.config.crossover_retries;
                 let mut attempt = 0usize;
-                loop {
+                let outcome = loop {
                     attempt += 1;
-                    if self.evolve_crossover_child(clock, roll, attempt)? {
+                    let out = self.evolve_crossover_child(clock, roll, attempt)?;
+                    if out.survived {
                         cross_survived += 1;
-                        break;
+                        break out;
                     }
                     if attempt >= max_attempts {
                         cross_discarded += 1;
-                        break;
+                        break out;
                     }
-                    if self.verbose_detail() {
-                        info!(
-                            "step {} │ crossover roll {} retry {}/{} (gate rejected prior attempt)",
-                            clock,
-                            roll,
-                            attempt,
-                            max_attempts - 1,
-                        );
-                    }
-                }
+                    // retry — the prior attempt's detail is superseded
+                    let _ = &out;
+                };
+                info!(
+                    "step {} │ crossover roll {}/{} ({} attempt(s)): {} │ pop now {}",
+                    clock,
+                    roll + 1,
+                    cross_total,
+                    attempt,
+                    outcome.detail,
+                    self.state.live_count(),
+                );
             }
             // 3b. mutation rolls: random immigrants (no gate).
-            for roll in 0..self.config.mutate_rolls {
+            for roll in 0..mutate_total {
                 if self.state.live_count() == 0 {
+                    info!(
+                        "step {} │ mutation roll {}/{} skipped (pop empty)",
+                        clock,
+                        roll + 1,
+                        mutate_total,
+                    );
                     break;
                 }
                 if fastrand::f32() >= self.config.mutate_prob {
+                    info!(
+                        "step {} │ mutation roll {}/{} did not fire (p={:.2})",
+                        clock,
+                        roll + 1,
+                        mutate_total,
+                        self.config.mutate_prob,
+                    );
                     continue;
                 }
                 mutate_fired += 1;
-                self.evolve_random_immigrant(clock, roll)?;
+                let detail = self.evolve_random_immigrant(clock, roll)?;
+                info!(
+                    "step {} │ mutation roll {}/{}: {} │ pop now {}",
+                    clock,
+                    roll + 1,
+                    mutate_total,
+                    detail,
+                    self.state.live_count(),
+                );
             }
             // Evolve-phase summary for the `Minimal` table (rendered as part
             // of the NEXT step's frame, so the reader sees "what happened last
@@ -885,48 +943,6 @@ impl RaceEngine {
                 cross_discarded,
                 mutate_fired,
             };
-            // Evolve rollup — plain-language, no roll ordinals. "discarded"
-            // = a crossover child was rejected by the checkpoint gate (the
-            // population did NOT shrink; only the attempt was dropped). Rolls
-            // that did NOT fire are also shown, so a quiet step is explained:
-            // "fired 0/2» means the probability roll said no (normal), while
-            // "fired 2 → 0 inserted" means the gate said no (selection).
-            if self.verbose_detail() {
-                let cross_total = self.config.crossover_rolls;
-                let mutate_total = self.config.mutate_rolls;
-                info!(
-                    "step {} │ evolve │ crossover fired {}/{} → {} inserted, {} discarded by gate │ mutation fired {}/{} → {} immigrant(s) inserted (no gate) │ pop now {}",
-                    clock,
-                    cross_fired,
-                    cross_total,
-                    cross_survived,
-                    cross_discarded,
-                    mutate_fired,
-                    mutate_total,
-                    mutate_fired,
-                    self.state.live_count(),
-                );
-                // Per-roll detail in Full mode: say WHY each roll stayed cold.
-                if self.log_level == crate::engine::config::LogLevel::Full {
-                    if cross_fired < cross_total {
-                        info!(
-                            "step {} │ evolve │ crossover: {} roll(s) did not fire (probability roll, p={:.2}){}",
-                            clock,
-                            cross_total - cross_fired,
-                            self.config.crossover_prob,
-                            if self.state.live_count() < 2 { " — also pop < 2 blocks crossover" } else { "" },
-                        );
-                    }
-                    if mutate_fired < mutate_total {
-                        info!(
-                            "step {} │ evolve │ mutation: {} roll(s) did not fire (probability roll, p={:.2})",
-                            clock,
-                            mutate_total - mutate_fired,
-                            self.config.mutate_prob,
-                        );
-                    }
-                }
-            }
 
             // ── 4. stop criteria ────────────────────────────────────────────
             if let Some(reason) = self.check_stop(clock) {
@@ -995,6 +1011,10 @@ impl RaceEngine {
             ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
             ranked.into_iter().take(k).map(|(h, _)| h).collect::<Vec<_>>()
         };
+        // Worst-net dump BEFORE the cull: the anti-champion only exists
+        // while the full field is alive — after culling to elites there is
+        // no "worst" left to distinguish from the elite.
+        self.write_worst_artifacts()?;
         let victims: Vec<String> = self
             .state
             .live_hashes()
@@ -1039,7 +1059,6 @@ impl RaceEngine {
         if pruner.steps == 0 {
             self.write_champion_markdown()?;
             self.write_champion_safetensors()?;
-            self.write_worst_artifacts()?;
             if self.verbose_detail() {
                 info!("  pruner phase: 0 steps configured — nothing further to train");
             }
@@ -1065,7 +1084,8 @@ impl RaceEngine {
         let final_step = clock + pruner.steps;
         self.write_champion_markdown()?;
         self.write_champion_safetensors()?;
-        self.write_worst_artifacts()?;
+        // NOTE: no worst dump here — the population was already culled to
+        // elites above (the worst was dumped pre-cull, before that).
         if self.verbose_detail() {
             info!(
                 "── pruner phase complete ── trained to step {} ({} solo step(s))",
@@ -1167,7 +1187,13 @@ impl RaceEngine {
         };
         let short = &champ[..8.min(champ.len())];
         let path = self.run_dir.join(format!("elite-{short}.md"));
-        let md = crate::utils::markdown::topology_markdown(&topo, None);
+        let fitness = ranked.first().map(|(_, f)| *f).unwrap_or(f32::NAN);
+        let md = format!(
+            "**Elite · fitness {} (smoothed) = {:.4}**\n\n{}",
+            self.fitness.direction().arrow(),
+            fitness,
+            crate::utils::markdown::topology_markdown(&topo, None),
+        );
         match std::fs::write(&path, &md) {
             Ok(()) => {
                 if self.verbose_detail() {
@@ -1237,18 +1263,20 @@ impl RaceEngine {
     }
 
     /// When any `worst_save_*` flag is set: save the WORST live net's
-    /// artifacts too — `worst-<hash>.md` (topology markdown) and/or
-    /// `worst-<hash>.safetensors` (weights), each behind its own flag. Same
-    /// artifact discipline as the elite dumps: unconditional on log level,
-    /// called right after them at every stop path. The anti-champion is the
-    /// net the search avoided — its topology is often the cheapest way to see
-    /// what the fitness signal rejected.
+    /// artifacts — `worst-<hash>.md` (topology markdown) and/or
+    /// `worst-<hash>.safetensors` (weights), each behind its own flag. The
+    /// anti-champion is the net the search avoided — its topology is often
+    /// the cheapest way to see what the fitness signal rejected.
+    ///
+    /// MUST be called BEFORE any cull shrinks the population: the worst is
+    /// ranked over the full pre-cull field (e.g. the pop_pruner culls to
+    /// elites, so a post-cull call would find no worst to dump).
     fn write_worst_artifacts(&self) -> Result<()> {
         if !self.config.worst_save_topology && !self.config.worst_save_safetensors {
             return Ok(());
         }
         let ranked = self.rank_live();
-        let Some((worst, _)) = ranked.last() else {
+        let Some((worst, worst_fitness)) = ranked.last() else {
             return Ok(()); // nothing ever scored — nothing to dump
         };
         let short = &worst[..8.min(worst.len())];
@@ -1256,7 +1284,12 @@ impl RaceEngine {
             if let Some(state) = self.state.net(worst) {
                 if let Ok(topo) = state.topology() {
                     let path = self.run_dir.join(format!("worst-{short}.md"));
-                    let md = crate::utils::markdown::topology_markdown(&topo, None);
+                    let md = format!(
+                        "**Worst · fitness {} (smoothed) = {:.4}**\n\n{}",
+                        self.fitness.direction().arrow(),
+                        worst_fitness,
+                        crate::utils::markdown::topology_markdown(&topo, None),
+                    );
                     if let Err(source) = std::fs::write(&path, &md) {
                         log::warn!(
                             "worst markdown write failed: {}",
@@ -1445,8 +1478,7 @@ impl RaceEngine {
             .collect();
         let fit_stats = stats(&fits);
         // Per-step rollup: Summ = compact one-liner; Minimal = framed table
-        // (from step 2 — deltas need a prior step); Full = one-liner + per-net
-        // detail + checkpoint + divergence lines.
+        // (from step 2 — deltas need a prior step).
         if self.log_level == crate::engine::config::LogLevel::Minimal {
             self.log_minimal_table(&trains, &evals, &fits);
         } else {
@@ -1459,33 +1491,6 @@ impl RaceEngine {
                 self.fitness.direction().arrow(),
                 fit_stats,
             );
-        }
-        if self.log_level == crate::engine::config::LogLevel::Full {
-            // Per-net detail for this step.
-            for h in self.state.live_hashes() {
-                if let Some(m) = self.state.net(&h).and_then(|s| s.last_metrics.as_ref()) {
-                    log::info!(
-                        "step {} │ net {} │ train_loss↓ {} │ eval_loss↓ {} │ fitness{} {}",
-                        clock,
-                        h,
-                        fmt2(m.train_loss),
-                        fmt_opt2(&m.eval_loss),
-                        self.fitness.direction().arrow(),
-                        fmt2(m.fitness),
-                    );
-                }
-            }
-            // Checkpoint ledger diagnostic.
-            if !self.checkpoints.is_empty() {
-                let last = &self.checkpoints[self.checkpoints.len() - 1];
-                log::info!(
-                    "step {} │ checkpoint │ step {} │ pop_mean_fitness {} {:.4}",
-                    clock,
-                    last.step,
-                    self.fitness.direction().arrow(),
-                    last.pop_mean_fitness,
-                );
-            }
         }
     }
 
@@ -1543,8 +1548,8 @@ impl RaceEngine {
                 e.inserts,
             ),
             format!(
-                "evolve │ crossover fired {} ({} inserted, {} discarded) │ mutation {}",
-                e.cross_fired, e.cross_survived, e.cross_discarded, e.mutate_fired,
+                "crossover fired {} ({} inserted, {} spent) │ mutation rolled {} ({} immigrant(s))",
+                e.cross_fired, e.cross_survived, e.cross_discarded, e.mutate_fired, e.mutate_fired,
             ),
         ];
         // Display width: count chars, not bytes (↓/↑/∆ are 3 bytes, 1 char).
@@ -1628,11 +1633,12 @@ impl RaceEngine {
             .insert(hash.to_string(), RollingBuffer::new(SMOOTHING_WINDOW));
     }
 
-    /// A guaranteed-fresh random child: bump the clock ordinal until the
-    /// topology hash is not live (bounded retries; log when a dup is hit).
+    /// A guaranteed-fresh random child (mutation path): roll `random_child`
+    /// directly (bypassing the crossover/mutation dispatch, which the caller
+    /// has already resolved), re-rolling on duplicate hashes (bounded).
     fn generate_random_at(&mut self, clock: usize, start_idx: usize) -> Result<RaceChild> {
         for attempt in 0..8 {
-            let child = self.generate_child(clock, start_idx + attempt)?;
+            let child = self.random_child(clock, start_idx + attempt)?;
             if !self.state.net(&child.state.hash).is_some() {
                 // consume the ordinal(s) we used
                 *self.children_born_at_clock.get_mut(&clock).unwrap() = start_idx + attempt + 1;
@@ -1640,7 +1646,7 @@ impl RaceEngine {
             }
             if self.verbose_detail() {
                 info!(
-                    "step {} │ crossover child {} is a duplicate topology → discarded, random replacement",
+                    "step {} │ random child {} is a duplicate topology → re-rolling unique seed",
                     clock,
                     &child.state.hash[..8],
                 );
@@ -1653,40 +1659,58 @@ impl RaceEngine {
 
     /// Insert a caught-up child into the live maps (state, network, optimizer;
     /// its rolling buffer was pre-inserted before catch-up and is NOT reset).
-    fn insert_child(&mut self, child: RaceChild, clock: usize) {
-        let lineage = child.state.created_from.clone().unwrap_or("?".into());
+    fn insert_child(&mut self, child: RaceChild, _clock: usize, _group: &str) {
+        // NO per-event log here: inserts are reported on the calling roll's
+        // single line — one roll, one line.
         let child_fitness = child.state.last_metrics.as_ref().map(|m| m.fitness);
         self.state.insert(child.state.clone(), child_fitness);
         self.networks.insert(child.state.hash.clone(), child.net);
         self.optimizers
             .insert(child.state.hash.clone(), child.optimizer);
-        if self.verbose_detail() {
-            info!(
-                "step {} │ inserted {} {} │ caught-up {} → json",
-                clock, child.state.hash, lineage, clock,
-            );
-        }
     }
 
     /// One evolution roll of the crossover branch: generate a child, run the
     /// checkpoint-gated catch-up (early-out discard on the first failed
-    /// gate), and on success cull the current worst net + insert the child.
-    /// A failed child culls nothing — the gate IS the cull.
-    /// Returns `true` when the child survived the gate and was inserted.
-    /// `attempt` is the 1-based retry ordinal (for history.csv).
-    fn evolve_crossover_child(&mut self, clock: usize, _roll: usize, attempt: usize) -> Result<bool> {
+    /// gate), and on success cull one slot per the cull policy + insert the
+    /// child. A failed child culls nothing — the gate IS the cull, and a
+    /// failed attempt is a SPENT ROLL: no random fallback (random whole nets
+    /// enter exclusively via the mutation rolls).
+    /// Returns the roll outcome (survived + log detail); `attempt` is the
+    /// 1-based retry ordinal (for history.csv).
+    fn evolve_crossover_child(&mut self, clock: usize, _roll: usize, attempt: usize) -> Result<RollOutcome> {
         let idx = self.next_child_ordinal(clock);
-        let mut child = self.generate_child(clock, idx)?;
+        // Ok(spent) = spent roll (crossover produced nothing viable or a
+        // duplicate of a live net): no cull, no insert, move on.
+        let mut child = match self.generate_child(clock, idx)? {
+            Some(c) => c,
+            None => return Ok(RollOutcome::spent(format!(
+                "no child: {} parent-pairing draw(s) × {} gate attempt(s) all incompatible (no compatible pivot/dims)",
+                crate::engine::child::MAX_PARENT_PAIRINGS,
+                attempt,
+            ))),
+        };
         if self.state.net(&child.state.hash).is_some() {
-            if self.verbose_detail() {
-                info!(
-                    "step {} │ crossover child {} is a duplicate topology → discarded, random replacement",
-                    clock,
-                    &child.state.hash[..8],
-                );
-            }
-            let idx = self.next_child_ordinal(clock);
-            child = self.generate_random_at(clock, idx)?;
+            // Duplicate of a live topology (crossover recreated an existing
+            // net) → the roll is spent: discard, no replacement. Random
+            // whole nets enter only via the mutation path.
+            self.record_attempt(
+                clock,
+                "crossover",
+                attempt,
+                None,
+                None,
+                "duplicate-discarded",
+                "rejected_duplicate",
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            return Ok(RollOutcome::spent(format!(
+                "child {} duplicates a live topology → discarded",
+                &child.state.hash[..8.min(child.state.hash.len())],
+            )));
         }
 
         // Checkpoint-gated catch-up: the child must beat the recorded
@@ -1757,23 +1781,6 @@ impl RaceEngine {
         if let Some((gate_i, gate_step, child_fit, bar)) = failed_gate {
             // "discarded" = the child was rejected by the checkpoint gate and
             // never joined the population; the pop did NOT shrink.
-            if self.verbose_detail() {
-                info!(
-                    "step {} │ crossover child {} rejected by {} gate {}/{} ({}{:.4} vs bar {:.4}) → discarded at step {}, pop unchanged",
-                    clock,
-                    &child.state.hash[..8],
-                    match self.config.crossover_gate {
-                        crate::engine::config::CrossoverGate::Hard => "hard",
-                        crate::engine::config::CrossoverGate::Soft => "soft",
-                    },
-                    gate_i,
-                    checkpoint_count,
-                    self.fitness.direction().arrow(),
-                    child_fit,
-                    bar,
-                    gate_step,
-                );
-            }
             // Record the rejected attempt (cx_retry_full measurement).
             self.record_attempt(
                 clock,
@@ -1793,7 +1800,20 @@ impl RaceEngine {
             self.rolling_fitness.remove(&child.state.hash);
             self.rolling_train.remove(&child.state.hash);
             self.rolling_eval.remove(&child.state.hash);
-            return Ok(false);
+            return Ok(RollOutcome::spent(format!(
+                "child {} rejected by {} gate {}/{} ({}{:.4} vs bar {:.4}) → discarded at step {}",
+                &child.state.hash[..8.min(child.state.hash.len())],
+                match self.config.crossover_gate {
+                    crate::engine::config::CrossoverGate::Hard => "hard",
+                    crate::engine::config::CrossoverGate::Soft => "soft",
+                },
+                gate_i,
+                checkpoint_count,
+                self.fitness.direction().arrow(),
+                child_fit,
+                bar,
+                gate_step,
+            )));
         }
         let _ = last_checkpoint_step;
         let _ = child_fit_at_gate;
@@ -1845,8 +1865,19 @@ impl RaceEngine {
                 }
             }
         }
-        self.insert_child(child, clock);
-        Ok(true)
+        let inserted_hash = child.state.hash[..8.min(child.state.hash.len())].to_string();
+        let lineage = child
+            .state
+            .created_from
+            .clone()
+            .unwrap_or_else(|| "?".into());
+        self.insert_child(child, clock, "crossover");
+        Ok(RollOutcome::survived(format!(
+            "child {} ({}) inserted, victim {} culled",
+            inserted_hash,
+            lineage,
+            victim_for_log.as_deref().map(|v| v[..8.min(v.len())].to_string()).unwrap_or_else(|| "none".into()),
+        )))
     }
 
     /// Append one evolution-event row to the history.csv buffer (cx_retry_full
@@ -1936,7 +1967,7 @@ impl RaceEngine {
     /// buffers), falls back to culling the first live net — the immigrant
     /// still needs a slot, and a random cull is the only honest option when
     /// nothing distinguishes the population yet.
-    fn evolve_random_immigrant(&mut self, clock: usize, roll: usize) -> Result<()> {
+    fn evolve_random_immigrant(&mut self, clock: usize, roll: usize) -> Result<String> {
         // Pick a victim: fitness-inverse among NON-ELITE nets when possible
         // (the elite guard makes the top-k immune to mutation culls too),
         // worst-net when buffers are cold, first-live as last resort.
@@ -1955,14 +1986,11 @@ impl RaceEngine {
         self.pre_insert_buffer(&child.state.hash);
         self.catch_up(&mut child, clock)?;
         let _ = roll; // roll index kept for determinism only, not logged
-        if self.verbose_detail() {
-            info!(
-                "step {} │ mutation │ inserted {} random immigrant (no gate) → caught up to step {}",
-                clock,
-                &child.state.hash[..8],
-                clock,
-            );
-        }
+        let detail = format!(
+            "victim {} culled, immigrant {} inserted (no gate)",
+            &victim[..8.min(victim.len())],
+            &child.state.hash[..8.min(child.state.hash.len())],
+        );
         let victim_net_seed = self.state.net(&victim).map(|s| s.net_seed);
         self.record_attempt(
             clock,
@@ -1978,8 +2006,8 @@ impl RaceEngine {
             Some(&victim),
             victim_net_seed,
         );
-        self.insert_child(child, clock);
-        Ok(())
+        self.insert_child(child, clock, "mutation");
+        Ok(detail)
     }
 
     /// The next child ordinal at this clock (across all evolution branches).
@@ -1991,23 +2019,13 @@ impl RaceEngine {
 
     /// Cull one net: final state snapshot to disk, drop from all live maps.
     fn cull_net(&mut self, hash: &str, clock: usize, reason: &str) -> Result<()> {
-        let dir = self.fitness.direction().arrow();
+        // NO per-event log here: culls are reported on the calling roll's
+        // single line (crossover/mutation/pruned) — one roll, one line.
         let smoothed = self
             .rolling_fitness
             .get(hash)
             .map(rolling_mean)
             .unwrap_or(f32::NAN);
-        if self.verbose_detail() {
-            info!(
-                "step {} │ culled {} smoothed{} {} ({}) → tombstone, pop now {}",
-                clock,
-                hash,
-                dir,
-                fmt2(smoothed),
-                reason,
-                self.state.live_count() - 1,
-            );
-        }
         if let Some(mut state) = self.state.net(hash).cloned() {
             state.is_alive = false;
             // Cull metadata turns the tombstone into a complete record of
@@ -2849,7 +2867,9 @@ mod tests {
             .seed_population_internal(vec![tiny_topology(7)], Some(0.0))
             .unwrap();
         let clock = 5;
-        let mut child = engine.generate_child(clock, 0).unwrap();
+        // generate_child can now return Ok(None) (spent roll) — this test
+        // exercises catch-up mechanics, so build the child directly.
+        let mut child = engine.random_child(clock, 0).unwrap();
         assert!(
             !child
                 .state
@@ -2886,8 +2906,8 @@ mod tests {
             .seed_population_internal(vec![tiny_topology(7)], Some(0.0))
             .unwrap();
         let clock = 5;
-        let mut child_a = engine_a.generate_child(clock, 0).unwrap();
-        let mut child_b = engine_b.generate_child(clock, 0).unwrap();
+        let mut child_a = engine_a.random_child(clock, 0).unwrap();
+        let mut child_b = engine_b.random_child(clock, 0).unwrap();
         engine_a.catch_up(&mut child_a, clock).unwrap();
         engine_b.catch_up(&mut child_b, clock).unwrap();
         // Same seed ⇒ same catch-up metrics.
@@ -2948,8 +2968,10 @@ mod tests {
         let dir_b = std::env::temp_dir().join("race_child_det_b");
         let mut a = seed_two_parents(&dir_a, 123);
         let mut b = seed_two_parents(&dir_b, 123);
-        let ca = a.generate_child(3, 0).unwrap();
-        let cb = b.generate_child(3, 0).unwrap();
+        a.config.crossover_prob = 1.0;
+        b.config.crossover_prob = 1.0;
+        let ca = a.generate_child(3, 0).unwrap().unwrap();
+        let cb = b.generate_child(3, 0).unwrap().unwrap();
         assert_eq!(
             ca.state.hash, cb.state.hash,
             "same seed + clock ⇒ same child topology"
@@ -2959,28 +2981,30 @@ mod tests {
     }
 
     #[test]
-    fn crossover_prob_zero_means_always_random_branch() {
+    fn crossover_prob_zero_means_spent_roll() {
         let dir = std::env::temp_dir().join("race_child_cx0");
         let mut engine = seed_two_parents(&dir, 7);
         engine.config.crossover_prob = 0.0;
-        // One child per culled slot; every one must be lineage "random".
+        // crossover_prob=0 ⇒ the roll never fires ⇒ Ok(None) (spent roll).
+        // Random immigrants come only from the mutation rolls.
         for clock in 0..4 {
             let child = engine.generate_child(clock, 0).unwrap();
-            let lineage = child.state.created_from.as_deref().unwrap();
             assert!(
-                lineage == "random" || lineage == "random+mut",
-                "crossover_prob=0 ⇒ random branch at clock {clock}, got {lineage}"
+                child.is_none(),
+                "crossover_prob=0 ⇒ no child at clock {clock}"
             );
         }
     }
 
     #[test]
     fn mutation_prob_zero_and_one_flips_mut_suffix() {
+        // The mutation roll now belongs to the CROSSOVER branch only: the
+        // exploit path may get a perturbation; the immigrant path is pure
+        // exploration and never carries the '+mut' suffix.
         let dir_no = std::env::temp_dir().join("race_child_mut0");
         let mut no = seed_two_parents(&dir_no, 21);
-        no.config.crossover_prob = 0.0;
         no.config.mutate_prob = 0.0;
-        let c = no.generate_child(1, 0).unwrap();
+        let c = no.random_child(1, 0).unwrap();
         assert_eq!(
             c.state.created_from.as_deref(),
             Some("random"),
@@ -2989,13 +3013,12 @@ mod tests {
 
         let dir_yes = std::env::temp_dir().join("race_child_mut1");
         let mut yes = seed_two_parents(&dir_yes, 21);
-        yes.config.crossover_prob = 0.0;
         yes.config.mutate_prob = 1.0;
-        let c = yes.generate_child(1, 0).unwrap();
+        let c = yes.random_child(1, 0).unwrap();
         assert_eq!(
             c.state.created_from.as_deref(),
-            Some("random+mut"),
-            "mutate_prob=1 ⇒ '+mut' suffix"
+            Some("random"),
+            "immigrant path is mutation-free regardless of mutate_prob"
         );
     }
 
@@ -3038,12 +3061,12 @@ mod tests {
     }
 
     #[test]
-    fn fallback_after_three_failed_crossovers_is_random_topology() {
+    fn failed_crossover_after_three_attempts_is_a_noop() {
         // Hidden-less parents make every crossover attempt a no-op
-        // (cx_one_point/cx_uniform both bail with zero hidden nodes), so
-        // after 3 attempts the engine must fall back to a fresh random
-        // topology (lineage "random"), never stall — and never clone the
-        // fittest (cloning would reinforce the leader and starve diversity).
+        // (cx_one_point/cx_uniform both bail with zero hidden nodes). After
+        // 3 attempts the roll is SPENT — no random fallback (random whole
+        // nets enter only via the mutation path), signaled by a clean error
+        // the caller skips, never a stall.
         let dir = std::env::temp_dir().join("race_child_fallback");
         let mut engine = engine(&dir, 55).unwrap();
         engine
@@ -3051,14 +3074,17 @@ mod tests {
             .unwrap();
         engine.config.crossover_prob = 1.0;
         engine.config.mutate_prob = 0.0;
-        let child = engine.generate_child(2, 0).unwrap();
-        let lineage = child.state.created_from.as_deref().unwrap();
+        let before = engine.state.live_count();
+        let result = engine.generate_child(2, 0).unwrap();
         assert!(
-            lineage == "random",
-            "3 failed crossovers ⇒ random topology fallback, got {lineage}"
+            result.is_none(),
+            "3 failed crossovers ⇒ spent roll (no child), not a random fallback"
         );
-        // Child must still be trainable: dataset dims stamped, seed set.
-        assert!(child.state.net_seed != 0);
+        assert_eq!(
+            engine.state.live_count(),
+            before,
+            "population must be untouched by a spent crossover roll"
+        );
     }
 
     // ── Iter-6 Tier B/C: resume replay + parity ──────────────────────
@@ -3307,24 +3333,32 @@ mod tests {
     }
 
     #[test]
-    fn stop_criteria_race_first_fire_wins() {
-        // Two criteria set → both are live; whichever fires first ends the run.
-        // max_steps fires at step 20 while target (2.0) is unreachable — the
-        // step budget must win at its own step because it is checked first.
+    #[should_panic(expected = "only one stop criteria can be used at a time")]
+    fn stop_criteria_both_set_panics_at_build() {
+        // max_steps + max_target_fitness together are a config error, not a
+        // recoverable state — `build()` panics with the exclusive-criteria
+        // message before any run can start.
+        RaceConfig::builder()
+            .set_max_steps(20)
+            .set_max_target_fitness(0.5)
+            .build();
+    }
+
+    #[test]
+    fn stop_criteria_single_each_fires() {
+        // max_steps alone: fires at its own step.
         let run_dir = std::env::temp_dir().join("gras-race-steps");
         let mut eng = engine(&run_dir, 5).unwrap();
         eng.config.max_steps = Some(20);
-        eng.config.max_target_fitness = Some(-1.0); // unreachable under Minimize (fires when best < target)
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
         seed_raw_fitness(&mut eng, 0.5);
-        assert_eq!(eng.check_stop(19), None, "neither has fired yet");
+        assert_eq!(eng.check_stop(19), None, "not fired yet");
         assert_eq!(eng.check_stop(20), Some(StopReason::MaxSteps));
 
-        // Reverse the race: target fires first while the step budget is far.
+        // max_target_fitness alone: fires once best smoothed crosses it.
         let run_dir = std::env::temp_dir().join("gras-race-target");
         let mut eng = engine(&run_dir, 5).unwrap();
-        eng.config.max_steps = Some(1000);
         eng.config.max_target_fitness = Some(0.6); // Minimize: fires once best smoothed (0.5) < 0.6
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();

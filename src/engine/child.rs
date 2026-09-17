@@ -1,21 +1,23 @@
 //! Entrant generation: exactly one child per culled slot (Iter 5 contract).
 //!
 //! `generate_child` rolls `crossover_prob` → roulette-select parents →
-//! crossover (≤3 attempts) → clone-fittest fallback → random fallback;
-//! then rolls `mutate_prob` for a yes/no mutation. The child always gets
+//! crossover (≤3 attempts) — a failed crossover makes the roll a NO-OP
+//! (no random fallback: random nets enter ONLY via the mutation path).
+//! There is NO part-mutation: crossover children are pure recombination
+//! (crossover exploits, mutation explores). The child always gets
 //! its own `derive_seed(run_seed, clock)` weight seed and a `created_from`
 //! lineage string. Catch-up replays the shared stream solo so the child
 //! rejoin the group at the current clock.
 
 use flodl::nn::Optimizer;
 use flodl::tensor::Result;
-use log::{debug, info};
+use log::debug;
 
-/// Parent-pairing attempts before falling back to a random topology.
+/// Parent-pairing attempts before the crossover roll is spent as a no-op.
 /// Distinct from `crossover_rolls` (rolls per step) and `crossover_retries`
 /// (gate-rejection retries) — this bounds only the draw of fresh parent
 /// PAIRS when no compatible pairing is found.
-const MAX_PARENT_PAIRINGS: usize = 3;
+pub(crate) const MAX_PARENT_PAIRINGS: usize = 3;
 
 use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
@@ -55,7 +57,10 @@ impl RaceEngine {
     ///
     /// The child always gets its own weight seed `derive_seed(run_seed, clock)`
     /// and `created_from` lineage recording what actually happened.
-    pub(crate) fn generate_child(&mut self, clock: usize, child_idx: usize) -> Result<RaceChild> {
+    /// Returns `Ok(None)` when the roll was spent without a child (crossover
+    /// fired but produced nothing viable) — NOT an error, just nothing to
+    /// insert. `Ok(Some(child))` is a ready child (evolved or random).
+    pub(crate) fn generate_child(&mut self, clock: usize, child_idx: usize) -> Result<Option<RaceChild>> {
         // Same-clock siblings must differ: mix the child ordinal into the
         // derivation so two culled slots at one step make distinct children
         // (the pop-shrink bug: identical roll seeds ⇒ identical children ⇒
@@ -63,30 +68,24 @@ impl RaceEngine {
         let roll_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx);
         let mut rng = fastrand::Rng::with_seed(roll_seed);
 
-        // Crossover attempt: independent of mutation. When ``crossover_prob``
-        // does not fire we skip straight to a random child (the not-evolved
-        // branch). When it fires we try roulette → crossover up to 3 times;
-        // a hard failure (no live parents, etc.) falls back to random so the
-        // race never stalls.
+        // Every roll is a CROSSOVER roll now: when `crossover_prob` does not
+        // fire, or the attempt fails, the roll is simply spent (no child).
+        // Random whole nets enter exclusively via the mutation rolls — the
+        // old not-fired → random fallback is gone.
         let try_crossover = rng.f32() < self.config.crossover_prob;
 
         if try_crossover {
             match self.evolved_child(clock, child_idx, &mut rng) {
-                Ok(child) => Ok(child),
-                Err(e) => {
-                    // Crossover machinery failed hard (not just a no-op):
-                    // fall back to a random child so the race never stalls.
-                    if self.verbose_detail() {
-                        info!(
-                            "step {} │ evolved child failed ({:?}) → random fallback",
-                            clock, e,
-                        );
-                    }
-                    self.random_child(clock, child_idx)
-                }
+                // Crossover produced nothing viable: the roll does NOTHING.
+                // No random fallback — random whole nets enter the population
+                // exclusively via the mutation path.
+                // NO log here: the caller logs one line per roll, including
+                // the no-child outcome (this None is returned as detail).
+                Ok(None) => Ok(None),
+                other => other,
             }
         } else {
-            self.random_child(clock, child_idx)
+            Ok(None) // probability roll said no — roll spent, no child
         }
     }
 
@@ -94,13 +93,17 @@ impl RaceEngine {
     /// The evolved branch: roulette parents → crossover → maybe mutate.
     /// Called only when ``crossover_prob`` fires; returns an error when there
     /// are no live parents to select from (which is treated as "no crossover
-    /// this step" by ``generate_child``, which falls back to random).
+    /// this step" by ``generate_child`` — a spent roll, NO random fallback: a
+    /// not-fired or failed crossover roll inserts nothing; random whole nets
+    /// enter exclusively via the mutation rolls.
     fn evolved_child(
         &mut self,
         clock: usize,
         child_idx: usize,
         rng: &mut fastrand::Rng,
-    ) -> Result<RaceChild> {
+    ) -> Result<Option<RaceChild>> {
+        // Ok(None) = the roll produced no child (no compatible pairing); the
+        // caller treats it as a spent roll, not an error path.
         // 1. Ranking: live hashes ordered best-first by smoothed fitness.
         let hashes = self.state.live_hashes();
         if hashes.is_empty() {
@@ -192,51 +195,40 @@ impl RaceEngine {
                 parent_hashes = attempt_parents;
                 break;
             }
-        }
-
-        let mut child_topo = match child_topo {
+        }        let mut child_topo = match child_topo {
             Some(t) => t,
             None => {
-                // MAX_PARENT_PAIRINGS exhausted → fresh random topology, NOT a
-                // clone of the fittest: cloning reinforces the leader and
-                // starves diversity; a random entrant brings new blood. The
-                // race never stalls either way (pop size stays constant).
-                if self.verbose_detail() {
-                    info!(
-                        "step {} │ crossover produced no child after {} parent-pairing attempts (no compatible pivot/dims) → random topology fallback",
-                        clock,
-                        MAX_PARENT_PAIRINGS,
-                    );
-                }
-                return self.random_child(clock, child_idx);
+                // MAX_PARENT_PAIRINGS exhausted → NO child this roll. No
+                // random fallback: random whole nets enter only via the
+                // mutation path. The roll is simply spent (the population
+                // stays untouched — no cull happens for a child that was
+                // never born). NO log — the caller's roll line carries it.
+                return Ok(None);
             }
         };
 
-        // 4. Mutation: yes/no rolled per child from ``mutate_prob``; the op
-        //    type is drawn from the three built-in mutation kinds (activation /
-        //    combine / standardize).
-        let mutated = if rng.f32() < self.config.mutate_prob {
-            let kinds = [
-                crate::evolution::mutation::MutationMethod::Activation { prob: 1.0 },
-                crate::evolution::mutation::MutationMethod::CombineOp { prob: 1.0 },
-                crate::evolution::mutation::MutationMethod::Standardize { prob: 1.0 },
-            ];
-            let kind = &kinds[rng.usize(0..kinds.len())];
-            self.apply_mutation(&mut child_topo, kind, rng);
-            cx_note.push_str("+mut");
-            true
-        } else {
-            false
-        };
+        // NO part-mutation anywhere: crossover exploits (pure recombination),
+        // mutation explores (fresh random immigrants). `mutate_prob` gates the
+        // immigrant rolls in the race loop, not topology tweaks on children.
 
-        self.finalize_child(
-            child_topo,
-            clock,
-            child_idx,
-            &cx_note,
-            &parent_hashes,
-            mutated,
-        )
+        // Crossover children get per-port activations — the port pool
+        // is part of the search space, not just the immigrant path.
+        child_topo.assign_port_activations(
+            &self
+                .config
+                .resolved_activation_pool()
+                .unwrap_or_else(|_| crate::evolution::pools::all_activations()),
+        );
+        Ok(Some(
+            self.finalize_child(
+                child_topo,
+                clock,
+                child_idx,
+                &cx_note,
+                &parent_hashes,
+                false,
+            )?,
+        ))
     }
 
     /// Load a live net's topology by hash (parents must still be live —
@@ -250,52 +242,10 @@ impl RaceEngine {
         }
     }
 
-    /// Apply one mutation op to the child topology. `prob: 1.0` inside the
-    /// method means "definitely mutate" (the yes/no was already rolled).
-    fn apply_mutation(
-        &self,
-        topo: &mut Topology,
-        kind: &crate::evolution::mutation::MutationMethod,
-        rng: &mut fastrand::Rng,
-    ) {
-        use crate::evolution::mutation::MutationMethod;
-        match kind {
-            MutationMethod::Activation { .. } => {
-                let pool = self
-                    .config
-                    .resolved_activation_pool()
-                    .unwrap_or_else(|_| crate::evolution::pools::all_activations());
-                if let Some(node) = topo.nodes.iter_mut().find(|n| n.kind == NodeKind::Hidden) {
-                    node.activation = pool[rng.usize(0..pool.len())];
-                }
-            }
-            MutationMethod::CombineOp { .. } => {
-                let pool = self
-                    .config
-                    .resolved_combine_pool()
-                    .unwrap_or_else(|_| crate::evolution::pools::all_combine_ops());
-                if let Some(node) = topo.nodes.iter_mut().find(|n| n.kind == NodeKind::Hidden) {
-                    node.combine_op = Some(pool[rng.usize(0..pool.len())]);
-                }
-            }
-            MutationMethod::Standardize { .. } => {
-                let pool = self
-                    .config
-                    .resolved_standardize_pool()
-                    .unwrap_or_else(|_| crate::evolution::pools::all_standardize_ops());
-                if let Some(node) = topo.nodes.iter_mut().find(|n| n.kind == NodeKind::Hidden) {
-                    node.standardize = Some(pool[rng.usize(0..pool.len())]);
-                }
-            }
-        }
-        topo.refresh_labels();
-        topo.finalize();
-    }
-
     /// A fresh random child from the run's resolved pools (the crossover_prob
     /// "random" branch, and the last-resort fallback for a failed evolved
     /// path). Mirrors the generational `create_individual` shape.
-    fn random_child(&mut self, clock: usize, child_idx: usize) -> Result<RaceChild> {
+    pub(crate) fn random_child(&mut self, clock: usize, child_idx: usize) -> Result<RaceChild> {
         let roll_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx);
         let mut rng = fastrand::Rng::with_seed(roll_seed);
         let topo_opts = self.config.topology_options;
@@ -339,19 +289,19 @@ impl RaceEngine {
         }
         graph.refresh_labels();
         graph.finalize();
-        // The random branch rolls mutate_prob too — the yes/no is per child,
-        // not per branch (Iter-5 contract: every child gets the mutation roll).
-        let mutated = rng.f32() < self.config.mutate_prob;
-        if mutated {
-            let kinds = [
-                crate::evolution::mutation::MutationMethod::Activation { prob: 1.0 },
-                crate::evolution::mutation::MutationMethod::CombineOp { prob: 1.0 },
-                crate::evolution::mutation::MutationMethod::Standardize { prob: 1.0 },
-            ];
-            let kind = &kinds[rng.usize(0..kinds.len())];
-            self.apply_mutation(&mut graph, kind, &mut rng);
-        }
-        self.finalize_child(graph, clock, child_idx, "random", &[], mutated)
+        // Per-port activations AFTER finalize: num_outputs is final only
+        // once trim_orphaned_ports compacted the ports. Pool = the run's
+        // resolved activation pool (same knob as node-level activations).
+        let act_pool = self
+            .config
+            .resolved_activation_pool()
+            .unwrap_or_else(|_| crate::evolution::pools::all_activations());
+        graph.assign_port_activations(&act_pool);
+        // NO mutation roll on the immigrant path. Crossover exploits, mutation
+        // explores: a brand-new random topology is already maximal exploration
+        // — a second random op tweak on top is redundant noise. The mutation
+        // roll belongs to the crossover branch only.
+        self.finalize_child(graph, clock, child_idx, "random", &[], false)
     }
 
     /// Shared child finalization: fresh weight seed from `run_seed + clock`,

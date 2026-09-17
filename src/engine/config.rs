@@ -48,11 +48,6 @@ pub enum LogLevel {
     /// and the current best net. No per-net detail lines, no separate rollup
     /// line — just the table.
     Minimal,
-    /// One compact line per step plus per-net detail lines and the checkpoint
-    /// diagnostic. The readable, sequential evolve block lives here:
-    /// what fired, what was checked against gates, what passed/failed, what
-    /// entered or left the population, and the net pop change.
-    Full,
 }
 
 /// How strict the checkpoint gate is for a crossover child.
@@ -139,7 +134,9 @@ pub struct RaceConfig {
     /// crossover child must clear at every gate to be inserted.
     pub checkpoint_every: usize,
     /// Independent crossover rolls per step. Each roll fires with
-    /// `crossover_prob`; a firing roll produces one checkpoint-gated child.
+    /// `crossover_prob`; a firing roll produces one checkpoint-gated recombined
+    /// child. A not-fired or failed roll is SPENT — no random fallback (random
+    /// whole nets enter only via `mutate_rolls`).
     pub crossover_rolls: usize,
     /// Independent mutation rolls per step. Each roll fires with
     /// `mutate_prob`; a firing roll culls one fitness-inverse-selected net
@@ -200,8 +197,10 @@ pub struct RaceConfig {
     /// shared by every individual in the run.
     pub topology_options: crate::graph::topology::TopologyOptions,
     pub crossover_prob: f32,
-    /// Probability the child gets mutated (yes/no per child). Formerly
-    /// `evolve_prob` — renamed to match DEAP-style per-op probabilities.
+    /// DEPRECATED knob kept for API compatibility — part-mutation has been
+    /// dropped: crossover children are pure recombination and random
+    /// immigrants are never perturbed (crossover exploits, mutation
+    /// explores). Setting it has no effect.
     pub mutate_prob: f32,
     /// Pluggable stop criterion **in addition** to the built-ins (Iter 5
     /// contract). When `None`, only the built-ins apply.
@@ -651,13 +650,14 @@ impl RaceConfigBuilder {
         self
     }
     /// Validate the stop-criteria surface: `max_steps` and
-    /// `max_target_fitness` are **exclusive** — at most one may be set. Both
-    /// would fight for different things (a budget vs. a quality bar), and
-    /// whichever fires first would silently mask the other.
+    /// `max_target_fitness` are **exclusive** — only one stop criterion at a
+    /// time. Both would fight for different things (a budget vs. a quality
+    /// bar), and whichever fires first would silently mask the other. A
+    /// config with both panics at `build()`.
     pub(crate) fn validate_single_stop(cfg: &RaceConfig) -> Result<(), String> {
         if cfg.max_steps.is_some() && cfg.max_target_fitness.is_some() {
             return Err(
-                "max_steps and max_target_fitness are mutually exclusive — set only one stop criterion".into(),
+                "only one stop criteria can be used at a time: max_steps and max_target_fitness are mutually exclusive".into(),
             );
         }
         Ok(())

@@ -78,7 +78,7 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
             continue;
         }
         log::info!(
-            "initial population: duplicate topology {} → discarded, random replacement",
+            "initial population: duplicate topology {} → discarded, re-rolling a unique seed",
             &hash[..8]
         );
         // Duplicate — re-roll at ordinals past the initial batch, bounded.
