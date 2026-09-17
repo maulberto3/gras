@@ -27,6 +27,10 @@ pub struct NetworkFacts {
     pub kind_counts: (usize, usize, usize),
     pub activation_counts: Vec<(crate::graph::node::Activation, usize)>,
     pub standardize_counts: Vec<(crate::graph::node::StandardizeOp, usize)>,
+    /// Per-port activation census: how many ports carry each activation,
+    /// across the whole graph (node-level + per-port overrides combined —
+    /// what actually flows, port by port).
+    pub port_activation_counts: Vec<(crate::graph::node::Activation, usize)>,
 }
 
 impl NetworkFacts {
@@ -61,6 +65,7 @@ impl NetworkFacts {
             kind_counts: (kind_counts.input, kind_counts.hidden, kind_counts.output),
             activation_counts: graph_utils::node_activation_counts(&net.nodes),
             standardize_counts: graph_utils::node_standardize_counts(&net.nodes),
+            port_activation_counts: graph_utils::port_activation_counts(&net.nodes),
         }
     }
 
@@ -83,6 +88,7 @@ impl NetworkFacts {
             "kind_counts": [self.kind_counts.0, self.kind_counts.1, self.kind_counts.2],
             "activation_counts": self.activation_counts,
             "standardize_counts": self.standardize_counts,
+            "port_activation_counts": self.port_activation_counts,
         });
         serde_json::to_string_pretty(&spec).map_err(|e| {
             crate::utils::error::NetworkError::Json(format!("network facts: {e}")).into()
