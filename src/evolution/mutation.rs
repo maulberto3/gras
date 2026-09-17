@@ -17,6 +17,10 @@ pub enum MutationMethod {
     CombineOp { prob: f32 },
     /// Swap a random hidden node's standardize op.
     Standardize { prob: f32 },
+    /// Redraw one non-primary output port's activation (port >= 1) of a
+    /// random hidden node from the run's activation pool. Ports >= 1 only:
+    /// port 0 mirrors the node-level activation (the node's main signal).
+    PortActivation { prob: f32 },
 }
 
 impl Default for MutationMethod {
@@ -32,7 +36,8 @@ impl MutationMethod {
         match self {
             MutationMethod::Activation { prob }
             | MutationMethod::CombineOp { prob }
-            | MutationMethod::Standardize { prob } => *prob,
+            | MutationMethod::Standardize { prob }
+            | MutationMethod::PortActivation { prob } => *prob,
         }
     }
 }
