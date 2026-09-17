@@ -182,6 +182,9 @@ impl Display for MutationMethod {
             MutationMethod::Standardize { prob } => {
                 write!(f, "mut_standardize(p={:.0}%)", prob * 100.0)
             }
+            MutationMethod::PortActivation { prob } => {
+                write!(f, "mut_port_activation(p={:.0}%)", prob * 100.0)
+            }
         }
     }
 }

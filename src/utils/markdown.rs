@@ -67,7 +67,15 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
                 NodeKind::Hidden => "Hidden",
                 NodeKind::Output => "Output",
             };
-            let act = node.activation;
+            // Activation column: node-level, plus `[a|b|…]` when ports
+            // diverge — mirrors the mermaid per-port sig.
+            let act = match &node.port_activations {
+                Some(ports) if ports.iter().any(|a| *a != node.activation) => {
+                    let list: Vec<String> = ports.iter().map(|a| format!("{a}")).collect();
+                    format!("{} [{}]", node.activation, list.join("|"))
+                }
+                _ => format!("{}", node.activation),
+            };
             let combine = node.combine_op.map_or("—".into(), |op| format!("{op}"));
             let std = node.standardize.map_or("—".into(), |s| format!("{s}"));
             let (in_dim, out_dim) = graph.node_dims().get(i).copied().unwrap_or((0, 0));
@@ -127,19 +135,33 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
         .nodes
         .iter()
         .enumerate()
-        .map(|(i, n)| AsciiNode {
-            id: n.id,
-            kind: n.kind,
-            num_inputs: n.num_inputs,
-            num_outputs: n.num_outputs,
-            out_dim: node_dims.get(i).map(|&(_, out)| out),
+        .map(|(i, n)| {
+            let in_wires = graph
+                .connections
+                .iter()
+                .filter(|c| c.to.node == n.id)
+                .count();
+            let out_wires = graph
+                .connections
+                .iter()
+                .filter(|c| c.from.node == n.id)
+                .count();
+            AsciiNode {
+                id: n.id,
+                kind: n.kind,
+                num_inputs: n.num_inputs,
+                num_outputs: n.num_outputs,
+                out_dim: node_dims.get(i).map(|&(_, out)| out),
+                in_wires,
+                out_wires,
+            }
         })
         .collect();
     out.push_str(&render_wire_diagram(&nodes, &graph.connections));
     out.push_str("```\n");
     out.push_str("\n> **Legend**:\n");
     out.push_str("> - I=input  H=hidden  O=output\n");
-    out.push_str("> - 0i/4o = input ports / output ports\n");
+    out.push_str("> - `4w→2i/1o→5w` = wires→input ports / output ports→wires (a port may carry several wires; the combine op merges them)\n");
     out.push_str("> - ->dim = output dimension\n");
     out.push_str("> - ▶ connected output  ◀ connected input  * orphaned port\n");
 
@@ -151,17 +173,17 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     // Each visual channel (border, wire, label) encodes one structural
     // fact; the legend says which, so a reader never has to guess.
     out.push_str("\n## How to read this\n\n");
-    out.push_str("| You see | It means | How to reason about it |\n");
-    out.push_str("|---|---|---|");
-    out.push_str("\n| **Box border thickness** | the node's `hidden_dim` | A thick border = that node carries a lot of information (wide layer). Thin = narrow layer. Compare borders *within this one net* — they are scaled to this net's min→max dim, not a global scale. |");
-    out.push_str("\n| **Wire thickness** | hop distance of the connection | A thick wire skips far (e.g. H1 → out, jumping over intermediate layers) — a long-range shortcut. Thin wires connect neighbors. Skip-heavy nets mix features from different depths; neighbor-only nets process locally, layer by layer. |");
-    out.push_str("\n| **Box label** | `H<id> <activation> <dim>` | The node's id, its activation function, and its width. E.g. `H3 gelu 48` = hidden node 3, GELU, 48 units. |");
-    out.push_str("\n| **`in <n>` / `out <n>`** | dataset shape | Fixed by the problem: number of features in, classes out. |");
-    out.push_str("\n| **Nodes table → `Sources`** | which outputs feed each node | `n1_o2, n3_o0` = this node reads output 2 of node 1 and output 0 of node 3. Empty (`*`) = orphaned port (nothing connects there). |");
-    out.push_str("\n| **Nodes table → `Combine`** | how a node merges its inputs | `Mean`/`Min`/`Max` — what happens when several wires arrive at one box. |");
-    out.push_str("\n| **Nodes table → `Std`** | per-node standardization | Whether inputs are normalized before combining. |");
-    out.push_str("\n| **Edge list → `<<<<`** | long jump | Same fact as thick wires, in text form: this connection skips over nodes. |");
-    out.push_str("\n| **Wiring diagram → `▶ ◀ *`** | port connection state | ▶ = this output is wired somewhere, ◀ = this input receives something, * = orphaned (unused port — often harmless, sometimes a search artifact). |");
+    out.push_str("| Visual | Meaning |\n");
+    out.push_str("|---|---|");
+    out.push_str("\n| **Box border thickness** | node width (`hidden_dim`, scaled min→max within this net). |");
+    out.push_str("\n| **Wire thickness** | hop distance — thick = long-range skip, thin = neighbor. |");
+    out.push_str("\n| **Box label (Graph)** | `H<id> <combine>·<std> <dim>` — the node's internal processing. Activation is NOT here: it lives on each outgoing arrow. |");
+    out.push_str("\n| **Arrow label (Graph)** | the wire's own activation — per-port, so one node can emit `mish` to one neighbor and `tanh` to another. Equal labels from the same node = same signal; duplicates are impossible (dedup collapses them). |");
+    out.push_str("\n| **Dashed stub `selu (input)` / `mish (orphan)`** | orphaned port — an input nothing feeds / an output nothing reads (mermaid's counterpart of the ASCII `*`). |");
+    out.push_str("\n| **`in <n>` / `out <n>`** | dataset shape (fixed by the problem). |");
+    out.push_str("\n| **Nodes table → `Sources`** | which output ports feed this node (`n1_o2` = output 2 of node 1); `*` = orphaned. |");
+    out.push_str("\n| **Nodes table → `Combine` / `Std`** | how multiple inputs are merged / whether they're normalized first. |");
+    out.push_str("\n| **Edge list & wiring diagram** | one line per wire, exact ports (`n0_o1 → n2_i0`); `<<<<` = long jump; `▶ ◀ *` = wired out / wired in / orphaned. |");
     out.push_str("\n");
 
     out

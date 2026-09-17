@@ -14,6 +14,12 @@ pub(crate) struct AsciiNode {
     pub num_outputs: usize,
     /// Output dimension (from node_dims), shown in parentheses.
     pub out_dim: Option<usize>,
+    /// Wires ARRIVING at this node (may exceed num_inputs: several wires can
+    /// share one input port — the combine op merges them).
+    pub in_wires: usize,
+    /// Wires LEAVING this node (may exceed num_outputs: the Input node's
+    /// single port fans out to many targets by design).
+    pub out_wires: usize,
 }
 
 pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection]) -> String {
@@ -30,22 +36,26 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
     // ── 1. Clean Label Strings (Pure ASCII) ──
     let labels: Vec<String> = nodes
         .iter()
-        .map(|n| match n.out_dim {
-            Some(dim) => format!(
-                "n{} {} {}i/{}o ->{}",
-                n.id,
-                kind_name(n.kind),
-                n.num_inputs,
-                n.num_outputs,
-                dim
-            ),
-            None => format!(
-                "n{} {} {}i/{}o",
-                n.id,
-                kind_name(n.kind),
-                n.num_inputs,
-                n.num_outputs
-            ),
+        .map(|n| {
+            // Wires vs ports, stated explicitly on both sides:
+            // `in: 2 wires → 1 port · out: 1 port → 3 wires`. A bare port
+            // count read as "one input" while 4 arrows arrived (or hid a
+            // fan-out) — the wire counts make the box match the arrows.
+            let in_part = format!("{}w→{}i", n.in_wires.max(n.num_inputs), n.num_inputs);
+            let out_part = format!("{}o→{}w", n.num_outputs, n.out_wires.max(n.num_outputs));
+            match n.out_dim {
+                Some(dim) => format!(
+                    "n{} {} {}/{} ->{}",
+                    n.id, kind_name(n.kind), in_part, out_part, dim
+                ),
+                None => format!(
+                    "n{} {} {}/{}",
+                    n.id,
+                    kind_name(n.kind),
+                    in_part,
+                    out_part
+                ),
+            }
         })
         .collect();
 

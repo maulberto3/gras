@@ -59,7 +59,7 @@ pub struct ConfigSnapshot {
     /// Whether a pluggable `custom_stop` closure was installed. The closure is
     /// code, not data, so only its presence is recordable.
     pub has_custom_stop: bool,
-    /// Per-step verbosity (`"none"` | `"summ"` | `"minimal"` | `"full"`).
+    /// Per-step verbosity (`"none"` | `"summ"` | `"minimal"`).
     pub log_level: String,
     /// Problem-space target (`"tabular"` | `"onecimage"` | `"threecimage"` |
     /// `"nlp"` | `"rl"`).

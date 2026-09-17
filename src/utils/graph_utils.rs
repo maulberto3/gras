@@ -119,6 +119,24 @@ pub(crate) fn node_activation_counts(nodes: &[Node]) -> Vec<(Activation, usize)>
     counts
 }
 
+/// Per-port activation histogram: one entry per OUTPUT PORT of every node
+/// (what actually flows on the wires), counting each port's effective
+/// activation — per-port override when set, node-level activation otherwise.
+pub(crate) fn port_activation_counts(nodes: &[Node]) -> Vec<(Activation, usize)> {
+    let mut counts: Vec<(Activation, usize)> = Vec::new();
+    for n in nodes {
+        for o in 0..n.num_outputs.max(1) {
+            let a = n.port_activation(o);
+            if let Some(entry) = counts.iter_mut().find(|(x, _)| *x == a) {
+                entry.1 += 1;
+            } else {
+                counts.push((a, 1));
+            }
+        }
+    }
+    counts
+}
+
 /// Standardize-op histogram across nodes.
 pub(crate) fn node_standardize_counts(
     nodes: &[Node],

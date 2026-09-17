@@ -48,6 +48,7 @@ pub fn accuracy_score(pred: &Variable, y: &Variable) -> Result<f32> {
 pub fn f1_score(pred: &Variable, y: &Variable) -> Result<f32> {
     let (pa, ta) = argmax_classes(pred, y)?;
     let classes = y.data().shape()[1] as usize;
+    // eli5: average the F1 score of each class, where F1 = 2 * precision * recall / (precision + recall)
     Ok(f1_from_vecs(&pa, &ta, classes))
 }
 
@@ -81,6 +82,7 @@ pub fn f1_from_vecs(pa: &[i64], ta: &[i64], classes: usize) -> f32 {
 pub fn precision_score(pred: &Variable, y: &Variable) -> Result<f32> {
     let (pa, ta) = argmax_classes(pred, y)?;
     let classes = y.data().shape()[1] as usize;
+    // eli5: average the precision of each class, where precision = TP / (TP + FP)
     Ok(precision_from_vecs(&pa, &ta, classes))
 }
 
