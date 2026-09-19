@@ -39,7 +39,7 @@ use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{RaceConfig, RaceEngine};
 use gras::graph::network::Network;
 use gras::graph::topology::TopologyOptions;
-use gras::trainer::{StepContext, StepReport, Trainer};
+use gras::trainer::{StepReport, StepTrainer, TabularContext, TabularStep};
 use gras::utils::{tabular_data, score};
 
 // ── 1. The custom trainer ────────────────────────────────────────────────────
@@ -101,33 +101,7 @@ impl WarmupSgdTrainer {
     }
 }
 
-impl Trainer for WarmupSgdTrainer {
-    // OPTIONAL: shape the engine's shared batch stream. This scheme prefers
-    // a smaller train batch (SGD noise) and a bigger eval batch (stabler
-    // readings). The split RATIO is not overridable — which rows are held
-    // out is engine bookkeeping protecting comparability.
-    fn stream_shape(&self) -> Option<gras::trainer::StreamShape> {
-        Some(gras::trainer::StreamShape {
-            batch_size: 2,
-            eval_batch_size: 3,
-        })
-    }
-
-    // OPTIONAL: record the scheme's hyperparameters in `engine.json` so the run
-    // is reproducible without reading this file. Free-form JSON — the engine
-    // persists it verbatim and never interprets it.
-    fn describe(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "trainer": "warmup-sgd",
-            "optimizer": "sgd",
-            "peak_lr": self.peak_lr,
-            "momentum": self.momentum,
-            "grad_clip": self.grad_clip,
-            "warmup_steps": self.warmup_steps,
-            "eval_every": self.eval_every,
-        }))
-    }
-
+impl StepTrainer for WarmupSgdTrainer {
     // Called by the engine at every net birth (initial population, crossover
     // child, random immigrant) and on resume rebuilds. The lr baked in here
     // is the *warmup-schedule* lr for the net's birth step — the momentum
@@ -145,12 +119,46 @@ impl Trainer for WarmupSgdTrainer {
         ))
     }
 
+    // OPTIONAL: record the scheme's hyperparameters in `engine.json` so the run
+    // is reproducible without reading this file. Free-form JSON — the engine
+    // persists it verbatim and never interprets it.
+    fn describe(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "trainer": "warmup-sgd",
+            "optimizer": "sgd",
+            "peak_lr": self.peak_lr,
+            "momentum": self.momentum,
+            "grad_clip": self.grad_clip,
+            "warmup_steps": self.warmup_steps,
+            "eval_every": self.eval_every,
+        }))
+    }
+}
+
+impl TabularStep for WarmupSgdTrainer {
+    // REQUIRED: the (pred, target) loss — a supervised scheme's defining
+    // choice. (RL schemes implement RlStep instead and have no loss method.)
+    fn loss(&self) -> gras::trainer::LossFn<'_> {
+        &*self.loss_fn
+    }
+
+    // OPTIONAL: shape the engine's shared batch stream. This scheme prefers
+    // a smaller train batch (SGD noise) and a bigger eval batch (stabler
+    // readings). The split RATIO is not overridable — which rows are held
+    // out is engine bookkeeping protecting comparability.
+    fn stream_shape(&self) -> Option<gras::trainer::StreamShape> {
+        Some(gras::trainer::StreamShape {
+            batch_size: 2,
+            eval_batch_size: 3,
+        })
+    }
+
     fn train_step(
         &mut self,
         net: &mut Network,
         optimizer: &mut dyn Optimizer,
         step: usize,
-        ctx: &StepContext<'_>,
+        ctx: &TabularContext<'_>,
     ) -> flodl::tensor::Result<StepReport> {
         // ── determinism (required pattern) ──
         // Seed per (net, step) so dropout masks are reproducible across
@@ -168,9 +176,9 @@ impl Trainer for WarmupSgdTrainer {
         // This scheme uses the shared stream + its OWN loss (a supervised
         // scheme keeps its loss internally), and scores eval via the run's
         // fitness — showing which handles are offered vs owned.
-        let data = ctx.data.expect("WarmupSgd uses the run's shared data");
-        let fitness = ctx.fitness.expect("WarmupSgd uses the run's fitness");
-        let loss_fn = &*self.loss_fn;
+        let data = &ctx.data;
+        let fitness = ctx.fitness;
+        let loss_fn = self.loss();
         let batch = data.train_batch(step as u64)?;
         let train_loss = gras::train_one_step(net, optimizer, loss_fn, &batch, self.grad_clip)?;
 
@@ -252,15 +260,15 @@ fn main() {
 
     // Run — the ONLY difference from a default run is the trainer argument:
     let run_seed = 42u64;
-    let mut engine = RaceEngine::new(gras::engine::RunSpec {
-        data_dir: data_dir.to_path_buf(),
+    let mut engine = RaceEngine::new(gras::engine::RunSpec::new(
+        data_dir,
         config,
         fitness,
         // Our scheme instead of TabularTrainer — that's the whole swap.
-        trainer: WarmupSgdTrainer::new(loss_fn, 0.05, 0.9),
-        seed: Some(run_seed),
-        run_dir: Some(run_dir),
-    })
+        WarmupSgdTrainer::new(loss_fn, 0.05, 0.9),
+        Some(run_seed),
+        Some(run_dir),
+    ))
     .unwrap();
     match engine.run() {
         Ok(reason) => println!("race stopped: {reason:?}"),

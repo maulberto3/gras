@@ -9,7 +9,6 @@
 //! synthetic data to demonstrate the end-to-end recovery, replay, and continued
 //! training.
 
-use gras::Trainer;
 use gras::engine::fitness::{Direction, Fitness};
 use gras::engine::{RaceConfig, RaceEngine};
 use gras::graph::network::Network;
@@ -67,6 +66,7 @@ fn main() {
     // Create the batch stream config
     let split = gras::trainer::stream::PoolSplit::of(&dataset, 0.2, header.run_seed);
     let stream = gras::trainer::stream::BatchStream::new(header.run_seed, 16, split);
+    use gras::trainer::StepTrainer;
     let mut optimizer = trainer.make_optimizer(&net);
 
     println!("--------------------------------------------------------------------------------");
@@ -185,14 +185,14 @@ fn setup_demo_run() -> (PathBuf, String, PathBuf) {
         .with_learning_rate(1e-3)
         .with_grad_clip(1.0);
 
-    let mut engine = RaceEngine::new(gras::engine::RunSpec {
-        data_dir: data_dir.clone(),
+    let mut engine = RaceEngine::new(gras::engine::RunSpec::new(
+        data_dir.clone(),
         config,
         fitness,
         trainer,
-        seed: Some(123),
-        run_dir: Some(demo_dir.clone()),
-    })
+        Some(123),
+        Some(demo_dir.clone()),
+    ))
     .unwrap();
 
     engine.run().unwrap();
@@ -200,5 +200,5 @@ fn setup_demo_run() -> (PathBuf, String, PathBuf) {
     let live_hashes = engine.state().live_hashes();
     let net_hash = live_hashes[0].clone();
 
-    (demo_dir, net_hash, data_dir)
+    (demo_dir, net_hash, data_dir.clone())
 }

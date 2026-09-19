@@ -69,14 +69,14 @@ fn main() {
         let sq = diff.mul(&diff)?;
         Ok(Variable::new(sq.mean()?, true))
     };
-    let mut engine = RaceEngine::new(gras::engine::RunSpec {
-        data_dir: data_dir.to_path_buf(),
+    let mut engine = RaceEngine::new(gras::engine::RunSpec::new(
+        data_dir,
         config,
         fitness,
-        trainer: gras::TabularTrainer::new(loss_fn),
-        seed: Some(run_seed),
-        run_dir: Some(run_dir),
-    })
+        gras::TabularTrainer::new(loss_fn),
+        Some(run_seed),
+        Some(run_dir),
+    ))
     .unwrap();
     match engine.run() {
         Ok(reason) => println!("race stopped: {reason:?}"),
