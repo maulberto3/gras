@@ -52,7 +52,8 @@ pub use evolution::selection::SelectionMethod;
 pub use trainer::stream::{BatchStream, PoolSplit};
 pub use trainer::supervised::TabularTrainer;
 pub use trainer::{
-    IntoBoxedTrainer, LossFn, RunData, StepContext, StepEnv, StepReport, StreamShape, Trainer,
+    IntoBoxedTrainer, LossFn, ModeTrainer, RlContext, RlStep, RunData, StepEnv, StepReport,
+    StepTrainer, StreamShape, TabularContext, TabularStep,
 };
 
 // ── data ─────────────────────────────────────────────────────────────
@@ -72,6 +73,7 @@ pub use utils::score::{
 // ── step primitives ──────────────────────────────────────────────────
 pub use utils::race_steps::{
     deterministic_train_step, eval_one_step, seed_step_randomness, train_one_step,
+    train_one_step_pred_only,
 };
 
 // ── flodl — the tensor backend ───────────────────────────────────────
