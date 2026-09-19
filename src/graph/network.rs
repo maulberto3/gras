@@ -19,12 +19,10 @@ use crate::utils::graph_utils::build_node_sources;
 
 /// Options for materializing a [`Network`] from a topology blueprint.
 ///
-/// The **network link** of the option chain (engine → topology → network):
-/// [`crate::engine::EngineOptions`] embeds one of these as its `network`
-/// field, the engine passes it to [`Network::build_with_options`], and
-/// [`Network::build`] is the CPU convenience wrapper. It holds the
-/// **execution** knobs (device, dtype) — *not* the architecture values
-/// (dims, port ranges, combine op), which live in `TopologyOptions`.
+/// Passed to [`Network::build_with_options`]; [`Network::build`] is the CPU
+/// convenience wrapper. It holds the **execution** knobs (device, dtype,
+/// seed, dropout) — *not* the architecture values (dims, port ranges,
+/// combine op), which live in `TopologyOptions`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NetworkOptions {
     pub device: Device,
@@ -545,6 +543,211 @@ impl Network {
     /// [`NetworkFacts`](crate::spec::NetworkFacts).
     pub fn to_json(&self) -> flodl::tensor::Result<String> {
         crate::spec::NetworkFacts::from_network(self).to_json()
+    }
+
+    /// Reconstruct the graph blueprint this network was built from — same
+    /// nodes, same wiring, same per-node dims. Calling
+    /// [`Network::build`] on the result reproduces an architecture-identical
+    /// module (fresh random weights — sync them with
+    /// [`Network::clone_weights_from`]).
+    ///
+    /// Options are recovered from the materialized net: `input_dim` and
+    /// `output_dim` come from the net's own fields, while `topology_seed` /
+    /// `dropout_prob` are pinned to neutral values (seed 0, dropout 0.0) —
+    /// the seed only shapes the throwaway init weights, and dropout 0 keeps
+    /// eval-time forward passes deterministic.
+    pub fn topology_blueprint(&self) -> crate::graph::topology::Topology {
+        let mut topo = crate::graph::topology::Topology::new(
+            0,
+            Some(crate::graph::topology::TopologyOptions {
+                input_dim: Some(self.input_dim),
+                output_dim: Some(self.node_dims[self.output_node].1),
+                ..Default::default()
+            }),
+        );
+        topo.nodes = self.nodes.clone();
+        topo.connections = self.connections.clone();
+        topo
+    }
+
+    /// Copy the weights of `other` into `self`, layer by layer.
+    ///
+    /// Both networks MUST have the same architecture (built from the same
+    /// [`Topology`]) — layer shapes are asserted, not silently mismatched.
+    /// This is the load_state_dict primitive: used by trainers that run
+    /// parallel copies of one net (each thread owns its own `Network`, synced
+    /// from the master before its batch) and by any future import path.
+    ///
+    /// Only leaf weights are copied (node layers + port projections); the
+    /// copies are detached tensors, so gradients never flow across the pair —
+    /// each net keeps its own autograd graph and optimizer state.
+    pub fn clone_weights_from(&mut self, other: &Network) -> flodl::tensor::Result<()> {
+        if self.layers.len() != other.layers.len() {
+            return Err(flodl::tensor::TensorError::new(&format!(
+                "clone_weights_from: architecture mismatch ({} vs {} layers)",
+                self.layers.len(),
+                other.layers.len()
+            )));
+        }
+        for (dst, src) in self.layers.iter_mut().zip(other.layers.iter()) {
+            let sw = src.weight.variable.data();
+            let dw = dst.weight.variable.data();
+            if dw.shape() != sw.shape() {
+                return Err(flodl::tensor::TensorError::new(&format!(
+                    "clone_weights_from: layer weight shape mismatch {:?} vs {:?}",
+                    dw.shape(),
+                    sw.shape()
+                )));
+            }
+            dst.weight.variable.set_data(sw.clone());
+            match (&mut dst.bias, &src.bias) {
+                (Some(db), Some(sb)) => {
+                    let sbt = sb.variable.data();
+                    db.variable.set_data(sbt.clone());
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(flodl::tensor::TensorError::new(
+                        "clone_weights_from: bias presence mismatch",
+                    ))
+                }
+            }
+        }
+        // Port projections: iterate in lockstep, copying the Some(...) pairs.
+        for (dst_ports, src_ports) in self
+            .port_projections
+            .iter_mut()
+            .zip(other.port_projections.iter())
+        {
+            for (dst_list, src_list) in dst_ports.iter_mut().zip(src_ports.iter()) {
+                for (dst_proj, src_proj) in dst_list.iter_mut().zip(src_list.iter()) {
+                    match (dst_proj, src_proj) {
+                        (Some(dp), Some(sp)) => {
+                            let sw = sp.weight.variable.data();
+                            dp.weight.variable.set_data(sw.clone());
+                            match (&mut dp.bias, &sp.bias) {
+                                (Some(db), Some(sb)) => {
+                                    let sbt = sb.variable.data();
+                                    db.variable.set_data(sbt.clone());
+                                }
+                                (None, None) => {}
+                                _ => {
+                                    return Err(flodl::tensor::TensorError::new(
+                                        "clone_weights_from: projection bias mismatch",
+                                    ))
+                                }
+                            }
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(flodl::tensor::TensorError::new(
+                                "clone_weights_from: projection presence mismatch",
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    /// All learnable parameters as one flat f32 vector, in a deterministic
+    /// order (node layers by id, then port projections in build order).
+    /// The `Send`-safe weight format: `Network` itself is `!Send` (flodl's
+    /// autograd `Variable` is `Rc`-based), so moving weights to a worker
+    /// thread means moving THIS, not the net. Sizes are appended to the
+    /// front so [`Self::import_weights`] can assert a perfect match.
+    pub fn export_weights(&self) -> flodl::tensor::Result<Vec<f32>> {
+        let mut out = Vec::new();
+        let mut count = 0usize;
+        let push_tensor = |t: &flodl::tensor::Tensor, out: &mut Vec<f32>, count: &mut usize| -> flodl::tensor::Result<()> {
+            let v = t.to_f32_vec()?;
+            *count += 1;
+            out.extend_from_slice(&v);
+            Ok(())
+        };
+        for layer in &self.layers {
+            push_tensor(&layer.weight.variable.data(), &mut out, &mut count)?;
+            if let Some(b) = &layer.bias {
+                push_tensor(&b.variable.data(), &mut out, &mut count)?;
+            }
+        }
+        for ports in &self.port_projections {
+            for port_projs in ports {
+                for p in port_projs.iter().flatten() {
+                    push_tensor(&p.weight.variable.data(), &mut out, &mut count)?;
+                    if let Some(b) = &p.bias {
+                        push_tensor(&b.variable.data(), &mut out, &mut count)?;
+                    }
+                }
+            }
+        }
+        out.splice(0..0, [count as f32, out.len() as f32]);
+        Ok(out)
+    }
+
+    /// Load weights produced by [`Self::export_weights`] (same architecture,
+    /// same tensor count/total — asserted, not assumed). Overwrites leaf
+    /// weights in place; gradients never flow across the pair.
+    pub fn import_weights(&mut self, blob: &[f32]) -> flodl::tensor::Result<()> {
+        let Some(&[count, total]) = blob.first_chunk::<2>() else {
+            return Err(flodl::tensor::TensorError::new(
+                "import_weights: blob too small for header",
+            ));
+        };
+        let count = count as usize;
+        let total = total as usize;
+        if blob.len() - 2 != total {
+            return Err(flodl::tensor::TensorError::new(&format!(
+                "import_weights: header says {} values, blob holds {}",
+                total,
+                blob.len() - 2
+            )));
+        }
+        let mut cursor = 2usize;
+        let mut seen = 0usize;
+        // Load one tensor's worth of f32s from the blob into `var`.
+        // Variable::set_data swaps the leaf's storage in place: the
+        // optimizer's Variable handles stay valid, gradient tracking is
+        // preserved (set_data re-enables requires_grad automatically).
+        let load = |var: &flodl::Variable,
+                        blob: &[f32],
+                        cursor: &mut usize,
+                        seen: &mut usize|
+         -> flodl::tensor::Result<()> {
+            let data = var.data();
+            let shape = data.shape();
+            let n: usize = shape.iter().product::<i64>() as usize;
+            let chunk = blob
+                .get(*cursor..*cursor + n)
+                .ok_or_else(|| flodl::tensor::TensorError::new("import_weights: blob truncated"))?;
+            let fresh = flodl::tensor::Tensor::from_f32(chunk, &shape, data.device())?;
+            var.set_data(fresh);
+            *cursor += n;
+            *seen += 1;
+            Ok(())
+        };
+        for layer in &self.layers {
+            load(&layer.weight.variable, blob, &mut cursor, &mut seen)?;
+            if let Some(b) = &layer.bias {
+                load(&b.variable, blob, &mut cursor, &mut seen)?;
+            }
+        }
+        for ports in &self.port_projections {
+            for port_projs in ports {
+                for p in port_projs.iter().flatten() {
+                    load(&p.weight.variable, blob, &mut cursor, &mut seen)?;
+                    if let Some(b) = &p.bias {
+                        load(&b.variable, blob, &mut cursor, &mut seen)?;
+                    }
+                }
+            }
+        }
+        if seen != count {
+            return Err(flodl::tensor::TensorError::new(&format!(
+                "import_weights: architecture mismatch — blob holds {count} tensors, net has {seen}"
+            )));
+        }
+        Ok(())
     }
 }
 
