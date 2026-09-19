@@ -22,7 +22,6 @@
 //! the live network is exported in memory. This example covers every other
 //! net (tombstones included) by replaying its history.
 
-use gras::Trainer;
 use gras::graph::network::Network;
 use gras::graph::topology::Topology;
 use gras::state::load_net_state;
@@ -74,9 +73,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         header.run_seed,
     );
     let stream = gras::trainer::stream::BatchStream::new(header.run_seed, 16, split);
-    let trainer = TabularTrainer::new(|pred, y| score::cross_entropy_onehot_loss(pred, y))
+    let trainer = TabularTrainer::new(score::cross_entropy_onehot_loss)
         .with_learning_rate(1e-3)
         .with_grad_clip(1.0);
+    use gras::trainer::StepTrainer;
     let mut optimizer = trainer.make_optimizer(&net);
     let loss_fn = |pred: &gras::Variable, y: &gras::Variable| score::cross_entropy_onehot_loss(pred, y);
 
