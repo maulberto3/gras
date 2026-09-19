@@ -14,7 +14,7 @@
 //! (the crate does not clean up runs automatically).
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{RaceConfig, RaceEngine};
@@ -33,7 +33,7 @@ const PRUNER_STEPS: usize = 50; // extra solo steps for the pruner phase
 const LOG_LEVEL: gras::engine::config::LogLevel = gras::engine::config::LogLevel::Summ;
 const RUN_NAME: &str = "mnist"; // recorded in engine.json ("run_name") — purely informational
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
@@ -69,13 +69,11 @@ fn main() {
     // .with_grad_clip(1.0)
     .with_batch_size(64) // Showcase new setter: set training batch size
     .with_eval_batch_size(128)
+    // LR schedule showcase — uncomment to decay the LR over the run (pure
+    // function of the step clock, so replay/catch-up stays deterministic):
     // .with_lr_schedule({
     //     let total = MAX_STEPS;
-    //     move |s| WarmupScheduler::new(
-    //         CosineScheduler::new(1e-3, 1e-6, total),
-    //         1e-3,
-    //         gras::engine::smoothing::SMOOTHING_WINDOW,
-    //     ).lr(s)
+    //     move |s| gras::flodl::CosineScheduler::new(1e-3, 1e-6, total).lr(s)
     // })
     ;
 
@@ -149,19 +147,47 @@ fn main() {
         .build();
 
     // ── 4. Execution ───────────────────────────────────────────────────────
+    // Optional `--resume <run_dir>`: continue a previous run from its saved
+    // frontier (`results/<timestamp>`). The trainer, fitness, and config must
+    // be the same scheme the run started with (resume validates identity via
+    // engine.json and replays each live net with metric parity asserts).
+    let resume_dir: Option<PathBuf> = {
+        let args: Vec<String> = std::env::args().collect();
+        let mut r = None;
+        let mut i = 1;
+        while i < args.len() {
+            if args[i] == "--resume" {
+                if i + 1 >= args.len() {
+                    eprintln!("--resume requires a run directory, e.g. --resume results/1700000000000");
+                    std::process::exit(2);
+                }
+                r = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            } else if let Some(rest) = args[i].strip_prefix("--resume=") {
+                r = Some(PathBuf::from(rest));
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        r
+    };
     // RunSpec::new coerces path-like args (Into<PathBuf>): pass &Path directly.
     // Trainer is auto-boxed by with_trainer.
-    let mut engine = RaceEngine::new(
-        gras::engine::RunSpec::new(
+    let mut engine = match &resume_dir {
+        Some(dir) => {
+            println!("Resuming from {}", dir.display());
+            RaceEngine::resume(dir.clone(), data_dir.to_path_buf(), builder, fitness, trainer)?
+        }
+        None => RaceEngine::new(gras::engine::RunSpec::new(
             data_dir,
             builder,
             fitness,
             trainer,
             RUN_SEED,
             None::<&str>, // run_dir: None ⇒ results/<timestamp>
-        ),
-    )
-    .unwrap();
+        ))?,
+    };
 
     println!("================================================================================");
     println!("MNIST Race Engine Launched successfully!");
@@ -172,4 +198,5 @@ fn main() {
         Ok(reason) => println!("Race stopped successfully: {reason:?}"),
         Err(e) => eprintln!("Race encountered an error: {e}"),
     }
+    Ok(())
 }
