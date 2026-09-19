@@ -381,28 +381,28 @@ impl RaceEngine {
         for step in from..to {
             // The child replays through the caller's training scheme — the
             // same contract group-step nets use, so the recipe is identical.
-            let run_data = crate::trainer::RunData {
-                dataset: &self.dataset,
-                stream: &self.stream,
+            let run_data = self.dataset.as_ref().zip(self.stream.as_ref()).map(
+                |(dataset, stream)| crate::trainer::RunData { dataset, stream },
+            );
+            let env = crate::trainer::StepEnv {
+                step,
+                run_seed: self.header.run_seed,
+                pop_size: self.config.pop_size,
+                live_count: self.state.live_count(),
+                checkpoint_every: self.config.checkpoint_every,
+                smoothing_window: crate::engine::smoothing::SMOOTHING_WINDOW,
             };
-            let ctx = crate::trainer::StepContext {
-                data: Some(&run_data),
-                fitness: Some(&self.fitness),
-                metrics: &self.metrics,
-                env: crate::trainer::StepEnv {
-                    step,
-                    run_seed: self.header.run_seed,
-                    pop_size: self.config.pop_size,
-                    live_count: self.state.live_count(),
-                    checkpoint_every: self.config.checkpoint_every,
-                    smoothing_window: crate::engine::smoothing::SMOOTHING_WINDOW,
-                },
-                net_hash: &child.state.hash,
-                net_seed: child.state.net_seed as u64,
-            };
-            let report =
-                self.trainer
-                    .train_step(&mut child.net, &mut *child.optimizer, step, &ctx)?;
+            let report = self.trainer.train_step(
+                &mut child.net,
+                &mut *child.optimizer,
+                step,
+                run_data.as_ref(),
+                &self.fitness,
+                &self.metrics,
+                env,
+                &child.state.hash,
+                child.state.net_seed as u64,
+            )?;
             let metrics = NetMetrics {
                 step,
                 train_loss: report.train_loss,

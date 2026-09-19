@@ -7,6 +7,9 @@ use flodl::Variable;
 use flodl::tensor::Result;
 use serde::{Deserialize, Serialize};
 
+/// The engine-computed scoring signature: `(pred, target) → f32`.
+type ScoreFn = dyn Fn(&Variable, &Variable) -> Result<f32> + Send + Sync;
+
 // ── Direction — lower or higher is better ─────────────────────────────────
 
 /// Whether lower or higher is better.
@@ -46,54 +49,112 @@ impl Direction {
     }
 }
 
-// ── Fitness — pure scoring ───────────────────────────────────────────────
+// ── Fitness — computed or reported ───────────────────────────────────────
 
-/// Pure scoring function for ranking individuals.
+/// Ranking signal for the race. Two flavors:
 ///
-/// The engine evolves on `score()`. Training loss is the user's
-/// responsibility — lives inside the trainer, not here.
-pub struct Fitness {
-    /// Ranking metric: `(pred, target) → f32`.
-    score_fn: Box<dyn Fn(&Variable, &Variable) -> Result<f32> + Send + Sync>,
-    /// Score direction.
-    direction: Direction,
-    /// Label for logs.
-    label: String,
+/// - **[`Fitness::Computed`]** — the engine scores `(pred, target)` itself on
+///   the step's eval batch (supervised style: accuracy, mse, …). Built with
+///   [`Fitness::new`].
+/// - **[`Fitness::Reported`]** — the trainer computes the scalar however it
+///   wants (e.g. an RL episode reward) and ships it back in
+///   [`StepReport::fitness`](crate::trainer::StepReport); the engine only
+///   ranks/culls on the reported values. Built with [`Fitness::reported`].
+///
+/// In both cases the engine's evolutionary machinery (ranking, culling,
+/// gates, smoothing) operates on the scalar — the flavors differ only in
+/// WHO computes it and whether a `(pred, target)` pair is needed.
+pub enum Fitness {
+    /// Engine-computed: a pure `(pred, target) → f32` scoring function,
+    /// plus the direction and label that travel with it.
+    Computed {
+        /// Ranking metric: `(pred, target) → f32`.
+        score_fn: Box<ScoreFn>,
+        /// Score direction.
+        direction: Direction,
+        /// Label for logs.
+        label: String,
+    },
+    /// Trainer-reported: the value arrives via `StepReport.fitness`; the
+    /// engine never scores. Carries only the direction and label.
+    Reported {
+        /// Score direction.
+        direction: Direction,
+        /// Label for logs.
+        label: String,
+    },
 }
 
 impl Fitness {
-    /// Create a new fitness function.
+    /// Create a new engine-computed fitness function (supervised style).
     pub fn new<F>(score_fn: F, direction: Direction, label: &str) -> Self
     where
         F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
     {
-        Fitness {
-            score_fn: Box::new(score_fn),
+        Fitness::Computed {
+            score_fn: Box::new(score_fn) as Box<ScoreFn>,
             direction,
             label: label.to_string(),
         }
     }
 
-    /// Score prediction against target — scalar ranking metric.
+    /// Trainer-reported fitness (RL / episode style): the trainer supplies
+    /// the scalar in `StepReport.fitness` each step; the engine ranks on it.
+    /// The engine never calls a scorer in this mode.
+    pub fn reported(direction: Direction, label: &str) -> Self {
+        Fitness::Reported {
+            direction,
+            label: label.to_string(),
+        }
+    }
+
+    /// Score prediction against target — engine-computed ranking metric.
+    ///
+    /// Errors on a [`Fitness::Reported`] (the trainer owns the value there —
+    /// there is nothing to score). Callers on engine paths that may run in
+    /// reported mode branch on [`Fitness::is_reported`] first.
     pub fn score(&self, pred: &Variable, target: &Variable) -> Result<f32> {
-        (self.score_fn)(pred, target)
+        match self {
+            Fitness::Computed { score_fn, .. } => score_fn(pred, target),
+            Fitness::Reported { label, .. } => Err(flodl::tensor::TensorError::new(
+                &format!(
+                    "fitness `{label}` is Reported — the trainer supplies the value in StepReport; there is no (pred, target) scorer to call"
+                ),
+            )),
+        }
     }
 
     /// Score direction.
     pub fn direction(&self) -> Direction {
-        self.direction
+        match self {
+            Fitness::Computed { direction, .. } => *direction,
+            Fitness::Reported { direction, .. } => *direction,
+        }
     }
 
     /// Label for logs.
     pub fn label(&self) -> &str {
-        &self.label
+        match self {
+            Fitness::Computed { label, .. } => label,
+            Fitness::Reported { label, .. } => label,
+        }
+    }
+
+    /// Does the engine compute the score itself (`true` = Computed)?
+    pub fn is_computed(&self) -> bool {
+        matches!(self, Fitness::Computed { .. })
+    }
+
+    /// Does the trainer report the score (`true` = Reported)?
+    pub fn is_reported(&self) -> bool {
+        matches!(self, Fitness::Reported { .. })
     }
 }
 
 // ── Re-exports for backward compat ────────────────────────────────────────
 
-// Backward-compat: old code used FitnessKind in EngineOptions.
-// We keep a serializable label string instead.
+// Historical note: old code used FitnessKind in the pre-split engine config;
+// we keep a serializable label string instead.
 
 /// Serialized fitness label for engine.json (e.g. "mse", "accuracy").
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,7 +173,7 @@ pub struct FitnessLabel(pub String);
 #[derive(Clone, Default)]
 pub struct Metric {
     pub label: String,
-    custom: Option<std::sync::Arc<dyn Fn(&Variable, &Variable) -> Result<f32> + Send + Sync>>,
+    custom: Option<std::sync::Arc<ScoreFn>>,
 }
 
 impl Metric {
@@ -218,6 +279,27 @@ mod tests {
         assert!(!Direction::Minimize.is_better(1.0, 0.5));
         assert!(Direction::Maximize.is_better(1.0, 0.5));
         assert!(!Direction::Maximize.is_better(0.5, 1.0));
+    }
+
+    #[test]
+    fn test_reported_fitness_contract() {
+        let f = Fitness::reported(Direction::Maximize, "episode_reward");
+        assert!(f.is_reported());
+        assert!(!f.is_computed());
+        assert_eq!(f.direction(), Direction::Maximize);
+        assert_eq!(f.label(), "episode_reward");
+        // No scorer exists — scoring must error loudly, not return a value.
+        let net = tiny_net();
+        let x = input(&[1.0, 2.0, 3.0]);
+        let pred = net.forward(&x).unwrap();
+        assert!(f.score(&pred, &pred).is_err());
+    }
+
+    #[test]
+    fn test_computed_fitness_flags() {
+        let f = Fitness::new(mse_loss_score, Direction::Minimize, "mse");
+        assert!(f.is_computed());
+        assert!(!f.is_reported());
     }
 
     #[test]

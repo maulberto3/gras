@@ -1,19 +1,20 @@
-//! The one bundle a caller hands the engine to start a race.
+//! The one bundle a caller hands the engine to start a race — one variant per
+//! run mode (see [`RunSpec`]).
 //!
-//! Everything the engine needs, nothing else: data directory, one config,
-//! the ranking fitness, and the training scheme. The training scheme is a
-//! **self-contained** struct you build — it owns its loss, its optimizer
-//! choice, its learning-rate / grad-clip / schedule, and optionally its own
-//! shape for the shared batch stream. The engine never touches any of that:
-//! it only reads the [`Trainer`] contract from the scheme.
+//! Everything the engine needs for the chosen mode, nothing else. The
+//! training scheme is a **self-contained** struct you build — it owns its
+//! loss, its optimizer choice, its learning-rate / grad-clip / schedule, and
+//! optionally its own shape for the shared batch stream (Tabular). The engine
+//! never touches any of that: it only reads the [`Trainer`] contract from the
+//! scheme.
 //!
-//! The engine derives the rest — run id, run directory, dataset load, batch
-//! stream — and exposes what it chose via [`crate::RaceEngine::run_dir`] and
-//! [`crate::RaceEngine::run_seed`].
+//! The engine derives the rest — run id, run directory, (Tabular only:)
+//! dataset load and batch stream — and exposes what it chose via
+//! [`crate::RaceEngine::run_dir`] and [`crate::RaceEngine::run_seed`].
 
 use crate::engine::config::RaceConfig;
 use crate::engine::fitness::Fitness;
-use crate::trainer::Trainer;
+use crate::trainer::{RlStep, TabularStep};
 
 /// Start-a-race spec: the entire `RaceEngine::new` argument surface.
 ///
@@ -27,13 +28,13 @@ use crate::trainer::Trainer;
 ///   trainer.
 /// - `trainer` — your training scheme, self-contained: it owns its loss, its
 ///   optimizer recipe, its LR / grad-clip / schedule, and (optionally) the
-///   shape of the shared batch stream it wants. Accepts any `T: Trainer`
-///   (auto-boxed), or a ready `Box<dyn Trainer>`.
+///   shape of the shared batch stream it wants. Accepts any `T: TabularStep`
+///   (auto-boxed), or a ready `Box<dyn TabularStep>`.
 /// - `seed` — `None` = random (recorded in `engine.json` for repro).
 /// - `run_dir` — `None` = `results/<run_id>` with a timestamp id; give a
 ///   path to place the run anywhere. The chosen dir is readable via
 ///   `RaceEngine::run_dir()` after construction.
-pub struct RunSpec<T: Trainer + 'static = Box<dyn Trainer>> {
+pub struct TabularSpec<T: TabularStep + 'static = Box<dyn TabularStep>> {
     pub data_dir: std::path::PathBuf,
     pub config: RaceConfig,
     pub fitness: Fitness,
@@ -42,10 +43,40 @@ pub struct RunSpec<T: Trainer + 'static = Box<dyn Trainer>> {
     pub run_dir: Option<std::path::PathBuf>,
 }
 
-impl<T: Trainer + 'static> RunSpec<T> {
-    /// Convenience constructor: every path field coerces via `Into<PathBuf>`,
-    /// so callers can pass `&str`, `String`, `&Path`, or `PathBuf` directly —
-    /// no `.to_path_buf()` / `.clone()` noise:
+/// RL spec: the run learns from an ENVIRONMENT the trainer drives, not from a
+/// dataset. No `data_dir`, no split/stream/eval — the engine's only ranking
+/// input is the fitness value the trainer reports in `StepReport.fitness`
+/// each step (require `Fitness::reported`). Everything evolution-side
+/// (population, rolls, culls, gates, smoothing, exports) is identical to
+/// Tabular mode.
+pub struct RLSpec<T: RlStep + 'static = Box<dyn RlStep>> {
+    pub config: RaceConfig,
+    /// MUST be `Fitness::reported(..)` — validated at engine construction.
+    pub fitness: Fitness,
+    pub trainer: T,
+    pub seed: Option<u64>,
+    pub run_dir: Option<std::path::PathBuf>,
+}
+
+/// Start-a-race spec — one variant per run mode, each self-contained. The
+/// compiler enforces that each mode supplies exactly its own requirement set:
+///
+/// - **[`RunSpec::Tabular`]** — supervised tabular style: `data_dir` + engine-
+///   computed fitness (see [`Fitness::new`]). This is the historical behavior;
+///   `RunSpec::new` builds it.
+/// - **[`RunSpec::RL`]** — environment/RL style: no dataset at all, a
+///   [`Fitness::reported`] ranking signal, and a trainer that drives the
+///   environment and reports the reward. `RunSpec::rl` builds it.
+pub enum RunSpec<TT: TabularStep + 'static = Box<dyn TabularStep>, TR: RlStep + 'static = Box<dyn RlStep>> {
+    Tabular(TabularSpec<TT>),
+    RL(RLSpec<TR>),
+}
+
+impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
+    /// Convenience constructor for the (default) Tabular variant — every
+    /// path field coerces via `Into<PathBuf>`, so callers can pass `&str`,
+    /// `String`, `&Path`, or `PathBuf` directly — no `.to_path_buf()` /
+    /// `.clone()` noise:
     ///
     /// ```ignore
     /// RunSpec::new("data/mnist/train", config, fitness, trainer, Some(42), run_dir)
@@ -57,32 +88,65 @@ impl<T: Trainer + 'static> RunSpec<T> {
         data_dir: impl Into<std::path::PathBuf>,
         config: RaceConfig,
         fitness: Fitness,
-        trainer: T,
+        trainer: impl TabularStep + 'static,
         seed: Option<u64>,
         run_dir: Option<P>,
     ) -> Self {
-        Self {
+        Self::Tabular(TabularSpec {
             data_dir: data_dir.into(),
             config,
             fitness,
-            trainer,
+            trainer: Box::new(trainer),
             seed,
             run_dir: run_dir.map(|p| p.into()),
-        }
+        })
+    }
+
+    /// Convenience constructor for the RL variant: NO data_dir (the trainer
+    /// learns from an environment), and `fitness` MUST be
+    /// [`Fitness::reported`] — the engine validates and refuses
+    /// `Fitness::Computed` here (a (pred, target) scorer has nothing to score
+    /// without a dataset).
+    pub fn rl(
+        config: RaceConfig,
+        fitness: Fitness,
+        trainer: impl RlStep + 'static,
+        seed: Option<u64>,
+        run_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::RL(RLSpec {
+            config,
+            fitness,
+            trainer: Box::new(trainer),
+            seed,
+            run_dir,
+        })
     }
 
     /// Convenience: build a spec with the trainer auto-boxed. Accepts any
-    /// `U: Trainer + 'static` so callers can write
+    /// `U: TabularStep + 'static` so callers can write
     /// `.with_trainer(TabularTrainer::new(loss).with_learning_rate(1e-3))`
     /// instead of `trainer: Box::new(...)`.
-    pub fn with_trainer<U: Trainer + 'static>(self, trainer: U) -> RunSpec<Box<dyn Trainer>> {
-        RunSpec {
-            data_dir: self.data_dir,
-            config: self.config,
-            fitness: self.fitness,
-            trainer: Box::new(trainer),
-            seed: self.seed,
-            run_dir: self.run_dir,
+    pub fn with_trainer<U: TabularStep + 'static>(
+        self,
+        trainer: U,
+    ) -> RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
+        match self {
+            RunSpec::Tabular(s) => RunSpec::Tabular(TabularSpec {
+                data_dir: s.data_dir,
+                config: s.config,
+                fitness: s.fitness,
+                trainer: Box::new(trainer),
+                seed: s.seed,
+                run_dir: s.run_dir,
+            }),
+            RunSpec::RL(s) => RunSpec::RL(RLSpec {
+                config: s.config,
+                fitness: s.fitness,
+                trainer: s.trainer,
+                seed: s.seed,
+                run_dir: s.run_dir,
+            }),
         }
     }
 }
@@ -139,10 +203,10 @@ impl DefaultTrainerBuilder {
         self
     }
 
-    /// Build the boxed [`Trainer`]. The loss is required — a run without a
-    /// loss has no training signal. The default loss fallback is
+    /// Build the boxed [`TabularStep`] trainer. The loss is required — a run
+    /// without a loss has no training signal. The default loss fallback is
     /// cross-entropy (so `Default` stays usable for tests that don't care).
-    pub fn build(self) -> Box<dyn Trainer> {
+    pub fn build(self) -> Box<dyn crate::trainer::TabularStep> {
         let loss = self.loss.unwrap_or_else(|| {
             Box::new(|pred, y| crate::utils::score::cross_entropy_onehot_loss(pred, y))
         });
@@ -155,7 +219,7 @@ impl DefaultTrainerBuilder {
 }
 
 /// Stream shape request — what the trainer wants the shared batch stream to
-/// look like. Returned from [`crate::trainer::Trainer::stream_shape`]; the
+/// look like. Returned from [`crate::trainer::TabularStep::stream_shape`]; the
 /// engine uses it to build the `BatchStream` at construction.
 ///
 /// The trainer owns this request; the engine applies it (or the default if

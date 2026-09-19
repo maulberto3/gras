@@ -55,7 +55,6 @@ use crate::state::{
     ConfigSnapshot, NetMetrics, NetState, RaceState, RunConfig, RunHeader, write_engine_json,
     write_net_state,
 };
-use crate::trainer::Trainer;
 use crate::trainer::stream::{BatchStream, PoolSplit};
 // Used by the debug contract probe in `step_one_net` and by the checkpoint
 // surprise exam (`run_checkpoint_exam`) — the exam runs in release too, so
@@ -131,14 +130,19 @@ pub struct RaceEngine {
     pub(crate) config: RaceConfig,
     /// Run-level context stamped into each net's meta block.
     pub(crate) meta_ctx: crate::engine::config::RunMetaCtx,
-    pub(crate) stream: BatchStream,
-    pub(crate) dataset: crate::utils::tabular_data::Dataset,
+    /// Shared batch stream (Tabular mode). `None` in RL mode — the trainer
+    /// drives its own environment; `ctx.data` is `None` there.
+    pub(crate) stream: Option<BatchStream>,
+    /// The run's dataset (Tabular mode). `None` in RL mode.
+    pub(crate) dataset: Option<crate::utils::tabular_data::Dataset>,
     pub(crate) fitness: Fitness,
     pub(crate) metrics: Vec<Metric>,
-    /// The caller-supplied training scheme. The engine never trains — it only
-    /// orchestrates the population lifecycle and delegates one net/one step
-    /// to this contract (see `crate::trainer::Trainer`).
-    pub(crate) trainer: Box<dyn crate::trainer::Trainer>,
+    /// The caller-supplied training scheme, boxed per mode. The engine never
+    /// trains — it only orchestrates the population lifecycle and delegates
+    /// one net/one step to this contract (see `crate::trainer::{TabularStep,
+    /// RlStep}`). The mode arm decides which context (data or no data) the
+    /// step receives.
+    pub(crate) trainer: crate::trainer::ModeTrainer,
     /// Per-step log verbosity for the engine.
     pub(crate) log_level: crate::engine::config::LogLevel,
 
@@ -245,18 +249,68 @@ impl RaceEngine {
     ///
     /// After construction, `engine.run_dir()` and `engine.run_seed()` expose
     /// what the engine chose.
-    pub fn new<T: Trainer + 'static>(spec: crate::engine::run_spec::RunSpec<T>) -> Result<Self> {
-        let crate::engine::run_spec::RunSpec {
-            data_dir,
-            config,
-            fitness,
-            trainer,
-            seed,
-            run_dir,
-        } = spec;
-        let trainer: Box<dyn Trainer> = Box::new(trainer);
-        let dataset = crate::utils::tabular_data::resolve_dataset(&data_dir)?
-            .to_device(config.device())?;
+    pub fn new(
+        spec: crate::engine::run_spec::RunSpec<Box<dyn crate::trainer::TabularStep>, Box<dyn crate::trainer::RlStep>>,
+    ) -> Result<Self> {
+        use crate::engine::run_spec::RunSpec as RS;
+        let (config, fitness, trainer, seed, run_dir, tabular_data_dir) = match spec {
+            RS::Tabular(s) => (
+                s.config,
+                s.fitness,
+                crate::trainer::ModeTrainer::Tabular(s.trainer),
+                s.seed,
+                s.run_dir,
+                Some(s.data_dir),
+            ),
+            RS::RL(s) => (
+                s.config,
+                s.fitness,
+                crate::trainer::ModeTrainer::Rl(s.trainer),
+                s.seed,
+                s.run_dir,
+                None,
+            ),
+        };
+        // The config's RunMode and the spec variant must AGREE. The spec
+        // variant decides the mechanics (data vs env); `set_mode(..)` decides
+        // the recorded/validated intent. A mismatch is a config bug — fail
+        // loudly at construction rather than running the wrong paradigm.
+        // (Image/NLP modes are future variants of RunSpec — they must be
+        // declared in config but have no spec variant yet, hence they're
+        // rejected too. The DEFAULT Tabular mode is exempt: it matches both
+        // variants' zero-config story — an RL spec with an unset mode fails,
+        // forcing the user to declare intent.)
+        if tabular_data_dir.is_none() && config.mode != crate::engine::config::RunMode::Rl {
+            return Err(crate::utils::error::EngineError::InvalidOptions(
+                "RunSpec::rl requires .set_mode(RunMode::Rl) on the config — the declared mode and the spec variant must agree".to_string(),
+            )
+            .into());
+        }
+        if tabular_data_dir.is_some() && config.mode != crate::engine::config::RunMode::Tabular {
+            return Err(crate::utils::error::EngineError::InvalidOptions(
+                format!(
+                    "RunSpec::new (tabular, data_dir given) requires .set_mode(RunMode::Tabular) — config declares {:?} with no way to serve it; Image/NLP spec variants are future work",
+                    config.mode
+                ),
+            )
+            .into());
+        }
+        // RL mode REQUIRES a reported fitness: there is no dataset, so a
+        // (pred, target) scorer has nothing to score. Fail before the run
+        // starts, not three steps in.
+        if tabular_data_dir.is_none() && fitness.is_computed() {
+            return Err(crate::utils::error::EngineError::InvalidOptions(
+                "RL spec requires Fitness::reported(direction, label) — a Computed (pred, target) scorer has no dataset to score against. The trainer must supply the fitness value in StepReport.".to_string(),
+            )
+            .into());
+        }
+        let dataset = match &tabular_data_dir {
+            Some(data_dir) => Some(
+                crate::utils::tabular_data::resolve_dataset(data_dir)?
+                    .to_device(config.device())?,
+            ),
+            None => None,
+        };
         // Random seed when omitted: time ^ fastrand (recorded in engine.json).
         let run_seed = seed.unwrap_or_else(|| {
             let t = std::time::SystemTime::now()
@@ -271,31 +325,46 @@ impl RaceEngine {
             .as_millis()
             .to_string();
         let run_dir = run_dir.unwrap_or_else(|| std::path::Path::new("results").join(&run_id));
-        // Infer dims from data_dir when TopologyOptions leaves them unset.
-        // input_dim/output_dim are now Option<usize> — None means
-        // "fill from dataset at run start", Some(v) means user set it (and
-        // the engine validates v against the dataset below).
-        let inferred_input_dim = dataset.inputs.shape()[1] as usize;
-        let inferred_output_dim = dataset.targets.shape()[1] as usize;
+        // Infer dims from data_dir when TopologyOptions leaves them unset
+        // (Tabular only). input_dim/output_dim are now Option<usize> — None
+        // means "fill from dataset at run start", Some(v) means user set it
+        // (and the engine validates v against the dataset below). RL specs
+        // have no dataset: dims MUST be set explicitly by the user.
         let mut topology_options = config.topology_options;
         let mut topology_errors: Vec<String> = Vec::new();
-        if let Some(user_in) = topology_options.input_dim {
-            if user_in != inferred_input_dim {
-                topology_errors.push(format!(
-                    "config.topology_options.input_dim = {user_in} but data_dir has {inferred_input_dim} features — set to None to infer, or fix either side"
-                ));
+        if let Some(dataset) = &dataset {
+            let inferred_input_dim = dataset.inputs.shape()[1] as usize;
+            let inferred_output_dim = dataset.targets.shape()[1] as usize;
+            if let Some(user_in) = topology_options.input_dim {
+                if user_in != inferred_input_dim {
+                    topology_errors.push(format!(
+                        "config.topology_options.input_dim = {user_in} but data_dir has {inferred_input_dim} features — set to None to infer, or fix either side"
+                    ));
+                }
+            } else {
+                topology_options.input_dim = Some(inferred_input_dim);
+            }
+            if let Some(user_out) = topology_options.output_dim {
+                if user_out != inferred_output_dim {
+                    topology_errors.push(format!(
+                        "config.topology_options.output_dim = {user_out} but data_dir has {inferred_output_dim} target columns — set to None to infer, or fix either side"
+                    ));
+                }
+            } else {
+                topology_options.output_dim = Some(inferred_output_dim);
             }
         } else {
-            topology_options.input_dim = Some(inferred_input_dim);
-        }
-        if let Some(user_out) = topology_options.output_dim {
-            if user_out != inferred_output_dim {
-                topology_errors.push(format!(
-                    "config.topology_options.output_dim = {user_out} but data_dir has {inferred_output_dim} target columns — set to None to infer, or fix either side"
-                ));
+            if topology_options.input_dim.is_none() {
+                topology_errors.push(
+                    "RL spec has no dataset — set set_network_input_dim(..) explicitly".to_string(),
+                );
             }
-        } else {
-            topology_options.output_dim = Some(inferred_output_dim);
+            if topology_options.output_dim.is_none() {
+                topology_errors.push(
+                    "RL spec has no dataset — set set_network_output_dim(..) explicitly"
+                        .to_string(),
+                );
+            }
         }
         if !topology_errors.is_empty() {
             return Err(crate::utils::error::EngineError::InvalidOptions(
@@ -307,21 +376,32 @@ impl RaceEngine {
         let train_eval_split_ratio = 0.2f32;
         let held_out_eval_rows = 256usize;
         let default_batch_size = 16usize;
-        // The trainer owns batch geometry. Resolve it BEFORE the header so
-        // engine.json records the stream shape the run actually used.
+        // The trainer owns batch geometry (Tabular only — RL has no stream).
+        // Resolve it BEFORE the header so engine.json records the stream
+        // shape the run actually used.
         let (batch_size, eval_batch_size) = match trainer.stream_shape() {
             Some(shape) => (shape.batch_size, shape.eval_batch_size),
             None => (default_batch_size, default_batch_size),
         };
 
+        let (header_input_dim, header_output_dim) = match &dataset {
+            Some(d) => (
+                d.inputs.shape()[1] as usize,
+                d.targets.shape()[1] as usize,
+            ),
+            None => (
+                topology_options.input_dim.unwrap_or(0),
+                topology_options.output_dim.unwrap_or(0),
+            ),
+        };
         let header = RunHeader::from_race_options_at(
             RunConfig {
                 run_id: run_id.clone(),
                 run_seed,
                 fitness_label: FitnessLabel(fitness.label().to_string()),
                 fitness_direction: fitness.direction(),
-                input_dim: dataset.inputs.shape()[1] as usize,
-                output_dim: dataset.targets.shape()[1] as usize,
+                input_dim: header_input_dim,
+                output_dim: header_output_dim,
                 topology_options,
                 hidden_dim_pool: config.hidden_dim_pool.clone().unwrap_or(4..=8),
                 hidden_dim_stride: config.hidden_dim_stride,
@@ -348,21 +428,33 @@ impl RaceEngine {
         // Generated before the engine consumes the config.
         let initial_topologies = super::population::initial_population(&config, run_seed);
 
-        // Shared batch stream — engine infrastructure. The
+        // Shared batch stream — engine infrastructure (Tabular only). The
         // trainer may shape batch sizes (`Trainer::stream_shape`) but the
         // split ratio is NOT overridable: which rows are held out protects
         // fitness comparability across every net, whatever the recipe.
-        let split = PoolSplit::of(&dataset, train_eval_split_ratio, run_seed);
-        let batch_stream = BatchStream::new(run_seed, batch_size, split)
-            .with_eval_batch_size(eval_batch_size)
-            .with_held_out_eval_rows(held_out_eval_rows)
-            .with_checkpoint_every(config.checkpoint_every);
+        // RL mode has no dataset — `ctx.data` is `None` and the trainer is
+        // fully responsible for its own experience (the env it drives).
+        let batch_stream = match &dataset {
+            Some(dataset) => {
+                let split = PoolSplit::of(dataset, train_eval_split_ratio, run_seed);
+                Some(
+                    BatchStream::new(run_seed, batch_size, split)
+                        .with_eval_batch_size(eval_batch_size)
+                        .with_held_out_eval_rows(held_out_eval_rows)
+                        .with_checkpoint_every(config.checkpoint_every),
+                )
+            }
+            None => None,
+        };
 
         let log_level = config.log_level;
         let meta_ctx = crate::engine::config::RunMetaCtx {
             input_dim: header.input_dim,
             output_dim: header.output_dim,
-            batch_size: batch_stream.batch_size(),
+            batch_size: batch_stream
+                .as_ref()
+                .map(|s| s.batch_size())
+                .unwrap_or(batch_size),
             dropout_prob: header.topology_options.dropout_prob,
             fitness_label: header.fitness_label.0.clone(),
             loss_label: "cross_entropy".to_string(),
@@ -500,14 +592,17 @@ impl RaceEngine {
     /// (minus seed/run_dir — both come from the persisted `engine.json` and
     /// the directory itself). The trainer must be the same scheme the run
     /// started with; split ratio / eval rows also come from the header.
-    pub fn resume<T: Trainer + 'static>(
+    ///
+    /// Tabular-only for now: a persisted run records a dataset, and RL-mode
+    /// replay (env-state reconstruction) is future work.
+    pub fn resume(
         run_dir: std::path::PathBuf,
         data_dir: std::path::PathBuf,
         config: RaceConfig,
         fitness: Fitness,
-        trainer: T,
+        trainer: impl crate::trainer::TabularStep + 'static,
     ) -> Result<Self> {
-        let trainer: Box<dyn Trainer> = Box::new(trainer);
+        let trainer = crate::trainer::ModeTrainer::Tabular(Box::new(trainer));
         let header = crate::state::load_engine_json(&run_dir)?;
         let dataset = crate::utils::tabular_data::resolve_dataset(&data_dir)?
             .to_device(config.device())?;
@@ -526,9 +621,14 @@ impl RaceEngine {
             None => (16, 16), // conservative default when no stream_shape override
         };
         let split = PoolSplit::of(&dataset, header_stream_ratio, run_seed);
-        let stream = BatchStream::new(run_seed, batch_size, split)
-            .with_eval_batch_size(eval_batch_size)
-            .with_checkpoint_every(config.checkpoint_every);
+        // Resume is Tabular-only today (a persisted run carries a dataset);
+        // both fields are wrapped in Some to satisfy the Option'd struct.
+        let stream = Some(
+            BatchStream::new(run_seed, batch_size, split)
+                .with_eval_batch_size(eval_batch_size)
+                .with_checkpoint_every(config.checkpoint_every),
+        );
+        let dataset = Some(dataset);
 
         let log_level = config.log_level;
         let meta_ctx = crate::engine::config::RunMetaCtx {
@@ -721,7 +821,9 @@ impl RaceEngine {
         // Keep the stream's eval-rotation cadence in lockstep with the gate
         // cadence — a post-construction config edit (tests, tooling) must not
         // desync era numbering between the replay and the gate ledger.
-        self.stream.set_checkpoint_every(self.config.checkpoint_every);
+        if let Some(stream) = self.stream.as_mut() {
+            stream.set_checkpoint_every(self.config.checkpoint_every);
+        }
         // Run-start config resolution line: everything that shapes the search,
         // logged once so the log is self-describing (empty pools ⇒ all ops).
         if self.verbose_detail() {
@@ -1167,77 +1269,87 @@ impl RaceEngine {
         Ok(())
     }
 
-    /// Write the champion's (elite rank #1) topology markdown to the run dir.
+    /// Write the top-k elites' topology markdown to the run dir, one file
+    /// per elite (`elite-<hash>.md`), k = `elite_count` (min 1). The user
+    /// configured more than one elite — they get more than one artifact.
     /// UNCONDITIONAL — called at stop regardless of log level: the `.md` file
     /// is a run artifact (like `nets/<hash>.json` and `history.csv`), not a
     /// log line. Prints a confirmation only when per-step detail is on.
     fn write_champion_markdown(&self) -> Result<()> {
-        let ranked = self.rank_live();
-        let Some((champ, _)) = ranked.first() else {
-            return Ok(()); // nothing ever scored — no champion to dump
-        };
         if !self.config.elite_save_topology {
             return Ok(());
         }
-        let Some(state) = self.state.net(champ) else {
-            return Ok(());
-        };
-        let Ok(topo) = state.topology() else {
-            return Ok(());
-        };
-        let short = &champ[..8.min(champ.len())];
-        let path = self.run_dir.join(format!("elite-{short}.md"));
-        let fitness = ranked.first().map(|(_, f)| *f).unwrap_or(f32::NAN);
-        let md = format!(
-            "**Elite · fitness {} (smoothed) = {:.4}**\n\n{}",
-            self.fitness.direction().arrow(),
-            fitness,
-            crate::utils::markdown::topology_markdown(&topo, None),
-        );
-        match std::fs::write(&path, &md) {
-            Ok(()) => {
-                if self.verbose_detail() {
-                    info!("  champion topology → {} (markdown, ready to view)", path.display());
+        let ranked = self.rank_live();
+        let k = self.config.elite_count.max(1);
+        for (rank, (hash, fitness)) in ranked.iter().take(k).enumerate() {
+            let Some(state) = self.state.net(hash) else {
+                continue;
+            };
+            let Ok(topo) = state.topology() else {
+                continue;
+            };
+            let short = &hash[..8.min(hash.len())];
+            let path = self.run_dir.join(format!("elite-{short}.md"));
+            let label = if k == 1 {
+                "Elite".to_string()
+            } else {
+                format!("Elite #{}", rank + 1)
+            };
+            let md = format!(
+                "**{label} · fitness {} (smoothed) = {:.4}**\n\n{}",
+                self.fitness.direction().arrow(),
+                fitness,
+                crate::utils::markdown::topology_markdown(&topo, None),
+            );
+            match std::fs::write(&path, &md) {
+                Ok(()) => {
+                    if self.verbose_detail() {
+                        info!(
+                            "  elite topology → {} (markdown, ready to view)",
+                            path.display()
+                        );
+                    }
                 }
+                Err(source) => log::warn!(
+                    "elite markdown write failed: {}",
+                    crate::utils::error::EngineError::Io {
+                        path: path.display().to_string(),
+                        source,
+                    }
+                ),
             }
-            Err(source) => log::warn!(
-                "elite markdown write failed: {}",
-                crate::utils::error::EngineError::Io {
-                    path: path.display().to_string(),
-                    source,
-                }
-            ),
         }
         Ok(())
     }
 
-    /// Write the champion's (elite rank #1) weights as `.safetensors` to the
-    /// run dir. UNCONDITIONAL — same artifact discipline as
-    /// [`Self::write_champion_markdown`]: lands on disk at every log level.
-    /// Exports the champion's live in-memory `Network` — byte-faithful
-    /// coefficients, exactly what the race left it with.
+    /// Write the top-k elites' weights as `.safetensors`, one file per elite
+    /// (`elite-<hash>.safetensors`), k = `elite_count` (min 1). UNCONDITIONAL
+    /// — same artifact discipline as [`Self::write_champion_markdown`]: lands
+    /// on disk at every log level. Exports each elite's live in-memory
+    /// `Network` — byte-faithful coefficients, exactly what the race left
+    /// them with.
     fn write_champion_safetensors(&self) -> Result<()> {
-        let ranked = self.rank_live();
-        let Some((champ, _)) = ranked.first() else {
-            return Ok(()); // nothing ever scored — no champion to dump
-        };
         if !self.config.elite_save_safetensors {
             return Ok(());
         }
-        let short = &champ[..8.min(champ.len())];
-        let path = self.run_dir.join(format!("elite-{short}.safetensors"));
-        // The champion's live Network is still in memory at stop — export
-        // it directly, no rebuild/replay needed. Its coefficients are the
-        // exact ones the race left it with (byte-faithful by construction).
-        match self.networks.get(champ.as_str()) {
-            Some(net) => {
-                if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
-                    log::warn!("elite safetensors export failed: {e}");
-                } else if self.verbose_detail() {
-                    info!("  champion weights → {} (safetensors)", path.display());
+        let ranked = self.rank_live();
+        let k = self.config.elite_count.max(1);
+        for (hash, _) in ranked.iter().take(k) {
+            let short = &hash[..8.min(hash.len())];
+            let path = self.run_dir.join(format!("elite-{short}.safetensors"));
+            // The elite's live Network is still in memory at stop — export
+            // it directly, no rebuild/replay needed. Its coefficients are the
+            // exact ones the race left it with (byte-faithful by construction).
+            match self.networks.get(hash.as_str()) {
+                Some(net) => {
+                    if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
+                        log::warn!("elite safetensors export failed: {e}");
+                    } else if self.verbose_detail() {
+                        info!("  elite weights → {} (safetensors)", path.display());
+                    }
                 }
+                None => log::warn!("elite safetensors export failed: live network missing"),
             }
-            None => log::warn!("elite safetensors export failed: live network missing"),
         }
         Ok(())
     }
@@ -1339,57 +1451,53 @@ impl RaceEngine {
                 "race: net {hash} not live (no Optimizer in memory)"
             ))
         })?;
-        // Build the context from engine-owned state only. The loss comes
-        // from the trainer; to avoid borrowing `self.trainer` immutably here
-        // (conflicts with the mutable `train_step` below), we pass a fresh
-        // loss *option* resolved via a one-time split: trainer.loss() borrows
-        // self.trainer, so instead we lend the loss through a scoped raw
-        // pointer-free trick — call loss() first, keep the borrow in `ctx`,
-        // and make train_step take `&mut self` *before* ctx borrow ends by
-        // reborrowing through a local. Rust's NLL handles this because ctx's
-        // loss lifetime is tied to the trainer, and train_step reborrows
-        // through the same path — so we split the borrows explicitly:
-        // compute the loss borrow BEFORE the mutable trainer borrow begins,
-        // by taking trainer out of self for the duration.
-        let run_data = crate::trainer::RunData {
-            dataset: &self.dataset,
-            stream: &self.stream,
-        };
-        let ctx = crate::trainer::StepContext {
-            data: Some(&run_data),
-            fitness: Some(&self.fitness),
-            metrics: &self.metrics,
-            env: crate::trainer::StepEnv {
-                step: clock,
-                run_seed: self.header.run_seed,
-                pop_size: self.config.pop_size,
-                live_count: self.state.live_count(),
-                checkpoint_every: self.config.checkpoint_every,
-                smoothing_window: SMOOTHING_WINDOW,
-            },
-            net_hash: hash,
-            net_seed,
+        // The mode decides the context: Tabular receives the run's data
+        // handle (guaranteed present by construction), RL receives none. The
+        // context itself is built inside `ModeTrainer::train_step`.
+        let run_data = self.dataset.as_ref().zip(self.stream.as_ref()).map(
+            |(dataset, stream)| crate::trainer::RunData { dataset, stream },
+        );
+        let env = crate::trainer::StepEnv {
+            step: clock,
+            run_seed: self.header.run_seed,
+            pop_size: self.config.pop_size,
+            live_count: self.state.live_count(),
+            checkpoint_every: self.config.checkpoint_every,
+            smoothing_window: SMOOTHING_WINDOW,
         };
         let net = self.networks.get_mut(hash).ok_or_else(|| {
             crate::utils::error::EngineError::InvalidOptions(format!(
                 "race: net {hash} not live (no Network in memory)"
             ))
         })?;
-        let report = self
-            .trainer
-            .train_step(net, optimizer.as_mut(), clock, &ctx)?;
+        let report = self.trainer.train_step(
+            net,
+            optimizer.as_mut(),
+            clock,
+            run_data.as_ref(),
+            &self.fitness,
+            &self.metrics,
+            env,
+            hash,
+            net_seed,
+        )?;
         // Debug-only contract probe: the Trainer's per-step clause says the
         // report describes the net AFTER this step's training. Re-score the
         // net on the step's eval batch and check the reported eval loss is
         // what this net actually scores — catches a stale/fabricated report
         // at development time. Zero cost in release.
         #[cfg(debug_assertions)]
-        if let (Some(reported), Some(net)) = (report.eval_loss, self.networks.get_mut(hash)) {
-            let eval_batch = self
-                .stream
-                .eval_batch(&self.dataset, clock as u64)
-                .expect("probe: eval batch");
-            if let (Some(loss), Some(fit)) = (self.trainer.loss(), Some(&self.fitness)) {
+        // Tabular-only: the probe needs an eval batch + a computed fitness
+        // scorer. RL mode has neither (reported fitness, no dataset).
+        if let (Some(reported), Some(net), Some(stream), Some(dataset), true) = (
+            report.eval_loss,
+            self.networks.get_mut(hash),
+            self.stream.as_ref(),
+            self.dataset.as_ref(),
+            self.fitness.is_computed(),
+        ) {
+            let eval_batch = stream.eval_batch(dataset, clock as u64).expect("probe: eval batch");
+            if let (Some(loss), Some(fit)) = (self.trainer.as_tabular().map(|t| t.loss()), Some(&self.fitness)) {
                 if let Ok(actual) = eval_one_step(net, loss, fit, &self.metrics, &eval_batch) {
                     if let Some(actual_loss) = actual.eval_loss {
                         let rel = ((reported - actual_loss).abs()) / actual_loss.abs().max(1e-6);
@@ -2063,7 +2171,18 @@ impl RaceEngine {
     /// scored in eval mode (no gradients); a net whose eval-mode forward has
     /// side effects would violate the Trainer contract anyway.
     fn run_checkpoint_exam(&mut self, era: u64) -> Result<f32> {
-        let exam_batch = self.stream.exam_batch(&self.dataset, era)?;
+        // RL mode has no dataset to examine — the exam is a generalization
+        // diagnostic over held-out DATA rows, meaningless without data. Also
+        // requires a Tabular trainer (the loss to score with).
+        let (stream, dataset, loss) = match (
+            self.stream.as_ref(),
+            self.dataset.as_ref(),
+            self.trainer.as_tabular(),
+        ) {
+            (Some(s), Some(d), Some(t)) => (s, d, t.loss()),
+            _ => return Ok(0.0),
+        };
+        let exam_batch = stream.exam_batch(dataset, era)?;
         let direction = self.fitness.direction();
         let mut scores: Vec<f32> = Vec::new();
         // Collect hashes first to avoid borrowing self.networks while calling
@@ -2071,12 +2190,10 @@ impl RaceEngine {
         let hashes = self.state.live_hashes();
         for hash in &hashes {
             if let Some(net) = self.networks.get_mut(hash) {
-                if let Some(loss) = self.trainer.loss() {
-                    if let Ok(report) =
-                        eval_one_step(net, loss, &self.fitness, &self.metrics, &exam_batch)
-                    {
-                        scores.push(report.fitness);
-                    }
+                if let Ok(report) =
+                    eval_one_step(net, loss, &self.fitness, &self.metrics, &exam_batch)
+                {
+                    scores.push(report.fitness);
                 }
             }
         }
@@ -2516,12 +2633,28 @@ impl RaceEngine {
             standardize_op_pool: self.config.standardize_op_pool.clone(),
             informative_metrics: self.metrics.clone(),
             max_steps: self.config.max_steps,
-            train_eval_split_ratio: Some(self.stream.train_eval_split_ratio()),
-            held_out_eval_rows: Some(self.stream.held_out_eval_rows()),
+            train_eval_split_ratio: Some(
+                self.stream
+                    .as_ref()
+                    .map(|s| s.train_eval_split_ratio())
+                    .unwrap_or(0.2),
+            ),
+            held_out_eval_rows: Some(
+                self.stream
+                    .as_ref()
+                    .map(|s| s.held_out_eval_rows())
+                    .unwrap_or(256),
+            ),
             config: ConfigSnapshot::from_config(
                 &self.config,
-                self.stream.batch_size(),
-                self.stream.eval_batch_size(),
+                self.stream
+                    .as_ref()
+                    .map(|s| s.batch_size())
+                    .unwrap_or(16),
+                self.stream
+                    .as_ref()
+                    .map(|s| s.eval_batch_size())
+                    .unwrap_or(16),
             ),
             trainer: self.trainer.describe(),
         };
@@ -2627,14 +2760,14 @@ mod tests {
             pop_size: 0,
             ..RaceConfig::defaults()
         };
-        RaceEngine::new(crate::engine::run_spec::RunSpec {
+        RaceEngine::new(crate::engine::run_spec::RunSpec::new(
             data_dir,
             config,
-            fitness: fitness(),
-            trainer: crate::trainer::TabularTrainer::new(loss_fn()),
-            seed: Some(seed),
-            run_dir: Some(run_dir.to_path_buf()),
-        })
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+            Some(seed),
+            Some(run_dir.to_path_buf()),
+        ))
     }
 
     #[test]
@@ -2952,6 +3085,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── RL mode (RunSpec::rl) ─────────────────────────────────────────
+
+    /// Minimal RlStep for construction-validation tests: reports a constant
+    /// fitness, touches nothing else.
+    struct TestRlTrainer;
+    impl crate::trainer::StepTrainer for TestRlTrainer {
+        fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
+            use flodl::nn::Module;
+            Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
+        }
+    }
+    impl crate::trainer::RlStep for TestRlTrainer {
+        fn train_step(
+            &mut self,
+            _net: &mut Network,
+            _optimizer: &mut dyn Optimizer,
+            _step: usize,
+            _ctx: &crate::trainer::RlContext<'_>,
+        ) -> flodl::tensor::Result<crate::trainer::StepReport> {
+            Ok(crate::trainer::StepReport {
+                train_loss: 0.0,
+                eval_loss: None,
+                fitness: 1.0,
+                informative: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn rl_spec_requires_declared_rl_mode() {
+        // The spec variant and the config's set_mode(..) must agree: an RL
+        // spec with the default Tabular mode is a config bug.
+        let config = RaceConfig {
+            pop_size: 2,
+            max_steps: Some(1),
+            ..RaceConfig::defaults()
+        };
+        let spec = crate::engine::run_spec::RunSpec::rl(
+            config,
+            crate::engine::fitness::Fitness::reported(
+                crate::engine::fitness::Direction::Maximize,
+                "reward",
+            ),
+            TestRlTrainer,
+            Some(7),
+            None,
+        );
+        let err = match RaceEngine::new(spec) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("RL spec without set_mode(RunMode::Rl) must be rejected"),
+        };
+        assert!(
+            err.contains("set_mode(RunMode::Rl)"),
+            "error must name the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn rl_spec_rejects_computed_fitness() {
+        // No dataset exists in RL mode, so a (pred, target) scorer has
+        // nothing to score — construction must fail loudly, not mid-run.
+        let config = RaceConfig {
+            pop_size: 2,
+            max_steps: Some(1),
+            mode: crate::engine::config::RunMode::Rl, // declared correctly; the FITNESS is the bug under test
+            ..RaceConfig::defaults()
+        };
+        let mut topo = crate::graph::topology::TopologyOptions::default();
+        topo.input_dim = Some(1);
+        topo.output_dim = Some(1);
+        let config = RaceConfig {
+            topology_options: topo,
+            ..config
+        };
+        let spec = crate::engine::run_spec::RunSpec::rl(
+            config,
+            fitness(), // Computed — WRONG for RL
+            TestRlTrainer,
+            Some(7),
+            None,
+        );
+        let err = match RaceEngine::new(spec) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("RL spec with Computed fitness must be rejected at construction"),
+        };
+        assert!(
+            err.contains("Fitness::reported"),
+            "error must name the fix: {err}"
+        );
+    }
+
     // ── Iter-5: child generation contract ──────────────────────────────
 
     fn seed_two_parents(dir: &std::path::Path, seed: u64) -> RaceEngine {
@@ -3226,7 +3450,11 @@ mod tests {
         engine.config.checkpoint_every = 2;
         // Keep the stream's rotation cadence in sync, exactly as run() does —
         // this test steps nets manually, bypassing run().
-        engine.stream.set_checkpoint_every(engine.config.checkpoint_every);
+        engine
+            .stream
+            .as_mut()
+            .unwrap()
+            .set_checkpoint_every(engine.config.checkpoint_every);
         engine
             .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
@@ -3392,14 +3620,14 @@ mod tests {
             }),
             ..RaceConfig::defaults()
         };
-        RaceEngine::new(crate::engine::run_spec::RunSpec {
+        RaceEngine::new(crate::engine::run_spec::RunSpec::new(
             data_dir,
             config,
-            fitness: fitness(),
-            trainer: crate::trainer::TabularTrainer::new(loss_fn()),
-            seed: Some(seed),
-            run_dir: Some(run_dir.to_path_buf()),
-        })
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+            Some(seed),
+            Some(run_dir.to_path_buf()),
+        ))
         .unwrap()
     }
 
