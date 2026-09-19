@@ -92,14 +92,14 @@ fn main() {
     let _ = std::fs::remove_dir_all(&run_dir);
 
     let started = Instant::now();
-    let mut engine = RaceEngine::new(gras::engine::RunSpec {
-        data_dir: data_dir.to_path_buf(),
+    let mut engine = RaceEngine::new(gras::engine::RunSpec::new(
+        data_dir.to_path_buf(),
         config,
-        fitness: Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy"),
-        trainer: gras::TabularTrainer::new(score::cross_entropy_onehot_loss),
-        seed: Some(SEED),
-        run_dir: Some(run_dir.to_path_buf()),
-    })
+        Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy"),
+        gras::TabularTrainer::new(score::cross_entropy_onehot_loss),
+        Some(SEED),
+        Some(run_dir.to_path_buf()),
+    ))
     .unwrap();
     engine.run().unwrap();
     let elapsed = started.elapsed().as_secs_f32();
