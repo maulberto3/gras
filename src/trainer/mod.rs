@@ -10,7 +10,8 @@ pub mod trainer;
 pub use flodl::Variable;
 pub use supervised::TabularTrainer;
 pub use trainer::{
-    IntoBoxedTrainer, RunData, StepContext, StepEnv, StepReport, StreamShape, Trainer,
+    IntoBoxedTrainer, ModeTrainer, RlContext, RlStep, RunData, StepEnv, StepReport, StepTrainer,
+    StreamShape, TabularContext, TabularStep,
 };
 
 /// The loss-function signature, aliased for readability in the trait and

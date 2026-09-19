@@ -1,15 +1,16 @@
-//! The reference [`Trainer`]: the classic tabular recipe the race engine
-//! used to run inline, extracted verbatim so `TabularTrainer` is a
-//! drop-in — identical RNG discipline, identical batches, identical metrics.
+//! The reference [`TabularStep`]: the classic tabular recipe the race engine
+//! used to run inline, extracted verbatim so `TabularTrainer` is a drop-in —
+//! identical RNG discipline, identical batches, identical metrics.
 //!
-//! This is also the template for custom schemes: clone it and change the
-//! internals (multi-minibatch steps, curriculum, custom eval cadence, …).
-//! The engine only consumes the [`Trainer`] contract — it never trains.
-//! (Named "tabular" because the shared-batch, one-step-clock shape fits
-//! small structured datasets; image/RL/NLP schemes subclass the same trait.)
+//! This is also the template for custom tabular schemes: clone it and change
+//! the internals (multi-minibatch steps, curriculum, custom eval cadence, …).
+//! The engine only consumes the [`TabularStep`] contract — it never trains.
+//!
+//! For the RL counterpart see `examples/cartpole.rs` (the canonical
+//! [`RlStep`] implementation) and `examples/bandit.rs` (the minimal one).
 
 use crate::graph::network::Network;
-use crate::trainer::{StepContext, StepReport, Trainer};
+use crate::trainer::{StepTrainer, TabularContext, TabularStep};
 use crate::utils::race_steps::{deterministic_train_step, eval_one_step};
 use flodl::nn::optim::Optimizer;
 use flodl::tensor::Result;
@@ -39,7 +40,7 @@ pub struct TabularTrainer {
     /// Optional LR schedule: pure function of the step clock. `None` = fixed
     /// LR. Wrapped as a closure so any flodl scheduler (or hand math) fits:
     /// `.with_lr_schedule(move |s| CosineScheduler::new(base, min, total).lr(s))`.
-    /// MUST be a pure function of `step` — see `Trainer::scheduled_lr`.
+    /// MUST be a pure function of `step` — see `TabularStep::scheduled_lr`.
     pub lr_schedule: Option<Box<dyn Fn(usize) -> f64 + Send + Sync>>,
 }
 
@@ -86,8 +87,8 @@ impl TabularTrainer {
     /// ```
     ///
     /// The closure must be deterministic in `step` alone (replay/catch-up
-    /// contract — see `Trainer::scheduled_lr`). `None` (default) keeps the
-    /// optimizer's fixed LR.
+    /// contract — see `TabularStep::scheduled_lr`). `None` (default) keeps
+    /// the optimizer's fixed LR.
     pub fn with_lr_schedule(
         mut self,
         schedule: impl Fn(usize) -> f64 + Send + Sync + 'static,
@@ -112,203 +113,33 @@ impl Default for TabularTrainer {
     }
 }
 
-// ── Placeholder trainers (skeleton for other paradigms) ──────────────────────
-// These are stub implementations showing how each paradigm maps to the
-// Trainer contract. Each is compiletest-clean but deliberately minimal —
-// replace the body with your recipe. The key difference between paradigms
-// is what they own vs what they ignore from StepContext.
-
-// Stub RL trainer — no loss function (rewards are internal), its own
-// data source (ignores ctx.data), brings its own optimizer.
-//
-// Pattern: return None from loss(), ignore ctx.data, score via the
-// environment's reward signal translated to fitness. For a real RL scheme
-// you would bring your own environment/dataloader and seed it per
-// (net_seed, step) for catch-up parity.
-//
-// RL = no loss; reward signal is the trainer's internal business.
-pub struct RlTrainer {
-    /// Placeholder — replace with your env/dataloader handle.
-    _private: (),
-}
-
-impl RlTrainer {
-    pub fn new() -> Self {
-        Self { _private: () }
-    }
-}
-
-impl Default for RlTrainer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Trainer for RlTrainer {
-    /// RL has no loss function in this sense — rewards are internal.
-    fn loss(&self) -> Option<crate::trainer::LossFn<'_>> {
-        None
-    }
-
-    /// RL brings its own data source — ignore the engine's shared stream.
-    fn stream_shape(&self) -> Option<crate::trainer::StreamShape> {
-        None // not using the engine stream at all
-    }
-
-    fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
-        // TODO: replace with your optimizer (PPO, SAC, …).
-        use flodl::nn::Module;
-        Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
-    }
-
-    fn train_step(
-        &mut self,
-        _net: &mut Network,
-        _optimizer: &mut dyn Optimizer,
-        _step: usize,
-        _ctx: &StepContext<'_>,
-    ) -> Result<StepReport> {
-        // TODO: run one env step / policy update. Seed per (net, step) for
-        // catch-up parity:
-        //   crate::utils::race_steps::deterministic_train_step(ctx.net_seed, step as u64, 0, net, optimizer, &loss_fn, &batch, grad_clip)?;
-        // Score fitness from your reward signal (not from ctx.fitness):
-        let fitness = 0.0_f32; // TODO: your reward → fitness mapping
-        Ok(StepReport {
-            train_loss: 0.0,
-            eval_loss: None, // RL usually has no held-out eval
-            fitness,
-            informative: Vec::new(),
-        })
-    }
-}
-
-/// Stub image trainer — uses the shared stream but with a different batch
-/// semantics (e.g. augmentation, multi-crop). Owns its loss + augmentation
-/// config; uses `ctx.data` for the base batches.
-///
-/// Pattern: use `ctx.data` (Option) for the raw batches, apply per-image
-/// augmentation inside `train_step`, score with your own loss + `ctx.fitness`.
-pub struct ImageTrainer {
-    /// Placeholder — replace with your loss + augmentation config.
-    _private: (),
-}
-
-impl ImageTrainer {
-    pub fn new() -> Self {
-        Self { _private: () }
-    }
-}
-
-impl Default for ImageTrainer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Trainer for ImageTrainer {
-    fn loss(&self) -> Option<crate::trainer::LossFn<'_>> {
-        None // TODO: return your image loss when implemented
-    }
-
-    fn stream_shape(&self) -> Option<crate::trainer::StreamShape> {
-        // Image batches are typically larger; override if using the engine
-        // stream (or ignore ctx.data and bring your own dataloader).
-        Some(crate::trainer::StreamShape {
-            batch_size: 32,
-            eval_batch_size: 64,
-        })
-    }
-
+impl StepTrainer for TabularTrainer {
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
         use flodl::nn::Module;
-        Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
+        Box::new(flodl::nn::Adam::new(
+            &net.parameters(),
+            self.learning_rate as f64,
+        ))
     }
 
-    fn train_step(
-        &mut self,
-        _net: &mut Network,
-        _optimizer: &mut dyn Optimizer,
-        _step: usize,
-        _ctx: &StepContext<'_>,
-    ) -> Result<StepReport> {
-        // TODO: draw `ctx.data.train_batch(step)`, augment, train.
-        // Seed per (net, step):
-        //   crate::utils::race_steps::deterministic_train_step(ctx.net_seed, step as u64, 0, net, optimizer, &loss_fn, &batch, grad_clip)?;
-        let fitness = 0.0_f32; // TODO
-        Ok(StepReport {
-            train_loss: 0.0,
-            eval_loss: None,
-            fitness,
-            informative: Vec::new(),
-        })
+    /// Record this scheme's training recipe in `engine.json` (see
+    /// [`StepTrainer::describe`]).
+    fn describe(&self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "trainer": "tabular",
+            "optimizer": "adam",
+            "learning_rate": self.learning_rate,
+            "grad_clip": self.grad_clip,
+            "batch_size": self.batch_size,
+            "eval_batch_size": self.eval_batch_size,
+            "lr_schedule": self.lr_schedule.is_some(),
+        }))
     }
 }
 
-/// Stub NLP trainer — sequence-shaped batches, per-token or per-sequence
-/// loss. Owns its tokenizer/vocab + loss; may use `ctx.data` or bring its
-/// own streamer.
-///
-/// Pattern: same as ImageTrainer — own the sequence machinery, use
-/// `ctx.data` if the engine stream fits, otherwise ignore it.
-pub struct NlpTrainer {
-    /// Placeholder — replace with your tokenizer + language-modeling loss.
-    _private: (),
-}
-
-impl NlpTrainer {
-    pub fn new() -> Self {
-        Self { _private: () }
-    }
-}
-
-impl Default for NlpTrainer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Trainer for NlpTrainer {
-    fn loss(&self) -> Option<crate::trainer::LossFn<'_>> {
-        None // TODO: return your LM loss when implemented
-    }
-
-    fn stream_shape(&self) -> Option<crate::trainer::StreamShape> {
-        Some(crate::trainer::StreamShape {
-            batch_size: 16,
-            eval_batch_size: 16,
-        })
-    }
-
-    fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
-        use flodl::nn::Module;
-        Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
-    }
-
-    fn train_step(
-        &mut self,
-        _net: &mut Network,
-        _optimizer: &mut dyn Optimizer,
-        _step: usize,
-        _ctx: &StepContext<'_>,
-    ) -> Result<StepReport> {
-        // TODO: draw sequences, train one step, score.
-        // Seed per (net, step):
-        //   crate::utils::race_steps::deterministic_train_step(ctx.net_seed, step as u64, 0, net, optimizer, &loss_fn, &batch, grad_clip)?;
-        let fitness = 0.0_f32; // TODO
-        Ok(StepReport {
-            train_loss: 0.0,
-            eval_loss: None,
-            fitness,
-            informative: Vec::new(),
-        })
-    }
-}
-
-// ── Reference trainer (the real implementation) ──────────────────────────────
-
-impl Trainer for TabularTrainer {
-    fn loss(&self) -> Option<crate::trainer::LossFn<'_>> {
-        Some(&*self.loss_fn)
+impl TabularStep for TabularTrainer {
+    fn loss(&self) -> crate::trainer::LossFn<'_> {
+        &*self.loss_fn
     }
 
     fn scheduled_lr(&self, step: usize) -> Option<f64> {
@@ -322,45 +153,18 @@ impl Trainer for TabularTrainer {
         })
     }
 
-    fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
-        use flodl::nn::Module;
-        Box::new(flodl::nn::Adam::new(
-            &net.parameters(),
-            self.learning_rate as f64,
-        ))
-    }
-
-    /// Record this scheme's training recipe in `engine.json` (see
-    /// [`Trainer::describe`]).
-    fn describe(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "trainer": "tabular",
-            "optimizer": "adam",
-            "learning_rate": self.learning_rate,
-            "grad_clip": self.grad_clip,
-            "batch_size": self.batch_size,
-            "eval_batch_size": self.eval_batch_size,
-            "lr_schedule": self.lr_schedule.is_some(),
-        }))
-    }
-
     fn train_step(
         &mut self,
         net: &mut Network,
         optimizer: &mut dyn Optimizer,
         step: usize,
-        ctx: &StepContext<'_>,
-    ) -> Result<StepReport> {
+        ctx: &TabularContext<'_>,
+    ) -> Result<crate::trainer::StepReport> {
         // The tabular recipe uses every engine-provided handle: shared
         // stream for the step's batches, loss + fitness + metrics for
-        // scoring. (A scheme that doesn't fit that mold simply ignores the
-        // handles it doesn't need — they're Options.)
-        let data = ctx
-            .data
-            .expect("TabularTrainer requires the run's shared data (stream + dataset)");
-        let fitness = ctx
-            .fitness
-            .expect("TabularTrainer requires a fitness function");
+        // scoring. A scheme that doesn't fit that mold implements
+        // `TabularStep` differently — nothing here is engine-hidden.
+        let fitness = ctx.fitness;
         let loss_fn: crate::trainer::LossFn<'_> = &*self.loss_fn; // our own loss
 
         // call_index = hash of the net's name, so each net sees distinct
@@ -369,7 +173,7 @@ impl Trainer for TabularTrainer {
             .net_hash
             .bytes()
             .fold(0u64, |a, b| a.wrapping_add(b as u64));
-        let batch: (Tensor, Tensor) = data.train_batch(step as u64)?;
+        let batch: (Tensor, Tensor) = ctx.data.train_batch(step as u64)?;
         // LR schedule first (pure function of step — replay-safe), then the
         // deterministic train step (seeds the RNG, then forward/backward).
         if let Some(lr) = self.scheduled_lr(step) {
@@ -388,10 +192,10 @@ impl Trainer for TabularTrainer {
 
         // Eval on the step's shared eval batch (held-out stream), never the
         // train batch — this must mirror catch-up exactly.
-        let eval_batch: (Tensor, Tensor) = data.eval_batch(step as u64)?;
+        let eval_batch: (Tensor, Tensor) = ctx.data.eval_batch(step as u64)?;
         let report = eval_one_step(net, loss_fn, fitness, ctx.metrics, &eval_batch)?;
 
-        Ok(StepReport {
+        Ok(crate::trainer::StepReport {
             train_loss,
             eval_loss: report.eval_loss,
             fitness: report.fitness,
