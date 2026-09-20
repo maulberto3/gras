@@ -17,9 +17,12 @@
 //!    child replaces the worst net only if it clears every gate, otherwise the
 //!    attempt is discarded and the population is unchanged. Immigrant rolls: a
 //!    random entrant replaces an inverse-fitness victim (pop stays constant).
-//! 5. Stop criteria checked (max_steps, max_target_fitness, custom_stop) —
-//!    custom stop) — log which fired.
-//! 6. Repeat — the loop's clock is the nets' recorded steps (every net is at
+//! 5. One per-step rollup line (or the `Minimal` frame) describing the step
+//!    that just ended — logged LAST on purpose, so it always sits at the bottom
+//!    of the terminal.
+//! 6. Stop criteria checked (max_steps, max_target_fitness, custom_stop) —
+//!    log which fired.
+//! 7. Repeat — the loop's clock is the nets' recorded steps (every net is at
 //!    the same step after the group steps, so reading any live net's step
 //!    gives the clock).
 //!
@@ -147,9 +150,14 @@ pub struct RaceEngine {
     pub(crate) log_level: crate::engine::config::LogLevel,
 
     /// Per-step step-log counters captured during the evolve phase and
-    /// consumed by the `Minimal` framed table at the start of the NEXT step
-    /// (so the table shows "what happened last step" without extra lines).
+    /// consumed by the SAME step's rollup line / `Minimal` framed table (both
+    /// render after the evolve phase, so the reader's last line always
+    /// describes the step that just finished).
     pub(crate) step_evolve: StepEvolve,
+    /// Per-step RL volume (matches + turns), summed over every net that
+    /// stepped this clock. Reset at the top of each step; consumed by the
+    /// same step's rollup line / `Minimal` table. Stays zero in Tabular mode.
+    pub(crate) step_rl: RlVolume,
     /// In-memory state of the live population (topology JSON, seed, step,
     /// last_metrics, lineage). The source of truth for resume + tooling.
     pub(crate) state: RaceState,
@@ -168,6 +176,11 @@ pub struct RaceEngine {
     pub(crate) rolling_eval: HashMap<String, RollingBuffer>,
     /// Wall-clock start for the wall-clock stop criterion.
     pub(crate) started_at_wall: std::time::Instant,
+    /// Wall-clock start of the CURRENT step (set at the top of the run loop).
+    /// Consumed by the per-step logs (`Summ` rollup line / `Minimal` table) so
+    /// long runs surface per-step cost — e.g. RL bridges where one step plays
+    /// many full matches through a Python subprocess.
+    pub(crate) step_started_at_wall: std::time::Instant,
     /// Cumulative culls so far (for max_culls stop).
     pub(crate) culls: usize,
     /// Children born per step clock. Disambiguates same-clock siblings across
@@ -218,6 +231,38 @@ pub(crate) struct StepEvolve {
     pub cross_survived: usize,
     pub cross_discarded: usize,
     pub mutate_fired: usize,
+}
+
+/// Per-step RL volume, summed over every net that stepped this clock — the
+/// environment work the population actually did. `matches`/`turns` come from
+/// `StepReport.rl` (see [`crate::trainer::RlStepMeta`]); `nets` counts the nets
+/// that reported, so a trainer which forgets to report shows as `—` instead of
+/// a silent `0`. Always zero in Tabular mode.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RlVolume {
+    /// Nets that reported `StepReport.rl` this step.
+    pub nets: usize,
+    /// Matches played by those nets, summed.
+    pub matches: usize,
+    /// Environment turns played by those nets, summed.
+    pub turns: usize,
+}
+
+impl RlVolume {
+    /// The RL middle column of the per-step rollup, e.g.
+    /// `matches 100 │ turns 14400 │ turns/match 144`. `—` when no net reported
+    /// any match (Tabular mode, or a mis-wired RL trainer).
+    fn label(&self) -> String {
+        if self.nets == 0 || self.matches == 0 {
+            return "matches — │ turns — │ turns/match —".to_string();
+        }
+        format!(
+            "matches {} │ turns {} │ turns/match {:.0}",
+            self.matches,
+            self.turns,
+            self.turns as f32 / self.matches as f32
+        )
+    }
 }
 
 impl RaceEngine {
@@ -289,7 +334,7 @@ impl RaceEngine {
         if tabular_data_dir.is_some() && config.mode != crate::engine::config::RunMode::Tabular {
             return Err(crate::utils::error::EngineError::InvalidOptions(
                 format!(
-                    "RunSpec::new (tabular, data_dir given) requires .set_mode(RunMode::Tabular) — config declares {:?} with no way to serve it; Image/NLP spec variants are future work",
+                    "RunSpec::tabular (a data_dir was given) requires .set_mode(RunMode::Tabular) — config declares {:?} with no way to serve it; Image/NLP spec variants are future work",
                     config.mode
                 ),
             )
@@ -378,10 +423,12 @@ impl RaceEngine {
         let default_batch_size = 16usize;
         // The trainer owns batch geometry (Tabular only — RL has no stream).
         // Resolve it BEFORE the header so engine.json records the stream
-        // shape the run actually used.
+        // shape the run actually used. `None` = no stream at all (RL), which
+        // stays `None` in the record — a tabular default here would read as a
+        // fact about a run that never draws a batch.
         let (batch_size, eval_batch_size) = match trainer.stream_shape() {
-            Some(shape) => (shape.batch_size, shape.eval_batch_size),
-            None => (default_batch_size, default_batch_size),
+            Some(shape) => (Some(shape.batch_size), Some(shape.eval_batch_size)),
+            None => (None, None),
         };
 
         let (header_input_dim, header_output_dim) = match &dataset {
@@ -438,10 +485,14 @@ impl RaceEngine {
             Some(dataset) => {
                 let split = PoolSplit::of(dataset, train_eval_split_ratio, run_seed);
                 Some(
-                    BatchStream::new(run_seed, batch_size, split)
-                        .with_eval_batch_size(eval_batch_size)
-                        .with_held_out_eval_rows(held_out_eval_rows)
-                        .with_checkpoint_every(config.checkpoint_every),
+                    BatchStream::new(
+                        run_seed,
+                        batch_size.unwrap_or(default_batch_size),
+                        split,
+                    )
+                    .with_eval_batch_size(eval_batch_size.unwrap_or(default_batch_size))
+                    .with_held_out_eval_rows(held_out_eval_rows)
+                    .with_checkpoint_every(config.checkpoint_every),
                 )
             }
             None => None,
@@ -451,13 +502,9 @@ impl RaceEngine {
         let meta_ctx = crate::engine::config::RunMetaCtx {
             input_dim: header.input_dim,
             output_dim: header.output_dim,
-            batch_size: batch_stream
-                .as_ref()
-                .map(|s| s.batch_size())
-                .unwrap_or(batch_size),
+            batch_size: batch_stream.as_ref().map(|s| s.batch_size()),
             dropout_prob: header.topology_options.dropout_prob,
             fitness_label: header.fitness_label.0.clone(),
-            loss_label: "cross_entropy".to_string(),
             direction: format!("{:?}", header.fitness_direction).to_lowercase(),
             pop_size: config.pop_size,
             run_seed,
@@ -482,9 +529,11 @@ impl RaceEngine {
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
             started_at_wall: std::time::Instant::now(),
+            step_started_at_wall: std::time::Instant::now(),
             culls: 0,
             children_born_at_clock: HashMap::new(),
             step_evolve: StepEvolve::default(),
+            step_rl: RlVolume::default(),
             checkpoints: Vec::new(),
             minimal_prev_means: None,
             log_level,
@@ -620,6 +669,8 @@ impl RaceEngine {
             Some(shape) => (shape.batch_size, shape.eval_batch_size),
             None => (16, 16), // conservative default when no stream_shape override
         };
+        // Resume always has a stream by construction (tabular-only today), so
+        // the recorded geometry is genuinely `Some` here.
         let split = PoolSplit::of(&dataset, header_stream_ratio, run_seed);
         // Resume is Tabular-only today (a persisted run carries a dataset);
         // both fields are wrapped in Some to satisfy the Option'd struct.
@@ -634,10 +685,9 @@ impl RaceEngine {
         let meta_ctx = crate::engine::config::RunMetaCtx {
             input_dim: header.input_dim,
             output_dim: header.output_dim,
-            batch_size,
+            batch_size: Some(batch_size),
             dropout_prob: header.topology_options.dropout_prob,
             fitness_label: header.fitness_label.0.clone(),
-            loss_label: "cross_entropy".to_string(),
             direction: format!("{:?}", header.fitness_direction).to_lowercase(),
             pop_size: config.pop_size,
             run_seed,
@@ -660,9 +710,11 @@ impl RaceEngine {
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
             started_at_wall: std::time::Instant::now(),
+            step_started_at_wall: std::time::Instant::now(),
             culls: 0,
             children_born_at_clock: HashMap::new(),
             step_evolve: StepEvolve::default(),
+            step_rl: RlVolume::default(),
             checkpoints: Vec::new(),
             minimal_prev_means: None,
             log_level,
@@ -881,6 +933,10 @@ impl RaceEngine {
 
         loop {
             let clock = self.step_clock();
+            self.step_started_at_wall = std::time::Instant::now();
+            // Per-step accumulators start empty; the rollup at the END of this
+            // step reads them (it is the last line printed for the step).
+            self.step_rl = RlVolume::default();
 
             // ── 1. group step: every live net on the same shared batch ──────
             let hashes = self.state.live_hashes();
@@ -892,12 +948,6 @@ impl RaceEngine {
                 self.step_one_net(hash, clock)?;
             }
             self.append_metrics_csv(clock)?;
-            // `None` mode: no per-step logging at all (log_step_rollup's
-            // best-net eval still runs — it feeds snapshot bookkeeping).
-            // `Minimal` is handled INSIDE log_step_rollup (table only).
-            if self.log_level != crate::engine::config::LogLevel::None {
-                self.log_step_rollup(clock);
-            }
 
             // ── 2. record checkpoint (every `checkpoint_every` steps) ───────
             if clock > 0 && clock % self.config.checkpoint_every == 0 {
@@ -1046,6 +1096,16 @@ impl RaceEngine {
                 mutate_fired,
             };
 
+            // ── 3c. per-step rollup — LAST line of the step ─────────────────
+            // Ordered train → checkpoint → evolve → rollup so the summary
+            // always sits at the bottom of the terminal: no scrolling back to
+            // find "how is this run doing", and `took` covers the whole step.
+            // `Minimal` renders its framed table here instead. `None` mode
+            // stays silent per step.
+            if self.log_level != crate::engine::config::LogLevel::None {
+                self.log_step_rollup(clock);
+            }
+
             // ── 4. stop criteria ────────────────────────────────────────────
             if let Some(reason) = self.check_stop(clock) {
                 // Post-race pruner (pop_pruner): the stop reason becomes a
@@ -1171,6 +1231,11 @@ impl RaceEngine {
         // simply keep learning at the same LR/hyperparams.
         for offset in 0..pruner.steps {
             let step = clock + 1 + offset;
+            // Solo steps evolve nothing: both per-step accumulators start
+            // clean, so the rollup reports this step's own RL volume and the
+            // (already logged) pruner culls are not re-counted every step.
+            self.step_evolve = StepEvolve::default();
+            self.step_rl = RlVolume::default();
             let hashes = self.state.live_hashes();
             if hashes.is_empty() {
                 break;
@@ -1509,6 +1574,14 @@ impl RaceEngine {
                 }
             }
         }
+        // RL volume: the trainer's reported environment work for this step
+        // accumulates across the group so the rollup can show the step's real
+        // workload (matches + turns). Tabular trainers report `None`.
+        if let Some(rl) = report.rl {
+            self.step_rl.nets += 1;
+            self.step_rl.matches += rl.matches;
+            self.step_rl.turns += rl.turns;
+        }
         let metrics = NetMetrics {
             step: clock,
             train_loss: report.train_loss,
@@ -1543,9 +1616,15 @@ impl RaceEngine {
         Ok(())
     }
 
-    /// One rollup line per step: pop size, train/eval loss means ± std, and
-    /// the fitness column in the same shape. Two decimals throughout — the
-    /// spread is the signal worth reading, the extremes are noise.
+    /// One rollup line per step: pop size, the train-loss mean ± std, the
+    /// mode's middle column, and the fitness column in the same shape. Two
+    /// decimals throughout — the spread is the signal worth reading, the
+    /// extremes are noise. Printed LAST for the step (see the run loop), so
+    /// it lands at the bottom of the terminal.
+    ///
+    /// Middle column by mode: Tabular = held-out `eval_loss`; RL = the step's
+    /// environment volume (`matches`/`turns`, from [`RlVolume`]) — an RL net
+    /// has no held-out batch, and the volume is what explains the wall time.
     fn log_step_rollup(&mut self, clock: usize) {
         // Smoothed (K-step rolling mean) population stats — raw per-step
         // values bounce with batch difficulty; the trend is what matters.
@@ -1572,6 +1651,9 @@ impl RaceEngine {
                 format!("{mean:.2} ± {:.2}", var.sqrt())
             }
         };
+        // Per-step wall time: the step's own cost (train + evolve), not time
+        // since run start. Matters most in RL (one step = many full matches).
+        let step_secs = self.step_started_at_wall.elapsed().as_secs_f32();
         // Fitness column: same mean ± std shape so all three read alike.
         let fits: Vec<f32> = self
             .state
@@ -1585,19 +1667,27 @@ impl RaceEngine {
             .map(rolling_mean)
             .collect();
         let fit_stats = stats(&fits);
+        // The mode's middle column: tabular reports the held-out eval loss,
+        // RL reports the environment volume it actually played.
+        let mid = if self.trainer.is_tabular() {
+            format!("eval_loss↓ {}", stats(&evals))
+        } else {
+            self.step_rl.label()
+        };
         // Per-step rollup: Summ = compact one-liner; Minimal = framed table
         // (from step 2 — deltas need a prior step).
         if self.log_level == crate::engine::config::LogLevel::Minimal {
-            self.log_minimal_table(&trains, &evals, &fits);
+            self.log_minimal_table(&trains, &evals, &fits, step_secs);
         } else {
             info!(
-                "step {} │ pop {} │ train_loss↓ {} │ eval_loss↓ {} │ fitness{} {}",
+                "step {} │ pop {} │ train_loss↓ {} │ {} │ fitness{} {} │ took {:.1}s",
                 clock,
                 self.state.live_count(),
                 stats(&trains),
-                stats(&evals),
+                mid,
                 self.fitness.direction().arrow(),
                 fit_stats,
+                step_secs,
             );
         }
     }
@@ -1609,7 +1699,12 @@ impl RaceEngine {
     /// last step); a zero delta drops the parenthetical. The evolve counters
     /// and the best-net footer are plain current values — no delta on the
     /// footer. Nothing else is printed per step in this mode.
-    fn log_minimal_table(&mut self, trains: &[f32], evals: &[f32], fits: &[f32]) {
+    ///
+    /// Row 1's tail is mode-dependent, exactly like the `Summ` line: tabular
+    /// shows the held-out `eval_loss`, RL shows the step's environment volume
+    /// (`matches`/`turns`). Rendered at the END of the step, so the evolve
+    /// counters in the frame are this step's own.
+    fn log_minimal_table(&mut self, trains: &[f32], evals: &[f32], fits: &[f32], step_secs: f32) {
         let mean = |v: &[f32]| {
             if v.is_empty() {
                 f32::NAN
@@ -1639,14 +1734,24 @@ impl RaceEngine {
         // since every glyph here is 3-byte UTF-8 but consistently present
         // per column) — so alignment holds.
         let rows: Vec<String> = vec![
-            format!(
-                "pop {:>3} │ train_loss↓ {:.2}{} │ eval_loss↓ {:.2}{}",
-                pop,
-                train_m,
-                delta(train_m, Some(pt)),
-                eval_m,
-                delta(eval_m, Some(pe)),
-            ),
+            if self.trainer.is_tabular() {
+                format!(
+                    "pop {:>3} │ train_loss↓ {:.2}{} │ eval_loss↓ {:.2}{}",
+                    pop,
+                    train_m,
+                    delta(train_m, Some(pt)),
+                    eval_m,
+                    delta(eval_m, Some(pe)),
+                )
+            } else {
+                format!(
+                    "pop {:>3} │ train_loss↓ {:.2}{} │ {}",
+                    pop,
+                    train_m,
+                    delta(train_m, Some(pt)),
+                    self.step_rl.label(),
+                )
+            },
             format!(
                 "fitness{} {:.2}{} │ culls {} │ inserts {}",
                 self.fitness.direction().arrow(),
@@ -1659,6 +1764,7 @@ impl RaceEngine {
                 "crossover fired {} ({} inserted, {} spent) │ mutation rolled {} ({} immigrant(s))",
                 e.cross_fired, e.cross_survived, e.cross_discarded, e.mutate_fired, e.mutate_fired,
             ),
+            format!("step took {:.1}s", step_secs),
         ];
         // Display width: count chars, not bytes (↓/↑/∆ are 3 bytes, 1 char).
         let inner = rows
@@ -2647,14 +2753,8 @@ impl RaceEngine {
             ),
             config: ConfigSnapshot::from_config(
                 &self.config,
-                self.stream
-                    .as_ref()
-                    .map(|s| s.batch_size())
-                    .unwrap_or(16),
-                self.stream
-                    .as_ref()
-                    .map(|s| s.eval_batch_size())
-                    .unwrap_or(16),
+                self.stream.as_ref().map(|s| s.batch_size()),
+                self.stream.as_ref().map(|s| s.eval_batch_size()),
             ),
             trainer: self.trainer.describe(),
         };
@@ -2680,6 +2780,30 @@ mod tests {
     use flodl::{Device, Variable};
 
     use crate::engine::config::DEFAULT_CHECKPOINT_EVERY;
+
+    /// The RL volume label is the RL middle column of the per-step rollup:
+    /// totals plus the mean turns/match. A population that reported nothing
+    /// (Tabular, or a mis-wired RL trainer) must read as `—`, never as a
+    /// silent `0`.
+    #[test]
+    fn rl_volume_label_formats_and_never_lies() {
+        let empty = RlVolume::default();
+        assert!(empty.label().contains('—'), "{}", empty.label());
+        let pop = RlVolume {
+            nets: 3,
+            matches: 3,
+            turns: 432,
+        };
+        assert_eq!(pop.label(), "matches 3 │ turns 432 │ turns/match 144");
+        // Matches with zero turns is still a real report (every match died on
+        // turn 0) — it reads as a mean of 0, not as `—`.
+        let zero_turns = RlVolume {
+            nets: 1,
+            matches: 1,
+            turns: 0,
+        };
+        assert_eq!(zero_turns.label(), "matches 1 │ turns 0 │ turns/match 0");
+    }
 
     fn tiny_dataset() -> crate::utils::tabular_data::Dataset {
         synthetic_classification(64, 2, 2, 7, Device::CPU).unwrap()
@@ -2760,7 +2884,7 @@ mod tests {
             pop_size: 0,
             ..RaceConfig::defaults()
         };
-        RaceEngine::new(crate::engine::run_spec::RunSpec::new(
+        RaceEngine::new(crate::engine::run_spec::RunSpec::tabular(
             data_dir,
             config,
             fitness(),
@@ -3109,6 +3233,7 @@ mod tests {
                 eval_loss: None,
                 fitness: 1.0,
                 informative: Vec::new(),
+                rl: None,
             })
         }
     }
@@ -3620,7 +3745,7 @@ mod tests {
             }),
             ..RaceConfig::defaults()
         };
-        RaceEngine::new(crate::engine::run_spec::RunSpec::new(
+        RaceEngine::new(crate::engine::run_spec::RunSpec::tabular(
             data_dir,
             config,
             fitness(),

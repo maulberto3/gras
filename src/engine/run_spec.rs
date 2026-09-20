@@ -61,9 +61,9 @@ pub struct RLSpec<T: RlStep + 'static = Box<dyn RlStep>> {
 /// Start-a-race spec — one variant per run mode, each self-contained. The
 /// compiler enforces that each mode supplies exactly its own requirement set:
 ///
-/// - **[`RunSpec::Tabular`]** — supervised tabular style: `data_dir` + engine-
+/// - **[`RunSpec::tabular`]** — supervised tabular style: `data_dir` + engine-
 ///   computed fitness (see [`Fitness::new`]). This is the historical behavior;
-///   `RunSpec::new` builds it.
+///   `RunSpec::tabular` builds it.
 /// - **[`RunSpec::RL`]** — environment/RL style: no dataset at all, a
 ///   [`Fitness::reported`] ranking signal, and a trainer that drives the
 ///   environment and reports the reward. `RunSpec::rl` builds it.
@@ -79,12 +79,12 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
     /// `.clone()` noise:
     ///
     /// ```ignore
-    /// RunSpec::new("data/mnist/train", config, fitness, trainer, Some(42), run_dir)
+    /// RunSpec::tabular("data/mnist/train", config, fitness, trainer, Some(42), run_dir)
     /// ```
     ///
     /// `run_dir` takes `Option<P>` where `P: Into<PathBuf>`; pass
     /// `None::<&str>` for the default `results/<timestamp>` location.
-    pub fn new<P: Into<std::path::PathBuf>>(
+    pub fn tabular<P: Into<std::path::PathBuf>>(
         data_dir: impl Into<std::path::PathBuf>,
         config: RaceConfig,
         fitness: Fitness,

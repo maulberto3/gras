@@ -50,6 +50,33 @@ pub enum LogLevel {
     Minimal,
 }
 
+impl LogLevel {
+    /// Parse the engine's own level name: `none` / `summ` / `minimal`
+    /// (case-insensitive). This is the vocabulary users type on the examples'
+    /// `--log-level` flag, so it must be understood there — passing `summ`
+    /// straight to `env_logger` would be read as a *module name* and silence
+    /// the whole run.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "silent" => Some(LogLevel::None),
+            "summ" | "summary" => Some(LogLevel::Summ),
+            "minimal" => Some(LogLevel::Minimal),
+            _ => None,
+        }
+    }
+
+    /// The `env_logger` verbosity under which this level's lines are visible.
+    /// `Summ` prints through `log::info!`, so it needs `info`; `Minimal` and
+    /// `None` print their own lines through `println!` and only need the
+    /// chatter quieted down.
+    pub fn env_filter(self) -> &'static str {
+        match self {
+            LogLevel::Summ => "info",
+            LogLevel::Minimal | LogLevel::None => "warn",
+        }
+    }
+}
+
 /// How strict the checkpoint gate is for a crossover child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CrossoverGate {
@@ -277,10 +304,11 @@ pub struct PopPruner {
 pub struct RunMetaCtx {
     pub input_dim: usize,
     pub output_dim: usize,
-    pub batch_size: usize,
+    /// Shared-stream batch size; `None` in modes with no shared stream (RL),
+    /// where the trainer owns the per-step volume.
+    pub batch_size: Option<usize>,
     pub dropout_prob: f32,
     pub fitness_label: String,
-    pub loss_label: String,
     pub direction: String,
     pub pop_size: usize,
     pub run_seed: u64,
@@ -792,5 +820,25 @@ impl RaceConfig {
             .iter()
             .map(|s| Self::parse_standardize(s))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LogLevel;
+
+    /// The examples' `--log-level` vocabulary must parse: handed to env_logger
+    /// verbatim, `summ` is read as a module name and mutes the whole run, so
+    /// this mapping is load-bearing.
+    #[test]
+    fn log_level_names_parse_to_a_visible_verbosity() {
+        assert_eq!(LogLevel::parse("summ"), Some(LogLevel::Summ));
+        assert_eq!(LogLevel::parse("SUMM"), Some(LogLevel::Summ));
+        assert_eq!(LogLevel::parse("minimal"), Some(LogLevel::Minimal));
+        assert_eq!(LogLevel::parse("none"), Some(LogLevel::None));
+        assert_eq!(LogLevel::parse("debug"), None, "env_logger levels pass through");
+        assert_eq!(LogLevel::Summ.env_filter(), "info");
+        assert_eq!(LogLevel::Minimal.env_filter(), "warn");
+        assert_eq!(LogLevel::None.env_filter(), "warn");
     }
 }
