@@ -96,7 +96,7 @@ fn main() {
 
     let _ = std::fs::remove_dir_all(&run_dir);
 
-    let mut engine = RaceEngine::new(gras::engine::RunSpec::new(
+    let mut engine = RaceEngine::new(gras::engine::RunSpec::tabular(
         data_dir.to_path_buf(),
         config,
         Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy"),
