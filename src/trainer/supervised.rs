@@ -42,6 +42,15 @@ pub struct TabularTrainer {
     /// `.with_lr_schedule(move |s| CosineScheduler::new(base, min, total).lr(s))`.
     /// MUST be a pure function of `step` — see `TabularStep::scheduled_lr`.
     pub lr_schedule: Option<Box<dyn Fn(usize) -> f64 + Send + Sync>>,
+    /// What objective `loss_fn` actually optimizes, for the run record.
+    ///
+    /// The engine cannot see inside the closure, so this label is the only
+    /// machine-readable statement of the loss. Offline replay tools
+    /// (`examples/export_champion.rs`) need it to rebuild a net's weights: a
+    /// replay under a *different* objective retrains different weights and
+    /// still looks plausible, so those tools refuse an unlabeled scheme rather
+    /// than guess.
+    pub loss_label: Option<String>,
 }
 
 impl TabularTrainer {
@@ -53,6 +62,16 @@ impl TabularTrainer {
             loss_fn: Box::new(loss_fn),
             ..Self::default()
         }
+    }
+
+    /// Name the loss this scheme trains against, for `engine.json`. Use a
+    /// plain name for a plain loss (`"mse"`, `"cross_entropy"`) so replay
+    /// tools can rebuild it; a custom objective should carry a descriptive
+    /// label (`"cross_entropy_label_smoothing_0.1"`) — that records the truth
+    /// and tells the tool it cannot replay this run.
+    pub fn with_loss_label(mut self, label: impl Into<String>) -> Self {
+        self.loss_label = Some(label.into());
+        self
     }
 
     /// Set the Adam learning rate (default: the crate's historical 1e-3).
@@ -108,6 +127,9 @@ impl Default for TabularTrainer {
             grad_clip: 1.0,
             batch_size: 16,
             eval_batch_size: 16,
+            // Unlabeled by default: the engine cannot see inside `loss_fn`, so
+            // silence is the honest record. `with_loss_label` names it.
+            loss_label: None,
             lr_schedule: None,
         }
     }
@@ -128,6 +150,7 @@ impl StepTrainer for TabularTrainer {
         Some(serde_json::json!({
             "trainer": "tabular",
             "optimizer": "adam",
+            "loss": self.loss_label,
             "learning_rate": self.learning_rate,
             "grad_clip": self.grad_clip,
             "batch_size": self.batch_size,
@@ -200,6 +223,7 @@ impl TabularStep for TabularTrainer {
             eval_loss: report.eval_loss,
             fitness: report.fitness,
             informative: report.metrics,
+            rl: None, // tabular: no environment, so no matches/turns to report
         })
     }
 }

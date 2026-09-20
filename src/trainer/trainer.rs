@@ -15,7 +15,7 @@
 //! The split makes wrong flavor combinations a **compile error**: an RL
 //! scheme cannot return a `(pred, target)` loss, and a tabular scheme cannot
 //! be built without one. `RaceEngine::new` enforces the mode pairing via
-//! trait bounds (`RunSpec::Tabular` demands `T: TabularStep`,
+//! trait bounds (`RunSpec::tabular` demands `T: TabularStep`,
 //! `RunSpec::RL` demands `T: RlStep`).
 
 use crate::graph::network::Network;
@@ -37,6 +37,32 @@ pub struct StepReport {
     pub fitness: f32,
     /// Extra non-ranking/informative scores configured for the run, if any.
     pub informative: Vec<f32>,
+    /// RL-only environment volume for this step — see [`RlStepMeta`]. `None`
+    /// in Tabular (no environment) and from RL trainers that don't report it
+    /// (the log then prints `—` in the RL columns).
+    #[serde(default)]
+    pub rl: Option<RlStepMeta>,
+}
+
+/// How much environment this step actually played — the RL counterpart of
+/// tabular's eval-loss column, which has nothing to report in a mode with no
+/// held-out batch.
+///
+/// Vocabulary (used by the engine log and every RL example): **match** = one
+/// episode (one full game, one bandit pull), **turn** = one environment step
+/// inside a match. CartPole calls them episodes/timesteps; the engine log says
+/// match/turn throughout.
+///
+/// The engine sums these over the live population per clock-step and prints
+/// `matches <total> │ turns <total> │ turns/match <mean>` in the per-step
+/// rollup — so a long RL step shows *why* it took long, and a changing match
+/// length (e.g. `MatchLength::RandomNumTurns`) is visible as it happens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RlStepMeta {
+    /// Matches (episodes) this net's trainer played this step.
+    pub matches: usize,
+    /// Environment turns played across those matches.
+    pub turns: usize,
 }
 
 /// Lightweight engine-metadata snapshot handed to the trainer each step.
@@ -224,7 +250,7 @@ pub trait RlStep: StepTrainer {
 /// [`RunSpec`](crate::engine::RunSpec) variant; each step dispatches on the
 /// arm so a Tabular step always carries data and an RL step never does.
 pub enum ModeTrainer {
-    /// Dataset-driven scheme (from `RunSpec::Tabular`).
+    /// Dataset-driven scheme (from `RunSpec::tabular`).
     Tabular(Box<dyn TabularStep>),
     /// Environment-driven scheme (from `RunSpec::RL`).
     Rl(Box<dyn RlStep>),
