@@ -200,6 +200,7 @@ impl TabularStep for WarmupSgdTrainer {
             eval_loss,
             fitness,
             informative,
+            rl: None, // tabular: no environment volume to report
         })
     }
 }
@@ -260,7 +261,7 @@ fn main() {
 
     // Run — the ONLY difference from a default run is the trainer argument:
     let run_seed = 42u64;
-    let mut engine = RaceEngine::new(gras::engine::RunSpec::new(
+    let mut engine = RaceEngine::new(gras::engine::RunSpec::tabular(
         data_dir,
         config,
         fitness,

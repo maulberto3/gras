@@ -33,7 +33,7 @@ use flodl::Tensor;
 use gras::engine::fitness::{Direction, Fitness};
 use gras::engine::{RaceConfig, RaceEngine, RunMode};
 use gras::graph::network::Network;
-use gras::trainer::{RlContext, RlStep, StepReport, StepTrainer};
+use gras::trainer::{RlContext, RlStep, RlStepMeta, StepReport, StepTrainer};
 use gras::utils::race_steps::train_one_step_pred_only;
 use gras::Variable;
 
@@ -54,6 +54,12 @@ fn env_num(key: &str, default: usize) -> usize {
 const RACE_STEPS: usize = 80;
 const EPISODES_PER_STEP: usize = 12;
 const POP: usize = 8;
+
+/// The policy's learning rate — an ordinary f32 knob like every other const
+/// here (gras is f32 end to end). flodl's `Adam::new` is typed `f64` because
+/// it mirrors libtorch, where optimizer scalars are C++ `double`; the value is
+/// cast exactly once, at that boundary.
+const LEARNING_RATE: f32 = 2e-3;
 
 // ── REWARD KNOBS (the experiment surface) ──────────────────────────────────
 
@@ -256,6 +262,12 @@ impl RlStep for CartPoleTrainer {
                 eval_loss: None,
                 fitness: 0.0,
                 informative: Vec::new(),
+                // Every episode died on turn 0, so the batch is empty — but the
+                // episodes were still played: report them (turns 0).
+                rl: Some(RlStepMeta {
+                    matches: self.episodes_per_step,
+                    turns: survivals.iter().sum(),
+                }),
             });
         }
         // 2. The weight update — selected by `UPDATE` (see its doc).
@@ -358,6 +370,12 @@ impl RlStep for CartPoleTrainer {
             eval_loss: None, // no eval batch in RL mode
             fitness: fitness_from_survivals(&survivals),
             informative: Vec::new(),
+            // RL volume for the engine's per-step log: episodes played this
+            // step and the timesteps they survived in total.
+            rl: Some(RlStepMeta {
+                matches: self.episodes_per_step,
+                turns: survivals.iter().sum(),
+            }),
         })
     }
 }
@@ -365,7 +383,7 @@ impl RlStep for CartPoleTrainer {
 impl StepTrainer for CartPoleTrainer {
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
         use flodl::nn::Module;
-        Box::new(flodl::nn::Adam::new(&net.parameters(), 0.002_f64))
+        Box::new(flodl::nn::Adam::new(&net.parameters(), LEARNING_RATE as f64))
     }
 
     fn describe(&self) -> Option<serde_json::Value> {
@@ -456,15 +474,22 @@ fn holdout_survival(run_dir: &std::path::Path, episodes: usize) -> Option<f32> {
 
 fn main() {
     // Logger init. Level: `--log-level <level>` arg wins, else RUST_LOG,
-    // else info — same contract as the kagiculture example.
+    // else info — same contract as the kagiculture example. The engine's own
+    // names (`summ` / `minimal` / `none`) are accepted and mapped onto the
+    // verbosity that lets their lines through — typed verbatim into
+    // env_logger, `summ` would be read as a module name and mute everything.
     let args: Vec<String> = std::env::args().collect();
     let level = if args.len() > 2 && args[1] == "--log-level" {
         args[2].clone()
     } else {
         "info".into()
     };
+    let filter = match gras::engine::config::LogLevel::parse(&level) {
+        Some(engine_level) => engine_level.env_filter().to_string(),
+        None => level,
+    };
     env_logger::Builder::new()
-        .parse_filters(&level)
+        .parse_filters(&filter)
         .format(|buf, record| writeln!(buf, "{}", record.args()))
         .init();
 

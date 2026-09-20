@@ -185,7 +185,7 @@ fn setup_demo_run() -> (PathBuf, String, PathBuf) {
         .with_learning_rate(1e-3)
         .with_grad_clip(1.0);
 
-    let mut engine = RaceEngine::new(gras::engine::RunSpec::new(
+    let mut engine = RaceEngine::new(gras::engine::RunSpec::tabular(
         data_dir.clone(),
         config,
         fitness,

@@ -172,14 +172,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         r
     };
-    // RunSpec::new coerces path-like args (Into<PathBuf>): pass &Path directly.
+    // RunSpec::tabular coerces path-like args (Into<PathBuf>): pass &Path directly.
     // Trainer is auto-boxed by with_trainer.
     let mut engine = match &resume_dir {
         Some(dir) => {
             println!("Resuming from {}", dir.display());
             RaceEngine::resume(dir.clone(), data_dir.to_path_buf(), builder, fitness, trainer)?
         }
-        None => RaceEngine::new(gras::engine::RunSpec::new(
+        None => RaceEngine::new(gras::engine::RunSpec::tabular(
             data_dir,
             builder,
             fitness,

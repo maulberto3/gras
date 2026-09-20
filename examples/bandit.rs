@@ -26,7 +26,7 @@ use std::io::Write;
 use gras::engine::fitness::{Direction, Fitness};
 use gras::engine::{RaceConfig, RaceEngine, RunMode};
 use gras::graph::network::Network;
-use gras::trainer::{RlContext, RlStep, StepReport, StepTrainer};
+use gras::trainer::{RlContext, RlStep, RlStepMeta, StepReport, StepTrainer};
 use gras::utils::race_steps::train_one_step_pred_only;
 use gras::Variable;
 use flodl::{nn::optim::Optimizer, Tensor};
@@ -131,12 +131,18 @@ impl RlStep for BanditTrainer {
         )?;
 
         // 5. Report: fitness = the reward we collected. The ENGINE ranks on
-        //    this — it never recomputes anything.
+        //    this — it never recomputes anything. The volume is one match of
+        //    one turn (a single pull), so the per-step log reads
+        //    `matches 1 │ turns 1 │ turns/match 1`.
         Ok(StepReport {
             train_loss: loss_report,
             eval_loss: None, // no eval batch exists in RL mode
             fitness: reward,
             informative: Vec::new(),
+            rl: Some(RlStepMeta {
+                matches: 1,
+                turns: 1,
+            }),
         })
     }
 }

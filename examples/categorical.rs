@@ -59,7 +59,7 @@ fn main() {
 
     // 4. Run — one RunSpec; the cross-entropy loss lives inside the trainer.
     let run_seed = 42u64;
-    let mut engine = RaceEngine::new(gras::engine::RunSpec::new(
+    let mut engine = RaceEngine::new(gras::engine::RunSpec::tabular(
         data_dir,
         config,
         fitness,

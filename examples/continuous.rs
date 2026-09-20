@@ -69,11 +69,13 @@ fn main() {
         let sq = diff.mul(&diff)?;
         Ok(Variable::new(sq.mean()?, true))
     };
-    let mut engine = RaceEngine::new(gras::engine::RunSpec::new(
+    let mut engine = RaceEngine::new(gras::engine::RunSpec::tabular(
         data_dir,
         config,
         fitness,
-        gras::TabularTrainer::new(loss_fn),
+        // Name the objective: replay tools (export_champion) rebuild weights
+        // only if they can reproduce this exact loss.
+        gras::TabularTrainer::new(loss_fn).with_loss_label("mse"),
         Some(run_seed),
         Some(run_dir),
     ))
