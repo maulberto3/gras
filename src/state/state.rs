@@ -54,8 +54,12 @@ pub struct ConfigSnapshot {
     pub crossover_ops_pool: Vec<String>,
     pub crossover_prob: f32,
     pub mutate_prob: f32,
-    /// Stop budgets as configured (`None` = no limit).
+    /// Stop budgets as configured (`None` = no limit). The two are mutually
+    /// exclusive, so at most one is ever `Some`. `max_steps` is duplicated at
+    /// the header root for readers that want the stop criterion without
+    /// opening `config`; this copy is the authoritative one.
     pub max_target_fitness: Option<f32>,
+    pub max_steps: Option<usize>,
     /// Whether a pluggable `custom_stop` closure was installed. The closure is
     /// code, not data, so only its presence is recordable.
     pub has_custom_stop: bool,
@@ -65,9 +69,13 @@ pub struct ConfigSnapshot {
     /// `"nlp"` | `"rl"`).
     pub mode: String,
     /// Effective shared-stream geometry — after the trainer's `stream_shape()`
-    /// override, i.e. the shape the run actually used.
-    pub batch_size: usize,
-    pub eval_batch_size: usize,
+    /// override, i.e. the shape the run actually used. `None` in modes with no
+    /// shared stream (RL): there is no stream and no eval batch to describe,
+    /// and the trainer owns the per-step volume (`matches_per_step`, …),
+    /// recorded in `engine.json` → `"trainer"`. Tabular defaults must never be
+    /// stamped into a run that never draws a batch.
+    pub batch_size: Option<usize>,
+    pub eval_batch_size: Option<usize>,
     /// Per-net fitness smoothing window (K).
     pub smoothing_window: usize,
     /// Device the run executed on (`"cpu"` | `"cuda:0"`).
@@ -84,8 +92,13 @@ pub struct ConfigSnapshot {
 }
 
 impl ConfigSnapshot {
-    /// Capture every knob from a run's config plus the effective stream shape.
-    pub fn from_config(cfg: &RaceConfig, batch_size: usize, eval_batch_size: usize) -> Self {
+    /// Capture every knob from a run's config plus the effective stream shape
+    /// (`None`/`None` for modes with no shared stream — see the fields).
+    pub fn from_config(
+        cfg: &RaceConfig,
+        batch_size: Option<usize>,
+        eval_batch_size: Option<usize>,
+    ) -> Self {
         ConfigSnapshot {
             pop_size: cfg.pop_size,
             checkpoint_every: cfg.checkpoint_every,
@@ -99,6 +112,7 @@ impl ConfigSnapshot {
             crossover_prob: cfg.crossover_prob,
             mutate_prob: cfg.mutate_prob,
             max_target_fitness: cfg.max_target_fitness,
+            max_steps: cfg.max_steps,
             has_custom_stop: cfg.custom_stop.is_some(),
             log_level: format!("{:?}", cfg.log_level).to_lowercase(),
             mode: format!("{:?}", cfg.mode).to_lowercase(),
@@ -148,8 +162,9 @@ pub struct RunHeader {
     /// Their labels determine the extra columns a reader may expect in a
     /// per-net metrics snapshot.
     pub informative_metrics: Vec<String>,
-    /// Stop criteria / budgets configured for the run (informational;
-    /// the scheduler honors them, this is the recorded shape for later tools).
+    /// Stop criteria / budgets configured for the run. The scheduler honors
+    /// them at runtime and `config` carries the authoritative copy of both;
+    /// the stopped-by fact itself is in `history.csv` / the stop banner.
     pub max_steps: Option<usize>,
     /// When the run was started (wall clock), for human-readability.
     pub started_at: Option<String>,
@@ -448,27 +463,22 @@ pub struct NetMeta {
     pub input_dim: Option<usize>,
     #[serde(default)]
     pub output_dim: Option<usize>,
-    /// Shared training regime for the run.
+    /// Shared training regime for the run. `None` in modes with no shared
+    /// stream (RL) — learning rate, grad clip and the per-step volume are all
+    /// trainer-owned and live in `engine.json` → `"trainer"`
+    /// (`Trainer::describe`), never in per-net schema.
     #[serde(default)]
     pub batch_size: Option<usize>,
-    /// Deprecated: the learning rate is trainer-owned. The authoritative value
-    /// is `engine.json` → `"trainer"` (from `Trainer::describe`). Stays `None`
-    /// here because the engine cannot see inside the user's trainer.
-    #[serde(default)]
-    pub learning_rate: Option<f32>,
-    /// Deprecated: see `learning_rate` — trainer-owned, recorded in
-    /// `engine.json` → `"trainer"`.
-    #[serde(default)]
-    pub grad_clip: Option<f32>,
     /// Dropout probability stamped into the topology (also lives in the
     /// topology JSON; duplicated here for quick scanning).
     #[serde(default)]
     pub dropout_prob: Option<f32>,
-    /// Ranking fitness + loss function labels for this run.
+    /// Ranking fitness label for this run. There is deliberately no
+    /// `loss_label` beside it: the loss/update scheme is trainer-owned (the
+    /// engine cannot see it), so `engine.json` → `"trainer"` is the only
+    /// honest record.
     #[serde(default)]
     pub fitness_label: Option<String>,
-    #[serde(default)]
-    pub loss_label: Option<String>,
     /// What ranking direction this run uses ("minimize"/"maximize").
     #[serde(default)]
     pub direction: Option<String>,
@@ -512,12 +522,11 @@ impl NetState {
         self.meta.params = Some(params.iter().map(|p| p.variable.numel()).sum());
         self.meta.input_dim = Some(run.input_dim);
         self.meta.output_dim = Some(run.output_dim);
-        self.meta.batch_size = Some(run.batch_size);
-        // learning_rate/grad_clip are trainer-owned, so the engine leaves them
-        // None in the per-net meta; the trainer's `describe()` block in
-        // engine.json is the authoritative record.
+        self.meta.batch_size = run.batch_size;
+        // Learning rate, grad clip and the loss scheme are trainer-owned, so
+        // the engine records none of them here; the trainer's `describe()`
+        // block in engine.json is the authoritative record.
         self.meta.fitness_label = Some(run.fitness_label.clone());
-        self.meta.loss_label = Some(run.loss_label.clone());
         self.meta.direction = Some(run.direction.clone());
         self.meta.born_at_step = Some(self.entered_at_step);
         self.meta.pop_size = Some(run.pop_size);
@@ -949,6 +958,58 @@ mod tests {
         let rebuilt = loaded.topology().unwrap();
         let rebuilt_json = rebuilt.to_json().unwrap();
         assert_eq!(rebuilt_json, loaded.topology);
+    }
+
+    /// Schema separation: run-level facts live in the header's `config`, per-net
+    /// facts in `nets/<hash>.json` — and neither invents a value for a mode that
+    /// has none (RL has no shared stream ⇒ no batch geometry; the loss/update
+    /// scheme is trainer-owned ⇒ no `loss_label` in the schema at all).
+    #[test]
+    fn schema_records_mode_appropriate_geometry_and_no_trainer_owned_fields() {
+        // RL header: no stream, so geometry is genuinely absent (`null`), and
+        // the step budget sits beside the fitness target in `config`.
+        let mut rl_cfg = crate::engine::RaceConfig {
+            mode: crate::engine::config::RunMode::Rl,
+            max_steps: Some(25),
+            max_target_fitness: None,
+            ..Default::default()
+        };
+        let rl = ConfigSnapshot::from_config(&rl_cfg, None, None);
+        assert_eq!(rl.batch_size, None);
+        assert_eq!(rl.eval_batch_size, None);
+        assert_eq!(rl.max_steps, Some(25), "step budget recorded with the stop criteria");
+        rl_cfg.max_target_fitness = Some(1.0); // exclusive pair, never both Some
+        assert_eq!(ConfigSnapshot::from_config(&rl_cfg, None, None).max_steps, Some(25));
+
+        // Tabular header: the stream shape the run actually used is recorded.
+        let tab = ConfigSnapshot::from_config(&crate::engine::RaceConfig::default(), Some(16), Some(128));
+        assert_eq!(tab.batch_size, Some(16));
+        assert_eq!(tab.eval_batch_size, Some(128));
+
+        // In the written header, absent means absent — not a 16 default.
+        let dir = fresh_dir();
+        let mut header = baseline_header("rl-run");
+        header.config = rl;
+        write_engine_json(&dir, &header).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("engine.json")).unwrap()).unwrap();
+        assert_eq!(v["config"]["batch_size"], serde_json::Value::Null);
+        assert_eq!(v["config"]["max_steps"], serde_json::json!(25));
+
+        // Per-net meta follows the same rule, and carries no trainer-owned knob.
+        let topo = tiny_topology();
+        let net = crate::graph::network::Network::build(&topo, crate::Device::CPU).unwrap();
+        let mut state = NetState::new(&topo, 0, None).unwrap();
+        state.stamp_meta(&net, &crate::engine::config::RunMetaCtx::default());
+        assert_eq!(state.meta.batch_size, None);
+        let net_json: serde_json::Value =
+            serde_json::from_str(&state.to_json().unwrap()).unwrap();
+        for absent in ["loss_label", "learning_rate", "grad_clip"] {
+            assert!(
+                net_json["meta"].get(absent).is_none(),
+                "`{absent}` is trainer-owned (engine.json → trainer), not per-net schema"
+            );
+        }
     }
 
     #[test]
