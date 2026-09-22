@@ -27,9 +27,15 @@
 //! surface as any other run: the training scheme is the only seam.
 //!
 //! Run: `source env_setup.sh && cargo run --example custom_trainer`
+//! Flags: the shared engine set (`--pop`, `--max-steps`, `--seed`,
+//! `--log-level`, `--run-dir`, …) — run with `--help` for the full list.
+
+#[path = "cli/mod.rs"]
+mod cli;
 
 use std::path::Path;
 
+use clap::Parser;
 use flodl::Tensor;
 use flodl::nn::Module;
 use flodl::nn::optim::Optimizer;
@@ -207,11 +213,20 @@ impl TabularStep for WarmupSgdTrainer {
 
 // ── 2. The run — plain public surface, like any other example ────────────────
 
+/// The command line: the shared engine flags (this example has no extra knobs).
+#[derive(Parser, Debug)]
+#[command(
+    name = "custom_trainer",
+    about = "Bring-your-own trainer: SGD + warmup + gated eval on XOR."
+)]
+struct Cli {
+    #[command(flatten)]
+    engine: cli::EngineArgs,
+}
+
 fn main() {
-    use std::io::Write;
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(|buf, record| writeln!(buf, "{}", record.args()))
-        .init();
+    let cli = Cli::parse();
+    cli.engine.init_logger(gras::engine::config::LogLevel::Summ);
 
     // Data — XOR: 4 rows, 2 features, 2 one-hot classes. Persisted so the
     // engine's deterministic-split contract holds even for tiny data.
@@ -251,13 +266,13 @@ fn main() {
 
     // Config — note there are NO training knobs here anymore (no learning
     // rate, no grad clip): those live on the trainer below.
-    let config = RaceConfig::builder()
+    let builder = RaceConfig::builder()
         .set_pop_size(4)
         .set_max_steps(30)
         .set_crossover_gate_checkpoint_every(5)
         .set_topology_options(topo_opts)
-        .set_additional_metrics(metrics.clone())
-        .build();
+        .set_additional_metrics(metrics.clone());
+    let config = cli.engine.apply(builder).build();
 
     // Run — the ONLY difference from a default run is the trainer argument:
     let run_seed = 42u64;
@@ -267,8 +282,8 @@ fn main() {
         fitness,
         // Our scheme instead of TabularTrainer — that's the whole swap.
         WarmupSgdTrainer::new(loss_fn, 0.05, 0.9),
-        Some(run_seed),
-        Some(run_dir),
+        cli.engine.seed_or(Some(run_seed)),
+        cli.engine.run_dir_or(Some(run_dir)),
     ))
     .unwrap();
     match engine.run() {

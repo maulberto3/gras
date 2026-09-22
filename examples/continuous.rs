@@ -4,21 +4,36 @@
 //! Demonstrates: MSE loss, MSE fitness under Minimize, regression-shaped
 //! topology (single output, standardize ops).
 //!
-//! Run: `source env_setup.sh && cargo run --example continuous_showcase`
+//! Run: `source env_setup.sh && cargo run --example continuous`
+//! Flags: the shared engine set (`--pop`, `--max-steps`, `--seed`,
+//! `--log-level`, `--run-dir`, …) — run with `--help` for the full list.
+
+#[path = "cli/mod.rs"]
+mod cli;
 
 use std::path::Path;
 
+use clap::Parser;
 use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{RaceConfig, RaceEngine};
 use gras::graph::topology::TopologyOptions;
 use gras::utils::{tabular_data, score};
 
+/// The command line: the shared engine flags (this example has no extra knobs).
+#[derive(Parser, Debug)]
+#[command(
+    name = "continuous",
+    about = "Tabular race fitting y = sin(2πx): MSE under Minimize."
+)]
+struct Cli {
+    #[command(flatten)]
+    engine: cli::EngineArgs,
+}
+
 fn main() {
-    use std::io::Write;
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(|buf, record| writeln!(buf, "{}", record.args()))
-        .init();
+    let cli = Cli::parse();
+    cli.engine.init_logger(gras::engine::config::LogLevel::Summ);
 
     // 1. Data — synthetic sine wave, persisted for the engine's deterministic
     //    split contract. Single-output targets (y = sin(2πx)). The ENGINE
@@ -51,14 +66,14 @@ fn main() {
     topo_opts.input_dim = Some(d_in);
     topo_opts.output_dim = Some(d_out);
 
-    // 4. Config.
-    let config = RaceConfig::builder()
+    // 4. Config — small defaults (this is a showpiece), overridable by flags.
+    let builder = RaceConfig::builder()
         .set_pop_size(6)
         .set_max_steps(50)
         .set_network_hidden_dim_range(4, 8)
         .set_topology_options(topo_opts)
-        .set_additional_metrics(metrics.clone())
-        .build();
+        .set_additional_metrics(metrics.clone());
+    let config = cli.engine.apply(builder).build();
 
     // 5. Run — one RunSpec: data_dir + config + fitness + trainer + seed.
     //    The MSE loss lives inside the trainer (training business).
@@ -76,8 +91,8 @@ fn main() {
         // Name the objective: replay tools (export_champion) rebuild weights
         // only if they can reproduce this exact loss.
         gras::TabularTrainer::new(loss_fn).with_loss_label("mse"),
-        Some(run_seed),
-        Some(run_dir),
+        cli.engine.seed_or(Some(run_seed)),
+        cli.engine.run_dir_or(Some(run_dir)),
     ))
     .unwrap();
     match engine.run() {

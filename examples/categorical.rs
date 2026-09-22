@@ -4,19 +4,34 @@
 //! Demonstrates: `RaceConfig` builder, accuracy fitness (Maximize),
 //! informative metrics, per-step evolve rolls.
 //!
-//! Run: `source env_setup.sh && cargo run --example categorical_showcase`
+//! Run: `source env_setup.sh && cargo run --example categorical`
+//! Flags: the shared engine set (`--pop`, `--max-steps`, `--seed`,
+//! `--log-level`, `--run-dir`, …) — run with `--help` for the full list.
+
+#[path = "cli/mod.rs"]
+mod cli;
 
 use std::path::Path;
 
+use clap::Parser;
 use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{RaceConfig, RaceEngine};
 use gras::utils::{tabular_data, score};
 
+/// The command line: the shared engine flags (this example has no extra knobs).
+#[derive(Parser, Debug)]
+#[command(
+    name = "categorical",
+    about = "Tabular race on synthetic classification: accuracy under Maximize."
+)]
+struct Cli {
+    #[command(flatten)]
+    engine: cli::EngineArgs,
+}
+
 fn main() {
-    use std::io::Write;
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format(|buf, record| writeln!(buf, "{}", record.args()))
-        .init();
+    let cli = Cli::parse();
+    cli.engine.init_logger(gras::engine::config::LogLevel::Summ);
 
     // 1. Data — synthetic classification, persisted so the engine's
     //    reproducibility contract (deterministic split from run_seed) holds.
@@ -49,13 +64,13 @@ fn main() {
     let mut topo_opts = gras::graph::topology::TopologyOptions::default();
     topo_opts.input_dim = Some(d_in);
     topo_opts.output_dim = Some(d_out);
-    let config = RaceConfig::builder()
+    let builder = RaceConfig::builder()
         .set_pop_size(6)
         .set_max_steps(50)
         .set_network_hidden_dim_range(4, 8)
         .set_topology_options(topo_opts)
-        .set_additional_metrics(metrics.clone())
-        .build();
+        .set_additional_metrics(metrics.clone());
+    let config = cli.engine.apply(builder).build();
 
     // 4. Run — one RunSpec; the cross-entropy loss lives inside the trainer.
     let run_seed = 42u64;
@@ -64,8 +79,8 @@ fn main() {
         config,
         fitness,
         gras::TabularTrainer::new(score::cross_entropy_onehot_loss),
-        Some(run_seed),
-        Some(run_dir),
+        cli.engine.seed_or(Some(run_seed)),
+        cli.engine.run_dir_or(Some(run_dir)),
     ))
     .unwrap();
     match engine.run() {
