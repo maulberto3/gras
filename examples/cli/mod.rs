@@ -105,22 +105,22 @@ pub struct EngineArgs {
 
     /// Who an admitted crossover child evicts: `worst` (default, merit-based)
     /// or `random` (keeps slots turning over). Mutation victims are always
-    /// fitness-inverse and ignore this.
+    /// fitness-inverse and ignore this. (Crossover gate semantics: §2 of
+    /// OPTIONS.md.)
     #[arg(long, value_name = "POLICY")]
     pub crossover_cull_policy: Option<String>,
 
     /// Mutation victim policy for the mutation/immigrant channel: `inverse`
     /// (default, fitness-inverse roulette), `worst` (deterministic worst by
     /// smoothed fitness), or `random` (uniform, keeps slots turning over).
+    /// Only fires when a mutation roll fires (see `--mutate-prob`).
     #[arg(long, value_name = "POLICY")]
     pub mutation_cull_policy: Option<String>,
 
-    /// Run-level grace period: the number of engine steps every net trains
-    /// normally, with no evolution and no relay (no `DecisionLagTrainer`
-    /// wrapper), before the full trainer scheme takes over. `0` (default)
-    /// = no grace, the runner uses the plain trainer. Tabular and RL both
-    /// honour this; use a runner-level `*Trainer` wrapper (e.g. in a runner
-    /// helper) to apply it. See `GracePeriodTrainer`.
+    /// Warm-up before the decision-lag relay engages (RL only): for the
+    /// first N engine steps every net just trains — no relay cycles. 0
+    /// (default) = relay from step 0. See OPTIONS.md §8 for the relay
+    /// itself, and how to run without it entirely.
     #[arg(long, value_name = "N")]
     pub grace_periods: Option<usize>,
 
@@ -148,12 +148,10 @@ pub struct EngineArgs {
     #[arg(long)]
     pub freeze_elites: bool,
 
-    /// Run-level grace period: the number of engine steps every net trains
-    /// normally, with no evolution and no relay (no `DecisionLagTrainer`
-    /// wrapper), before the full trainer scheme takes over. `0` (default)
-    /// = no grace, the runner uses the plain trainer / whatever wrapper the
     /// Anti-devolution D: demote nets whose smoothed fitness falls below
     /// their entry floor × this tolerance (0.7 = 30% collapse triggers).
+    /// Demotion is a per-step status (loses the freeze seat, up-weighted in
+    /// cull roulette) — NOT removal from the population.
     #[arg(long, value_name = "TOL")]
     pub regression_tol: Option<f32>,
 
@@ -162,6 +160,32 @@ pub struct EngineArgs {
     /// a tabular run at engine construction.
     #[arg(long)]
     pub fresh_immigrants: bool,
+
+    /// Fresh games the post-race guardrail plays to judge the champion
+    /// (cartpole default 10; each game runs to the env's max turns). Raise
+    /// it when two finalists sit close together and the verdict matters —
+    /// the mean tightens as √N. Costs ~one race step per 10 games.
+    #[arg(long, value_name = "N", default_value_t = 10)]
+    pub holdout_matches: usize,
+
+    /// How often buffered history.csv rows hit disk: `checkpoint` (default,
+    /// every `--checkpoint-every` steps and at stop — a `kill -9` loses at
+    /// most that many steps of history) or `each` (every step, zero-loss
+    /// history at the cost of a file write per step).
+    #[arg(long, value_name = "MODE")]
+    pub history_flush: Option<String>,
+
+    // Note — there is intentionally no `--log-file` flag. Teeing stdout+
+    // stderr into a file needs fd-level interception (dup2 a pipe over fds
+    // 1/2 with a reader thread echoing to the SAVED fd — naively echoing via
+    // `std::io::stdout()` self-feeds the pipe and loops forever), which means
+    // unsafe. The zero-code alternative lives in the shell:
+    //
+    //     cargo run --release --example cartpole -- <flags> 2>&1 | tee run.log
+    //
+    // which keeps the live console AND leaves the full trace on disk. An
+    // engine-side `set_log_to_file(bool)` (dual-write at the `log` sink) is
+    // the safe in-library future path — see TODO.md "Persist the run log".
 }
 
 impl EngineArgs {
