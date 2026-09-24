@@ -18,7 +18,7 @@ use std::path::Path;
 use flodl::tensor::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::engine::config::{RaceConfig, SMOOTHING_WINDOW};
+use crate::engine::config::RaceConfig;
 use crate::engine::fitness::{Direction, FitnessLabel, Metric};
 use crate::graph::topology::{Topology, TopologyOptions};
 use crate::utils::error::EngineError;
@@ -89,6 +89,25 @@ pub struct ConfigSnapshot {
     /// Human label for the experiment (`set_run_name`), verbatim. Purely
     /// informative — never affects the results folder name.
     pub run_name: Option<String>,
+    /// Anti-devolution A (`set_elite_freeze`): top-k nets skip the trainer
+    /// call. Changes WHICH nets train during a replay, so it must match on
+    /// resume — record it.
+    #[serde(default)]
+    pub freeze_elites: bool,
+    /// Anti-devolution D (`set_fitness_regression_tol`): collapse-below-floor ratio,
+    /// `None` = off. Same replay-relevance as `freeze_elites`.
+    #[serde(default)]
+    pub regression_tol: Option<f32>,
+    /// Fresh-start immigrants (`set_immigrant_fresh_start`): mutation
+    /// immigrants skip catch-up. Replay-relevant — a resumed run must use the
+    /// same insertion semantics or the replayed population diverges.
+    #[serde(default)]
+    pub fresh_immigrants: bool,
+    /// One-line identity of the binary that produced the run (`gras` version,
+    /// profile, exe path, build time). Diagnostics only — lets a reader tell
+    /// a stale-process artifact from a logic bug.
+    #[serde(default)]
+    pub build: String,
 }
 
 impl ConfigSnapshot {
@@ -118,11 +137,22 @@ impl ConfigSnapshot {
             mode: format!("{:?}", cfg.mode).to_lowercase(),
             batch_size,
             eval_batch_size,
-            smoothing_window: SMOOTHING_WINDOW,
-            device: if cfg!(feature = "cuda") { "cuda:0" } else { "cpu" }.to_string(),
+            smoothing_window: cfg.smoothing_window,
+            device: if cfg!(feature = "cuda") {
+                "cuda:0"
+            } else {
+                "cpu"
+            }
+            .to_string(),
             csv_export: cfg.csv_export,
-            pop_pruner: cfg.pop_pruner.map(|p| (format!("{:?}", p.method).to_lowercase(), p.steps)),
+            pop_pruner: cfg
+                .pop_pruner
+                .map(|p| (format!("{:?}", p.method).to_lowercase(), p.steps)),
             run_name: cfg.run_name.clone(),
+            freeze_elites: cfg.freeze_elites,
+            regression_tol: cfg.regression_tol,
+            fresh_immigrants: cfg.immigrant_fresh_start,
+            build: crate::engine::race_engine::build_stamp(),
         }
     }
 }
@@ -977,12 +1007,20 @@ mod tests {
         let rl = ConfigSnapshot::from_config(&rl_cfg, None, None);
         assert_eq!(rl.batch_size, None);
         assert_eq!(rl.eval_batch_size, None);
-        assert_eq!(rl.max_steps, Some(25), "step budget recorded with the stop criteria");
+        assert_eq!(
+            rl.max_steps,
+            Some(25),
+            "step budget recorded with the stop criteria"
+        );
         rl_cfg.max_target_fitness = Some(1.0); // exclusive pair, never both Some
-        assert_eq!(ConfigSnapshot::from_config(&rl_cfg, None, None).max_steps, Some(25));
+        assert_eq!(
+            ConfigSnapshot::from_config(&rl_cfg, None, None).max_steps,
+            Some(25)
+        );
 
         // Tabular header: the stream shape the run actually used is recorded.
-        let tab = ConfigSnapshot::from_config(&crate::engine::RaceConfig::default(), Some(16), Some(128));
+        let tab =
+            ConfigSnapshot::from_config(&crate::engine::RaceConfig::default(), Some(16), Some(128));
         assert_eq!(tab.batch_size, Some(16));
         assert_eq!(tab.eval_batch_size, Some(128));
 
@@ -992,7 +1030,8 @@ mod tests {
         header.config = rl;
         write_engine_json(&dir, &header).unwrap();
         let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("engine.json")).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.join("engine.json")).unwrap())
+                .unwrap();
         assert_eq!(v["config"]["batch_size"], serde_json::Value::Null);
         assert_eq!(v["config"]["max_steps"], serde_json::json!(25));
 
@@ -1002,8 +1041,7 @@ mod tests {
         let mut state = NetState::new(&topo, 0, None).unwrap();
         state.stamp_meta(&net, &crate::engine::config::RunMetaCtx::default());
         assert_eq!(state.meta.batch_size, None);
-        let net_json: serde_json::Value =
-            serde_json::from_str(&state.to_json().unwrap()).unwrap();
+        let net_json: serde_json::Value = serde_json::from_str(&state.to_json().unwrap()).unwrap();
         for absent in ["loss_label", "learning_rate", "grad_clip"] {
             assert!(
                 net_json["meta"].get(absent).is_none(),
