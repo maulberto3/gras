@@ -165,7 +165,7 @@ A child must prove itself over a replay window of past population means
 | Option | Setter | Default | What it controls |
 |---|---|---|---|
 | Enable pruner | `set_pruner_enabled(enabled)` | `false` (no pruner) | When on: after the stop fires, cull everyone except the elite(s) and keep training solo for `steps`. |
-| Pruner method | `set_pruner_method(m)` | `PopPrunerMethod::Hard` | Currently the only variant: keep only the elite, plain solo training. There is **no `Soft` pruner** — the `Hard`/`Soft` pair belongs to the *crossover gate* (§2), a different knob. A soft/gradual pruner (population shrinking *during* the race) is a design-only idea: see TODO "Population reducer". |
+| Pruner method | `set_pruner_method(m)` | `PopPrunerMethod::Hard` | Currently the only variant: keep the top `elite_count` survivors (min 1 — with the default `elite_count = 1` that is the champion alone), plain solo training for all of them. There is **no `Soft` pruner** — the `Hard`/`Soft` pair belongs to the *crossover gate* (§2), a different knob. A soft/gradual pruner (population shrinking *during* the race) is a design-only idea: see TODO "Population reducer". |
 | Pruner steps | `set_pruner_steps(n)` | `0` | How many solo-training steps the survivor gets post-race (outside evolution machinery — no crossover/mutation/stop checks). |
 
 ## 4. Network architecture (per-individual)
@@ -202,7 +202,7 @@ A child must prove itself over a replay window of past population means
 | Run mode | `set_run_mode(mode)` | `RunMode::Tabular` | Must agree with the spec variant: `RunSpec::tabular` ⇒ Tabular, `RunSpec::rl` ⇒ Rl. Engine validates at construction. |
 | Smoothing window | `set_fitness_smoothing_window(k)` | `10` | Per-net rolling window (K) every ranking decision averages over. Load-bearing ranking semantics, so **resume-guarded** like `pop_size`. |
 | Elite freeze | `set_elite_freeze(true)` | `false` | **Anti-devolution A**: top-`elite_count` nets skip the trainer call — they score, rank, and parent crossovers, but their weights never change, so a bad training step can't erase the best skill found. Freeze follows rank, not identity: a child that trains past the frozen elite takes the crown. Motivated by on-policy RL self-collapse; dormant in tabular (guard only fires via ranking facts). Do **not** combine with the decision-lag relay (§8): a frozen net skips its `train_step`, which is where the shadow forks. |
-| Regression tol | `set_fitness_regression_tol(0.7)` | `None` (off) | **Anti-devolution D**: each net's first smoothed fitness becomes its floor. Smoothed fitness falling more than `(1 − tol) × |floor|` below it (signed distance, sign-agnostic — the old `floor × tol` ratio silently inverted for negative fitness) ⇒ **loses elite protection** while regressed; recovery clears the flag. The collapsed fitness already up-weights it in the ordinary inverse-fitness cull roulette — there is no separate demotion queue. A status system, never a weight rollback. |
+| Regression tol | `set_fitness_regression_tol(0.7)` | `None` (off) | **Anti-devolution D**: each net's first smoothed fitness becomes its floor. Smoothed fitness falling more than `(1 − tol) × |floor|` below it (signed distance, sign-agnostic — the old `floor × tol` ratio silently inverted for negative fitness) ⇒ **loses elite protection** while regressed; recovery clears the flag. The collapsed fitness already up-weights it in the ordinary inverse-fitness cull roulette — there is no separate demotion queue. A status system, never a weight rollback. **Demoted ≠ culled:** the net stays in the population and keeps its fitness — it just loses the freeze seat for that step (the `★` badge drops it) and the "REGRESSED below floor" log line fires. In the pruner's solo phase (no culls) the demotion has no effect beyond the badge. |
 | Fresh-start immigrants | `set_immigrant_fresh_start(true)` | `false` | **Requires RL mode** (tabular + this = construction error — the concept is mode-agnostic but tabular cannot honor it). Mutation immigrants skip the catch-up replay and train from the current clock — a newborn earning its seat from birth. Sound in RL because there is no shared data stream to have missed (each net's matches are generated fresh from its own seeds); in tabular it would silently skip shared training rows. A fresh immigrant's first verdict is random (~baseline), and its empty rolling buffers mean it can be neither culled nor crowned before its first step. |
 | Run name | `set_run_name(name)` | `None` (timestamp dir) | Human label; results land in `results/<run_name or timestamp>/`. |
 | Additional metrics | `set_run_metrics(metrics)` | `[]` | Informative (non-ranking) metrics; labels become extra columns in per-net metrics snapshots. |
@@ -234,18 +234,32 @@ A child must prove itself over a replay window of past population means
   optimizer step, then the shadow is promoted to face at the step boundary —
   a gap between the acting policy and the learning policy. Costs 2× matches
   per step.
-  - **Lag width:** `.with_lag(k)` sets the gap in ENGINE STEPS (default `1`):
+  - **Lag width:** `.with_lag(k)` sets the gap in ENGINE STEPS (`k ≥ 1`
+    engages the relay; `0` — the conservative **default** — leaves it OFF,
+    so a bare `DecisionLagTrainer::new(trainer)` is a plain pass-through):
     the face holds its weights for `k` steps, the shadow takes `k` optimizer
     steps, promotion on the cycle's last step. The shadow's steps are batched
     onto that last step, so it costs ≈ `k`× a normal one (a `took Xs` spike)
     while the other `k−1` steps cost one face pass each.
+  - **Grace warm-up:** `.with_grace(n)` = plain per-net training (no relay)
+    for the first `n` engine steps before engagement; the first cycle after
+    grace is always a full `k` steps. Conservative **default** `5`; the
+    examples pin `.with_grace(0)` (relay from step 0) and expose
+    `--grace-periods N` to opt in. Inert while the relay is off.
   - **Telemetry:** one INFO banner at first use; per-step tallies at DEBUG
     (they also cover the engine's replay paths — a replayed child shows up as
     "1 face decision" for its replayed steps); and a WARN whenever a promotion
     changes no weights (the scheme silently not learning).
   - **Identity:** it declares itself in the trainer blob
-    (`"decision_lag": true, "decision_lag_steps": k`), so `engine.json`
-    records it and `resume` refuses a run under a different lag.
+    (`"decision_lag": lag > 0, "decision_lag_steps": k, "grace_periods": n`),
+    so `engine.json` records it and `resume` refuses a run under a different
+    lag or grace.
   - Combined with `set_elite_freeze(true)` it breaks: a frozen net skips its
     `train_step`, which is exactly where the shadow forks. To remove the
     experiment, stop wrapping the trainer.
+  - **Classic trainer:** want none of this? Pass the inner trainer straight
+    to `build_engine` (no wrapper) — or equivalently keep the wrapper with
+    `lag = 0`. Identical step behavior either way; the run record then shows
+    no `decision_lag` fields. Don't switch modes mid-run: resuming a run
+    under a different lag/grace than it was trained with is a loud error
+    (the blob check), by design.

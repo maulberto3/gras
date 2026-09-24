@@ -100,6 +100,18 @@ That is what explains a step that took minutes.
 Everything the log shows (and more) is recorded losslessly in `history.csv`
 and `nets/<hash>.json` — the log is a view, the files are the record.
 
+Three step-line extras worth decoding:
+- **`★ <hash> <hash> …`** — the *freeze crown* (only with `--freeze-elites`):
+  the nets currently holding elite seats, i.e. skipping training. It follows
+  RANK, so names churn as fitness moves — it is not the population or the
+  survivor list.
+- **`frozen@N`** (final-elites listing) — the last step at which the net
+  held/won a crown seat.
+- **`REGRESSED below floor … demoted`** — a net whose smoothed fitness
+  collapsed below its entry floor. A per-step status: it loses the crown
+  seat and is up-weighted if a cull fires — it is NOT removed from the
+  population (see OPTIONS.md §6, `set_fitness_regression_tol`).
+
 Note: the `--log-level` CLI flag on the RL examples (cartpole,
 kaggle_kagiculture) is a *different* axis — it sets the env_logger
 verbosity filter (`info`/`debug`/…), not the engine's line shape above.
