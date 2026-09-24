@@ -37,7 +37,7 @@ use gras::engine::config::LogLevel;
 use gras::engine::fitness::{Direction, Fitness};
 use gras::engine::{RaceConfig, RaceEngine};
 use gras::graph::topology::TopologyOptions;
-use gras::utils::{tabular_data, score};
+use gras::utils::{score, tabular_data};
 
 const SEED: u64 = 42;
 const POP: usize = 10;
@@ -64,7 +64,8 @@ fn main() {
     let data_dir = root.join("data/flamegraph");
     let run_dir = root.join("benches/memgraph/run");
     if !data_dir.exists() {
-        let ds = tabular_data::synthetic_classification(1024, 64, 4, SEED, gras::auto_device()).unwrap();
+        let ds =
+            tabular_data::synthetic_classification(1024, 64, 4, SEED, gras::auto_device()).unwrap();
         tabular_data::save_dataset(&data_dir, &ds).unwrap();
     }
     let peeked = tabular_data::resolve_dataset(&data_dir).unwrap();
@@ -82,17 +83,17 @@ fn main() {
 
     let mut builder = RaceConfig::builder()
         .set_pop_size(POP)
-        .set_max_steps(steps)
-        .set_network_hidden_dim_range(4, 16)
+        .set_stop_max_steps(steps)
+        .set_topology_hidden_dim_range(4, 16)
         .set_topology_options(topo_opts)
-        .set_log_level(LogLevel::None)
-        .set_crossover_gate_checkpoint_every(steps + 1);
+        .set_run_log_level(LogLevel::None)
+        .set_checkpoint_every(steps + 1);
     if evolve {
         builder = builder.set_crossover_rolls(1).set_mutate_rolls(1);
     } else {
         builder = builder.set_crossover_rolls(0).set_mutate_rolls(0);
     }
-    let config = builder.set_csv_export(false).build();
+    let config = builder.set_run_csv_export(false).build();
 
     let _ = std::fs::remove_dir_all(&run_dir);
 
@@ -116,9 +117,7 @@ fn main() {
     let peak = stats.max_bytes as f64 / MB;
     let end_live = stats.curr_bytes as f64 / MB;
     println!("\n── dhat heap report ({steps} steps, pop {POP}, evolve={evolve}) ──");
-    println!(
-        "  total allocated : {churn:8.1} MB  (churn — every byte ever handed out)"
-    );
+    println!("  total allocated : {churn:8.1} MB  (churn — every byte ever handed out)");
     println!("  peak live       : {peak:8.1} MB  (high-water mark)");
     println!("  live at exit    : {end_live:8.1} MB  (≈ leaks if this equals peak)");
     println!(
@@ -138,7 +137,9 @@ fn main() {
         dhat::HeapStats::get();
         // dhat writes its JSON on Profiler drop via the builder API; for a raw
         // dump we re-run a tiny profile — keep it simple and just note it.
-        println!("\n  (json dump: run with the `dhat` Profiler builder API or use the\n   CHURN numbers above — see dhat docs §save_json)");
+        println!(
+            "\n  (json dump: run with the `dhat` Profiler builder API or use the\n   CHURN numbers above — see dhat docs §save_json)"
+        );
     }
 }
 

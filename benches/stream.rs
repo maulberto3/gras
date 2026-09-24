@@ -34,7 +34,7 @@ use gras::engine::population::initial_population;
 use gras::graph::network::Network;
 use gras::trainer::stream::{BatchStream, PoolSplit};
 use gras::utils::race_steps::{eval_one_step, train_one_step};
-use gras::utils::{tabular_data, score};
+use gras::utils::{score, tabular_data};
 
 const SEED: u64 = 42;
 const FEATURES: usize = 64;
@@ -59,12 +59,17 @@ fn per_call(iters: u64, mut f: impl FnMut()) -> f64 {
 
 fn main() {
     let device = Device::CPU;
-    println!(
-        "gras stream bench — CPU, {FEATURES} features -> {CLASSES} classes, batch {BATCH}\n"
-    );
+    println!("gras stream bench — CPU, {FEATURES} features -> {CLASSES} classes, batch {BATCH}\n");
     println!(
         "{:>7}  {:>7}  {:>11}  {:>10}  {:>11}  {:>10}  {:>9}  {:>10}",
-        "rows", "pool", "train_batch", "eval_batch", "train_step", "eval_step", "stream %", "era_eval"
+        "rows",
+        "pool",
+        "train_batch",
+        "eval_batch",
+        "train_step",
+        "eval_step",
+        "stream %",
+        "era_eval"
     );
 
     // One net for the whole run: the architecture mix matches a real run's
@@ -76,7 +81,8 @@ fn main() {
     let topo = initial_population(&config, SEED).remove(0);
 
     for rows in ROW_COUNTS {
-        let ds = tabular_data::synthetic_classification(rows, FEATURES, CLASSES, SEED, device).unwrap();
+        let ds =
+            tabular_data::synthetic_classification(rows, FEATURES, CLASSES, SEED, device).unwrap();
         let stream = BatchStream::new(SEED, BATCH, PoolSplit::of(&ds, 0.2, SEED));
 
         // The stream: one train + one eval batch materialization per net per
@@ -102,10 +108,8 @@ fn main() {
 
         // The actual training work, on pre-drawn batches.
         let mut net = Network::build(&topo, device).unwrap();
-        let mut optimizer: Box<dyn Optimizer> = Box::new(flodl::nn::Adam::new(
-            &net.parameters(),
-            1e-3,
-        ));
+        let mut optimizer: Box<dyn Optimizer> =
+            Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3));
         let loss_fn =
             |p: &gras::Variable, y: &gras::Variable| score::cross_entropy_onehot_loss(p, y);
         let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
@@ -113,15 +117,18 @@ fn main() {
         let eval_batch = stream.eval_batch(&ds, 3).unwrap();
 
         let train_step_us = per_call(50, || {
-            black_box(train_one_step(&mut net, optimizer.as_mut(), &loss_fn, &train_batch, 1.0).unwrap());
+            black_box(
+                train_one_step(&mut net, optimizer.as_mut(), &loss_fn, &train_batch, 1.0).unwrap(),
+            );
         });
         let eval_step_us = per_call(50, || {
             black_box(eval_one_step(&mut net, &loss_fn, &fitness, &[], &eval_batch).unwrap());
         });
 
         let stream_us = train_batch_us + eval_batch_us;
-        let step_us = stream_us + train_step_us + eval_step_us;    println!(
-        "{rows:>7}  {:>7}  {:>10.1}µ  {:>9.1}µ  {:>10.1}µ  {:>9.1}µ  {:>8.1}%  {:>9.1}µ",
+        let step_us = stream_us + train_step_us + eval_step_us;
+        println!(
+            "{rows:>7}  {:>7}  {:>10.1}µ  {:>9.1}µ  {:>10.1}µ  {:>9.1}µ  {:>8.1}%  {:>9.1}µ",
             ds.len() * 4 / 5, // train pool = 1 - 0.2 split ratio
             train_batch_us,
             eval_batch_us,
