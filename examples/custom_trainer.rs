@@ -36,17 +36,16 @@ mod cli;
 use std::path::Path;
 
 use clap::Parser;
-use flodl::Tensor;
-use flodl::nn::Module;
-use flodl::nn::optim::Optimizer;
+use gras::flodl::Tensor;
+use gras::flodl::nn::Module;
+use gras::flodl::nn::optim::Optimizer;
 
 use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{RaceConfig, RaceEngine};
 use gras::graph::network::Network;
-use gras::graph::topology::TopologyOptions;
 use gras::trainer::{StepReport, StepTrainer, TabularContext, TabularStep};
-use gras::utils::{tabular_data, score};
+use gras::utils::{score, tabular_data};
 
 // ── 1. The custom trainer ────────────────────────────────────────────────────
 
@@ -65,7 +64,8 @@ use gras::utils::{tabular_data, score};
 /// eval cadence), internal mutable state (a step counter), skipped evals.
 struct WarmupSgdTrainer {
     /// This scheme's loss (supervised paradigm — owned by the trainer).
-    loss_fn: Box<dyn Fn(&Variable, &Variable) -> flodl::tensor::Result<Variable> + Send + Sync>,
+    loss_fn:
+        Box<dyn Fn(&Variable, &Variable) -> gras::flodl::tensor::Result<Variable> + Send + Sync>,
     /// Peak SGD learning rate, reached after `warmup_steps`.
     peak_lr: f32,
     /// SGD momentum.
@@ -83,7 +83,7 @@ struct WarmupSgdTrainer {
 
 impl WarmupSgdTrainer {
     fn new(
-        loss_fn: impl Fn(&Variable, &Variable) -> flodl::tensor::Result<Variable>
+        loss_fn: impl Fn(&Variable, &Variable) -> gras::flodl::tensor::Result<Variable>
         + Send
         + Sync
         + 'static,
@@ -118,7 +118,7 @@ impl StepTrainer for WarmupSgdTrainer {
         // whatever point of the ramp the clock is at (read via the next
         // train_step call). A conservative constant here is fine for the
         // demo; see the note in train_step.
-        Box::new(flodl::nn::optim::SGD::new(
+        Box::new(gras::flodl::nn::optim::SGD::new(
             &net.parameters(),
             self.peak_lr as f64 * 0.1, // conservative start-of-ramp lr
             self.momentum as f64,
@@ -165,7 +165,7 @@ impl TabularStep for WarmupSgdTrainer {
         optimizer: &mut dyn Optimizer,
         step: usize,
         ctx: &TabularContext<'_>,
-    ) -> flodl::tensor::Result<StepReport> {
+    ) -> gras::flodl::tensor::Result<StepReport> {
         // ── determinism (required pattern) ──
         // Seed per (net, step) so dropout masks are reproducible across
         // catch-up replay and resume. Omit this and resume parity fails
@@ -257,21 +257,19 @@ fn main() {
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
     let metrics = vec![Metric::new("accuracy")];
 
-    // Topology — 2 features in, 2 one-hot classes out.
-    let mut topo_opts = TopologyOptions::default();
-    topo_opts.input_dim = Some(2);
-    topo_opts.output_dim = Some(2);
-    topo_opts.min_hidden_num_nodes = 2;
-    topo_opts.max_hidden_num_nodes = 4;
+    // Topology — 2 features in, 2 one-hot classes out (setters, no struct).
 
     // Config — note there are NO training knobs here anymore (no learning
     // rate, no grad clip): those live on the trainer below.
     let builder = RaceConfig::builder()
         .set_pop_size(4)
-        .set_max_steps(30)
-        .set_crossover_gate_checkpoint_every(5)
-        .set_topology_options(topo_opts)
-        .set_additional_metrics(metrics.clone());
+        .set_stop_max_steps(30)
+        .set_checkpoint_every(5)
+        .set_topology_input_dim(2)
+        .set_topology_output_dim(2)
+        .set_topology_min_hidden_num_nodes(2)
+        .set_topology_max_hidden_num_nodes(4)
+        .set_run_metrics(metrics.clone());
     let config = cli.engine.apply(builder).build();
 
     // Run — the ONLY difference from a default run is the trainer argument:

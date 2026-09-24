@@ -17,8 +17,7 @@ use clap::Parser;
 use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{RaceConfig, RaceEngine};
-use gras::graph::topology::TopologyOptions;
-use gras::utils::{tabular_data, score};
+use gras::utils::{score, tabular_data};
 
 /// The command line: the shared engine flags (this example has no extra knobs).
 #[derive(Parser, Debug)]
@@ -61,18 +60,15 @@ fn main() {
     let fitness = Fitness::new(score::mse_loss_score, Direction::Minimize, "mse");
     let metrics = vec![Metric::new("mae")];
 
-    // 3. Topology — 1 input feature, 1 output value.
-    let mut topo_opts = TopologyOptions::default();
-    topo_opts.input_dim = Some(d_in);
-    topo_opts.output_dim = Some(d_out);
-
-    // 4. Config — small defaults (this is a showpiece), overridable by flags.
+    // 3. Config — small defaults (this is a showpiece), overridable by flags.
+    //    Topology: 1 input feature, 1 output value.
     let builder = RaceConfig::builder()
         .set_pop_size(6)
-        .set_max_steps(50)
-        .set_network_hidden_dim_range(4, 8)
-        .set_topology_options(topo_opts)
-        .set_additional_metrics(metrics.clone());
+        .set_stop_max_steps(50)
+        .set_topology_hidden_dim_range(4, 8)
+        .set_topology_input_dim(d_in)
+        .set_topology_output_dim(d_out)
+        .set_run_metrics(metrics.clone());
     let config = cli.engine.apply(builder).build();
 
     // 5. Run — one RunSpec: data_dir + config + fitness + trainer + seed.

@@ -37,32 +37,54 @@
 //! the live network is exported in memory. This example covers every other
 //! net (tombstones included) by replaying its history.
 
+use clap::Parser;
 use gras::graph::network::Network;
 use gras::graph::topology::Topology;
 use gras::state::load_net_state;
 use gras::trainer::TabularTrainer;
-use gras::utils::{tabular_data, score};
+use gras::utils::{score, tabular_data};
 use std::path::PathBuf;
 
+/// The command line: run + net identity + the replay recipe.
+#[derive(Parser, Debug)]
+#[command(
+    name = "export_champion",
+    about = "Rebuild a net from its recorded recipe and export its weights as .safetensors.",
+    after_help = "Hashes come from history.csv, tombstone logs, or nets/ filenames."
+)]
+struct Cli {
+    /// The run directory (e.g. results/1789501974049).
+    #[arg(value_name = "RUN_DIR")]
+    run_dir: PathBuf,
+
+    /// The net's EXACT full hash.
+    #[arg(value_name = "HASH")]
+    hash: String,
+
+    /// Dataset directory the run trained on (the stream must match).
+    #[arg(value_name = "DATA_DIR")]
+    data_dir: PathBuf,
+
+    /// Objective to replay with. Without it the run's recorded label is used,
+    /// and a custom/unlabeled loss is refused rather than guessed.
+    #[arg(long, value_name = "NAME")]
+    loss: Option<String>,
+
+    /// Print the replay's per-step train_loss (diff it against history.csv).
+    #[arg(long)]
+    trace: bool,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 4 {
-        eprintln!("usage: cargo run --example export_champion -- <run_dir> <full-hash> <data_dir> [--loss <name>]");
-        eprintln!("       e.g. cargo run --example export_champion -- results/1789501974049 0b9891b7... data/mnist/train");
-        eprintln!("       hashes come from history.csv, tombstone logs, or nets/ filenames");
-        eprintln!("       --loss names the objective to replay with (supported: {SUPPORTED_LOSSES}); without");
-        eprintln!("       it the run's recorded label is used, and a custom/unlabeled loss is refused");
-        eprintln!("       --trace prints the replay's per-step train_loss (diff it against history.csv)");
-        std::process::exit(1);
-    }
-    let run_dir = PathBuf::from(&args[1]);
-    let hash = &args[2];
-    let data_dir = PathBuf::from(&args[3]);
-    let loss_flag = flag_value(&args, "--loss");
+    let cli = Cli::parse();
+    let run_dir = cli.run_dir;
+    let hash = &cli.hash;
+    let data_dir = cli.data_dir;
+    let loss_flag = cli.loss.clone();
     // `--trace`: print the per-step training loss of the replay. The engine
     // writes the same quantity per (step, net) into `history.csv` (`metric`
     // rows), so a diff of the two shows exactly where a replay diverges.
-    let trace = args.iter().any(|a| a == "--trace");
+    let trace = cli.trace;
 
     // Exact identity only — the file must be nets/<hash>.json, verbatim.
     let net_state = load_net_state(&run_dir, hash)?;
@@ -94,7 +116,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let batch_size = blob_num(blob, "batch_size").unwrap_or(16.0) as usize;
     println!(
         "recipe (engine.json → trainer): loss={loss_name} │ lr={lr} │ grad_clip={grad_clip} │ batch={batch_size}"
-    );    if let Some(recorded) = blob.and_then(|b| b.get("loss")).and_then(|v| v.as_str()) {
+    );
+    if let Some(recorded) = blob.and_then(|b| b.get("loss")).and_then(|v| v.as_str()) {
         if recorded != loss_name {
             println!(
                 "(note: the run recorded loss \"{recorded}\" — replaying with {loss_name} is an \
@@ -154,7 +177,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 4. Export ─────────────────────────────────────────────────────────
     let out = run_dir.join(format!("{hash}.safetensors"));
     gras::utils::safetensors::export_safetensors(&net, &out)?;
-    println!("wrote {} ({} linear layers)", out.display(), net.layers.len());
+    println!(
+        "wrote {} ({} linear layers)",
+        out.display(),
+        net.layers.len()
+    );
     Ok(())
 }
 
@@ -166,7 +193,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 const SUPPORTED_LOSSES: &str = "mse, cross_entropy";
 
 type Loss = Box<
-    dyn Fn(&gras::Variable, &gras::Variable) -> flodl::tensor::Result<gras::Variable> + Send + Sync,
+    dyn Fn(&gras::Variable, &gras::Variable) -> gras::flodl::tensor::Result<gras::Variable>
+        + Send
+        + Sync,
 >;
 
 fn loss_by_name(name: &str) -> Option<Loss> {
@@ -249,14 +278,6 @@ fn replay_plan(step: usize, entered_at_step: usize) -> Vec<usize> {
         .collect()
 }
 
-/// `--flag value`, or `None` when the flag is absent (or has no value).
-fn flag_value(args: &[String], flag: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-}
-
 /// Read a numeric field from the trainer blob (`None` = absent or not numeric).
 fn blob_num(blob: Option<&serde_json::Value>, key: &str) -> Option<f64> {
     blob?.get(key)?.as_f64()
@@ -295,8 +316,14 @@ mod tests {
     #[test]
     fn custom_or_missing_loss_is_refused_not_guessed() {
         let custom = json!({"loss": "cross_entropy_label_smoothing_0.1"});
-        assert!(resolve_loss(Some(&custom), None).is_err(), "custom objective must refuse");
-        assert!(resolve_loss(Some(&json!({})), None).is_err(), "unlabeled must refuse");
+        assert!(
+            resolve_loss(Some(&custom), None).is_err(),
+            "custom objective must refuse"
+        );
+        assert!(
+            resolve_loss(Some(&json!({})), None).is_err(),
+            "unlabeled must refuse"
+        );
         assert!(resolve_loss(None, None).is_err(), "absent blob must refuse");
         // …but an explicit flag overrides, on purpose (an approximation).
         assert_eq!(
@@ -309,20 +336,40 @@ mod tests {
     fn schedule_run_and_unknown_names_are_refused() {
         let scheduled = json!({"loss": "mse", "lr_schedule": true});
         let err = resolve_loss(Some(&scheduled), Some("mse")).unwrap_err();
-        assert!(err.contains("LR schedule"), "error should name the blocker: {err}");
+        assert!(
+            err.contains("LR schedule"),
+            "error should name the blocker: {err}"
+        );
         assert!(loss_by_name("nope").is_none());
         assert!(resolve_loss(None, Some("nope")).is_err());
     }
 
     #[test]
     fn blob_numbers_come_from_the_record() {
-        let blob = json!({"learning_rate": 1e-5, "grad_clip": 1.0, "batch_size": 128, "loss": null});
+        let blob =
+            json!({"learning_rate": 1e-5, "grad_clip": 1.0, "batch_size": 128, "loss": null});
         assert_eq!(blob_num(Some(&blob), "learning_rate"), Some(1e-5));
         assert_eq!(blob_num(Some(&blob), "batch_size"), Some(128.0));
         assert_eq!(blob_num(Some(&blob), "loss"), None); // null is not a number
         assert_eq!(blob_num(None, "grad_clip"), None);
-        // A `--loss` with no value is not a flag.
-        let args = vec!["x".to_string(), "--loss".to_string()];
-        assert_eq!(flag_value(&args, "--loss"), None);
+        // The CLI parses `--loss` itself (clap), so a valueless flag is a
+        // clap error, not a silent `None`: pinned by the accepted forms below.
+        let ok = Cli::try_parse_from([
+            "export_champion",
+            "results/123",
+            "abc123",
+            "data/mnist/train",
+            "--loss",
+            "mse",
+        ]);
+        assert_eq!(ok.unwrap().loss.as_deref(), Some("mse"));
+        let missing = Cli::try_parse_from([
+            "export_champion",
+            "results/123",
+            "abc123",
+            "data/mnist/train",
+            "--loss",
+        ]);
+        assert!(missing.is_err(), "--loss without a value must be rejected");
     }
 }

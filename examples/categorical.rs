@@ -16,7 +16,7 @@ use std::path::Path;
 use clap::Parser;
 use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{RaceConfig, RaceEngine};
-use gras::utils::{tabular_data, score};
+use gras::utils::{score, tabular_data};
 
 /// The command line: the shared engine flags (this example has no extra knobs).
 #[derive(Parser, Debug)]
@@ -44,7 +44,8 @@ fn main() {
     let data_dir = root.join("data/categorical");
     let run_dir = root.join("examples/categorical/run");
     if !data_dir.exists() {
-        let ds = tabular_data::synthetic_classification(1024, 16, 4, 42, gras::auto_device()).unwrap();
+        let ds =
+            tabular_data::synthetic_classification(1024, 16, 4, 42, gras::auto_device()).unwrap();
         tabular_data::save_dataset(&data_dir, &ds).unwrap();
     }
     let peeked = tabular_data::resolve_dataset(&data_dir).unwrap();
@@ -61,15 +62,13 @@ fn main() {
 
     // 3. Config — budgets inactive unless set; here a step budget only.
     //    Topology dims must match the dataset (16 features → 4 classes).
-    let mut topo_opts = gras::graph::topology::TopologyOptions::default();
-    topo_opts.input_dim = Some(d_in);
-    topo_opts.output_dim = Some(d_out);
     let builder = RaceConfig::builder()
         .set_pop_size(6)
-        .set_max_steps(50)
-        .set_network_hidden_dim_range(4, 8)
-        .set_topology_options(topo_opts)
-        .set_additional_metrics(metrics.clone());
+        .set_stop_max_steps(50)
+        .set_topology_hidden_dim_range(4, 8)
+        .set_topology_input_dim(d_in)
+        .set_topology_output_dim(d_out)
+        .set_run_metrics(metrics.clone());
     let config = cli.engine.apply(builder).build();
 
     // 4. Run — one RunSpec; the cross-entropy loss lives inside the trainer.

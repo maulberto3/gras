@@ -9,28 +9,51 @@
 //! synthetic data to demonstrate the end-to-end recovery, replay, and continued
 //! training.
 
+use clap::Parser;
 use gras::engine::fitness::{Direction, Fitness};
 use gras::engine::{RaceConfig, RaceEngine};
 use gras::graph::network::Network;
 use gras::graph::topology::Topology;
 use gras::state::{load_engine_json, load_net_state};
 use gras::trainer::TabularTrainer;
-use gras::utils::{tabular_data, score};
+use gras::utils::{score, tabular_data};
 use std::path::PathBuf;
 
+/// The command line: optional run/hash positionals (no args = demo run).
+#[derive(Parser, Debug)]
+#[command(
+    name = "train_by_hash",
+    about = "Rebuild one net by hash, replay it, and continue training solo.",
+    after_help = "With no arguments a temporary demo run is created from scratch."
+)]
+struct Cli {
+    /// The run directory (omit to create the demo run).
+    #[arg(value_name = "RUN_DIR")]
+    run_dir: Option<PathBuf>,
+
+    /// The net's EXACT full hash (required with run_dir).
+    #[arg(value_name = "NET_HASH")]
+    net_hash: Option<String>,
+
+    /// Dataset directory the run trained on.
+    #[arg(long, value_name = "DIR", default_value = "data/mnist/train")]
+    data_dir: PathBuf,
+}
+
 fn main() {
+    let cli = Cli::parse();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let (run_dir, net_hash, data_dir) = if args.len() >= 3 {
-        (
-            PathBuf::from(&args[1]),
-            args[2].clone(),
-            PathBuf::from("data/mnist/train"),
-        )
-    } else {
-        println!("No arguments supplied. Creating a temporary run for demonstration...");
-        setup_demo_run()
+    let (run_dir, net_hash, data_dir) = match (cli.run_dir, cli.net_hash) {
+        (Some(dir), Some(hash)) => (dir, hash, cli.data_dir),
+        (None, None) => {
+            println!("No arguments supplied. Creating a temporary run for demonstration...");
+            setup_demo_run()
+        }
+        _ => {
+            eprintln!("RUN_DIR and NET_HASH must be given together (or neither, for the demo run)");
+            std::process::exit(2);
+        }
     };
 
     println!("================================================================================");
@@ -167,15 +190,12 @@ fn setup_demo_run() -> (PathBuf, String, PathBuf) {
     let ds = tabular_data::synthetic_classification(128, 8, 2, 42, gras::auto_device()).unwrap();
     tabular_data::save_dataset(&data_dir, &ds).unwrap();
 
-    let mut topo_opts = gras::graph::topology::TopologyOptions::default();
-    topo_opts.input_dim = Some(8);
-    topo_opts.output_dim = Some(2);
-
     let config = RaceConfig::builder()
         .set_pop_size(2)
-        .set_max_steps(5)
-        .set_csv_export(true)
-        .set_topology_options(topo_opts)
+        .set_stop_max_steps(5)
+        .set_run_csv_export(true)
+        .set_topology_input_dim(8)
+        .set_topology_output_dim(2)
         .build();
 
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
