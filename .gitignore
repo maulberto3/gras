@@ -3,16 +3,16 @@
 /target_cuda
 /libtorch
 /saved
-
+1789787353879/
 .vscode
-
+*.safetensors*
 GEMINI.md
 NOTES.md
 NAS_GUIDE.md
 WORKFLOW.md
 PROD_REFACTOR_WINS.md
 RACE_REVAMP.md
-
+assets/
 /data
 
 TODO.md

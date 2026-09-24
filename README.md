@@ -48,10 +48,10 @@ fn main() -> flodl::tensor::Result<()> {
     // both together panic at build() (only one stop criterion at a time).
     let config = RaceConfig::builder()
         .set_pop_size(10)
-        .set_max_steps(100)
+        .set_stop_max_steps(100)
         .build();
 
-    let spec = RunSpec::new(data_dir, config, fitness, trainer, Some(42), None::<&str>);
+    let spec = RunSpec::tabular(data_dir, config, fitness, trainer, Some(42), None::<&str>);
 
     let mut engine = RaceEngine::new(spec)?;
 
@@ -69,9 +69,48 @@ Two replacement channels, strictly separated:
 
 Stop criteria are exclusive: set `max_steps` **or** `max_target_fitness`, never both (it panics at build).
 
+## Run modes
+
+`RunSpec` has one variant per mode, each self-contained — and the trainer trait is split to match, so a wrong flavor combination is a **compile error**, not a runtime surprise:
+
+- **`RunSpec::tabular(..)` (tabular):** dataset + `Fitness::new(scorer, ..)` + a `TabularStep` trainer — the engine loads the data, draws batches, and scores `(pred, target)` itself. A tabular trainer implements `TabularStep`: it owns a **required** loss (`fn loss()`), may shape the shared batch stream (`stream_shape`), and receives data via `TabularContext`.
+- **`RunSpec::rl(..)` (RL / environment):** **no dataset**. The trainer implements `RlStep` — there is **no loss method at all**: the training signal lives inside `train_step`, the trainer drives its own environment and reports the ranking scalar in `StepReport.fitness`; the fitness must be `Fitness::reported(direction, label)`. `RlContext` carries no data.
+- Both mode traits extend `StepTrainer` (`make_optimizer`, `describe`). The engine dispatches through an internal `ModeTrainer` enum — a tabular step always carries data, an RL step never does.
+
+Evolution (crossover, mutation, gates, culls) is identical in both modes.
+
+See `examples/cartpole.rs` (canonical RL: autodiff REINFORCE on a pure-Rust CartPole).
+
 ## Log levels
 
-`None` (silent) · `Summ` (default: one compact line per step + one line per evolution roll) · `Minimal` (a framed in-place table). Everything the log shows is also recorded in `history.csv` and `nets/<hash>.json`.
+Set once per run via the config builder: `.set_run_log_level(LogLevel::…)`.
+
+| Level | What you see per step | Use it when |
+|---|---|---|
+| `Summ` **(default)** | One compact line at the **end** of each step — `step N │ pop K │ train_loss↓ mean±std │ eval_loss↓ … │ fitness↑ … │ took …s` — plus one line per evolution roll that fired (crossover attempts/inserts, mutation immigrants, culls), plus start/stop/checkpoint/elite-save lines. Printed last on purpose: the summary stays at the bottom of the terminal. | Watching a run live; the everyday default. |
+| `Minimal` | A framed in-place table (from step 2 on): population means with deltas vs last step, evolve counters (culls, inserts, crossover attempted/passed/gated, mutation), current best net footer. **No other lines** — no per-roll detail, no start/checkpoint chatter. | Long runs on one terminal; the numbers move, the shape doesn't. |
+| `None` | Nothing per step. Only the run-start line and the final stop reason. | Power users who parse `engine.json`, `history.csv`, and the artifacts instead of watching the stream; fastest I/O path. |
+
+The middle column of that line is mode-dependent: **Tabular** reports the
+held-out `eval_loss`; **RL** has no eval batch, so it reports the step's
+environment volume instead — `matches N │ turns N │ turns/match N`, summed
+over the live population (each RL trainer reports it in `StepReport.rl`).
+That is what explains a step that took minutes.
+
+Everything the log shows (and more) is recorded losslessly in `history.csv`
+and `nets/<hash>.json` — the log is a view, the files are the record.
+
+Note: the `--log-level` CLI flag on the RL examples (cartpole,
+kaggle_kagiculture) is a *different* axis — it sets the env_logger
+verbosity filter (`info`/`debug`/…), not the engine's line shape above.
+The engine's own names are accepted there too (`--log-level summ` / `minimal`
+/ `none`), mapped onto the verbosity that lets those lines through.
+
+## Learn more
+
+- [STDIO_BRIDGE.md](STDIO_BRIDGE.md) — the stdin/stdout two-language bridge trick, with examples beyond kagiculture (including why Rust plays parent)
+- [OPTIONS.md](OPTIONS.md) — every engine option and its default
+- [TODO.md](TODO.md) — plan of record for open work
 
 ## License
 
