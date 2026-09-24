@@ -985,7 +985,7 @@ mod tests {
         });
         graph.finalize();
 
-        let mut net = Network::build(&graph, Device::CPU).unwrap();
+        let net = Network::build(&graph, Device::CPU).unwrap();
         let mut optimizer = flodl::nn::Adam::new(&net.parameters(), 1e-3);
         // Many dropout draws: with p=0.25 an all-zeros column on the
         // denominator branch is likely within a handful of masks.

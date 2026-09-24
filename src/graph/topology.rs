@@ -2171,7 +2171,7 @@ mod finalize_order_tests {
 
             // 1. Round-trip is faithful — build from the parsed graph as-is.
             let parsed = Topology::from_json(&json).unwrap();
-            let mut conns = |t: &Topology| {
+            let conns = |t: &Topology| {
                 let mut v: Vec<(usize, usize, usize, usize)> = t
                     .connections
                     .iter()
