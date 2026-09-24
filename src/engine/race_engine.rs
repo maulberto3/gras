@@ -266,6 +266,11 @@ pub struct RaceEngine {
     pub(crate) rolling_eval: HashMap<String, RollingBuffer>,
     /// Wall-clock start for the wall-clock stop criterion.
     pub(crate) started_at_wall: std::time::Instant,
+    /// Wall-clock seconds accumulated by EARLIER sessions of this run (stop
+    /// → resume cycles). `elapsed_seconds` reports `elapsed_base_secs +
+    /// started_at_wall.elapsed()`, so a resumed run keeps its true age. 0 on
+    /// a fresh run; restored from `engine.json` on resume.
+    pub(crate) elapsed_base_secs: u64,
     /// Wall-clock start of the CURRENT step (set at the top of the run loop).
     /// Consumed by the per-step logs (`Summ` rollup line / `Minimal` table) so
     /// long runs surface per-step cost — e.g. RL bridges where one step plays
@@ -585,6 +590,9 @@ impl RaceEngine {
                 max_steps: config.max_steps,
                 train_eval_split_ratio: Some(train_eval_split_ratio),
                 held_out_eval_rows: Some(held_out_eval_rows),
+                culls: 0,
+                run_elapsed_secs: 0,
+                children_born_at_clock: HashMap::new(),
                 config: ConfigSnapshot::from_config(&config, batch_size, eval_batch_size),
                 trainer: trainer.describe(),
             },
@@ -649,6 +657,7 @@ impl RaceEngine {
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
             started_at_wall: std::time::Instant::now(),
+            elapsed_base_secs: 0,
             step_started_at_wall: std::time::Instant::now(),
             culls: 0,
             children_born_at_clock: HashMap::new(),
@@ -857,6 +866,14 @@ impl RaceEngine {
     ) -> Result<Self> {
         let trainer = crate::trainer::ModeTrainer::Tabular(Box::new(trainer));
         let header = crate::state::load_engine_json(&run_dir)?;
+        // Pluck the run-level counters out BEFORE `header` moves into the
+        // engine struct (resume restores them after the frontier loads).
+        let persisted_counters = RunHeader {
+            culls: header.culls,
+            run_elapsed_secs: header.run_elapsed_secs,
+            children_born_at_clock: header.children_born_at_clock.clone(),
+            ..header.clone()
+        };
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume")?;
         let dataset =
             crate::utils::tabular_data::resolve_dataset(&data_dir)?.to_device(config.device())?;
@@ -865,7 +882,9 @@ impl RaceEngine {
         // On resume, stream shape comes from the run header (data integrity),
         // but the trainer's stream_shape() can still override batch sizes.
         let header_stream_ratio = header.train_eval_split_ratio.unwrap_or(0.2); // legacy default if header missing it
-        let _header_held_out = header.held_out_eval_rows.unwrap_or(256); // legacy default if header missing it
+        // Held-out eval rows are data geometry — restored from the header,
+        // not re-decided by the resume config (mirrors the split ratio rule).
+        let header_held_out = header.held_out_eval_rows.unwrap_or(256); // legacy default if header missing it
 
         // Same rule on resume: the trainer's stream shape (same trainer the
         // run started with) overrides batch sizes; the split ratio comes from
@@ -882,6 +901,7 @@ impl RaceEngine {
         let stream = Some(
             BatchStream::new(run_seed, batch_size, split)
                 .with_eval_batch_size(eval_batch_size)
+                .with_held_out_eval_rows(header_held_out)
                 .with_checkpoint_every(config.checkpoint_every),
         );
         let dataset = Some(dataset);
@@ -915,6 +935,7 @@ impl RaceEngine {
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
             started_at_wall: std::time::Instant::now(),
+            elapsed_base_secs: 0,
             step_started_at_wall: std::time::Instant::now(),
             culls: 0,
             children_born_at_clock: HashMap::new(),
@@ -932,6 +953,13 @@ impl RaceEngine {
         };
 
         engine.load_live_frontier()?;
+        // Counters continue from the recorded values (cull budget, wall-clock
+        // age, child-seed ordinals) — a resumed run is the same race, not a
+        // fresh one with reset budgets. Legacy headers (missing fields) read
+        // as fresh, which is the only sane fallback.
+        engine.culls = persisted_counters.culls;
+        engine.children_born_at_clock = persisted_counters.children_born_at_clock;
+        engine.elapsed_base_secs = persisted_counters.run_elapsed_secs;
         Ok(engine)
     }
 
@@ -968,6 +996,13 @@ impl RaceEngine {
         }
         let trainer = crate::trainer::ModeTrainer::Rl(Box::new(trainer));
         let header = crate::state::load_engine_json(&run_dir)?;
+        // Counter snapshot before `header` moves (see the tabular flavor).
+        let persisted_counters = RunHeader {
+            culls: header.culls,
+            run_elapsed_secs: header.run_elapsed_secs,
+            children_born_at_clock: header.children_born_at_clock.clone(),
+            ..header.clone()
+        };
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume_rl")?;
         // The persisted run must itself be RL: its frontier was trained with
         // no dataset, so replaying it as tabular (or vice versa) is a bug.
@@ -1010,6 +1045,7 @@ impl RaceEngine {
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
             started_at_wall: std::time::Instant::now(),
+            elapsed_base_secs: 0,
             step_started_at_wall: std::time::Instant::now(),
             culls: 0,
             children_born_at_clock: HashMap::new(),
@@ -1026,6 +1062,10 @@ impl RaceEngine {
             trainer,
         };
         engine.load_live_frontier()?;
+        // Counter restore — same contract as the tabular flavor above.
+        engine.culls = persisted_counters.culls;
+        engine.children_born_at_clock = persisted_counters.children_born_at_clock;
+        engine.elapsed_base_secs = persisted_counters.run_elapsed_secs;
         Ok(engine)
     }
 
@@ -1617,7 +1657,24 @@ impl RaceEngine {
         }
         self.write_live_frontier_states()?;
         self.flush_metrics_csv()?;
+        self.persist_run_counters();
         Ok(reason)
+    }
+
+    /// Stamp the run-level counters (`culls`, accumulated wall time,
+    /// `children_born_at_clock`) into `engine.json` so a resume restores
+    /// them instead of starting fresh — a resumed run continues the ORIGINAL
+    /// cull budget, wall-clock age, and child-seed disambiguation state.
+    /// Best-effort: a write failure is a warning, not a stop failure (the
+    /// frontier and ledger are already safely on disk at this point).
+    fn persist_run_counters(&self) {
+        let mut header = self.header.clone();
+        header.culls = self.culls;
+        header.run_elapsed_secs = self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs();
+        header.children_born_at_clock = self.children_born_at_clock.clone();
+        if let Err(e) = crate::state::write_engine_json(&self.run_dir, &header) {
+            log::warn!("engine.json counter persistence failed: {e}");
+        }
     }
 
     /// Post-race pruner phase (Hard method): cull all but the top
@@ -3468,7 +3525,7 @@ impl RaceEngine {
             worst_smoothed_fitness: worst,
             mean_smoothed_fitness: mean,
             culls: self.culls,
-            elapsed_seconds: self.started_at_wall.elapsed().as_secs(),
+            elapsed_seconds: self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs(),
         }
     }
 
@@ -3696,6 +3753,9 @@ impl RaceEngine {
                     .map(|s| s.held_out_eval_rows())
                     .unwrap_or(256),
             ),
+            culls: self.culls,
+            run_elapsed_secs: self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs(),
+            children_born_at_clock: self.children_born_at_clock.clone(),
             config: ConfigSnapshot::from_config(
                 &self.config,
                 self.stream.as_ref().map(|s| s.batch_size()),
@@ -5039,6 +5099,115 @@ mod tests {
     }
 
     // ── Iter-6 Tier B/C: resume replay + parity ──────────────────────
+
+    #[test]
+    fn resume_restores_run_counters() {
+        // Stop → resume must continue the ORIGINAL cull budget, wall-clock
+        // age, and child-seed ordinals — a resumed run is the same race, not
+        // a fresh one with reset budgets. `held_out_eval_rows` also rides the
+        // header: the resumed stream must use the run's recorded geometry.
+        let dir = std::env::temp_dir().join("race_resume_counters");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut engine = engine(&dir, 99).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        let hashes = engine.state.live_hashes();
+        for clock in 0..2 {
+            for h in &hashes {
+                engine.step_one_net(h, clock).unwrap();
+            }
+        }
+        // Simulate a run history: some culls, some elapsed wall time, a
+        // couple of child ordinals.
+        engine.culls = 7;
+        engine.elapsed_base_secs = 120;
+        engine.children_born_at_clock.insert(1, 2);
+        engine.children_born_at_clock.insert(3, 5);
+        // A stop stamps the counters into engine.json.
+        engine.persist_run_counters();
+        for h in &hashes {
+            let state = engine.state.net(h).cloned().unwrap();
+            crate::state::write_net_state(&dir, &state).unwrap();
+        }
+        drop(engine);
+
+        // The persisted header carries them.
+        let header = crate::state::load_engine_json(&dir).unwrap();
+        assert_eq!(header.culls, 7);
+        assert_eq!(header.run_elapsed_secs, 120);
+        assert_eq!(header.children_born_at_clock.get(&3), Some(&5));
+
+        let resumed = RaceEngine::resume(
+            dir.clone(),
+            tiny_dataset_dir("resume_counters"),
+            {
+                let mut c = RaceConfig::defaults();
+                c.pop_size = 2;
+                c
+            },
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        )
+        .unwrap();
+        assert_eq!(resumed.culls, 7, "cull budget continues, not resets");
+        assert_eq!(
+            resumed.elapsed_base_secs, 120,
+            "wall-clock age restored as base offset"
+        );
+        assert_eq!(
+            resumed.children_born_at_clock.get(&1),
+            Some(&2),
+            "child ordinals restored"
+        );
+        // elapsed_seconds now reports base + current-session time.
+        let snap = resumed.snapshot(2);
+        assert!(
+            snap.elapsed_seconds >= 120,
+            "elapsed_seconds keeps the run's true age (got {})",
+            snap.elapsed_seconds
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_held_out_eval_rows_ride_the_header() {
+        // The header's held_out_eval_rows is data geometry: the resumed
+        // stream must use the run's recorded value, not re-decide it.
+        let dir = std::env::temp_dir().join("race_resume_held_out");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut engine = engine(&dir, 99).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+            .unwrap();
+        let h = engine.state.live_hashes()[0].clone();
+        engine.step_one_net(&h, 0).unwrap();
+        let state = engine.state.net(&h).cloned().unwrap();
+        crate::state::write_net_state(&dir, &state).unwrap();
+        // Stamp a distinctive value into the header (as a run with a custom
+        // stream would have recorded).
+        engine.header.held_out_eval_rows = Some(64);
+        crate::state::write_engine_json(&dir, &engine.header).unwrap();
+        drop(engine);
+
+        let resumed = RaceEngine::resume(
+            dir,
+            tiny_dataset_dir("resume_held_out"),
+            {
+                let mut c = RaceConfig::defaults();
+                c.pop_size = 1;
+                c
+            },
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.stream.as_ref().unwrap().held_out_eval_rows(),
+            64,
+            "resumed stream honors the header's held_out_eval_rows"
+        );
+    }
 
     #[test]
     fn resume_replays_nets_with_metric_parity() {

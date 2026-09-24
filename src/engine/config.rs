@@ -175,9 +175,11 @@ pub enum RunMode {
 }
 
 /// Step-race knob surface. Defaults are conservative and small for quick
-/// testing (pop 5, grace 15, threshold 0.20, batch 16, train_eval_split_ratio 0.2,
-/// held_out_eval_rows 256, hidden_dim_pool 4..=8) — the user runs bigger or
-/// explicitly overrides when it matters.
+/// testing (pop 5, checkpoint every 10, 1 crossover + 1 mutation roll,
+/// elite_count 1, mutate_prob 0.2, smoothing K = 10, hidden_dim_pool 4..=8)
+/// — the user runs bigger or explicitly overrides when it matters. Data
+/// geometry (batch size, split ratio, held-out rows) is deliberately NOT
+/// here: it lives on `RunSpec::stream` (see the batch-stream note below).
 ///
 /// No `Clone`/`Debug` derive: the pluggable Iter-5 closure fields
 /// (`Option<Box<dyn Fn>>`) support neither, and nothing in the crate needs to
@@ -293,6 +295,12 @@ pub struct RaceConfig {
     /// live-net metric rows + evolution attempt rows, typed by the `type` column).
     /// All run settings live in `engine.json`; there is no `options.csv`.
     pub csv_export: bool,
+    /// Flush `history.csv` after EVERY step instead of at checkpoint/stop
+    /// boundaries. Default false (checkpoint cadence — a `kill -9` loses at
+    /// most `checkpoint_every` steps of history rows, all other artifacts stay
+    /// consistent). true = zero-loss history at the cost of a file write per
+    /// step; only worth it on flaky infrastructure.
+    pub history_flush_each: bool,
     /// At stop, save the elite's topology markdown (`elite-<hash>.md`).
     /// Default true — the champion's blueprint is the run's headline artifact.
     pub elite_save_topology: bool,
@@ -430,6 +438,7 @@ impl RaceConfig {
             log_level: LogLevel::default(),
             mode: RunMode::Tabular,
             csv_export: true,
+            history_flush_each: false,
             elite_save_topology: true,
             elite_save_safetensors: true,
             worst_save_topology: false,
