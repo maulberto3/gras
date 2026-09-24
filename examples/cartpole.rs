@@ -571,7 +571,6 @@ fn random_baseline(matches: usize) -> f64 {
 /// any (net_seed, step) triple, so holdout games are reproducible AND
 /// disjoint from the race's own match starts.
 const HOLDOUT_SEED_BASE: u64 = 0x0132_7A11;
-
 /// Holdout batch size: how many fresh games the guardrail (post-race) and
 /// `--score-only` play to judge a champion. Small because each game runs to
 /// 500 turns; the mean over 10 is enough to separate "solved" from "random"
@@ -587,12 +586,14 @@ const HOLDOUT_MATCHES: usize = 10;
 /// garbage verdicts like "smoothed 201 but holdout 9" on nets that had
 /// actually learned. Still independent: fresh matches the net never
 /// saw. `champion_hash` comes from the engine's `champion_hashes()`.
+/// Returns `(mean, std)` over the batch — the ± matters as much as the
+/// mean: a `312 ± 87` is a different verdict quality than `312 ± 5`.
 fn holdout_survival(
     run_dir: &std::path::Path,
     champion_hash: &str,
     matches: usize,
     device: gras::flodl::Device,
-) -> Option<f32> {
+) -> Option<(f32, f32)> {
     let latest = run_dir.join("nets").join(format!("{champion_hash}.json"));
     // The state file nests the topology JSON as a STRING field.
     let state_raw = std::fs::read_to_string(&latest).ok()?;
@@ -652,7 +653,19 @@ fn holdout_survival(
             }
         }
     }
-    Some(fitness_from_survivals(&survivals))
+    let mean = fitness_from_survivals(&survivals);
+    // Population std over the batch — how ragged the champion's play is.
+    // A tight ± means the verdict is solid; a wide ± means the mean hides
+    // a mix of solved and fluke games (worth knowing before trusting it).
+    let var = survivals
+        .iter()
+        .map(|&s| {
+            let d = s as f32 - mean;
+            d * d
+        })
+        .sum::<f32>()
+        / survivals.len() as f32;
+    Some((mean, var.sqrt()))
 }
 
 /// `--score-only`: rebuild each saved champion from its topology, load its
@@ -711,8 +724,8 @@ fn score_saved_elites(run_dir: &std::path::Path, only: Option<&str>) {
             continue;
         };
         match holdout_survival(run_dir, &full, HOLDOUT_MATCHES, device) {
-            Some(holdout) => println!(
-                "guardrail: elite {} holdout survival {holdout:.0}/{} turns — {}",
+            Some((holdout, std)) => println!(
+                "guardrail: elite {} holdout survival {holdout:.0} ± {std:.0}/{} turns — {}",
                 &full[..8.min(full.len())],
                 MAX_TURNS_PER_MATCH,
                 if holdout >= MAX_TURNS_PER_MATCH as f32 {
@@ -975,19 +988,18 @@ fn main() {
         .expect("engine construction (RL spec)")
     }
     // ── Trainer selection: BOTH forms here — pick one by commenting a line ──
-    // ── Trainer selection: BOTH forms here — pick one by commenting a line ──
-    // Runner-level wrapper concept (see `GracePeriodTrainer` for why this is
-    // something the runner does, not the engine config): the grace period is
-    // a *plain* wrapper that delegates straight through to the relay once
-    // its window closes. `grace == 0` = the wrapper is a no-op pass-through
-    // and the relay runs immediately from step 0.
-    let base_trainer = gras::trainer::DecisionLagTrainer::new(trainer).with_lag(RELAY_LAG);
-    let trainer =
-        gras::trainer::GracePeriodTrainer::new(base_trainer, cli.engine.grace_periods.unwrap_or(0));
+    // RELAY (active): the deciding face never trains; a shadow forked from it
+    // does (see RELAY_LAG). Grace pins the warm-up OFF so the relay engages
+    // at step 0 (this example's explicit choice — the wrapper's conservative
+    // default is 5); `--grace-periods N` opts into N plain per-net steps
+    // before the relay engages.
+    let relay = gras::trainer::DecisionLagTrainer::new(trainer)
+        .with_lag(RELAY_LAG)
+        .with_grace(cli.engine.grace_periods.unwrap_or(0));
     println!(
         "Trainer: DECISION-LAG RELAY (lag {RELAY_LAG} engine step(s)) — the face decides/ranks on held weights; a shadow learns and is promoted every {RELAY_LAG} step(s)."
     );
-    let mut engine = build_engine(&cli, builder, fitness, trainer);
+    let mut engine = build_engine(&cli, builder, fitness, relay);
     // CLASSIC (fallback): the net learns from the games it just played.
     // println!("Trainer: classic — the net learns from its own games.");
     // let mut engine = build_engine(&cli, builder, fitness, trainer);
@@ -1013,9 +1025,21 @@ fn main() {
         return;
     }
     let champion = &champions[0];
-    if let Some(holdout) = holdout_survival(engine.run_dir(), champion, HOLDOUT_MATCHES, device) {
+    // Echo the champion's final smoothed fitness next to the holdout reading:
+    // the two estimators agree when the race signal is honest, and diverge
+    // exactly when it isn't (the collapse this guardrail exists to catch).
+    let smoothed = engine
+        .state()
+        .net(champion)
+        .and_then(|s| s.last_metrics.as_ref().map(|m| m.fitness));
+    if let Some((holdout, std)) =
+        holdout_survival(engine.run_dir(), champion, HOLDOUT_MATCHES, device)
+    {
+        let smoothed_note = smoothed
+            .map(|s| format!(" (race smoothed {s:.1})"))
+            .unwrap_or_default();
         println!(
-            "guardrail: elite {} holdout survival {holdout:.0}/{} turns — {}",
+            "guardrail: elite {} holdout survival {holdout:.0} ± {std:.0}/{} turns{smoothed_note} — {}",
             &champion[..8.min(champion.len())],
             MAX_TURNS_PER_MATCH,
             if holdout >= MAX_TURNS_PER_MATCH as f32 {
