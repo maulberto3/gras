@@ -143,7 +143,11 @@ pub fn cross_entropy_onehot(pred: &Variable, y: &Variable) -> Result<f32> {
 /// target is softened to `1−ε` on the true class and `ε/n_classes` elsewhere
 /// before the standard CE — penalizes overconfident logits, regularizes the
 /// survivor nets. `ε = 0` reduces exactly to [`cross_entropy_onehot_loss`].
-pub fn label_smoothing_cross_entropy_loss(pred: &Variable, y: &Variable, smoothing: f32) -> Result<Variable> {
+pub fn label_smoothing_cross_entropy_loss(
+    pred: &Variable,
+    y: &Variable,
+    smoothing: f32,
+) -> Result<Variable> {
     let n_classes = y.data().shape()[1] as f32;
     let scale = flodl::Tensor::from_f32(&[1.0 - smoothing], &[1], y.data().device())?;
     let off = flodl::Tensor::from_f32(&[smoothing / n_classes], &[1], y.data().device())?;

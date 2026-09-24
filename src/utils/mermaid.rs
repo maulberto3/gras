@@ -30,7 +30,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
                     node.id,
                     graph.options.input_dim.unwrap_or(1)
                 )
-            }            NodeKind::Hidden => {
+            }
+            NodeKind::Hidden => {
                 let dim = node.hidden_dim.unwrap_or(8);
                 // Node-level activation moves OFF the label: with per-port
                 // activations it's no longer "the" node's activation — each
@@ -105,8 +106,7 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         // Edge label = the SOURCE PORT's activation: with per-port
         // activations, the wire itself carries the non-linearity, so the
         // signal name belongs on the arrow, not the box.
-        let edge_act = graph.nodes[conn.from.node]
-            .port_activation(conn.from.index);
+        let edge_act = graph.nodes[conn.from.node].port_activation(conn.from.index);
         let act = format!("{:#?}", edge_act).to_lowercase();
         // No port annotation: dedup guarantees at most one wire per
         // (source → target, activation) — so parallel wires always differ
@@ -158,10 +158,7 @@ pub fn topology_mermaid(graph: &Topology) -> String {
                     "    {}(( )) -- {} (input) --> n{}\n",
                     marker, act, node.id
                 ));
-                out.push_str(&format!(
-                    "    style {} fill:none,stroke:none\n",
-                    marker
-                ));
+                out.push_str(&format!("    style {} fill:none,stroke:none\n", marker));
                 out.push_str(&format!(
                     "    linkStyle {} stroke-dasharray:3 3\n",
                     orphan_idx
@@ -185,10 +182,7 @@ pub fn topology_mermaid(graph: &Topology) -> String {
                     "    n{} -- {} (orphan) --> {}(( ))\n",
                     node.id, act, marker
                 ));
-                out.push_str(&format!(
-                    "    style {} fill:none,stroke:none\n",
-                    marker
-                ));
+                out.push_str(&format!("    style {} fill:none,stroke:none\n", marker));
                 out.push_str(&format!(
                     "    linkStyle {} stroke-dasharray:3 3\n",
                     orphan_idx

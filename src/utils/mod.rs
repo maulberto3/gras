@@ -2,7 +2,6 @@
 //! step-race training primitives.
 
 pub mod ascii;
-pub mod tabular_data;
 pub mod display;
 pub(crate) mod error;
 pub mod graph_utils;
@@ -12,3 +11,4 @@ pub mod race_steps;
 pub mod safetensors;
 pub mod score;
 pub mod seed;
+pub mod tabular_data;

@@ -1,16 +1,27 @@
 //! Graph diagnostic utilities — shared helpers over raw node/connection data.
 
-use std::collections::HashMap;
-
 use crate::graph::node::{Activation, Node, NodeKind};
 use crate::graph::topology::{Connection, KindCounts, Port};
 
 /// Precompute wiring table: per node, per port, list of source ports.
+///
+/// **Order is deterministic**: each port's sources appear in CONNECTION
+/// order (the order wires were declared / saved to JSON), regardless of map
+/// type — the per-key Vec preserves push order. The src index derived from
+/// this Vec names the bridge Linear `proj<node>_<port>_<src>` in the
+/// safetensors exporter AND the Python loader
+/// (examples/python/load_gras_net.py), so both must count the same way.
+/// The map itself is a BTreeMap purely so any iteration over it (diagnostics,
+/// future callers) is key-ordered, never hash-seed dependent — the per-port
+/// Vec order, the load-bearing part, is connection order either way.
 pub(crate) fn build_node_sources(
     connections: &[Connection],
     num_inputs: &[usize],
 ) -> Vec<Vec<Vec<Port>>> {
-    let mut input_map: HashMap<Port, Vec<Port>> = HashMap::new();
+    // (node, port) → sources, appended in connection order; BTreeMap so
+    // iteration (never the per-key Vec order) is deterministic.
+    let mut input_map: std::collections::BTreeMap<Port, Vec<Port>> =
+        std::collections::BTreeMap::new();
     for c in connections {
         input_map.entry(c.to).or_default().push(c.from);
     }

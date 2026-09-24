@@ -46,15 +46,13 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
             match n.out_dim {
                 Some(dim) => format!(
                     "n{} {} {}/{} ->{}",
-                    n.id, kind_name(n.kind), in_part, out_part, dim
-                ),
-                None => format!(
-                    "n{} {} {}/{}",
                     n.id,
                     kind_name(n.kind),
                     in_part,
-                    out_part
+                    out_part,
+                    dim
                 ),
+                None => format!("n{} {} {}/{}", n.id, kind_name(n.kind), in_part, out_part),
             }
         })
         .collect();
@@ -128,10 +126,7 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
             (ports(n) - min_ports) * MAX_EXTRA / (max_ports - min_ports)
         }
     };
-    let node_rows: Vec<usize> = nodes
-        .iter()
-        .map(|n| base_rows + extra_rows(n))
-        .collect();
+    let node_rows: Vec<usize> = nodes.iter().map(|n| base_rows + extra_rows(n)).collect();
 
     let mut block_row = vec![0usize; nodes.len()];
     let mut gap_row = vec![0usize; nodes.len().saturating_sub(1)];
