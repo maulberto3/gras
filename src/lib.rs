@@ -12,7 +12,7 @@
 //! # use gras::engine::RaceConfig;
 //! let config = RaceConfig::builder()
 //!     .set_pop_size(6)
-//!     .set_max_steps(100)
+//!     .set_stop_max_steps(100)
 //!     .build();
 //! ```
 
@@ -29,8 +29,8 @@ pub mod utils;
 pub use engine::fitness;
 pub use evolution::{crossover, mutation, pools, selection};
 pub use graph::{network, node, topology};
-pub use utils::tabular_data;
 pub use utils::markdown;
+pub use utils::tabular_data;
 
 // ── engine — the step-race loop ──────────────────────────────────────
 pub use engine::{
@@ -65,8 +65,8 @@ pub use utils::tabular_data::{
 
 // ── scoring helpers ──────────────────────────────────────────────────
 pub use utils::score::{
-    accuracy_score, argmax_classes, cross_entropy_onehot, cross_entropy_onehot_loss,
-    f1_from_vecs, f1_score, l1_loss_score, label_smoothing_cross_entropy_loss, mse_loss_score,
+    accuracy_score, argmax_classes, cross_entropy_onehot, cross_entropy_onehot_loss, f1_from_vecs,
+    f1_score, l1_loss_score, label_smoothing_cross_entropy_loss, mse_loss_score,
     precision_from_vecs, precision_score, r2_score, rmse_score,
 };
 
