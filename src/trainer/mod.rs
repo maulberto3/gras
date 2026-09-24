@@ -4,14 +4,12 @@
 //! `trainer.rs` holds the core trait and context structures.
 
 pub mod decision_lag;
-pub mod grace;
 pub mod stream;
 pub mod supervised;
 pub mod trainer;
 
 pub use decision_lag::DecisionLagTrainer;
 pub use flodl::Variable;
-pub use grace::GracePeriodTrainer;
 pub use supervised::TabularTrainer;
 pub use trainer::{
     IntoBoxedTrainer, ModeTrainer, RlContext, RlStep, RlStepMeta, RunData, StepEnv, StepReport,
