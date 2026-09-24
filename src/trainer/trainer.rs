@@ -242,6 +242,19 @@ pub trait RlStep: StepTrainer {
         step: usize,
         ctx: &RlContext<'_>,
     ) -> flodl::tensor::Result<StepReport>;
+
+    /// Pop-wide phase: called ONCE per step with ALL live nets (mutable,
+    /// read order = live order) BEFORE any per-net `train_step`. Default:
+    /// no-op (the historical per-net-isolated behavior).
+    ///
+    /// This is the engine-side vantage point for loop-breaking schemes that
+    /// need the whole population: pop-mean action anchors, distillation,
+    /// shared-referee matches. The trainer may READ every net here and
+    /// cache whatever its `train_step` needs (e.g. the pop's mean action
+    /// distribution per observation); per-net learning stays in
+    /// `train_step`. Implementations must not rely on the order or on
+    /// Optimizer state — only on the forward pass.
+    fn pop_phase(&mut self, _nets: &mut [(String, &mut Network)], _step: usize) {}
 }
 
 // ── Trait-object plumbing ────────────────────────────────────────────────────
@@ -281,6 +294,15 @@ impl ModeTrainer {
         match self {
             ModeTrainer::Tabular(t) => t.describe(),
             ModeTrainer::Rl(t) => t.describe(),
+        }
+    }
+
+    /// Pop-wide phase dispatch (RL only): see [`RlStep::pop_phase`]. Tabular
+    /// has no such phase — its group step IS shared by construction (the
+    /// shared batch stream).
+    pub(crate) fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize) {
+        if let ModeTrainer::Rl(t) = self {
+            t.pop_phase(nets, step);
         }
     }
 
@@ -380,6 +402,9 @@ impl RlStep for Box<dyn RlStep> {
         ctx: &RlContext<'_>,
     ) -> flodl::tensor::Result<StepReport> {
         self.as_mut().train_step(net, optimizer, step, ctx)
+    }
+    fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize) {
+        self.as_mut().pop_phase(nets, step)
     }
 }
 

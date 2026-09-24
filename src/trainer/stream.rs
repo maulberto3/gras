@@ -25,8 +25,8 @@
 use flodl::Tensor;
 use flodl::tensor::Result;
 
-use crate::utils::tabular_data::Dataset;
 use crate::utils::seed::derive_seed;
+use crate::utils::tabular_data::Dataset;
 
 /// Per-step eval batches are derived from `run_seed + EVAL_STREAM_OFFSET`,
 /// never `run_seed` itself — same contract shape as the legacy
@@ -71,14 +71,21 @@ impl PoolSplit {
         // shuffled by split_indices).
         let half = rest.len() / 2;
         let (eval, gating) = if half == 0 && rest.len() > 1 {
-            (rest[..rest.len() - 1].to_vec(), rest[rest.len() - 1..].to_vec())
+            (
+                rest[..rest.len() - 1].to_vec(),
+                rest[rest.len() - 1..].to_vec(),
+            )
         } else if rest.len() == 1 {
             // Degenerate: a single held-out row doubles as eval + gating.
             (rest.clone(), rest.clone())
         } else {
             (rest[..half].to_vec(), rest[half..].to_vec())
         };
-        PoolSplit { train, eval, gating }
+        PoolSplit {
+            train,
+            eval,
+            gating,
+        }
     }
 
     /// Split from an existing dataset — convenience over [`PoolSplit::new`].
@@ -240,8 +247,7 @@ impl BatchStream {
     /// single ordering of the eval pool dominates the ranking. Pure function
     /// of `(run_seed, era)`; era 0 matches the legacy fixed permutation.
     fn eval_permutation(&self, era: u64) -> Vec<i64> {
-        let perm_seed =
-            derive_seed(self.run_seed.wrapping_add(EVAL_STREAM_OFFSET), era as usize);
+        let perm_seed = derive_seed(self.run_seed.wrapping_add(EVAL_STREAM_OFFSET), era as usize);
         let mut perm = self.eval_pool.clone();
         let mut rng = fastrand::Rng::with_seed(perm_seed);
         for i in (1..perm.len()).rev() {
@@ -277,10 +283,7 @@ impl BatchStream {
     /// exam score can only reflect generalization, not memorized rows or a
     /// rehearsed ordering. Pure function of `(run_seed, era)`.
     pub fn exam_batch(&self, dataset: &Dataset, era: u64) -> Result<(Tensor, Tensor)> {
-        let exam_seed = derive_seed(
-            self.run_seed.wrapping_add(EXAM_STREAM_OFFSET),
-            era as usize,
-        );
+        let exam_seed = derive_seed(self.run_seed.wrapping_add(EXAM_STREAM_OFFSET), era as usize);
         let mut perm = self.gating_pool.clone();
         let mut rng = fastrand::Rng::with_seed(exam_seed);
         for i in (1..perm.len()).rev() {
@@ -390,7 +393,11 @@ mod tests {
             .collect();
         all.sort();
         all.dedup();
-        assert_eq!(all.len(), ds.len(), "train+eval+gating must cover the dataset");
+        assert_eq!(
+            all.len(),
+            ds.len(),
+            "train+eval+gating must cover the dataset"
+        );
         assert!(!split.gating.is_empty(), "gating pool must be non-empty");
     }
 

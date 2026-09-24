@@ -7,7 +7,7 @@
 //! The engine only consumes the [`TabularStep`] contract — it never trains.
 //!
 //! For the RL counterpart see `examples/cartpole.rs` (the canonical
-//! [`RlStep`] implementation) and `examples/bandit.rs` (the minimal one).
+//! [`RlStep`] implementation; kagiculture shows the bridge-flavored one).
 
 use crate::graph::network::Network;
 use crate::trainer::{StepTrainer, TabularContext, TabularStep};
