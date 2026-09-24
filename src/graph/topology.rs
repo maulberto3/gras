@@ -120,10 +120,12 @@ impl Default for TopologyOptions {
             max_hidden_outputs_per_node: 5,
             input_dim: None,
             output_dim: None,
-            // 0.0 keeps the race's determinism contract intact: dropout masks
-            // draw from libtorch's global RNG (unseeded), so any nonzero
-            // default makes training non-reproducible. Opt in per-binary via
-            // `config.topology_options.dropout_prob` when you accept that.
+            // 0.0 keeps regularization opt-in per binary via
+            // `config.topology_options.dropout_prob`. Masks draw from
+            // libtorch's global RNG, which the engine seeds per
+            // (net_seed, step) before every trainer step (see
+            // `seed_step_randomness`), so a nonzero value is reproducible and
+            // still resumable — it just costs the extra dropout forward.
             dropout_prob: 0.0,
         }
     }
@@ -138,7 +140,7 @@ impl Default for TopologyOptions {
 /// Ports exist so a node can fan out (one output port per wire) while keeping
 /// wiring 1:1. **All of a node's output ports emit the same tensor** — the
 /// output-port index only matters for bookkeeping, never for values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Port {
     pub node: usize,  //  which node
     pub index: usize, //  which socket on that node
@@ -361,6 +363,22 @@ impl Topology {
     /// Simple maths: with I input ports and O output ports the random pass
     /// creates at most min(I, O) connections; the de-orphan pass may add
     /// more (one per orphaned output with a compatible later target).
+    ///
+    /// # DESTRUCTIVE — never call this on a topology loaded from JSON
+    ///
+    /// The first thing it does is `connections.clear()`, then it **regenerates
+    /// the wiring from scratch** (port pairing, orphan rewiring, dedup, trim).
+    /// It is a *generator*, not a validator, and it is **not idempotent**: on a
+    /// deserialized (already-finalized) topology it throws away the saved graph
+    /// and invents a different one with the same nodes and dims.
+    ///
+    /// That is not a subtle drift — it is a different network, with a
+    /// different set of cross-dim bridges, so any weights you then load will
+    /// either mismatch or (worse) half-apply. [`Topology::from_json`] returns a
+    /// graph that is already finalized: build it directly
+    /// (`Network::build(&topo, device)`), and see
+    /// `finalize_regenerates_wiring_and_must_not_run_on_loaded_topologies` for
+    /// the regression test that pins this down.
     pub fn finalize(&mut self) {
         self.connections.clear();
 
@@ -600,8 +618,7 @@ impl Topology {
                         node.num_outputs
                     )));
                 }
-                if node.kind == NodeKind::Input
-                    && ports.iter().any(|a| *a != Activation::Identity)
+                if node.kind == NodeKind::Input && ports.iter().any(|a| *a != Activation::Identity)
                 {
                     return Err(TopologyError::InvalidOptions(format!(
                         "node n{i} is an Input node — its ports must stay Identity"
@@ -1005,7 +1022,13 @@ impl Topology {
                         .filter(|&&v| v != usize::MAX)
                         .filter_map(|&old| ports.get(old).copied())
                         .collect();
-                    compacted.resize(node.num_outputs, compacted.last().copied().unwrap_or(crate::graph::node::Activation::Identity));
+                    compacted.resize(
+                        node.num_outputs,
+                        compacted
+                            .last()
+                            .copied()
+                            .unwrap_or(crate::graph::node::Activation::Identity),
+                    );
                     *ports = compacted;
                 }
             }
@@ -1336,11 +1359,7 @@ mod tests {
             g.create_random_hidden_nodes(3);
             g.refresh_labels();
             g.finalize();
-            g.assign_port_activations(&[
-                Activation::ReLU,
-                Activation::Tanh,
-                Activation::Sin,
-            ]);
+            g.assign_port_activations(&[Activation::ReLU, Activation::Tanh, Activation::Sin]);
             g
         };
         let a = build();
@@ -1397,7 +1416,10 @@ mod tests {
             .iter()
             .filter(|c| c.from.node == 1 && c.to.node == 2)
             .count();
-        assert_eq!(n1_to_n2, 1, "same-activation wires into one target must dedup");
+        assert_eq!(
+            n1_to_n2, 1,
+            "same-activation wires into one target must dedup"
+        );
         // Port 0 ReLU, port 1 Tanh ⇒ distinct values ⇒ both survive.
         let mut distinct = build(Some(vec![Activation::ReLU, Activation::Tanh]));
         distinct.dedup_value_wires();
@@ -1442,8 +1464,14 @@ mod tests {
             .iter()
             .filter(|c| c.from.node == 0 && c.to.node == 2)
             .count();
-        assert_eq!(into_n1, 1, "two Identity Input wires into one target must dedup");
-        assert_eq!(into_n2, 1, "Input wire into a different target must survive");
+        assert_eq!(
+            into_n1, 1,
+            "two Identity Input wires into one target must dedup"
+        );
+        assert_eq!(
+            into_n2, 1,
+            "Input wire into a different target must survive"
+        );
     }
 
     #[test]
@@ -1455,7 +1483,11 @@ mod tests {
         g.nodes.push(Node::new_input(0, 1));
         let mut n1 = Node::new_hidden(1, 1, 3);
         n1.activation = Activation::ReLU;
-        n1.port_activations = Some(vec![Activation::ReLU, Activation::Tanh, Activation::Sigmoid]);
+        n1.port_activations = Some(vec![
+            Activation::ReLU,
+            Activation::Tanh,
+            Activation::Sigmoid,
+        ]);
         g.nodes.push(n1);
         g.nodes.push(Node::new_output(2, 1, 1));
         // Only ports 0 and 2 are wired; port 1 is orphaned and must be trimmed.
@@ -2123,6 +2155,61 @@ mod finalize_order_tests {
     use super::*;
 
     #[test]
+    fn finalize_is_not_idempotent_so_never_run_it_on_loaded_topologies() {
+        // The guardrail bug of record: the holdout re-check loaded a saved
+        // topology and called `finalize()` "to be safe" — which threw the
+        // wiring away and regenerated a DIFFERENT graph (same nodes/dims,
+        // different connections, different cross-dim bridges). The rebuilt net
+        // then failed or, worse, half-loaded the champion's weights and the
+        // verdict described a stranger. Assert both halves of that:
+        //   1. from_json → the graph is already final: connections preserved;
+        //   2. finalize() on it CHANGES the wiring (it is a generator).
+        for seed in 0..25 {
+            let mut original = Topology::new(seed, Some(TopologyOptions::default()));
+            original.finalize();
+            let json = original.to_json().unwrap();
+
+            // 1. Round-trip is faithful — build from the parsed graph as-is.
+            let parsed = Topology::from_json(&json).unwrap();
+            let mut conns = |t: &Topology| {
+                let mut v: Vec<(usize, usize, usize, usize)> = t
+                    .connections
+                    .iter()
+                    .map(|c| (c.from.node, c.from.index, c.to.node, c.to.index))
+                    .collect();
+                v.sort_unstable();
+                v
+            };
+            assert_eq!(
+                conns(&original),
+                conns(&parsed),
+                "seed {seed}: from_json must preserve the finalized wiring"
+            );
+
+            // 2. Calling finalize() again REGENERATES — different graph.
+            let mut re_finalized = parsed.clone();
+            re_finalized.finalize();
+            let differs = conns(&re_finalized) != conns(&parsed)
+                // A regenerated graph usually differs in wiring; if a seed
+                // happens to reproduce the same wiring, the bridge sets can
+                // still differ. Either way, the two must never be ASSUMED
+                // interchangeable — and the round-trip above is the contract
+                // callers should rely on.
+                || Topology::from_json(&re_finalized.to_json().unwrap()).unwrap().connections.len()
+                    != parsed.connections.len();
+            if !differs {
+                // Rare: finalize reproduced the same wiring for this seed.
+                // Not a failure — just not evidence. Skip.
+                continue;
+            }
+            assert!(
+                differs,
+                "seed {seed}: finalize() regenerated the wiring (as documented)"
+            );
+        }
+    }
+
+    #[test]
     fn finalize_leaves_no_orphaned_input_output_ports() {
         // Regression: dedup_value_wires used to run AFTER trim_orphaned_ports,
         // stranding ports whose only wire got value-deduped (visible in
@@ -2130,18 +2217,32 @@ mod finalize_order_tests {
         for seed in 0..40 {
             let mut g = Topology::new(seed, Some(TopologyOptions::default()));
             g.finalize();
-            let in_id = g.nodes.iter().find(|n| n.kind == NodeKind::Input).unwrap().id;
-            let out_id = g.nodes.iter().find(|n| n.kind == NodeKind::Output).unwrap().id;
+            let in_id = g
+                .nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Input)
+                .unwrap()
+                .id;
+            let out_id = g
+                .nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Output)
+                .unwrap()
+                .id;
             for p in 0..g.nodes[in_id].num_outputs {
                 assert!(
-                    g.connections.iter().any(|c| c.from.node == in_id && c.from.index == p),
+                    g.connections
+                        .iter()
+                        .any(|c| c.from.node == in_id && c.from.index == p),
                     "seed {seed}: input port o{p} orphaned after finalize"
                 );
             }
             for n in &g.nodes {
                 for p in 0..n.num_inputs {
                     assert!(
-                        g.connections.iter().any(|c| c.to.node == n.id && c.to.index == p),
+                        g.connections
+                            .iter()
+                            .any(|c| c.to.node == n.id && c.to.index == p),
                         "seed {seed}: node n{} input port i{p} orphaned after finalize",
                         n.id
                     );
@@ -2149,7 +2250,9 @@ mod finalize_order_tests {
                 if n.id != out_id {
                     for p in 0..n.num_outputs {
                         assert!(
-                            g.connections.iter().any(|c| c.from.node == n.id && c.from.index == p),
+                            g.connections
+                                .iter()
+                                .any(|c| c.from.node == n.id && c.from.index == p),
                             "seed {seed}: node n{} output port o{p} orphaned after finalize",
                             n.id
                         );

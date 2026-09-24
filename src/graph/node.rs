@@ -7,6 +7,21 @@
 use flodl::Variable;
 use serde::{Deserialize, Serialize};
 
+/// Divide floor used by [`CombineOp::Divide`]: denominators smaller than this
+/// in magnitude are treated as ±ε (bounded output, bounded gradients).
+pub const DIVIDE_EPS: f64 = 1e-3;
+
+/// `n / d` without the singularity: `n * (d / clamp(|d|, ε))`.
+/// Exact whenever `|d| ≥ ε`; below it the quotient saturates instead of
+/// blowing up. Differentiable end to end (clamp passes gradients through
+/// where |d| > ε and zeroes them below — no NaN paths in backward).
+pub fn safe_divide(n: &Variable, d: &Variable) -> flodl::tensor::Result<Variable> {
+    let d_abs = d.abs()?;
+    let clamped = d_abs.clamp_min(DIVIDE_EPS)?;
+    let ratio = d.div(&clamped)?;
+    n.mul(&ratio)
+}
+
 /// How multiple incoming tensors are combined before the node transforms them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CombineOp {
@@ -56,9 +71,15 @@ impl CombineOp {
                 Ok(result)
             }
             CombineOp::Divide => {
+                // Divide-safe: n/d = n * (d / clamp(|d|, ε)). For |d| ≥ ε this
+                // is exactly n/d (the d/d cancels); below ε the multiplier
+                // saturates at ±1/ε instead of exploding — so a zeroed
+                // denominator (dropout mask, dead branch) yields a bounded
+                // value, never inf/NaN. Gradients keep the same guard shape,
+                // so backward stays finite too.
                 let mut result = tensors[0].clone();
                 for t in &tensors[1..] {
-                    result = result.div(t)?;
+                    result = safe_divide(&result, t)?;
                 }
                 Ok(result)
             }
@@ -319,11 +340,7 @@ impl Node {
     /// exactly `num_outputs` long; `validate()` enforces the same invariant
     /// on whole graphs. Empty = inherit node-level activation everywhere.
     pub fn with_port_activations(mut self, ports: Vec<Activation>) -> Self {
-        self.port_activations = if ports.is_empty() {
-            None
-        } else {
-            Some(ports)
-        };
+        self.port_activations = if ports.is_empty() { None } else { Some(ports) };
         self
     }
 
@@ -358,12 +375,18 @@ mod tests {
         // Softmax over features: rows sum to 1, all positive.
         let s = Activation::Softmax.apply(&x).unwrap();
         let sums = s.data().sum().unwrap().item().unwrap() as f32;
-        assert!((sums - 2.0).abs() < 1e-4, "softmax rows must sum to 1 each (got {sums})");
+        assert!(
+            (sums - 2.0).abs() < 1e-4,
+            "softmax rows must sum to 1 each (got {sums})"
+        );
 
         // LogSoftmax: log of softmax — strictly non-positive, exp sums to 1.
         let ls = Activation::LogSoftmax.apply(&x).unwrap();
         let recon = ls.data().exp().unwrap().sum().unwrap().item().unwrap() as f32;
-        assert!((recon - 2.0).abs() < 1e-4, "exp(log_softmax) must sum to 1 per row (got {recon})");
+        assert!(
+            (recon - 2.0).abs() < 1e-4,
+            "exp(log_softmax) must sum to 1 per row (got {recon})"
+        );
 
         // RMSNorm: per-row RMS of output ≈ 1.
         let r = StandardizeOp::RmsNorm.apply(&x).unwrap();
@@ -376,7 +399,10 @@ mod tests {
             .item()
             .unwrap() as f32;
         let rms = ms.sqrt();
-        assert!((rms - 1.0).abs() < 1e-3, "rmsnorm output RMS ≈ 1 (got {rms})");
+        assert!(
+            (rms - 1.0).abs() < 1e-3,
+            "rmsnorm output RMS ≈ 1 (got {rms})"
+        );
 
         // InstanceNorm (hand-rolled, stateless): per-row mean 0, std 1.
         let i = StandardizeOp::InstanceNorm.apply(&x).unwrap();

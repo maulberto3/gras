@@ -448,7 +448,12 @@ impl Network {
                     result = match op {
                         CombineOp::Multiply => result.mul(&t)?,
                         CombineOp::Subtract => result.sub(&t)?,
-                        CombineOp::Divide => result.div(&t)?,
+                        // Divide-safe: dropout zeroes elements of the
+                        // denominator tensor, and a raw div by 0.0 is inf →
+                        // NaN poison in the loss (live kagi run, net
+                        // 0ce5f88ce646d532: Divide nodes 2/6/8 + dropout
+                        // 0.25). Same guard as CombineOp::apply.
+                        CombineOp::Divide => crate::graph::node::safe_divide(&result, &t)?,
                         CombineOp::Max => result.maximum(&t)?,
                         CombineOp::Min => result.minimum(&t)?,
                         _ => unreachable!(),
@@ -609,7 +614,7 @@ impl Network {
                 _ => {
                     return Err(flodl::tensor::TensorError::new(
                         "clone_weights_from: bias presence mismatch",
-                    ))
+                    ));
                 }
             }
         }
@@ -634,7 +639,7 @@ impl Network {
                                 _ => {
                                     return Err(flodl::tensor::TensorError::new(
                                         "clone_weights_from: projection bias mismatch",
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -642,7 +647,7 @@ impl Network {
                         _ => {
                             return Err(flodl::tensor::TensorError::new(
                                 "clone_weights_from: projection presence mismatch",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -659,7 +664,10 @@ impl Network {
     pub fn export_weights(&self) -> flodl::tensor::Result<Vec<f32>> {
         let mut out = Vec::new();
         let mut count = 0usize;
-        let push_tensor = |t: &flodl::tensor::Tensor, out: &mut Vec<f32>, count: &mut usize| -> flodl::tensor::Result<()> {
+        let push_tensor = |t: &flodl::tensor::Tensor,
+                           out: &mut Vec<f32>,
+                           count: &mut usize|
+         -> flodl::tensor::Result<()> {
             let v = t.to_f32_vec()?;
             *count += 1;
             out.extend_from_slice(&v);
@@ -710,9 +718,9 @@ impl Network {
         // optimizer's Variable handles stay valid, gradient tracking is
         // preserved (set_data re-enables requires_grad automatically).
         let load = |var: &flodl::Variable,
-                        blob: &[f32],
-                        cursor: &mut usize,
-                        seen: &mut usize|
+                    blob: &[f32],
+                    cursor: &mut usize,
+                    seen: &mut usize|
          -> flodl::tensor::Result<()> {
             let data = var.data();
             let shape = data.shape();
@@ -856,6 +864,13 @@ impl Module for Network {
         &self.name
     }
 
+    /// Flip all dropout layers between train and eval mode. A **trainer-side**
+    /// knob: the engine never touches this. `Network::build` leaves every net
+    /// in eval mode (deterministic forwards — the replay-parity contract
+    /// depends on it), so a training scheme that wants dropout noise must
+    /// call [`Network::train`](Self::train) before its loss forwards and
+    /// [`Network::eval`](Self::eval) before rollouts/eval matches. The mode
+    /// is per-instance, not persisted — it resets to eval on rebuild.
     fn set_training(&self, training: bool) {
         for d in self.dropout_layers.iter().flatten() {
             d.set_training(training);
@@ -927,6 +942,77 @@ mod tests {
             output.shape(),
             &[batch, graph.options.output_dim.unwrap_or(1) as i64]
         );
+    }
+
+    #[test]
+    fn test_divide_combine_with_dropout_stays_finite() -> flodl::tensor::Result<()> {
+        use flodl::Optimizer;
+        // Regression: net 0ce5f88ce646d532 (live kagi run) went NaN at step 0.
+        // Its hidden nodes combine via Divide; with dropout active the
+        // denominator tensor can contain exact zeros, and raw `div` produced
+        // inf → NaN in the loss. The divide-safe guard must keep BOTH the
+        // forward output and one training step (forward + backward + Adam)
+        // finite.
+        let mut graph = Topology::new(0, None);
+        graph.options.dropout_prob = 0.25;
+        graph.options.input_dim = Some(8);
+        graph.options.output_dim = Some(4);
+        graph.nodes.push(Node::new_input(0, 2));
+        let mut den = Node::new_hidden(1, 1, 1);
+        den.hidden_dim = Some(16);
+        den.combine_op = Some(CombineOp::Add);
+        graph.nodes.push(den);
+        let mut div = Node::new_hidden(2, 2, 1);
+        div.hidden_dim = Some(16);
+        div.combine_op = Some(CombineOp::Divide);
+        graph.nodes.push(div);
+        graph.nodes.push(Node::new_output(3, 1, 1));
+        graph.connections.push(Connection {
+            from: Port { node: 0, index: 0 },
+            to: Port { node: 1, index: 0 },
+        });
+        graph.connections.push(Connection {
+            from: Port { node: 0, index: 1 },
+            to: Port { node: 2, index: 0 },
+        });
+        graph.connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 1 },
+        });
+        graph.connections.push(Connection {
+            from: Port { node: 2, index: 0 },
+            to: Port { node: 3, index: 0 },
+        });
+        graph.finalize();
+
+        let mut net = Network::build(&graph, Device::CPU).unwrap();
+        let mut optimizer = flodl::nn::Adam::new(&net.parameters(), 1e-3);
+        // Many dropout draws: with p=0.25 an all-zeros column on the
+        // denominator branch is likely within a handful of masks.
+        for step in 0..50 {
+            net.train();
+            let input = rand_input(4, 8);
+            let loss = net.forward(&input)?;
+            assert!(
+                loss.data().to_f32_vec()?.iter().all(|x| x.is_finite()),
+                "forward produced non-finite output at step {step}"
+            );
+            optimizer.zero_grad();
+            let scalar = loss.mean()?; // non-scalar output needs a grad seed
+            scalar.set_requires_grad(true)?;
+            scalar.backward()?;
+            for p in net.parameters() {
+                if let Some(g) = p.variable.grad() {
+                    assert!(
+                        g.to_f32_vec()?.iter().all(|x| x.is_finite()),
+                        "non-finite gradient at step {step}"
+                    );
+                }
+            }
+            optimizer.step()?;
+            net.eval();
+        }
+        Ok(())
     }
 
     #[test]
@@ -1100,7 +1186,10 @@ mod tests {
         let p1 = Activation::Tanh.apply(&sample).unwrap();
         let d0 = p0.data().to_f32_vec().unwrap();
         let d1 = p1.data().to_f32_vec().unwrap();
-        assert_ne!(d0, d1, "port 0 (ReLU) and port 1 (Tanh) must differ on negative input");
+        assert_ne!(
+            d0, d1,
+            "port 0 (ReLU) and port 1 (Tanh) must differ on negative input"
+        );
     }
 
     #[test]
