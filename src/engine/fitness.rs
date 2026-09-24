@@ -116,11 +116,9 @@ impl Fitness {
     pub fn score(&self, pred: &Variable, target: &Variable) -> Result<f32> {
         match self {
             Fitness::Computed { score_fn, .. } => score_fn(pred, target),
-            Fitness::Reported { label, .. } => Err(flodl::tensor::TensorError::new(
-                &format!(
-                    "fitness `{label}` is Reported — the trainer supplies the value in StepReport; there is no (pred, target) scorer to call"
-                ),
-            )),
+            Fitness::Reported { label, .. } => Err(flodl::tensor::TensorError::new(&format!(
+                "fitness `{label}` is Reported — the trainer supplies the value in StepReport; there is no (pred, target) scorer to call"
+            ))),
         }
     }
 

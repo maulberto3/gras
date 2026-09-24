@@ -25,8 +25,8 @@ use crate::graph::topology::Topology;
 use crate::state::{NetMetrics, NetState, write_net_state};
 use crate::utils::seed::derive_seed;
 
-use super::smoothing::rolling_mean;
 use super::race_engine::RaceEngine;
+use super::smoothing::rolling_mean;
 
 /// A freshly-built child net being caught up solo before it rejoins the group.
 ///
@@ -60,7 +60,11 @@ impl RaceEngine {
     /// Returns `Ok(None)` when the roll was spent without a child (crossover
     /// fired but produced nothing viable) — NOT an error, just nothing to
     /// insert. `Ok(Some(child))` is a ready child (evolved or random).
-    pub(crate) fn generate_child(&mut self, clock: usize, child_idx: usize) -> Result<Option<RaceChild>> {
+    pub(crate) fn generate_child(
+        &mut self,
+        clock: usize,
+        child_idx: usize,
+    ) -> Result<Option<RaceChild>> {
         // Same-clock siblings must differ: mix the child ordinal into the
         // derivation so two culled slots at one step make distinct children
         // (the pop-shrink bug: identical roll seeds ⇒ identical children ⇒
@@ -195,7 +199,8 @@ impl RaceEngine {
                 parent_hashes = attempt_parents;
                 break;
             }
-        }        let mut child_topo = match child_topo {
+        }
+        let mut child_topo = match child_topo {
             Some(t) => t,
             None => {
                 // MAX_PARENT_PAIRINGS exhausted → NO child this roll. No
@@ -219,16 +224,14 @@ impl RaceEngine {
                 .resolved_activation_pool()
                 .unwrap_or_else(|_| crate::evolution::pools::all_activations()),
         );
-        Ok(Some(
-            self.finalize_child(
-                child_topo,
-                clock,
-                child_idx,
-                &cx_note,
-                &parent_hashes,
-                false,
-            )?,
-        ))
+        Ok(Some(self.finalize_child(
+            child_topo,
+            clock,
+            child_idx,
+            &cx_note,
+            &parent_hashes,
+            false,
+        )?))
     }
 
     /// Load a live net's topology by hash (parents must still be live —
@@ -372,6 +375,24 @@ impl RaceEngine {
     /// checkpoint-gated evolution path to evaluate the child at each gate
     /// without replaying the whole history — `from` is where the child's
     /// replay currently stands, `to` the next gate (or the clock).
+    /// Catch-up variant for PROVISIONAL children (crossover gate
+    /// candidates): identical replay, but no state file is written. A
+    /// gate-rejected child must leave NOTHING behind — writing its state
+    /// mid-replay left "ghost" `nets/<hash>.json` files (`is_alive: true`,
+    /// counters from the replay window) that resume then tried to resurrect
+    /// as real members (parity failure + pop corruption).
+    pub(crate) fn catch_up_range_provisional(
+        &mut self,
+        child: &mut RaceChild,
+        from: usize,
+        to: usize,
+    ) -> Result<()> {
+        for step in from..to {
+            self.catch_up_step(child, step)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn catch_up_range(
         &mut self,
         child: &mut RaceChild,
@@ -379,59 +400,73 @@ impl RaceEngine {
         to: usize,
     ) -> Result<()> {
         for step in from..to {
-            // The child replays through the caller's training scheme — the
-            // same contract group-step nets use, so the recipe is identical.
-            let run_data = self.dataset.as_ref().zip(self.stream.as_ref()).map(
-                |(dataset, stream)| crate::trainer::RunData { dataset, stream },
-            );
-            let env = crate::trainer::StepEnv {
-                step,
-                run_seed: self.header.run_seed,
-                pop_size: self.config.pop_size,
-                live_count: self.state.live_count(),
-                checkpoint_every: self.config.checkpoint_every,
-                smoothing_window: crate::engine::smoothing::SMOOTHING_WINDOW,
-            };
-            let report = self.trainer.train_step(
-                &mut child.net,
-                &mut *child.optimizer,
-                step,
-                run_data.as_ref(),
-                &self.fitness,
-                &self.metrics,
-                env,
-                &child.state.hash,
-                child.state.net_seed as u64,
-            )?;
-            let metrics = NetMetrics {
-                step,
-                train_loss: report.train_loss,
-                eval_loss: report.eval_loss,
-                fitness: report.fitness,
-                informative: report.informative,
-            };
-            child.state.record_metrics(metrics.clone());
-            child.state.advance_step();
-            // Keep the rolling buffer in sync (catch-up steps count toward the
-            // child's smoothed fitness once it rejoins).
-            if let Some(buf) = self.rolling_fitness.get_mut(&child.state.hash) {
-                buf.push(metrics.fitness);
-            }
-            // Per-step catch-up lines are debug-only — the user-facing log
-            // is one "catch-up: N steps … done" message from the caller.
-            log::debug!(
-                "catch-up step {}: net {} train_loss↓ {:.4} eval_loss↓ {:?} fitness{} {:.4}",
-                step,
-                child.state.hash,
-                metrics.train_loss,
-                metrics.eval_loss,
-                self.fitness.direction().arrow(),
-                metrics.fitness,
-            );
+            self.catch_up_step(child, step)?;
         }
         // Write the child's final caught-up state once. (Per-step writes during
         // catch-up are a later nicety — see the function doc.)
         write_net_state(&self.run_dir, &child.state)?;
+        Ok(())
+    }
+
+    /// One catch-up/replay training step, shared by both range flavors.
+    /// Writes nothing — the range wrapper decides persistence.
+    fn catch_up_step(&mut self, child: &mut RaceChild, step: usize) -> Result<()> {
+        // The child replays through the caller's training scheme — the
+        // same contract group-step nets use, so the recipe is identical.
+        let run_data = self
+            .dataset
+            .as_ref()
+            .zip(self.stream.as_ref())
+            .map(|(dataset, stream)| crate::trainer::RunData { dataset, stream });
+        let env = crate::trainer::StepEnv {
+            step,
+            run_seed: self.header.run_seed,
+            pop_size: self.config.pop_size,
+            live_count: self.state.live_count(),
+            checkpoint_every: self.config.checkpoint_every,
+            smoothing_window: self.config.smoothing_window,
+        };
+        // Same (net, step) seed discipline the group step uses, so a
+        // catch-up replay and a resume replay draw the SAME dropout masks
+        // (fastrand + libtorch). This is what keeps stochastic nets
+        // bit-exact across replays.
+        crate::utils::race_steps::seed_step_randomness(child.state.net_seed as u64, step as u64, 0);
+        let report = self.trainer.train_step(
+            &mut child.net,
+            &mut *child.optimizer,
+            step,
+            run_data.as_ref(),
+            &self.fitness,
+            &self.metrics,
+            env,
+            &child.state.hash,
+            child.state.net_seed as u64,
+        )?;
+        let metrics = NetMetrics {
+            step,
+            train_loss: report.train_loss,
+            eval_loss: report.eval_loss,
+            fitness: report.fitness,
+            informative: report.informative,
+        };
+        child.state.record_metrics(metrics.clone());
+        child.state.advance_step();
+        // Keep the rolling buffer in sync (catch-up steps count toward the
+        // child's smoothed fitness once it rejoins).
+        if let Some(buf) = self.rolling_fitness.get_mut(&child.state.hash) {
+            buf.push(metrics.fitness);
+        }
+        // Per-step catch-up lines are debug-only — the user-facing log
+        // is one "catch-up: N steps … done" message from the caller.
+        log::debug!(
+            "catch-up step {}: net {} train_loss↓ {:.4} eval_loss↓ {:?} fitness{} {:.4}",
+            step,
+            child.state.hash,
+            metrics.train_loss,
+            metrics.eval_loss,
+            self.fitness.direction().arrow(),
+            metrics.fitness,
+        );
         Ok(())
     }
 
@@ -450,8 +485,18 @@ impl RaceEngine {
     pub(crate) fn replay_loaded_net(&mut self, state: NetState) -> Result<RaceChild> {
         let clock = state.step;
         let recorded = state.last_metrics.clone();
+        let segments = replay_segments(&state);
         let mut child = self.build_child_from_state(state)?;
-        self.catch_up(&mut child, clock)?;
+        // Replay the clocks this net ACTUALLY trained, not a naive `0..clock`:
+        // a net inserted mid-run never trains at its own birth clock (the group
+        // step for that clock ran before it existed — its first `history.csv`
+        // row is `entered_at_step + 1`), while a founder trained every clock.
+        // `state.step` counts trainings, so the two cases end at different
+        // clocks; walking the wrong set feeds a stale batch and drops a real
+        // one, drifting the weights by ~1e-3…1e-2.
+        for (from, to) in segments {
+            self.catch_up_range(&mut child, from, to)?;
+        }
 
         if let (Some(recorded), Some(replayed)) = (recorded, child.state.last_metrics.clone()) {
             if recorded != replayed {
@@ -503,4 +548,51 @@ impl RaceEngine {
             optimizer,
         })
     }
+}
+
+/// The clocks a reconstructed net must replay, as contiguous `(from, to)`
+/// segments consumable by [`RaceEngine::catch_up_range`].
+///
+/// A net trains at every clock in its life **except its birth clock**: the
+/// group step for the clock it joined ran *before* it existed (a joiner's
+/// first `history.csv` row is `entered_at_step + 1`). A founder predates clock
+/// 0, so nothing is skipped. `state.step` counts **trainings**, not clocks — so
+/// the skip is not visible there; it IS visible in the pair
+/// (`state.step`, recorded last clock):
+///   - `trainings == end_clock + 1` → nothing skipped (founder / seeded net),
+///   - `trainings == end_clock`     → exactly one skipped clock (the birth one).
+///
+/// Deriving it from the record (instead of assuming `entered_at_step == 0`
+/// means "founder") matters: a mutation immigrant inserted at the END of clock
+/// 0 also has `entered_at_step == 0`, but it trained clocks `1..=end`, not
+/// `0..=end-1`. Same count, different set — replaying the wrong one feeds a
+/// batch the net never saw and drops one it did (~1e-3…1e-2 weight drift).
+///
+/// Mirrored by `replay_plan` in `examples/export_champion.rs`, so resume and
+/// the export tool can never disagree about which steps a net saw.
+fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
+    let trainings = state.step;
+    if trainings == 0 {
+        return Vec::new(); // nothing trained yet
+    }
+    // No recorded clock (legacy/aborted nets): the pre-existing contiguous walk.
+    let Some(end) = state.last_metrics.as_ref().map(|m| m.step) else {
+        return vec![(0, trainings)];
+    };
+    let skipped = (end + 1).saturating_sub(trainings);
+    if skipped == 0 {
+        return vec![(0, end + 1)];
+    }
+    let birth = state.entered_at_step;
+    let mut out = Vec::new();
+    // 0..birth — what the net caught up on before it was live …
+    if birth > 0 {
+        out.push((0, birth.min(end + 1)));
+    }
+    // … and birth+1..=end — its live steps (the birth clock is skipped).
+    let after = birth + 1;
+    if after <= end {
+        out.push((after, end + 1));
+    }
+    out
 }

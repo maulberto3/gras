@@ -22,6 +22,9 @@ impl RollingBuffer {
             cap,
         }
     }
+    /// A buffer pre-filled with the given values (capped at `cap`, oldest
+    /// dropped first). Test convenience: fixtures push a whole history at
+    /// once instead of looping `push`.
     pub fn push(&mut self, v: f32) {
         self.inner.push_back(v);
         if self.inner.len() > self.cap {
@@ -39,6 +42,14 @@ impl RollingBuffer {
     }
     pub fn clear(&mut self) {
         self.inner.clear();
+    }
+    /// Pre-filled constructor: `RollingBuffer::from_values(10, &[0.5, 1.0])`.
+    pub fn from_values(cap: usize, values: &[f32]) -> Self {
+        let mut buf = RollingBuffer::new(cap);
+        for &v in values {
+            buf.push(v);
+        }
+        buf
     }
 }
 

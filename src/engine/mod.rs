@@ -17,13 +17,15 @@
 
 pub mod child;
 pub mod config;
-pub mod smoothing;
 pub mod fitness;
 pub mod population;
 pub mod race_engine;
 pub mod run_spec;
+pub mod smoothing;
 
-pub use config::{CrossCullPolicy, RaceConfig, RaceSnapshot, RunMode, StopReason};
+pub use config::{
+    CrossCullPolicy, MutationCullPolicy, RaceConfig, RaceSnapshot, RunMode, StopReason,
+};
 pub use fitness::{Direction, Fitness, FitnessLabel};
 pub use race_engine::RaceEngine;
 pub use run_spec::{RunSpec, StreamShape};

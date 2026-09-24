@@ -3,7 +3,6 @@
 //! context stamped into every net's `meta` block (`RunMetaCtx`).
 
 use crate::engine::fitness::Metric;
-use crate::graph::topology::TopologyOptions;
 
 /// What the scheduler checks to decide whether to stop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,6 +12,11 @@ pub enum StopReason {
     /// A user-supplied `custom_stop` closure returned true (Iter 5 pluggable
     /// contract; consulted after all built-ins).
     CustomStop,
+    /// Ctrl+C (SIGINT) received: the in-flight step was abandoned at the next
+    /// loop boundary and the race shut down through the SAME artifact path as
+    /// a natural stop (pruner, frontier, champion export, guardrail). Always
+    /// on — a second Ctrl+C during shutdown force-kills.
+    Interrupted,
 }
 
 // ── Consolidated defaults (one place for all engine constants) ────────────────────
@@ -93,8 +97,8 @@ pub enum CrossoverGate {
 }
 
 /// Who gets evicted when a crossover child passes the gate and takes a slot.
-/// **Crossover-only** — the mutation/immigrant channel has its own
-/// fitness-inverse victim selection and never consults this policy.
+/// **Crossover-only** — the mutation/immigrant channel has its own policy
+/// ([`MutationCullPolicy`]) and never consults this one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CrossCullPolicy {
     /// **Worst** (default) — evict the current worst net by smoothed fitness.
@@ -107,6 +111,31 @@ pub enum CrossCullPolicy {
     /// Gives every net a finite expected lifetime regardless of rank, which
     /// keeps slots turning over and prevents a long-lived leader from
     /// starving diversity. Risk: a strong net can be lost to bad luck.
+    Random,
+}
+
+/// Who gets evicted when a MUTATION roll inserts a fresh random immigrant.
+/// **Mutation-only** — the crossover channel has its own policy
+/// ([`CrossCullPolicy`]). The two are deliberately separate: a crossover child
+/// has just proven itself over the replay window, while an immigrant has
+/// proven nothing, so "evict the worst" is not obviously the right rule for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MutationCullPolicy {
+    /// **InverseFitness** (default) — a fitness-inverse roulette over the
+    /// non-elite nets that have a fitness verdict: the worst net carries the
+    /// largest weight, the current best is never drawn (weight 0), and a net
+    /// whose fitness collapses up-weights itself naturally. Chance is kept, so
+    /// a mediocre net is not condemned deterministically. This is the
+    /// historical behavior, now nameable/configurable.
+    #[default]
+    InverseFitness,
+    /// **Worst** — evict the worst net by smoothed fitness, deterministically
+    /// (mirrors [`CrossCullPolicy::Worst`]). Strictly merit-based, and always
+    /// the same target for a given population.
+    Worst,
+    /// **Random** — evict a uniformly random live net (mirrors
+    /// [`CrossCullPolicy::Random`]): every net keeps a finite expected
+    /// lifetime, at the cost of occasionally losing a good one.
     Random,
 }
 
@@ -166,8 +195,9 @@ pub struct RaceConfig {
     /// whole nets enter only via `mutate_rolls`).
     pub crossover_rolls: usize,
     /// Independent mutation rolls per step. Each roll fires with
-    /// `mutate_prob`; a firing roll culls one fitness-inverse-selected net
-    /// and inserts a fully-random immigrant (no checkpoint gate).
+    /// `mutate_prob`; a firing roll culls one net (chosen by
+    /// `mutation_cull_policy`) and inserts a fully-random immigrant (no
+    /// checkpoint gate).
     pub mutate_rolls: usize,
     /// Checkpoint gate strictness for crossover children (see
     /// [`CrossoverGate`]).
@@ -179,9 +209,13 @@ pub struct RaceConfig {
     /// gate failure discards the roll (legacy behavior).
     pub crossover_retries: usize,
     /// Who a surviving crossover child evicts (see [`CrossCullPolicy`]).
-    /// Crossover-only: mutation immigrants always evict via the
-    /// fitness-inverse roulette, regardless of this setting.
+    /// Crossover-only: mutation immigrants follow `mutation_cull_policy`
+    /// instead, regardless of this setting.
     pub crossover_cull_policy: CrossCullPolicy,
+    /// Who a firing mutation roll evicts before inserting its immigrant (see
+    /// [`MutationCullPolicy`]). Mutation-only: crossover children follow
+    /// `crossover_cull_policy`.
+    pub mutation_cull_policy: MutationCullPolicy,
     /// Elite guard: the top-k live nets (by smoothed fitness) are immune to
     /// ALL culls — crossover (any policy) and mutation alike. Minimum 1 (the
     /// champion is always guarded; the setter clamps lower values up).
@@ -190,6 +224,21 @@ pub struct RaceConfig {
     /// smoothed fitness drops out of the top-k — "elite" is a rank, not an
     /// identity.
     pub elite_count: usize,
+    /// Anti-devolution A: skip the trainer call for the top-k nets (see
+    /// [`RaceConfigBuilder::set_elite_freeze`]).
+    pub freeze_elites: bool,
+    /// Anti-devolution D: demote nets below `floor × tol` (see
+    /// [`RaceConfigBuilder::set_fitness_regression_tol`]). `None` = off.
+    pub regression_tol: Option<f32>,
+    /// Per-net smoothed-fitness rolling window (K) — how many recent step
+    /// fitnesses every ranking decision averages over (see
+    /// [`RaceConfigBuilder::set_fitness_smoothing_window`]). Defaults to
+    /// [`SMOOTHING_WINDOW`].
+    pub smoothing_window: usize,
+    /// Mutation/crossover immigrants skip catch-up and start at the current
+    /// clock (see [`RaceConfigBuilder::set_immigrant_fresh_start`]).
+    /// Construction error on tabular runs (see the setter's doc).
+    pub immigrant_fresh_start: bool,
     /// Crossover operator pool — which recombination operators the two-parent
     /// path may use (`"one_point"` | `"uniform"`). Drawn uniformly per
     /// attempt. Empty ⇒ both operators (the `empty ⇒ all` convention shared
@@ -206,9 +255,9 @@ pub struct RaceConfig {
     // seeded split. The trainer owns batch geometry; the engine owns data
     // integrity (split ratio) and can always read the effective shape via
     // stream_info().
-    /// Hidden-dim sampling range, same convention as the old generational
-    /// engine's `set_hidden_dim_pool(min, max)`. When `None`, the default
-    /// 4..=8 range is used.
+    /// Hidden-dim sampling range — set with
+    /// [`RaceConfig::set_topology_hidden_dim_range`]. When `None`, the
+    /// default 4..=8 range is used.
     pub hidden_dim_pool: Option<std::ops::RangeInclusive<usize>>,
     /// Stride within the hidden-dim pool when sampling node dimensions.
     pub hidden_dim_stride: usize,
@@ -359,7 +408,12 @@ impl RaceConfig {
             crossover_gate: CrossoverGate::default(),
             crossover_retries: 0,
             crossover_cull_policy: CrossCullPolicy::default(),
+            mutation_cull_policy: MutationCullPolicy::default(),
             elite_count: 1,
+            freeze_elites: false,
+            regression_tol: None,
+            smoothing_window: SMOOTHING_WINDOW,
+            immigrant_fresh_start: false,
             crossover_ops_pool: Vec::new(),
             max_steps: None,
             max_target_fitness: None,
@@ -410,7 +464,7 @@ pub struct RaceConfigBuilder {
     cfg: RaceConfig,
     /// Pruner params stored by `set_pruner_method`/`set_pruner_steps` while
     /// the pruner switch is still off — replayed by `build()` if
-    /// `set_pruner_pop(true)` comes later. Either call order works.
+    /// `set_pruner_enabled(true)` comes later. Either call order works.
     pending_pruner: Option<PopPruner>,
 }
 
@@ -419,7 +473,7 @@ impl RaceConfigBuilder {
         self.cfg.pop_size = n;
         self
     }
-    pub fn set_crossover_gate_checkpoint_every(mut self, n: usize) -> Self {
+    pub fn set_checkpoint_every(mut self, n: usize) -> Self {
         self.cfg.checkpoint_every = n.max(1);
         self
     }
@@ -448,10 +502,20 @@ impl RaceConfigBuilder {
     /// Crossover replacement policy: `CrossCullPolicy::Worst` = evict the
     /// worst net by smoothed fitness (default); `CrossCullPolicy::Random` =
     /// evict a uniformly random live net (diversity-first, elite can be lost).
-    /// Applies ONLY to crossover children — mutation immigrants always evict
-    /// via the fitness-inverse roulette.
+    /// Applies ONLY to crossover children — mutation immigrants evict per
+    /// [`Self::set_mutation_cull_policy`] instead.
     pub fn set_crossover_cull_policy(mut self, policy: CrossCullPolicy) -> Self {
         self.cfg.crossover_cull_policy = policy;
+        self
+    }
+    /// Mutation replacement policy (see [`MutationCullPolicy`]): who a firing
+    /// mutation roll evicts before inserting its fully-random immigrant.
+    /// Defaults to `MutationCullPolicy::InverseFitness` — a fitness-inverse
+    /// roulette, the engine's historical behavior, now explicit. Applies ONLY
+    /// to the mutation/immigrant channel; crossover children use
+    /// [`Self::set_crossover_cull_policy`].
+    pub fn set_mutation_cull_policy(mut self, policy: MutationCullPolicy) -> Self {
+        self.cfg.mutation_cull_policy = policy;
         self
     }
     /// Elite guard: top-k nets by smoothed fitness are immune to ALL culls
@@ -463,35 +527,159 @@ impl RaceConfigBuilder {
         self.cfg.elite_count = n.max(1);
         self
     }
-    /// Crossover operator pool (`"one_point"` | `"uniform"`). Drawn uniformly
-    /// per crossover attempt. Empty (default) ⇒ both operators.
-    pub fn set_crossover_ops_pool(mut self, ops: Vec<String>) -> Self {
-        self.cfg.crossover_ops_pool = ops;
+    /// ANTI-DEVOLUTION A — elite freeze: the top-`elite_count` nets (same
+    /// smoothed-fitness ranking the elite guard uses) are exempt from the
+    /// trainer call. They are still scored (their frozen skill re-measured
+    /// every step), still rank, and still serve as crossover parents — but
+    /// their weights never change, so a bad training step cannot erase the
+    /// best skill ever found. "Elites hold rank, not identity" still applies
+    /// one level deeper: freeze is recomputed each step from the ranking, so
+    /// a child that trains past the frozen elite takes the crown next step
+    /// and the old elite resumes training. Motivated by on-policy RL, where
+    /// a net's own rollouts become its curriculum and one unlucky batch can
+    /// collapse it below random (tabular, with its fixed data distribution,
+    /// never trips the guard — the feature is dormant there).
+    ///
+    /// A frozen net's StepReport carries its last recorded metrics (skill is
+    /// the frozen state — re-measuring would re-run the trainer). Default
+    /// `false` — off, existing runs bit-identical.
+    pub fn set_elite_freeze(mut self, yes: bool) -> Self {
+        self.cfg.freeze_elites = yes;
         self
     }
-    /// Same as [`Self::set_crossover_ops_pool`] with string slices.
-    pub fn set_crossover_ops_pool_from_strs(self, ops: &[&str]) -> Self {
-        self.set_crossover_ops_pool(ops.iter().map(|s| s.to_string()).collect())
+    /// Fresh-start immigrants: mutation immigrants skip the catch-up replay
+    /// and begin training at the current clock instead.
+    ///
+    /// Conceptually mode-agnostic ("does an immigrant inherit the population's
+    /// clock?") — but **only RL accepts it today**:
+    /// **Why this is an RL-only idea, and why it is sound there.** Catch-up
+    /// exists so an immigrant is *comparable* to the population: same step
+    /// count, same weight-update history. In Tabular that is sacred — everyone
+    /// shares one data stream, and a net that missed steps missed DATA. In RL
+    /// there is no shared stream: every net's matches are generated fresh from
+    /// its own seeds, so an immigrant that starts at step k has missed no data
+    /// at all, only k updates. And the survivors are survivors precisely
+    /// because their updates went well — which is the thing we want the cull
+    /// roulette to reward, instead of handing every newborn 50 replayed steps
+    /// of inherited history.
+    ///
+    /// Costs: a fresh immigrant's first verdict is random (~the baseline), so
+    /// it competes from birth rather than from a replayed adulthood. Its
+    /// rolling buffers start empty, which the cull/elite paths already treat
+    /// as "no verdict yet" — it cannot be culled before it has one, and it
+    /// cannot hold elite status either. Its state file records `step: 0` with
+    /// no metrics, so resume replays nothing for it (replay_segments returns
+    /// empty on zero trainings) and it simply trains from the current clock —
+    /// deterministic, because its first step's seeds are `(net_seed, clock)`.
+    ///
+    /// Setting this on a Tabular run is a construction ERROR — the setter is
+    /// mode-agnostic but tabular cannot honor it: there the replay would have
+    /// to re-derive historical batches, and starting mid-stream silently skips
+    /// training rows, breaking fitness comparability. (A future tabular
+    /// variant — e.g. rank the immigrant only after K catch-up steps — is a
+    /// separate design decision, parked in TODO.)
+    pub fn set_immigrant_fresh_start(mut self, yes: bool) -> Self {
+        self.cfg.immigrant_fresh_start = yes;
+        self
+    }
+    /// ANTI-DEVOLUTION D — regression demotion: each net's entry smoothed
+    /// fitness (first verdict after birth/insertion) becomes its `floor`. A
+    /// net whose smoothed fitness falls below `floor × tol` (Maximize; the
+    /// comparison inverts for Minimize) LOSES elite protection — a collapsed
+    /// net can't hold the crown while it's collapsed, and recovering clears
+    /// the flag. Culling needs no special lane: the collapsed fitness itself
+    /// up-weights the net in the ordinary inverse-proportional mutation-cull
+    /// roulette. Graduated demotion, never a weight rollback: fitness is the
+    /// only currency; failures are culled, not edited. Off by default
+    /// (`None`); typical value 0.7 — tight enough to ignore ordinary SGD
+    /// wobble (which is small and self-correcting), loose enough to catch a
+    /// genuine collapse (which is large and self-reinforcing).
+    pub fn set_fitness_regression_tol(mut self, tol: f32) -> Self {
+        self.cfg.regression_tol = Some(tol);
+        self
+    }
+    /// Per-net smoothed-fitness rolling window (K), in steps. Every ranking
+    /// decision — elite selection, cull roulette weights, regression floors,
+    /// the checkpoint ledger, stop criteria — averages the last K step
+    /// fitnesses instead of reading the latest value, so a single lucky or
+    /// unlucky step cannot flip a verdict. Default
+    /// [`SMOOTHING_WINDOW`] = 10.
+    ///
+    /// **Replay-relevant**: like freeze/regression/immigrant knobs, this
+    /// changes what a run MEANS — a resumed run must set the same value or
+    /// construction fails parity. Larger K = stabler, slower-reacting
+    /// rankings (a collapse takes K steps to fully register); smaller K =
+    /// jumpier, faster to react.
+    pub fn set_fitness_smoothing_window(mut self, k: usize) -> Self {
+        self.cfg.smoothing_window = k.max(1);
+        self
+    }
+    /// A user-supplied stop predicate, consulted every step alongside
+    /// `max_steps` / `max_target_fitness`: returning `true` ends the race
+    /// with stop reason `Custom`. Receives a [`RaceSnapshot`] of the current
+    /// population. Example: stop when the population mean plateaus.
+    pub fn set_stop_custom(
+        mut self,
+        f: impl Fn(&RaceSnapshot) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.cfg.custom_stop = Some(Box::new(f));
+        self
+    }
+    /// Crossover operator pool (`"one_point"` | `"uniform"`). Drawn uniformly
+    /// per crossover attempt. Empty (default) ⇒ both operators.
+    ///
+    /// Takes owned or borrowed strings: `&["uniform"]`, `vec!["uniform".into()]`,
+    /// `&existing_vec` all work — one setter, no `_from_strs` twin.
+    pub fn set_crossover_ops_pool<I, S>(mut self, ops: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.cfg.crossover_ops_pool = ops.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self
     }
     /// Explicit step budget. Mutually exclusive with
-    /// [`Self::set_max_target_fitness`] — exactly one stop criterion.
+    /// [`Self::set_stop_target_fitness`] — exactly one stop criterion.
     /// Accepts a bare value or an `Option` (`impl Into<Option<usize>>`).
-    pub fn set_max_steps(mut self, n: impl Into<Option<usize>>) -> Self {
+    /// Setting this CLEARS any previously-set target fitness: the two are
+    /// exclusive by construction, so the last writer wins (a const default
+    /// is overridden by a later flag, not combined with it).
+    pub fn set_stop_max_steps(mut self, n: impl Into<Option<usize>>) -> Self {
         self.cfg.max_steps = n.into();
+        self.cfg.max_target_fitness = None;
         self
     }
     /// Max target fitness: stop when the best smoothed fitness reaches `v`.
-    /// Mutually exclusive with [`Self::set_max_steps`] — exactly one stop
+    /// Mutually exclusive with [`Self::set_stop_max_steps`] — exactly one stop
     /// criterion. Accepts a bare value or an `Option`.
-    pub fn set_max_target_fitness(mut self, v: impl Into<Option<f32>>) -> Self {
+    /// Setting this CLEARS any previously-set max steps (see above).
+    pub fn set_stop_target_fitness(mut self, v: impl Into<Option<f32>>) -> Self {
         self.cfg.max_target_fitness = v.into();
+        self.cfg.max_steps = None;
+        self
+    }
+    /// Whole-bundle stop criteria — DELETED: the two field setters
+    /// ([`Self::set_stop_max_steps`] / [`Self::set_stop_target_fitness`]) are
+    /// the whole surface, and each clears its sibling on write (last writer
+    /// wins), which made the struct form redundant.
+    /// Whole-bundle pruner — the struct form of [`Self::set_pruner_enabled`] /
+    /// [`Self::set_pruner_method`] / [`Self::set_pruner_steps`]:
+    ///
+    /// ```ignore
+    /// .set_pruner(PopPruner { method: PopPrunerMethod::Hard, steps: 50 })
+    /// ```
+    ///
+    /// An `enabled == false` pruner is still stored (the stop simply ends the
+    /// run) — pass `method`/`steps` alone instead if you want it off.
+    pub fn set_pruner(mut self, pruner: PopPruner) -> Self {
+        self.cfg.pop_pruner = Some(pruner);
         self
     }
     /// Post-race pruner switch: `true` = when a stop criterion fires, cull
     /// everything except the top-`elite_count` nets (default 1: the champion)
     /// and keep training them for `steps` more steps (evolution off, stop
     /// criteria off). `false` (default) = the stop reason ends the run.
-    pub fn set_pruner_pop(mut self, enabled: bool) -> Self {
+    pub fn set_pruner_enabled(mut self, enabled: bool) -> Self {
         self.cfg.pop_pruner = enabled.then(|| {
             self.pending_pruner.take().unwrap_or(PopPruner {
                 method: PopPrunerMethod::Hard,
@@ -501,7 +689,7 @@ impl RaceConfigBuilder {
         self
     }
     /// Pruner strategy (`Hard` = keep the elites, plain solo training).
-    /// Takes effect only when [`Self::set_pruner_pop`](`true`) is also
+    /// Takes effect only when [`Self::set_pruner_enabled`](`true`) is also
     /// called — either call order works.
     pub fn set_pruner_method(mut self, method: PopPrunerMethod) -> Self {
         match self.cfg.pop_pruner.as_mut() {
@@ -518,7 +706,7 @@ impl RaceConfigBuilder {
         self
     }
     /// Extra solo-training step count after the stop fires (the `50` in
-    /// `Hard` + 50). Takes effect only when [`Self::set_pruner_pop`](`true`)
+    /// `Hard` + 50). Takes effect only when [`Self::set_pruner_enabled`](`true`)
     /// is also called — either call order works.
     pub fn set_pruner_steps(mut self, steps: usize) -> Self {
         match self.cfg.pop_pruner.as_mut() {
@@ -534,37 +722,59 @@ impl RaceConfigBuilder {
         }
         self
     }
-    pub fn set_network_hidden_dim_range(mut self, min: usize, max: usize) -> Self {
+    pub fn set_topology_hidden_dim_range(mut self, min: usize, max: usize) -> Self {
         self.cfg.hidden_dim_pool = Some(min..=max);
         self
     }
-    pub fn set_network_hidden_dim_stride(mut self, n: usize) -> Self {
+    pub fn set_topology_hidden_dim_stride(mut self, n: usize) -> Self {
         self.cfg.hidden_dim_stride = n;
         self
     }
-    pub fn set_network_combine_op_pool(mut self, pool: Vec<String>) -> Self {
-        self.cfg.combine_op_pool = pool;
+    /// How a node merges its incoming wires (see [`crate::graph::node::CombineOp`]).
+    /// Empty ⇒ the full default pool. Accepts owned or borrowed strings.
+    pub fn set_topology_combine_op_pool<I, S>(mut self, pool: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.cfg.combine_op_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
-    pub fn set_network_combine_ops(self, ops: &[&str]) -> Self {
-        self.set_network_combine_op_pool(ops.iter().map(|s| s.to_string()).collect())
-    }
-    pub fn set_network_activation_pool(mut self, pool: Vec<String>) -> Self {
-        self.cfg.activation_pool = pool;
+    /// Per-node non-linearities (see [`crate::graph::node::Activation`]).
+    /// Empty ⇒ the full default pool. Accepts owned or borrowed strings.
+    pub fn set_topology_activation_pool<I, S>(mut self, pool: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.cfg.activation_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
-    pub fn set_network_activations(self, ops: &[&str]) -> Self {
-        self.set_network_activation_pool(ops.iter().map(|s| s.to_string()).collect())
-    }
-    pub fn set_network_standardize_op_pool(mut self, pool: Vec<String>) -> Self {
-        self.cfg.standardize_op_pool = pool;
+    /// Per-node normalization ops (see [`crate::graph::node::StandardizeOp`]).
+    /// Empty ⇒ the full default pool. Accepts owned or borrowed strings.
+    pub fn set_topology_standardize_op_pool<I, S>(mut self, pool: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.cfg.standardize_op_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
-    pub fn set_network_standardize_ops(self, ops: &[&str]) -> Self {
-        self.set_network_standardize_op_pool(ops.iter().map(|s| s.to_string()).collect())
+    /// Dropout probability applied by the blueprint when building this run's
+    /// networks (part of `TopologyOptions` — the blueprint a saved topology
+    /// replays from, so it must ride with the run config). TRAIN forwards
+    /// only: the trainer flips `net.train()`/`net.eval()` around the loss.
+    pub fn set_topology_dropout_prob(mut self, p: f32) -> Self {
+        self.cfg.topology_options.dropout_prob = p;
+        self
     }
-    pub fn set_topology_options(mut self, opts: TopologyOptions) -> Self {
-        self.cfg.topology_options = opts;
+    /// Seed for the topology's own RNG (graph wiring + weight init). The
+    /// template seed comes from here; the ENGINE then re-seeds each child's
+    /// topology from `(run_seed, clock, child_idx)` at birth, so two runs
+    /// with the same run seed build identical children regardless of this
+    /// value. Set it only to pin the template's structure deterministically.
+    pub fn set_topology_seed(mut self, seed: usize) -> Self {
+        self.cfg.topology_options.topology_seed = seed;
         self
     }
     // ── individual topology fields (direct, no need to build a full TopologyOptions)
@@ -592,11 +802,11 @@ impl RaceConfigBuilder {
         self.cfg.topology_options.max_hidden_outputs_per_node = n;
         self
     }
-    pub fn set_network_input_dim(mut self, n: usize) -> Self {
+    pub fn set_topology_input_dim(mut self, n: usize) -> Self {
         self.cfg.topology_options.input_dim = Some(n);
         self
     }
-    pub fn set_network_output_dim(mut self, n: usize) -> Self {
+    pub fn set_topology_output_dim(mut self, n: usize) -> Self {
         self.cfg.topology_options.output_dim = Some(n);
         self
     }
@@ -613,7 +823,7 @@ impl RaceConfigBuilder {
     /// (`"f1"`), a `Metric::new(label)`, or a `Metric::custom(label, closure)`
     /// with your own scoring function. These NEVER affect selection/culling —
     /// the ranking fitness is set separately via `Fitness`.
-    pub fn set_additional_metrics<I, M>(mut self, metrics: I) -> Self
+    pub fn set_run_metrics<I, M>(mut self, metrics: I) -> Self
     where
         I: IntoIterator<Item = M>,
         M: Into<Metric>,
@@ -631,24 +841,17 @@ impl RaceConfigBuilder {
     }
     /// Per-step log verbosity: `Summ` (compact one-line rollup) or `Full`
     /// (also dumps every per-net detail line each step).
-    pub fn set_log_level(mut self, level: LogLevel) -> Self {
+    pub fn set_run_log_level(mut self, level: LogLevel) -> Self {
         self.cfg.log_level = level;
         self
     }
-    /// Dropout probability stamped into every new net's topology by the engine
-    /// (immigrants + crossover children; the initial population carries its own
-    /// `topology_options.dropout_prob` from config construction).
-    pub fn set_network_dropout_prob(mut self, p: f32) -> Self {
-        self.cfg.topology_options.dropout_prob = p;
-        self
-    }
     /// Set the training paradigm / problem space target.
-    pub fn set_mode(mut self, mode: RunMode) -> Self {
+    pub fn set_run_mode(mut self, mode: RunMode) -> Self {
         self.cfg.mode = mode;
         self
     }
     /// Set whether to write the lossless unified event log (`history.csv`).
-    pub fn set_csv_export(mut self, enabled: bool) -> Self {
+    pub fn set_run_csv_export(mut self, enabled: bool) -> Self {
         self.cfg.csv_export = enabled;
         self
     }
@@ -679,9 +882,12 @@ impl RaceConfigBuilder {
     }
     /// Validate the stop-criteria surface: `max_steps` and
     /// `max_target_fitness` are **exclusive** — only one stop criterion at a
-    /// time. Both would fight for different things (a budget vs. a quality
-    /// bar), and whichever fires first would silently mask the other. A
-    /// config with both panics at `build()`.
+    /// time. The field setters already enforce this (each write clears its
+    /// sibling), so this is a belt-and-suspenders check for configs built by
+    /// hand (struct literal) rather than through the builder — both would
+    /// fight for different things (a budget vs. a quality bar), and whichever
+    /// fired first would silently mask the other. A config with both panics
+    /// at `build()`.
     pub(crate) fn validate_single_stop(cfg: &RaceConfig) -> Result<(), String> {
         if cfg.max_steps.is_some() && cfg.max_target_fitness.is_some() {
             return Err(
@@ -697,13 +903,12 @@ impl RaceConfigBuilder {
         // surfaced loudly (a silent no-op would hide the misconfig).
         if let Some(p) = self.pending_pruner.take() {
             log::warn!(
-                "set_pruner_method({:?})/set_pruner_steps({}) were called without set_pruner_pop(true) — pruner is OFF",
+                "set_pruner_method({:?})/set_pruner_steps({}) were called without set_pruner_enabled(true) — pruner is OFF",
                 p.method,
                 p.steps
             );
         }
-        Self::validate_single_stop(&cfg)
-            .unwrap_or_else(|e| panic!("invalid RaceConfig: {e}"));
+        Self::validate_single_stop(&cfg).unwrap_or_else(|e| panic!("invalid RaceConfig: {e}"));
         cfg
     }
 }
@@ -825,7 +1030,7 @@ impl RaceConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::LogLevel;
+    use super::{LogLevel, RaceConfig};
 
     /// The examples' `--log-level` vocabulary must parse: handed to env_logger
     /// verbatim, `summ` is read as a module name and mutes the whole run, so
@@ -836,9 +1041,40 @@ mod tests {
         assert_eq!(LogLevel::parse("SUMM"), Some(LogLevel::Summ));
         assert_eq!(LogLevel::parse("minimal"), Some(LogLevel::Minimal));
         assert_eq!(LogLevel::parse("none"), Some(LogLevel::None));
-        assert_eq!(LogLevel::parse("debug"), None, "env_logger levels pass through");
+        assert_eq!(
+            LogLevel::parse("debug"),
+            None,
+            "env_logger levels pass through"
+        );
         assert_eq!(LogLevel::Summ.env_filter(), "info");
         assert_eq!(LogLevel::Minimal.env_filter(), "warn");
         assert_eq!(LogLevel::None.env_filter(), "warn");
+    }
+
+    /// The stop field setters are mutually exclusive BY CONSTRUCTION: each
+    /// write clears its sibling, so "const default then flag wins" composes
+    /// without a build error. This is what let every example drop the old
+    /// `set_stop`-wipe workaround (regression guard for the deleted
+    /// whole-bundle setter).
+    #[test]
+    fn stop_setters_are_exclusive_last_writer_wins() {
+        // const default: steps... then a flag asks for the fitness bar instead.
+        let cfg = RaceConfig::builder()
+            .set_stop_max_steps(15)
+            .set_stop_target_fitness(3050.0)
+            .build();
+        assert_eq!(cfg.max_steps, None, "fitness flag cleared the step budget");
+        assert_eq!(cfg.max_target_fitness, Some(3050.0));
+
+        // and the reverse order: fitness default... then a flag asks for steps.
+        let cfg = RaceConfig::builder()
+            .set_stop_target_fitness(3050.0)
+            .set_stop_max_steps(15)
+            .build();
+        assert_eq!(cfg.max_steps, Some(15));
+        assert_eq!(
+            cfg.max_target_fitness, None,
+            "step flag cleared the fitness bar"
+        );
     }
 }

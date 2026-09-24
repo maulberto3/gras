@@ -67,7 +67,10 @@ pub struct RLSpec<T: RlStep + 'static = Box<dyn RlStep>> {
 /// - **[`RunSpec::RL`]** — environment/RL style: no dataset at all, a
 ///   [`Fitness::reported`] ranking signal, and a trainer that drives the
 ///   environment and reports the reward. `RunSpec::rl` builds it.
-pub enum RunSpec<TT: TabularStep + 'static = Box<dyn TabularStep>, TR: RlStep + 'static = Box<dyn RlStep>> {
+pub enum RunSpec<
+    TT: TabularStep + 'static = Box<dyn TabularStep>,
+    TR: RlStep + 'static = Box<dyn RlStep>,
+> {
     Tabular(TabularSpec<TT>),
     RL(RLSpec<TR>),
 }
