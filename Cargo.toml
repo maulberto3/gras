@@ -33,6 +33,9 @@ comfy-table = "7"
 proptest = "1.11.0"
 dhat = "0.3"
 clap = { version = "4.6.7", features = ["derive"] }
+# examples/mnist_data.rs (the MNIST data producer) — HTTP download only,
+# so it stays out of the lib's dependency tree.
+ureq = "3"
 
 [profile.dev]
 opt-level = 0
