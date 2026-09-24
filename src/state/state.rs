@@ -200,6 +200,20 @@ pub struct RunHeader {
     pub started_at: Option<String>,
     pub train_eval_split_ratio: Option<f32>,
     pub held_out_eval_rows: Option<usize>,
+    /// Cumulative culls recorded at the last stop. Restored on resume so a
+    /// resumed run continues the ORIGINAL cull budget instead of a fresh one.
+    /// `0` on legacy engine.json files (written before this existed).
+    #[serde(default)]
+    pub culls: usize,
+    /// Wall-clock seconds the run had accumulated at the last stop. Restored
+    /// on resume as the base offset, so `elapsed_seconds` keeps counting the
+    /// run's true age across stop/resume cycles. `0` on legacy files.
+    #[serde(default)]
+    pub run_elapsed_secs: u64,
+    /// Children born per step clock at the last stop (same-clock siblings get
+    /// distinct child seeds). Restored on resume; empty on legacy files.
+    #[serde(default)]
+    pub children_born_at_clock: std::collections::HashMap<usize, usize>,
     /// The run's complete configuration (see [`ConfigSnapshot`]). This is the
     /// authoritative settings record — `engine.json` alone reproduces a run.
     #[serde(default)]
@@ -232,6 +246,9 @@ pub struct RunConfig {
     pub max_steps: Option<usize>,
     pub train_eval_split_ratio: Option<f32>,
     pub held_out_eval_rows: Option<usize>,
+    pub culls: usize,
+    pub run_elapsed_secs: u64,
+    pub children_born_at_clock: std::collections::HashMap<usize, usize>,
     /// The run's complete configuration (see [`ConfigSnapshot`]).
     pub config: ConfigSnapshot,
     /// The training scheme's self-description (see `Trainer::describe`).
@@ -258,6 +275,9 @@ impl RunHeader {
             max_steps,
             train_eval_split_ratio,
             held_out_eval_rows,
+            culls,
+            run_elapsed_secs,
+            children_born_at_clock,
             config,
             trainer,
         } = cfg;
@@ -282,6 +302,9 @@ impl RunHeader {
             started_at: None,
             train_eval_split_ratio,
             held_out_eval_rows,
+            culls: culls,
+            run_elapsed_secs: run_elapsed_secs,
+            children_born_at_clock,
             config,
             trainer,
         }
@@ -375,6 +398,25 @@ impl RunHeader {
             .get("held_out_eval_rows")
             .and_then(|f| f.as_u64())
             .map(|n| n as usize);
+        // Counter persistence (written at stop; legacy files read as fresh).
+        let culls = v.get("culls").and_then(|f| f.as_u64()).unwrap_or(0) as usize;
+        let run_elapsed_secs = v
+            .get("run_elapsed_secs")
+            .and_then(|f| f.as_u64())
+            .unwrap_or(0);
+        let children_born_at_clock: std::collections::HashMap<usize, usize> = v
+            .get("children_born_at_clock")
+            .and_then(|c| c.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, val)| {
+                        let clock: usize = k.parse().ok()?;
+                        let n = val.as_u64()? as usize;
+                        Some((clock, n))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // Missing on legacy engine.json files ⇒ Default (all-zero snapshot).
         let config: ConfigSnapshot = v
             .get("config")
@@ -406,6 +448,9 @@ impl RunHeader {
             started_at,
             train_eval_split_ratio,
             held_out_eval_rows,
+            culls,
+            run_elapsed_secs,
+            children_born_at_clock,
             config,
             trainer,
         })
@@ -909,6 +954,9 @@ mod tests {
             max_steps: Some(10_000),
             train_eval_split_ratio: Some(0.2),
             held_out_eval_rows: Some(256),
+            culls: 0,
+            run_elapsed_secs: 0,
+            children_born_at_clock: std::collections::HashMap::new(),
             config: ConfigSnapshot::default(),
             trainer: None,
         })
