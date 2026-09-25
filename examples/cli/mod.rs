@@ -174,7 +174,6 @@ pub struct EngineArgs {
     /// history at the cost of a file write per step).
     #[arg(long, value_name = "MODE")]
     pub history_flush: Option<String>,
-
     // Note — there is intentionally no `--log-file` flag. Teeing stdout+
     // stderr into a file needs fd-level interception (dup2 a pipe over fds
     // 1/2 with a reader thread echoing to the SAVED fd — naively echoing via

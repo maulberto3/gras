@@ -152,7 +152,7 @@ impl ConfigSnapshot {
             freeze_elites: cfg.freeze_elites,
             regression_tol: cfg.regression_tol,
             fresh_immigrants: cfg.immigrant_fresh_start,
-            build: crate::engine::race_engine::build_stamp(),
+            build: crate::engine::core::build_stamp(),
         }
     }
 }

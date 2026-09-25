@@ -11,21 +11,25 @@
 //! - [`population`] — initial population generation from the config's pools
 //! - [`child`] — child generation (roulette → crossover → mutate) + catch-up
 //! - [`smoothing`] — the rolling fitness buffer + its mean (ranking inputs)
-//! - [`race_engine`] — the `RaceEngine` itself: construction, the run loop,
+//! - [`core`] — the `RaceEngine` itself: construction, the run loop,
 //!   per-net stepping, culling, persistence hooks
+//! - [`tabular_engine`] — tabular-mode constructors (`resume`)
+//! - [`rl_engine`] — RL-mode constructors (`resume_rl`)
 //! - [`fitness`] — `Fitness`, `Direction`, `Metric`, `FitnessLabel`
 
 pub mod child;
 pub mod config;
+pub mod core;
 pub mod fitness;
 pub mod population;
-pub mod race_engine;
+pub mod rl_engine;
 pub mod run_spec;
 pub mod smoothing;
+pub mod tabular_engine;
 
 pub use config::{
     CrossCullPolicy, MutationCullPolicy, RaceConfig, RaceSnapshot, RunMode, StopReason,
 };
+pub use core::RaceEngine;
 pub use fitness::{Direction, Fitness, FitnessLabel};
-pub use race_engine::RaceEngine;
 pub use run_spec::{RunSpec, StreamShape};

@@ -25,7 +25,7 @@ use crate::graph::topology::Topology;
 use crate::state::{NetMetrics, NetState, write_net_state};
 use crate::utils::seed::derive_seed;
 
-use super::race_engine::RaceEngine;
+use super::core::RaceEngine;
 use super::smoothing::rolling_mean;
 
 /// A freshly-built child net being caught up solo before it rejoins the group.
