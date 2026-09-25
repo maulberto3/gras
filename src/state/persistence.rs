@@ -98,7 +98,7 @@ pub struct ConfigSnapshot {
     /// `None` = off. Same replay-relevance as `freeze_elites`.
     #[serde(default)]
     pub regression_tol: Option<f32>,
-    /// Fresh-start immigrants (`set_immigrant_fresh_start`): mutation
+    /// Fresh-start immigrants (`set_mutation_fresh_start`): mutation
     /// immigrants skip catch-up. Replay-relevant — a resumed run must use the
     /// same insertion semantics or the replayed population diverges.
     #[serde(default)]
@@ -151,7 +151,7 @@ impl ConfigSnapshot {
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
             regression_tol: cfg.regression_tol,
-            fresh_immigrants: cfg.immigrant_fresh_start,
+            fresh_immigrants: cfg.mutation_fresh_start,
             build: crate::engine::core::build_stamp(),
         }
     }
@@ -314,8 +314,8 @@ impl RunHeader {
             started_at: None,
             train_eval_split_ratio,
             held_out_eval_rows,
-            culls: culls,
-            run_elapsed_secs: run_elapsed_secs,
+            culls,
+            run_elapsed_secs,
             children_born_at_clock,
             config,
             trainer,
