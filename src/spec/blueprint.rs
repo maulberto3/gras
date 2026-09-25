@@ -134,10 +134,14 @@ mod tests {
 
         fn rand_input(batch: i64, input_dim: usize) -> Variable {
             Variable::new(
-                Tensor::randn(&[batch, input_dim as i64], TensorOptions {
-                    dtype: flodl::DType::Float32,
-                    device: Device::CPU,
-                }).unwrap(),
+                Tensor::randn(
+                    &[batch, input_dim as i64],
+                    TensorOptions {
+                        dtype: flodl::DType::Float32,
+                        device: Device::CPU,
+                    },
+                )
+                .unwrap(),
                 false,
             )
         }
@@ -161,7 +165,7 @@ mod tests {
         assert_eq!(rebuilt.nodes, module.nodes);
         assert_eq!(rebuilt.node_dims, module.node_dims);
         assert_eq!(rebuilt.parameters().len(), module.parameters().len());
-        let input = rand_input(2, graph.options.input_dim);
+        let input = rand_input(2, graph.options.input_dim.unwrap_or(1));
         assert_eq!(
             rebuilt.forward(&input).unwrap().shape(),
             module.forward(&input).unwrap().shape()

@@ -6,7 +6,7 @@
 //! - [`NetworkFacts`] — materialized-network diagnostics ("nutrition label")
 
 mod network_facts;
-mod spec;
+mod blueprint;
 
 pub use network_facts::NetworkFacts;
-pub use spec::Spec;
+pub use blueprint::Spec;
