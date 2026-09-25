@@ -237,7 +237,7 @@ impl EngineArgs {
             b = b.set_fitness_regression_tol(tol);
         }
         if self.fresh_immigrants {
-            b = b.set_immigrant_fresh_start(true);
+            b = b.set_mutation_fresh_start(true);
         }
         if let Some(mode) = &self.crossover_gate {
             b = b.set_crossover_gate(match mode.trim().to_ascii_lowercase().as_str() {

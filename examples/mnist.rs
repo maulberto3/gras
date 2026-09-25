@@ -147,22 +147,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_run_log_level(LOG_LEVEL) // Log level verbosity
         .set_run_metrics(vec![
             Metric::from("f1"), // built-in label — scored by the score_by_label dispatcher
-                                // Metric::from("precision"), // another built-in
-                                // Metric::custom("top1_margin", |pred: &Variable, y: &Variable| {
-                                //     // Custom closure metric: confidence margin between the top-1
-                                //     // logit and the runner-up — one extra history.csv column.
-                                //     let p = pred.data().to_f32_vec()?;
-                                //     let n = p.len() / y.data().shape()[1] as usize;
-                                //     let c = y.data().shape()[1] as usize;
-                                //     let mut sum = 0.0f32;
-                                //     for r in 0..n {
-                                //         let row = &p[r * c..(r + 1) * c];
-                                //         let mut s = row.to_vec();
-                                //         s.sort_by(|a, b| b.partial_cmp(a).unwrap());
-                                //         sum += s[0] - s[1];
-                                //     }
-                                //     Ok(sum / n as f32)
-                                // }),
+            // Metric::from("precision"), // another built-in
+            // Metric::custom("top1_margin", |pred: &Variable, y: &Variable| {
+            //     // Custom closure metric: confidence margin between the top-1
+            //     // logit and the runner-up — one extra history.csv column.
+            //     let p = pred.data().to_f32_vec()?;
+            //     let n = p.len() / y.data().shape()[1] as usize;
+            //     let c = y.data().shape()[1] as usize;
+            //     let mut sum = 0.0f32;
+            //     for r in 0..n {
+            //         let row = &p[r * c..(r + 1) * c];
+            //         let mut s = row.to_vec();
+            //         s.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            //         sum += s[0] - s[1];
+            //     }
+            //     Ok(sum / n as f32)
+            // }),
         ]) // Informative (non-ranking) metrics: scored on the eval batch each step, one extra history.csv column each. Ranking fitness is set separately via Fitness — these NEVER affect selection/culling.
         // --- Stop Criteria (mutually exclusive — set exactly ONE) ---
         // .set_stop_max_steps(MAX_STEPS) // Total global step budget — or pass --max-steps.
@@ -179,7 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_checkpoint_every(CHECKPOINT_EVERY) // Steps between checkpoint gate recordings
         .set_crossover_gate(gras::engine::config::CrossoverGate::Soft) // Gate strictness for crossover children: CrossoverGate::Hard (beat every checkpoint bar) or CrossoverGate::Soft (beat the mean of the bars)
         .set_crossover_retries(3) // cx_retry_full: gate-rejected child ⇒ up to 3 TOTAL attempts (fresh parents + generate + gate each), then the roll is spent. Every attempt (inserted or rejected) is recorded in history.csv
-        .set_immigrant_fresh_start(false)
+        .set_mutation_fresh_start(false)
         // .set_crossover_ops_pool(["one_point".into(), "uniform".into()]) // Crossover operators drawn per attempt. Empty (default) ⇒ both. The chosen op is logged per child in its lineage note (crossover-one-point / crossover-uniform).
         .set_mutate_prob(0.5) // Probability of an immigrant roll firing per step
         .set_mutate_rolls(pop / 5) // Number of random immigrant substitution rolls per step
@@ -203,7 +203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Dropout lives on the blueprint (TopologyOptions), not the engine:
         // this setter writes it there. Replaces the removed
         // set_network_dropout_prob sugar — same 0.1, canonical route.
-        .set_topology_dropout_prob(0.1)
+        .set_topology_dropout_prob(0.25)
         // .set_topology_combine_op_pool(&["Mean", "Min", "Max"])     // Allowed merge operations for search
         // .set_topology_activation_pool(&["ReLU", "SELU", "GELU"])   // Allowed activations for search
         // .set_topology_standardize_op_pool(&["Identity"])           // Allowed standardization operations for search

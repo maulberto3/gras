@@ -101,15 +101,12 @@ const POP: usize = 100;
 // the CLASSIC form just lets the net learn from the games it played. Comment
 // one, uncomment the other. Costs 2× matches per step.
 ///
-/// Relay width, in ENGINE STEPS: the face holds its weights for this many
-/// steps and the shadow takes this many optimizer steps before it is promoted
-/// (1 = the classic one-step lag). A wider lag asks whether MORE distance
-/// between the acting policy and the learning policy helps further. The
-/// shadow's steps are batched onto the cycle's last step, so that step costs
-/// ≈ this many × a normal one (a visible `took Xs` spike); the amortized env
-/// cost stays ≈ 2×.
-const RELAY_LAG: usize = 2;
-
+/// Relay width, in ENGINE STEPS: the face holds its weights for 2 steps and
+/// the shadow takes 2 optimizer steps before it is promoted (1 = the classic
+/// one-step lag). A wider lag asks whether MORE distance between the acting
+/// policy and the learning policy helps further. The shadow's steps are
+/// batched onto the cycle's last step, so that step costs ≈ 2× a normal one
+/// (a visible `took Xs` spike); the amortized env cost stays ≈ 2×.
 /// The policy's learning rate — an ordinary f32 knob like every other const
 /// here (gras is f32 end to end). flodl's `Adam::new` is typed `f64` because
 /// it mirrors libtorch, where optimizer scalars are C++ `double`; the value is
@@ -883,7 +880,7 @@ fn main() {
         .set_crossover_rolls(pop / 2) // scales with the RESOLVED pop (flag > const)
         .set_mutate_prob(0.5) // high mutation churn + noisy fitness = good nets culled before they prove themselves (67/75 immigrants died in run 6)
         .set_mutate_rolls(pop / 5)
-        .set_immigrant_fresh_start(false) // immigration skips catch-up replay (RL-only concept today — see the knob's docs) — off here
+        .set_mutation_fresh_start(false) // immigration skips catch-up replay (RL-only concept today — see the knob's docs) — off here
         .set_stop_custom(|s| !s.best_smoothed_fitness.is_finite()) // extra stop lane: a NaN/-inf leader means the signal broke — stop rather than spin
         // Informative-only metrics (never rank). RL has no (pred, target) to
         // score against, so this is the shape you'd use in a TABULAR run —
@@ -993,16 +990,16 @@ fn main() {
     // at step 0 (this example's explicit choice — the wrapper's conservative
     // default is 5); `--grace-periods N` opts into N plain per-net steps
     // before the relay engages.
-    let relay = gras::trainer::DecisionLagTrainer::new(trainer)
-        .with_lag(RELAY_LAG)
-        .with_grace(cli.engine.grace_periods.unwrap_or(0));
-    println!(
-        "Trainer: DECISION-LAG RELAY (lag {RELAY_LAG} engine step(s)) — the face decides/ranks on held weights; a shadow learns and is promoted every {RELAY_LAG} step(s)."
-    );
-    let mut engine = build_engine(&cli, builder, fitness, relay);
+    // let relay = gras::trainer::DecisionLagTrainer::new(trainer)
+    //     .with_lag(RELAY_LAG)
+    //     .with_grace(cli.engine.grace_periods.unwrap_or(0));
+    // println!(
+    //     "Trainer: DECISION-LAG RELAY (lag {RELAY_LAG} engine step(s)) — the face decides/ranks on held weights; a shadow learns and is promoted every {RELAY_LAG} step(s)."
+    // );
+    // let mut engine = build_engine(&cli, builder, fitness, relay);
     // CLASSIC (fallback): the net learns from the games it just played.
-    // println!("Trainer: classic — the net learns from its own games.");
-    // let mut engine = build_engine(&cli, builder, fitness, trainer);
+    println!("Trainer: classic — the net learns from its own games.");
+    let mut engine = build_engine(&cli, builder, fitness, trainer);
 
     println!("================================================================");
     match &cli.resume {

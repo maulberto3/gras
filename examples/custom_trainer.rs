@@ -64,8 +64,7 @@ use gras::utils::{score, tabular_data};
 /// eval cadence), internal mutable state (a step counter), skipped evals.
 struct WarmupSgdTrainer {
     /// This scheme's loss (supervised paradigm — owned by the trainer).
-    loss_fn:
-        Box<dyn Fn(&Variable, &Variable) -> gras::flodl::tensor::Result<Variable> + Send + Sync>,
+    loss_fn: gras::trainer::BoxedLossFn,
     /// Peak SGD learning rate, reached after `warmup_steps`.
     peak_lr: f32,
     /// SGD momentum.
