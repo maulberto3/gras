@@ -123,7 +123,7 @@ fn serialize(blobs: &[TensorBlob]) -> Result<Vec<u8>> {
     let header = format!("{{{}}}", entries.join(","));
     // Header length must be a multiple of 8 per spec — pad with spaces.
     let len = header.len();
-    let padded = (len + 7) / 8 * 8;
+    let padded = len.div_ceil(8) * 8;
     let mut header_bytes = header.into_bytes();
     header_bytes.resize(padded, b' ');
 
@@ -246,7 +246,7 @@ fn copy_entry(
 ) -> Result<()> {
     let shape: Vec<usize> = entry["shape"]
         .as_array()
-        .ok_or_else(|| TensorError::new("bad tensor entry".into()))?
+        .ok_or_else(|| TensorError::new("bad tensor entry"))?
         .iter()
         .map(|v| v.as_u64().unwrap_or(0) as usize)
         .collect();
@@ -256,7 +256,7 @@ fn copy_entry(
     ];
     let blob = data
         .get(a..b)
-        .ok_or_else(|| TensorError::new("tensor offsets out of bounds".into()))?;
+        .ok_or_else(|| TensorError::new("tensor offsets out of bounds"))?;
     let shape_i64: Vec<i64> = shape.iter().map(|&d| d as i64).collect();
     let t = Tensor::from_blob(blob, &shape_i64, DType::Float32, flodl::tensor::Device::CPU)?;
     let cur = variable.data();

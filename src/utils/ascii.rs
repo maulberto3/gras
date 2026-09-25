@@ -311,27 +311,21 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         let lane = (lane_x0 + j * lane_step).min(width - 1);
 
         // East run from source port to lane
-        for c in (src + 1)..lane.min(width) {
-            if c < width {
-                let ch = canvas[src_track[j]][c];
-                canvas[src_track[j]][c] = match ch {
-                    '│' => '┼',
-                    ' ' => '─',
-                    other => other,
-                };
-            }
+        for slot in canvas[src_track[j]][(src + 1)..lane.min(width)].iter_mut() {
+            *slot = match *slot {
+                '│' => '┼',
+                ' ' => '─',
+                other => other,
+            };
         }
 
         // West run from lane to target port
-        for c in (tgt + 1..lane).rev() {
-            if c < width {
-                let ch = canvas[tgt_track[j]][c];
-                canvas[tgt_track[j]][c] = match ch {
-                    '│' => '┼',
-                    ' ' => '─',
-                    other => other,
-                };
-            }
+        for slot in canvas[tgt_track[j]][(tgt + 1)..lane].iter_mut().rev() {
+            *slot = match *slot {
+                '│' => '┼',
+                ' ' => '─',
+                other => other,
+            };
         }
     }
 

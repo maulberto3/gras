@@ -72,6 +72,7 @@ pub fn seed_step_randomness(net_seed: u64, step: u64, call_index: u64) {
 /// replays) — bundling both into one call makes that ordering impossible to
 /// get wrong at the call site. Custom schemes that manage their own RNG can
 /// call [`train_one_step`] directly.
+#[allow(clippy::too_many_arguments)] // seed triple + step inputs; all required, none optional
 pub fn deterministic_train_step(
     net_seed: u64,
     step: u64,

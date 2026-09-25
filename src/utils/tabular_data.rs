@@ -38,6 +38,11 @@ impl Dataset {
         self.inputs.shape()[0] as usize
     }
 
+    /// True when the dataset holds no samples.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Cast both tensors to `Float32` if they aren't already — flodl's
     /// native workhorse dtype and this crate's default precision. The
     /// engine calls this on load, so a dataset written in another dtype

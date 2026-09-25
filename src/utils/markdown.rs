@@ -185,7 +185,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("\n| **Nodes table → `Sources`** | which output ports feed this node (`n1_o2` = output 2 of node 1); `*` = orphaned. |");
     out.push_str("\n| **Nodes table → `Combine` / `Std`** | how multiple inputs are merged / whether they're normalized first. |");
     out.push_str("\n| **Edge list & wiring diagram** | one line per wire, exact ports (`n0_o1 → n2_i0`); `<<<<` = long jump; `▶ ◀ *` = wired out / wired in / orphaned. |");
-    out.push_str("\n");
+    out.push('\n');
 
     out
 }
