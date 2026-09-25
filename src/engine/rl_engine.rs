@@ -46,6 +46,40 @@ impl RlEngine {
     ) -> Result<Self> {
         Ok(Self(CoreEngine::from_spec(spec)?))
     }
+
+    /// Build an RL run from an [`RLSpec`] DIRECTLY — no enum wrapping.
+    ///
+    /// The typed-spec path: keep your spec in a variable (or a const panel /
+    /// config file), tweak it, feed it here. Equivalent to
+    /// `RlEngine::from_spec(RunSpec::rl(..))` minus the enum round-trip; the
+    /// trainer is auto-boxed, so a concrete `CartPoleTrainer` goes straight
+    /// in.
+    ///
+    /// ```ignore
+    /// let spec = RLSpec {
+    ///     config: builder,
+    ///     fitness: Fitness::reported(Direction::Maximize, "turns"),
+    ///     trainer,                       // impl RlStep + 'static
+    ///     seed: Some(42),
+    ///     run_dir: None,
+    /// };
+    /// let mut engine = RlEngine::from_rl_spec(spec)?;
+    /// engine.run()?;
+    /// ```
+    pub fn from_rl_spec<T: crate::trainer::RlStep + 'static>(
+        spec: crate::engine::run_spec::RLSpec<T>,
+    ) -> Result<Self> {
+        let crate::engine::run_spec::RLSpec {
+            config,
+            fitness,
+            trainer,
+            seed,
+            run_dir,
+        } = spec;
+        Ok(Self(CoreEngine::from_spec(
+            crate::engine::run_spec::RunSpec::rl(config, fitness, trainer, seed, run_dir),
+        )?))
+    }
     /// Resume an **RL** run (no dataset) from its run directory, reusing the
     /// persisted identity — the environment-driven sibling of [`crate::engine::TabularEngine::resume`].
     ///

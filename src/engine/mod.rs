@@ -33,5 +33,5 @@ pub use config::{
 pub use core::CoreEngine;
 pub use fitness::{Direction, Fitness, FitnessLabel};
 pub use rl_engine::RlEngine;
-pub use run_spec::{RunSpec, StreamShape};
+pub use run_spec::{RLSpec, RunSpec, StreamShape, TabularSpec};
 pub use tabular_engine::TabularEngine;

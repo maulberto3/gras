@@ -47,6 +47,28 @@ impl TabularEngine {
     ) -> Result<Self> {
         Ok(Self(CoreEngine::from_spec(spec)?))
     }
+
+    /// Build a tabular run from a [`TabularSpec`] DIRECTLY — no enum
+    /// wrapping. The typed-spec path: keep your spec in a variable, tweak it,
+    /// feed it here. Trainer is auto-boxed. Mirrors
+    /// [`RlEngine::from_rl_spec`](crate::engine::RlEngine::from_rl_spec).
+    pub fn from_tabular_spec<T: crate::trainer::TabularStep + 'static>(
+        spec: crate::engine::run_spec::TabularSpec<T>,
+    ) -> Result<Self> {
+        let crate::engine::run_spec::TabularSpec {
+            data_dir,
+            config,
+            fitness,
+            trainer,
+            seed,
+            run_dir,
+        } = spec;
+        Ok(Self(CoreEngine::from_spec(
+            crate::engine::run_spec::RunSpec::tabular(
+                data_dir, config, fitness, trainer, seed, run_dir,
+            ),
+        )?))
+    }
     /// Resume a run from its run directory + the same spec shape as `new`
     /// (minus seed/run_dir — both come from the persisted `engine.json` and
     /// the directory itself). The trainer must be the same scheme the run
