@@ -35,8 +35,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use gras::engine::config::LogLevel;
 use gras::engine::fitness::{Direction, Fitness};
-use gras::engine::{RaceConfig, RaceEngine};
-use gras::graph::topology::TopologyOptions;
+use gras::engine::{RaceConfig, TabularEngine};
 use gras::utils::{score, tabular_data};
 
 const SEED: u64 = 42;
@@ -75,17 +74,12 @@ fn main() {
     );
     drop(peeked);
 
-    let topo_opts = TopologyOptions {
-        input_dim: Some(d_in),
-        output_dim: Some(d_out),
-        ..Default::default()
-    };
 
     let mut builder = RaceConfig::builder()
         .set_pop_size(POP)
         .set_stop_max_steps(steps)
         .set_topology_hidden_dim_range(4, 16)
-        .set_topology_options(topo_opts)
+        .set_topology_input_dim(d_in).set_topology_output_dim(d_out)
         .set_run_log_level(LogLevel::None)
         .set_checkpoint_every(steps + 1);
     if evolve {
@@ -97,7 +91,7 @@ fn main() {
 
     let _ = std::fs::remove_dir_all(&run_dir);
 
-    let mut engine = RaceEngine::new(gras::engine::RunSpec::tabular(
+    let mut engine = TabularEngine::from_spec(gras::engine::RunSpec::tabular(
         data_dir.to_path_buf(),
         config,
         Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy"),
