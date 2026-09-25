@@ -230,7 +230,7 @@ pub struct CoreEngine {
     /// this core and are the public types; this field stays the internal
     /// dispatch enum until step 8/9 deletes it in favor of per-mode concrete
     /// trainers.
-    pub(crate) trainer: crate::trainer::ModeTrainer,
+    pub(crate) trainer: Box<dyn crate::trainer::EngineTrainer>,
     /// Per-step log verbosity for the engine.
     pub(crate) log_level: crate::engine::config::LogLevel,
     /// Graceful Ctrl+C flag (set by `run`'s signal handler, consumed by
@@ -429,7 +429,8 @@ impl CoreEngine {
             RS::Tabular(s) => (
                 s.config,
                 s.fitness,
-                crate::trainer::ModeTrainer::Tabular(s.trainer),
+                Box::new(crate::trainer::ModeTrainer::Tabular(s.trainer))
+                    as Box<dyn crate::trainer::EngineTrainer>,
                 s.seed,
                 s.run_dir,
                 Some(s.data_dir),
@@ -437,7 +438,8 @@ impl CoreEngine {
             RS::RL(s) => (
                 s.config,
                 s.fitness,
-                crate::trainer::ModeTrainer::Rl(s.trainer),
+                Box::new(crate::trainer::ModeTrainer::Rl(s.trainer))
+                    as Box<dyn crate::trainer::EngineTrainer>,
                 s.seed,
                 s.run_dir,
                 None,
@@ -1077,7 +1079,7 @@ impl CoreEngine {
                 // (self.networks) and the &mut trainer call don't alias.
                 let mut trainer = std::mem::replace(
                     &mut self.trainer,
-                    crate::trainer::ModeTrainer::Rl(Box::new(NoopPopTrainer)),
+                    Box::new(crate::trainer::ModeTrainer::Rl(Box::new(NoopPopTrainer))),
                 );
                 // One pass over the map — multiple get_mut borrows stored at
                 // once don't compile (NLL), but iter_mut does.
@@ -2058,7 +2060,7 @@ impl CoreEngine {
         let fit_stats = stats(&fits);
         // The mode's middle column: tabular reports the held-out eval loss,
         // RL reports the environment volume it actually played.
-        let mid = if self.trainer.is_tabular() {
+        let mid = if !self.trainer.is_rl() {
             format!("eval_loss↓ {}", stats(&evals))
         } else {
             self.step_rl.label()
@@ -2141,7 +2143,7 @@ impl CoreEngine {
         // since every glyph here is 3-byte UTF-8 but consistently present
         // per column) — so alignment holds.
         let mut rows: Vec<String> = vec![
-            if self.trainer.is_tabular() {
+            if !self.trainer.is_rl() {
                 format!(
                     "pop {:>3} │ train_loss↓ {:.2}{} │ eval_loss↓ {:.2}{}",
                     pop,
@@ -2830,7 +2832,7 @@ impl CoreEngine {
     /// data) do not. The ledger still stores 0.0 for those; this predicate is
     /// what lets the log print `—` instead of a fabricated score.
     fn exam_available(&self) -> bool {
-        self.stream.is_some() && self.dataset.is_some() && self.trainer.as_tabular().is_some()
+        self.stream.is_some() && self.dataset.is_some() && !self.trainer.is_rl()
     }
 
     /// The gate bar a crossover child faces at `clock` — the exact quantity
@@ -2876,9 +2878,9 @@ impl CoreEngine {
         let (stream, dataset, loss) = match (
             self.stream.as_ref(),
             self.dataset.as_ref(),
-            self.trainer.as_tabular(),
+            self.trainer.tabular_loss(),
         ) {
-            (Some(s), Some(d), Some(t)) => (s, d, t.loss()),
+            (Some(s), Some(d), Some(t)) => (s, d, t),
             _ => return Ok(0.0),
         };
         let exam_batch = stream.exam_batch(dataset, era)?;
@@ -3487,7 +3489,7 @@ impl CoreEngine {
 /// *declared* drift early. The parity assert remains the hard gate.
 pub(crate) fn assert_trainer_blob_matches(
     recorded: &Option<serde_json::Value>,
-    incoming_trainer: &crate::trainer::ModeTrainer,
+    incoming_trainer: &dyn crate::trainer::EngineTrainer,
     caller: &str,
 ) -> Result<()> {
     let Some(recorded) = recorded else {

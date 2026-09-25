@@ -111,7 +111,8 @@ impl RlEngine {
             ))
             .into());
         }
-        let trainer = crate::trainer::ModeTrainer::Rl(Box::new(trainer));
+        let trainer = Box::new(crate::trainer::ModeTrainer::Rl(Box::new(trainer)))
+            as Box<dyn crate::trainer::EngineTrainer>;
         let header = crate::state::load_engine_json(&run_dir)?;
         // Counter snapshot before `header` moves (see the tabular flavor).
         let persisted_counters = RunHeader {
@@ -120,7 +121,7 @@ impl RlEngine {
             children_born_at_clock: header.children_born_at_clock.clone(),
             ..header.clone()
         };
-        assert_trainer_blob_matches(&header.trainer, &trainer, "resume_rl")?;
+        assert_trainer_blob_matches(&header.trainer, trainer.as_ref(), "resume_rl")?;
         // The persisted run must itself be RL: its frontier was trained with
         // no dataset, so replaying it as tabular (or vice versa) is a bug.
         // `engine_mode` is the root discriminator; legacy headers derive it

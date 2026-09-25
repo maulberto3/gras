@@ -156,7 +156,8 @@ impl TabularEngine {
         fitness: Fitness,
         trainer: impl crate::trainer::TabularStep + 'static,
     ) -> Result<Self> {
-        let trainer = crate::trainer::ModeTrainer::Tabular(Box::new(trainer));
+        let trainer = Box::new(crate::trainer::ModeTrainer::Tabular(Box::new(trainer)))
+            as Box<dyn crate::trainer::EngineTrainer>;
         let header = crate::state::load_engine_json(&run_dir)?;
         // Pluck the run-level counters out BEFORE `header` moves into the
         // engine struct (resume restores them after the frontier loads).
@@ -179,7 +180,7 @@ impl TabularEngine {
                 .into())
             }
         }
-        assert_trainer_blob_matches(&header.trainer, &trainer, "resume")?;
+        assert_trainer_blob_matches(&header.trainer, trainer.as_ref(), "resume")?;
         let dataset =
             crate::utils::tabular_data::resolve_dataset(&data_dir)?.to_device(config.device())?;
         let metrics = config.metrics.clone();

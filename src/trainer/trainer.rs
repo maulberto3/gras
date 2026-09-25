@@ -259,6 +259,40 @@ pub trait RlStep: StepTrainer {
 
 // ── Trait-object plumbing ────────────────────────────────────────────────────
 
+/// The ENGINE's view of any trainer — the seam the split rests on
+/// (TODO.md step 8). The engine core never knows which mode it serves; it
+/// talks to this trait. Implemented by the per-mode dispatch object
+/// (`ModeTrainer` today, per-engine concrete boxes after the mode-ifs
+/// collapse). Sealed: only this module can add implementations.
+pub trait EngineTrainer: Send {
+    fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
+    fn describe(&self) -> Option<serde_json::Value>;
+    /// RL pop-wide phase (no-op for tabular): see [`RlStep::pop_phase`].
+    fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize);
+    /// One training step — the mode decides which context type to build.
+    #[allow(clippy::too_many_arguments)]
+    fn train_step(
+        &mut self,
+        net: &mut Network,
+        optimizer: &mut dyn flodl::nn::optim::Optimizer,
+        step: usize,
+        data: Option<&RunData<'_>>,
+        fitness: &crate::engine::fitness::Fitness,
+        metrics: &[crate::engine::fitness::Metric],
+        env: StepEnv,
+        net_hash: &str,
+        net_seed: u64,
+    ) -> flodl::tensor::Result<StepReport>;
+    /// Mode tag (drives the engine's log columns and RL-only phases).
+    fn is_rl(&self) -> bool;
+    /// The tabular loss, when this is a tabular trainer (checkpoint exam).
+    fn tabular_loss(&self) -> Option<super::LossFn<'_>>;
+    /// Requested batch geometry (tabular only; `None` for RL).
+    fn stream_shape(&self) -> Option<StreamShape> {
+        None
+    }
+}
+
 /// The engine's boxed trainer, tagged by mode. Built from the matching
 /// [`RunSpec`](crate::engine::RunSpec) variant; each step dispatches on the
 /// arm so a Tabular step always carries data and an RL step never does.
@@ -363,6 +397,43 @@ impl ModeTrainer {
                 t.train_step(net, optimizer, step, &ctx)
             }
         }
+    }
+}
+
+impl EngineTrainer for ModeTrainer {
+    fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
+        ModeTrainer::make_optimizer(self, net)
+    }
+    fn describe(&self) -> Option<serde_json::Value> {
+        ModeTrainer::describe(self)
+    }
+    fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize) {
+        ModeTrainer::pop_phase(self, nets, step)
+    }
+    fn train_step(
+        &mut self,
+        net: &mut Network,
+        optimizer: &mut dyn flodl::nn::optim::Optimizer,
+        step: usize,
+        data: Option<&RunData<'_>>,
+        fitness: &crate::engine::fitness::Fitness,
+        metrics: &[crate::engine::fitness::Metric],
+        env: StepEnv,
+        net_hash: &str,
+        net_seed: u64,
+    ) -> flodl::tensor::Result<StepReport> {
+        ModeTrainer::train_step(
+            self, net, optimizer, step, data, fitness, metrics, env, net_hash, net_seed,
+        )
+    }
+    fn is_rl(&self) -> bool {
+        ModeTrainer::is_rl(self)
+    }
+    fn tabular_loss(&self) -> Option<super::LossFn<'_>> {
+        self.as_tabular().map(|t| t.loss())
+    }
+    fn stream_shape(&self) -> Option<StreamShape> {
+        ModeTrainer::stream_shape(self)
     }
 }
 
