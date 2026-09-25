@@ -28,7 +28,7 @@ use flodl::{Tensor, Variable};
 /// them — `RaceConfig` has no training knobs.
 pub struct TabularTrainer {
     /// The loss this scheme trains against (supervised paradigm).
-    pub loss_fn: Box<dyn Fn(&Variable, &Variable) -> Result<Variable> + Send + Sync>,
+    pub loss_fn: crate::trainer::BoxedLossFn,
     /// Adam learning rate for every optimizer this scheme creates.
     pub learning_rate: f32,
     /// Gradient-norm clip applied per optimizer step (0 = off).
@@ -122,7 +122,7 @@ impl Default for TabularTrainer {
         Self {
             // Fallback loss (plain cross-entropy) so `Default` stays
             // available; real runs construct via `TabularTrainer::new(loss)`.
-            loss_fn: Box::new(|pred, y| crate::utils::score::cross_entropy_onehot_loss(pred, y)),
+            loss_fn: Box::new(crate::utils::score::cross_entropy_onehot_loss),
             learning_rate: crate::engine::config::DEFAULT_LR,
             grad_clip: 1.0,
             batch_size: 16,

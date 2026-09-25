@@ -373,7 +373,7 @@ impl EngineTrainer for ModeAdapter<Box<dyn RlStep>> {
         net: &mut Network,
         optimizer: &mut dyn flodl::nn::optim::Optimizer,
         step: usize,
-        data: Option<&RunData<'_>>,
+        _data: Option<&RunData<'_>>,
         fitness: &crate::engine::fitness::Fitness,
         metrics: &[crate::engine::fitness::Metric],
         env: StepEnv,

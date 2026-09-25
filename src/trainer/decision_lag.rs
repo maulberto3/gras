@@ -43,7 +43,7 @@
 //! which is the only weights that ever decide or rank.
 
 use crate::graph::network::Network;
-use crate::trainer::trainer::{RlContext, RlStep, StepEnv, StepReport, StepTrainer};
+use crate::trainer::core::{RlContext, RlStep, StepEnv, StepReport, StepTrainer};
 
 /// The decision-lag relay around any [`RlStep`] trainer. See the module docs.
 ///
@@ -373,7 +373,7 @@ fn net_device(net: &Network) -> flodl::Device {
 mod tests {
     use super::*;
     use crate::engine::fitness::{Direction, Fitness};
-    use crate::trainer::trainer::{RlContext, StepEnv};
+    use crate::trainer::core::{RlContext, StepEnv};
     use flodl::nn::Module;
 
     /// Minimal RL trainer: fitness = net.forward(specific input)'s first
@@ -401,7 +401,7 @@ mod tests {
             use flodl::nn::Module;
             // Differentiable scalar: mean of the net's output. Trainable.
             let x = flodl::Variable::new(
-                flodl::Tensor::from_f32(&vec![0.5; 4], &[1, 4], flodl::Device::CPU)?,
+                flodl::Tensor::from_f32(&[0.5; 4], &[1, 4], flodl::Device::CPU)?,
                 true,
             );
             let out = net.forward(&x)?;
@@ -520,7 +520,7 @@ mod tests {
         let mut replay = probe_net();
         replay.import_weights(&face_before_step1).unwrap();
         let x = flodl::Variable::new(
-            flodl::Tensor::from_f32(&vec![0.5; 4], &[1, 4], flodl::Device::CPU).unwrap(),
+            flodl::Tensor::from_f32(&[0.5; 4], &[1, 4], flodl::Device::CPU).unwrap(),
             false,
         );
         let out = replay.forward(&x).unwrap();

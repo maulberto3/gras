@@ -6,12 +6,12 @@
 pub mod decision_lag;
 pub mod stream;
 pub mod supervised;
-pub mod trainer;
+pub mod core;
 
 pub use decision_lag::DecisionLagTrainer;
 pub use flodl::Variable;
 pub use supervised::TabularTrainer;
-pub use trainer::{
+pub use core::{
     EngineTrainer, IntoBoxedTrainer, ModeAdapter, RlContext, RlStep, RlStepMeta, RunData, StepEnv,
     StepReport, StepTrainer, StreamShape, TabularContext, TabularStep,
 };
@@ -23,3 +23,11 @@ pub type LossFn<'a> = &'a (
             + Send
             + Sync
     );
+
+/// Owned (boxed) form of the loss-function signature.
+pub type BoxedLossFn = Box<
+    dyn Fn(&flodl::Variable, &flodl::Variable) -> flodl::tensor::Result<flodl::Variable>
+        + Send
+        + Sync
+        + 'static,
+>;
