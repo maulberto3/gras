@@ -108,7 +108,7 @@ const POP: usize = 100;
 /// shadow's steps are batched onto the cycle's last step, so that step costs
 /// ≈ this many × a normal one (a visible `took Xs` spike); the amortized env
 /// cost stays ≈ 2×.
-const RELAY_LAG: usize = 5;
+const RELAY_LAG: usize = 2;
 
 /// The policy's learning rate — an ordinary f32 knob like every other const
 /// here (gras is f32 end to end). flodl's `Adam::new` is typed `f64` because

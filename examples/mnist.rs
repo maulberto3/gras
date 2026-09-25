@@ -179,6 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_checkpoint_every(CHECKPOINT_EVERY) // Steps between checkpoint gate recordings
         .set_crossover_gate(gras::engine::config::CrossoverGate::Soft) // Gate strictness for crossover children: CrossoverGate::Hard (beat every checkpoint bar) or CrossoverGate::Soft (beat the mean of the bars)
         .set_crossover_retries(3) // cx_retry_full: gate-rejected child ⇒ up to 3 TOTAL attempts (fresh parents + generate + gate each), then the roll is spent. Every attempt (inserted or rejected) is recorded in history.csv
+        .set_immigrant_fresh_start(false)
         // .set_crossover_ops_pool(["one_point".into(), "uniform".into()]) // Crossover operators drawn per attempt. Empty (default) ⇒ both. The chosen op is logged per child in its lineage note (crossover-one-point / crossover-uniform).
         .set_mutate_prob(0.5) // Probability of an immigrant roll firing per step
         .set_mutate_rolls(pop / 5) // Number of random immigrant substitution rolls per step
