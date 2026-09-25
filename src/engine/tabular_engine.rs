@@ -7,7 +7,7 @@
 //! in [`crate::engine::core::RaceEngine`] and is shared with the RL engine.
 
 use super::config::{RaceConfig, RaceSnapshot, StopReason};
-use super::core::{RaceEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
+use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
 use super::smoothing::RollingBuffer;
 use crate::engine::fitness::{Fitness, Metric};
 use crate::graph::network::Network;
@@ -19,7 +19,34 @@ use crate::trainer::stream::{BatchStream, PoolSplit};
 use flodl::tensor::Result;
 use std::collections::HashMap;
 
-impl RaceEngine {
+/// The dataset-driven (tabular) engine — the public handle for
+/// `RunSpec::tabular` runs. Wraps [`CoreEngine`]; derefs to it, so every
+/// shared method (step loop, ranking, artifacts) is reachable directly.
+pub struct TabularEngine(pub(crate) CoreEngine);
+
+impl std::ops::Deref for TabularEngine {
+    type Target = CoreEngine;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for TabularEngine {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl TabularEngine {
+    /// Build a tabular run from its spec (mode-validated: the spec variant
+    /// must be `RunSpec::tabular`).
+    pub fn from_spec(
+        spec: crate::engine::run_spec::RunSpec<
+            Box<dyn crate::trainer::TabularStep>,
+            Box<dyn crate::trainer::RlStep>,
+        >,
+    ) -> Result<Self> {
+        Ok(Self(CoreEngine::from_spec(spec)?))
+    }
     /// Resume a run from its run directory + the same spec shape as `new`
     /// (minus seed/run_dir — both come from the persisted `engine.json` and
     /// the directory itself). The trainer must be the same scheme the run
@@ -161,7 +188,7 @@ impl RaceEngine {
             run_seed,
         };
 
-        let mut engine = RaceEngine {
+        let mut engine = CoreEngine {
             run_dir: run_dir.clone(),
             header,
             config,
@@ -203,6 +230,6 @@ impl RaceEngine {
         engine.culls = persisted_counters.culls;
         engine.children_born_at_clock = persisted_counters.children_born_at_clock;
         engine.elapsed_base_secs = persisted_counters.run_elapsed_secs;
-        Ok(engine)
+        Ok(Self(engine))
     }
 }

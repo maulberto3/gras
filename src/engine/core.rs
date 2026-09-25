@@ -192,7 +192,7 @@ pub(crate) struct Checkpoint {
     pub exam_mean_fitness: f32,
 }
 
-// ── RaceEngine ───────────────────────────────────────────────────────────────
+// ── CoreEngine ───────────────────────────────────────────────────────────────
 
 /// The continuous step-race loop.
 ///
@@ -207,7 +207,7 @@ pub(crate) struct Checkpoint {
 /// cull, the culled net's entries are dropped (memory freed). On insert, the
 /// child's entries are added. This is simple, not minimal-memory — fine for
 /// the small default pop; the user runs bigger pops when it matters.
-pub struct RaceEngine {
+pub struct CoreEngine {
     pub(crate) run_dir: std::path::PathBuf,
     pub(crate) header: RunHeader,
     pub(crate) config: RaceConfig,
@@ -225,6 +225,11 @@ pub struct RaceEngine {
     /// one net/one step to this contract (see `crate::trainer::{TabularStep,
     /// RlStep}`). The mode arm decides which context (data or no data) the
     /// step receives.
+    ///
+    /// Engine-split note (TODO.md step 5): `TabularEngine`/`RlEngine` wrap
+    /// this core and are the public types; this field stays the internal
+    /// dispatch enum until step 8/9 deletes it in favor of per-mode concrete
+    /// trainers.
     pub(crate) trainer: crate::trainer::ModeTrainer,
     /// Per-step log verbosity for the engine.
     pub(crate) log_level: crate::engine::config::LogLevel,
@@ -384,7 +389,7 @@ impl RlVolume {
     }
 }
 
-impl RaceEngine {
+impl CoreEngine {
     /// True when per-step detail lines (evolve rollup, per-child gate/cull/
     /// insert lines, checkpoint line, race-start line) should be emitted —
     /// i.e. every level except `Minimal` (table only) and `None` (silent).
@@ -413,7 +418,7 @@ impl RaceEngine {
     ///
     /// After construction, `engine.run_dir()` and `engine.run_seed()` expose
     /// what the engine chose.
-    pub fn new(
+    pub fn from_spec(
         spec: crate::engine::run_spec::RunSpec<
             Box<dyn crate::trainer::TabularStep>,
             Box<dyn crate::trainer::RlStep>,
@@ -640,7 +645,7 @@ impl RaceEngine {
             run_seed,
         };
 
-        let mut engine = RaceEngine {
+        let mut engine = CoreEngine {
             run_dir,
             header,
             dataset,
@@ -3402,7 +3407,7 @@ impl RaceEngine {
     /// Rebuild the run header from the current config and re-write `engine.json`.
     ///
     /// This is an instrumental for later iters, not a required path for Item 4.
-    /// Today the header is written once at ``RaceEngine::new`` and the run config
+    /// Today the header is written once at ``CoreEngine::from_spec`` and the run config
     /// is not mutated mid-run, so this method is a no-op in the current layout.
     /// It exists so a future iter can re-serialize the header if/when it adds a
     /// mid-run config change (for example a live ``max_steps`` or
@@ -3648,7 +3653,7 @@ mod tests {
         dir
     }
 
-    fn engine(run_dir: &std::path::Path, seed: u64) -> Result<RaceEngine> {
+    fn engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::TabularEngine> {
         // pop_size 0 ⇒ new() auto-seeds nothing; each test seeds its own
         // tiny topologies explicitly.
         let data_dir = tiny_dataset_dir("engine");
@@ -3656,7 +3661,7 @@ mod tests {
             pop_size: 0,
             ..RaceConfig::defaults()
         };
-        RaceEngine::new(crate::engine::run_spec::RunSpec::tabular(
+        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
             data_dir,
             config,
             fitness(),
@@ -4226,14 +4231,15 @@ mod tests {
             immigrant_fresh_start: true,
             ..RaceConfig::defaults()
         };
-        let result = RaceEngine::new(crate::engine::run_spec::RunSpec::tabular(
-            data_dir,
-            config,
-            fitness(),
-            crate::trainer::TabularTrainer::new(loss_fn()),
-            Some(9),
-            Some(dir.clone()),
-        ));
+        let result =
+            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+                data_dir,
+                config,
+                fitness(),
+                crate::trainer::TabularTrainer::new(loss_fn()),
+                Some(9),
+                Some(dir.clone()),
+            ));
         let err_text = match result {
             Ok(_) => panic!("tabular + fresh-start must fail at construction"),
             Err(e) => format!("{e}"),
@@ -4473,8 +4479,8 @@ mod tests {
     }
 
     /// RL-mode engine harness: no dataset, no stream, `RunMode::Rl`.
-    fn rl_engine(run_dir: &std::path::Path, seed: u64) -> Result<RaceEngine> {
-        RaceEngine::new(crate::engine::run_spec::RunSpec::rl(
+    fn rl_engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::RlEngine> {
+        crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
             rl_config(0),
             crate::engine::fitness::Fitness::reported(
                 crate::engine::fitness::Direction::Maximize,
@@ -4514,7 +4520,7 @@ mod tests {
                 .map(|h| (h.clone(), eng.state.net(h).unwrap().last_metrics.clone()))
                 .collect();
             // Persist the frontier the way a stop does. (`engine.json` is
-            // already on disk — `RaceEngine::new` writes the header.)
+            // already on disk — `from_spec` writes the header.)
             for h in &hashes {
                 let state = eng.state.net(h).cloned().unwrap();
                 crate::state::write_net_state(dir, &state).unwrap();
@@ -4528,7 +4534,7 @@ mod tests {
         // Interrupted: 3 steps, drop, resume, 2 more.
         let interrupted = run(&dir_b, 3);
         assert_eq!(interrupted[0].1.as_ref().unwrap().step, 2);
-        let mut resumed = RaceEngine::resume_rl(
+        let mut resumed = crate::engine::RlEngine::resume(
             dir_b.clone(),
             rl_config(2),
             crate::engine::fitness::Fitness::reported(
@@ -4563,7 +4569,7 @@ mod tests {
         eng.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
             .unwrap();
         drop(eng);
-        let err = match RaceEngine::resume_rl(
+        let err = match crate::engine::RlEngine::resume(
             dir.clone(),
             rl_config(1),
             crate::engine::fitness::Fitness::reported(
@@ -4601,7 +4607,7 @@ mod tests {
             Some(7),
             None,
         );
-        let err = match RaceEngine::new(spec) {
+        let err = match CoreEngine::from_spec(spec) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("RL spec without set_run_mode(RunMode::Rl) must be rejected"),
         };
@@ -4635,7 +4641,7 @@ mod tests {
             Some(7),
             None,
         );
-        let err = match RaceEngine::new(spec) {
+        let err = match CoreEngine::from_spec(spec) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("RL spec with Computed fitness must be rejected at construction"),
         };
@@ -4647,7 +4653,7 @@ mod tests {
 
     // ── Iter-5: child generation contract ──────────────────────────────
 
-    fn seed_two_parents(dir: &std::path::Path, seed: u64) -> RaceEngine {
+    fn seed_two_parents(dir: &std::path::Path, seed: u64) -> crate::engine::TabularEngine {
         let mut engine = engine(dir, seed).unwrap();
         engine
             .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
@@ -4820,7 +4826,7 @@ mod tests {
         assert_eq!(header.run_elapsed_secs, 120);
         assert_eq!(header.children_born_at_clock.get(&3), Some(&5));
 
-        let resumed = RaceEngine::resume(
+        let resumed = crate::engine::TabularEngine::resume(
             dir.clone(),
             tiny_dataset_dir("resume_counters"),
             {
@@ -4872,7 +4878,7 @@ mod tests {
         crate::state::write_engine_json(&dir, &engine.header).unwrap();
         drop(engine);
 
-        let resumed = RaceEngine::resume(
+        let resumed = crate::engine::TabularEngine::resume(
             dir,
             tiny_dataset_dir("resume_held_out"),
             {
@@ -4919,7 +4925,7 @@ mod tests {
         drop(engine);
 
         // Reconstruct via resume — parity is asserted inside.
-        let mut resumed = RaceEngine::resume(
+        let mut resumed = crate::engine::TabularEngine::resume(
             dir.clone(),
             tiny_dataset_dir("resume"),
             {
@@ -4972,7 +4978,7 @@ mod tests {
         crate::state::write_net_state(&dir_b, &state).unwrap();
         drop(part);
 
-        let mut resumed = RaceEngine::resume(
+        let mut resumed = crate::engine::TabularEngine::resume(
             dir_b,
             tiny_dataset_dir("resume2"),
             {
@@ -5028,11 +5034,12 @@ mod tests {
         engine.config.checkpoint_every = 2;
         // Keep the stream's rotation cadence in sync, exactly as run() does —
         // this test steps nets manually, bypassing run().
+        let ckpt_every = engine.config.checkpoint_every;
         engine
             .stream
             .as_mut()
             .unwrap()
-            .set_checkpoint_every(engine.config.checkpoint_every);
+            .set_checkpoint_every(ckpt_every);
         engine
             .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
@@ -5045,10 +5052,9 @@ mod tests {
             }
             // Trigger checkpoint write in engine.run() equivalent
             if clock > 0 && clock % engine.config.checkpoint_every == 0 {
+                let era = (clock / engine.config.checkpoint_every) as u64;
                 let mean = engine.population_mean_smoothed_fitness();
-                let exam = engine
-                    .run_checkpoint_exam((clock / engine.config.checkpoint_every) as u64)
-                    .unwrap();
+                let exam = engine.run_checkpoint_exam(era).unwrap();
                 engine.checkpoints.push(Checkpoint {
                     step: clock,
                     pop_mean_fitness: mean,
@@ -5068,7 +5074,7 @@ mod tests {
         drop(engine);
 
         // Resume engine
-        let resumed = RaceEngine::resume(
+        let resumed = crate::engine::TabularEngine::resume(
             dir.clone(),
             tiny_dataset_dir("chk_parity"),
             {
@@ -5112,7 +5118,7 @@ mod tests {
         // Resume with pop_size 3 (mismatch, expects 3, only 2 found)
         let mut config = RaceConfig::defaults();
         config.pop_size = 3;
-        let resumed = RaceEngine::resume(
+        let resumed = crate::engine::TabularEngine::resume(
             dir.clone(),
             tiny_dataset_dir("pop_validation"),
             config,
@@ -5145,7 +5151,7 @@ mod tests {
         crate::state::write_net_state(&dir, &state).unwrap();
         drop(engine);
 
-        let resumed = RaceEngine::resume(
+        let resumed = crate::engine::TabularEngine::resume(
             dir.clone(),
             tiny_dataset_dir("blob_mismatch"),
             {
@@ -5184,7 +5190,7 @@ mod tests {
         crate::state::write_net_state(&dir, &state).unwrap();
         drop(engine);
 
-        let resumed = RaceEngine::resume(
+        let resumed = crate::engine::TabularEngine::resume(
             dir.clone(),
             tiny_dataset_dir("blob_match"),
             {
@@ -5244,7 +5250,7 @@ mod tests {
     }
 
     /// Seed every live net with a RAW last-step fitness of `v`.
-    fn seed_raw_fitness(engine: &mut RaceEngine, v: f32) {
+    fn seed_raw_fitness(engine: &mut crate::engine::TabularEngine, v: f32) {
         for h in engine.state.live_hashes() {
             engine
                 .state
@@ -5318,7 +5324,12 @@ mod tests {
 
     // ── Post-race pruner (pop_pruner) ─────────────────────────────────────
 
-    fn pruned_engine(run_dir: &std::path::Path, seed: u64, keep: usize, solo: usize) -> RaceEngine {
+    fn pruned_engine(
+        run_dir: &std::path::Path,
+        seed: u64,
+        keep: usize,
+        solo: usize,
+    ) -> crate::engine::TabularEngine {
         let data_dir = tiny_dataset_dir("pruner");
         let config = RaceConfig {
             pop_size: 0,
@@ -5330,7 +5341,7 @@ mod tests {
             }),
             ..RaceConfig::defaults()
         };
-        RaceEngine::new(crate::engine::run_spec::RunSpec::tabular(
+        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
             data_dir,
             config,
             fitness(),

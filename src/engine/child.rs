@@ -25,7 +25,7 @@ use crate::graph::topology::Topology;
 use crate::state::{NetMetrics, NetState, write_net_state};
 use crate::utils::seed::derive_seed;
 
-use super::core::RaceEngine;
+use super::core::CoreEngine;
 use super::smoothing::rolling_mean;
 
 /// A freshly-built child net being caught up solo before it rejoins the group.
@@ -39,7 +39,7 @@ pub struct RaceChild {
     pub optimizer: Box<dyn Optimizer>,
 }
 
-impl RaceEngine {
+impl CoreEngine {
     // ── Child generation (Iter 5: roulette → crossover → mutate?) ───────────
 
     /// Generate exactly one child for a culled slot (Iter 5 contract).

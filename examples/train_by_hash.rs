@@ -11,7 +11,7 @@
 
 use clap::Parser;
 use gras::engine::fitness::{Direction, Fitness};
-use gras::engine::{RaceConfig, RaceEngine};
+use gras::engine::{RaceConfig, TabularEngine};
 use gras::graph::network::Network;
 use gras::graph::topology::Topology;
 use gras::state::{load_engine_json, load_net_state};
@@ -205,7 +205,7 @@ fn setup_demo_run() -> (PathBuf, String, PathBuf) {
         .with_learning_rate(1e-3)
         .with_grad_clip(1.0);
 
-    let mut engine = RaceEngine::new(gras::engine::RunSpec::tabular(
+    let mut engine = TabularEngine::from_spec(gras::engine::RunSpec::tabular(
         data_dir.clone(),
         config,
         fitness,

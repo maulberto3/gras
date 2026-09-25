@@ -15,7 +15,7 @@ use std::path::Path;
 
 use clap::Parser;
 use gras::engine::fitness::{Direction, Fitness, Metric};
-use gras::engine::{RaceConfig, RaceEngine};
+use gras::engine::{RaceConfig, TabularEngine};
 use gras::utils::{score, tabular_data};
 
 /// The command line: the shared engine flags (this example has no extra knobs).
@@ -73,7 +73,7 @@ fn main() {
 
     // 4. Run — one RunSpec; the cross-entropy loss lives inside the trainer.
     let run_seed = 42u64;
-    let mut engine = RaceEngine::new(gras::engine::RunSpec::tabular(
+    let mut engine = TabularEngine::from_spec(gras::engine::RunSpec::tabular(
         data_dir,
         config,
         fitness,

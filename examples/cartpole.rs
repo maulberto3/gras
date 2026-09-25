@@ -52,7 +52,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness};
-use gras::engine::{RaceConfig, RaceEngine, RunMode};
+use gras::engine::{RaceConfig, RlEngine, RunMode};
 use gras::flodl::Tensor;
 use gras::flodl::nn::optim::Optimizer;
 use gras::graph::network::Network;
@@ -966,7 +966,7 @@ fn main() {
         builder: RaceConfig,
         fitness: Fitness,
         trainer: T,
-    ) -> RaceEngine {
+    ) -> RlEngine {
         match &cli.resume {
             // Resume: the seed and the net frontier come from the run directory;
             // the stop criteria come from THIS config, which is how a stopped run
@@ -975,9 +975,9 @@ fn main() {
             // from (net_seed, step, match_i), so the env is fully reproducible).
             Some(dir) => {
                 println!("Resuming RL run from {} …", dir.display());
-                RaceEngine::resume_rl(dir.clone(), builder, fitness, trainer)
+                RlEngine::resume(dir.clone(), builder, fitness, trainer)
             }
-            None => RaceEngine::new(gras::engine::RunSpec::rl(
+            None => RlEngine::from_spec(gras::engine::RunSpec::rl(
                 builder,
                 fitness,
                 trainer,

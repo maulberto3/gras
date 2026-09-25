@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gras::engine::fitness::{Direction, Fitness, Metric};
-use gras::engine::{RaceConfig, RaceEngine};
+use gras::engine::{RaceConfig, TabularEngine};
 use gras::utils::{score, tabular_data};
 use gras::{RunMode, Variable};
 
@@ -229,7 +229,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut engine = match &cli.resume {
         Some(dir) => {
             println!("Resuming from {}", dir.display());
-            RaceEngine::resume(
+            TabularEngine::resume(
                 dir.clone(),
                 data_dir.to_path_buf(),
                 builder,
@@ -237,7 +237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 trainer,
             )?
         }
-        None => RaceEngine::new(gras::engine::RunSpec::tabular(
+        None => TabularEngine::from_spec(gras::engine::RunSpec::tabular(
             data_dir,
             builder,
             fitness,

@@ -42,7 +42,7 @@ use gras::flodl::nn::optim::Optimizer;
 
 use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness, Metric};
-use gras::engine::{RaceConfig, RaceEngine};
+use gras::engine::{RaceConfig, TabularEngine};
 use gras::graph::network::Network;
 use gras::trainer::{StepReport, StepTrainer, TabularContext, TabularStep};
 use gras::utils::{score, tabular_data};
@@ -274,7 +274,7 @@ fn main() {
 
     // Run — the ONLY difference from a default run is the trainer argument:
     let run_seed = 42u64;
-    let mut engine = RaceEngine::new(gras::engine::RunSpec::tabular(
+    let mut engine = TabularEngine::from_spec(gras::engine::RunSpec::tabular(
         data_dir,
         config,
         fitness,

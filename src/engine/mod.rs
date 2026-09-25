@@ -30,6 +30,8 @@ pub mod tabular_engine;
 pub use config::{
     CrossCullPolicy, MutationCullPolicy, RaceConfig, RaceSnapshot, RunMode, StopReason,
 };
-pub use core::RaceEngine;
+pub use core::CoreEngine;
 pub use fitness::{Direction, Fitness, FitnessLabel};
+pub use rl_engine::RlEngine;
 pub use run_spec::{RunSpec, StreamShape};
+pub use tabular_engine::TabularEngine;

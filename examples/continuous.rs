@@ -16,7 +16,7 @@ use std::path::Path;
 use clap::Parser;
 use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness, Metric};
-use gras::engine::{RaceConfig, RaceEngine};
+use gras::engine::{RaceConfig, TabularEngine};
 use gras::utils::{score, tabular_data};
 
 /// The command line: the shared engine flags (this example has no extra knobs).
@@ -80,7 +80,7 @@ fn main() {
         let sq = diff.mul(&diff)?;
         Ok(Variable::new(sq.mean()?, true))
     };
-    let mut engine = RaceEngine::new(gras::engine::RunSpec::tabular(
+    let mut engine = TabularEngine::from_spec(gras::engine::RunSpec::tabular(
         data_dir,
         config,
         fitness,
