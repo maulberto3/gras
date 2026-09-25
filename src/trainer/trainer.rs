@@ -261,9 +261,9 @@ pub trait RlStep: StepTrainer {
 
 /// The ENGINE's view of any trainer — the seam the split rests on
 /// (TODO.md step 8). The engine core never knows which mode it serves; it
-/// talks to this trait. Implemented by the per-mode dispatch object
-/// (`ModeTrainer` today, per-engine concrete boxes after the mode-ifs
-/// collapse). Sealed: only this module can add implementations.
+/// talks to this trait. Implemented by [`ModeAdapter`], the per-mode
+/// adapter whose type carries the mode tag. Sealed: only this module can
+/// add implementations.
 pub trait EngineTrainer: Send {
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
     fn describe(&self) -> Option<serde_json::Value>;
@@ -293,70 +293,34 @@ pub trait EngineTrainer: Send {
     }
 }
 
-/// The engine's boxed trainer, tagged by mode. Built from the matching
-/// [`RunSpec`](crate::engine::RunSpec) variant; each step dispatches on the
-/// arm so a Tabular step always carries data and an RL step never does.
-pub enum ModeTrainer {
-    /// Dataset-driven scheme (from `RunSpec::tabular`).
-    Tabular(Box<dyn TabularStep>),
-    /// Environment-driven scheme (from `RunSpec::RL`).
-    Rl(Box<dyn RlStep>),
+/// Per-mode engine adapter: statically knows its mode, wraps the boxed
+/// user trainer. The mode tag lives in the TYPE, not a runtime enum arm
+/// (TODO.md step 8/9 — replaces the deleted ModeTrainer enum).
+pub struct ModeAdapter<T: Send + 'static> {
+    inner: T,
 }
 
-impl ModeTrainer {
-    /// Which mode this trainer serves.
-    pub fn is_tabular(&self) -> bool {
-        matches!(self, ModeTrainer::Tabular(_))
+impl ModeAdapter<Box<dyn TabularStep>> {
+    pub fn tabular(inner: Box<dyn TabularStep>) -> Self {
+        Self { inner }
     }
+}
 
-    /// RL arm check (mirror of [`Self::is_tabular`]).
-    pub fn is_rl(&self) -> bool {
-        matches!(self, ModeTrainer::Rl(_))
+impl ModeAdapter<Box<dyn RlStep>> {
+    pub fn rl(inner: Box<dyn RlStep>) -> Self {
+        Self { inner }
     }
+}
 
-    /// The Tabular arm, if this is one. The engine's tabular-only paths
-    /// (stream shape resolution, the loss-based checkpoint exam) use this.
-    pub fn as_tabular(&self) -> Option<&dyn TabularStep> {
-        match self {
-            ModeTrainer::Tabular(t) => Some(t.as_ref()),
-            ModeTrainer::Rl(_) => None,
-        }
+impl EngineTrainer for ModeAdapter<Box<dyn TabularStep>> {
+    fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
+        self.inner.make_optimizer(net)
     }
-
-    /// Batch-shape request from a Tabular trainer; RL has no stream, so it
-    /// is always `None` there.
-    pub fn stream_shape(&self) -> Option<StreamShape> {
-        self.as_tabular().and_then(|t| t.stream_shape())
+    fn describe(&self) -> Option<serde_json::Value> {
+        self.inner.describe()
     }
-
-    pub fn describe(&self) -> Option<serde_json::Value> {
-        match self {
-            ModeTrainer::Tabular(t) => t.describe(),
-            ModeTrainer::Rl(t) => t.describe(),
-        }
-    }
-
-    /// Pop-wide phase dispatch (RL only): see [`RlStep::pop_phase`]. Tabular
-    /// has no such phase — its group step IS shared by construction (the
-    /// shared batch stream).
-    pub(crate) fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize) {
-        if let ModeTrainer::Rl(t) = self {
-            t.pop_phase(nets, step);
-        }
-    }
-
-    pub fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
-        match self {
-            ModeTrainer::Tabular(t) => t.make_optimizer(net),
-            ModeTrainer::Rl(t) => t.make_optimizer(net),
-        }
-    }
-
-    /// Run one training step with an optional data handle. The mode decides
-    /// which context type is constructed: Tabular requires `data` to be
-    /// `Some` (the engine guarantees this — it is a construction invariant,
-    /// not a per-step check); RL ignores it entirely.
-    pub(crate) fn train_step(
+    fn pop_phase(&mut self, _nets: &mut [(String, &mut Network)], _step: usize) {}
+    fn train_step(
         &mut self,
         net: &mut Network,
         optimizer: &mut dyn flodl::nn::optim::Optimizer,
@@ -368,47 +332,41 @@ impl ModeTrainer {
         net_hash: &str,
         net_seed: u64,
     ) -> flodl::tensor::Result<StepReport> {
-        match self {
-            ModeTrainer::Tabular(t) => {
-                let data = data.expect(
-                    "ModeTrainer::Tabular step without data — engine construction invariant violated",
-                );
-                let ctx = TabularContext {
-                    data: RunData {
-                        dataset: data.dataset,
-                        stream: data.stream,
-                    },
-                    fitness,
-                    metrics,
-                    env,
-                    net_hash,
-                    net_seed,
-                };
-                t.train_step(net, optimizer, step, &ctx)
-            }
-            ModeTrainer::Rl(t) => {
-                let ctx = RlContext {
-                    fitness,
-                    metrics,
-                    env,
-                    net_hash,
-                    net_seed,
-                };
-                t.train_step(net, optimizer, step, &ctx)
-            }
-        }
+        let data =
+            data.expect("Tabular step without data — engine construction invariant violated");
+        let ctx = TabularContext {
+            data: RunData {
+                dataset: data.dataset,
+                stream: data.stream,
+            },
+            fitness,
+            metrics,
+            env,
+            net_hash,
+            net_seed,
+        };
+        self.inner.train_step(net, optimizer, step, &ctx)
+    }
+    fn is_rl(&self) -> bool {
+        false
+    }
+    fn tabular_loss(&self) -> Option<super::LossFn<'_>> {
+        Some(self.inner.loss())
+    }
+    fn stream_shape(&self) -> Option<StreamShape> {
+        self.inner.stream_shape()
     }
 }
 
-impl EngineTrainer for ModeTrainer {
+impl EngineTrainer for ModeAdapter<Box<dyn RlStep>> {
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
-        ModeTrainer::make_optimizer(self, net)
+        self.inner.make_optimizer(net)
     }
     fn describe(&self) -> Option<serde_json::Value> {
-        ModeTrainer::describe(self)
+        self.inner.describe()
     }
     fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize) {
-        ModeTrainer::pop_phase(self, nets, step)
+        self.inner.pop_phase(nets, step)
     }
     fn train_step(
         &mut self,
@@ -422,21 +380,22 @@ impl EngineTrainer for ModeTrainer {
         net_hash: &str,
         net_seed: u64,
     ) -> flodl::tensor::Result<StepReport> {
-        ModeTrainer::train_step(
-            self, net, optimizer, step, data, fitness, metrics, env, net_hash, net_seed,
-        )
+        let ctx = RlContext {
+            fitness,
+            metrics,
+            env,
+            net_hash,
+            net_seed,
+        };
+        self.inner.train_step(net, optimizer, step, &ctx)
     }
     fn is_rl(&self) -> bool {
-        ModeTrainer::is_rl(self)
+        true
     }
     fn tabular_loss(&self) -> Option<super::LossFn<'_>> {
-        self.as_tabular().map(|t| t.loss())
-    }
-    fn stream_shape(&self) -> Option<StreamShape> {
-        ModeTrainer::stream_shape(self)
+        None
     }
 }
-
 impl StepTrainer for Box<dyn StepTrainer> {
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
         self.as_ref().make_optimizer(net)

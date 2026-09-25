@@ -52,7 +52,7 @@ pub use evolution::selection::SelectionMethod;
 pub use trainer::stream::{BatchStream, PoolSplit};
 pub use trainer::supervised::TabularTrainer;
 pub use trainer::{
-    IntoBoxedTrainer, LossFn, ModeTrainer, RlContext, RlStep, RlStepMeta, RunData, StepEnv,
+    IntoBoxedTrainer, LossFn, ModeAdapter, RlContext, RlStep, RlStepMeta, RunData, StepEnv,
     StepReport, StepTrainer, StreamShape, TabularContext, TabularStep,
 };
 

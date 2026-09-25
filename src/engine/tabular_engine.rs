@@ -156,7 +156,7 @@ impl TabularEngine {
         fitness: Fitness,
         trainer: impl crate::trainer::TabularStep + 'static,
     ) -> Result<Self> {
-        let trainer = Box::new(crate::trainer::ModeTrainer::Tabular(Box::new(trainer)))
+        let trainer = Box::new(crate::trainer::ModeAdapter::tabular(Box::new(trainer)))
             as Box<dyn crate::trainer::EngineTrainer>;
         let header = crate::state::load_engine_json(&run_dir)?;
         // Pluck the run-level counters out BEFORE `header` moves into the

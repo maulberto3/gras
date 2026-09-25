@@ -12,7 +12,7 @@ pub use decision_lag::DecisionLagTrainer;
 pub use flodl::Variable;
 pub use supervised::TabularTrainer;
 pub use trainer::{
-    EngineTrainer, IntoBoxedTrainer, ModeTrainer, RlContext, RlStep, RlStepMeta, RunData, StepEnv,
+    EngineTrainer, IntoBoxedTrainer, ModeAdapter, RlContext, RlStep, RlStepMeta, RunData, StepEnv,
     StepReport, StepTrainer, StreamShape, TabularContext, TabularStep,
 };
 

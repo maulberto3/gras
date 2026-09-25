@@ -66,21 +66,33 @@ use crate::trainer::stream::{BatchStream, PoolSplit};
 /// and its other methods are never called (it lives inside `run` for a few
 /// lines only).
 struct NoopPopTrainer;
-impl crate::trainer::StepTrainer for NoopPopTrainer {
-    fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
-        use flodl::nn::Module;
-        Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
+impl crate::trainer::EngineTrainer for NoopPopTrainer {
+    fn make_optimizer(&self, _net: &Network) -> Box<dyn Optimizer> {
+        unreachable!("NoopPopTrainer never builds optimizers")
     }
-}
-impl crate::trainer::RlStep for NoopPopTrainer {
+    fn describe(&self) -> Option<serde_json::Value> {
+        None
+    }
+    fn pop_phase(&mut self, _nets: &mut [(String, &mut Network)], _step: usize) {}
     fn train_step(
         &mut self,
         _net: &mut Network,
         _optimizer: &mut dyn Optimizer,
         _step: usize,
-        _ctx: &crate::trainer::RlContext<'_>,
+        _data: Option<&crate::trainer::RunData<'_>>,
+        _fitness: &Fitness,
+        _metrics: &[Metric],
+        _env: crate::trainer::StepEnv,
+        _net_hash: &str,
+        _net_seed: u64,
     ) -> flodl::tensor::Result<crate::trainer::StepReport> {
         unreachable!("NoopPopTrainer is a placeholder only for the pop-wide phase")
+    }
+    fn is_rl(&self) -> bool {
+        true
+    }
+    fn tabular_loss(&self) -> Option<crate::trainer::LossFn<'_>> {
+        None
     }
 }
 // Used by the debug contract probe in `step_one_net` and by the checkpoint
@@ -429,7 +441,7 @@ impl CoreEngine {
             RS::Tabular(s) => (
                 s.config,
                 s.fitness,
-                Box::new(crate::trainer::ModeTrainer::Tabular(s.trainer))
+                Box::new(crate::trainer::ModeAdapter::tabular(s.trainer))
                     as Box<dyn crate::trainer::EngineTrainer>,
                 s.seed,
                 s.run_dir,
@@ -438,7 +450,7 @@ impl CoreEngine {
             RS::RL(s) => (
                 s.config,
                 s.fitness,
-                Box::new(crate::trainer::ModeTrainer::Rl(s.trainer))
+                Box::new(crate::trainer::ModeAdapter::rl(s.trainer))
                     as Box<dyn crate::trainer::EngineTrainer>,
                 s.seed,
                 s.run_dir,
@@ -1077,10 +1089,7 @@ impl CoreEngine {
             if self.trainer.is_rl() {
                 // Take the trainer OUT of self so the &mut Network borrows
                 // (self.networks) and the &mut trainer call don't alias.
-                let mut trainer = std::mem::replace(
-                    &mut self.trainer,
-                    Box::new(crate::trainer::ModeTrainer::Rl(Box::new(NoopPopTrainer))),
-                );
+                let mut trainer = std::mem::replace(&mut self.trainer, Box::new(NoopPopTrainer));
                 // One pass over the map — multiple get_mut borrows stored at
                 // once don't compile (NLL), but iter_mut does.
                 let live: std::collections::HashSet<&String> = hashes.iter().collect();
@@ -1890,7 +1899,7 @@ impl CoreEngine {
         })?;
         // The mode decides the context: Tabular receives the run's data
         // handle (guaranteed present by construction), RL receives none. The
-        // context itself is built inside `ModeTrainer::train_step`.
+        // context is built by the engine-trainer adapter (see trainer.rs).
         let run_data = self
             .dataset
             .as_ref()
@@ -5288,7 +5297,7 @@ mod tests {
         // A legacy run (or hook-less trainer) records no blob: the check
         // must stay silent, not hard-fail every old run_dir.
         let recorded = None;
-        let trainer = crate::trainer::ModeTrainer::Tabular(Box::new(
+        let trainer = crate::trainer::ModeAdapter::tabular(Box::new(
             crate::trainer::TabularTrainer::new(loss_fn()),
         ));
         assert!(

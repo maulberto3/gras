@@ -1678,7 +1678,7 @@ mod tests {
         // A legacy run (or hook-less trainer) records no blob: the check
         // must stay silent, not hard-fail every old run_dir.
         let recorded = None;
-        let trainer = crate::trainer::ModeTrainer::Tabular(Box::new(
+        let trainer = crate::trainer::ModeAdapter::tabular(Box::new(
             crate::trainer::TabularTrainer::new(loss_fn()),
         ));
         assert!(

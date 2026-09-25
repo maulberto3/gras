@@ -111,7 +111,7 @@ impl RlEngine {
             ))
             .into());
         }
-        let trainer = Box::new(crate::trainer::ModeTrainer::Rl(Box::new(trainer)))
+        let trainer = Box::new(crate::trainer::ModeAdapter::rl(Box::new(trainer)))
             as Box<dyn crate::trainer::EngineTrainer>;
         let header = crate::state::load_engine_json(&run_dir)?;
         // Counter snapshot before `header` moves (see the tabular flavor).
