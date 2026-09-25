@@ -100,6 +100,14 @@ pub struct Network {
     pub(crate) dropout_layers: Vec<Option<flodl::nn::Dropout>>,
 }
 
+/// Intermediate build state from `prepare_build`: the seeded RNG plus the
+/// wiring table (per-node, per-port, per-source ports) and per-node dims.
+struct BuildPlan {
+    rng: Option<fastrand::Rng>,
+    node_sources: Vec<Vec<Vec<crate::graph::topology::Port>>>,
+    node_dims: Vec<(usize, usize)>,
+}
+
 impl Network {
     /// Compile blueprint on the given device. Convenience wrapper over
     /// `build_with_options` that derives the **architecture-affecting** knobs
@@ -132,7 +140,8 @@ impl Network {
         graph.validate().map_err(NetworkError::InvalidTopology)?;
 
         // Step 1: Seed RNG, compute wiring table + per-node dims
-        let (mut rng, node_sources, node_dims) = Self::prepare_build(graph, opts);
+        let plan = Self::prepare_build(graph, opts);
+        let (mut rng, node_sources, node_dims) = (plan.rng, plan.node_sources, plan.node_dims);
 
         // Step 2: One Linear per node
         let layers =
@@ -165,11 +174,7 @@ impl Network {
     fn prepare_build(
         graph: &Topology,
         opts: &NetworkOptions,
-    ) -> (
-        Option<fastrand::Rng>,
-        Vec<Vec<Vec<crate::graph::topology::Port>>>,
-        Vec<(usize, usize)>,
-    ) {
+    ) -> BuildPlan {
         let node_inputs: Vec<usize> = graph.nodes.iter().map(|n| n.num_inputs).collect();
         let node_sources = build_node_sources(&graph.connections, &node_inputs);
         let node_dims = graph.node_dims();
@@ -181,10 +186,12 @@ impl Network {
             graph.connections.len(),
             graph.options.input_dim.unwrap_or(1)
         );
-        (rng, node_sources, node_dims)
+        BuildPlan {
+            rng,
+            node_sources,
+            node_dims,
+        }
     }
-
-    /// Step 2: One Linear per node.
     fn build_linear_layers(
         graph: &Topology,
         node_dims: &[(usize, usize)],
@@ -1126,12 +1133,14 @@ mod tests {
         // n1 has 2 output ports: port 0 ReLU, port 1 Tanh. The consumer n2
         // receives port 0's tensor on i0 and port 1's on i1 — the wires must
         // carry DIFFERENT tensors even though they leave the same node.
-        let mut opts = crate::graph::topology::TopologyOptions::default();
-        // Guarantee the hidden node keeps 2 wired output ports after trim.
-        opts.min_hidden_outputs_per_node = 2;
-        opts.max_hidden_outputs_per_node = 2;
-        opts.input_dim = Some(8);
-        opts.output_dim = Some(1);
+        let opts = crate::graph::topology::TopologyOptions {
+            // Guarantee the hidden node keeps 2 wired output ports after trim.
+            min_hidden_outputs_per_node: 2,
+            max_hidden_outputs_per_node: 2,
+            input_dim: Some(8),
+            output_dim: Some(1),
+            ..Default::default()
+        };
         let mut g = Topology::new(0, Some(opts));
         g.nodes.push(Node::new_input(0, 1));
         let mut n1 = Node::new_hidden(1, 1, 2).with_activation(Activation::ReLU);

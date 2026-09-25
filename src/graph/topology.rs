@@ -2273,11 +2273,13 @@ mod fanout_bounds_tests {
         // declared input count past the configured maximum (fan-in rescue
         // passes may add wires, but only onto declared ports).
         for seed in 0..60 {
-            let mut opts = TopologyOptions::default();
-            opts.min_hidden_inputs_per_node = 2;
-            opts.max_hidden_inputs_per_node = 3;
-            opts.min_hidden_outputs_per_node = 2;
-            opts.max_hidden_outputs_per_node = 3;
+            let opts = TopologyOptions {
+                min_hidden_inputs_per_node: 2,
+                max_hidden_inputs_per_node: 3,
+                min_hidden_outputs_per_node: 2,
+                max_hidden_outputs_per_node: 3,
+                ..Default::default()
+            };
             let mut g = Topology::new(seed, Some(opts));
             g.create_random_hidden_nodes(5);
             g.finalize();
