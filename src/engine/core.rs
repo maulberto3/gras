@@ -580,6 +580,14 @@ impl CoreEngine {
         let header = RunHeader::from_race_options_at(
             RunConfig {
                 run_id: run_id.clone(),
+                engine_mode: Some(
+                    if tabular_data_dir.is_some() {
+                        "tabular"
+                    } else {
+                        "rl"
+                    }
+                    .to_string(),
+                ),
                 run_seed,
                 fitness_label: FitnessLabel(fitness.label().to_string()),
                 fitness_direction: fitness.direction(),
@@ -3415,6 +3423,7 @@ impl CoreEngine {
     pub fn refresh_header(&mut self) -> Result<()> {
         let cfg = RunConfig {
             run_id: self.header.run_id.clone(),
+            engine_mode: self.header.engine_mode.clone(),
             run_seed: self.header.run_seed,
             fitness_label: self.header.fitness_label.clone(),
             fitness_direction: self.header.fitness_direction,
@@ -4898,6 +4907,68 @@ mod tests {
     }
 
     #[test]
+    fn engine_mode_discriminator_roundtrip() {
+        // Engine split (TODO.md step 6): new headers carry `engine_mode` at
+        // the root; legacy shared-shape headers (absent root field) are
+        // migrated on load by deriving from `config.mode`, so old run dirs
+        // keep resuming. New dirs get the discriminator stamped.
+        let dir = std::env::temp_dir().join("race_engine_mode_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut engine = engine(&dir, 99).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+            .unwrap();
+        let h = engine.state.live_hashes()[0].clone();
+        engine.step_one_net(&h, 0).unwrap();
+        let state = engine.state.net(&h).cloned().unwrap();
+        crate::state::write_net_state(&dir, &state).unwrap();
+
+        // New header: root discriminator present and correct.
+        let header = crate::state::load_engine_json(&dir).unwrap();
+        assert_eq!(
+            header.engine_mode.as_deref(),
+            Some("tabular"),
+            "from_spec stamps the mode at the header root"
+        );
+
+        // Legacy shape: strip the root field, keep `config.mode` — must still
+        // load, deriving the mode, and must still resume.
+        let mut legacy: serde_json::Value = serde_json::from_str(
+            &crate::state::load_engine_json(&dir)
+                .unwrap()
+                .to_json()
+                .unwrap(),
+        )
+        .unwrap();
+        legacy.as_object_mut().unwrap().remove("engine_mode");
+        assert!(legacy.get("config").unwrap().get("mode").is_some());
+        std::fs::write(
+            dir.join("engine.json"),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        let migrated = crate::state::load_engine_json(&dir).unwrap();
+        assert_eq!(
+            migrated.engine_mode.as_deref(),
+            Some("tabular"),
+            "legacy header migrates via config.mode"
+        );
+        let mut resumed = crate::engine::TabularEngine::resume(
+            dir.clone(),
+            tiny_dataset_dir("engine_mode_rt"),
+            {
+                let mut c = RaceConfig::defaults();
+                c.pop_size = 1;
+                c
+            },
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        )
+        .unwrap();
+        resumed.step_one_net(&h, 1).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn resume_replays_nets_with_metric_parity() {
         let dir = std::env::temp_dir().join("race_resume_parity");
         let _ = std::fs::remove_dir_all(&dir);

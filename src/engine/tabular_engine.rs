@@ -144,6 +144,19 @@ impl TabularEngine {
             children_born_at_clock: header.children_born_at_clock.clone(),
             ..header.clone()
         };
+        // Mode guard (engine split, TODO.md step 6): a run dir written by
+        // the RL engine cannot be resumed as tabular (no dataset geometry).
+        // Legacy headers derive `engine_mode` from `config.mode` on load.
+        match header.engine_mode.as_deref() {
+            Some("tabular") | None => {}
+            Some(other) => {
+                return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                    "resume: {run_dir_display} was recorded as mode \"{other}\", not \"tabular\" — use RlEngine::resume for RL runs",
+                    run_dir_display = run_dir.display(),
+                ))
+                .into())
+            }
+        }
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume")?;
         let dataset =
             crate::utils::tabular_data::resolve_dataset(&data_dir)?.to_device(config.device())?;

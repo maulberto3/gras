@@ -167,6 +167,14 @@ impl ConfigSnapshot {
 pub struct RunHeader {
     /// User-visible run id (directory name or CLI-chosen label).
     pub run_id: String,
+    /// Mode discriminator (engine split, TODO.md step 6): `"tabular"` | `"rl"`.
+    /// Sits at the header ROOT so a reader picks the engine before touching
+    /// `config`. Written by both engines at construction and at every stop;
+    /// legacy shared-shape headers have it ABSENT — `from_json` then derives
+    /// it from `config.mode` (one-generation migration, documented in
+    /// OPTIONS.md §0).
+    #[serde(default)]
+    pub engine_mode: Option<String>,
     /// Single deterministic root for the whole run. When the user passes
     /// `--seed N` this is that N; when no seed is given the engine generates
     /// one and records it here so an interrupted run can be resumed exactly.
@@ -231,6 +239,8 @@ pub struct RunHeader {
 #[derive(Debug)]
 pub struct RunConfig {
     pub run_id: String,
+    /// Mode discriminator (`"tabular"` | `"rl"`) — see [`RunHeader::engine_mode`].
+    pub engine_mode: Option<String>,
     pub run_seed: u64,
     pub fitness_label: FitnessLabel,
     pub fitness_direction: Direction,
@@ -260,6 +270,7 @@ impl RunHeader {
     pub fn from_race_options(cfg: RunConfig) -> Self {
         let RunConfig {
             run_id,
+            engine_mode,
             run_seed,
             fitness_label,
             fitness_direction,
@@ -283,6 +294,7 @@ impl RunHeader {
         } = cfg;
         RunHeader {
             run_id,
+            engine_mode,
             run_seed,
             fitness_label,
             fitness_direction,
@@ -426,12 +438,27 @@ impl RunHeader {
         // Trainer self-description (see `Trainer::describe`). Absent on legacy
         // files and on trainers that don't implement the hook.
         let trainer = v.get("trainer").cloned();
+        // Migration (engine split, TODO.md step 6): legacy shared-shape
+        // headers have no root `engine_mode` — derive it from `config.mode`
+        // (same vocabulary, always present). New headers carry it at the
+        // root so a reader picks the engine before touching `config`.
+        let engine_mode = v
+            .get("engine_mode")
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                v.get("config")
+                    .and_then(|c| c.get("mode"))
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            });
         Ok(RunHeader {
             run_id: v
                 .get("run_id")
                 .and_then(|f| f.as_str())
                 .unwrap_or("unknown")
                 .to_string(),
+            engine_mode,
             run_seed: v.get("run_seed").and_then(|f| f.as_u64()).unwrap_or(0),
             fitness_label,
             fitness_direction,
@@ -939,6 +966,7 @@ mod tests {
     fn baseline_header(run_id: &str) -> RunHeader {
         RunHeader::from_race_options(RunConfig {
             run_id: run_id.to_string(),
+            engine_mode: Some("tabular".into()),
             run_seed: 42,
             fitness_label: FitnessLabel("f1".to_string()),
             fitness_direction: Direction::Maximize,

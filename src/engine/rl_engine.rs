@@ -89,8 +89,9 @@ impl RlEngine {
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume_rl")?;
         // The persisted run must itself be RL: its frontier was trained with
         // no dataset, so replaying it as tabular (or vice versa) is a bug.
-        // `header.config.mode` is the recorded label (lowercase debug name).
-        if header.config.mode != "rl" {
+        // `engine_mode` is the root discriminator; legacy headers derive it
+        // from `config.mode` on load (same vocabulary).
+        if header.engine_mode.as_deref() != Some("rl") {
             return Err(crate::utils::error::EngineError::InvalidOptions(format!(
                 "resume_rl: {} was recorded as mode \"{}\", not \"rl\" — use RaceEngine::resume with its data_dir",
                 run_dir.display(),
