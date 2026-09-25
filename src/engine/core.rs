@@ -1072,7 +1072,7 @@ impl CoreEngine {
             // schemes (pop-mean action anchors, distillation) build their
             // shared state here; the default is a no-op. Tabular never calls
             // it — its group sharing is the batch stream itself.
-            if !self.trainer.is_tabular() {
+            if self.trainer.is_rl() {
                 // Take the trainer OUT of self so the &mut Network borrows
                 // (self.networks) and the &mut trainer call don't alias.
                 let mut trainer = std::mem::replace(

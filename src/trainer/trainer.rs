@@ -275,6 +275,11 @@ impl ModeTrainer {
         matches!(self, ModeTrainer::Tabular(_))
     }
 
+    /// RL arm check (mirror of [`Self::is_tabular`]).
+    pub fn is_rl(&self) -> bool {
+        matches!(self, ModeTrainer::Rl(_))
+    }
+
     /// The Tabular arm, if this is one. The engine's tabular-only paths
     /// (stream shape resolution, the loss-based checkpoint exam) use this.
     pub fn as_tabular(&self) -> Option<&dyn TabularStep> {
