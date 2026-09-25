@@ -123,13 +123,15 @@ mod tests {
     use super::*;
 
     fn tiny_config(pop: usize) -> RaceConfig {
-        let mut opts = crate::graph::topology::TopologyOptions::default();
-        // Deliberately tiny topology space: 1 hidden node, 1 dim ⇒ collisions
-        // are guaranteed, which is exactly what the gate must handle.
-        opts.min_hidden_num_nodes = 1;
-        opts.max_hidden_num_nodes = 1;
-        opts.input_dim = Some(2);
-        opts.output_dim = Some(2);
+        let opts = crate::graph::topology::TopologyOptions {
+            // Deliberately tiny topology space: 1 hidden node, 1 dim ⇒ collisions
+            // are guaranteed, which is exactly what the gate must handle.
+            min_hidden_num_nodes: 1,
+            max_hidden_num_nodes: 1,
+            input_dim: Some(2),
+            output_dim: Some(2),
+            ..Default::default()
+        };
         let mut cfg = RaceConfig::defaults();
         cfg.pop_size = pop;
         cfg.topology_options = opts;

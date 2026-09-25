@@ -350,7 +350,7 @@ mod tests {
             .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], None)
             .unwrap();
         let hashes = engine.state.live_hashes();
-        let metrics = |step: usize| crate::state::state::NetMetrics {
+        let metrics = |step: usize| crate::state::NetMetrics {
             step,
             train_loss: 0.0,
             eval_loss: None,
@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(eng.elite_hashes(), vec![hs[1].clone()]);
         // Give the elite a recorded skill state, then verify the freeze
         // branch carries it into the rolling buffer without any training.
-        let m = crate::state::state::NetMetrics {
+        let m = crate::state::NetMetrics {
             // fitness 0.5 — a plausible frozen skill
             step: 3,
             train_loss: 0.0,
@@ -538,7 +538,7 @@ mod tests {
         eng.rolling_fitness.get_mut(&hs[1]).unwrap().push(0.1);
         assert_eq!(eng.elite_hashes(), vec![hs[1].clone()]);
         // First frozen step: crown set (info line "champion crowned" fires).
-        let m = crate::state::state::NetMetrics {
+        let m = crate::state::NetMetrics {
             step: 3,
             train_loss: 0.0,
             eval_loss: None,
@@ -554,7 +554,7 @@ mod tests {
         // Crown migration: net A trains past the frozen champion, becomes
         // elite (and thus frozen) — crown moves ("crown moved" line fires).
         eng.rolling_fitness.get_mut(&hs[0]).unwrap().push(0.05);
-        let m2 = crate::state::state::NetMetrics {
+        let m2 = crate::state::NetMetrics {
             step: 6,
             train_loss: 0.0,
             eval_loss: None,
@@ -659,7 +659,7 @@ mod tests {
         let dir = std::env::temp_dir().join("gras_fresh_start_immigrant");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 31).unwrap();
-        eng.config.immigrant_fresh_start = true;
+        eng.config.mutation_fresh_start = true;
         eng.config.mutate_rolls = 1;
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
@@ -692,7 +692,7 @@ mod tests {
         let data_dir = tiny_dataset_dir("fresh-reject");
         let config = RaceConfig {
             pop_size: 2,
-            immigrant_fresh_start: true,
+            mutation_fresh_start: true,
             ..RaceConfig::defaults()
         };
         let result = RaceEngine::new(crate::engine::run_spec::RunSpec::tabular(
@@ -968,7 +968,7 @@ mod tests {
 
         let run = |dir: &std::path::Path,
                    steps: usize|
-         -> Vec<(String, Option<crate::state::state::NetMetrics>)> {
+         -> Vec<(String, Option<crate::state::NetMetrics>)> {
             let mut eng = rl_engine(dir, 4242).unwrap();
             eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
                 .unwrap();
@@ -1719,7 +1719,7 @@ mod tests {
                 .state
                 .record_step(
                     &h,
-                    crate::state::state::NetMetrics {
+                    crate::state::NetMetrics {
                         step: 0,
                         train_loss: 0.0,
                         eval_loss: None,

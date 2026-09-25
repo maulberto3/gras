@@ -238,9 +238,9 @@ pub struct RaceConfig {
     /// [`SMOOTHING_WINDOW`].
     pub smoothing_window: usize,
     /// Mutation/crossover immigrants skip catch-up and start at the current
-    /// clock (see [`RaceConfigBuilder::set_immigrant_fresh_start`]).
+    /// clock (see [`RaceConfigBuilder::set_mutation_fresh_start`]).
     /// Construction error on tabular runs (see the setter's doc).
-    pub immigrant_fresh_start: bool,
+    pub mutation_fresh_start: bool,
     /// Crossover operator pool — which recombination operators the two-parent
     /// path may use (`"one_point"` | `"uniform"`). Drawn uniformly per
     /// attempt. Empty ⇒ both operators (the `empty ⇒ all` convention shared
@@ -421,7 +421,7 @@ impl RaceConfig {
             freeze_elites: false,
             regression_tol: None,
             smoothing_window: SMOOTHING_WINDOW,
-            immigrant_fresh_start: false,
+            mutation_fresh_start: false,
             crossover_ops_pool: Vec::new(),
             max_steps: None,
             max_target_fitness: None,
@@ -556,8 +556,9 @@ impl RaceConfigBuilder {
         self.cfg.freeze_elites = yes;
         self
     }
-    /// Fresh-start immigrants: mutation immigrants skip the catch-up replay
-    /// and begin training at the current clock instead.
+    /// Mutation-family knob — fresh-start immigrants: a mutation immigrant
+    /// skips the catch-up replay and begins training at the current clock
+    /// instead.
     ///
     /// Conceptually mode-agnostic ("does an immigrant inherit the population's
     /// clock?") — but **only RL accepts it today**:
@@ -587,8 +588,8 @@ impl RaceConfigBuilder {
     /// training rows, breaking fitness comparability. (A future tabular
     /// variant — e.g. rank the immigrant only after K catch-up steps — is a
     /// separate design decision, parked in TODO.)
-    pub fn set_immigrant_fresh_start(mut self, yes: bool) -> Self {
-        self.cfg.immigrant_fresh_start = yes;
+    pub fn set_mutation_fresh_start(mut self, yes: bool) -> Self {
+        self.cfg.mutation_fresh_start = yes;
         self
     }
     /// ANTI-DEVOLUTION D — regression demotion: each net's entry smoothed

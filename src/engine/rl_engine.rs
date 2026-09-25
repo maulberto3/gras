@@ -5,16 +5,12 @@
 //! struct, the step loop, evolution, artifacts — lives in
 //! [`crate::engine::core::RaceEngine`] and is shared with the tabular engine.
 
-use super::config::{RaceConfig, RaceSnapshot, StopReason};
+use super::config::RaceConfig;
 use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
-use super::smoothing::RollingBuffer;
-use crate::engine::fitness::{Fitness, Metric};
-use crate::graph::network::Network;
+use crate::engine::fitness::Fitness;
 use crate::state::{
-    ConfigSnapshot, NetMetrics, NetState, RaceState, RunConfig, RunHeader, write_engine_json,
-    write_net_state,
+    RaceState, RunHeader,
 };
-use crate::trainer::stream::{BatchStream, PoolSplit};
 use flodl::tensor::Result;
 use std::collections::HashMap;
 

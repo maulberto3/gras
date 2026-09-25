@@ -164,16 +164,15 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
 /// warmup, multi-minibatch, RL, image, NLP — the engine only sees the
 /// [`Trainer`] contract).
 pub struct DefaultTrainerBuilder {
-    loss: Option<
-        Box<
-            dyn Fn(&flodl::Variable, &flodl::Variable) -> flodl::tensor::Result<flodl::Variable>
-                + Send
-                + Sync
-                + 'static,
-        >,
-    >,
+    loss: Option<crate::trainer::BoxedLossFn>,
     learning_rate: f32,
     grad_clip: f32,
+}
+
+impl Default for DefaultTrainerBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DefaultTrainerBuilder {
@@ -211,7 +210,7 @@ impl DefaultTrainerBuilder {
     /// cross-entropy (so `Default` stays usable for tests that don't care).
     pub fn build(self) -> Box<dyn crate::trainer::TabularStep> {
         let loss = self.loss.unwrap_or_else(|| {
-            Box::new(|pred, y| crate::utils::score::cross_entropy_onehot_loss(pred, y))
+            Box::new(crate::utils::score::cross_entropy_onehot_loss)
         });
         Box::new(
             crate::trainer::TabularTrainer::new(loss)

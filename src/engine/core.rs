@@ -495,9 +495,9 @@ impl CoreEngine {
         // that comparability is sacred (one shared data stream — starting
         // mid-stream silently skips training rows). Only the engine knows the
         // mode AND the knob, so this is where the conflict fails loudly.
-        if tabular_data_dir.is_some() && config.immigrant_fresh_start {
+        if tabular_data_dir.is_some() && config.mutation_fresh_start {
             return Err(crate::utils::error::EngineError::InvalidOptions(
-                "set_immigrant_fresh_start(true) requires RL mode: in tabular, an immigrant that skips catch-up misses shared training data, breaking fitness comparability with the population".to_string(),
+                "set_mutation_fresh_start(true) requires RL mode: in tabular, an immigrant that skips catch-up misses shared training data, breaking fitness comparability with the population".to_string(),
             )
             .into());
         }
@@ -909,8 +909,7 @@ impl CoreEngine {
         topologies: Vec<crate::graph::topology::Topology>,
         initial_fitness: Option<f32>,
     ) -> Result<()> {
-        for ordinal in 0..topologies.len() {
-            let topo = &topologies[ordinal];
+        for (ordinal, topo) in topologies.iter().enumerate() {
             let net = Network::build(topo, self.config.device())?;
             // Lineage: founders are labeled `founder-<ordinal>` — a readable
             // "part of the original population" marker, distinct from
@@ -1038,7 +1037,7 @@ impl CoreEngine {
                     .regression_tol
                     .map(|t| format!("{t}"))
                     .unwrap_or_else(|| "off".into()),
-                self.config.immigrant_fresh_start,
+                self.config.mutation_fresh_start,
                 self.config.elite_save_topology,
                 self.config.worst_save_topology,
             );
@@ -1954,7 +1953,7 @@ impl CoreEngine {
                 .eval_batch(dataset, clock as u64)
                 .expect("probe: eval batch");
             if let (Some(loss), Some(fit)) = (
-                self.trainer.as_tabular().map(|t| t.loss()),
+                self.trainer.tabular_loss(),
                 Some(&self.fitness),
             ) {
                 if let Ok(actual) = eval_one_step(net, loss, fit, &self.metrics, &eval_batch) {
@@ -2568,12 +2567,17 @@ impl CoreEngine {
             .created_from
             .clone()
             .unwrap_or_else(|| "?".into());
+        // Catch-up status on the success line: a gated child has ALWAYS
+        // replayed the full history (0..clock) — that's what the gate judged.
+        // Stated explicitly so a reader never has to infer it.
+        let catchup_note = format!("caught up {clock} step(s)");
         self.insert_child(child, clock, "crossover");
         Ok(RollOutcome::survived(format!(
-            "child {} ({}) inserted{}, victim {} culled",
+            "child {} ({}) inserted{}, {}, victim {} culled",
             inserted_hash,
             lineage,
             gate_note,
+            catchup_note,
             victim_for_log
                 .as_deref()
                 .map(|v| v[..8.min(v.len())].to_string())
@@ -2586,6 +2590,7 @@ impl CoreEngine {
     /// rejected — so gate-failure rate, operator yield, and retry economics are
     /// queryable after the run. Buffered, flushed at the same points as the
     /// per-step metric rows (they share the unified history.csv).
+    #[allow(clippy::too_many_arguments)] // one row of the attempt ledger — fields, not logic
     fn record_attempt(
         &mut self,
         step: usize,
@@ -2740,13 +2745,13 @@ impl CoreEngine {
         let mut child = self.generate_random_at(clock, idx)?;
         self.pre_insert_buffer(&child.state.hash);
         // Catch-up (the default) replays steps 0..clock so the newborn is
-        // comparable to the population. With `immigrant_fresh_start` it is
+        // comparable to the population. With `mutation_fresh_start` it is
         // skipped instead: the immigrant keeps its fresh-init weights and
         // trains from the current clock on. Sound in RL (no shared data stream
         // to have missed — see the knob's docs); rejected for Tabular at
         // construction. Its empty rolling buffers already mean "no verdict
         // yet", so it cannot be culled or crowned before its first step.
-        let fresh_start = self.config.immigrant_fresh_start;
+        let fresh_start = self.config.mutation_fresh_start;
         if fresh_start {
             child.state.step = 0;
             child.state.last_metrics = None;
@@ -2755,13 +2760,13 @@ impl CoreEngine {
         }
         let detail = if fresh_start {
             format!(
-                "victim {} culled ({reason}), immigrant {} inserted (no gate, FRESH-START at step {clock} — no catch-up)",
+                "victim {} culled ({reason}), immigrant {} inserted (no gate, NO catch-up — fresh-start at step {clock})",
                 &victim[..8.min(victim.len())],
                 &child.state.hash[..8.min(child.state.hash.len())],
             )
         } else {
             format!(
-                "victim {} culled ({reason}), immigrant {} inserted (no gate)",
+                "victim {} culled ({reason}), immigrant {} inserted (no gate, caught up {clock} step(s))",
                 &victim[..8.min(victim.len())],
                 &child.state.hash[..8.min(child.state.hash.len())],
             )
@@ -3906,7 +3911,7 @@ mod tests {
             .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], None)
             .unwrap();
         let hashes = engine.state.live_hashes();
-        let metrics = |step: usize| crate::state::state::NetMetrics {
+        let metrics = |step: usize| crate::state::NetMetrics {
             step,
             train_loss: 0.0,
             eval_loss: None,
@@ -3949,7 +3954,7 @@ mod tests {
         assert_eq!(eng.elite_hashes(), vec![hs[1].clone()]);
         // Give the elite a recorded skill state, then verify the freeze
         // branch carries it into the rolling buffer without any training.
-        let m = crate::state::state::NetMetrics {
+        let m = crate::state::NetMetrics {
             // fitness 0.5 — a plausible frozen skill
             step: 3,
             train_loss: 0.0,
@@ -4094,7 +4099,7 @@ mod tests {
         eng.rolling_fitness.get_mut(&hs[1]).unwrap().push(0.1);
         assert_eq!(eng.elite_hashes(), vec![hs[1].clone()]);
         // First frozen step: crown set (info line "champion crowned" fires).
-        let m = crate::state::state::NetMetrics {
+        let m = crate::state::NetMetrics {
             step: 3,
             train_loss: 0.0,
             eval_loss: None,
@@ -4110,7 +4115,7 @@ mod tests {
         // Crown migration: net A trains past the frozen champion, becomes
         // elite (and thus frozen) — crown moves ("crown moved" line fires).
         eng.rolling_fitness.get_mut(&hs[0]).unwrap().push(0.05);
-        let m2 = crate::state::state::NetMetrics {
+        let m2 = crate::state::NetMetrics {
             step: 6,
             train_loss: 0.0,
             eval_loss: None,
@@ -4215,7 +4220,7 @@ mod tests {
         let dir = std::env::temp_dir().join("gras_fresh_start_immigrant");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 31).unwrap();
-        eng.config.immigrant_fresh_start = true;
+        eng.config.mutation_fresh_start = true;
         eng.config.mutate_rolls = 1;
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
@@ -4248,7 +4253,7 @@ mod tests {
         let data_dir = tiny_dataset_dir("fresh-reject");
         let config = RaceConfig {
             pop_size: 2,
-            immigrant_fresh_start: true,
+            mutation_fresh_start: true,
             ..RaceConfig::defaults()
         };
         let result =
@@ -4487,9 +4492,11 @@ mod tests {
     /// An RL-mode config (`RaceConfig` is not `Clone`, so tests rebuild it by
     /// value: `pop == 0` only for the harness that seeds its own topologies).
     fn rl_config(pop: usize) -> RaceConfig {
-        let mut topo = crate::graph::topology::TopologyOptions::default();
-        topo.input_dim = Some(2);
-        topo.output_dim = Some(2);
+        let topo = crate::graph::topology::TopologyOptions {
+            input_dim: Some(2),
+            output_dim: Some(2),
+            ..Default::default()
+        };
         RaceConfig {
             pop_size: pop,
             mode: crate::engine::config::RunMode::Rl,
@@ -4525,7 +4532,7 @@ mod tests {
 
         let run = |dir: &std::path::Path,
                    steps: usize|
-         -> Vec<(String, Option<crate::state::state::NetMetrics>)> {
+         -> Vec<(String, Option<crate::state::NetMetrics>)> {
             let mut eng = rl_engine(dir, 4242).unwrap();
             eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
                 .unwrap();
@@ -4647,9 +4654,11 @@ mod tests {
             mode: crate::engine::config::RunMode::Rl, // declared correctly; the FITNESS is the bug under test
             ..RaceConfig::defaults()
         };
-        let mut topo = crate::graph::topology::TopologyOptions::default();
-        topo.input_dim = Some(1);
-        topo.output_dim = Some(1);
+        let topo = crate::graph::topology::TopologyOptions {
+            input_dim: Some(1),
+            output_dim: Some(1),
+            ..Default::default()
+        };
         let config = RaceConfig {
             topology_options: topo,
             ..config
@@ -4980,6 +4989,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
     fn resume_replays_nets_with_metric_parity() {
         let dir = std::env::temp_dir().join("race_resume_parity");
         let _ = std::fs::remove_dir_all(&dir);
@@ -5338,7 +5348,7 @@ mod tests {
                 .state
                 .record_step(
                     &h,
-                    crate::state::state::NetMetrics {
+                    crate::state::NetMetrics {
                         step: 0,
                         train_loss: 0.0,
                         eval_loss: None,
