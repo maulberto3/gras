@@ -29,7 +29,7 @@ You'll need a CUDA-enabled libtorch on disk and `LIBTORCH_PATH` (plus CUDA env v
 ## Quick Start
 
 ```rust
-use gras::engine::{Direction, Fitness, RaceConfig, RaceEngine, RunSpec};
+use gras::engine::{Direction, Fitness, RaceConfig, RunSpec, TabularEngine};
 use gras::trainer::TabularTrainer;
 use gras::utils::{tabular_data, score};
 
@@ -53,7 +53,7 @@ fn main() -> flodl::tensor::Result<()> {
 
     let spec = RunSpec::tabular(data_dir, config, fitness, trainer, Some(42), None::<&str>);
 
-    let mut engine = RaceEngine::new(spec)?;
+    let mut engine = TabularEngine::from_spec(spec)?;
 
     println!("Race stopped: {:?}", engine.run()?);
     Ok(())
@@ -73,8 +73,8 @@ Stop criteria are exclusive: set `max_steps` **or** `max_target_fitness`, never 
 
 `RunSpec` has one variant per mode, each self-contained — and the trainer trait is split to match, so a wrong flavor combination is a **compile error**, not a runtime surprise:
 
-- **`RunSpec::tabular(..)` (tabular):** dataset + `Fitness::new(scorer, ..)` + a `TabularStep` trainer — the engine loads the data, draws batches, and scores `(pred, target)` itself. A tabular trainer implements `TabularStep`: it owns a **required** loss (`fn loss()`), may shape the shared batch stream (`stream_shape`), and receives data via `TabularContext`.
-- **`RunSpec::rl(..)` (RL / environment):** **no dataset**. The trainer implements `RlStep` — there is **no loss method at all**: the training signal lives inside `train_step`, the trainer drives its own environment and reports the ranking scalar in `StepReport.fitness`; the fitness must be `Fitness::reported(direction, label)`. `RlContext` carries no data.
+- **`TabularEngine` + `RunSpec::tabular(..)`:** dataset + `Fitness::new(scorer, ..)` + a `TabularStep` trainer — the engine loads the data, draws batches, and scores `(pred, target)` itself. A tabular trainer implements `TabularStep`: it owns a **required** loss (`fn loss()`), may shape the shared batch stream (`stream_shape`), and receives data via `TabularContext`.
+- **`RlEngine` + `RunSpec::rl(..)` (RL / environment):** **no dataset**. The trainer implements `RlStep` — there is **no loss method at all**: the training signal lives inside `train_step`, the trainer drives its own environment and reports the ranking scalar in `StepReport.fitness`; the fitness must be `Fitness::reported(direction, label)`. `RlContext` carries no data. (Typed-spec alternative: `RLSpec{..}` → `RlEngine::from_rl_spec`; tabular mirror `TabularSpec` → `from_tabular_spec`. See OPTIONS.md §7.)
 - Both mode traits extend `StepTrainer` (`make_optimizer`, `describe`). The engine dispatches through an internal `ModeTrainer` enum — a tabular step always carries data, an RL step never does.
 
 Evolution (crossover, mutation, gates, culls) is identical in both modes.

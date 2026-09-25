@@ -48,10 +48,15 @@ across the examples.
 
 ## 0. Resume semantics — what must match vs what's yours to change
 
-`RaceEngine::resume(run_dir, data_dir, config, fitness, trainer)` replays
-every live net from step 0 to its recorded step (no weights are persisted —
+Resume is per-engine (the 2026-09-24 engine split — `RaceEngine` is gone):
+`TabularEngine::resume(run_dir, data_dir, config, fitness, trainer)` and
+`RlEngine::resume(run_dir, config, fitness, trainer)`. Both replay every
+live net from step 0 to its recorded step (no weights are persisted —
 topology + weight seed + the deterministic stream reproduce them), asserting
-metric parity with the recorded values.
+metric parity with the recorded values. `engine.json` carries a root
+`engine_mode` ("tabular" | "rl"); legacy headers without it are migrated on
+load (derived from `config.mode`), and resuming a run under the WRONG
+engine errors loudly, naming the mode.
 
 **Frozen (changing these hard-errors at construction, or fails the parity
 assert on the first replayed step):**
@@ -213,15 +218,28 @@ A child must prove itself over a replay window of past population means
 | Worst topology md | `set_worst_save_topology(enabled)` | `false` | Same as elite but for the worst net (debugging what loses). |
 | Worst safetensors | `set_worst_save_safetensors(enabled)` | `false` | Weights for the worst net. |
 
-## 7. `RunSpec` positional args (not setters)
+## 7. Engines & `RunSpec` positional args (not setters)
+
+The engine is split per mode (2026-09-24): **`TabularEngine`** (dataset runs)
+and **`RlEngine`** (environment runs) share one core; each takes its own spec
+variant. `RlEngine::resume` replaced `RaceEngine::resume_rl`.
 
 | Arg | Default | What it controls |
 |---|---|---|
 | data dir (Tabular only) | required | Where train/eval data lives; also fills input/output dims when unset. |
 | fitness | required | `Fitness` (direction + label, or `Fitness::reported` for RL). |
-| trainer | required | Boxed `TabularTrainer`/`StepTrainer` — the engine never trains; it consumes the step contract. |
+| trainer | required | Any `TabularStep`/`RlStep` impl — the engine never trains; it consumes the step contract. Auto-boxed. |
 | run seed | `None` | Master seed (population init, evolution rolls). `None` = entropy-seeded, non-replayable. |
 | run dir | `None` | `None` ⇒ `results/<timestamp>`; pass a path for fixed locations. |
+
+Three construction paths per engine:
+
+```text
+TabularEngine::from_spec(RunSpec::tabular(..))      // enum variant
+TabularEngine::from_tabular_spec(TabularSpec{..})   // typed spec, no enum
+TabularEngine::resume(dir, data_dir, ..)            // continue a stopped run
+// RL mirror: RlEngine::from_spec / from_rl_spec(RLSpec{..}) / resume
+```
 
 ## 8. Related (examples-side, not engine) reminders
 
