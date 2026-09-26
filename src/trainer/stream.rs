@@ -156,7 +156,7 @@ impl BatchStream {
     /// In-place variant of [`Self::with_checkpoint_every`]. The engine calls
     /// this at run start / resume so a post-construction config edit can never
     /// desync the eval rotation from the gate cadence.
-    pub fn set_checkpoint_every(&mut self, n: usize) {
+    pub fn set_run_checkpoint_every(&mut self, n: usize) {
         self.checkpoint_every = n.max(1);
     }
 
