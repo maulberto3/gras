@@ -168,8 +168,6 @@ impl RlEngine {
             step_rl: RlVolume::default(),
             champions: Vec::new(),
             checkpoints: Vec::new(),
-            fitness_floors: HashMap::new(),
-            demoted: std::collections::HashSet::new(),
             frozen_crown: std::collections::HashSet::new(),
             minimal_prev_means: None,
             log_level,

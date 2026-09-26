@@ -356,6 +356,7 @@ mod tests {
             eval_loss: None,
             fitness: 0.5,
             informative: vec![],
+            frozen: false,
         };
         // Founder-shaped: 4 trainings, last clock 3 (trained every clock).
         for _ in 0..4 {
@@ -400,6 +401,7 @@ mod tests {
             eval_loss: None,
             fitness: 0.5,
             informative: vec![],
+            frozen: false,
         };
         eng.state.record_step(&hs[1], m).unwrap();
         let before_len = eng.rolling_fitness.get(&hs[1]).unwrap().len();
@@ -544,6 +546,7 @@ mod tests {
             eval_loss: None,
             fitness: 0.1,
             informative: vec![],
+            frozen: false,
         };
         eng.state.record_step(&hs[1], m).unwrap();
         eng.step_one_net(&hs[1], 5).unwrap();
@@ -560,6 +563,7 @@ mod tests {
             eval_loss: None,
             fitness: 0.05,
             informative: vec![],
+            frozen: false,
         };
         eng.state.record_step(&hs[0], m2).unwrap();
         eng.step_one_net(&hs[0], 7).unwrap();
@@ -659,7 +663,7 @@ mod tests {
         let dir = std::env::temp_dir().join("gras_fresh_start_immigrant");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 31).unwrap();
-        eng.config.mutation_fresh_start = true;
+        eng.config.mutation_catch_up = true;
         eng.config.mutate_rolls = 1;
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
@@ -891,6 +895,7 @@ mod tests {
                 fitness: 1.0,
                 informative: Vec::new(),
                 rl: None,
+                frozen: false,
             })
         }
     }
@@ -922,6 +927,7 @@ mod tests {
                 rl: Some(crate::trainer::RlStepMeta {
                     matches: 2,
                     turns: 20 + step,
+                frozen: false,
                 }),
             })
         }
@@ -1501,7 +1507,7 @@ mod tests {
             .stream
             .as_mut()
             .unwrap()
-            .set_checkpoint_every(engine.config.checkpoint_every);
+            .set_run_checkpoint_every(engine.config.checkpoint_every);
         engine
             .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
@@ -1725,6 +1731,7 @@ mod tests {
                         eval_loss: None,
                         fitness: v,
                         informative: vec![],
+                        frozen: false,
                     },
                 )
                 .unwrap();
@@ -1743,7 +1750,7 @@ mod tests {
         cfg.max_target_fitness = Some(0.5);
         // Route the hand-built config through build()'s validation by
         // rebuilding it from the same fields the builder would have written.
-        let b = RaceConfig::builder().set_pop_size(2);
+        let b = RaceConfig::builder().set_run_pop_size(2);
         let mut rebuilt = b.build();
         rebuilt.max_steps = cfg.max_steps;
         rebuilt.max_target_fitness = cfg.max_target_fitness;

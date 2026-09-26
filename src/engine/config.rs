@@ -164,6 +164,13 @@ impl CrossoverOp {
 }
 
 /// The training paradigm / problem space the run targets.
+///
+/// Only `Tabular` and `Rl` are constructible today — they are the arms the
+/// `RunSpec` variants (`RunSpec::tabular`/`RunSpec::rl`) validate against.
+/// The image/NLP arms are RESERVED for future `RunSpec` variants (see the
+/// engine's construction error in core.rs); they exist so persisted
+/// `engine.json` files can already declare the intended paradigm and so the
+/// wire format does not need re-versioning when those specs land.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
 pub enum RunMode {
     #[default]
@@ -226,21 +233,30 @@ pub struct RaceConfig {
     /// smoothed fitness drops out of the top-k — "elite" is a rank, not an
     /// identity.
     pub elite_count: usize,
-    /// Anti-devolution A: skip the trainer call for the top-k nets (see
-    /// [`RaceConfigBuilder::set_elite_freeze`]).
+    /// Anti-devolution A: the top-k nets act-and-measure without weight
+    /// updates (see [`RaceConfigBuilder::set_elite_freeze`]). Default `true`.
     pub freeze_elites: bool,
-    /// Anti-devolution D: demote nets below `floor × tol` (see
-    /// [`RaceConfigBuilder::set_fitness_regression_tol`]). `None` = off.
-    pub regression_tol: Option<f32>,
     /// Per-net smoothed-fitness rolling window (K) — how many recent step
     /// fitnesses every ranking decision averages over (see
     /// [`RaceConfigBuilder::set_fitness_smoothing_window`]). Defaults to
     /// [`SMOOTHING_WINDOW`].
     pub smoothing_window: usize,
     /// Mutation/crossover immigrants skip catch-up and start at the current
-    /// clock (see [`RaceConfigBuilder::set_mutation_fresh_start`]).
-    /// Construction error on tabular runs (see the setter's doc).
-    pub mutation_fresh_start: bool,
+    /// clock (see [`RaceConfigBuilder::set_mutation_catch_up`]).
+    /// RL-effective only: tabular runs always catch up (see the setters).
+    pub mutation_catch_up: bool,
+    /// Whether a crossover child replays the training stream before insertion
+    /// (see [`RaceConfigBuilder::set_crossover_catch_up`]). RL-effective only.
+    pub crossover_catch_up: bool,
+    /// Whether a population net rejoining the group step replays missed
+    /// training (see [`RaceConfigBuilder::set_run_pop_catch_up`]).
+    /// RL-effective only. (Reserved: with act-and-measure freeze, dethroned
+    /// elites never fall behind the clock, so this has no consumer in the
+    /// default flow today.)
+    pub run_pop_catch_up: bool,
+    /// Reset a dethroned elite's optimizer state (momentum/velocity/step
+    /// counters — see [`RaceConfigBuilder::set_dethrone_reset_optimizer_state`]).
+    pub dethrone_reset_optimizer_state: bool,
     /// Crossover operator pool — which recombination operators the two-parent
     /// path may use (`"one_point"` | `"uniform"`). Drawn uniformly per
     /// attempt. Empty ⇒ both operators (the `empty ⇒ all` convention shared
@@ -418,10 +434,12 @@ impl RaceConfig {
             crossover_cull_policy: CrossCullPolicy::default(),
             mutation_cull_policy: MutationCullPolicy::default(),
             elite_count: 1,
-            freeze_elites: false,
-            regression_tol: None,
+            freeze_elites: true,
             smoothing_window: SMOOTHING_WINDOW,
-            mutation_fresh_start: false,
+            mutation_catch_up: false,
+            crossover_catch_up: true,
+            run_pop_catch_up: false,
+            dethrone_reset_optimizer_state: true,
             crossover_ops_pool: Vec::new(),
             max_steps: None,
             max_target_fitness: None,
@@ -478,11 +496,11 @@ pub struct RaceConfigBuilder {
 }
 
 impl RaceConfigBuilder {
-    pub fn set_pop_size(mut self, n: usize) -> Self {
+    pub fn set_run_pop_size(mut self, n: usize) -> Self {
         self.cfg.pop_size = n;
         self
     }
-    pub fn set_checkpoint_every(mut self, n: usize) -> Self {
+    pub fn set_run_checkpoint_every(mut self, n: usize) -> Self {
         self.cfg.checkpoint_every = n.max(1);
         self
     }
@@ -549,67 +567,83 @@ impl RaceConfigBuilder {
     /// collapse it below random (tabular, with its fixed data distribution,
     /// never trips the guard — the feature is dormant there).
     ///
-    /// A frozen net's StepReport carries its last recorded metrics (skill is
-    /// the frozen state — re-measuring would re-run the trainer). Default
-    /// `false` — off, existing runs bit-identical.
+    /// A frozen elite ACTS and MEASURES every step (fresh fitness through a
+    /// `NoopOptimizer` — the weight update is discarded), so its standing
+    /// stays honest and it never falls behind the clock. Default `true` —
+    /// the champion's peak is always worth protecting; pass `false` to let
+    /// elites keep training (e.g. when the decision-lag relay needs the
+    /// trainer call to fork a shadow).
     pub fn set_elite_freeze(mut self, yes: bool) -> Self {
         self.cfg.freeze_elites = yes;
         self
     }
-    /// Mutation-family knob — fresh-start immigrants: a mutation immigrant
-    /// skips the catch-up replay and begins training at the current clock
-    /// instead.
+    /// Catch-up toggles (mutation family): whether a mutation immigrant
+    /// replays the training stream before training at the current clock.
+    /// Default `false` — no handicap: the immigrant keeps its fresh-init
+    /// weights and trains from the current clock on (the old
+    /// "fresh-start" behavior, now the default).
     ///
-    /// Conceptually mode-agnostic ("does an immigrant inherit the population's
-    /// clock?") — but **only RL accepts it today**:
-    /// **Why this is an RL-only idea, and why it is sound there.** Catch-up
-    /// exists so an immigrant is *comparable* to the population: same step
-    /// count, same weight-update history. In Tabular that is sacred — everyone
-    /// shares one data stream, and a net that missed steps missed DATA. In RL
-    /// there is no shared stream: every net's matches are generated fresh from
-    /// its own seeds, so an immigrant that starts at step k has missed no data
-    /// at all, only k updates. And the survivors are survivors precisely
-    /// because their updates went well — which is the thing we want the cull
-    /// roulette to reward, instead of handing every newborn 50 replayed steps
-    /// of inherited history.
-    ///
-    /// Costs: a fresh immigrant's first verdict is random (~the baseline), so
-    /// it competes from birth rather than from a replayed adulthood. Its
-    /// rolling buffers start empty, which the cull/elite paths already treat
-    /// as "no verdict yet" — it cannot be culled before it has one, and it
-    /// cannot hold elite status either. Its state file records `step: 0` with
-    /// no metrics, so resume replays nothing for it (replay_segments returns
-    /// empty on zero trainings) and it simply trains from the current clock —
-    /// deterministic, because its first step's seeds are `(net_seed, clock)`.
-    ///
-    /// Setting this on a Tabular run is a construction ERROR — the setter is
-    /// mode-agnostic but tabular cannot honor it: there the replay would have
-    /// to re-derive historical batches, and starting mid-stream silently skips
-    /// training rows, breaking fitness comparability. (A future tabular
-    /// variant — e.g. rank the immigrant only after K catch-up steps — is a
-    /// separate design decision, parked in TODO.)
-    pub fn set_mutation_fresh_start(mut self, yes: bool) -> Self {
-        self.cfg.mutation_fresh_start = yes;
+    /// **RL-effective only.** Catch-up exists so a net is *comparable* to the
+    /// population: same step count, same weight-update history. In Tabular
+    /// that is sacred — everyone shares one data stream, and a net that missed
+    /// steps missed DATA, so tabular runs ALWAYS catch up regardless of this
+    /// flag. In RL there is no shared stream: every net's matches are
+    /// generated fresh from its own seeds, so starting at step k misses no
+    /// data, only k updates. With catch-up off the immigrant's rolling
+    /// buffers start empty ("no verdict yet") — it cannot be culled or
+    /// crowned before its first step, and its first verdict is ~baseline
+    /// random (it competes from birth rather than from a replayed adulthood).
+    pub fn set_mutation_catch_up(mut self, yes: bool) -> Self {
+        self.cfg.mutation_catch_up = yes;
         self
     }
-    /// ANTI-DEVOLUTION D — regression demotion: each net's entry smoothed
-    /// fitness (first verdict after birth/insertion) becomes its `floor`. A
-    /// net whose smoothed fitness falls below `floor × tol` (Maximize; the
-    /// comparison inverts for Minimize) LOSES elite protection — a collapsed
-    /// net can't hold the crown while it's collapsed, and recovering clears
-    /// the flag. Culling needs no special lane: the collapsed fitness itself
-    /// up-weights the net in the ordinary inverse-proportional mutation-cull
-    /// roulette. Graduated demotion, never a weight rollback: fitness is the
-    /// only currency; failures are culled, not edited. Off by default
-    /// (`None`); typical value 0.7 — tight enough to ignore ordinary SGD
-    /// wobble (which is small and self-correcting), loose enough to catch a
-    /// genuine collapse (which is large and self-reinforcing).
-    pub fn set_fitness_regression_tol(mut self, tol: f32) -> Self {
-        self.cfg.regression_tol = Some(tol);
+    /// Catch-up toggle (crossover family): whether a crossover child replays
+    /// the training stream (and passes the checkpoint gate on the replayed
+    /// history) before insertion. Default `true` — exploitation: a child
+    /// inherits the population's full update history and is checkpoint-gated
+    /// on it, exactly the historical behavior. With `false`, the child skips
+    /// catch-up AND the checkpoint gate (a net with no replayed history has
+    /// nothing to compare against the historical bars — gating off is the
+    /// only sound reading) and trains from the current clock like a mutation
+    /// immigrant, competing from birth.
+    ///
+    /// **RL-effective only** — tabular runs always catch up (shared data
+    /// stream; see [`Self::set_mutation_catch_up`]).
+    pub fn set_crossover_catch_up(mut self, yes: bool) -> Self {
+        self.cfg.crossover_catch_up = yes;
+        self
+    }
+    /// Catch-up toggle (population): whether a population net rejoining the
+    /// group step replays the training it missed. Default `false` — no
+    /// handicap: every net works on its own from where it stands. Note: with
+    /// act-and-measure elite freeze ([`Self::set_elite_freeze`]), a frozen
+    /// elite keeps acting and measuring every step, so dethroned elites never
+    /// fall behind the clock and nothing re-enters with a gap — this knob is
+    /// reserved for future rejoin paths.
+    ///
+    /// **RL-effective only** — tabular runs always catch up. RESUME IS
+    /// EXEMPT: resume always replays (weights are never persisted; replay
+    /// parity is the resume contract regardless of this flag).
+    pub fn set_run_pop_catch_up(mut self, yes: bool) -> Self {
+        self.cfg.run_pop_catch_up = yes;
+        self
+    }
+    /// Dethrone behavior: when a frozen elite loses its crown, reset its
+    /// optimizer STATE (Adam momentum/velocity/step counters) while keeping
+    /// the weights and all hyperparameters. Why: the state is stale — its
+    /// notes describe the gradient landscape of the FROZEN era, and trusting
+    /// them makes the first reclaim updates mis-scaled or mis-directed. A
+    /// reset gives the comeback a clean, well-scaled warm-up: all the frozen
+    /// skill (weights intact), none of the disorientation. Default `true`.
+    /// Pass `false` to keep momentum across the freeze (nonstationary envs
+    /// where the old trend is still meaningful). Replay-relevant — recorded
+    /// in `engine.json` and validated on resume.
+    pub fn set_dethrone_reset_optimizer_state(mut self, yes: bool) -> Self {
+        self.cfg.dethrone_reset_optimizer_state = yes;
         self
     }
     /// Per-net smoothed-fitness rolling window (K), in steps. Every ranking
-    /// decision — elite selection, cull roulette weights, regression floors,
+    /// decision — elite selection, cull roulette weights,
     /// the checkpoint ledger, stop criteria — averages the last K step
     /// fitnesses instead of reading the latest value, so a single lucky or
     /// unlucky step cannot flip a verdict. Default
@@ -620,7 +654,7 @@ impl RaceConfigBuilder {
     /// construction fails parity. Larger K = stabler, slower-reacting
     /// rankings (a collapse takes K steps to fully register); smaller K =
     /// jumpier, faster to react.
-    pub fn set_fitness_smoothing_window(mut self, k: usize) -> Self {
+    pub fn set_run_smoothing_window(mut self, k: usize) -> Self {
         self.cfg.smoothing_window = k.max(1);
         self
     }

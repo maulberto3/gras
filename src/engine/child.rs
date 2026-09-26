@@ -431,9 +431,19 @@ impl CoreEngine {
         // (fastrand + libtorch). This is what keeps stochastic nets
         // bit-exact across replays.
         crate::utils::race_steps::seed_step_randomness(child.state.net_seed as u64, step as u64, 0);
+        // Replay must mirror the step's ORIGINAL execution: a recorded frozen
+        // step (act-and-measure) is re-run through a no-op optimizer so the
+        // weights stay put and the metrics reproduce bit-exactly.
+        let frozen_step = child.state.is_frozen_step(step);
+        let mut noop = crate::engine::core::NoopOptimizer;
+        let optimizer: &mut dyn flodl::nn::optim::Optimizer = if frozen_step {
+            &mut noop
+        } else {
+            &mut *child.optimizer
+        };
         let report = self.trainer.train_step(
             &mut child.net,
-            &mut *child.optimizer,
+            optimizer,
             step,
             run_data.as_ref(),
             &self.fitness,
@@ -448,6 +458,7 @@ impl CoreEngine {
             eval_loss: report.eval_loss,
             fitness: report.fitness,
             informative: report.informative,
+            frozen: frozen_step,
         };
         child.state.record_metrics(metrics.clone());
         child.state.advance_step();
@@ -539,6 +550,8 @@ impl CoreEngine {
             culled_at_step: None,
             cull_reason: None,
             final_smoothed_fitness: None,
+            // frozen_spans are KEPT: replay needs to know which clocks were
+            // act-and-measure so it reproduces them with the no-op optimizer.
             // Keep the rest (hash, topology, net_seed, lineage, entry step, meta).
             ..state
         };
