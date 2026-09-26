@@ -63,7 +63,7 @@ fn main() {
     // 3. Config — small defaults (this is a showpiece), overridable by flags.
     //    Topology: 1 input feature, 1 output value.
     let builder = RaceConfig::builder()
-        .set_pop_size(6)
+        .set_run_pop_size(6)
         .set_stop_max_steps(50)
         .set_topology_hidden_dim_range(4, 8)
         .set_topology_input_dim(d_in)

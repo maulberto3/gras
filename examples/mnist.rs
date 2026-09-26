@@ -143,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = RaceConfig::builder()
         // --- Population & Engine options ---
         .set_run_name(RUN_NAME) // Human experiment label → engine.json "run_name" (folder name unchanged)
-        .set_pop_size(pop) // Number of active, live networks in population
+        .set_run_pop_size(pop) // Number of active, live networks in population
         .set_run_log_level(LOG_LEVEL) // Log level verbosity
         .set_run_metrics(vec![
             Metric::from("f1"), // built-in label — scored by the score_by_label dispatcher
@@ -170,16 +170,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // when neither criterion was given on the CLI.
         // --- Evolutionary Probabilities & Rolls ---
         .set_elite_count(1) // Elite guard: top-k nets by smoothed fitness are immune to ALL culls (crossover AND mutation). Minimum 1 — the champion is always guarded. Elites hold rank, not identity — a declining net falls out naturally.
-        .set_elite_freeze(true) // Anti-devolution A: the top elite_count nets skip the trainer entirely — their last recorded metrics are carried forward, weights never change
-        .set_fitness_smoothing_window(5) // Ranking averages the last K steps of fitness — one lucky eval batch can't flip a verdict
-        .set_fitness_regression_tol(0.5) // Anti-devolution D: a net whose smoothed fitness collapses below (1−tol) × its birth fitness is demoted (loses the elite seat, fronts the cull line)
+        .set_elite_freeze(true) // Anti-devolution A (default): the top elite_count nets act-and-measure without weight updates
+        .set_run_smoothing_window(5) // Ranking averages the last K steps of fitness — one lucky eval batch can't flip a verdict
         .set_crossover_prob(0.5) // Probability of a crossover roll firing per step
         .set_crossover_rolls(pop / 2) // Number of crossover attempts/rolls per step
         .set_crossover_cull_policy(gras::engine::config::CrossCullPolicy::Worst) // Who a surviving CROSSOVER child evicts: CrossCullPolicy::Worst (worst by smoothed fitness) or CrossCullPolicy::Random (uniform, diversity-first). Mutation immigrants always evict via fitness-inverse roulette — not this knob.
-        .set_checkpoint_every(CHECKPOINT_EVERY) // Steps between checkpoint gate recordings
+        .set_run_checkpoint_every(CHECKPOINT_EVERY) // Steps between checkpoint gate recordings
         .set_crossover_gate(gras::engine::config::CrossoverGate::Soft) // Gate strictness for crossover children: CrossoverGate::Hard (beat every checkpoint bar) or CrossoverGate::Soft (beat the mean of the bars)
         .set_crossover_retries(3) // cx_retry_full: gate-rejected child ⇒ up to 3 TOTAL attempts (fresh parents + generate + gate each), then the roll is spent. Every attempt (inserted or rejected) is recorded in history.csv
-        .set_mutation_fresh_start(false)
+        .set_mutation_catch_up(true) // tabular always catches up — the flag is RL-effective
         // .set_crossover_ops_pool(["one_point".into(), "uniform".into()]) // Crossover operators drawn per attempt. Empty (default) ⇒ both. The chosen op is logged per child in its lineage note (crossover-one-point / crossover-uniform).
         .set_mutate_prob(0.5) // Probability of an immigrant roll firing per step
         .set_mutate_rolls(pop / 5) // Number of random immigrant substitution rolls per step

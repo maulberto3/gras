@@ -143,21 +143,16 @@ pub struct EngineArgs {
     #[arg(long)]
     pub no_elite_save: bool,
 
-    /// Anti-devolution A: top-elite_count nets skip the trainer call (their
-    /// weights never change — a bad training step can't erase the best skill).
-    #[arg(long)]
+    /// Anti-devolution A: top-elite_count nets act-and-measure without
+    /// weight updates (default on). Pass --no-freeze-elites to let elites
+    /// keep training.
+    #[arg(long = "no-freeze-elites", action = clap::ArgAction::SetFalse)]
     pub freeze_elites: bool,
 
-    /// Anti-devolution D: demote nets whose smoothed fitness falls below
-    /// their entry floor × this tolerance (0.7 = 30% collapse triggers).
-    /// Demotion is a per-step status (loses the freeze seat, up-weighted in
-    /// cull roulette) — NOT removal from the population.
-    #[arg(long, value_name = "TOL")]
-    pub regression_tol: Option<f32>,
-
-    /// RL-only: mutation immigrants skip the catch-up replay and train from
-    /// the current clock (a newborn earning its seat from birth). Errors on
-    /// a tabular run at engine construction.
+    /// Mutation catch-up toggle (RL-effective): OFF (default) = no handicap —
+    /// the immigrant keeps fresh weights and trains from the current clock.
+    /// ON = the immigrant replays the training stream first (comparable
+    /// step-count on entry). Tabular always catches up regardless.
     #[arg(long)]
     pub fresh_immigrants: bool,
 
@@ -192,7 +187,7 @@ impl EngineArgs {
     /// left `None` keeps the example's own default (set by its const panel).
     pub fn apply(&self, mut b: RaceConfigBuilder) -> RaceConfigBuilder {
         if let Some(pop) = self.pop {
-            b = b.set_pop_size(pop);
+            b = b.set_run_pop_size(pop);
         }
         if let Some(steps) = self.max_steps {
             b = b.set_stop_max_steps(steps);
@@ -204,7 +199,7 @@ impl EngineArgs {
             b = b.set_elite_count(k);
         }
         if let Some(n) = self.checkpoint_every {
-            b = b.set_checkpoint_every(n);
+            b = b.set_run_checkpoint_every(n);
         }
         if let Some(p) = self.crossover_prob {
             b = b.set_crossover_prob(p);
@@ -230,14 +225,9 @@ impl EngineArgs {
         if let Some(steps) = self.pruner_steps {
             b = b.set_pruner_steps(steps);
         }
-        if self.freeze_elites {
-            b = b.set_elite_freeze(true);
-        }
-        if let Some(tol) = self.regression_tol {
-            b = b.set_fitness_regression_tol(tol);
-        }
+        b = b.set_elite_freeze(self.freeze_elites);
         if self.fresh_immigrants {
-            b = b.set_mutation_fresh_start(true);
+            b = b.set_mutation_catch_up(true);
         }
         if let Some(mode) = &self.crossover_gate {
             b = b.set_crossover_gate(match mode.trim().to_ascii_lowercase().as_str() {

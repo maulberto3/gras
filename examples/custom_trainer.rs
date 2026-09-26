@@ -261,9 +261,9 @@ fn main() {
     // Config — note there are NO training knobs here anymore (no learning
     // rate, no grad clip): those live on the trainer below.
     let builder = RaceConfig::builder()
-        .set_pop_size(4)
+        .set_run_pop_size(4)
         .set_stop_max_steps(30)
-        .set_checkpoint_every(5)
+        .set_run_checkpoint_every(5)
         .set_topology_input_dim(2)
         .set_topology_output_dim(2)
         .set_topology_min_hidden_num_nodes(2)

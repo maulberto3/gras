@@ -1,35 +1,27 @@
-//! CartPole — the RL-path example with REAL dynamics and REAL autodiff.
+//! CartPole — the RL-path example with real dynamics and real autodiff.
 //!
-//! Counterpart of `continuous.rs` for [`RunSpec::rl`]: NO dataset, NO
-//! (pred, target) scorer. The environment is a pure-Rust CartPole
-//! (OpenAI/Gym classic: balance a pole on a cart; 4 observations, 2 actions,
-//! a match ends when the pole falls or the 500-turn cap). The net is the
-//! POLICY: 2 output logits, argmax = action; trained with REINFORCE through
-//! real autodiff (`log_softmax` of the chosen action's logit, gradients flow
-//! into the graph). Reported fitness = match survival in turns.
+//! Counterpart of `continuous.rs` for [`RunSpec::rl`]: no dataset, no
+//! (pred, target) scorer. Pure-Rust CartPole physics (4 obs, 2 actions,
+//! match ends on pole fall or the 500-turn cap). The net is the policy
+//! (2 logits, argmax = action), trained with REINFORCE through autodiff.
+//! Reported fitness = mean match survival in turns.
 //!
-//! Vocabulary (gras-wide, see `RlStepMeta`): **match** = one episode (a full
-//! game), **turn** = one environment step inside a match. The Gym names
-//! survive only where physics demands them (`MAX_TURNS_PER_MATCH`),
-//! everything the engine sees uses match/turn.
+//! Vocabulary: **match** = one episode, **turn** = one env step inside a
+//! match (see `RlStepMeta`).
 //!
-//! What this demonstrates beyond `bandit.rs`:
-//! 1. A multi-turn ENVIRONMENT (credit assignment across a match, not a
-//!    one-shot pull) — still with zero engine changes.
-//! 2. `train_one_step_pred_only` used with genuine autodiff (the loss is
-//!    differentiable end-to-end).
+//! Demonstrates:
+//! 1. A multi-turn environment (credit assignment across a match), zero engine changes.
+//! 2. `train_one_step_pred_only` with genuine end-to-end autodiff.
 //! 3. Evolution identical to tabular: crossover, gates on reported fitness,
-//!    mutation immigrants, culls, markdown/safetensors exports.
-//! 4. **Full replay determinism for RL**: match start states are seeded
-//!    from `(net_seed, step, match_index)` — the whole run (including
-//!    catch-up children) replays bit-exactly from `run_seed`.
-//! 5. The A/B update switch (`Update` enum): REINFORCE vs ValueHead
-//!    regression, and a guardrail holdout that re-checks the champion's
-//!    TRAINED weights (loaded from the exported safetensors) on fresh
-//!    matches at race end.
-//! 6. RL volume reporting: the per-step log's
-//!    `matches <n> │ turns <n> │ turns/match <mean>` columns come from the
-//!    `StepReport.rl` this trainer fills (kagiculture fills the same struct).
+//!    mutation immigrants, culls, exports.
+//! 4. Full replay determinism for RL: match starts seeded from
+//!    `(net_seed, step, match_index)` — the whole run (including catch-up
+//!    children) replays bit-exactly from `run_seed`.
+//! 5. The A/B update switch (`Update` enum): REINFORCE vs ValueHead, plus a
+//!    post-race holdout guardrail on the champion's TRAINED weights
+//!    (loaded from the exported safetensors).
+//! 6. RL volume reporting: `matches/turns/turns-per-match` log columns from
+//!    `StepReport.rl`.
 //!
 //! Run: `source env_setup.sh && cargo run --release --example cartpole`
 //! Quick smoke: `cargo run --release --example cartpole -- --pop 6 --max-steps 3 --matches-per-step 2`
@@ -63,84 +55,69 @@ use gras::utils::race_steps::train_one_step_pred_only;
 type Transition = ([f32; 4], usize);
 
 // ── Race size knobs (fast example — env-var wins, else the const) ──────────
-// This env is cheap (pure-Rust physics, microseconds per step), so the
-// defaults here are REAL-training sized. Shrink via env vars for a quick
-// wiring check: CARTPOLE_STEPS=10 CARTPOLE_EPS=4 cargo run --release ...
-/// Salt XORed into the eval batch's seed derivation. Guarantees eval match
-/// starts never collide with train match starts for the same (net_seed,
-/// step) — the whole point is that the net is measured on games it did NOT
-/// train on. Nonzero, and distinct from HOLDOUT_SEED_BASE's namespace.
+// Pure-Rust physics is cheap; the defaults are real-training sized. Shrink
+// for a quick wiring check: CARTPOLE_STEPS=10 CARTPOLE_EPS=4 cargo run --release ...
+/// Salt XORed into the eval batch's seed derivation: guarantees eval match
+/// starts never collide with train match starts for the same (net_seed, step).
 const EVAL_SALT: u64 = 0x000E_BA11_5EED_0001;
 
 /// Run-level seed base for SHARED (population-common) derivations — eval
-/// match starts. Distinct namespace from any net's seed; this is what makes
-/// the eval batch identical for every net (paired comparison).
+/// match starts. No net seed mixed in, so the eval batch is identical for
+/// every net (paired comparison).
 const RUN_SEED: u64 = 0x000D_0011_DACE_0001;
 
-/// Alternative stop criterion — the const default for `--max-steps`. The
-/// wired default is `MAX_TARGET_FITNESS`; clap makes the two mutually
-/// exclusive on the command line, and the engine's `build()` panics if both
-/// are set, so a run can never carry two stop criteria.
+/// Alternative stop criterion — the const default for `--max-steps`. Clap
+/// makes the two mutually exclusive and the engine's `build()` panics if
+/// both are set.
 #[allow(dead_code)]
 const RACE_STEPS: usize = 80;
 const MATCHES_PER_STEP: usize = 2;
 /// Eval matches per step — THE fitness signal (see EVAL_SALT). Played with
-/// the CURRENT weights, never learned from: the engine ranks ONLY on these,
-/// so the number needs enough matches behind it (4, not 2) to rank
-/// reliably — that's the wall-clock price of a bias-free ranking.
-/// 0 disables, falling fitness back to the train batch (original behavior).
+/// the current weights, never learned from; the engine ranks only on these.
+/// Needs enough matches (4, not 2) to rank reliably. 0 disables, falling
+/// fitness back to the train batch (original behavior).
 const EVAL_MATCHES_PER_STEP: usize = 4;
 /// Population size — the number of networks maintained in the evolutionary loop.
 const POP: usize = 100;
 
-// ── DECISION-LAG RELAY (an RL experiment — see DecisionLagTrainer) ─────────
-// At the trainer call site below both forms sit side by side: the RELAY wraps
-// the trainer so the deciding *face* plays and ranks while a *shadow* forked
-// from it receives the optimizer step and is promoted at the step boundary
-// (policy and learning apart, breaking the self-reinforcing on-policy loop);
-// the CLASSIC form just lets the net learn from the games it played. Comment
-// one, uncomment the other. Costs 2× matches per step.
+// ── DECISION-LAG RELAY (an RL experiment — see DecisionLagTrainer) ───────
+// The RELAY wraps the trainer so the deciding *face* plays and ranks while a
+// *shadow* forked from it receives the optimizer step and is promoted at the
+// step boundary (policy and learning apart); the CLASSIC form lets the net
+// learn from the games it played. Comment one, uncomment the other. Costs
+// 2× matches per step.
 ///
 /// Relay width, in ENGINE STEPS: the face holds its weights for 2 steps and
-/// the shadow takes 2 optimizer steps before it is promoted (1 = the classic
-/// one-step lag). A wider lag asks whether MORE distance between the acting
-/// policy and the learning policy helps further. The shadow's steps are
-/// batched onto the cycle's last step, so that step costs ≈ 2× a normal one
-/// (a visible `took Xs` spike); the amortized env cost stays ≈ 2×.
-/// The policy's learning rate — an ordinary f32 knob like every other const
-/// here (gras is f32 end to end). flodl's `Adam::new` is typed `f64` because
-/// it mirrors libtorch, where optimizer scalars are C++ `double`; the value is
-/// cast exactly once, at that boundary.
+/// the shadow takes 2 optimizer steps before promotion (1 = classic one-step
+/// lag). The shadow's steps batch onto the cycle's last step (a visible
+/// `took Xs` spike); amortized env cost stays ≈ 2×.
+/// The policy's learning rate. flodl's `Adam::new` is typed `f64` (mirrors
+/// libtorch's C++ `double` optimizer scalars); the value is cast once, at
+/// that boundary.
 const LEARNING_RATE: f32 = 1e-3;
 
-/// Dropout probability stamped into every net's blueprint. Masks fire only on
-/// the TRAIN forward (`net.train()` around the loss); every rollout, eval match,
-/// holdout and export runs in eval mode. The engine seeds libtorch per
-/// `(net_seed, step)` before each step, so this stays replay-exact.
+/// Dropout probability stamped into every net's blueprint. Masks fire only
+/// on the TRAIN forward (`net.train()` around the loss); every rollout,
+/// eval match, holdout and export runs in eval mode. The engine seeds
+/// libtorch per `(net_seed, step)`, so this stays replay-exact.
 const DROPOUT_PROB: f32 = 0.25;
 
-// ── REWARD KNOBS (the experiment surface) ──────────────────────────────────
+// ── REWARD KNOBS ──────────────────────────────────────────────────────
 
 /// Match failure cap: a match reaching this many turns = solved.
-/// (The Gym classic calls this the episode step limit; here it is the
-/// longest a match can run before we call the policy good.)
 const MAX_TURNS_PER_MATCH: usize = 500;
 
 /// Alternative stop criterion (mutually exclusive with `max_steps`): stop
 /// once the best smoothed fitness — reported survival turns — reaches this.
+#[allow(dead_code)] // the commented-out stop_target_fitness lane uses it
 const MAX_TARGET_FITNESS: f32 = 200.0;
 
-/// The scalar reported to the engine as this net's fitness — THE reward
-/// evolution ranks on. Receives the batch's per-match turn counts
-/// (how many turns each match survived).
-///
-/// MEAN-of-batch, deliberately. The old best-of-batch (`survivals.max()`)
-/// measured the batch's luckiest match: one lucky start state out of N
-/// inflated the whole step, and the smoothed value then carried that
-/// spike across the stop bar while fresh holdout matches exposed the
-/// truth (smoothed 201.8 vs holdout 11 in the run that motivated this).
-/// The mean counts every match — luck averages out, and the number the
-/// engine ranks on finally means "how good is this policy, typically".
+/// The scalar reported to the engine as this net's fitness — the reward
+/// evolution ranks on. Receives the batch's per-match turn counts.
+/// MEAN-of-batch, deliberately: best-of-batch measured the batch's luckiest
+/// match, and the smoothed value then carried the spike across the stop bar
+/// (measured: smoothed 201.8 vs holdout 11 in one run). The mean counts
+/// every match — luck averages out.
 fn fitness_from_survivals(survivals: &[usize]) -> f32 {
     if survivals.is_empty() {
         return 0.0;
@@ -148,25 +125,23 @@ fn fitness_from_survivals(survivals: &[usize]) -> f32 {
     survivals.iter().copied().sum::<usize>() as f32 / survivals.len() as f32
 }
 
-/// The weight update applied after each match batch (T2 vs T3 flavor):
+/// The weight update applied after each match batch:
 /// - `Reinforce` — policy gradient. Loss =
 ///   `−Σ_adv_t · log P(a_t | s_t)` with batch-mean baseline and normalized
-///   advantages. Directly raises the probability of actions that beat
-///   average — the net *learns to play*.
+///   advantages. Directly raises the probability of actions that beat average.
 /// - `ValueHead` — A/B baseline: regress the output logits on the
-///   per-timestep returns (MSE). Teaches the net to *predict* survival;
-///   its argmax shifts only indirectly.
+///   per-timestep returns (MSE); argmax shifts only indirectly.
 ///
-/// (A third arm, `PopMean` — the population's mean policy as anchor — was
-/// implemented, measured, and REMOVED: four variants all underperformed
-/// vanilla REINFORCE. See `CARTPOLE_EXPERIMENTS.md` for the full record.)
+/// (A third arm, `PopMean`, was implemented, measured, and removed: four
+/// variants all underperformed vanilla REINFORCE. See
+/// `CARTPOLE_EXPERIMENTS.md`.)
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Update {
     Reinforce,
     ValueHead,
 }
 
-/// Which update the trainer applies. REINFORCE is the real deal.
+/// Which update the trainer applies.
 const UPDATE: Update = Update::Reinforce;
 
 // The `ValueHead` arm is constructed dynamically by the match on UPDATE
@@ -237,9 +212,8 @@ impl CartPole {
 }
 
 /// Deterministic match start jitter from (net_seed, step, match_index).
-/// Golden-ratio hash → ±0.05 on x and θ. This is what makes the whole RL
-/// run replay-deterministic: a catch-up child re-derives the SAME match
-/// starts its population saw, because they're a pure function of seeds.
+/// Golden-ratio hash → ±0.05 on x and θ. Pure function of seeds — this is
+/// what makes the RL run replay-deterministic.
 fn episode_start_seed(net_seed: u64, step: usize, match_i: usize) -> u64 {
     net_seed
         ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -247,35 +221,30 @@ fn episode_start_seed(net_seed: u64, step: usize, match_i: usize) -> u64 {
 }
 
 /// Eval-match start seed — SHARED across the whole population: a pure
-/// function of (RUN_SEED, step, match_i), with NO net_seed mixed in.
-///
-/// This is the paired-comparison trick (the tabular guarantee, imported):
-/// every net is measured on the IDENTICAL eval games each step, so a gentle
-/// or brutal start inflates everyone equally and cancels in the RANKING.
-/// Train matches keep per-net seeds (exploration diversity is a feature of
-/// the learning path); only the measurement is common. Still a pure
-/// function of seeds — replays byte-exactly on resume.
+/// function of (RUN_SEED, step, match_i), no net_seed mixed in. Every net
+/// is measured on the identical eval games each step, so start-state luck
+/// is common-mode and cancels in the ranking (paired comparison). Train
+/// matches keep per-net seeds (exploration diversity); only the
+/// measurement is common. Replays byte-exactly on resume.
 fn eval_start_seed(step: usize, match_i: usize) -> u64 {
     episode_start_seed(RUN_SEED ^ EVAL_SALT, step, match_i)
 }
 
 // ── The trainer: policy net + REINFORCE + reported fitness ────────────────
 
-/// Drives whole matches per training step. Each step: run a small batch of    /// matches with the current policy, collect (obs, action) pairs, then apply
+/// Drives whole matches per training step. Each step: run a small batch of
+/// matches with the current policy, collect (obs, action) pairs, then apply
 /// the configured update (`--update`, defaulting to the [`UPDATE`] const):
 ///
-/// - **Per-turn return:** G_t = (turns remaining after t). Early actions
-///   get MORE credit than late ones (they're the ones that kept the match
-///   alive long enough for late ones to exist).
-/// - **Baseline:** the mean return of the batch. REINFORCE's variance is
-///   proportional to the return magnitude (~500² without a baseline); with
-///   it, the gradient only encodes "better/worse than average".
-/// - **Estimator:** mean-of-batch (see `fitness_from_survivals`) — every
-///   match counts; a lucky single match cannot crown a bad policy.
+/// - **Per-turn return:** G_t = (turns remaining after t) — early actions
+///   get more credit than late ones.
+/// - **Baseline:** the mean return of the batch (REINFORCE's variance is
+///   proportional to the return magnitude without one).
+/// - **Estimator:** mean-of-batch (see `fitness_from_survivals`).
 /// - **Advantage normalization:** scales advantages to O(1) so grad_clip
 ///   stays sane regardless of match length.
 ///
-/// Reports the batch's BEST match survival as fitness (see
+/// Reports the batch's mean eval survival as fitness (see
 /// `fitness_from_survivals`); the engine ranks on it.
 struct CartPoleTrainer {
     grad_clip: f32,
@@ -285,12 +254,10 @@ struct CartPoleTrainer {
     /// Matches per training step (the update batch).
     matches_per_step: usize,
     /// Eval matches per step: played with the post-update weights for
-    /// MEASUREMENT ONLY (no gradient, no update). These start states come
-    /// from `eval_start_seed(step, match_i)` — SHARED across all nets, so
-    /// every net is ranked on the identical batch of unseen games (paired
-    /// comparison: start-state luck is common-mode and cancels). They are
-    /// also a different derivation than the train batch, so the reported
-    /// fitness can't be gamed by memorizing one's own seeded trajectories.
+    /// MEASUREMENT ONLY (no gradient). Start states come from
+    /// `eval_start_seed(step, match_i)` — shared across all nets (paired
+    /// comparison), and a different derivation than the train batch, so
+    /// reported fitness can't be gamed by memorizing one's own trajectories.
     eval_matches_per_step: usize,
     /// The step clock, mirrored from `train_step` so match starts are a
     /// pure function of (net_seed, step, match_i) — the replay-parity key.
@@ -398,18 +365,13 @@ impl RlStep for CartPoleTrainer {
             .sqrt()
             .max(1e-6);
         let scale = 1.0 / adv_std;
-        // The weight update: −Σ adv_t · log P(a_t | s_t), one-hot mask on
-        // the taken action (vanilla REINFORCE — the pop-mean arm variants
-        // that replaced this target were all removed; see
-        // CARTPOLE_EXPERIMENTS.md).
+        // Vanilla REINFORCE target; see CARTPOLE_EXPERIMENTS.md for the
+        // removed pop-mean arms.
         //
-        // DROPOUT: the loss forward runs in TRAIN mode (topology's
-        // dropout_prob = 0.2 → masks fire, regularizing the update), then
-        // back to EVAL so rollouts/eval-matches stay deterministic. Eval is
-        // the resting state: build(), play_episode and the guardrail all
-        // assume it. Masks come from libtorch's global RNG, which the engine
-        // seeds per (net_seed, step) before this call, so dropout runs replay
-        // bit-exactly and resume normally.
+        // DROPOUT: the loss forward runs in TRAIN mode, then back to EVAL —
+        // eval is the resting state (build(), play_episode and the guardrail
+        // all assume it). Masks come from libtorch's global RNG, which the
+        // engine seeds per (net_seed, step), so dropout replays bit-exactly.
         net.train();
         let loss = match self.update {
             Update::Reinforce => {
@@ -453,10 +415,9 @@ impl RlStep for CartPoleTrainer {
         };
         net.eval();
         // 3. Apply the update via the shared pred-only skeleton (backward +
-        //    clip + step). The closure ignores `pred` and returns the
-        //    prebuilt trajectory loss; the forward inside the skeleton runs
-        //    on a dummy observation — its result is discarded, only the
-        //    graph built above carries gradients. Shape must be [1, 4].
+        //    clip + step). The closure ignores `pred`; the forward inside
+        //    runs on a dummy obs and is discarded — only the graph built
+        //    above carries gradients. Shape must be [1, 4].
         let inputs = Tensor::from_f32(&[0.0; 4], &[1, 4], self.device)?;
         let train_loss = train_one_step_pred_only(
             net,
@@ -465,10 +426,9 @@ impl RlStep for CartPoleTrainer {
             &inputs,
             self.grad_clip,
         )?;
-        // 4. Eval batch — AFTER the update, so these matches measure the
-        //    weights the net actually carries into the next step. Played with
-        //    the same play_episode (no grad tape: its forward runs with
-        //    requires_grad=false), but NEVER added to the loss/backward path.
+        // 4. Eval batch — AFTER the update, so it measures the weights the
+        //    net carries into the next step. Same play_episode (no grad tape),
+        //    never added to the loss/backward path.
         let mut eval_survivals: Vec<usize> = Vec::with_capacity(self.eval_matches_per_step);
         for match_i in 0..self.eval_matches_per_step {
             let seed = eval_start_seed(step, match_i);
@@ -478,16 +438,10 @@ impl RlStep for CartPoleTrainer {
             eval_survivals.push(survival);
         }
 
-        // 5. Report: fitness = EVAL-ONLY. The engine ranks on games the net
-        //    did NOT learn from — the same quantity the holdout guardrail
-        //    measures, so ranking and holdout agree by construction. Train
-        //    matches remain the learning fuel (their returns feed the
-        //    REINFORCE update above) but no longer contaminate the score:
-        //    a train term re-introduces the in-sample bias the eval batch
-        //    exists to cancel. Init luck, the one bias eval-only can't
-        //    cancel, is left to selection across generations (crossover
-        //    inherits the architecture, children re-prove it with fresh
-        //    inits) — see TODO "N-inits per individual".
+        // 5. Report: fitness = EVAL-ONLY — the same quantity the holdout
+        //    guardrail measures, so ranking and holdout agree by construction.
+        //    Init luck is left to selection across generations — see TODO
+        //    "N-inits per individual".
         let eval_est = fitness_from_survivals(&eval_survivals);
         let fitness = eval_est;
         Ok(StepReport {
@@ -527,9 +481,7 @@ impl StepTrainer for CartPoleTrainer {
             "matches_per_step": self.matches_per_step,
             "eval_matches_per_step": self.eval_matches_per_step,
             // Trainer-owned training knobs: the engine cannot know them, so
-            // this block is their only record. lr lives in the const panel,
-            // not in a RaceConfig field, which is exactly why it must be
-            // written down here for an experiment to be reproducible.
+            // this block is their only record.
             "learning_rate": LEARNING_RATE,
             "grad_clip": self.grad_clip,
             "dropout_prob": DROPOUT_PROB,
@@ -568,23 +520,15 @@ fn random_baseline(matches: usize) -> f64 {
 /// any (net_seed, step) triple, so holdout games are reproducible AND
 /// disjoint from the race's own match starts.
 const HOLDOUT_SEED_BASE: u64 = 0x0132_7A11;
-/// Holdout batch size: how many fresh games the guardrail (post-race) and
-/// `--score-only` play to judge a champion. Small because each game runs to
-/// 500 turns; the mean over 10 is enough to separate "solved" from "random"
-/// at a glance (random ≈ 22, solved = 500).
+/// Holdout batch size for the guardrail (post-race) and `--score-only`.
+/// Small because each game runs to 500 turns (random ≈ 22, solved = 500).
 const HOLDOUT_MATCHES: usize = 10;
 
 /// Re-evaluate the champion over holdout matches — the SAME estimator as
-/// the race reports (mean-of-batch), so ranking and holdout measure the
-/// same quantity and agreement is the norm. Crucially, the champion's
-/// TRAINED weights are loaded from `elite-<hash>.safetensors` (via
-/// `load_safetensors`) — before that existed, the guardrail silently
-/// tested a NEWBORN brain (fresh init from the blueprint) and reported
-/// garbage verdicts like "smoothed 201 but holdout 9" on nets that had
-/// actually learned. Still independent: fresh matches the net never
-/// saw. `champion_hash` comes from the engine's `champion_hashes()`.
-/// Returns `(mean, std)` over the batch — the ± matters as much as the
-/// mean: a `312 ± 87` is a different verdict quality than `312 ± 5`.
+/// the race reports (mean-of-batch). The champion's TRAINED weights are
+/// loaded from `elite-<hash>.safetensors` — without that, the guardrail
+/// silently tested a newborn brain (measured: "smoothed 201 but holdout 9"
+/// on nets that had learned). Returns `(mean, std)` over the batch.
 fn holdout_survival(
     run_dir: &std::path::Path,
     champion_hash: &str,
@@ -600,22 +544,17 @@ fn holdout_survival(
         .and_then(|t| t.as_str())
         .map(String::from)?;
     // NOTE: do NOT call `topo.finalize()` here. The saved topology is already
-    // finalized, and `finalize()` clears + REGENERATES the wiring — calling it
-    // on a loaded graph silently swapped in a different network (different
-    // cross-dim bridges), which is what made this guardrail compare a stranger
-    // against the champion and report "collapsed ❌" on a net that scored 500.
+    // finalized, and finalize() clears + REGENERATES the wiring — which
+    // silently swapped in a different network.
     let topo = gras::Topology::from_json(&topo_json).ok()?;
     let mut net = Network::build(&topo, device).ok()?;
-    // The whole point: the champion's actual trained weights, not a fresh
-    // init. The safetensors sits next to the run's elite artifacts and is
-    // named with the SHORT hash (8 chars), as the engine writes it.
+    // The champion's trained weights (named with the SHORT hash, 8 chars,
+    // as the engine writes it).
     let short = &champion_hash[..8.min(champion_hash.len())];
     let weights = run_dir.join(format!("elite-{short}.safetensors"));
     if weights.exists() {
-        // A load failure must NEVER be swallowed: a partially-loaded net
-        // (e.g. bridges left at fresh init by the incomplete-export bug)
-        // measures like a different network, and the verdict below would be
-        // about that net, not the champion. Refuse loudly instead.
+        // A load failure must never be swallowed: a partially-loaded net
+        // measures like a different network.
         if let Err(e) = gras::utils::safetensors::load_safetensors(&mut net, &weights) {
             eprintln!(
                 "guardrail: loading {weights:?} failed ({e}) — cannot check the champion's trained weights, skipping"
@@ -623,8 +562,8 @@ fn holdout_survival(
             return None;
         }
     }
-    // No safetensors (elite_save disabled)? The verdict below would measure
-    // a newborn — surface that by refusing, rather than lying.
+    // No safetensors (elite_save disabled)? The verdict would measure a
+    // newborn — refuse rather than lie.
     else {
         eprintln!("guardrail: no {weights:?} — cannot check trained weights, skipping");
         return None;
@@ -651,9 +590,8 @@ fn holdout_survival(
         }
     }
     let mean = fitness_from_survivals(&survivals);
-    // Population std over the batch — how ragged the champion's play is.
-    // A tight ± means the verdict is solid; a wide ± means the mean hides
-    // a mix of solved and fluke games (worth knowing before trusting it).
+    // Population std over the batch — a wide ± hides a mix of solved and
+    // fluke games.
     let var = survivals
         .iter()
         .map(|&s| {
@@ -666,10 +604,8 @@ fn holdout_survival(
 }
 
 /// `--score-only`: rebuild each saved champion from its topology, load its
-/// trained weights, play the holdout batch, print the verdict. Deliberately
-/// engine-free — this path exists precisely for runs the engine cannot replay
-/// (unreproducible history), where a resume-based guardrail refuses. It also
-/// doubles as the post-hoc check on any exported elite.
+/// trained weights, play the holdout batch, print the verdict. Engine-free,
+/// so it works on runs whose history cannot be replayed.
 fn score_saved_elites(run_dir: &std::path::Path, only: Option<&str>) {
     let device = gras::auto_device();
     let baseline = random_baseline(20);
@@ -825,68 +761,60 @@ fn main() {
 
     // ONE device decision for the whole binary — mirrors the engine's
     // `RaceConfig::device()`: CUDA(0) under the `cuda` feature, CPU otherwise.
-    // Every trainer tensor, rollout forward, and the holdout guardrail below
-    // use THIS, so example code and engine nets always agree (a CPU-built
-    // net fed CUDA tensors, or vice versa, panics deep inside flodl).
+    // A CPU-built net fed CUDA tensors (or vice versa) panics inside flodl.
     let device = gras::auto_device();
 
-    // Score-only: no engine is constructed at all, so nothing is replayed and
-    // the resume parity check never runs. Scored against a holdout batch that
-    // is disjoint from every race match (and from each other run's holdout).
+    // Score-only: no engine is constructed, so nothing is replayed and the
+    // resume parity check never runs. Holdout batch is disjoint from every
+    // race match.
     if let Some(dir) = &cli.score_only {
         score_saved_elites(dir, cli.score_hash.as_deref());
         return;
     }
 
-    // Flag > const for every knob (the const panel above is the documented
-    // default). Stop criteria are mutually exclusive at the engine level too:
-    // `--max-steps` and `--max-target-fitness` conflict in clap, so only one
-    // ever reaches the builder here.
+    // Flag > const for every knob; stop criteria are mutually exclusive (clap
+    // and the engine both enforce it).
     let matches = cli.matches_per_step.unwrap_or(MATCHES_PER_STEP);
     let eval_matches = cli.eval_matches_per_step.unwrap_or(EVAL_MATCHES_PER_STEP);
     let pop = cli.engine.pop.unwrap_or(POP);
     let update = cli.update_or_default();
-
+    
     // T2.4-flavor baseline gate: the random policy's survival.
     let baseline = random_baseline(20);
     println!("baseline: random policy survives {baseline:.1} turns (race must beat this)");
-
-    // Defaults from the const panel, then the CLI overlays them. The stop
-    // criterion is the one place where "flag wins" needs care: the const
-    // default (target fitness) is only applied when the user asked for
-    // neither criterion, so `--max-steps` never collides with it.
-    let stop_overridden = cli.engine.max_steps.is_some() || cli.engine.max_target_fitness.is_some();
+    
+    // Stop criterion: the const target-fitness bar applies only when the user
+    // asked for neither flag, so --max-steps never collides with it.
     let builder = RaceConfig::builder()
         .set_run_name("cartpole")
         .set_run_mode(RunMode::Rl) // declare the use case — engine cross-checks it against the spec variant
-        .set_pop_size(pop)
-        .set_elite_count(pop / 10) // elites are safe from cull-thrash while the noisy REINFORCE signal oscillates
-        // Stop criterion (flag wins): the const target-fitness bar applies
-        // ONLY when the user asked for neither flag, so --max-steps never
-        // collides with it (the engine also hard-errors if both are set).
-        .set_stop_target_fitness(if stop_overridden {
-            None
-        } else {
-            Some(MAX_TARGET_FITNESS)
-        })
-        .set_stop_max_steps(cli.engine.max_steps)
-        .set_checkpoint_every(2) // explicit: gate bars from the last 3 checkpoints
-        .set_crossover_gate(gras::engine::config::CrossoverGate::Soft)
-        .set_crossover_retries(2) // gate-rejected child ⇒ 2 fresh parent-pair retries before the roll is spent
-        .set_crossover_cull_policy(gras::engine::config::CrossCullPolicy::Worst) // child evicts the worst-by-smoothed-fitness (elites guarded); Random = uniform victim, keeps slots turning over
-        .set_mutation_cull_policy(gras::engine::config::MutationCullPolicy::InverseFitness) // mutation roll evicts via fitness-inverse roulette (elites never culled)
-        .set_crossover_ops_pool(["one_point", "uniform"]) // explicit: both operators (empty ⇒ all, the pools convention)
-        .set_crossover_prob(0.5)
-        .set_crossover_rolls(pop / 2) // scales with the RESOLVED pop (flag > const)
-        .set_mutate_prob(0.5) // high mutation churn + noisy fitness = good nets culled before they prove themselves (67/75 immigrants died in run 6)
-        .set_mutate_rolls(pop / 5)
-        .set_mutation_fresh_start(false) // immigration skips catch-up replay (RL-only concept today — see the knob's docs) — off here
-        .set_stop_custom(|s| !s.best_smoothed_fitness.is_finite()) // extra stop lane: a NaN/-inf leader means the signal broke — stop rather than spin
-        // Informative-only metrics (never rank). RL has no (pred, target) to
-        // score against, so this is the shape you'd use in a TABULAR run —
-        // left off here rather than adding a permanently-empty column:
+        .set_run_csv_export(true) // lossless per-step metrics.csv (every net, every step)
         //   .set_run_metrics(["f1"])                       // built-in label
         //   .set_run_metrics([Metric::custom("gap", |p, y| ...)])  // your own
+        .set_run_log_level(gras::engine::config::LogLevel::Summ) // builder stays open — CLI overlay below
+        .set_run_pop_size(pop)
+        .set_run_smoothing_window(10) // ranking averages the last 10 steps — one lucky step can't flip a verdict
+        .set_run_pop_catch_up(false)
+        // Stop criterion: --max-steps by default; swap to the target-fitness
+        // bar by uncommenting (the two are mutually exclusive):
+        // .set_stop_target_fitness(Some(MAX_TARGET_FITNESS))
+        // .set_stop_custom(|s| !s.best_smoothed_fitness.is_finite()) // extra stop lane: a NaN/-inf leader means the signal broke — stop rather than spin
+        .set_stop_max_steps(cli.engine.max_steps)
+        .set_run_checkpoint_every(2) // explicit: gate bars from the last 3 checkpoints
+        // Crossover configuration
+        .set_crossover_prob(0.5)
+        .set_crossover_retries(2) // gate-rejected child ⇒ 2 fresh parent-pair retries before the roll is spent
+        .set_crossover_rolls(pop / 2)
+        .set_crossover_ops_pool(["one_point", "uniform"]) // explicit: both operators (empty ⇒ all, the pools convention)
+        .set_crossover_cull_policy(gras::engine::config::CrossCullPolicy::Worst) // child evicts the worst-by-smoothed-fitness (elites guarded); Random = uniform victim
+        .set_crossover_catch_up(true)
+        .set_crossover_gate(gras::engine::config::CrossoverGate::Soft)
+        // Mutation configuration
+        .set_mutate_prob(0.5) // high mutation churn + noisy fitness culls good nets early (measured: 67/75 immigrants died in run 6)
+        .set_mutate_rolls(pop / 5)
+        .set_mutation_catch_up(false) // catch-up off = the default (no handicap — the immigrant trains from the current clock)
+        .set_mutation_cull_policy(gras::engine::config::MutationCullPolicy::InverseFitness) // mutation roll evicts via fitness-inverse roulette (elites never culled)
+        // Topology configuration
         .set_topology_dropout_prob(DROPOUT_PROB) // blueprint regularization, TRAIN forwards only (see DROPOUT_PROB)
         .set_topology_min_hidden_num_nodes(2) // Minimum hidden layers/nodes
         .set_topology_max_hidden_num_nodes(15) // Maximum hidden layers/nodes
@@ -924,27 +852,22 @@ fn main() {
             "LogSoftmax",
         ]) // per-node non-linearities (per-port overrides may differ from these)
         .set_topology_standardize_op_pool(["Identity", "LayerNorm", "RmsNorm", "InstanceNorm"])
-        // per-node normalization after the linear, before the activation
         // ── anti-collapse stack (the guards cartpole runs with) ────────────
-        .set_elite_freeze(false) // top-k champions skip the trainer — their weights never drift back (OFF: the relay is active below, and a frozen net would never fork a shadow)
-        .set_fitness_regression_tol(0.7) // collapse below floor × 0.7 ⇒ loses the elite seat (recovery clears it)
-        .set_fitness_smoothing_window(10) // ranking averages the last 10 steps — one lucky step can't flip a verdict
-        // ── save artifacts ────────────────────────────────────────────────
-        .set_run_csv_export(true) // lossless per-step metrics.csv (every net, every step)
+        .set_elite_freeze(true) // default; pass --no-freeze-elites to fork relay shadows
+        .set_elite_count(pop / 10) // elites safe from cull-thrash under the noisy REINFORCE signal
         .set_elite_save_topology(true) // elite-<hash>.md at race end
         .set_elite_save_safetensors(true) // elite-<hash>.safetensors (the guardrail needs the trained weights)
         .set_worst_save_topology(true) // worst-<hash>.md: what the population's floor looked like
         .set_worst_save_safetensors(false)
-        // ── post-race pruner + logging ────────────────────────────────────
+        // Post-race pruner
         // After the stop fires: cull everything but the elite, then train the
         // elite SOLO for `pruner_steps` more steps (no evolution machinery).
         .set_pruner_enabled(true)
         .set_pruner_method(gras::engine::config::PopPrunerMethod::Hard) // the only method today
-        .set_pruner_steps(10)
-        .set_run_log_level(gras::engine::config::LogLevel::Summ); // builder stays open — CLI overlay below
+        .set_pruner_steps(10);
 
-    // The point: REPORTED fitness. Survival turns are computed by the
-    // trainer inside its env; the engine only ranks.
+    // REPORTED fitness: survival turns are computed by the trainer inside its
+    // env; the engine only ranks.
     let fitness = Fitness::reported(Direction::Maximize, "match_survival");
     let builder = cli.engine.apply(builder).build();
 
@@ -986,10 +909,7 @@ fn main() {
     }
     // ── Trainer selection: BOTH forms here — pick one by commenting a line ──
     // RELAY (active): the deciding face never trains; a shadow forked from it
-    // does (see RELAY_LAG). Grace pins the warm-up OFF so the relay engages
-    // at step 0 (this example's explicit choice — the wrapper's conservative
-    // default is 5); `--grace-periods N` opts into N plain per-net steps
-    // before the relay engages.
+    // does (see DECISION-LAG RELAY note above).
     // let relay = gras::trainer::DecisionLagTrainer::new(trainer)
     //     .with_lag(RELAY_LAG)
     //     .with_grace(cli.engine.grace_periods.unwrap_or(0));

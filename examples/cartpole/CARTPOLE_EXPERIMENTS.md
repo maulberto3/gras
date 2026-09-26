@@ -57,15 +57,15 @@ the random baseline):
 - **dropout 0.5, train-forwards only** (`net.train()` around the loss,
   `net.eval()` everywhere else) — noise forces redundant representations, so
   one unlucky batch can't erase a skill;
-- **elite freeze** (`--freeze-elites`) — the champion is never handed to the
-  optimizer, so the best-so-far skill survives its own training steps;
-- **regression demotion** (`--regression-tol 0.7`) — a net that falls more
-  than `(1 − tol) × |floor|` below its entry floor (signed distance — the
-  original `floor × tol` ratio silently inverted for negative fitness)
-  loses elite protection and is culled by the ordinary inverse-fitness
-  roulette, where its collapsed fitness up-weights it naturally (the
-  dedicated "demote queue" this used to describe was removed — see
-  TODO.md's anti-devolution item D), so self-destruction costs the seat;
+- **elite freeze** (default ON now; `--no-freeze-elites` to disable) — the
+  champion ACTS and MEASURES every step through a no-op optimizer, so the
+  best-so-far skill survives its own training steps AND its fitness stays
+  honest (fresh trajectories, real standing);
+- **regression demotion** (REMOVED 2026-09-25, was `--regression-tol 0.7`)
+  — culling via the ordinary inverse-fitness roulette (where a collapsed
+  fitness up-weights naturally) is the single regression story, and the
+  dethrone optimizer-state reset gives a displaced champion a fair warm-up
+  for its reclaim attempt (see TODO.md's anti-devolution entries);
 
 ## Two bugs that produced a FALSE guardrail verdict (both fixed)
 
@@ -93,6 +93,7 @@ mixed dims (i.e. with bridges). Both are now covered by tests, and
   averaging across inits — across generations, not within a step).
 - The ghost-file engine fix and the Ctrl+C graceful shutdown (both born from
   these experiments' operational failures).
-- Elite freeze + regression demotion (the anti-devolution guards), libtorch
+- Elite freeze (the surviving anti-devolution guard; the regression demotion
+  companion was removed 2026-09-25), libtorch
   RNG seeding per step (dropout became resumable), and the complete
   safetensors export — all three born from this campaign.

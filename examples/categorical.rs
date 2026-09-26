@@ -63,7 +63,7 @@ fn main() {
     // 3. Config — budgets inactive unless set; here a step budget only.
     //    Topology dims must match the dataset (16 features → 4 classes).
     let builder = RaceConfig::builder()
-        .set_pop_size(6)
+        .set_run_pop_size(6)
         .set_stop_max_steps(50)
         .set_topology_hidden_dim_range(4, 8)
         .set_topology_input_dim(d_in)

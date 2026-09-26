@@ -191,7 +191,7 @@ fn setup_demo_run() -> (PathBuf, String, PathBuf) {
     tabular_data::save_dataset(&data_dir, &ds).unwrap();
 
     let config = RaceConfig::builder()
-        .set_pop_size(2)
+        .set_run_pop_size(2)
         .set_stop_max_steps(5)
         .set_run_csv_export(true)
         .set_topology_input_dim(8)
