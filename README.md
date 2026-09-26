@@ -47,7 +47,7 @@ fn main() -> flodl::tensor::Result<()> {
     // Stop criteria: set exactly ONE of max_steps / max_target_fitness —
     // both together panic at build() (only one stop criterion at a time).
     let config = RaceConfig::builder()
-        .set_pop_size(10)
+        .set_run_pop_size(10)
         .set_stop_max_steps(100)
         .build();
 
@@ -107,10 +107,15 @@ Three step-line extras worth decoding:
   survivor list.
 - **`frozen@N`** (final-elites listing) — the last step at which the net
   held/won a crown seat.
-- **`REGRESSED below floor … demoted`** — a net whose smoothed fitness
-  collapsed below its entry floor. A per-step status: it loses the crown
-  seat and is up-weighted if a cull fires — it is NOT removed from the
-  population (see OPTIONS.md §6, `set_fitness_regression_tol`).
+- **`<hash> dethroned — resumes training…`** — a net that lost its freeze
+  crown goes back to normal stepping with a weight update. While frozen it
+  ACTED and MEASURED every clock (fresh fitness recorded through a no-op
+  optimizer — weights frozen, standing honest), so it never fell behind and
+  no catch-up is needed. A declining net's collapsed fitness up-weights it
+  in the ordinary cull roulette.
+- **`stepped 5/6 │ frozen (act+measure, no update): <hash> …`** — who
+  trained this clock and who was skipped as a frozen elite (freeze runs
+  only).
 
 Note: the `--log-level` CLI flag on the RL examples (cartpole,
 kaggle_kagiculture) is a *different* axis — it sets the env_logger
