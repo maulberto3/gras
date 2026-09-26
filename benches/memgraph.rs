@@ -76,12 +76,12 @@ fn main() {
 
 
     let mut builder = RaceConfig::builder()
-        .set_pop_size(POP)
+        .set_run_pop_size(POP)
         .set_stop_max_steps(steps)
         .set_topology_hidden_dim_range(4, 16)
         .set_topology_input_dim(d_in).set_topology_output_dim(d_out)
         .set_run_log_level(LogLevel::None)
-        .set_checkpoint_every(steps + 1);
+        .set_run_checkpoint_every(steps + 1);
     if evolve {
         builder = builder.set_crossover_rolls(1).set_mutate_rolls(1);
     } else {
