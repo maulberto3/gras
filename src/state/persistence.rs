@@ -94,15 +94,18 @@ pub struct ConfigSnapshot {
     /// resume — record it.
     #[serde(default)]
     pub freeze_elites: bool,
-    /// Anti-devolution D (`set_fitness_regression_tol`): collapse-below-floor ratio,
-    /// `None` = off. Same replay-relevance as `freeze_elites`.
-    #[serde(default)]
-    pub regression_tol: Option<f32>,
-    /// Fresh-start immigrants (`set_mutation_fresh_start`): mutation
-    /// immigrants skip catch-up. Replay-relevant — a resumed run must use the
-    /// same insertion semantics or the replayed population diverges.
-    #[serde(default)]
+    /// Mutation catch-up toggle (`set_mutation_catch_up`, engine.json key
+    /// kept as `fresh_immigrants`): `true` = immigrants replay catch-up.
+    /// Replay-relevant — a resumed run must use the same insertion semantics
+    /// or the replayed population diverges. (RL-effective only; tabular
+    /// always catches up.)
+    #[serde(default = "default_false")]
     pub fresh_immigrants: bool,
+    /// Dethrone optimizer-state reset (`set_dethrone_reset_optimizer_state`).
+    /// Replay-relevant: whether a resumed run re-applies `reset_state()` at
+    /// dethrone transitions (changes optimizer trajectories after unfreeze).
+    #[serde(default = "default_true")]
+    pub dethrone_reset_optimizer_state: bool,
     /// One-line identity of the binary that produced the run (`gras` version,
     /// profile, exe path, build time). Diagnostics only — lets a reader tell
     /// a stale-process artifact from a logic bug.
@@ -150,8 +153,8 @@ impl ConfigSnapshot {
                 .map(|p| (format!("{:?}", p.method).to_lowercase(), p.steps)),
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
-            regression_tol: cfg.regression_tol,
-            fresh_immigrants: cfg.mutation_fresh_start,
+            fresh_immigrants: cfg.mutation_catch_up,
+            dethrone_reset_optimizer_state: cfg.dethrone_reset_optimizer_state,
             build: crate::engine::core::build_stamp(),
         }
     }
@@ -488,6 +491,14 @@ fn default_alive() -> bool {
     true
 }
 
+fn default_false() -> bool {
+    false
+}
+
+fn default_true() -> bool {
+    true
+}
+
 // ── Per-net state (nets/<hash>.json) ──────────────────────────────────────
 
 /// The last-known state of one live net. Written to `nets/<hash>.json` and
@@ -540,6 +551,14 @@ pub struct NetState {
     /// without walking a separate CSV. Schema: loss + fitness + any configured
     /// informative metrics. Empty until the first persisted step.
     pub last_metrics: Option<NetMetrics>,
+    /// Inclusive clock ranges this net executed as FROZEN (act-and-measure:
+    /// played/measured, weight update discarded). Replay-relevant: resume
+    /// re-runs frozen clocks through a no-op optimizer to reproduce the
+    /// recorded metrics bit-exactly (a real optimizer pass would move the
+    /// frozen weights). Compact run-length form: `[(start, end), …]`,
+    /// non-overlapping, extending contiguously.
+    #[serde(default)]
+    pub frozen_spans: Vec<(usize, usize)>,
     /// Rich per-individual metadata (params, dims, training regime, run
     /// context). Written once at construction; missing on legacy JSONs
     /// (serde default) and backfilled on first rewrite.
@@ -607,6 +626,12 @@ pub struct NetMetrics {
     pub fitness: f32,
     /// Informative-only metric values, in the same order the run configured them.
     pub informative: Vec<f32>,
+    /// True when this step was an ACT-AND-MEASURE pass (frozen elite: the net
+    /// played/measured at this clock but the weight update was discarded).
+    /// Replay-relevant: resume replays frozen steps through a no-op optimizer
+    /// to reproduce the recorded metrics bit-exactly.
+    #[serde(default)]
+    pub frozen: bool,
 }
 
 impl NetState {
@@ -655,8 +680,23 @@ impl NetState {
             entered_at_step: step,
             created_from,
             last_metrics: None,
+            frozen_spans: Vec::new(),
             meta: NetMeta::default(),
         })
+    }
+
+    /// Record that clock `step` was an act-and-measure (frozen) step,
+    /// extending the last span when contiguous.
+    pub fn record_frozen_step(&mut self, step: usize) {
+        match self.frozen_spans.last_mut() {
+            Some((_, end)) if *end + 1 == step => *end = step,
+            _ => self.frozen_spans.push((step, step)),
+        }
+    }
+
+    /// Whether `step` lies inside a recorded frozen span.
+    pub fn is_frozen_step(&self, step: usize) -> bool {
+        self.frozen_spans.iter().any(|&(s, e)| step >= s && step <= e)
     }
 
     /// Serialize to pretty JSON for writing `nets/<hash>.json`.
@@ -1045,6 +1085,7 @@ mod tests {
             eval_loss: Some(1.40),
             fitness: 0.61,
             informative: vec![0.4, 0.6],
+            frozen: false,
         });
         write_net_state(&dir, &state).unwrap();
         let loaded = load_net_state(&dir, &state.hash).unwrap();
@@ -1137,6 +1178,7 @@ mod tests {
             eval_loss: Some(2.1),
             fitness: 0.1,
             informative: vec![],
+            frozen: false,
         });
         write_net_state(&dir, &state).unwrap();
 
@@ -1147,6 +1189,7 @@ mod tests {
             eval_loss: Some(1.6),
             fitness: 0.2,
             informative: vec![],
+            frozen: false,
         });
         write_net_state(&dir, &state).unwrap();
 
@@ -1192,6 +1235,7 @@ mod tests {
                 eval_loss: None,
                 fitness: 0.4,
                 informative: vec![],
+                frozen: false,
             },
         )
         .unwrap();
@@ -1203,6 +1247,7 @@ mod tests {
                 eval_loss: None,
                 fitness: 0.5,
                 informative: vec![],
+                frozen: false,
             },
         )
         .unwrap();
