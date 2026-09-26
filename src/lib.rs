@@ -11,7 +11,7 @@
 //! ```
 //! # use gras::engine::RaceConfig;
 //! let config = RaceConfig::builder()
-//!     .set_pop_size(6)
+//!     .set_run_pop_size(6)
 //!     .set_stop_max_steps(100)
 //!     .build();
 //! ```
