@@ -89,12 +89,19 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
     /// `None::<&str>` for the default `results/<timestamp>` location.
     pub fn tabular<P: Into<std::path::PathBuf>>(
         data_dir: impl Into<std::path::PathBuf>,
-        config: RaceConfig,
+        mut config: RaceConfig,
         fitness: Fitness,
         trainer: impl TabularStep + 'static,
         seed: Option<u64>,
         run_dir: Option<P>,
     ) -> Self {
+        // The spec variant DECIDES the mode arm: stamp the Tabular arm,
+        // replacing whatever placeholder the builder carried. A caller who
+        // tuned RL-only knobs on the builder would panic in the setters
+        // before ever reaching here (they match on the arm).
+        config.mode_specific = crate::engine::config::ModeConfig::Tabular(
+            crate::engine::config::TabularConfig::default(),
+        );
         Self::Tabular(TabularSpec {
             data_dir: data_dir.into(),
             config,
@@ -111,12 +118,20 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
     /// `Fitness::Computed` here (a (pred, target) scorer has nothing to score
     /// without a dataset).
     pub fn rl(
-        config: RaceConfig,
+        mut config: RaceConfig,
         fitness: Fitness,
         trainer: impl RlStep + 'static,
         seed: Option<u64>,
         run_dir: Option<std::path::PathBuf>,
     ) -> Self {
+        // The spec variant DECIDES the mode arm (see `tabular`).
+        if !matches!(
+            config.mode_specific,
+            crate::engine::config::ModeConfig::Rl(_)
+        ) {
+            config.mode_specific =
+                crate::engine::config::ModeConfig::Rl(crate::engine::config::RlConfig::default());
+        }
         Self::RL(RLSpec {
             config,
             fitness,

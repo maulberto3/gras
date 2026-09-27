@@ -188,6 +188,11 @@ pub enum RunMode {
 /// geometry (batch size, split ratio, held-out rows) is deliberately NOT
 /// here: it lives on `RunSpec::stream` (see the batch-stream note below).
 ///
+/// Mode-specific knobs live in [`RaceConfig::mode_specific`] (a
+/// [`ModeConfig`] enum arm) — the same split logic the `RunSpec` variants
+/// apply: the tabular/RL arm is carried in the TYPE. The engine core reads
+/// only the shared fields; mode branches read their own arm.
+///
 /// No `Clone`/`Debug` derive: the pluggable Iter-5 closure fields
 /// (`Option<Box<dyn Fn>>`) support neither, and nothing in the crate needs to
 /// clone or pretty-print a config.
@@ -241,19 +246,10 @@ pub struct RaceConfig {
     /// [`RaceConfigBuilder::set_fitness_smoothing_window`]). Defaults to
     /// [`SMOOTHING_WINDOW`].
     pub smoothing_window: usize,
-    /// Mutation/crossover immigrants skip catch-up and start at the current
-    /// clock (see [`RaceConfigBuilder::set_mutation_catch_up`]).
-    /// RL-effective only: tabular runs always catch up (see the setters).
-    pub mutation_catch_up: bool,
-    /// Whether a crossover child replays the training stream before insertion
-    /// (see [`RaceConfigBuilder::set_crossover_catch_up`]). RL-effective only.
-    pub crossover_catch_up: bool,
-    /// Whether a population net rejoining the group step replays missed
-    /// training (see [`RaceConfigBuilder::set_run_pop_catch_up`]).
-    /// RL-effective only. (Reserved: with act-and-measure freeze, dethroned
-    /// elites never fall behind the clock, so this has no consumer in the
-    /// default flow today.)
-    pub run_pop_catch_up: bool,
+    /// Mode-specific knobs (tabular vs RL). See [`ModeConfig`] — the same
+    /// type-carrying split the `RunSpec` variants apply. The engine core
+    /// reads only the shared fields above; mode branches match on this arm.
+    pub mode_specific: ModeConfig,
     /// Reset a dethroned elite's optimizer state (momentum/velocity/step
     /// counters — see [`RaceConfigBuilder::set_dethrone_reset_optimizer_state`]).
     pub dethrone_reset_optimizer_state: bool,
@@ -340,6 +336,147 @@ pub struct RaceConfig {
     /// folder name (that stays `results/<run_id>` unless `RunSpec.run_dir`
     /// is set) — it exists so analysis scripts can group runs by experiment.
     pub run_name: Option<String>,
+}
+
+/// Mode-specific knob set — the arm is carried in the TYPE (same split
+/// logic as the `RunSpec` variants). Constructed via
+/// [`TabularConfig::builder()`] / [`RlConfig::builder()`]; the engine
+/// derives the arm from the `RunSpec` variant at construction, so it can
+/// never disagree with the spec.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModeConfig {
+    /// Knobs that only exist in dataset-driven (tabular) runs.
+    Tabular(TabularConfig),
+    /// Knobs that only exist in environment-driven (RL) runs.
+    Rl(RlConfig),
+}
+
+impl ModeConfig {
+    /// The recorded `RunMode` this arm stands for (wire-format vocabulary).
+    pub fn run_mode(&self) -> RunMode {
+        match self {
+            ModeConfig::Tabular(_) => RunMode::Tabular,
+            ModeConfig::Rl(_) => RunMode::Rl,
+        }
+    }
+
+    /// The RL arm, when this IS the RL arm.
+    pub fn rl(&self) -> Option<&RlConfig> {
+        match self {
+            ModeConfig::Rl(rl) => Some(rl),
+            ModeConfig::Tabular(_) => None,
+        }
+    }
+
+    /// Whether this is the RL arm (the mode-branch helper the engine core
+    /// reads instead of a `RunMode` enum compare).
+    pub fn is_rl(&self) -> bool {
+        matches!(self, ModeConfig::Rl(_))
+    }
+
+    /// Mutation catch-up (RL arm; `false` on the tabular arm — tabular
+    /// ALWAYS catches up, the shared-stream rule, so `false` is the honest
+    /// read for every consumer that only asks "would this net replay?").
+    pub fn mutation_catch_up(&self) -> bool {
+        self.rl().map(|r| r.mutation_catch_up).unwrap_or(false)
+    }
+
+    /// Crossover catch-up (RL arm; `true` on the tabular arm — tabular
+    /// ALWAYS catches up and is always gated, so `true` is the honest read).
+    pub fn crossover_catch_up(&self) -> bool {
+        self.rl().map(|r| r.crossover_catch_up).unwrap_or(true)
+    }
+}
+
+/// Tabular-only knobs. Currently empty — every knob so far turned out to be
+/// shared (stream geometry is trainer/`RunSpec`-owned by design, see the
+/// batch-stream note on [`RaceConfig`]). The arm exists so future tabular
+/// knobs (split strategy, eval cadence) have a home without re-plumbing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TabularConfig {}
+
+impl TabularConfig {
+    /// Builder for the tabular-only knob surface.
+    pub fn builder() -> TabularConfigBuilder {
+        TabularConfigBuilder::default()
+    }
+}
+
+/// Builder for [`TabularConfig`].
+#[derive(Debug, Default)]
+pub struct TabularConfigBuilder {}
+
+impl TabularConfigBuilder {
+    /// Finalize the tabular arm.
+    pub fn build(self) -> TabularConfig {
+        TabularConfig {}
+    }
+}
+
+/// RL-only knobs: the catch-up family. Catch-up exists so a net becomes
+/// comparable to the population before ranking against it; in tabular that
+/// comparability is sacred (one shared data stream — every net replays the
+/// same batches), so the toggles only make sense where streams don't exist.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RlConfig {
+    /// Mutation/crossover immigrants skip catch-up and start at the current
+    /// clock (see [`RaceConfigBuilder::set_mutation_catch_up`]).
+    pub mutation_catch_up: bool,
+    /// Whether a crossover child replays the training stream before insertion
+    /// (see [`RaceConfigBuilder::set_crossover_catch_up`]). With it OFF the
+    /// checkpoint gate is OFF for those children too (nothing replayed to
+    /// compare against the bars).
+    pub crossover_catch_up: bool,
+    /// Whether a population net rejoining the group step replays missed
+    /// training (see [`RaceConfigBuilder::set_run_pop_catch_up`]).
+    /// (Reserved: with act-and-measure freeze, dethroned elites never fall
+    /// behind the clock, so this has no consumer in the default flow today.)
+    pub run_pop_catch_up: bool,
+}
+
+impl Default for RlConfig {
+    fn default() -> Self {
+        Self {
+            mutation_catch_up: false,
+            crossover_catch_up: true,
+            run_pop_catch_up: false,
+        }
+    }
+}
+
+impl RlConfig {
+    /// Builder for the RL-only knob surface.
+    pub fn builder() -> RlConfigBuilder {
+        RlConfigBuilder::default()
+    }
+}
+
+/// Builder for [`RlConfig`].
+#[derive(Debug, Default)]
+pub struct RlConfigBuilder {
+    cfg: RlConfig,
+}
+
+impl RlConfigBuilder {
+    /// Mutation immigrants skip catch-up (see [`RlConfig::mutation_catch_up`]).
+    pub fn set_mutation_catch_up(mut self, yes: bool) -> Self {
+        self.cfg.mutation_catch_up = yes;
+        self
+    }
+    /// Crossover children skip catch-up (see [`RlConfig::crossover_catch_up`]).
+    pub fn set_crossover_catch_up(mut self, yes: bool) -> Self {
+        self.cfg.crossover_catch_up = yes;
+        self
+    }
+    /// Population rejoin replay toggle (see [`RlConfig::run_pop_catch_up`]).
+    pub fn set_run_pop_catch_up(mut self, yes: bool) -> Self {
+        self.cfg.run_pop_catch_up = yes;
+        self
+    }
+    /// Finalize the RL arm.
+    pub fn build(self) -> RlConfig {
+        self.cfg
+    }
 }
 
 /// Type alias for the pluggable Iter-5 stop closure.
@@ -436,9 +573,7 @@ impl RaceConfig {
             elite_count: 1,
             freeze_elites: true,
             smoothing_window: SMOOTHING_WINDOW,
-            mutation_catch_up: false,
-            crossover_catch_up: true,
-            run_pop_catch_up: false,
+            mode_specific: ModeConfig::Tabular(TabularConfig::default()),
             dethrone_reset_optimizer_state: true,
             crossover_ops_pool: Vec::new(),
             max_steps: None,
@@ -469,11 +604,63 @@ impl RaceConfig {
     /// Fluent builder for the non-CLI config surface. Starts from
     /// [`RaceConfig::defaults`] and overrides field-by-field; `build()` returns
     /// the finished config.
+    ///
+    /// The arm starts TABULAR (the `Default` arm). For an RL run prefer the
+    /// mode front door [`RlRaceConfig::builder`] — it pre-stamps the RL arm
+    /// so the RL-only setters (`set_*_catch_up`) apply without ceremony.
+    /// (Whatever arm the builder carries, the `RunSpec` constructor stamps
+    /// its own — the front door just makes the call site honest.)
     pub fn builder() -> RaceConfigBuilder {
         RaceConfigBuilder {
             cfg: RaceConfig::defaults(),
             pending_pruner: None,
         }
+    }
+}
+
+/// Typed front door for RL runs: `RlRaceConfig::builder()` is
+/// [`RaceConfig::builder`] with the RL arm pre-stamped, so the RL-only
+/// setters (`set_crossover_catch_up` / `set_mutation_catch_up` /
+/// `set_run_pop_catch_up`) apply without panics or arm ceremony. The shared
+/// setters are exactly [`RaceConfigBuilder`]'s — same struct underneath, so
+/// `RunSpec::rl(..)` consumes the built config unchanged.
+pub type RlRaceConfig = RaceConfig;
+
+/// Typed front door for tabular runs (reads well at the call site; the
+/// catch-up setters are RL-only and panic on this arm).
+pub type TabularRaceConfig = RaceConfig;
+
+/// `TabularRaceConfig::builder()` — the tabular front door: a free function
+/// so the type alias can't shadow [`RaceConfig::builder`]. Starts from
+/// [`RaceConfig::defaults`] with the tabular arm pre-stamped
+/// (`ModeConfig::Tabular(TabularConfig::default())`). Functionally identical
+/// to [`RaceConfig::builder`] today (the tabular arm IS the default arm);
+/// it exists so call sites are mode-honest and a future tabular arm change
+/// can't silently leak into RL construction paths.
+#[doc(hidden)]
+pub fn tabular_race_config_builder() -> RaceConfigBuilder {
+    RaceConfigBuilder {
+        cfg: RaceConfig::defaults(),
+        pending_pruner: None,
+    }
+}
+
+/// `RlRaceConfig::builder()` — the RL front door: a free function so the
+/// type alias can't shadow [`RaceConfig::builder`]. Starts from
+/// [`RaceConfig::defaults`] with the RL arm pre-stamped
+/// (`ModeConfig::Rl(RlConfig::default())`), so the RL-only catch-up setters
+/// on the returned builder apply directly.
+// NOTE: a free function, not an inherent impl on the alias — `RlRaceConfig`
+// IS `RaceConfig`, so an inherent `builder()` there would collide with the
+// one above (two applicable items in scope).
+#[doc(hidden)]
+pub fn rl_race_config_builder() -> RaceConfigBuilder {
+    RaceConfigBuilder {
+        cfg: RaceConfig {
+            mode_specific: ModeConfig::Rl(RlConfig::default()),
+            ..RaceConfig::defaults()
+        },
+        pending_pruner: None,
     }
 }
 
@@ -593,8 +780,16 @@ impl RaceConfigBuilder {
     /// buffers start empty ("no verdict yet") — it cannot be culled or
     /// crowned before its first step, and its first verdict is ~baseline
     /// random (it competes from birth rather than from a replayed adulthood).
+    ///
+    /// Panics if the config's mode arm is Tabular (see [`ModeConfig`] — the
+    /// knob is RL-only; build the arm with [`RlConfig::builder`]).
     pub fn set_mutation_catch_up(mut self, yes: bool) -> Self {
-        self.cfg.mutation_catch_up = yes;
+        match &mut self.cfg.mode_specific {
+            ModeConfig::Rl(rl) => rl.mutation_catch_up = yes,
+            ModeConfig::Tabular(_) => panic!(
+                "set_mutation_catch_up is RL-only — this config carries the Tabular arm"
+            ),
+        }
         self
     }
     /// Catch-up toggle (crossover family): whether a crossover child replays
@@ -609,8 +804,15 @@ impl RaceConfigBuilder {
     ///
     /// **RL-effective only** — tabular runs always catch up (shared data
     /// stream; see [`Self::set_mutation_catch_up`]).
+    ///
+    /// Panics if the config's mode arm is Tabular (see [`ModeConfig`]).
     pub fn set_crossover_catch_up(mut self, yes: bool) -> Self {
-        self.cfg.crossover_catch_up = yes;
+        match &mut self.cfg.mode_specific {
+            ModeConfig::Rl(rl) => rl.crossover_catch_up = yes,
+            ModeConfig::Tabular(_) => panic!(
+                "set_crossover_catch_up is RL-only — this config carries the Tabular arm"
+            ),
+        }
         self
     }
     /// Catch-up toggle (population): whether a population net rejoining the
@@ -624,8 +826,15 @@ impl RaceConfigBuilder {
     /// **RL-effective only** — tabular runs always catch up. RESUME IS
     /// EXEMPT: resume always replays (weights are never persisted; replay
     /// parity is the resume contract regardless of this flag).
+    ///
+    /// Panics if the config's mode arm is Tabular (see [`ModeConfig`]).
     pub fn set_run_pop_catch_up(mut self, yes: bool) -> Self {
-        self.cfg.run_pop_catch_up = yes;
+        match &mut self.cfg.mode_specific {
+            ModeConfig::Rl(rl) => rl.run_pop_catch_up = yes,
+            ModeConfig::Tabular(_) => panic!(
+                "set_run_pop_catch_up is RL-only — this config carries the Tabular arm"
+            ),
+        }
         self
     }
     /// Dethrone behavior: when a frozen elite loses its crown, reset its
@@ -889,11 +1098,10 @@ impl RaceConfigBuilder {
         self.cfg.log_level = level;
         self
     }
-    /// Set the training paradigm / problem space target.
-    pub fn set_run_mode(mut self, mode: RunMode) -> Self {
-        self.cfg.mode = mode;
-        self
-    }
+    // NOTE: no `set_run_mode` — the RunMode is DERIVED from the RunSpec
+    // variant at engine construction (the spec's mechanics are the single
+    // source of truth; user-declared mode + cross-check was deleted when the
+    // two disagreed no more).
     /// Set whether to write the lossless unified event log (`history.csv`).
     pub fn set_run_csv_export(mut self, enabled: bool) -> Self {
         self.cfg.csv_export = enabled;

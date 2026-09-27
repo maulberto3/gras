@@ -247,6 +247,7 @@ impl TabularEngine {
             champions: Vec::new(),
             checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),
+            pruner_solo_active: false,
             minimal_prev_means: None,
             log_level,
             interrupt_flag: None,

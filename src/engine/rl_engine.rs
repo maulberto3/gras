@@ -32,8 +32,8 @@ impl std::ops::DerefMut for RlEngine {
 }
 
 impl RlEngine {
-    /// Build an RL run from its spec (mode-validated: the spec variant must
-    /// be `RunSpec::rl`).
+    /// Build an RL run from its spec (the `RunSpec::rl` variant IS the mode —
+    /// no config declaration needed or possible).
     pub fn from_spec(
         spec: crate::engine::run_spec::RunSpec<
             Box<dyn crate::trainer::TabularStep>,
@@ -100,13 +100,9 @@ impl RlEngine {
         fitness: Fitness,
         trainer: impl crate::trainer::RlStep + 'static,
     ) -> Result<Self> {
-        if config.mode != crate::engine::config::RunMode::Rl {
-            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume_rl requires .set_run_mode(RunMode::Rl) on the config (got {:?})",
-                config.mode
-            ))
-            .into());
-        }
+        // No config-mode guard needed here: the mode is DERIVED from the
+        // RunSpec variant, and `resume_rl` IS the RL variant by construction
+        // (the cross-engine check below reads the run dir's recorded mode).
         let trainer = Box::new(crate::trainer::ModeAdapter::rl(Box::new(trainer)))
             as Box<dyn crate::trainer::EngineTrainer>;
         let header = crate::state::load_engine_json(&run_dir)?;
@@ -169,6 +165,7 @@ impl RlEngine {
             champions: Vec::new(),
             checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),
+            pruner_solo_active: false,
             minimal_prev_means: None,
             log_level,
             interrupt_flag: None,

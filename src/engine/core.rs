@@ -312,6 +312,14 @@ pub struct CoreEngine {
     /// step, and so the badge can name every champion (with `elite_count > 1`
     /// there is more than one).
     pub(crate) frozen_crown: std::collections::HashSet<String>,
+    /// Set TRUE only inside the post-race pruner phase: the solo steps are
+    /// the finishing workout, so elite freeze is BYPASSED — survivors train
+    /// with the real optimizer regardless of `freeze_elites` (they are all
+    /// elites by construction, so freezing would mean the champion never
+    /// takes a weight update after the race). Not persisted: the pruner
+    /// phase runs inside a single `finish_race` call, and its history rows
+    /// are plain trained steps that replay with the real optimizer.
+    pub(crate) pruner_solo_active: bool,
     /// `Minimal` mode: last step's population means (train, eval, fitness)
     /// so the framed table can show what changed this step. `None` until the
     /// first table render (the table itself starts at step 2 for this reason).
@@ -463,30 +471,17 @@ impl CoreEngine {
                 None,
             ),
         };
-        // The config's RunMode and the spec variant must AGREE. The spec
-        // variant decides the mechanics (data vs env); `set_run_mode(..)` decides
-        // the recorded/validated intent. A mismatch is a config bug — fail
-        // loudly at construction rather than running the wrong paradigm.
-        // (Image/NLP modes are future variants of RunSpec — they must be
-        // declared in config but have no spec variant yet, hence they're
-        // rejected too. The DEFAULT Tabular mode is exempt: it matches both
-        // variants' zero-config story — an RL spec with an unset mode fails,
-        // forcing the user to declare intent.)
-        if tabular_data_dir.is_none() && config.mode != crate::engine::config::RunMode::Rl {
-            return Err(crate::utils::error::EngineError::InvalidOptions(
-                "RunSpec::rl requires .set_run_mode(RunMode::Rl) on the config — the declared mode and the spec variant must agree".to_string(),
-            )
-            .into());
-        }
-        if tabular_data_dir.is_some() && config.mode != crate::engine::config::RunMode::Tabular {
-            return Err(crate::utils::error::EngineError::InvalidOptions(
-                format!(
-                    "RunSpec::tabular (a data_dir was given) requires .set_run_mode(RunMode::Tabular) — config declares {:?} with no way to serve it; Image/NLP spec variants are future work",
-                    config.mode
-                ),
-            )
-            .into());
-        }
+        // The spec variant DECIDES the mode; the config's `mode` field is
+        // DERIVED (was: user-declared via `set_run_mode(..)` and validated —
+        // deleted, the derivation makes disagreement unrepresentable). The
+        // spec's mechanics (data_dir vs env) are the single source of truth.
+        let derived_mode = if tabular_data_dir.is_some() {
+            crate::engine::config::RunMode::Tabular
+        } else {
+            crate::engine::config::RunMode::Rl
+        };
+        let mut config = config;
+        config.mode = derived_mode;
         // RL mode REQUIRES a reported fitness: there is no dataset, so a
         // (pred, target) scorer has nothing to score. Fail before the run
         // starts, not three steps in.
@@ -695,6 +690,7 @@ impl CoreEngine {
             champions: Vec::new(),
             checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),
+            pruner_solo_active: false,
             minimal_prev_means: None,
             log_level,
             interrupt_flag: None,
@@ -1033,7 +1029,7 @@ impl CoreEngine {
                 self.config.crossover_retries,
                 self.header.topology_options.dropout_prob,
                 self.config.freeze_elites,
-                self.config.mutation_catch_up,
+                self.config.mode_specific.mutation_catch_up(),
                 self.config.elite_save_topology,
                 self.config.worst_save_topology,
             );
@@ -1456,7 +1452,7 @@ impl CoreEngine {
             .collect();
         if self.verbose_detail() {
             info!(
-                "── pruner phase ── race stop: {:?} at step {} → keeping top-{} ({}), culling {} → solo training for {} steps",
+                "── pruner phase ── race stop: {:?} at step {} → keeping top-{} ({}), culling {} → solo training for {} steps (freeze bypassed — real weight updates)",
                 reason,
                 clock,
                 keep.len(),
@@ -1502,7 +1498,11 @@ impl CoreEngine {
         }
         // Solo extension: the same group-step shape, minus evolution and stop
         // checks. Optimizer state is intact (nothing rebuilt) — the elites
-        // simply keep learning at the same LR/hyperparams.
+        // simply keep learning at the same LR/hyperparams. Elite freeze is
+        // BYPASSED (see `pruner_solo_active`): every survivor IS an elite,
+        // so freezing here would reduce the whole post-race workout to
+        // act-and-measure steps with zero weight updates.
+        self.pruner_solo_active = true;
         for offset in 0..pruner.steps {
             let step = clock + 1 + offset;
             // Solo steps evolve nothing: both per-step accumulators start
@@ -1529,6 +1529,7 @@ impl CoreEngine {
             }
         }
         let final_step = clock + pruner.steps;
+        self.pruner_solo_active = false;
         self.write_champion_markdown()?;
         self.write_champion_safetensors()?;
         // NOTE: no worst dump here — the population was already culled to
@@ -1859,7 +1860,14 @@ impl CoreEngine {
         // re-measuring would require re-running the trainer, which is
         // exactly what we're skipping. Scoring, ranking, parent selection
         // all proceed as normal off the carried metrics.
-        let frozen = self.config.freeze_elites && self.elite_hashes().contains(&hash.to_string());
+        // The pruner phase bypasses freeze entirely: it keeps ONLY elites,
+        // so with freeze active every solo step would be a no-op-optimizer
+        // act-and-measure and the post-race workout would train nothing
+        // (plus every crown flip would fire the dethrone optimizer reset,
+        // repeatedly erasing the survivor's momentum).
+        let frozen = !self.pruner_solo_active
+            && self.config.freeze_elites
+            && self.elite_hashes().contains(&hash.to_string());
         if frozen && !self.frozen_crown.contains(hash) {
             // Crown transition: this net newly joined the frozen set (first
             // crowning or a child trained past a frozen elite). One info
@@ -2504,7 +2512,7 @@ impl CoreEngine {
         // against the historical bars — gating off is the only sound reading.
         // It trains from the current clock like a mutation immigrant.
         self.pre_insert_buffer(&child.state.hash);
-        if !self.config.crossover_catch_up {
+        if !self.config.mode_specific.crossover_catch_up() {
             child.state.step = 0;
             child.state.last_metrics = None;
             let inserted_hash = child.state.hash[..8.min(child.state.hash.len())].to_string();
@@ -2922,7 +2930,7 @@ impl CoreEngine {
         // catches up regardless of the flag. Its empty rolling buffers
         // already mean "no verdict yet", so it cannot be culled or crowned
         // before its first step.
-        let fresh_start = !self.config.mutation_catch_up;
+        let fresh_start = !self.config.mode_specific.mutation_catch_up();
         if fresh_start {
             child.state.step = 0;
             child.state.last_metrics = None;
@@ -4228,7 +4236,12 @@ mod tests {
             "catch-up off (default): no replayed metrics"
         );
         // Flip the flag: the next immigrant catches up to the clock.
-        eng.config.mutation_catch_up = true;
+        eng.config.mode_specific = crate::engine::config::ModeConfig::Rl(
+            crate::engine::config::RlConfig {
+                mutation_catch_up: true,
+                ..crate::engine::config::RlConfig::default()
+            },
+        );
         let before = eng.state.live_hashes();
         eng.evolve_random_immigrant(7, 0).unwrap();
         let newcomer2 = eng
@@ -4586,9 +4599,12 @@ mod tests {
     }
 
     #[test]
-    fn rl_spec_requires_declared_rl_mode() {
-        // The spec variant and the config's set_run_mode(..) must agree: an RL
-        // spec with the default Tabular mode is a config bug.
+    fn rl_spec_derives_rl_mode_without_declaration() {
+        // The spec variant DECIDES the mode: an RL spec runs as RL with no
+        // `set_run_mode(..)` call (the setter is deleted — disagreement is
+        // unrepresentable). The engine derives `config.mode` from the spec.
+        let dir = std::env::temp_dir().join("gras-rl-mode-derived");
+        let _ = std::fs::remove_dir_all(&dir);
         let config = RaceConfig {
             pop_size: 2,
             max_steps: Some(1),
@@ -4602,16 +4618,24 @@ mod tests {
             ),
             TestRlTrainer,
             Some(7),
-            None,
+            Some(dir.clone()),
         );
-        let err = match CoreEngine::from_spec(spec) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("RL spec without set_run_mode(RunMode::Rl) must be rejected"),
+        let spec = match spec {
+            crate::engine::run_spec::RunSpec::RL(mut s) => {
+                s.config.topology_options.input_dim = Some(1);
+                s.config.topology_options.output_dim = Some(1);
+                crate::engine::run_spec::RunSpec::RL(s)
+            }
+            other => other,
         };
-        assert!(
-            err.contains("set_run_mode(RunMode::Rl)"),
-            "error must name the fix: {err}"
+        let eng = CoreEngine::from_spec(spec)
+            .expect("RL spec must derive RunMode::Rl from the spec variant itself");
+        assert_eq!(
+            eng.config.mode,
+            crate::engine::config::RunMode::Rl,
+            "mode is derived from the spec variant, not user-declared"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5466,6 +5490,58 @@ mod tests {
                 "solo step {solo_step} appears as a metric row"
             );
         }
+        // Freeze bypass: with freeze_elites on (the default), the survivor is
+        // an elite by construction — the pruner phase must still TRAIN it,
+        // not act-and-measure it. No frozen spans may cover the solo steps.
+        let survivor = eng.state.net(&live[0]).unwrap();
+        for solo_step in [3usize, 4, 5] {
+            assert!(
+                !survivor.is_frozen_step(solo_step),
+                "solo step {solo_step} must be a REAL trained step, not frozen"
+            );
+        }
+    }
+
+    #[test]
+    fn pruner_solo_steps_train_even_when_freeze_elites_is_on() {
+        let run_dir = std::env::temp_dir().join("gras-pruner-freeze-on");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        // freeze_elites defaults to TRUE — exactly the configuration where
+        // the old bug froze every solo step (all survivors are elites). The
+        // optimizer-moves proxy: the survivor takes REAL steps, so its
+        // trained-step count (step − frozen) advances through the phase.
+        let mut eng = pruned_engine(&run_dir, 42, 1, 3);
+        assert!(eng.config.freeze_elites, "freeze_elites default is on");
+        eng.seed_population_internal(
+            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+            Some(0.5),
+        )
+        .unwrap();
+        let live = {
+            let reason = eng.run().unwrap();
+            assert_eq!(reason, StopReason::MaxSteps);
+            eng.state.live_hashes()
+        };
+        let survivor = eng.state.net(&live[0]).unwrap();
+        // Dual assertion: freeze DOES engage during the race (the top net is
+        // frozen from the first step where an elite set exists — proving the
+        // flag below is a real bypass, not freeze being off) but NONE of the
+        // pruner solo steps are frozen — they took real optimizer steps.
+        let race_frozen = (0..=2).filter(|s| survivor.is_frozen_step(*s)).count();
+        assert!(
+            race_frozen > 0,
+            "freeze engaged during the race (the top net was frozen at least once)"
+        );
+        for solo_step in [3usize, 4, 5] {
+            assert!(
+                !survivor.is_frozen_step(solo_step),
+                "solo step {solo_step} must train (real optimizer) even with freeze_elites on"
+            );
+        }
+        assert!(
+            !eng.frozen_crown.contains(&live[0]),
+            "no crown membership should persist from the bypassed phase"
+        );
     }
 
     #[test]

@@ -663,7 +663,12 @@ mod tests {
         let dir = std::env::temp_dir().join("gras_fresh_start_immigrant");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 31).unwrap();
-        eng.config.mutation_catch_up = true;
+        eng.config.mode_specific = crate::engine::config::ModeConfig::Rl(
+            crate::engine::config::RlConfig {
+                mutation_catch_up: true,
+                ..crate::engine::config::RlConfig::default()
+            },
+        );
         eng.config.mutate_rolls = 1;
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
@@ -1058,9 +1063,10 @@ mod tests {
     }
 
     #[test]
-    fn rl_spec_requires_declared_rl_mode() {
-        // The spec variant and the config's set_run_mode(..) must agree: an RL
-        // spec with the default Tabular mode is a config bug.
+    fn rl_spec_derives_rl_mode_without_declaration() {
+        // The spec variant DECIDES the mode: an RL spec runs as RL with no
+        // `set_run_mode(..)` call (the setter is deleted — the mode is
+        // derived from the spec at construction).
         let config = RaceConfig {
             pop_size: 2,
             max_steps: Some(1),
@@ -1076,14 +1082,17 @@ mod tests {
             Some(7),
             None,
         );
-        let err = match RaceEngine::new(spec) {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("RL spec without set_run_mode(RunMode::Rl) must be rejected"),
-        };
-        assert!(
-            err.contains("set_run_mode(RunMode::Rl)"),
-            "error must name the fix: {err}"
-        );
+        // TestRlTrainer reports fitness without a real env, so construction
+        // succeeds (dims come from the default topology template) and the
+        // mode is the assertion target — a full run is covered elsewhere.
+        match RaceEngine::new(spec) {
+            Ok(eng) => assert_eq!(
+                eng.config.mode,
+                crate::engine::config::RunMode::Rl,
+                "mode is derived from the spec variant"
+            ),
+            Err(e) => panic!("RL spec must construct with a derived mode: {e}"),
+        }
     }
 
     #[test]
