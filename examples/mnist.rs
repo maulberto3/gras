@@ -163,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             //     }
             //     Ok(sum / n as f32)
             // }),
-        ]) // Informative (non-ranking) metrics: scored on the eval batch each step, one extra history.csv column each. Ranking fitness is set separately via Fitness — these NEVER affect selection/culling.
+        ]) // Informative (non-ranking) metrics: one extra history.csv column each. NEVER affect selection/culling — the ranking fitness is `Fitness`, set separately below.
         // --- Stop Criteria (mutually exclusive — set exactly ONE) ---
         // .set_stop_max_steps(MAX_STEPS) // Total global step budget — or pass --max-steps.
         // The const stop target (`MAX_TARGET_FITNESS`) is applied below, only
@@ -212,7 +212,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_elite_save_topology(true) // At stop, write elite-<hash>.md — the champion's blueprint (default true)
         .set_elite_save_safetensors(true) // At stop, write elite-<hash>.safetensors — the champion's weights (default true)
         .set_worst_save_topology(true) // At stop, also write worst-<hash>.md — the anti-champion's blueprint
-        .set_worst_save_safetensors(true); // At stop, also write worst-<hash>.safetensors — the anti-champion's weights
+        .set_worst_save_safetensors(true) // At stop, also write worst-<hash>.safetensors — the anti-champion's weights
+        .set_elite_checkpoint_weights(true) // default true: checkpoint-elite-<hash>.safetensors every checkpoint (kill -9 durability — latest wins)
+        // --- Remaining knobs (default-valued; uncomment to deviate) ---
+        // .set_mutation_cull_policy(gras::engine::config::MutationCullPolicy::InverseFitness) // mutation victim: InverseFitness (default) | Worst | Random
+        // .set_mutation_probation_steps(2) // fresh nets cull-immune for k clocks (all cull channels; a firing roll always finds a slot)
+        // .set_dethrone_reset_optimizer_state(true) // reset Adam state when a frozen elite loses its crown (default true)
+        // .set_history_flush_each(false) // false = flush history.csv at checkpoints + stop (default); true = every step
+        // .set_run_topologies(gras::engine::population::run_topologies_from_run_dir(Path::new("assets/<run>"), 4)?) // seed a prior run's elite blueprints (fresh weights; see also run_topology_from_json_file for a single net)
+        ;
     // The const default stop criterion is applied only when the user asked for
     // neither criterion on the CLI (they are mutually exclusive).
     if cli.engine.max_steps.is_none() && cli.engine.max_target_fitness.is_none() {

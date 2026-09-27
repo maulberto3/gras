@@ -149,13 +149,6 @@ pub struct EngineArgs {
     #[arg(long = "no-freeze-elites", action = clap::ArgAction::SetFalse)]
     pub freeze_elites: bool,
 
-    /// Mutation catch-up toggle (RL-effective): OFF (default) = no handicap —
-    /// the immigrant keeps fresh weights and trains from the current clock.
-    /// ON = the immigrant replays the training stream first (comparable
-    /// step-count on entry). Tabular always catches up regardless.
-    #[arg(long)]
-    pub fresh_immigrants: bool,
-
     /// Fresh games the post-race guardrail plays to judge the champion
     /// (cartpole default 10; each game runs to the env's max turns). Raise
     /// it when two finalists sit close together and the verdict matters —
@@ -169,17 +162,64 @@ pub struct EngineArgs {
     /// history at the cost of a file write per step).
     #[arg(long, value_name = "MODE")]
     pub history_flush: Option<String>,
-    // Note — there is intentionally no `--log-file` flag. Teeing stdout+
-    // stderr into a file needs fd-level interception (dup2 a pipe over fds
-    // 1/2 with a reader thread echoing to the SAVED fd — naively echoing via
-    // `std::io::stdout()` self-feeds the pipe and loops forever), which means
-    // unsafe. The zero-code alternative lives in the shell:
-    //
-    //     cargo run --release --example cartpole -- <flags> 2>&1 | tee run.log
-    //
-    // which keeps the live console AND leaves the full trace on disk. An
-    // engine-side `set_log_to_file(bool)` (dual-write at the `log` sink) is
-    // the safe in-library future path — see TODO.md "Persist the run log".
+}
+
+/// RL-only engine flags — the mode-specific twin of [`EngineArgs`], mirroring
+/// the config split: `ModeConfig::Rl` knobs get their own clap struct so a
+/// tabular example can't even PARSE `--fresh-immigrants` (clap rejects it at
+/// the usage line instead of the old behavior: a runtime panic when the
+/// RL-only setter hit the tabular arm).
+#[derive(Parser, Debug, Clone, Default)]
+pub struct RlEngineArgs {
+    /// The shared engine surface every mode has.
+    #[command(flatten)]
+    pub engine: EngineArgs,
+
+    /// Mutation catch-up toggle (RL only): OFF (default) = no handicap —
+    /// the immigrant keeps fresh weights and trains from the current clock.
+    /// ON = the immigrant replays the training stream first (comparable
+    /// step-count on entry).
+    #[arg(long)]
+    pub fresh_immigrants: bool,
+}
+
+impl std::ops::Deref for RlEngineArgs {
+    type Target = EngineArgs;
+    fn deref(&self) -> &EngineArgs {
+        &self.engine
+    }
+}
+
+// Each example binary compiles this module with only ITS flags reachable —
+// the RL-only methods are dead code in the tabular examples (and vice versa
+// would be true of any tabular-only wrapper). Not a smell: the module is the
+// union surface of all examples.
+#[allow(dead_code)]
+impl RlEngineArgs {
+    /// Overlay the shared flags, then the RL-only ones.
+    pub fn apply(&self, b: RaceConfigBuilder) -> RaceConfigBuilder {
+        let b = self.engine.apply(b);
+        if self.fresh_immigrants {
+            b.set_mutation_catch_up(true)
+        } else {
+            b
+        }
+    }
+
+    /// Delegate: the seed for `RunSpec` (see [`EngineArgs::seed_or`]).
+    pub fn seed_or(&self, default: Option<u64>) -> Option<u64> {
+        self.engine.seed_or(default)
+    }
+
+    /// Delegate: the run dir for `RunSpec` (see [`EngineArgs::run_dir_or`]).
+    pub fn run_dir_or(&self, default: Option<PathBuf>) -> Option<PathBuf> {
+        self.engine.run_dir_or(default)
+    }
+
+    /// Delegate: logger init (see [`EngineArgs::init_logger`]).
+    pub fn init_logger(&self, default_level: LogLevel) {
+        self.engine.init_logger(default_level)
+    }
 }
 
 impl EngineArgs {
@@ -226,9 +266,6 @@ impl EngineArgs {
             b = b.set_pruner_steps(steps);
         }
         b = b.set_elite_freeze(self.freeze_elites);
-        if self.fresh_immigrants {
-            b = b.set_mutation_catch_up(true);
-        }
         if let Some(mode) = &self.crossover_gate {
             b = b.set_crossover_gate(match mode.trim().to_ascii_lowercase().as_str() {
                 "hard" => gras::engine::config::CrossoverGate::Hard,
