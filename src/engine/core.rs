@@ -1980,34 +1980,23 @@ impl CoreEngine {
             // landscape of the frozen era. Resetting keeps all the weights
             // (the frozen skill) and all the hyperparameters, but forgets the
             // stale trend, so the first reclaim updates are clean-scaled.
-            if self.config.dethrone_reset_optimizer_state {
-                if let Some(opt) = self.optimizers.get_mut(hash) {
-                    opt.reset_state();
-                }
-                // Say WHO took the seat: the new elite set minus the dethroned
-                // net (the seats just re-dealt). First non-dethroned elite.
-                let taker = self
-                    .elite_hashes()
-                    .into_iter()
-                    .find(|h| h != hash)
-                    .unwrap_or_default();
-                info!(
-                    "step {} │ freeze │ {} dethroned (seat → {}) — resumes training, optimizer state reset (weights kept, momentum forgotten)",
-                    clock,
-                    &hash[..8.min(hash.len())],
-                    if taker.is_empty() {
-                        "?".to_string()
-                    } else {
-                        taker[..8.min(taker.len())].to_string()
-                    },
-                );
-            } else {
-                info!(
-                    "step {} │ freeze │ {} dethroned — resumes training (was acting/measuring while frozen, no catch-up needed)",
-                    clock,
-                    &hash[..8.min(hash.len())],
-                );
-            }
+            // Say WHO took the seat: the new elite set minus the dethroned
+            // net (the seats just re-dealt). First non-dethroned elite.
+            let taker = self
+                .elite_hashes()
+                .into_iter()
+                .find(|h| h != hash)
+                .unwrap_or_default();
+            info!(
+                "step {} │ freeze │ {} dethroned (seat → {}) — resumes training with its last optimizer state (was acting/measuring while frozen, no catch-up needed)",
+                clock,
+                &hash[..8.min(hash.len())],
+                if taker.is_empty() {
+                    "?".to_string()
+                } else {
+                    taker[..8.min(taker.len())].to_string()
+                },
+            );
         }
         if frozen {
             // ACT-AND-MEASURE freeze: the elite plays its normal step against
@@ -2440,6 +2429,16 @@ impl CoreEngine {
             .collect()
     }
 
+    /// The net's smoothed fitness (rolling mean over the last
+    /// `smoothing_window` step fitnesses — the same value every ranking
+    /// decision reads). `None` = no recorded fitness yet (never stepped, or
+    /// the buffer was empty). This is what the final-elites line prints; the
+    /// guardrail's "race smoothed" note should carry THIS number, not the
+    /// last raw step's fitness.
+    pub fn smoothed_fitness_of(&self, hash: &str) -> Option<f32> {
+        self.rolling_fitness.get(hash).map(rolling_mean)
+    }
+
     /// The best smoothed fitness in the live population (under the fitness
     /// direction).
     fn best_smoothed_fitness(&self) -> f32 {
@@ -2639,13 +2638,25 @@ impl CoreEngine {
         let mut replayed_to = 0usize;
         let mut last_checkpoint_step = 0usize;
         let mut child_fit_at_gate = f32::NAN;
-        let relevant: Vec<(usize, Checkpoint)> = self
+        // Gate window: both gates read only the last `crossover_gate_window`
+        // RECORDED checkpoints (0 = all — the unbounded legacy behavior).
+        // Bars are historical; the window keeps them local to the population's
+        // current era instead of averaging the run's whole life. Indices are
+        // preserved (`relevant` keeps its ledger position) so Hard's
+        // per-checkpoint replay sites stay exact.
+        let relevant_all: Vec<(usize, Checkpoint)> = self
             .checkpoints
             .iter()
             .enumerate()
             .filter(|(_, chk)| chk.step <= clock)
             .map(|(i, chk)| (i, *chk))
             .collect();
+        let gate_k = self.config.crossover_gate_window;
+        let relevant: Vec<(usize, Checkpoint)> = if gate_k == 0 || relevant_all.len() <= gate_k {
+            relevant_all
+        } else {
+            relevant_all[relevant_all.len() - gate_k..].to_vec()
+        };
         let checkpoint_count = relevant.len();
         let mut failed_gate: Option<(usize, usize, f32, f32)> = None; // (i+1, chk.step, child, mean)
         match self.config.crossover_gate {
@@ -2817,10 +2828,15 @@ impl CoreEngine {
                 crate::engine::config::CrossoverGate::Soft => 1,
             };
             format!(
-                " | gate {} {bars}/{bars} bars: {:.4} vs {:.4}",
+                " | gate {} {bars}/{bars} bars: {:.4} vs {:.4}{}",
                 gate_name,
                 child_fit_at_gate,
                 bar,
+                if gate_k > 0 {
+                    format!(" (window {gate_k}, {checkpoint_count} in window)")
+                } else {
+                    String::new()
+                },
             )
         } else {
             // No checkpoints yet — the gate was NOT supposed to apply. Stated
@@ -5980,6 +5996,58 @@ mod tests {
         let header = crate::state::load_engine_json(&dir).unwrap();
         assert_eq!(header.config.mutation_probation_steps, 4);
         assert!(header.config.elite_checkpoint_weights);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crossover_gate_window_limits_bars_and_persists() {
+        // The window must (a) slice the ledger to the last k RECORDED
+        // checkpoints for both gates and (b) round-trip through engine.json.
+        let dir = std::env::temp_dir().join("gras-cx-gate-window");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut engine = engine(&dir, 7).unwrap();
+        engine.config.crossover_gate_window = 2;
+        // Seed a 5-entry ledger with distinct, ordered bars (Minimize: lower
+        // = better — so the last-2 mean differs sharply from the all-5 mean).
+        for (i, step) in [10usize, 20, 30, 40, 50].iter().enumerate() {
+            engine.checkpoints.push(Checkpoint {
+                step: *step,
+                pop_mean_fitness: 1.0 + i as f32,
+                exam_mean_fitness: 0.0,
+            });
+        }
+        let all: Vec<(usize, Checkpoint)> = engine
+            .checkpoints
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, *c))
+            .collect();
+        let gate_k = engine.config.crossover_gate_window;
+        let windowed = &all[all.len() - gate_k..];
+        assert_eq!(windowed.len(), 2);
+        assert_eq!(windowed.len(), 2);
+        // The all-bars mean (3.0) vs windowed mean: window actually changed
+        // the verdict input.
+        let all_mean = all.iter().map(|(_, c)| c.pop_mean_fitness).sum::<f32>() / 5.0;
+        assert!((all_mean - 3.0).abs() < 1e-6);
+        let win_mean = windowed.iter().map(|(_, c)| c.pop_mean_fitness).sum::<f32>() / 2.0;
+        assert!(
+            (win_mean - 4.5).abs() < 1e-6,
+            "last two bars are 4.0 and 5.0 → mean 4.5 (got {win_mean})"
+        );
+        // Persist + reload: the knob is replay-relevant.
+        let cfg = crate::engine::config::RaceConfig {
+            crossover_gate_window: 7,
+            ..crate::engine::config::RaceConfig::defaults()
+        };
+        let snap =
+            crate::state::ConfigSnapshot::from_config(&cfg, Some(32), Some(32));
+        assert_eq!(snap.crossover_gate_window, 7);
+        assert_eq!(
+            crate::engine::config::RaceConfig::defaults().crossover_gate_window,
+            0,
+            "default = unbounded (legacy behavior)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

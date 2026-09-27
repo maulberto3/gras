@@ -216,6 +216,10 @@ pub struct RaceConfig {
     /// Checkpoint gate strictness for crossover children (see
     /// [`CrossoverGate`]).
     pub crossover_gate: CrossoverGate,
+    /// How many RECENT checkpoints the crossover gate reads (see
+    /// [`RaceConfigBuilder::set_crossover_gate_window`]). `0` = all of them
+    /// (unbounded, the legacy behavior).
+    pub crossover_gate_window: usize,
     /// Extra retries per crossover roll when the gate rejects the child
     /// (`cx_retry_full`). Each retry draws fresh parents and re-runs the full
     /// generate + gate pipeline; the original attempt plus every retry is
@@ -250,9 +254,6 @@ pub struct RaceConfig {
     /// type-carrying split the `RunSpec` variants apply. The engine core
     /// reads only the shared fields above; mode branches match on this arm.
     pub mode_specific: ModeConfig,
-    /// Reset a dethroned elite's optimizer state (momentum/velocity/step
-    /// counters — see [`RaceConfigBuilder::set_dethrone_reset_optimizer_state`]).
-    pub dethrone_reset_optimizer_state: bool,
     /// Crossover operator pool — which recombination operators the two-parent
     /// path may use (`"one_point"` | `"uniform"`). Drawn uniformly per
     /// attempt. Empty ⇒ both operators (the `empty ⇒ all` convention shared
@@ -593,6 +594,7 @@ impl RaceConfig {
             crossover_rolls: 1,
             mutate_rolls: 1,
             crossover_gate: CrossoverGate::default(),
+            crossover_gate_window: 0,
             crossover_retries: 0,
             crossover_cull_policy: CrossCullPolicy::default(),
             mutation_cull_policy: MutationCullPolicy::default(),
@@ -600,7 +602,6 @@ impl RaceConfig {
             freeze_elites: true,
             smoothing_window: SMOOTHING_WINDOW,
             mode_specific: ModeConfig::Tabular(TabularConfig::default()),
-            dethrone_reset_optimizer_state: true,
             crossover_ops_pool: Vec::new(),
             max_steps: None,
             max_target_fitness: None,
@@ -729,10 +730,25 @@ impl RaceConfigBuilder {
         self
     }
     /// Gate strictness for crossover children: `CrossoverGate::Hard` = beat
-    /// every checkpoint mean; `CrossoverGate::Soft` = beat the mean of the
-    /// checkpoint means.
+    /// every checkpoint bar in the gate window; `CrossoverGate::Soft` = beat
+    /// the mean of those bars.
     pub fn set_crossover_gate(mut self, mode: CrossoverGate) -> Self {
         self.cfg.crossover_gate = mode;
+        self
+    }
+    /// Limit the crossover gate to the last `k` RECORDED checkpoints (both
+    /// gates). Why: the bars are historical — a run-length ledger averages
+    /// over every era the run passed through, so a long run's Soft bar drifts
+    /// toward the lifetime average instead of the population's current
+    /// standing, and a Hard child is asked to re-beat bars from eras it never
+    /// lived in. Windowing keeps the bar local: Soft = mean of the last `k`
+    /// checkpoint means; Hard = beat each of the last `k` checkpoint means.
+    /// `0` (default) = no window — every recorded checkpoint gates, exactly
+    /// as before. Replay-relevant: recorded in `engine.json` and validated on
+    /// resume (a resumed run must gate against the same window or verdicts
+    /// change).
+    pub fn set_crossover_gate_window(mut self, k: usize) -> Self {
+        self.cfg.crossover_gate_window = k;
         self
     }
     /// Set how many extra full retries a crossover roll gets after a gate
@@ -864,20 +880,6 @@ impl RaceConfigBuilder {
                 "set_run_pop_catch_up is RL-only — this config carries the Tabular arm"
             ),
         }
-        self
-    }
-    /// Dethrone behavior: when a frozen elite loses its crown, reset its
-    /// optimizer STATE (Adam momentum/velocity/step counters) while keeping
-    /// the weights and all hyperparameters. Why: the state is stale — its
-    /// notes describe the gradient landscape of the FROZEN era, and trusting
-    /// them makes the first reclaim updates mis-scaled or mis-directed. A
-    /// reset gives the comeback a clean, well-scaled warm-up: all the frozen
-    /// skill (weights intact), none of the disorientation. Default `true`.
-    /// Pass `false` to keep momentum across the freeze (nonstationary envs
-    /// where the old trend is still meaningful). Replay-relevant — recorded
-    /// in `engine.json` and validated on resume.
-    pub fn set_dethrone_reset_optimizer_state(mut self, yes: bool) -> Self {
-        self.cfg.dethrone_reset_optimizer_state = yes;
         self
     }
     /// Per-net smoothed-fitness rolling window (K), in steps. Every ranking

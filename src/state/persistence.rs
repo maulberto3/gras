@@ -43,6 +43,9 @@ pub struct ConfigSnapshot {
     pub mutate_rolls: usize,
     /// Checkpoint gate strictness (`"hard"` | `"soft"`).
     pub crossover_gate: String,
+    /// Crossover gate window (last-k checkpoints; 0 = all). Replay-relevant.
+    #[serde(default)]
+    pub crossover_gate_window: usize,
     /// Extra gate-aware retries per crossover roll (0 = none).
     pub crossover_retries: usize,
     /// Crossover replacement policy (`"worst"` | `"random"`). Crossover-only:
@@ -101,11 +104,6 @@ pub struct ConfigSnapshot {
     /// always catches up.)
     #[serde(default = "default_false")]
     pub fresh_immigrants: bool,
-    /// Dethrone optimizer-state reset (`set_dethrone_reset_optimizer_state`).
-    /// Replay-relevant: whether a resumed run re-applies `reset_state()` at
-    /// dethrone transitions (changes optimizer trajectories after unfreeze).
-    #[serde(default = "default_true")]
-    pub dethrone_reset_optimizer_state: bool,
     /// How many of the initial population slots were user-supplied run
     /// topologies (the founding batch) (`set_run_topologies`). Informational (lineage reads:
     /// ordinals `< run_topology_count` are imports, the rest are random draws).
@@ -142,6 +140,7 @@ impl ConfigSnapshot {
             crossover_rolls: cfg.crossover_rolls,
             mutate_rolls: cfg.mutate_rolls,
             crossover_gate: format!("{:?}", cfg.crossover_gate).to_lowercase(),
+            crossover_gate_window: cfg.crossover_gate_window,
             crossover_retries: cfg.crossover_retries,
             crossover_cull_policy: format!("{:?}", cfg.crossover_cull_policy).to_lowercase(),
             elite_count: cfg.elite_count,
@@ -169,7 +168,6 @@ impl ConfigSnapshot {
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
             fresh_immigrants: cfg.mode_specific.mutation_catch_up(),
-            dethrone_reset_optimizer_state: cfg.dethrone_reset_optimizer_state,
             run_topology_count: cfg.run_topologies.len(),
             elite_checkpoint_weights: cfg.elite_checkpoint_weights,
             mutation_probation_steps: cfg.mutation_probation_steps,
