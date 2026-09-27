@@ -22,6 +22,7 @@ pub mod config;
 pub mod core;
 pub mod fitness;
 pub mod population;
+pub mod guardrail;
 pub mod rl_engine;
 pub mod run_spec;
 pub mod smoothing;
@@ -32,6 +33,7 @@ pub use config::{
     MutationCullPolicy, RaceConfig, RaceSnapshot, RlConfig, RlRaceConfig, RunMode, StopReason,
     TabularConfig, TabularRaceConfig,
 };
+pub use guardrail::{check_champion, ChampionScorer, GuardrailVerdict};
 pub use core::CoreEngine;
 pub use fitness::{Direction, Fitness, FitnessLabel};
 pub use rl_engine::RlEngine;

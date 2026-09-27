@@ -118,6 +118,69 @@ pub fn initial_population_from_header(
     initial_population(config, run_seed)
 }
 
+// ── Run topology (founding batch) loading ──────────────────────────────
+
+/// Load a run topology from a saved artifact: a topology JSON file
+/// (`Topology::to_json` output) or a `nets/<hash>.json` frontier state (its
+/// `topology` field is parsed). Blueprint-ONLY — the topology gets fresh
+/// weights and a fresh optimizer like every other net; weight import is a
+/// separate, not-yet-landed path.
+pub fn run_topology_from_json_file(path: &std::path::Path) -> Result<Topology, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("run-topology {}: {e}", path.display()))?;
+    // Try the two shapes: raw topology JSON first, then a NetState wrapper.
+    if let Ok(topo) = Topology::from_json(&raw) {
+        return Ok(topo);
+    }
+    let state: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("run-topology {}: not topology or net-state JSON: {e}", path.display()))?;
+    let topo_json = state
+        .get("topology")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| format!("run-topology {}: no `topology` field", path.display()))?;
+    Topology::from_json(topo_json).map_err(|e| format!("run-topology {}: bad topology: {e}", path.display()))
+}
+
+/// Load run topologies from a PRIOR RUN's directory: every
+/// `nets/<hash>.json` frontier state, ranked by final smoothed fitness (the
+/// champion first), up to `max` topologies. Dims and ops come from the saved
+/// blueprints verbatim — the new run's topology pools don't constrain them
+/// (the run topologies are proven architectures; re-rolling their nodes would
+/// defeat the point). Fails only when NO state parses.
+pub fn run_topologies_from_run_dir(dir: &std::path::Path, max: usize) -> Result<Vec<Topology>, String> {
+    let nets_dir = dir.join("nets");
+    let mut scored: Vec<(Option<f32>, Topology)> = Vec::new();
+    let entries = std::fs::read_dir(&nets_dir)
+        .map_err(|e| format!("{}: {e}", nets_dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let Ok(state) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+        let Some(topo_json) = state.get("topology").and_then(|t| t.as_str()) else { continue };
+        let Ok(topo) = Topology::from_json(topo_json) else { continue };
+        let fitness = state
+            .get("final_smoothed_fitness")
+            .and_then(|f| f.as_f64())
+            .map(|f| f as f32);
+        scored.push((fitness, topo));
+    }
+    if scored.is_empty() {
+        return Err(format!("{}: no parsable net states", nets_dir.display()));
+    }
+    // Ranked best-first when fitness exists; nets that never scored keep
+    // their (deterministic) file order at the end.
+    scored.sort_by(|a, b| match (b.0, a.0) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    Ok(scored.into_iter().take(max).map(|(_, t)| t).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

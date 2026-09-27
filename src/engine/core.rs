@@ -632,6 +632,18 @@ impl CoreEngine {
         // like the old generational engine where `run` was the only call.
         // Generated before the engine consumes the config.
         let initial_topologies = super::population::initial_population(&config, run_seed);
+        // User run-topologies fill slots FIRST (blueprint-only, fresh weights);
+        // the random batch fills the rest and re-rolls any draw that collides
+        // with a run topology (same dedupe discipline as the random batch itself).
+        let run_topology_count = config.run_topologies.len();
+        let initial_topologies = if run_topology_count > 0 {
+            let mut mixed = config.run_topologies.clone();
+            mixed.extend(initial_topologies);
+            mixed.truncate(config.pop_size.max(run_topology_count));
+            mixed
+        } else {
+            initial_topologies
+        };
 
         // Shared batch stream — engine infrastructure (Tabular only). The
         // trainer may shape batch sizes (`Trainer::stream_shape`) but the
@@ -1023,7 +1035,7 @@ impl CoreEngine {
             // front so a resumed command can be reconstructed from the log
             // alone (and so a stale binary is visible before it misleads).
             info!(
-                "race knobs: gate={:?} cull_policy={:?} retries={} dropout={} freeze_elites={} fresh_immigrants={} elite_save={} worst_save={}",
+                "race knobs: gate={:?} cull_policy={:?} retries={} dropout={} freeze_elites={} fresh_immigrants={} elite_save={} worst_save={} probation_steps={}",
                 self.config.crossover_gate,
                 self.config.crossover_cull_policy,
                 self.config.crossover_retries,
@@ -1032,6 +1044,7 @@ impl CoreEngine {
                 self.config.mode_specific.mutation_catch_up(),
                 self.config.elite_save_topology,
                 self.config.worst_save_topology,
+                self.config.mutation_probation_steps,
             );
             info!("  {}", build_stamp());
         }
@@ -1180,6 +1193,15 @@ impl CoreEngine {
                 }
                 if let Err(e) = self.write_live_frontier_states() {
                     log::warn!("checkpoint live states write failed: {e}");
+                }
+                // Elite weight snapshot (hard-kill durability): the frontier
+                // states above already carry topology + step counters every
+                // checkpoint; this adds the WEIGHTS of the top-k so a
+                // `kill -9` loses at most one checkpoint interval of them.
+                if self.config.elite_checkpoint_weights {
+                    if let Err(e) = self.write_checkpoint_elite_safetensors() {
+                        log::warn!("checkpoint elite snapshot failed: {e}");
+                    }
                 }
                 // Flush metrics at the checkpoint too: an interrupted run then
                 // keeps the per-step history up to its last checkpoint instead
@@ -1744,6 +1766,34 @@ impl CoreEngine {
         Ok(())
     }
 
+    /// Per-checkpoint elite weight snapshot (hard-kill durability). Writes
+    /// each top-`elite_count` net's weights as
+    /// `checkpoint-elite-<hash>.safetensors`, OVERWRITTEN every checkpoint —
+    /// latest wins, so the run dir never accumulates one file per era. The
+    /// stop-time `elite-<hash>.safetensors` artifacts stay separate (they are
+    /// the run's headline output; a mid-run snapshot must never shadow them).
+    /// Fires every checkpoint behind `elite_checkpoint_weights`.
+    fn write_checkpoint_elite_safetensors(&mut self) -> Result<()> {
+        self.record_champions();
+        for (hash, _) in self.champion_ranked() {
+            let short = &hash[..8.min(hash.len())];
+            let path = self
+                .run_dir
+                .join(format!("checkpoint-elite-{short}.safetensors"));
+            match self.networks.get(hash.as_str()) {
+                Some(net) => {
+                    if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
+                        log::warn!("checkpoint elite snapshot failed: {e}");
+                    } else if self.verbose_detail() {
+                        log::debug!("  checkpoint elite weights → {}", path.display());
+                    }
+                }
+                None => log::warn!("checkpoint elite snapshot: live network missing"),
+            }
+        }
+        Ok(())
+    }
+
     /// Full hashes of the elite set exported at stop — the single source of
     /// truth for "which nets are the champions". Read this (not file mtimes,
     /// not glob order) when post-race tooling needs the champion: the frontier
@@ -1934,10 +1984,22 @@ impl CoreEngine {
                 if let Some(opt) = self.optimizers.get_mut(hash) {
                     opt.reset_state();
                 }
+                // Say WHO took the seat: the new elite set minus the dethroned
+                // net (the seats just re-dealt). First non-dethroned elite.
+                let taker = self
+                    .elite_hashes()
+                    .into_iter()
+                    .find(|h| h != hash)
+                    .unwrap_or_default();
                 info!(
-                    "step {} │ freeze │ {} dethroned — resumes training, optimizer state reset (weights kept, momentum forgotten)",
+                    "step {} │ freeze │ {} dethroned (seat → {}) — resumes training, optimizer state reset (weights kept, momentum forgotten)",
                     clock,
                     &hash[..8.min(hash.len())],
+                    if taker.is_empty() {
+                        "?".to_string()
+                    } else {
+                        taker[..8.min(taker.len())].to_string()
+                    },
                 );
             } else {
                 info!(
@@ -2523,7 +2585,7 @@ impl CoreEngine {
                 .unwrap_or_else(|| "?".into());
             let victim_for_log: Option<String> = match self.config.crossover_cull_policy {
                 crate::engine::config::CrossCullPolicy::Worst => {
-                    self.worst_nets_by_smoothed_fitness(1)?.pop()
+                    self.select_crossover_worst_victim(clock)?
                 }
                 crate::engine::config::CrossCullPolicy::Random => {
                     Some(self.select_random_victim(clock)?)
@@ -2561,13 +2623,17 @@ impl CoreEngine {
             }
             self.insert_child(child, clock, "crossover");
             return Ok(RollOutcome::survived(format!(
-                "child {} ({}) inserted, NO catch-up (no gate), victim {} culled",
+                "child {} ({}) inserted, gate n/a (crossover_catch_up=off), caught up 0, victim {} culled ({})",
                 inserted_hash,
                 lineage,
                 victim_for_log
                     .as_deref()
                     .map(|v| v[..8.min(v.len())].to_string())
                     .unwrap_or_else(|| "none".into()),
+                    match self.config.crossover_cull_policy {
+                        crate::engine::config::CrossCullPolicy::Worst => "worst",
+                        crate::engine::config::CrossCullPolicy::Random => "random",
+                    },
             )));
         }
         let mut replayed_to = 0usize;
@@ -2681,7 +2747,7 @@ impl CoreEngine {
         // carry its identity (fills the previously-empty `victim` column).
         let victim_for_log: Option<String> = match self.config.crossover_cull_policy {
             crate::engine::config::CrossCullPolicy::Worst => {
-                self.worst_nets_by_smoothed_fitness(1)?.pop()
+                self.select_crossover_worst_victim(clock)?
             }
             crate::engine::config::CrossCullPolicy::Random => {
                 Some(self.select_random_victim(clock)?)
@@ -2720,8 +2786,13 @@ impl CoreEngine {
             }
         }
         // The gate verdict belongs on the SUCCESS line too: what the child
-        // scored vs the bar it beat is the whole story of the admission.
+        // scored vs the bar it beat, WHICH gate, and how many bars — the
+        // whole admission story, correlated to the `set_crossover_*` knobs.
         let gate_note = if checkpoint_count > 0 {
+            let gate_name = match self.config.crossover_gate {
+                crate::engine::config::CrossoverGate::Hard => "hard",
+                crate::engine::config::CrossoverGate::Soft => "soft",
+            };
             let bar = match self.config.crossover_gate {
                 crate::engine::config::CrossoverGate::Hard => {
                     // Hard gate: the LAST checkpoint's bar was the final one beaten.
@@ -2739,17 +2810,22 @@ impl CoreEngine {
                         / checkpoint_count.max(1) as f32
                 }
             };
+            // bars-beaten shown per configured gate: Hard beat ALL of the
+            // `checkpoint_count` bars; Soft beat the 1 aggregate of them.
+            let bars = match self.config.crossover_gate {
+                crate::engine::config::CrossoverGate::Hard => checkpoint_count,
+                crate::engine::config::CrossoverGate::Soft => 1,
+            };
             format!(
-                " | gate {} {:.4} vs bar {:.4}",
-                match self.config.crossover_gate {
-                    crate::engine::config::CrossoverGate::Hard => "hard",
-                    crate::engine::config::CrossoverGate::Soft => "soft",
-                },
+                " | gate {} {bars}/{bars} bars: {:.4} vs {:.4}",
+                gate_name,
                 child_fit_at_gate,
                 bar,
             )
         } else {
-            String::new() // no checkpoints yet — gate skipped, nothing to show
+            // No checkpoints yet — the gate was NOT supposed to apply. Stated
+            // so "no gate" never reads as "passed a gate".
+            " | gate n/a (no checkpoints yet)".to_string()
         };
         let inserted_hash = child.state.hash[..8.min(child.state.hash.len())].to_string();
         let lineage = child
@@ -2759,19 +2835,27 @@ impl CoreEngine {
             .unwrap_or_else(|| "?".into());
         // Catch-up status on the success line: a gated child has ALWAYS
         // replayed the full history (0..clock) — that's what the gate judged.
-        // Stated explicitly so a reader never has to infer it.
         let catchup_note = format!("caught up {clock} step(s)");
+        // Victim with its POLICY (which `set_crossover_cull_policy` chose it).
+        let victim_note = match victim_for_log.as_deref() {
+            Some(v) => format!(
+                "victim {} culled ({})",
+                &v[..8.min(v.len())],
+                match self.config.crossover_cull_policy {
+                    crate::engine::config::CrossCullPolicy::Worst => "worst",
+                    crate::engine::config::CrossCullPolicy::Random => "random",
+                },
+            ),
+            None => "victim none".to_string(),
+        };
         self.insert_child(child, clock, "crossover");
         Ok(RollOutcome::survived(format!(
-            "child {} ({}) inserted{}, {}, victim {} culled",
+            "child {} ({}) inserted{}, {}, {}",
             inserted_hash,
             lineage,
             gate_note,
             catchup_note,
-            victim_for_log
-                .as_deref()
-                .map(|v| v[..8.min(v.len())].to_string())
-                .unwrap_or_else(|| "none".into()),
+            victim_note,
         )))
     }
 
@@ -2840,12 +2924,25 @@ impl CoreEngine {
     /// it every roll of the same step would draw the same index.
     fn select_random_victim_at(&self, clock: usize, salt: usize) -> Result<String> {
         let elite = self.elite_hashes();
-        let hashes: Vec<String> = self
+        // The param `clock` is the SALTED seed input; the probation check
+        // needs the CURRENT race clock. Prefer off-probation victims; break
+        // probation only when every non-elite net is fresh (a firing roll
+        // must always find a slot).
+        let now = self.step_clock();
+        let all: Vec<String> = self
             .state
             .live_hashes()
             .into_iter()
             .filter(|h| !elite.contains(h))
             .collect();
+        let mut hashes: Vec<String> = all
+            .iter()
+            .filter(|h| !self.on_probation(h, now))
+            .cloned()
+            .collect();
+        if hashes.is_empty() {
+            hashes = all;
+        }
         if hashes.is_empty() {
             return Err(crate::utils::error::EngineError::InvalidOptions(
                 "random cull: no cullable (non-elite) live net".into(),
@@ -2896,12 +2993,28 @@ impl CoreEngine {
 
     /// Mutation victim last resorts: the worst net by smoothed fitness, else
     /// the first live hash. `None` only when the population is empty (a firing
-    /// roll cannot happen then).
+    /// roll cannot happen then). Probation-aware: off-probation victims are
+    /// preferred, but a firing roll ALWAYS finds a slot — if every
+    /// non-elite net is on probation (window ≥ pop − elite, an unusual
+    /// config), the protection is broken for this pick.
     fn mutation_victim_fallback(&self) -> Option<String> {
-        self.worst_nets_by_smoothed_fitness(1)
-            .ok()
-            .and_then(|mut w| w.pop())
-            .or_else(|| self.state.live_hashes().first().cloned())
+        let clock = self.step_clock();
+        let elite = self.elite_hashes();
+        let eligible = |h: &String| !elite.contains(h);
+        let off_probation = |h: &String| !self.on_probation(h, clock);
+        let live = self.state.live_hashes();
+        // Preferred: worst among non-elite, off-probation nets.
+        if let Some(worst) = self
+            .worst_nets_by_smoothed_fitness(live.len())
+            .ok()?
+            .into_iter()
+            .find(|h| eligible(h) && off_probation(h))
+        {
+            return Some(worst);
+        }
+        // Last resort: probation broken — first non-elite live net (the
+        // cull log's reason field is where this shows up, see the caller).
+        live.into_iter().find(|h| eligible(h))
     }
 
     /// One evolution roll of the mutation branch: cull a net selected
@@ -3100,8 +3213,9 @@ impl CoreEngine {
     /// Select a live net inversely-proportionate to smoothed fitness (worst
     /// nets most likely) — the `MutationCullPolicy::InverseFitness` arm. Elite
     /// nets (top-`config.elite_count`) are excluded entirely — they can never
-    /// be mutation victims. Returns `None` when no cullable candidate remains
-    /// (empty/single-net pop, or all elite).
+    /// be mutation victims; nets on mutation probation are excluded too (the
+    /// clock is the CURRENT race clock). Returns `None` when no cullable
+    /// candidate remains (empty/single-net pop, or all elite/on-probation).
     fn select_inverse_proportional(&self) -> Result<Option<String>> {
         let hashes = self.state.live_hashes();
         if hashes.len() < 2 {
@@ -3109,6 +3223,7 @@ impl CoreEngine {
         }
         let direction = self.fitness.direction();
         let elite = self.elite_hashes();
+        let clock = self.step_clock();
         // Inverse fitness: weight = (adjusted best) − (adjusted value) ≥ 0 —
         // the worst net gets the largest weight, the best gets zero. (The
         // previous `value − worst` weighting was inverted: it targeted the
@@ -3116,6 +3231,7 @@ impl CoreEngine {
         let scored: Vec<(String, f32)> = hashes
             .iter()
             .filter(|h| !elite.contains(h))
+            .filter(|h| !self.on_probation(h, clock))
             .filter(|h| {
                 self.rolling_fitness
                     .get(*h)
@@ -3158,6 +3274,40 @@ impl CoreEngine {
             }
         }
         Ok(weights.last().map(|(h, _)| h.clone()))
+    }
+
+    /// Whether `hash` is on mutation probation at `clock`: cull-IMMUNE for
+    /// its first `mutation_probation_steps` clocks (measured from
+    /// `entered_at_step`, which is already persisted — no new state,
+    /// resume-safe). With window 0 nobody is ever on probation (the default
+    /// — only the built-in empty-buffer step-0 immunity remains).
+    /// Probation is a STATUS, not a queue: the net still trains, measures,
+    /// and can rank — it just cannot be a cull VICTIM while fresh.
+    fn on_probation(&self, hash: &str, clock: usize) -> bool {
+        let window = self.config.mutation_probation_steps;
+        if window == 0 {
+            return false;
+        }
+        self.state
+            .net(hash)
+            .map(|s| clock.saturating_sub(s.entered_at_step) < window)
+            .unwrap_or(false)
+    }
+
+    /// The crossover Worst-policy victim: worst by smoothed fitness, with the
+    /// SAME probation discipline as the mutation channel (off-probation first;
+    /// protection broken when every non-elite net is fresh — an admitted child
+    /// must always get its slot). `None` only when no net has ever scored.
+    fn select_crossover_worst_victim(&self, clock: usize) -> Result<Option<String>> {
+        let worst = self.worst_nets_by_smoothed_fitness(self.state.live_count())?;
+        let victim = worst.into_iter().find(|h| !self.on_probation(h, clock)).or_else(|| {
+            // Probation broken: fall back to the plain worst (which may be
+            // on probation — an admitted child must get its slot).
+            self.worst_nets_by_smoothed_fitness(1)
+                .ok()
+                .and_then(|v| v.into_iter().next())
+        });
+        Ok(victim)
     }
 
     /// The elite set: the top `config.elite_count` live nets by smoothed
@@ -5595,5 +5745,241 @@ mod tests {
             hb.last_metrics.as_ref().map(|m| m.fitness),
             "same seed ⇒ identical solo trajectory"
         );
+    }
+
+    // ── Founder topologies ──────────────────────────────────────────────
+
+    #[test]
+    fn founders_fill_slots_first_and_random_fills_the_rest() {
+        let dir = std::env::temp_dir().join("gras-runtopos-mix");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        eng.config.pop_size = 3;
+        eng.config.run_topologies = vec![tiny_topology(101), tiny_topology(102)];
+        // Rebuild the population the way from_spec mixes founders: founders
+        // first, random batch after, truncated to pop_size.
+        let random_batch =
+            crate::engine::population::initial_population(&eng.config, eng.run_seed());
+        let mut mixed = eng.config.run_topologies.clone();
+        mixed.extend(random_batch);
+        mixed.truncate(eng.config.pop_size);
+        eng.seed_population_internal(mixed, Some(0.5)).unwrap();
+        assert_eq!(eng.state.live_count(), 3);
+        // The first two slots carry the founders' exact topology JSON.
+        let founder_json: Vec<String> = eng
+            .config
+            .run_topologies
+            .iter()
+            .map(|t| t.to_json().unwrap())
+            .collect();
+        let live: Vec<String> = eng
+            .state
+            .live_hashes()
+            .iter()
+            .filter_map(|h| eng.state.net(h).map(|s| s.topology.clone()))
+            .collect();
+        assert!(
+            live.contains(&founder_json[0]) && live.contains(&founder_json[1]),
+            "both founder blueprints must be in the population"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_topology_count_is_recorded_in_engine_json() {
+        let dir = std::env::temp_dir().join("gras-runtopos-count");
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = tiny_dataset_dir("runtopos-count");
+        let config = RaceConfig {
+            run_topologies: vec![tiny_topology(11)],
+            ..RaceConfig::defaults()
+        };
+        let eng = crate::engine::TabularEngine::from_spec(
+            crate::engine::run_spec::RunSpec::tabular(
+                data_dir,
+                config,
+                fitness(),
+                crate::trainer::TabularTrainer::new(loss_fn()),
+                Some(7),
+                Some(dir.clone()),
+            ),
+        )
+        .unwrap();
+        let header = crate::state::load_engine_json(&dir).unwrap();
+        assert_eq!(header.config.run_topology_count, 1);
+        // Founder labels: the ordinal order of seeding is founders-first.
+        assert_eq!(eng.step_clock(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn founder_topology_loader_reads_netstate_json() {
+        // Round-trip: a net state written by the engine's own persistence
+        // must be loadable back as a founder blueprint.
+        let dir = std::env::temp_dir().join("gras-runtopos-loader");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        eng.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+            .unwrap();
+        eng.write_live_frontier_states().unwrap();
+        let nets_dir = dir.join("nets");
+        let state_path = std::fs::read_dir(&nets_dir)
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .path();
+        let topo =
+            crate::engine::population::run_topology_from_json_file(&state_path).unwrap();
+        assert_eq!(
+            topo.to_json().unwrap(),
+            tiny_topology(7).to_json().unwrap(),
+            "loader must reproduce the exact blueprint"
+        );
+        // Run-dir loader: one ranked founder from the same run.
+        let found =
+            crate::engine::population::run_topologies_from_run_dir(&dir, 1).unwrap();
+        assert_eq!(found.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Checkpoint elite weight snapshot ────────────────────────────────
+
+    #[test]
+    fn checkpoint_elite_snapshot_lands_and_flag_off_skips() {
+        for (enabled, expect_file) in [(true, true), (false, false)] {
+            let dir =
+                std::env::temp_dir().join(format!("gras-ckpt-elite-{enabled}"));
+            let _ = std::fs::remove_dir_all(&dir);
+            let mut eng = engine(&dir, 7).unwrap();
+            eng.config.checkpoint_every = 2;
+            eng.config.max_steps = Some(4);
+            eng.config.elite_checkpoint_weights = enabled;
+            eng.seed_population_internal(
+                vec![tiny_topology(7), tiny_topology(8)],
+                Some(0.5),
+            )
+            .unwrap();
+            eng.run().unwrap();
+            if expect_file {
+                // Champion hash from the engine — the same source the
+                // snapshot writer used.
+                let champ = eng.champion_hashes()[0].clone();
+                let short = &champ[..8];
+                let snap = dir.join(format!("checkpoint-elite-{short}.safetensors"));
+                assert!(
+                    snap.exists(),
+                    "checkpoint snapshot missing for champion {short}"
+                );
+            } else {
+                let snaps = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| {
+                        e.file_name().to_string_lossy().starts_with("checkpoint-elite-")
+                    })
+                    .count();
+                assert_eq!(snaps, 0, "flag off ⇒ no checkpoint elite files");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // ── Mutation probation ─────────────────────────────────────────────
+
+    #[test]
+    fn probation_shields_fresh_nets_from_inverse_roulette() {
+        let dir = std::env::temp_dir().join("gras-probation-shield");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        eng.config.mutation_probation_steps = 3;
+        eng.seed_population_internal(
+            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+            Some(0.5),
+        )
+        .unwrap();
+        // Give everyone a verdict, one clearly worst (Minimize: highest =
+        // worst). Without probation, the inverse roulette would always
+        // target it.
+        let mut hashes = eng.state.live_hashes();
+        hashes.sort();
+        for (i, h) in hashes.iter().enumerate() {
+            let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+            buf.push(0.5 + i as f32 * 0.1);
+            *eng.rolling_fitness.get_mut(h).unwrap() = buf;
+        }
+        eng.state.net_mut(&hashes[2]).unwrap().entered_at_step = 10; // fresh
+        let clock = 11; // within the 3-step window
+        for _ in 0..20 {
+            let victim = eng.select_mutation_victim(clock, 0).unwrap();
+            assert_ne!(
+                victim, hashes[2],
+                "a net inside its probation steps must never be the victim"
+            );
+        }
+        // Past the window the protection lifts — the fresh net becomes an
+        // eligible candidate again (the roulette is probabilistic, so we
+        // assert eligibility via the predicate, not a single draw).
+        let late = 13; // 13 − 10 = 3 ≥ window 3
+        assert!(
+            !eng.on_probation(&hashes[2], late),
+            "protection expires after k clocks"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probation_breaks_when_every_non_elite_is_fresh() {
+        // A firing roll must ALWAYS find a slot: with the whole non-elite
+        // population inside its window, the last resort picks the worst
+        // on-probation net rather than failing.
+        let dir = std::env::temp_dir().join("gras-probation-break");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        eng.config.mutation_probation_steps = 100; // effectively everyone
+        eng.config.elite_count = 1;
+        eng.seed_population_internal(
+            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+            Some(0.5),
+        )
+        .unwrap();
+        let mut hashes = eng.state.live_hashes();
+        hashes.sort();
+        for (i, h) in hashes.iter().enumerate() {
+            let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+            buf.push(0.5 + i as f32 * 0.1);
+            *eng.rolling_fitness.get_mut(h).unwrap() = buf;
+        }
+        let victim = eng.select_mutation_victim(5, 0).unwrap();
+        // The elite (best = hashes[0]) must STILL be protected; the worst of
+        // the two remaining probation nets takes the slot.
+        assert_ne!(victim, hashes[0], "probation never overrides the elite guard");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probation_steps_is_recorded_in_engine_json() {
+        let dir = std::env::temp_dir().join("gras-probation-json");
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = tiny_dataset_dir("probation-json");
+        let config = RaceConfig {
+            mutation_probation_steps: 4,
+            ..RaceConfig::defaults()
+        };
+        crate::engine::TabularEngine::from_spec(
+            crate::engine::run_spec::RunSpec::tabular(
+                data_dir,
+                config,
+                fitness(),
+                crate::trainer::TabularTrainer::new(loss_fn()),
+                Some(7),
+                Some(dir.clone()),
+            ),
+        )
+        .unwrap();
+        let header = crate::state::load_engine_json(&dir).unwrap();
+        assert_eq!(header.config.mutation_probation_steps, 4);
+        assert!(header.config.elite_checkpoint_weights);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -106,6 +106,21 @@ pub struct ConfigSnapshot {
     /// dethrone transitions (changes optimizer trajectories after unfreeze).
     #[serde(default = "default_true")]
     pub dethrone_reset_optimizer_state: bool,
+    /// How many of the initial population slots were user-supplied run
+    /// topologies (the founding batch) (`set_run_topologies`). Informational (lineage reads:
+    /// ordinals `< run_topology_count` are imports, the rest are random draws).
+    #[serde(default)]
+    pub run_topology_count: usize,
+    /// Per-checkpoint elite weight snapshot flag
+    /// (`set_elite_checkpoint_weights`). Informational — describes artifact
+    /// cadence, not replay semantics.
+    #[serde(default = "default_true")]
+    pub elite_checkpoint_weights: bool,
+    /// Mutation probation steps (`set_mutation_probation_steps`):
+    /// cull-immunity for a net's first k clocks. Replay-relevant — it changes
+    /// WHICH nets get culled, so a resumed run must use the same window.
+    #[serde(default)]
+    pub mutation_probation_steps: usize,
     /// One-line identity of the binary that produced the run (`gras` version,
     /// profile, exe path, build time). Diagnostics only — lets a reader tell
     /// a stale-process artifact from a logic bug.
@@ -155,6 +170,9 @@ impl ConfigSnapshot {
             freeze_elites: cfg.freeze_elites,
             fresh_immigrants: cfg.mode_specific.mutation_catch_up(),
             dethrone_reset_optimizer_state: cfg.dethrone_reset_optimizer_state,
+            run_topology_count: cfg.run_topologies.len(),
+            elite_checkpoint_weights: cfg.elite_checkpoint_weights,
+            mutation_probation_steps: cfg.mutation_probation_steps,
             build: crate::engine::core::build_stamp(),
         }
     }

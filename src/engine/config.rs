@@ -336,6 +336,32 @@ pub struct RaceConfig {
     /// folder name (that stays `results/<run_id>` unless `RunSpec.run_dir`
     /// is set) — it exists so analysis scripts can group runs by experiment.
     pub run_name: Option<String>,
+    /// User-supplied run topologies (the founding batch) (blueprint-only, fresh weights):
+    /// seeded into the population BEFORE the random draws, in order, so a
+    /// run can start from proven architectures (e.g. the elite of a prior
+    /// run — see `population::run_topologies_from_run_dir`). The rest of
+    /// the `pop_size` slots stay random draws; duplicates against the random
+    /// batch (or within the run-topology list) are re-rolled like the standard
+    /// duplicate gate. Recorded in `engine.json` as `run_topology_count`.
+    pub run_topologies: Vec<crate::graph::topology::Topology>,
+    /// Per-checkpoint elite weight snapshot: every `checkpoint_every` steps,
+    /// export each top-`elite_count` net's weights as
+    /// `checkpoint-elite-<hash>.safetensors` (overwritten each checkpoint —
+    /// latest wins). Makes a hard kill (`kill -9`, power loss) lose at most
+    /// one checkpoint interval of weights; the frontier states already land
+    /// every checkpoint. Default true (k is small, the files are small).
+    pub elite_checkpoint_weights: bool,
+    /// Mutation probation: a net is cull-IMMUNE for its first
+    /// `mutation_probation_steps` clocks (while
+    /// `clock − entered_at_step < window`). The lower-half analog of the
+    /// elite guard: a fresh immigrant with 1–2 bad verdicts gets k steps to
+    /// draw its arch-lottery ticket before the inverse-fitness roulette can
+    /// claim it. `0` (default) = today's behavior (only the empty-buffer
+    /// step-0 immunity). A firing roll ALWAYS yields a slot: if every
+    /// non-elite net is on probation, the protection is broken for that
+    /// pick (last resort, logged). See `entered_at_step` — no new state,
+    /// resume-safe by construction.
+    pub mutation_probation_steps: usize,
 }
 
 /// Mode-specific knob set — the arm is carried in the TYPE (same split
@@ -598,6 +624,9 @@ impl RaceConfig {
             worst_save_safetensors: false,
             pop_pruner: None,
             run_name: None,
+            run_topologies: Vec::new(),
+            elite_checkpoint_weights: true,
+            mutation_probation_steps: 0,
         }
     }
 
@@ -1105,6 +1134,29 @@ impl RaceConfigBuilder {
     /// Set whether to write the lossless unified event log (`history.csv`).
     pub fn set_run_csv_export(mut self, enabled: bool) -> Self {
         self.cfg.csv_export = enabled;
+        self
+    }
+    /// Seed the population with user-supplied run topologies (blueprint-only
+    /// — fresh weights, same `make_optimizer` the race gives everyone). They
+    /// fill slots FIRST (in order), the remaining
+    /// `pop_size − run_topologies.len()` slots stay random draws; the duplicate
+    /// gate re-rolls colliders. Pair with `population::run_topologies_from_run_dir`
+    /// to re-run a prior run's elite architectures.
+    pub fn set_run_topologies(mut self, topos: Vec<crate::graph::topology::Topology>) -> Self {
+        self.cfg.run_topologies = topos;
+        self
+    }
+    /// Per-checkpoint elite weight snapshot
+    /// (`checkpoint-elite-<hash>.safetensors`, overwritten each checkpoint).
+    /// Default true — pass false to only write weights at stop.
+    pub fn set_elite_checkpoint_weights(mut self, enabled: bool) -> Self {
+        self.cfg.elite_checkpoint_weights = enabled;
+        self
+    }
+    /// Mutation probation steps: cull-immunity for a net's first `k`
+    /// clocks (see [`RaceConfig::mutation_probation_steps`]). Default 0.
+    pub fn set_mutation_probation_steps(mut self, k: usize) -> Self {
+        self.cfg.mutation_probation_steps = k;
         self
     }
     /// At stop, save the elite's topology markdown (`elite-<hash>.md`).

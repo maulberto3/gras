@@ -168,6 +168,13 @@ impl StreamShape {
 /// The mode-agnostic core every trainer implements: build an optimizer for a
 /// net and describe the recipe. The mode-specific contracts
 /// ([`TabularStep`], [`RlStep`]) require this as a supertrait.
+///
+/// # Contract: BOTH traits, always
+/// Implementing a mode contract means complying with BOTH halves — the
+/// supertrait [`StepTrainer`] (shared lifecycle: `make_optimizer`, optional
+/// `describe`) AND the mode trait itself (the step: [`RlStep::train_step`] or
+/// [`TabularStep::train_step`]). Rust requires two `impl` blocks; that is the
+/// contract, not boilerplate. `RlStep` alone does not compile as a trainer.
 pub trait StepTrainer: Send {
     /// Make the optimizer for a newly built or reloaded network.
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
@@ -185,7 +192,9 @@ pub trait StepTrainer: Send {
     }
 }
 
-/// The dataset-driven (supervised) training contract.
+/// The dataset-driven (supervised) training contract. A trainer complies
+/// with BOTH [`StepTrainer`] and this trait — two `impl` blocks, both
+/// required (see [`StepTrainer`]).
 ///
 /// Owns the loss — it is REQUIRED here, not an `Option` — and optionally
 /// shapes the shared batch stream. Data arrives via [`TabularContext::data`],
@@ -223,6 +232,11 @@ pub trait TabularStep: StepTrainer {
 }
 
 /// The environment-driven (RL) training contract.
+///
+/// # Contract: BOTH traits, always
+/// A trainer complies with BOTH [`StepTrainer`] (supertrait: optimizer +
+/// recipe) and `RlStep` (this step contract) — two `impl` blocks, both
+/// required. See [`StepTrainer`] for the full statement.
 ///
 /// There is deliberately NO `loss()` method and no data in [`RlContext`]:
 /// the training signal (rewards, trajectories, advantages) is the trainer's
