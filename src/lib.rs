@@ -34,8 +34,9 @@ pub use utils::tabular_data;
 
 // ── engine — the step-race loop ──────────────────────────────────────
 pub use engine::{
-    Direction, Fitness, FitnessLabel, RLSpec, RaceConfig, RaceSnapshot, RlEngine, RunMode, RunSpec,
-    StopReason, TabularEngine, TabularSpec,
+    rl_race_config_builder, tabular_race_config_builder, Direction, Fitness, FitnessLabel,
+    RLSpec, RaceConfig, RaceSnapshot, RlConfig, RlEngine, RlRaceConfig, RunMode, RunSpec,
+    StopReason, TabularConfig, TabularEngine, TabularRaceConfig, TabularSpec,
 };
 
 // ── graph — blueprints + executable networks ─────────────────────────
