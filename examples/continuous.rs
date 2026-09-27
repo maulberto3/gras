@@ -16,7 +16,7 @@ use std::path::Path;
 use clap::Parser;
 use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness, Metric};
-use gras::engine::{RaceConfig, TabularEngine};
+use gras::engine::{TabularEngine, TabularRaceConfig};
 use gras::utils::{score, tabular_data};
 
 /// The command line: the shared engine flags (this example has no extra knobs).
@@ -62,7 +62,7 @@ fn main() {
 
     // 3. Config — small defaults (this is a showpiece), overridable by flags.
     //    Topology: 1 input feature, 1 output value.
-    let builder = RaceConfig::builder()
+    let builder = TabularRaceConfig::builder()
         .set_run_pop_size(6)
         .set_stop_max_steps(50)
         .set_topology_hidden_dim_range(4, 8)

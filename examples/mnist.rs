@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use gras::engine::fitness::{Direction, Fitness, Metric};
-use gras::engine::{RaceConfig, TabularEngine};
+use gras::engine::{TabularEngine, TabularRaceConfig};
 use gras::utils::{score, tabular_data};
-use gras::{RunMode, Variable};
+use gras::{Variable};
 
 // ── Run knobs (the CONST defaults — every one is overridable by a flag) ────
 const RUN_SEED: Option<u64> = Some(16); // None = random, recorded in engine.json
@@ -140,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // documented default surface.
     // Rolls scale with the population, so they follow the RESOLVED pop (flag > const).
     let pop = cli.engine.pop.unwrap_or(POP_SIZE);
-    let mut builder = RaceConfig::builder()
+    let mut builder = TabularRaceConfig::builder()
         // --- Population & Engine options ---
         .set_run_name(RUN_NAME) // Human experiment label → engine.json "run_name" (folder name unchanged)
         .set_run_pop_size(pop) // Number of active, live networks in population
@@ -207,7 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // .set_topology_activation_pool(&["ReLU", "SELU", "GELU"])   // Allowed activations for search
         // .set_topology_standardize_op_pool(&["Identity"])           // Allowed standardization operations for search
         // --- Tooling, Target Modes & Exports ---
-        .set_run_mode(RunMode::Tabular) // Target paradigm mode (Tabular, OneCImage, NLP, etc.)
+        // (no set_run_mode — the RunSpec variant IS the mode)
         .set_run_csv_export(true) // Exports the lossless history.csv record (per-step metric rows + evolution attempt rows, typed by the `type` column)
         .set_elite_save_topology(true) // At stop, write elite-<hash>.md — the champion's blueprint (default true)
         .set_elite_save_safetensors(true) // At stop, write elite-<hash>.safetensors — the champion's weights (default true)

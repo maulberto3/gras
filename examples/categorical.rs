@@ -15,7 +15,7 @@ use std::path::Path;
 
 use clap::Parser;
 use gras::engine::fitness::{Direction, Fitness, Metric};
-use gras::engine::{RaceConfig, TabularEngine};
+use gras::engine::{TabularEngine, TabularRaceConfig};
 use gras::utils::{score, tabular_data};
 
 /// The command line: the shared engine flags (this example has no extra knobs).
@@ -62,7 +62,7 @@ fn main() {
 
     // 3. Config — budgets inactive unless set; here a step budget only.
     //    Topology dims must match the dataset (16 features → 4 classes).
-    let builder = RaceConfig::builder()
+    let builder = TabularRaceConfig::builder()
         .set_run_pop_size(6)
         .set_stop_max_steps(50)
         .set_topology_hidden_dim_range(4, 8)

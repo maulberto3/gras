@@ -42,7 +42,7 @@ use gras::flodl::nn::optim::Optimizer;
 
 use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness, Metric};
-use gras::engine::{RaceConfig, TabularEngine};
+use gras::engine::{TabularEngine, TabularRaceConfig};
 use gras::graph::network::Network;
 use gras::trainer::{StepReport, StepTrainer, TabularContext, TabularStep};
 use gras::utils::{score, tabular_data};
@@ -260,7 +260,7 @@ fn main() {
 
     // Config — note there are NO training knobs here anymore (no learning
     // rate, no grad clip): those live on the trainer below.
-    let builder = RaceConfig::builder()
+    let builder = TabularRaceConfig::builder()
         .set_run_pop_size(4)
         .set_stop_max_steps(30)
         .set_run_checkpoint_every(5)

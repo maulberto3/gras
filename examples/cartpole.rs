@@ -44,7 +44,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness};
-use gras::engine::{RaceConfig, RlEngine, RunMode};
+use gras::engine::{RaceConfig, RlEngine, RlRaceConfig};
 use gras::flodl::Tensor;
 use gras::flodl::nn::optim::Optimizer;
 use gras::graph::network::Network;
@@ -785,9 +785,9 @@ fn main() {
     
     // Stop criterion: the const target-fitness bar applies only when the user
     // asked for neither flag, so --max-steps never collides with it.
-    let builder = RaceConfig::builder()
+    let builder = RlRaceConfig::builder()
         .set_run_name("cartpole")
-        .set_run_mode(RunMode::Rl) // declare the use case — engine cross-checks it against the spec variant
+        // (no set_run_mode — the RunSpec::rl variant IS the mode)
         .set_run_csv_export(true) // lossless per-step metrics.csv (every net, every step)
         //   .set_run_metrics(["f1"])                       // built-in label
         //   .set_run_metrics([Metric::custom("gap", |p, y| ...)])  // your own
@@ -856,7 +856,7 @@ fn main() {
         .set_elite_freeze(true) // default; pass --no-freeze-elites to fork relay shadows
         .set_elite_count(pop / 10) // elites safe from cull-thrash under the noisy REINFORCE signal
         .set_elite_save_topology(true) // elite-<hash>.md at race end
-        .set_elite_save_safetensors(true) // elite-<hash>.safetensors (the guardrail needs the trained weights)
+        .set_elite_save_safetensors(false) // elite-<hash>.safetensors (the guardrail needs the trained weights)
         .set_worst_save_topology(true) // worst-<hash>.md: what the population's floor looked like
         .set_worst_save_safetensors(false)
         // Post-race pruner

@@ -11,7 +11,7 @@
 
 use clap::Parser;
 use gras::engine::fitness::{Direction, Fitness};
-use gras::engine::{RaceConfig, TabularEngine};
+use gras::engine::{TabularEngine, TabularRaceConfig};
 use gras::graph::network::Network;
 use gras::graph::topology::Topology;
 use gras::state::{load_engine_json, load_net_state};
@@ -190,7 +190,7 @@ fn setup_demo_run() -> (PathBuf, String, PathBuf) {
     let ds = tabular_data::synthetic_classification(128, 8, 2, 42, gras::auto_device()).unwrap();
     tabular_data::save_dataset(&data_dir, &ds).unwrap();
 
-    let config = RaceConfig::builder()
+    let config = TabularRaceConfig::builder()
         .set_run_pop_size(2)
         .set_stop_max_steps(5)
         .set_run_csv_export(true)
