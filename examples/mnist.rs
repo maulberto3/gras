@@ -217,7 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // --- Remaining knobs (default-valued; uncomment to deviate) ---
         // .set_mutation_cull_policy(gras::engine::config::MutationCullPolicy::InverseFitness) // mutation victim: InverseFitness (default) | Worst | Random
         // .set_mutation_probation_steps(2) // fresh nets cull-immune for k clocks (all cull channels; a firing roll always finds a slot)
-        // .set_dethrone_reset_optimizer_state(true) // reset Adam state when a frozen elite loses its crown (default true)
+        // .set_crossover_gate_window(5) // gate reads only the last k checkpoint bars (0 = all; keeps long-run bars local)
         // .set_history_flush_each(false) // false = flush history.csv at checkpoints + stop (default); true = every step
         // .set_run_topologies(gras::engine::population::run_topologies_from_run_dir(Path::new("assets/<run>"), 4)?) // seed a prior run's elite blueprints (fresh weights; see also run_topology_from_json_file for a single net)
         ;

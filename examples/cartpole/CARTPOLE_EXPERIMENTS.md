@@ -63,9 +63,9 @@ the random baseline):
   honest (fresh trajectories, real standing);
 - **regression demotion** (REMOVED 2026-09-25, was `--regression-tol 0.7`)
   — culling via the ordinary inverse-fitness roulette (where a collapsed
-  fitness up-weights naturally) is the single regression story, and the
-  dethrone optimizer-state reset gives a displaced champion a fair warm-up
-  for its reclaim attempt (see TODO.md's anti-devolution entries);
+  fitness up-weights naturally) is the single regression story, and a
+  dethroned champion resumes with its last optimizer state, giving its
+  reclaim attempt an intact trend (see TODO.md's anti-devolution entries);
 
 ## Two bugs that produced a FALSE guardrail verdict (both fixed)
 

@@ -39,12 +39,18 @@
 #[path = "cli/mod.rs"]
 mod cli;
 
+// Tests live in a sibling file so the example reads as a clean walkthrough.
+// Run: cargo test --example cartpole
+#[cfg(test)]
+#[path = "cartpole/tests.rs"]
+mod cartpole_tests;
+
 use std::path::PathBuf;
 
 use clap::Parser;
 use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness};
-use gras::engine::{RaceConfig, RlEngine};
+use gras::engine::{RlEngine, RunSpec};
 use gras::flodl::Tensor;
 use gras::flodl::nn::optim::Optimizer;
 use gras::graph::network::Network;
@@ -83,16 +89,6 @@ const MATCHES_PER_STEP: usize = 2;
 const EVAL_MATCHES_PER_STEP: usize = 4;
 /// Population size — live nets in the evolutionary race.
 const POP: usize = 100;
-
-// ── DECISION-LAG RELAY (alternative trainer form, see STEP C in main) ────
-// The RELAY wraps the trainer: the deciding *face* plays and ranks on held
-// weights while a *shadow* receives the optimizer step, promoted every
-// RELAY_LAG steps (policy and learning apart). Costs 2× matches per step.
-
-/// Relay width in ENGINE STEPS (1 = classic one-step lag). Unused unless
-/// the RELAY arm is uncommented in main.
-#[allow(dead_code)]
-const RELAY_LAG: usize = 2;
 
 /// The policy's learning rate (flodl's `Adam::new` is typed `f64`; cast
 /// once at that boundary).
@@ -499,217 +495,37 @@ impl StepTrainer for CartPoleTrainer {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 // SECTION 3 — VERDICT HELPERS (NOT gras: your honesty checks, your verdicts)
-// ═══════════════════════════════════════════════════════════════════════
-// These are EXAMPLE-side quality checks around the race — gras stays out of
-// the judgment business ("the engine only ranks"). The baseline is your bar;
-// the holdout re-check is your anti-self-deception device; the verdicts
-// (SOLVED / collapsed) are your presentation.
-//
-// WHY a holdout at all: the race's smoothed fitness is computed by the same
-// machinery that trains — a broken signal looks like progress. Fresh games
-// (disjoint seed base) with the TRAINED weights loaded from the export are
-// the independent reading. gras saves the weights; comparing is your job.
-//
-// ── Random-policy baseline ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// Example-side quality checks around the race — gras stays out of the
+// judgment business. The library half of the guardrail (champion reload +
+// aggregation) lives in `gras::engine::guardrail`; only the scorer impl and
+// the utilities at the bottom of this file are user-owned. Why a holdout:
+// the race's smoothed fitness comes from the machinery that trains — fresh
+// games with the TRAINED weights are the independent reading.
 
-/// Mean survival of a random (uniform LEFT/RIGHT) policy over a few
-/// matches — the number the race must beat. ~20 turns for CartPole-v1 physics.
-fn random_baseline(matches: usize) -> f64 {
-    let mut total = 0.0f64;
-    let mut rng = fastrand::Rng::with_seed(0xBA5E_1E55);
-    for _ in 0..matches {
-        let mut env = CartPole::new(0.0, 0.0);
-        let mut turns = 0usize;
-        while turns < MAX_TURNS_PER_MATCH {
-            env.step(rng.usize(..2));
-            turns += 1;
-            if env.failed() {
-                break;
-            }
-        }
-        total += turns as f64;
-    }
-    total / matches as f64
-}
-
-// ── Holdout guardrail: honest re-check of the champion ──────────────────
-
-/// Seed base for holdout matches — a fixed, arbitrary u64 distinct from
-/// any (net_seed, step) triple, so holdout games are reproducible AND
-/// disjoint from the race's own match starts.
+/// Seed base for holdout matches — distinct from any (net_seed, step,
+/// match_i) race triple, so holdout games are reproducible AND disjoint.
 const HOLDOUT_SEED_BASE: u64 = 0x0132_7A11;
-/// Holdout batch size for the guardrail (post-race) and `--score-only`.
-/// Small because each game runs to 500 turns (random ≈ 22, solved = 500).
+/// Holdout batch size (post-race guardrail and `--score-only`).
 const HOLDOUT_MATCHES: usize = 10;
 
-/// Re-evaluate the champion over holdout matches — the SAME estimator as
-/// the race reports (mean-of-batch). The champion's TRAINED weights are
-/// loaded from `elite-<hash>.safetensors` — without that, the guardrail
-/// silently tested a newborn brain (measured: "smoothed 201 but holdout 9"
-/// on nets that had learned). Returns `(mean, std)` over the batch.
-fn holdout_survival(
-    run_dir: &std::path::Path,
-    champion_hash: &str,
-    matches: usize,
-    device: gras::flodl::Device,
-) -> Option<(f32, f32)> {
-    let latest = run_dir.join("nets").join(format!("{champion_hash}.json"));
-    // The state file nests the topology JSON as a STRING field.
-    let state_raw = std::fs::read_to_string(&latest).ok()?;
-    let topo_json = serde_json::from_str::<serde_json::Value>(&state_raw)
-        .ok()?
-        .get("topology")
-        .and_then(|t| t.as_str())
-        .map(String::from)?;
-    // NOTE: do NOT call `topo.finalize()` here. The saved topology is already
-    // finalized, and finalize() clears + REGENERATES the wiring — which
-    // silently swapped in a different network.
-    let topo = gras::Topology::from_json(&topo_json).ok()?;
-    let mut net = Network::build(&topo, device).ok()?;
-    // The champion's trained weights (named with the SHORT hash, 8 chars,
-    // as the engine writes it).
-    let short = &champion_hash[..8.min(champion_hash.len())];
-    let weights = run_dir.join(format!("elite-{short}.safetensors"));
-    if weights.exists() {
-        // A load failure must never be swallowed: a partially-loaded net
-        // measures like a different network.
-        if let Err(e) = gras::utils::safetensors::load_safetensors(&mut net, &weights) {
-            eprintln!(
-                "guardrail: loading {weights:?} failed ({e}) — cannot check the champion's trained weights, skipping"
-            );
-            return None;
-        }
-    }
-    // No safetensors (elite_save disabled)? The verdict would measure a
-    // newborn — refuse rather than lie.
-    else {
-        eprintln!("guardrail: no {weights:?} — cannot check trained weights, skipping");
-        return None;
-    }
-    let trainer = CartPoleTrainer {
-        grad_clip: 1.0,
-        device,
-        matches_per_step: matches,
-        eval_matches_per_step: 0, // holdout plays its own batch; no eval batch needed
-        step_clock: 0,
-        update: UPDATE,
-    };
-    let mut survivals = Vec::with_capacity(matches);
-    for match_i in 0..matches {
-        // Holdout uses a dedicated seed base — distinct from any race
-        // match triple, so holdout games are never the race's games.
-        let seed = episode_start_seed(HOLDOUT_SEED_BASE, 0, match_i);
-        match trainer.play_episode(&mut net, seed) {
-            Ok((_, s)) => survivals.push(s),
-            Err(e) => {
-                eprintln!("guardrail: play_episode failed on {device:?}: {e} — skipping");
-                return None;
-            }
-        }
-    }
-    let mean = fitness_from_survivals(&survivals);
-    // Population std over the batch — a wide ± hides a mix of solved and
-    // fluke games.
-    let var = survivals
-        .iter()
-        .map(|&s| {
-            let d = s as f32 - mean;
-            d * d
-        })
-        .sum::<f32>()
-        / survivals.len() as f32;
-    Some((mean, var.sqrt()))
-}
-
-/// `--score-only`: rebuild each saved champion from its topology, load its
-/// trained weights, play the holdout batch, print the verdict. Engine-free,
-/// so it works on runs whose history cannot be replayed.
-fn score_saved_elites(run_dir: &std::path::Path, only: Option<&str>) {
-    let device = gras::auto_device();
-    let baseline = random_baseline(20);
-    println!(
-        "score-only: {} — engine NOT constructed (no replay, no parity check)",
-        run_dir.display()
-    );
-    println!("baseline: random policy survives {baseline:.1} turns (race must beat this)");
-
-    // Targets: the named net, else every elite-*.safetensors in the run dir.
-    let mut shorts: Vec<String> = Vec::new();
-    match only {
-        Some(needle) => match resolve_net_hash(run_dir, needle) {
-            Some(full) => shorts.push(full[..8.min(full.len())].to_string()),
-            None => {
-                eprintln!(
-                    "score-only: no net matching {needle:?} in {}",
-                    run_dir.display()
-                );
-                std::process::exit(2);
-            }
-        },
-        None => {
-            if let Ok(entries) = std::fs::read_dir(run_dir) {
-                for e in entries.flatten() {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    if let Some(short) = name
-                        .strip_prefix("elite-")
-                        .and_then(|s| s.strip_suffix(".safetensors"))
-                    {
-                        shorts.push(short.to_string());
-                    }
-                }
-            }
-        }
-    }
-    if shorts.is_empty() {
-        eprintln!(
-            "score-only: no elite-*.safetensors found in {}",
-            run_dir.display()
-        );
-        return;
-    }
-    shorts.sort();
-
-    for short in shorts {
-        let Some(full) = resolve_net_hash(run_dir, &short) else {
-            eprintln!("  elite {short}: no matching nets/*.json — skipped");
-            continue;
-        };
-        match holdout_survival(run_dir, &full, HOLDOUT_MATCHES, device) {
-            Some((holdout, std)) => println!(
-                "guardrail: elite {} holdout survival {holdout:.0} ± {std:.0}/{} turns — {}",
-                &full[..8.min(full.len())],
-                MAX_TURNS_PER_MATCH,
-                if holdout >= MAX_TURNS_PER_MATCH as f32 {
-                    "SOLVED ✅".to_string()
-                } else if holdout > baseline as f32 {
-                    "beats random ✅".to_string()
-                } else {
-                    "weak — at or below the random baseline ❌".to_string()
-                }
-            ),
-            None => eprintln!("  elite {short}: could not rebuild/score — skipped"),
-        }
+/// The guardrail's user-owned half: play ONE fresh holdout game with the
+/// champion's TRAINED weights (already loaded by the module). Same units
+/// and estimator as the reported fitness (survival turns, mean-of-batch).
+impl gras::engine::guardrail::ChampionScorer for CartPoleTrainer {
+    fn holdout_score(
+        &mut self,
+        net: &mut Network,
+        game_i: usize,
+    ) -> gras::flodl::tensor::Result<f32> {
+        let seed = episode_start_seed(HOLDOUT_SEED_BASE, 0, game_i);
+        let (_, survival) = self.play_episode(net, seed)?;
+        Ok(survival as f32)
     }
 }
 
-/// Resolve a full 16-char net hash from the run's `nets/` dir given any
-/// unique prefix (or the full hash itself).
-fn resolve_net_hash(run_dir: &std::path::Path, needle: &str) -> Option<String> {
-    let nets = run_dir.join("nets");
-    let mut hits: Vec<String> = Vec::new();
-    for e in std::fs::read_dir(nets).ok()?.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        if let Some(hash) = name.strip_suffix(".json") {
-            if hash.starts_with(needle) {
-                hits.push(hash.to_string());
-            }
-        }
-    }
-    hits.sort();
-    hits.first().cloned()
-}
 
 // ── CLI (thin: shared engine flags + this example's own knobs) ──────────
 
@@ -840,16 +656,16 @@ fn main() {
         .set_run_csv_export(true) // lossless history.csv (every net, every step)
         .set_run_log_level(gras::engine::config::LogLevel::Summ) // builder stays open — CLI overlay below
         .set_run_pop_size(pop)
-        .set_run_smoothing_window(10) // ranking averages the last n verdicts — one lucky step can't flip a rank
+        .set_run_smoothing_window(5) // ranking averages the last n verdicts — one lucky step can't flip a rank
         .set_run_pop_catch_up(false)
-        .set_run_checkpoint_every(5) // gate bars come from checkpoints
-        // .set_run_topologies(
-        //     gras::engine::population::run_topologies_from_run_dir(
-        //         std::path::Path::new("assets/1790398710472_cartpole"),
-        //         3,
-        //     )
-        //     .expect("run-topology load: assets/1790398710472_cartpole must contain nets/*.json"),
-        // )
+        .set_run_checkpoint_every(2) // gate bars come from checkpoints
+        .set_run_topologies(
+            gras::engine::population::run_topologies_from_run_dir(
+                std::path::Path::new("assets/1790398710472_cartpole"),
+                3,
+            )
+            .expect("run-topology load: assets/1790398710472_cartpole must contain nets/*.json"),
+        )
         // Stop evolution criteria
         .set_stop_max_steps(cli.engine.max_steps)
         // .set_stop_target_fitness(Some(MAX_TARGET_FITNESS))
@@ -861,7 +677,8 @@ fn main() {
         .set_crossover_ops_pool(["one_point", "uniform"]) // empty ⇒ all
         .set_crossover_cull_policy(gras::engine::config::CrossCullPolicy::Worst)
         .set_crossover_catch_up(true)
-        .set_crossover_gate(gras::engine::config::CrossoverGate::Soft)
+        .set_crossover_gate(gras::engine::config::CrossoverGate::Hard)
+        .set_crossover_gate_window(5)
         // Mutation: replace a net with a random immigrant (pure exploration).
         .set_mutate_prob(0.5)
         .set_mutate_rolls(pop / 5)
@@ -893,14 +710,15 @@ fn main() {
         .set_elite_freeze(true) // top-k act-and-measure, no weight updates (anti-devolution)
         .set_elite_count(pop / 10) // elites safe from cull-thrash under the noisy signal
         .set_elite_save_topology(true) // elite-<hash>.md at race end
-        .set_elite_save_safetensors(false) // (the guardrail needs trained weights when true)
+        .set_elite_save_safetensors(true) // elite-<hash>.safetensors at stop — the guardrail's primary weight source
         .set_elite_checkpoint_weights(true) // checkpoint-elite-<hash>.safetensors every checkpoint (kill -9 durability)
         .set_worst_save_topology(true) // worst-<hash>.md: what the search rejected
         .set_worst_save_safetensors(false)
         // Past-evolution elite training
-        .set_pruner_enabled(true) // after stop: cull all but the elite, train it solo
-        .set_pruner_method(gras::engine::config::PopPrunerMethod::Hard)
-        .set_pruner_steps(10);
+        .set_pruner_enabled(false) // after stop: cull all but the elite, train it solo
+        // .set_pruner_method(gras::engine::config::PopPrunerMethod::Hard)
+        // .set_pruner_steps(10)
+        ;
 
     // ═══════════════════════════════════════════════════════════════
     // STEP B — ③ THE HANDOFF (gras API): fitness + trainer + spec
@@ -922,48 +740,30 @@ fn main() {
         step_clock: 0,
         update,
     };
-    // Fresh/resume share one helper (both arms box the trainer into the
-    // spec; only the wrapper differs).
-    fn build_engine<T: RlStep + 'static>(
-        cli: &Cli,
-        builder: RaceConfig,
-        fitness: Fitness,
-        trainer: T,
-    ) -> RlEngine {
-        match &cli.resume {
-            // Resume: seed + net frontier come from the run dir; stop criteria
-            // from THIS config (a stopped run can continue under a new bar).
-            // Live nets replay bit-exactly (env seeds are pure functions of
-            // (net_seed, step, match_i) — see Section 1).
-            Some(dir) => {
-                println!("Resuming RL run from {} …", dir.display());
-                RlEngine::resume(dir.clone(), builder, fitness, trainer)
-            }
-            None => RlEngine::from_spec(gras::engine::RunSpec::rl(
-                builder,
-                fitness,
-                trainer,
-                cli.engine.seed_or(Some(42)),
-                cli.engine.run_dir_or(None), // default: results/<timestamp>
-            )),
-        }
-        .expect("engine construction (RL spec)")
-    }
     // ═══════════════════════════════════════════════════════════════
-    // STEP C — ④ THE RACE (gras API): build the engine, run it
+    // STEP C — THE RACE (gras API): build the engine, run it
     // ═══════════════════════════════════════════════════════════════
     // The spec variant IS the mode: `RunSpec::rl` = no dataset, reported
-    // fitness, your trainer called per net per step.
-    //
-    // Trainer selection — comment/uncomment:
-    // RELAY: face decides on held weights; a shadow learns (2× env cost).
-    // let relay = gras::trainer::DecisionLagTrainer::new(trainer)
-    //     .with_lag(RELAY_LAG)
-    //     .with_grace(cli.engine.grace_periods.unwrap_or(0));
-    // let mut engine = build_engine(&cli, builder, fitness, relay);
-    // CLASSIC (active): the net learns from its own games.
+    // fitness, your trainer called per net per step. CLASSIC trainer: the
+    // net learns from its own games.
     println!("Trainer: classic — the net learns from its own games.");
-    let mut engine = build_engine(&cli, builder, fitness, trainer);
+    let mut engine = match &cli.resume {
+        // Resume: seed + net frontier come from the run dir; stop criteria
+        // from THIS config. Live nets replay bit-exactly (env seeds are pure
+        // functions of (net_seed, step, match_i) — see Section 1).
+        Some(dir) => {
+            println!("Resuming RL run from {} …", dir.display());
+            RlEngine::resume(dir.clone(), builder, fitness, trainer)
+        }
+        None => RlEngine::from_spec(RunSpec::rl(
+            builder,
+            fitness,
+            trainer,
+            cli.engine.seed_or(Some(42)),
+            cli.engine.run_dir_or(None), // default: results/<timestamp>
+        )),
+    }
+    .expect("engine construction (RL spec)");
 
     println!("================================================================");
     match &cli.resume {
@@ -983,238 +783,183 @@ fn main() {
         Err(e) => eprintln!("race error: {e}"),
     }
 
-    // Holdout re-check: fresh games + trained weights vs the race's smoothed
-    // fitness. They agree when the race signal was honest; diverge when it
-    // wasn't (the self-deception this check exists to catch).
+    // Holdout re-check via the library contract: the guardrail module
+    // reloads the champion's TRAINED weights; our `ChampionScorer` impl
+    // (Section 3) plays the fresh games. They agree when the race signal
+    // was honest; diverge when it wasn't.
     let champions = engine.champion_hashes().to_vec();
     if champions.is_empty() {
         println!("guardrail: no elite exported (elite_save disabled or empty pop) — skipped");
         return;
     }
     let champion = &champions[0];
-    let smoothed = engine
-        .state()
-        .net(champion)
-        .and_then(|s| s.last_metrics.as_ref().map(|m| m.fitness));
-    if let Some((holdout, std)) =
-        holdout_survival(engine.run_dir(), champion, HOLDOUT_MATCHES, device)
-    {
-        let smoothed_note = smoothed
-            .map(|s| format!(" (race smoothed {s:.1})"))
-            .unwrap_or_default();
+    // The SAME smoothed value the final-elites line printed — not the last
+    // raw step's fitness (they diverge exactly when the label lies).
+    let smoothed = engine.smoothed_fitness_of(champion);
+    let mut scorer = CartPoleTrainer {
+        grad_clip: 1.0,
+        device,
+        matches_per_step: HOLDOUT_MATCHES,
+        eval_matches_per_step: 0, // measurement, never a training batch
+        step_clock: 0,
+        update,
+    };
+    match gras::engine::guardrail::check_champion(
+        engine.run_dir(),
+        champion,
+        smoothed,
+        &mut scorer,
+        HOLDOUT_MATCHES,
+        device,
+    ) {
+        Some(v) => {
+            let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
+            let smoothed_note = smoothed
+                .map(|s| format!(" (race smoothed fitness {s:.1} — holdout is a FRESH measurement, units differ)"))
+                .unwrap_or_default();
+            println!(
+                "guardrail: elite {} holdout survival {holdout:.0} ± {std:.0}/{} turns{smoothed_note} — {}",
+                &champion[..8.min(champion.len())],
+                MAX_TURNS_PER_MATCH,
+                if holdout >= MAX_TURNS_PER_MATCH as f32 {
+                    "SOLVED ✅"
+                } else if holdout > 4.0 * baseline as f32 {
+                    "well above random baseline 👍"
+                } else {
+                    "weak — REINFORCE may have collapsed ❌"
+                }
+            );
+        }
+        None => eprintln!("guardrail: champion reload refused — see warnings above"),
+    }
+}
+
+
+
+// ═══════════════════════════════════════════════════════════════════
+// EXAMPLE UTILITIES (NOT gras: plumbing for the verdict paths above)
+// ═══════════════════════════════════════════════════════════════════
+/// Mean survival of a random (uniform LEFT/RIGHT) policy over a few
+/// matches — the number the race must beat. ~20 turns for CartPole-v1 physics.
+fn random_baseline(matches: usize) -> f64 {
+    let mut total = 0.0f64;
+    let mut rng = fastrand::Rng::with_seed(0xBA5E_1E55);
+    for _ in 0..matches {
+        let mut env = CartPole::new(0.0, 0.0);
+        let mut turns = 0usize;
+        while turns < MAX_TURNS_PER_MATCH {
+            env.step(rng.usize(..2));
+            turns += 1;
+            if env.failed() {
+                break;
+            }
+        }
+        total += turns as f64;
+    }
+    total / matches as f64
+}
+
+/// `--score-only`: rebuild each saved champion from its topology, load its
+/// trained weights, play the holdout batch, print the verdict. Engine-free,
+/// so it works on runs whose history cannot be replayed.
+fn score_saved_elites(run_dir: &std::path::Path, only: Option<&str>) {
+    let device = gras::auto_device();
+    let baseline = random_baseline(20);
+    println!(
+        "score-only: {} — engine NOT constructed (no replay, no parity check)",
+        run_dir.display()
+    );
+    println!("baseline: random policy survives {baseline:.1} turns (race must beat this)");
+
+    // Targets: the named net, else every elite-*.safetensors in the run dir.
+    let mut shorts: Vec<String> = Vec::new();
+    match only {
+        Some(needle) => match resolve_net_hash(run_dir, needle) {
+            Some(full) => shorts.push(full[..8.min(full.len())].to_string()),
+            None => {
+                eprintln!(
+                    "score-only: no net matching {needle:?} in {}",
+                    run_dir.display()
+                );
+                std::process::exit(2);
+            }
+        },
+        None => {
+            if let Ok(entries) = std::fs::read_dir(run_dir) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if let Some(short) = name
+                        .strip_prefix("elite-")
+                        .and_then(|s| s.strip_suffix(".safetensors"))
+                    {
+                        shorts.push(short.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if shorts.is_empty() {
+        eprintln!(
+            "score-only: no elite-*.safetensors found in {}",
+            run_dir.display()
+        );
+        return;
+    }
+    shorts.sort();
+
+    let mut scorer = CartPoleTrainer {
+        grad_clip: 1.0,
+        device,
+        matches_per_step: HOLDOUT_MATCHES,
+        eval_matches_per_step: 0,
+        step_clock: 0,
+        update: UPDATE,
+    };
+    for short in shorts {
+        let Some(full) = resolve_net_hash(run_dir, &short) else {
+            eprintln!("  elite {short}: no matching nets/*.json — skipped");
+            continue;
+        };
+        let Some(v) = gras::engine::guardrail::check_champion(
+            run_dir,
+            &full,
+            None, // no race verdict recorded on this path — score-only
+            &mut scorer,
+            HOLDOUT_MATCHES,
+            device,
+        ) else {
+            eprintln!("  elite {short}: trained weights missing or unloadable — skipped");
+            continue;
+        };
+        let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
         println!(
-            "guardrail: elite {} holdout survival {holdout:.0} ± {std:.0}/{} turns{smoothed_note} — {}",
-            &champion[..8.min(champion.len())],
+            "guardrail: elite {} holdout survival {holdout:.0} ± {std:.0}/{} turns — {}",
+            &full[..8.min(full.len())],
             MAX_TURNS_PER_MATCH,
             if holdout >= MAX_TURNS_PER_MATCH as f32 {
                 "SOLVED ✅"
-            } else if holdout > 4.0 * baseline as f32 {
-                "well above random baseline 👍"
+            } else if holdout > baseline as f32 {
+                "beats random ✅"
             } else {
-                "weak — REINFORCE may have collapsed ❌"
+                "weak — at or below the random baseline ❌"
             }
         );
     }
 }
 
-// ── Tests (pure — no engine, no bridge) ────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// fitness_from_survivals is MEAN-of-batch: every match counts, one
-    /// lucky max cannot inflate the step.
-    #[test]
-    fn fitness_is_mean_of_batch() {
-        assert_eq!(fitness_from_survivals(&[10, 500, 42]), 552.0 / 3.0);
-        assert_eq!(fitness_from_survivals(&[0]), 0.0);
-        assert_eq!(fitness_from_survivals(&[]), 0.0);
-        // The luck case: best-of would say 500; mean says 27.5.
-        assert_eq!(
-            fitness_from_survivals(&[10, 10, 10, 500, 10, 10]),
-            550.0 / 6.0
-        );
-    }
-
-    /// Per-timestep credit sign: G_t = survival − t is strictly positive
-    /// for every action in a completed match and strictly decreasing —
-    /// early actions earn more (they enabled the rest).
-    #[test]
-    fn credit_assignment_sign() {
-        let survival = 10usize;
-        for t in 0..survival {
-            assert!(survival - t > 0);
-            if t > 0 {
-                assert!(survival - t < survival - (t - 1));
+/// Resolve a full 16-char net hash from the run's `nets/` dir given any
+/// unique prefix (or the full hash itself).
+fn resolve_net_hash(run_dir: &std::path::Path, needle: &str) -> Option<String> {
+    let nets = run_dir.join("nets");
+    let mut hits: Vec<String> = Vec::new();
+    for e in std::fs::read_dir(nets).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if let Some(hash) = name.strip_suffix(".json") {
+            if hash.starts_with(needle) {
+                hits.push(hash.to_string());
             }
         }
     }
-
-    /// Match starts are a pure function of (net_seed, step, match_i):
-    /// same triple ⇒ same start, any change to the triple ⇒ different start.
-    #[test]
-    fn match_starts_replayable() {
-        let a = episode_start_seed(42, 3, 1);
-        assert_eq!(a, episode_start_seed(42, 3, 1));
-        assert_ne!(a, episode_start_seed(42, 4, 1));
-        assert_ne!(a, episode_start_seed(42, 3, 2));
-        assert_ne!(a, episode_start_seed(43, 3, 1));
-    }
-
-    /// Eval games must be DISJOINT from train games — the honesty
-    /// guarantee. Every eval seed differs from every train seed at the
-    /// same step, and the derivation stays a pure function of seeds
-    /// (replay parity).
-    #[test]
-    fn eval_batch_disjoint_from_train_batch() {
-        let (net_seed, step) = (42u64, 3usize);
-        for match_i in 0..8usize {
-            let train = episode_start_seed(net_seed, step, match_i);
-            let eval = eval_start_seed(step, match_i);
-            assert_ne!(train, eval);
-            // And reproducible:
-            assert_eq!(eval, eval_start_seed(step, match_i));
-        }
-    }
-
-    /// PAIRED COMPARISON: all nets are measured on the IDENTICAL eval games
-    /// per step. The shared derivation equals (RUN_SEED ^ SALT, step, i) —
-    /// i.e. the same value ANY net would derive, and distinct from every
-    /// per-net train seed. Train batches stay per-net (exploration
-    /// diversity). This is what makes start-state luck common-mode and
-    /// cancel in the ranking.
-    #[test]
-    fn eval_batch_shared_across_nets() {
-        let (net_a, net_b, step) = (111u64, 999u64, 7usize);
-        for match_i in 0..8usize {
-            let shared = eval_start_seed(step, match_i);
-            // Same for everyone — independent of which net asks:
-            assert_eq!(
-                shared,
-                episode_start_seed(RUN_SEED ^ EVAL_SALT, step, match_i)
-            );
-            // ...and NOT any net's train seed (net_seed never enters):
-            assert_ne!(shared, episode_start_seed(net_a, step, match_i));
-            assert_ne!(shared, episode_start_seed(net_b, step, match_i));
-        }
-    }
-
-    /// Both update flavors produce finite scalar losses and actually change
-    /// weights (gradients flow) — the core learning loop works.
-    #[test]
-    fn update_losses_are_finite() -> gras::flodl::tensor::Result<()> {
-        use gras::flodl::nn::Module;
-        let device = gras::auto_device();
-        for update in [Update::Reinforce, Update::ValueHead] {
-            // Synthetic trajectory batch: 4 matches × varying survival.
-            let mut all_transitions: Vec<Transition> = Vec::new();
-            let mut matches: Vec<(usize, usize)> = Vec::new();
-            for match_i in 0..4usize {
-                let survival = 5 + match_i * 3;
-                let offset = all_transitions.len();
-                for t in 0..survival {
-                    let mut o = [0.0f32; 4];
-                    o[0] = (t + match_i) as f32 * 0.01;
-                    all_transitions.push((o, t % 2));
-                }
-                matches.push((offset, survival));
-            }
-            let total = all_transitions.len();
-            let mut flat = Vec::with_capacity(total * 4);
-            let mut mask = vec![0.0f32; total * 2];
-            let mut returns = Vec::with_capacity(total);
-            for (offset, survival) in &matches {
-                for t in 0..*survival {
-                    let i = offset + t;
-                    flat.extend_from_slice(&all_transitions[i].0);
-                    mask[i * 2 + all_transitions[i].1] = 1.0;
-                    returns.push((*survival - t) as f32);
-                }
-            }
-            let baseline = returns.iter().sum::<f32>() / returns.len() as f32;
-            let advantages: Vec<f32> = returns.iter().map(|g| g - baseline).collect();
-            let adv_std = (advantages.iter().map(|a| a * a).sum::<f32>() / advantages.len() as f32)
-                .sqrt()
-                .max(1e-6);
-            let scale = 1.0 / adv_std;
-
-            let topo = gras::TopologyOptions {
-                input_dim: Some(4),
-                output_dim: Some(2),
-                ..Default::default()
-            };
-            let mut t = gras::graph::topology::Topology::new(1, Some(topo));
-            t.finalize();
-            let mut net = Network::build(&t, device)?;
-            let mut opt = gras::flodl::nn::Adam::new(&net.parameters(), 1e-3_f64);
-
-            let loss = match update {
-                Update::Reinforce => {
-                    let x =
-                        Variable::new(Tensor::from_f32(&flat, &[total as i64, 4], device)?, true);
-                    let pred = net.forward(&x)?;
-                    let logp = pred.data().log_softmax(1)?;
-                    let m = Tensor::from_f32(&mask, &[total as i64, 2], device)?;
-                    let chosen = logp.mul(&m)?;
-                    let adv = Tensor::from_f32(&advantages, &[total as i64, 1], device)?;
-                    let weighted = chosen
-                        .sum_dims(&[1], false)?
-                        .reshape(&[total as i64, 1])?
-                        .mul(&adv)?;
-                    let s = Tensor::from_f32(&[scale], &[1], device)?;
-                    Variable::new(weighted.sum()?.mul(&s)?, false)
-                }
-                Update::ValueHead => {
-                    let x =
-                        Variable::new(Tensor::from_f32(&flat, &[total as i64, 4], device)?, true);
-                    let pred = net.forward(&x)?;
-                    let y = Tensor::from_f32(&returns, &[total as i64, 1], device)?;
-                    let diff = pred.sub(&Variable::new(y, false))?;
-                    let sq = diff.mul(&diff)?;
-                    let s = Variable::new(
-                        Tensor::from_f32(&[1.0 / total as f32], &[1], device)?,
-                        false,
-                    );
-                    Variable::new(sq.sum()?.mul(&s)?.data().clone(), false)
-                }
-            };
-            let v = loss.data().to_f32_vec()?;
-            assert_eq!(v.len(), 1, "{update:?} loss must be scalar");
-            assert!(v[0].is_finite(), "{update:?} loss not finite: {}", v[0]);
-
-            // One optimizer step must change the parameters (gradient flowed).
-            let before: Vec<f32> = net
-                .parameters()
-                .iter()
-                .flat_map(|p| p.variable.data().to_f32_vec().unwrap_or_default())
-                .take(16)
-                .collect();
-            let inputs = Tensor::from_f32(&[0.0; 4], &[1, 4], device)?;
-            let _ = train_one_step_pred_only(
-                &mut net,
-                &mut opt,
-                &|_: &Variable| Ok(loss.clone()),
-                &inputs,
-                1.0,
-            )?;
-            let after: Vec<f32> = net
-                .parameters()
-                .iter()
-                .flat_map(|p| p.variable.data().to_f32_vec().unwrap_or_default())
-                .take(16)
-                .collect();
-            assert_ne!(before, after, "{update:?} step did not change weights");
-        }
-        Ok(())
-    }
-
-    /// RUN_SEED namespace: the shared-eval derivation is run-level (no net
-    /// seed) and replayable, and distinct from any per-net train seed.
-    #[test]
-    fn run_seed_namespace_is_replayable() {
-        let a = eval_start_seed(4, 1);
-        assert_eq!(a, eval_start_seed(4, 1));
-        assert_ne!(a, episode_start_seed(42, 4, 1));
-    }
+    hits.sort();
+    hits.first().cloned()
 }
