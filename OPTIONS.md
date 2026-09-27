@@ -173,6 +173,8 @@ A child must prove itself over a replay window of past population means
 | Pruner method | `set_pruner_method(m)` | `PopPrunerMethod::Hard` | Currently the only variant: keep the top `elite_count` survivors (min 1 — with the default `elite_count = 1` that is the champion alone), plain solo training for all of them. There is **no `Soft` pruner** — the `Hard`/`Soft` pair belongs to the *crossover gate* (§2), a different knob. A soft/gradual pruner (population shrinking *during* the race) is a design-only idea: see TODO "Population reducer". |
 | Pruner steps | `set_pruner_steps(n)` | `0` | How many solo-training steps the survivor gets post-race (outside evolution machinery — no crossover/mutation/stop checks). |
 
+Note: pruner solo steps **always train with the real optimizer** — elite freeze is bypassed for the phase (every survivor IS an elite, so freezing would mean zero post-race weight updates; no crown/dethrone lines fire either). `freeze_elites` applies to race steps only.
+
 ## 4. Network architecture (per-individual)
 
 | Option | Setter | Default | What it controls |
@@ -204,13 +206,24 @@ A child must prove itself over a replay window of past population means
 
 | Option | Setter | Default | What it controls |
 |---|---|---|---|
-| Run mode | `set_run_mode(mode)` | `RunMode::Tabular` | Must agree with the spec variant: `RunSpec::tabular` ⇒ Tabular, `RunSpec::rl` ⇒ Rl. Engine validates at construction. |
+| Run mode | *(derived)* | — | NOT user-set. `RunMode` is derived from the `RunSpec` variant at engine construction (`RunSpec::tabular` ⇒ Tabular, `RunSpec::rl` ⇒ Rl) and recorded in `engine.json`. |
 | Smoothing window | `set_run_smoothing_window(k)` | `10` | Per-net rolling window (K) every ranking decision averages over. Load-bearing ranking semantics, so **resume-guarded** like `pop_size`. |
 | Elite freeze | `set_elite_freeze(true)` | `false` | **Anti-devolution A**: top-`elite_count` nets skip the trainer call — they score, rank, and parent crossovers, but their weights never change, so a bad training step can't erase the best skill found. Freeze follows rank, not identity: a child that trains past the frozen elite takes the crown. Motivated by on-policy RL self-collapse; dormant in tabular (guard only fires via ranking facts). Do **not** combine with the decision-lag relay (§8): a frozen net skips its `train_step`, which is where the shadow forks. |
 | Regression tol | *removed 2026-09-25* | — | **Anti-devolution D retired.** The personal-floor guard (net's first smoothed fitness as its fixed floor; falling more than `(1 − tol) × |floor|` below it ⇒ demotion) is gone. Culling via the ordinary roulette is the single regression story (a collapsed fitness up-weights a net there naturally), and elite freeze is now **act-and-measure**: a frozen elite plays its normal step every clock (fresh fitness recorded, standing stays honest) but runs through a no-op optimizer — weights never change, and dethroning needs no catch-up (the net never fell behind the clock). |
-| Crossover catch-up | `set_crossover_catch_up(true)` | `true` | Whether a crossover child replays the training stream (and passes the checkpoint gate on that replayed history) before insertion. `false` = no catch-up AND no gate (a net with no replayed history has nothing to compare against the historical bars); the child trains from the current clock. **RL-effective only** — tabular always catches up. |
-| Mutation catch-up | `set_mutation_catch_up(false)` | `false` | Whether a mutation immigrant replays catch-up before training at the current clock. Default `false` = no handicap: fresh weights, trains from the current clock, competes from birth (~baseline first verdict, empty buffers = "no verdict yet"). `true` = the old catch-up behavior. **RL-effective only.** |
-| Pop catch-up | `set_run_pop_catch_up(false)` | `false` | Whether a population net rejoining the group step replays missed training. Default `false` — every net works on its own. With act-and-measure freeze this has no consumer today (dethroned elites never fall behind the clock); reserved for future rejoin paths. RESUME IS EXEMPT: resume always replays (weights are never persisted). **RL-effective only.** |
+| Crossover catch-up | `set_crossover_catch_up(true)` | `true` | Whether a crossover child replays the training stream (and passes the checkpoint gate on that replayed history) before insertion. `false` = no catch-up AND no gate (a net with no replayed history has nothing to compare against the historical bars); the child trains from the current clock. **RL-only** — these knobs live on the config's `RlConfig` arm (see below); the tabular arm has no such knob because tabular always catches up. |
+| Mutation catch-up | `set_mutation_catch_up(false)` | `false` | Whether a mutation immigrant replays catch-up before training at the current clock. Default `false` = no handicap: fresh weights, trains from the current clock, competes from birth (~baseline first verdict, empty buffers = "no verdict yet"). `true` = the old catch-up behavior. **RL-only.** |
+| Pop catch-up | `set_run_pop_catch_up(false)` | `false` | Whether a population net rejoining the group step replays missed training. Default `false` — every net works on its own. With act-and-measure freeze this has no consumer today (dethroned elites never fall behind the clock); reserved for future rejoin paths. RESUME IS EXEMPT: resume always replays (weights are never persisted). **RL-only.** |
+
+### Mode-specific config arms
+
+The config's mode-specific knobs live in a typed arm (`config.mode_specific`),
+the same split the `RunSpec` variants apply: the `RunSpec::tabular`/`rl`
+constructor stamps the matching arm (`ModeConfig::Tabular(TabularConfig)` or
+`ModeConfig::Rl(RlConfig)`), so a config can never disagree with its spec.
+The tabular arm is currently empty (stream geometry is trainer/spec-owned by
+design); the RL arm carries the three catch-up toggles. Calling an RL-only
+setter on a tabular-armed builder panics loudly. Tabular runs always catch up
+— the shared data stream is the point of the mode.
 | Dethrone optimizer reset | `set_dethrone_reset_optimizer_state(true)` | `true` | When a frozen elite loses its crown, reset its optimizer STATE (Adam momentum/velocity/step counters) while keeping the weights and hyperparameters. The state is stale — its notes describe the gradient landscape of the frozen era — so a reset gives the reclaim attempt a clean, well-scaled warm-up instead of mis-scaled first updates. `false` keeps momentum across the freeze. Replay-relevant (recorded in `engine.json`, validated on resume). |
 | Run name | `set_run_name(name)` | `None` (timestamp dir) | Human label; results land in `results/<run_name or timestamp>/`. |
 | Additional metrics | `set_run_metrics(metrics)` | `[]` | Informative (non-ranking) metrics; labels become extra columns in per-net metrics snapshots. |
