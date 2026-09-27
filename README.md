@@ -107,7 +107,7 @@ Three step-line extras worth decoding:
   survivor list.
 - **`frozen@N`** (final-elites listing) — the last step at which the net
   held/won a crown seat.
-- **`<hash> dethroned — resumes training…`** — a net that lost its freeze
+- **`<hash> dethroned (seat → …) — resumes training…`** — a net that lost its freeze
   crown goes back to normal stepping with a weight update. While frozen it
   ACTED and MEASURED every clock (fresh fitness recorded through a no-op
   optimizer — weights frozen, standing honest), so it never fell behind and
