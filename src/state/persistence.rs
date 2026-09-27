@@ -153,7 +153,7 @@ impl ConfigSnapshot {
                 .map(|p| (format!("{:?}", p.method).to_lowercase(), p.steps)),
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
-            fresh_immigrants: cfg.mutation_catch_up,
+            fresh_immigrants: cfg.mode_specific.mutation_catch_up(),
             dethrone_reset_optimizer_state: cfg.dethrone_reset_optimizer_state,
             build: crate::engine::core::build_stamp(),
         }
