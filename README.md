@@ -12,53 +12,42 @@
 
 ## Installation
 
-```toml
-[dependencies]
-gras = "1.0"
+```bash
+cargo add gras
 ```
 
-`gras` builds on the [`flodl`](https://crates.io/crates/flodl) tensor/autograd crate, which works out of the box on **CPU**. For **CUDA** (GPU) support, enable the feature and point flodl at a CUDA libtorch build:
+That's it. For **CUDA** (GPU) support, enable the feature and point flodl at a CUDA libtorch build:
 
-```toml
-[dependencies]
-gras = { version = "1.0", features = ["cuda"] }
+```bash
+cargo add gras --features cuda
 ```
 
 You'll need a CUDA-enabled libtorch on disk and `LIBTORCH_PATH` (plus CUDA env vars) set before building — `env_setup.sh` in this repo wires it up, or point the vars at your own libtorch install.
 
 ## Quick Start
 
-```rust
-use gras::engine::{Direction, Fitness, RaceConfig, RunSpec, TabularEngine};
-use gras::trainer::TabularTrainer;
-use gras::utils::{tabular_data, score};
+The examples folder IS the quick start — each one is a complete, runnable
+program with every knob a const or a builder line (no CLI): edit, `cargo run
+--release --example <name>`, done.
 
-fn main() -> flodl::tensor::Result<()> {
-    let data_dir = std::path::Path::new("data/mnist");
+| Example | Mode | What it shows |
+|---|---|---|
+| [`examples/cartpole.rs`](examples/cartpole.rs) | **RL** | The cleanest RL walkthrough: a pure-Rust CartPole env, a REINFORCE trainer (`RlStep`), reported fitness, and the post-race `engine.guardrail(..)` holdout. Start here. |
+| [`examples/mnist.rs`](examples/mnist.rs) | Tabular | Dataset + custom loss, the full config surface showcase, per-mode builder (`TabularRaceConfig`). |
+| [`examples/kaggle_kagiculture.rs`](examples/kaggle_kagiculture.rs) | RL | A multi-minute trainer (self-play matches), the decision-lag relay, log-level discipline. |
+| [`examples/custom_trainer.rs`](examples/custom_trainer.rs) | Tabular | Writing your own `TabularStep` from scratch (no `TabularTrainer` helper). |
+| [`examples/continuous.rs`](examples/continuous.rs) | Tabular | Regression targets (`Direction::Minimize`, MSE), synthetic data generation. |
 
-    let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
+The shape is always the same, whatever the mode: **your closures → a config →
+a `RunSpec` → `engine.run()`**. The spec variant you pick
+(`RunSpec::tabular` vs `RunSpec::rl`) IS the mode declaration — wrong
+flavor combinations are compile errors, not runtime surprises.
 
-    let trainer = TabularTrainer::new(|pred, y| {
-        score::label_smoothing_cross_entropy_loss(pred, y, 0.1)
-    })
-    .with_learning_rate(1e-3)
-    .with_grad_clip(1.0);
-
-    // Stop criteria: set exactly ONE of max_steps / max_target_fitness —
-    // both together panic at build() (only one stop criterion at a time).
-    let config = RaceConfig::builder()
-        .set_run_pop_size(10)
-        .set_stop_max_steps(100)
-        .build();
-
-    let spec = RunSpec::tabular(data_dir, config, fitness, trainer, Some(42), None::<&str>);
-
-    let mut engine = TabularEngine::from_spec(spec)?;
-
-    println!("Race stopped: {:?}", engine.run()?);
-    Ok(())
-}
-```
+The one conceptual split to internalize before reading: the engine owns the
+**when/who** of racing (population, culls, gates, freezes, artifacts — all in
+`RaceConfig`); you own the **what** of learning (loss, optimizer, environment,
+fitness definition — all in your trainer). Nothing training-related exists on
+`RaceConfig`.
 
 ## Evolution model
 
@@ -69,6 +58,13 @@ Two replacement channels, strictly separated:
 
 Stop criteria are exclusive: set `max_steps` **or** `max_target_fitness`, never both (it panics at build).
 
+A few knobs worth knowing from step one:
+
+- **Elite freeze (act-and-measure):** the top-`elite_count` nets keep their crowns but keep MEASURING — each clock a frozen elite plays its normal step with weights frozen (fresh fitness recorded through a no-op optimizer), so a declining champion is dethroned by rank, not by a bad luck streak. A dethroned elite resumes training with its last optimizer state — nothing was stale while it was frozen.
+- **Crossover gate:** a child must beat the population's recorded checkpoint means before it takes a slot — `Hard` (every bar) or `Soft` (their mean), optionally limited to the last `k` checkpoints via `set_crossover_gate_window(k)` so a long run's bars stay local to the current era.
+- **Mutation probation:** `set_mutation_probation_steps(k)` makes a fresh immigrant cull-immune for its first `k` clocks — time to draw its architecture-lottery ticket before the fitness roulette can claim it.
+- **Guardrail:** after the race, `gras::engine::guardrail::check_champion` reloads the champion's trained weights and scores it on fresh holdout games through your `ChampionScorer` — the honesty check that the race fitness wasn't batch luck.
+
 ## Run modes
 
 `RunSpec` has one variant per mode, each self-contained — and the trainer trait is split to match, so a wrong flavor combination is a **compile error**, not a runtime surprise:
@@ -78,8 +74,6 @@ Stop criteria are exclusive: set `max_steps` **or** `max_target_fitness`, never 
 - Both mode traits extend `StepTrainer` (`make_optimizer`, `describe`). The engine dispatches through an internal `ModeTrainer` enum — a tabular step always carries data, an RL step never does.
 
 Evolution (crossover, mutation, gates, culls) is identical in both modes.
-
-See `examples/cartpole.rs` (canonical RL: autodiff REINFORCE on a pure-Rust CartPole).
 
 ## Log levels
 
@@ -127,6 +121,7 @@ The engine's own names are accepted there too (`--log-level summ` / `minimal`
 
 - [STDIO_BRIDGE.md](STDIO_BRIDGE.md) — the stdin/stdout two-language bridge trick, with examples beyond kagiculture (including why Rust plays parent)
 - [OPTIONS.md](OPTIONS.md) — every engine option and its default
+- [AGENTS.md](AGENTS.md) — repo conventions (also useful to humans: example layout, trainer contract, engine lifecycle)
 - [TODO.md](TODO.md) — plan of record for open work
 
 ## License

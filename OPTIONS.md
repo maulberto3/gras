@@ -23,8 +23,9 @@ field — no aliases, no duplicate entry points.
 |---|---|---|
 | `pop_` | `size` | §1 |
 | `elite_` | `count`, `freeze`, `save_topology`, `save_safetensors` | §1, §6 |
-| `crossover_` | `gate`, `rolls`, `prob`, `retries`, `cull_policy`, `ops_pool` | §1, §2 |
+| `crossover_` | `gate`, `gate_window`, `rolls`, `prob`, `retries`, `cull_policy`, `ops_pool` | §1, §2 |
 | `mutate_` | `rolls`, `prob` | §1 |
+| `mutation_` | `probation_steps` (immigrant probation rename — note the `mutate_`/`mutation_` split: `mutate_*` = the roll, `mutation_*` = the immigrant channel's policy/probation) | §1 |
 | `checkpoint_` | `every` (the gate's replay cadence — not a crossover-only knob) | §2 |
 | `stop_` | `max_steps`, `target_fitness`, `custom` | §3 |
 | `pruner_` | `enabled`, `method`, `steps`, `pruner(PopPruner)` umbrella | §3 |
@@ -33,6 +34,12 @@ field — no aliases, no duplicate entry points.
 | `run_` | `mode`, `name`, `log_level`, `csv_export`, `metrics` | §6 |
 | `fitness_` | `smoothing_window` | §1, §6 |
 | *(singles)* | `run_pop_catch_up`, `crossover_catch_up`, `mutation_catch_up` — the catch-up toggle family | §6 |
+
+**Families on the roadmap (2026-09-27 TOP PRIORITY, see TODO.md):**
+`set_evolution_mode` (competitive/cooperative option family) and
+`set_challenge_*` (population-wide anti-plateau challenges: forced actions
+for RL, x-disruption for tabular). Names are reserved — do not take the
+prefixes for other knobs.
 
 **Umbrella setters** take the whole struct in one call (`set_pruner(PopPruner)`) —
 the field setters remain available for one-knob tweaks. The topology blueprint
@@ -209,7 +216,7 @@ Note: pruner solo steps **always train with the real optimizer** — elite freez
 |---|---|---|---|
 | Run mode | *(derived)* | — | NOT user-set. `RunMode` is derived from the `RunSpec` variant at engine construction (`RunSpec::tabular` ⇒ Tabular, `RunSpec::rl` ⇒ Rl) and recorded in `engine.json`. |
 | Smoothing window | `set_run_smoothing_window(k)` | `10` | Per-net rolling window (K) every ranking decision averages over. Load-bearing ranking semantics, so **resume-guarded** like `pop_size`. |
-| Elite freeze | `set_elite_freeze(true)` | `false` | **Anti-devolution A**: top-`elite_count` nets skip the trainer call — they score, rank, and parent crossovers, but their weights never change, so a bad training step can't erase the best skill found. Freeze follows rank, not identity: a child that trains past the frozen elite takes the crown. Motivated by on-policy RL self-collapse; dormant in tabular (guard only fires via ranking facts). Do **not** combine with the decision-lag relay (§8): a frozen net skips its `train_step`, which is where the shadow forks. |
+| Elite freeze | `set_elite_freeze(false)` | `true` | **Anti-devolution A**: top-`elite_count` nets skip the trainer call — they score, rank, and parent crossovers, but their weights never change, so a bad training step can't erase the best skill found. Freeze follows rank, not identity: a child that trains past the frozen elite takes the crown. Motivated by on-policy RL self-collapse; dormant in tabular (guard only fires via ranking facts). Do **not** combine with the decision-lag relay (§8): a frozen net skips its `train_step`, which is where the shadow forks. |
 | Regression tol | *removed 2026-09-25* | — | **Anti-devolution D retired.** The personal-floor guard (net's first smoothed fitness as its fixed floor; falling more than `(1 − tol) × |floor|` below it ⇒ demotion) is gone. Culling via the ordinary roulette is the single regression story (a collapsed fitness up-weights a net there naturally), and elite freeze is now **act-and-measure**: a frozen elite plays its normal step every clock (fresh fitness recorded, standing stays honest) but runs through a no-op optimizer — weights never change, and dethroning needs no catch-up (the net never fell behind the clock). |
 | Crossover catch-up | `set_crossover_catch_up(true)` | `true` | Whether a crossover child replays the training stream (and passes the checkpoint gate on that replayed history) before insertion. `false` = no catch-up AND no gate (a net with no replayed history has nothing to compare against the historical bars); the child trains from the current clock. **RL-only** — these knobs live on the config's `RlConfig` arm (see below); the tabular arm has no such knob because tabular always catches up. |
 | Mutation catch-up | `set_mutation_catch_up(false)` | `false` | Whether a mutation immigrant replays catch-up before training at the current clock. Default `false` = no handicap: fresh weights, trains from the current clock, competes from birth (~baseline first verdict, empty buffers = "no verdict yet"). `true` = the old catch-up behavior. **RL-only.** |
@@ -225,7 +232,7 @@ The tabular arm is currently empty (stream geometry is trainer/spec-owned by
 design); the RL arm carries the three catch-up toggles. Calling an RL-only
 setter on a tabular-armed builder panics loudly. Tabular runs always catch up
 — the shared data stream is the point of the mode.
-sets a crown seat to keep training. A dethroned elite resumes with its LAST optimizer state — it kept acting and measuring while frozen, so nothing is stale and no reset is needed.
+| Dethrone behavior | — (no knob; fixed behavior) | — | A dethroned elite resumes training with its LAST optimizer state — it kept acting and measuring while frozen, so nothing is stale and no reset is needed. (The old `set_dethrone_reset_optimizer_state` was deleted 2026-09-27.) |
 | Mutation probation | `set_mutation_probation_steps(k)` | `0` | Cull-immunity for a net's first `k` clocks (`clock − entered_at_step < k`). The lower-half analog of the elite guard: a fresh immigrant with 1–2 bad verdicts gets k steps to draw its arch-lottery ticket before the inverse-fitness roulette can claim it. Shields ALL cull channels (mutation roulette/fallbacks, crossover Worst and Random); a firing roll always finds a slot — if every non-elite net is on probation, the protection breaks for that pick. Probation is a STATUS, not a queue: the net still trains, measures, and ranks. Recorded in `engine.json`; state-free (uses the persisted `entered_at_step`). |
 | Founder topologies | `set_run_topologies(topos)` | `[]` | User-supplied founder blueprints (blueprint-ONLY — fresh weights + optimizer like every net) seeded into the population FIRST at step 0, in order; the random batch fills the remaining `pop_size` slots. Loaders: `population::run_topology_from_json_file` (topology JSON or a `nets/<hash>.json` state) and `population::run_topologies_from_run_dir` (a prior run's net states, ranked by final smoothed fitness, champion first). Count recorded as `run_topology_count` in `engine.json`. |
 | Checkpoint elite weights | `set_elite_checkpoint_weights(enabled)` | `true` | Every checkpoint, export top-`elite_count` weights as `checkpoint-elite-<hash>.safetensors` (overwritten — latest wins). Hard-kill durability: a `kill -9` loses at most one checkpoint interval of weights; the frontier states already carry topology + counters each checkpoint. The stop-time `elite-<hash>.safetensors` artifacts stay separate. |
