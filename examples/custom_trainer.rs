@@ -44,7 +44,7 @@ use gras::Variable;
 use gras::engine::fitness::{Direction, Fitness, Metric};
 use gras::engine::{TabularEngine, TabularRaceConfig};
 use gras::graph::network::Network;
-use gras::trainer::{StepReport, StepTrainer, TabularContext, TabularStep};
+use gras::trainer::{StepTrainer, TabularContext, TabularStep, TabularStepReport};
 use gras::utils::{score, tabular_data};
 
 // ── 1. The custom trainer ────────────────────────────────────────────────────
@@ -164,7 +164,7 @@ impl TabularStep for WarmupSgdTrainer {
         optimizer: &mut dyn Optimizer,
         step: usize,
         ctx: &TabularContext<'_>,
-    ) -> gras::flodl::tensor::Result<StepReport> {
+    ) -> gras::flodl::tensor::Result<TabularStepReport> {
         // ── determinism (required pattern) ──
         // Seed per (net, step) so dropout masks are reproducible across
         // catch-up replay and resume. Omit this and resume parity fails
@@ -200,12 +200,11 @@ impl TabularStep for WarmupSgdTrainer {
             (None, self.last_fitness, Vec::new())
         };
 
-        Ok(StepReport {
+        Ok(TabularStepReport {
             train_loss,
             eval_loss,
             fitness,
             informative,
-            rl: None, // tabular: no environment volume to report
         })
     }
 }
