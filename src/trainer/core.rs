@@ -10,7 +10,12 @@
 //!   `(pred, target)` loss, access to the shared batch stream, per-step eval.
 //! - [`RlStep`] — the environment-driven contract: **no loss method at all**
 //!   (the training signal lives inside `train_step`), no data in the context,
-//!   the fitness is whatever the trainer reports in `StepReport.fitness`.
+//!   the fitness is whatever the trainer reports in `RlStepReport.fitness`.
+//!
+//! Reports are mode-split too: [`TabularStep`] returns [`TabularStepReport`],
+//! [`RlStep`] returns [`RlStepReport`] — no always-`None` fields. Both
+//! normalize into the engine-internal [`StepReport`] union (the persisted
+//! `NetMetrics` stays one type: wire format, history.csv, replay parity).
 //!
 //! The split makes wrong flavor combinations a **compile error**: an RL
 //! scheme cannot return a `(pred, target)` loss, and a tabular scheme cannot
@@ -42,6 +47,69 @@ pub struct StepReport {
     /// (the log then prints `—` in the RL columns).
     #[serde(default)]
     pub rl: Option<RlStepMeta>,
+}
+
+/// The report a [`TabularStep`] trainer returns. Tabular-shaped: no RL
+/// volume field exists here (a dataset trainer has no environment to
+/// report) — that dishonesty of the old union struct is gone.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct TabularStepReport {
+    /// The training loss achieved on this step's train batch (logging only;
+    /// ranking reads `fitness`).
+    pub train_loss: f32,
+    /// Held-out loss on this step's shared eval batch. `None` = not measured.
+    pub eval_loss: Option<f32>,
+    /// The ranking fitness — computed by the run's fitness scorer on the
+    /// eval batch (a [`TabularStep`] reports the value, the run owns the fn).
+    pub fitness: f32,
+    /// Extra non-ranking/informative scores configured for the run, if any.
+    pub informative: Vec<f32>,
+}
+
+/// The report an [`RlStep`] trainer returns. RL-shaped: no `eval_loss` field
+/// exists here (there is no (pred, target) held-out batch in RL — evaluation
+/// happens inside `train_step` and its result IS `fitness`).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RlStepReport {
+    /// The training objective your update produced (REINFORCE loss, TD error,
+    /// …). Logging only — the engine never ranks on it.
+    pub train_loss: f32,
+    /// The ranking scalar derived from your environment. MANDATORY meaning:
+    /// this is the ONLY ranking input the engine gets from an RL trainer.
+    pub fitness: f32,
+    /// Extra non-ranking/informative scores configured for the run, if any.
+    pub informative: Vec<f32>,
+    /// Environment volume for this step — feeds the `matches`/`turns` rollup
+    /// columns. `None` = not reported (the log prints `—`).
+    pub rl: Option<RlStepMeta>,
+}
+
+// ── Report normalization: the mode reports collapse into the engine-internal
+// union the persisted `NetMetrics` consumes. This is the ONLY place the two
+// report types meet.
+
+impl From<TabularStepReport> for StepReport {
+    fn from(r: TabularStepReport) -> Self {
+        StepReport {
+            train_loss: r.train_loss,
+            eval_loss: r.eval_loss,
+            fitness: r.fitness,
+            informative: r.informative,
+            rl: None, // tabular: no environment, so no volume to report
+        }
+    }
+}
+
+impl From<RlStepReport> for StepReport {
+    fn from(r: RlStepReport) -> Self {
+        StepReport {
+            train_loss: r.train_loss,
+            eval_loss: None, // RL: no (pred, target) held-out loss exists
+            fitness: r.fitness,
+            informative: r.informative,
+            rl: r.rl,
+        }
+    }
 }
 
 /// How much environment this step actually played — the RL counterpart of
@@ -126,7 +194,7 @@ pub struct TabularContext<'a> {
 /// still exposed (for logging the reported score in the trainer's own style).
 pub struct RlContext<'a> {
     /// The ranking fitness metric (direction + label; the VALUE is the
-    /// trainer's to produce in `StepReport.fitness`).
+    /// trainer's to produce in `RlStepReport.fitness`).
     pub fitness: &'a crate::engine::fitness::Fitness,
     /// Informative non-ranking metrics configured for the run.
     pub metrics: &'a [crate::engine::fitness::Metric],
@@ -228,7 +296,7 @@ pub trait TabularStep: StepTrainer {
         optimizer: &mut dyn flodl::nn::optim::Optimizer,
         step: usize,
         ctx: &TabularContext<'_>,
-    ) -> flodl::tensor::Result<StepReport>;
+    ) -> flodl::tensor::Result<TabularStepReport>;
 }
 
 /// The environment-driven (RL) training contract.
@@ -242,7 +310,7 @@ pub trait TabularStep: StepTrainer {
 /// the training signal (rewards, trajectories, advantages) is the trainer's
 /// internal business, produced inside `train_step`. The engine's ONLY ranking
 /// input is the fitness value the trainer puts in
-/// [`StepReport::fitness`] each step — which is why RL runs are built with
+/// [`RlStepReport::fitness`] each step — which is why RL runs are built with
 /// [`crate::engine::fitness::Fitness::reported`].
 ///
 /// See `examples/cartpole.rs` for the canonical implementation.
@@ -255,7 +323,7 @@ pub trait RlStep: StepTrainer {
         optimizer: &mut dyn flodl::nn::optim::Optimizer,
         step: usize,
         ctx: &RlContext<'_>,
-    ) -> flodl::tensor::Result<StepReport>;
+    ) -> flodl::tensor::Result<RlStepReport>;
 
     /// Pop-wide phase: called ONCE per step with ALL live nets (mutable,
     /// read order = live order) BEFORE any per-net `train_step`. Default:
@@ -359,7 +427,7 @@ impl EngineTrainer for ModeAdapter<Box<dyn TabularStep>> {
             net_hash,
             net_seed,
         };
-        self.inner.train_step(net, optimizer, step, &ctx)
+        Ok(self.inner.train_step(net, optimizer, step, &ctx)?.into())
     }
     fn is_rl(&self) -> bool {
         false
@@ -401,7 +469,7 @@ impl EngineTrainer for ModeAdapter<Box<dyn RlStep>> {
             net_hash,
             net_seed,
         };
-        self.inner.train_step(net, optimizer, step, &ctx)
+        Ok(self.inner.train_step(net, optimizer, step, &ctx)?.into())
     }
     fn is_rl(&self) -> bool {
         true
@@ -437,7 +505,7 @@ impl TabularStep for Box<dyn TabularStep> {
         optimizer: &mut dyn flodl::nn::optim::Optimizer,
         step: usize,
         ctx: &TabularContext<'_>,
-    ) -> flodl::tensor::Result<StepReport> {
+    ) -> flodl::tensor::Result<TabularStepReport> {
         self.as_mut().train_step(net, optimizer, step, ctx)
     }
 }
@@ -449,7 +517,7 @@ impl RlStep for Box<dyn RlStep> {
         optimizer: &mut dyn flodl::nn::optim::Optimizer,
         step: usize,
         ctx: &RlContext<'_>,
-    ) -> flodl::tensor::Result<StepReport> {
+    ) -> flodl::tensor::Result<RlStepReport> {
         self.as_mut().train_step(net, optimizer, step, ctx)
     }
     fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize) {

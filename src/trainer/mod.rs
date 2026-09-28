@@ -12,8 +12,9 @@ pub use decision_lag::DecisionLagTrainer;
 pub use flodl::Variable;
 pub use supervised::TabularTrainer;
 pub use core::{
-    EngineTrainer, IntoBoxedTrainer, ModeAdapter, RlContext, RlStep, RlStepMeta, RunData, StepEnv,
-    StepReport, StepTrainer, StreamShape, TabularContext, TabularStep,
+    EngineTrainer, IntoBoxedTrainer, ModeAdapter, RlContext, RlStep, RlStepMeta, RlStepReport,
+    RunData, StepEnv, StepReport, StepTrainer, StreamShape, TabularContext, TabularStepReport,
+    TabularStep,
 };
 
 /// The loss-function signature, aliased for readability in the trait and

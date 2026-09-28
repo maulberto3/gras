@@ -182,7 +182,7 @@ impl TabularStep for TabularTrainer {
         optimizer: &mut dyn Optimizer,
         step: usize,
         ctx: &TabularContext<'_>,
-    ) -> Result<crate::trainer::StepReport> {
+    ) -> Result<crate::trainer::TabularStepReport> {
         // The tabular recipe uses every engine-provided handle: shared
         // stream for the step's batches, loss + fitness + metrics for
         // scoring. A scheme that doesn't fit that mold implements
@@ -218,12 +218,11 @@ impl TabularStep for TabularTrainer {
         let eval_batch: (Tensor, Tensor) = ctx.data.eval_batch(step as u64)?;
         let report = eval_one_step(net, loss_fn, fitness, ctx.metrics, &eval_batch)?;
 
-        Ok(crate::trainer::StepReport {
+        Ok(crate::trainer::TabularStepReport {
             train_loss,
             eval_loss: report.eval_loss,
             fitness: report.fitness,
             informative: report.metrics,
-            rl: None, // tabular: no environment, so no matches/turns to report
         })
     }
 }

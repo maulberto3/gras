@@ -1264,6 +1264,7 @@ mod tests {
         );
     }
 
+
     // ── Iter-6 Tier B/C: resume replay + parity ──────────────────────
 
     #[test]

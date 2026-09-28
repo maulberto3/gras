@@ -43,7 +43,7 @@
 //! which is the only weights that ever decide or rank.
 
 use crate::graph::network::Network;
-use crate::trainer::core::{RlContext, RlStep, StepEnv, StepReport, StepTrainer};
+use crate::trainer::core::{RlContext, RlStep, RlStepReport, StepEnv, StepTrainer};
 
 /// The decision-lag relay around any [`RlStep`] trainer. See the module docs.
 ///
@@ -191,7 +191,7 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
         optimizer: &mut dyn flodl::nn::optim::Optimizer,
         step: usize,
         ctx: &RlContext<'_>,
-    ) -> flodl::tensor::Result<StepReport> {
+    ) -> flodl::tensor::Result<RlStepReport> {
         // ── 0. Relay off (the conservative default: lag 0) ─────────────
         // A plain pass-through: the net trains directly every step — no
         // face-hold, no shadow, no promotions. Grace is inert here.
@@ -397,7 +397,7 @@ mod tests {
             optimizer: &mut dyn flodl::nn::optim::Optimizer,
             _step: usize,
             _ctx: &RlContext<'_>,
-        ) -> flodl::tensor::Result<StepReport> {
+        ) -> flodl::tensor::Result<RlStepReport> {
             use flodl::nn::Module;
             // Differentiable scalar: mean of the net's output. Trainable.
             let x = flodl::Variable::new(
@@ -411,9 +411,8 @@ mod tests {
             loss.backward()?;
             optimizer.step()?;
             let fit = out.mean()?.item().unwrap_or(0.0) as f32;
-            Ok(StepReport {
+            Ok(RlStepReport {
                 train_loss: 0.0,
-                eval_loss: None,
                 fitness: fit,
                 informative: vec![],
                 rl: None,

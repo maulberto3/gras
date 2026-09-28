@@ -1,6 +1,8 @@
 //! Post-race guardrail — the honest holdout re-check of the exported
-//! champion, as a library module (NOT an engine method: the engine's public
-//! surface keeps exactly one user contract, `EngineTrainer`).
+//! champion. Users call it through the ENGINE method
+//! [`crate::CoreEngine::guardrail`] (which fills in run_dir/champion/race
+//! smoothed automatically) or via [`check_champion`] directly for saved-run
+//! scoring (`--score-only` style, no engine).
 //!
 //! Ownership split:
 //! - **Module** (here): which net is the champion (`champion_hashes`),
@@ -116,6 +118,20 @@ pub fn reload_champion(
         return None;
     }
     Some(net)
+}
+
+/// Score a SAVED champion without an engine (the `--score-only` path):
+/// reload from `run_dir`, play `matches` fresh games, aggregate. Same
+/// semantics as [`check_champion`] but you name the hash yourself and there
+/// is no race-smoothed value to compare against.
+pub fn score_saved(
+    run_dir: &std::path::Path,
+    champion_hash: &str,
+    scorer: &mut dyn ChampionScorer,
+    matches: usize,
+    device: flodl::Device,
+) -> Option<GuardrailVerdict> {
+    check_champion(run_dir, champion_hash, None, scorer, matches, device)
 }
 
 /// Run the guardrail: reload the champion's TRAINED weights, play `matches`

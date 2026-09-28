@@ -1631,7 +1631,10 @@ impl CoreEngine {
             // ± std over the smoothing window, same framing as the holdout
             // guardrail: the mean alone hides the mix of raw values behind it
             // (two elites at 500 can be 500-always vs 500-by-luck). A wide ±
-            // means the smoothed value rests on noisy raw steps.
+            // means the smoothed value rests on noisy raw steps — and at race
+            // end, that the ORDERING of this list itself is luck-sensitive.
+            // When std > mean/2, say so instead of trusting the reader to
+            // compare the two numbers.
             let std_note = match self.rolling_fitness.get(h) {
                 Some(buf) if buf.len() > 1 => {
                     let m = *fit;
@@ -1643,7 +1646,12 @@ impl CoreEngine {
                         })
                         .sum::<f32>()
                         / buf.len() as f32;
-                    format!(" ± {:.4}", var.sqrt())
+                    let std = var.sqrt();
+                    let wide = std > m.abs() / 2.0;
+                    format!(
+                        " ± {std:.4}{}",
+                        if wide { " (noisy — rank not decisive)" } else { "" }
+                    )
                 }
                 _ => String::new(),
             };
@@ -1651,6 +1659,8 @@ impl CoreEngine {
                 // Trained-vs-acted split: with act-and-measure freeze a net's
                 // step count mixes real training updates with frozen passes,
                 // so the raw number hides how much it actually learned.
+                // trained + acted(frozen) always sums to the net's recorded
+                // step clock (= `last_step`/`frozen@N` on this line).
                 let frozen = s.frozen_spans.iter().map(|(a, b)| b - a + 1).sum::<usize>();
                 let acted = frozen.min(s.step);
                 let trained = s.step - acted;
@@ -1666,13 +1676,19 @@ impl CoreEngine {
                     acted,
                 )
             });
+            // eval_loss: `—` when the mode doesn't produce one (RL trainers
+            // report fitness only). `None` is Rust-speak; a dash reads as
+            // "not applicable", which is the truth.
+            let eval_label = eval_loss
+                .map(|v| format!("{v:.6}"))
+                .unwrap_or_else(|| "—".to_string());
             info!(
-                "  #{} {} fitness{arrow} {:.4}{} │ eval_loss {:?} │ {} │ {}",
+                "  #{} {} fitness{arrow} {:.4}{} │ eval_loss {} │ {} │ {}",
                 rank + 1,
                 &h[..8.min(h.len())],
                 fit,
                 std_note,
-                eval_loss,
+                eval_label,
                 step_label,
                 meta.unwrap_or_default(),
             );
@@ -2437,6 +2453,34 @@ impl CoreEngine {
     /// last raw step's fitness.
     pub fn smoothed_fitness_of(&self, hash: &str) -> Option<f32> {
         self.rolling_fitness.get(hash).map(rolling_mean)
+    }
+
+    /// The post-race holdout guardrail: reload the champion's TRAINED
+    /// weights from this run's exports and play `matches` fresh unseen games
+    /// through the user's `ChampionScorer` (play one game, same units as the
+    /// reported fitness). The engine fills in everything run-specific — run
+    /// dir, champion hash, the race's smoothed fitness for the verdict — so
+    /// the user call is just `engine.guardrail(&mut scorer, matches, device)`.
+    ///
+    /// `None` = the champion could not be reloaded (missing/unloadable
+    /// weights — the verdict would be about a stranger) or every game
+    /// failed; both log a warning.
+    pub fn guardrail(
+        &self,
+        scorer: &mut dyn crate::engine::guardrail::ChampionScorer,
+        matches: usize,
+        device: flodl::Device,
+    ) -> Option<crate::engine::guardrail::GuardrailVerdict> {
+        let champion = self.champions.first()?;
+        let race_smoothed = self.smoothed_fitness_of(champion);
+        crate::engine::guardrail::check_champion(
+            &self.run_dir,
+            champion,
+            race_smoothed,
+            scorer,
+            matches,
+            device,
+        )
     }
 
     /// The best smoothed fitness in the live population (under the fitness
@@ -4595,10 +4639,9 @@ mod tests {
             _optimizer: &mut dyn Optimizer,
             _step: usize,
             _ctx: &crate::trainer::RlContext<'_>,
-        ) -> flodl::tensor::Result<crate::trainer::StepReport> {
-            Ok(crate::trainer::StepReport {
+        ) -> flodl::tensor::Result<crate::trainer::RlStepReport> {
+            Ok(crate::trainer::RlStepReport {
                 train_loss: 0.0,
-                eval_loss: None,
                 fitness: 1.0,
                 informative: Vec::new(),
                 rl: None,
@@ -4623,11 +4666,10 @@ mod tests {
             _optimizer: &mut dyn Optimizer,
             step: usize,
             ctx: &crate::trainer::RlContext<'_>,
-        ) -> flodl::tensor::Result<crate::trainer::StepReport> {
+        ) -> flodl::tensor::Result<crate::trainer::RlStepReport> {
             let fitness = (ctx.net_seed % 97) as f32 + step as f32;
-            Ok(crate::trainer::StepReport {
+            Ok(crate::trainer::RlStepReport {
                 train_loss: step as f32 * 0.5,
-                eval_loss: None,
                 fitness,
                 informative: Vec::new(),
                 rl: Some(crate::trainer::RlStepMeta {
@@ -4858,8 +4900,16 @@ mod tests {
         let mut b = seed_two_parents(&dir_b, 123);
         a.config.crossover_prob = 1.0;
         b.config.crossover_prob = 1.0;
-        let ca = a.generate_child(3, 0).unwrap().unwrap();
-        let cb = b.generate_child(3, 0).unwrap().unwrap();
+        // Determinism ⇒ the SAME outcome, including `None` (all pairing
+        // attempts incompatible). The self-pairing redraw shares the rng, so
+        // it must fire identically in both engines.
+        let ca = a.generate_child(3, 0).unwrap();
+        let cb = b.generate_child(3, 0).unwrap();
+        let (ca, cb) = match (ca, cb) {
+            (Some(ca), Some(cb)) => (ca, cb),
+            (None, None) => return,
+            _ => panic!("deterministic engines must agree on Some/None"),
+        };
         assert_eq!(
             ca.state.hash, cb.state.hash,
             "same seed + clock ⇒ same child topology"
@@ -4975,7 +5025,45 @@ mod tests {
         );
     }
 
-    // ── Iter-6 Tier B/C: resume replay + parity ──────────────────────
+    #[test]
+    fn crossover_never_self_pairs_the_same_net() {
+        // The two roulette draws are independent, so without the redraw guard
+        // the same net could be both parents (a no-op self-cross that burns
+        // the roll on a clone). Sweep several (seed, clock) pairs — with one
+        // net dominating the roulette wheel the naive draw self-pairs often —
+        // and assert no surviving lineage reads `parents=X,X`.
+        for seed in [3u64, 17, 55, 123, 9001] {
+            let dir = std::env::temp_dir().join(format!("race_self_pair_{seed}"));
+            let mut eng = engine(&dir, seed).unwrap();
+            eng.seed_population_internal(
+                vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+                Some(0.5),
+            )
+            .unwrap();
+            eng.config.crossover_prob = 1.0;
+            // Fixture is Minimize: make net 0 the overwhelming favorite.
+            let hs = eng.state.live_hashes();
+            for (i, h) in hs.iter().enumerate() {
+                let v = 0.01 + i as f32 * 10.0;
+                eng.rolling_fitness.get_mut(h).unwrap().push(v);
+            }
+            for clock in 0..12 {
+                if let Some(Some(child)) = eng.generate_child(clock, 0).unwrap().into() {
+                    let lineage = child.state.created_from.clone().unwrap_or_default();
+                    let parents = lineage
+                        .split_once("parents=")
+                        .map(|(_, p)| p)
+                        .unwrap_or_default();
+                    let pair: Vec<&str> = parents.split(',').collect();
+                    assert!(
+                        !(pair.len() == 2 && pair[0] == pair[1]),
+                        "seed {seed} clock {clock}: self-paired crossover ({lineage})"
+                    );
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 
     #[test]
     fn resume_restores_run_counters() {

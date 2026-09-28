@@ -156,7 +156,15 @@ impl CoreEngine {
         for _ in 0..MAX_PARENT_PAIRINGS {
             // 2. Roulette-select parents — INSIDE the attempt loop: a failed
             //    pairing gets fresh parents, per the design contract.
-            let parent_positions: Vec<usize> = (0..n_parents)
+            //
+            //    Self-pairing guard: each parent is an INDEPENDENT roulette
+            //    draw, so the same net can come up twice. Crossing a net with
+            //    itself is a no-op (identical topologies swap nothing) — the
+            //    roll would burn on a clone. If B duplicated A, redraw B
+            //    uniformly from the OTHER positions (roulette weighting is
+            //    only lost in this rare case; a redraw loop cannot beat a
+            //    dominant wheel). pop==1 keeps the self-pair: an honest clone.
+            let mut parent_positions: Vec<usize> = (0..n_parents)
                 .filter_map(|_| {
                     crate::evolution::selection::SelectionMethod::Roulette
                         .apply(&scores, direction, rng, 0)
@@ -164,6 +172,13 @@ impl CoreEngine {
                         .next()
                 })
                 .collect();
+            if n_parents == 2 && parent_positions.len() == 2 && parent_positions[0] == parent_positions[1] {
+                let others: Vec<usize> =
+                    (0..scores.len()).filter(|&p| p != parent_positions[0]).collect();
+                if !others.is_empty() {
+                    parent_positions[1] = others[rng.usize(..others.len())];
+                }
+            }
             let attempt_parents: Vec<String> = parent_positions
                 .iter()
                 .map(|&p| ranked[p].0.clone())
