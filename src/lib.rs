@@ -34,10 +34,10 @@ pub use utils::tabular_data;
 
 // ── engine — the step-race loop ──────────────────────────────────────
 pub use engine::{
-    check_champion, rl_race_config_builder, tabular_race_config_builder, ChampionScorer,
-    Direction, Fitness, FitnessLabel, GuardrailVerdict, RLSpec, RaceConfig,
+    ChampionScorer, Direction, Fitness, FitnessLabel, GuardrailVerdict, RLSpec, RaceConfig,
     RaceSnapshot, RlConfig, RlEngine, RlRaceConfig, RunMode, RunSpec, StopReason, TabularConfig,
-    TabularEngine, TabularRaceConfig, TabularSpec,
+    TabularEngine, TabularRaceConfig, TabularSpec, check_champion, rl_race_config_builder,
+    tabular_race_config_builder,
 };
 
 // ── graph — blueprints + executable networks ─────────────────────────
@@ -85,6 +85,54 @@ pub use flodl::{DType, Device, Variable};
 // The whole crate, so advanced users can reach the full flodl API
 // (nn::Module, tensor::Result, ...) as `gras::flodl::...`.
 pub use flodl;
+
+// ── prelude — one import for the common surface ──────────────────────
+
+/// One import for the common surface: `use gras::prelude::*;`.
+///
+/// Covers the engine entry points, the fitness/direction types, the trainer
+/// contracts and their reports, the shared batch stream, the graph types, the
+/// config enums an example actually touches, and the tensor/device
+/// re-exports. Everything else stays reachable through its module path —
+/// `gras::engine::config::*` for the full knob surface, `gras::utils::*` for
+/// data/score/step helpers — so a glob import here stays legible.
+///
+/// Deliberately NOT re-exported: `flodl::tensor::Result` (glob-importing
+/// `Result` would collide with `std::result::Result`), the `Metric`-adjacent
+/// low-level scoring helpers, and the `DataFormat`/loader family.
+pub mod prelude {
+    // Engine config + entry points.
+    pub use crate::engine::config::{
+        CrossCullPolicy, CrossoverGate, LogLevel, MutationCullPolicy, PopPruner, PopPrunerMethod,
+        RaceConfig, RaceConfigBuilder, RaceSnapshot, RlConfig, RlRaceConfig, RunMode, StopReason,
+        TabularConfig, TabularRaceConfig, rl_race_config_builder, tabular_race_config_builder,
+    };
+    pub use crate::engine::fitness::Metric;
+    pub use crate::engine::guardrail::{ChampionScorer, GuardrailVerdict, check_champion};
+    pub use crate::engine::{
+        Direction, Fitness, FitnessLabel, RLSpec, RlEngine, RunSpec, TabularEngine, TabularSpec,
+    };
+
+    // Trainer contracts + report types.
+    pub use crate::trainer::{
+        BoxedLossFn, EngineTrainer, IntoBoxedTrainer, LossFn, ModeAdapter, RlContext, RlStep,
+        RlStepMeta, RlStepReport, RunData, StepEnv, StepReport, StepTrainer, StreamShape,
+        TabularContext, TabularStep, TabularStepReport,
+    };
+
+    // Shared deterministic batching.
+    pub use crate::trainer::stream::{BatchStream, PoolSplit};
+
+    // Graph blueprints + executable networks.
+    pub use crate::graph::network::{Network, NetworkOptions};
+    pub use crate::graph::node::{Activation, CombineOp, Node, NodeKind, StandardizeOp};
+    pub use crate::graph::topology::{Topology, TopologyOptions};
+
+    // Tensors, devices, and the trainer-facing flodl traits.
+    pub use crate::flodl::nn::Module;
+    pub use crate::flodl::nn::optim::Optimizer;
+    pub use crate::flodl::{DType, Device, Tensor, Variable};
+}
 
 // ── helpers ──────────────────────────────────────────────────────────
 pub fn auto_device() -> flodl::Device {
