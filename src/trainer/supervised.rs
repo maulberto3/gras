@@ -55,10 +55,7 @@ pub struct TabularTrainer {
 }
 
 /// The installed holdout scorer (see [`TabularTrainer::with_holdout_scorer`]).
-type HoldoutScorer = (
-    Box<dyn Fn(&mut Network, usize) -> Result<f32> + Send>,
-    usize,
-);
+type HoldoutScorer = Box<dyn Fn(&mut Network, usize) -> Result<f32> + Send>;
 
 impl TabularTrainer {
     /// A tabular scheme is defined by its loss — constructor takes it.
@@ -129,12 +126,15 @@ impl TabularTrainer {
     /// and scores the net in the SAME units as the run's fitness. The
     /// engine's `guardrail()` then needs no second object. `game_i` is the
     /// deterministic game index — seed your draw from it.
+    ///
+    /// How many games get played is the RUN's business, not this
+    /// constructor's: `set_guardrail_matches` (default 16) or an explicit
+    /// count on the `guardrail` call.
     pub fn with_holdout_scorer(
         mut self,
         scorer: impl Fn(&mut Network, usize) -> Result<f32> + Send + 'static,
-        matches: usize,
     ) -> Self {
-        self.holdout = Some((Box::new(scorer), matches));
+        self.holdout = Some(Box::new(scorer));
         self
     }
 }
@@ -187,13 +187,9 @@ impl StepTrainer for TabularTrainer {
     /// trait's contract panic.
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> Result<f32> {
         match &self.holdout {
-            Some((scorer, _)) => scorer(net, game_i),
+            Some(scorer) => scorer(net, game_i),
             None => crate::trainer::StepTrainer::holdout_score(self, net, game_i),
         }
-    }
-
-    fn holdout_matches(&self) -> Option<usize> {
-        self.holdout.as_ref().map(|(_, n)| *n)
     }
 }
 

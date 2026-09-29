@@ -28,7 +28,10 @@ use crate::utils::tabular_data::Dataset;
 
 /// The evaluation/metrics report returned by a trainer's `train_step` at the
 /// end of each clock-step.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// `Default` is derived so a mostly-zero report stays short to spell:
+/// `StepReport { fitness, ..Default::default() }`.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct StepReport {
     /// The training loss achieved on the train batch (for logging).
     pub train_loss: f32,
@@ -61,7 +64,9 @@ pub struct StepReport {
 /// The report a [`TabularStep`] trainer returns. Tabular-shaped: no RL
 /// volume field exists here (a dataset trainer has no environment to
 /// report) — that dishonesty of the old union struct is gone.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// `Default` is derived for `..Default::default()` convenience.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct TabularStepReport {
     /// The training loss achieved on this step's train batch (logging only;
     /// ranking reads `fitness`).
@@ -85,7 +90,9 @@ pub struct TabularStepReport {
 /// The report an [`RlStep`] trainer returns. RL-shaped: no `eval_loss` field
 /// exists here (there is no (pred, target) held-out batch in RL — evaluation
 /// happens inside `train_step` and its result IS `fitness`).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+///
+/// `Default` is derived for `..Default::default()` convenience.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct RlStepReport {
     /// The training objective your update produced (REINFORCE loss, TD error,
     /// …). Logging only — the engine never ranks on it.
@@ -351,10 +358,15 @@ pub trait StepTrainer: Send {
 
     /// The guardrail's measurement half: score ONE fresh holdout game with
     /// the given (champion-reloaded) net, in the SAME units and estimator
-    /// as the fitness reported in the step report. Implement this (plus
-    /// `holdout_matches` when the default doesn't fit) to make the trainer
-    /// guardrail-capable — the engine's `guardrail()` then needs no second
-    /// scorer object: `engine.guardrail()` is the whole call.
+    /// as the fitness reported in the step report. Implement it to make the
+    /// trainer guardrail-capable — the engine's `guardrail()` then needs no
+    /// second scorer object: `engine.guardrail()` is the whole call.
+    ///
+    /// How MANY games are played is the run's business, not the trainer's:
+    /// the config's `set_guardrail_matches` (default 16), or an explicit
+    /// count on the `guardrail` call. The contract is index-based (`game_i`),
+    /// so any count works — seed the draw from `game_i` and the games stay
+    /// independent.
     ///
     /// Default: unimplemented (calling `guardrail()` without a scorer
     /// panics with this contract text — loud, not silent).
@@ -363,13 +375,6 @@ pub trait StepTrainer: Send {
             "holdout_score is not implemented for this trainer — implement it (one fresh \
              game, same units as the reported fitness) to use engine.guardrail()"
         )
-    }
-
-    /// How many holdout games `guardrail()` plays. Default `None` = the
-    /// engine falls back to 16. Override when your measurement batch has a
-    /// natural size (e.g. the example's HOLDOUT_MATCHES const).
-    fn holdout_matches(&self) -> Option<usize> {
-        None
     }
 }
 
@@ -492,12 +497,6 @@ pub trait EngineTrainer: Send {
              game, same units as the reported fitness) to use engine.guardrail()"
         )
     }
-    /// Guardrail dispatch — forwards to the inner trainer's
-    /// `StepTrainer::holdout_matches` (see the adapters). None here (no
-    /// stream) → the engine falls back to 16.
-    fn holdout_matches(&self) -> Option<usize> {
-        None
-    }
     /// Mode tag (drives the engine's log columns and RL-only phases).
     fn is_rl(&self) -> bool;
     /// The tabular loss, when this is a tabular trainer (checkpoint exam).
@@ -574,9 +573,6 @@ impl EngineTrainer for ModeAdapter<Box<dyn TabularStep>> {
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
         self.inner.holdout_score(net, game_i)
     }
-    fn holdout_matches(&self) -> Option<usize> {
-        self.inner.holdout_matches()
-    }
     fn is_rl(&self) -> bool {
         false
     }
@@ -625,9 +621,6 @@ impl EngineTrainer for ModeAdapter<Box<dyn RlStep>> {
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
         self.inner.holdout_score(net, game_i)
     }
-    fn holdout_matches(&self) -> Option<usize> {
-        self.inner.holdout_matches()
-    }
     fn is_rl(&self) -> bool {
         true
     }
@@ -642,15 +635,12 @@ impl StepTrainer for Box<dyn StepTrainer> {
     fn describe(&self) -> Option<serde_json::Value> {
         self.as_ref().describe()
     }
-    /// Guardrail: forward through the box. Omitting these is a silent trap —
+    /// Guardrail: forward through the box. Omitting this is a silent trap —
     /// `self.inner.holdout_score(..)` on a `Box<dyn _>` resolves to the BOX's
     /// impl (found before the autoderef to `dyn _`), whose default is
-    /// `unimplemented!()`. Every boxed impl below must forward both halves.
+    /// `unimplemented!()`. Every boxed impl below must forward it.
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
         self.as_mut().holdout_score(net, game_i)
-    }
-    fn holdout_matches(&self) -> Option<usize> {
-        self.as_ref().holdout_matches()
     }
 }
 
@@ -703,9 +693,6 @@ impl StepTrainer for Box<dyn TabularStep> {
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
         self.as_mut().holdout_score(net, game_i)
     }
-    fn holdout_matches(&self) -> Option<usize> {
-        self.as_ref().holdout_matches()
-    }
 }
 
 impl StepTrainer for Box<dyn RlStep> {
@@ -721,9 +708,6 @@ impl StepTrainer for Box<dyn RlStep> {
     /// absent override here means the trait default `unimplemented!()` runs.
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
         self.as_mut().holdout_score(net, game_i)
-    }
-    fn holdout_matches(&self) -> Option<usize> {
-        self.as_ref().holdout_matches()
     }
 }
 
@@ -761,9 +745,6 @@ mod tests {
             game_i: usize,
         ) -> flodl::tensor::Result<f32> {
             Ok(100.0 + game_i as f32)
-        }
-        fn holdout_matches(&self) -> Option<usize> {
-            Some(3)
         }
     }
 
@@ -836,7 +817,6 @@ mod tests {
             101.0,
             "the boxed trainer's override must run, not the trait default"
         );
-        assert_eq!(EngineTrainer::holdout_matches(&adapter), Some(3));
     }
 
     /// The tabular half of the same bug: `ModeAdapter<Box<dyn TabularStep>>`
@@ -850,10 +830,9 @@ mod tests {
                 unimplemented!("the guardrail dispatch test never trains")
             },
         )
-        .with_holdout_scorer(
-            |_net, game_i| -> flodl::tensor::Result<f32> { Ok(7.0 + game_i as f32) },
-            5,
-        );
+        .with_holdout_scorer(|_net, game_i| -> flodl::tensor::Result<f32> {
+            Ok(7.0 + game_i as f32)
+        });
         let mut adapter = ModeAdapter::tabular(Box::new(trainer));
         let mut net = tiny_net();
         assert_eq!(
@@ -861,6 +840,5 @@ mod tests {
             9.0,
             "the installed scorer must run through the tabular adapter"
         );
-        assert_eq!(EngineTrainer::holdout_matches(&adapter), Some(5));
     }
 }
