@@ -433,7 +433,7 @@ pub fn load_csv_dataset(dir: &Path) -> Result<Dataset> {
             Err(e) => {
                 if n_samples == 0 && !skipped_header {
                     skipped_header = true;
-                    log::debug!("inputs.csv: skipping header row: {line}");
+                    tracing::debug!("inputs.csv: skipping header row: {line}");
                     continue;
                 }
                 return Err(DataError::Csv(format!("inputs.csv parse error: {e}")).into());
@@ -475,7 +475,7 @@ pub fn load_csv_dataset(dir: &Path) -> Result<Dataset> {
             Err(e) => {
                 if n_targets == 0 && !skipped_header {
                     skipped_header = true;
-                    log::debug!("targets.csv: skipping header row: {line}");
+                    tracing::debug!("targets.csv: skipping header row: {line}");
                     continue;
                 }
                 return Err(DataError::Csv(format!("targets.csv parse error: {e}")).into());
@@ -652,7 +652,7 @@ pub fn split_indices(
     if eval.is_empty() {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
-            log::warn!(
+            tracing::warn!(
                 "eval set is empty (train_ratio={train_ratio}) — falling back to using ALL data for eval (train/eval overlap)"
             );
         });
