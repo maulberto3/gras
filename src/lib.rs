@@ -35,9 +35,9 @@ pub use utils::tabular_data;
 // ── engine — the step-race loop ──────────────────────────────────────
 pub use engine::{
     check_champion, rl_race_config_builder, tabular_race_config_builder, ChampionScorer,
-    Direction, Fitness, FitnessLabel, GuardrailVerdict, RLSpec, RaceConfig, RaceSnapshot,
-    RlConfig, RlEngine, RlRaceConfig, RunMode, RunSpec, StopReason, TabularConfig, TabularEngine,
-    TabularRaceConfig, TabularSpec,
+    Direction, Fitness, FitnessLabel, GuardrailVerdict, RLSpec, RaceConfig,
+    RaceSnapshot, RlConfig, RlEngine, RlRaceConfig, RunMode, RunSpec, StopReason, TabularConfig,
+    TabularEngine, TabularRaceConfig, TabularSpec,
 };
 
 // ── graph — blueprints + executable networks ─────────────────────────
@@ -52,7 +52,9 @@ pub use evolution::selection::SelectionMethod;
 
 // ── trainer — shared deterministic batching ──────────────────────────
 pub use trainer::stream::{BatchStream, PoolSplit};
-pub use trainer::supervised::TabularTrainer;
+// NOTE: no concrete tabular scheme is re-exported — the library ships the
+// contract only. Bring your own (or copy the reference recipes under
+// `examples/`: `mnist.rs` hand-rolled, `ref_trainer/` shared).
 pub use trainer::{
     IntoBoxedTrainer, LossFn, ModeAdapter, RlContext, RlStep, RlStepMeta, RunData, StepEnv,
     StepReport, StepTrainer, StreamShape, TabularContext, TabularStep,
