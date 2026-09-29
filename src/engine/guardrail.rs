@@ -33,6 +33,15 @@ pub trait ChampionScorer: Send {
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32>;
 }
 
+/// The engine's own trainer is a scorer: implementing
+/// `StepTrainer::holdout_score` on the trainer type IS the guardrail
+/// capability, so `engine.guardrail(device, None)` needs no second object.
+impl ChampionScorer for dyn crate::trainer::EngineTrainer {
+    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
+        crate::trainer::EngineTrainer::holdout_score(self, net, game_i)
+    }
+}
+
 /// The guardrail's verdict: per-game scores plus the two readings users
 /// compare. `scores` is empty only when scoring failed entirely (see
 /// [`check_champion`] — it returns `None` then, so a `Some` verdict always
@@ -108,13 +117,13 @@ pub fn reload_champion(
         run_dir.join(format!("checkpoint-elite-{short}.safetensors"))
     };
     if !weights.exists() {
-        log::warn!(
+        tracing::warn!(
             "guardrail: no trained weights for {short} (looked for elite-*.safetensors and checkpoint-elite-*.safetensors) — refusing to score a fresh-init net"
         );
         return None;
     }
     if let Err(e) = crate::utils::safetensors::load_safetensors(&mut net, &weights) {
-        log::warn!("guardrail: loading {} failed ({e}) — refusing to score a partially-loaded net", weights.display());
+        tracing::warn!("guardrail: loading {} failed ({e}) — refusing to score a partially-loaded net", weights.display());
         return None;
     }
     Some(net)
@@ -132,6 +141,40 @@ pub fn score_saved(
     device: flodl::Device,
 ) -> Option<GuardrailVerdict> {
     check_champion(run_dir, champion_hash, None, scorer, matches, device)
+}
+
+/// The engine's seam: reload + play + aggregate, where the scorer IS the
+/// run's own trainer (reached through the [`EngineTrainer`] dispatch). This
+/// is what `engine.guardrail(device, None)` calls — no second scorer object.
+/// Also available to embedders that hold a trainer in their own container.
+pub fn score_with<T, F>(
+    run_dir: &std::path::Path,
+    champion_hash: &str,
+    race_smoothed: Option<f32>,
+    matches: usize,
+    device: flodl::Device,
+    trainer: &mut T,
+    score: F,
+) -> Option<GuardrailVerdict>
+where
+    F: Fn(&mut T, &mut Network, usize) -> flodl::tensor::Result<f32>,
+{
+    let mut net = reload_champion(run_dir, champion_hash, device)?;
+    let mut scores = Vec::with_capacity(matches);
+    for game_i in 0..matches {
+        match score(trainer, &mut net, game_i) {
+            Ok(s) => scores.push(s),
+            Err(e) => tracing::warn!("guardrail: holdout game {game_i} failed ({e}) — skipped"),
+        }
+    }
+    if scores.is_empty() {
+        return None;
+    }
+    Some(GuardrailVerdict {
+        hash: champion_hash.to_string(),
+        race_smoothed,
+        scores,
+    })
 }
 
 /// Run the guardrail: reload the champion's TRAINED weights, play `matches`
@@ -155,7 +198,7 @@ pub fn check_champion(
     for game_i in 0..matches {
         match scorer.holdout_score(&mut net, game_i) {
             Ok(s) => scores.push(s),
-            Err(e) => log::warn!("guardrail: holdout game {game_i} failed ({e}) — skipped"),
+            Err(e) => tracing::warn!("guardrail: holdout game {game_i} failed ({e}) — skipped"),
         }
     }
     if scores.is_empty() {

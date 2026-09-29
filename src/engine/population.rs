@@ -29,7 +29,14 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
 
     let seed = derive_seed(run_seed, ordinal) as usize;
     let mut rng = fastrand::Rng::with_seed(seed as u64);
-    let opts = config.topology_options;
+    // Per-individual identity seed. `options.topology_seed` is the seed the
+    // whole engine keys off: `Network::build` weights, `seed_step_randomness`,
+    // and the anti-plateau challenge trigger. Leaving it at the template
+    // default made every founder share ONE seed — identical initial weights,
+    // and a challenge trigger that fired for the entire population at once
+    // (or not at all) instead of ~`challenge_prob` of the nets per step.
+    let mut opts = config.topology_options;
+    opts.topology_seed = seed;
     let n_hidden = rng.usize(opts.min_hidden_num_nodes..=opts.max_hidden_num_nodes);
     let mut graph = Topology::new(seed, Some(opts));
     graph.create_random_hidden_nodes(n_hidden);
@@ -77,7 +84,7 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
             out.push(topo);
             continue;
         }
-        log::info!(
+        tracing::info!(
             "initial population: duplicate topology {} → discarded, re-rolling a unique seed",
             &hash[..8]
         );
@@ -96,7 +103,7 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
             }
         }
         if !replaced {
-            log::warn!(
+            tracing::warn!(
                 "initial population: could not replace a duplicate topology after 8 attempts — \
                  keeping it (the engine's hash map will dedupe; pop runs one short)"
             );
@@ -248,5 +255,19 @@ mod tests {
         cfg.standardize_op_pool = vec!["identity".into()];
         let topos = initial_population(&cfg, 42);
         assert_eq!(topos.len(), 3, "pop size preserved even when trapped");
+    }
+
+    /// Every founder must carry its OWN `net_seed`. Sharing the template's
+    /// seed gave the whole population identical initial weights and one
+    /// challenge trigger — so `⚔` fired for every net at once (or none) on a
+    /// given step instead of ~`challenge_prob` of them.
+    #[test]
+    fn founders_get_distinct_net_seeds() {
+        let cfg = tiny_config(8);
+        let topos = initial_population(&cfg, 42);
+        let mut seeds: Vec<usize> = topos.iter().map(|t| t.options.topology_seed).collect();
+        seeds.sort_unstable();
+        seeds.dedup();
+        assert_eq!(seeds.len(), 8, "each founder must carry a distinct net_seed");
     }
 }

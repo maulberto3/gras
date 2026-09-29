@@ -1,9 +1,10 @@
 //! RL engine — the environment-driven race resume.
 //!
-//! Split from `race_engine.rs` (2026-09-24 engine split, TODO.md). This file
-//! holds the RL-specific constructor (`resume_rl`). Everything else — the
-//! struct, the step loop, evolution, artifacts — lives in
-//! [`crate::engine::core::RaceEngine`] and is shared with the tabular engine.
+//! One of the 2026-09-24 engine-split slices (TODO.md) out of what was the
+//! single `race_engine.rs` monolith. This file holds the RL-specific
+//! constructor (`resume_rl`). Everything else — the struct, the step loop,
+//! evolution, artifacts — lives in [`crate::engine::core::CoreEngine`] and is
+//! shared with the tabular engine.
 
 use super::config::RaceConfig;
 use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
@@ -100,11 +101,21 @@ impl RlEngine {
         fitness: Fitness,
         trainer: impl crate::trainer::RlStep + 'static,
     ) -> Result<Self> {
-        // No config-mode guard needed here: the mode is DERIVED from the
-        // RunSpec variant, and `resume_rl` IS the RL variant by construction
-        // (the cross-engine check below reads the run dir's recorded mode).
-        let trainer = Box::new(crate::trainer::ModeAdapter::rl(Box::new(trainer)))
-            as Box<dyn crate::trainer::EngineTrainer>;
+        Self::resume_with(
+            run_dir,
+            config,
+            fitness,
+            Box::new(crate::trainer::ModeAdapter::rl(Box::new(trainer)))
+                as Box<dyn crate::trainer::EngineTrainer>,
+        )
+    }
+
+    fn resume_with(
+        run_dir: std::path::PathBuf,
+        config: RaceConfig,
+        fitness: Fitness,
+        trainer: Box<dyn crate::trainer::EngineTrainer>,
+    ) -> Result<Self> {
         let header = crate::state::load_engine_json(&run_dir)?;
         // Counter snapshot before `header` moves (see the tabular flavor).
         let persisted_counters = RunHeader {
@@ -162,6 +173,12 @@ impl RlEngine {
             children_born_at_clock: HashMap::new(),
             step_evolve: StepEvolve::default(),
             step_rl: RlVolume::default(),
+            total_challenged_turns: 0,
+            total_train_turns: 0,
+            expected_challenged_turns: 0.0,
+            step_challenged_inputs: 0,
+            total_challenged_inputs: 0,
+            expected_challenged_inputs: 0.0,
             champions: Vec::new(),
             checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),

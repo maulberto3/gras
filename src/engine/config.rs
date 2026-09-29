@@ -8,7 +8,6 @@ use crate::engine::fitness::Metric;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
     MaxSteps,
-    TargetScore,
     /// A user-supplied `custom_stop` closure returned true (Iter 5 pluggable
     /// contract; consulted after all built-ins).
     CustomStop,
@@ -44,7 +43,7 @@ pub enum LogLevel {
     /// plus a short evolve note on the same line when crossover/mutation fires.
     #[default]
     Summ,
-    /// A comfy framed table per step (from step 2 onward — step 1 has no prior
+    /// A boxed table per step (from step 2 onward — step 1 has no prior
     /// step to diff against, so it is skipped). Reuses the engine's existing
     /// per-step reporting: population rollup stats with deltas vs the last step
     /// (delta omitted when it is exactly 0), the evolve counters (culls, random
@@ -70,7 +69,7 @@ impl LogLevel {
     }
 
     /// The `env_logger` verbosity under which this level's lines are visible.
-    /// `Summ` prints through `log::info!`, so it needs `info`; `Minimal` and
+    /// `Summ` prints through `tracing::info!`, so it needs `info`; `Minimal` and
     /// `None` print their own lines through `println!` and only need the
     /// chatter quieted down.
     pub fn env_filter(self) -> &'static str {
@@ -261,9 +260,6 @@ pub struct RaceConfig {
     pub crossover_ops_pool: Vec<String>,
     /// Max steps before stopping (None = no limit).
     pub max_steps: Option<usize>,
-    /// Max target fitness: stop when the best smoothed fitness reaches this
-    /// (None = no target stop). Compared under the fitness direction.
-    pub max_target_fitness: Option<f32>,
     // NOTE: the shared batch stream (batch size, split ratio, eval rows) is
     // NOT a RaceConfig knob. It is engine infrastructure, rebuilt each run
     // from the trainer's optional stream_shape() request + the dataset's
@@ -288,16 +284,20 @@ pub struct RaceConfig {
     /// shared by every individual in the run.
     pub topology_options: crate::graph::topology::TopologyOptions,
     pub crossover_prob: f32,
-    /// DEPRECATED knob kept for API compatibility — part-mutation has been
-    /// dropped: crossover children are pure recombination and random
-    /// immigrants are never perturbed (crossover exploits, mutation
-    /// explores). Setting it has no effect.
+    /// Per-roll chance a mutation roll FIRES and inserts a fully-random
+    /// immigrant (crossover exploits, mutation explores; immigrants are never
+    /// perturbed). Applies to both modes — `mutate_rolls` controls how many
+    /// rolls are attempted per step, this controls how often each one fires.
     pub mutate_prob: f32,
     /// Pluggable stop criterion **in addition** to the built-ins (Iter 5
     /// contract). When `None`, only the built-ins apply.
     pub custom_stop: StopFn,
     /// Per-step log verbosity for the engine.
     pub log_level: LogLevel,
+    /// Write `<run_dir>/telemetry.jsonl`: one JSON record per engine event, at
+    /// full fidelity (debug included), next to whatever the console shows.
+    /// Off by default — the console is the view, this is the record.
+    pub trace_file: bool,
     /// Informative (non-ranking) metrics configured for the run, if any.
     /// Their labels determine the extra columns a reader may expect in a
     /// per-net metrics snapshot.
@@ -363,6 +363,67 @@ pub struct RaceConfig {
     /// pick (last resort, logged). See `entered_at_step` — no new state,
     /// resume-safe by construction.
     pub mutation_probation_steps: usize,
+    /// Anti-plateau challenge probability (`set_run_challenge_prob`):
+    /// per-step, per-net chance the engine fires a challenged step and the
+    /// trainer's `challenge_step` runs instead of `train_step`. 0.0
+    /// (default) = the mechanism is OFF. A single knob by design — the
+    /// trainer owns the action draw itself (no engine-side script/ledger).
+    pub challenge_prob: f32,
+}
+
+/// How far through its step budget a run is, `0.0` → `1.0` (clamped), or
+/// `None` when the run is unbounded (`max_steps = None`) or the budget is
+/// degenerate (`0`).
+///
+/// THE one definition of "how far along are we": trainers reach it through
+/// [`crate::trainer::StepEnv::progress`] and the engine's challenge decay is
+/// built on it, so every schedule in the crate agrees on what "halfway"
+/// means. Pure arithmetic on persisted values — nothing is stored, so replay,
+/// catch-up and resume re-derive the identical number.
+pub fn run_progress(step: usize, max_steps: Option<usize>) -> Option<f32> {
+    let max = max_steps?;
+    if max == 0 {
+        return None;
+    }
+    Some((step as f32 / max as f32).min(1.0))
+}
+
+/// The effective (decayed) challenge probability at `step`: the knob scaled
+/// linearly to 0 by the end of the step budget, flat when the run is
+/// unbounded (same convention as [`run_progress`]).
+///
+/// Why the decay: challenges fight plateaus, and late-run steps are exactly
+/// where the final polish happens — the run ends with a fully challenge-free
+/// stretch so the last checkpoints measure the policy clean.
+///
+/// [`challenge_fires`] DECIDES with this value and
+/// `CoreEngine::effective_challenge_prob` LOGS it — one function, so the number
+/// shown can never drift from the number used.
+pub fn effective_challenge_prob(prob: f32, step: usize, max_steps: Option<usize>) -> f32 {
+    let progress = run_progress(step, max_steps).unwrap_or(0.0);
+    prob * (1.0 - progress)
+}
+
+/// The challenge trigger: a pure function of `(run_seed, net_seed, step,
+/// challenge_prob, max_steps)` — deterministic, so replay/catch-up re-fires
+/// the exact same challenges the original run saw (no persisted flag needed).
+/// `prob <= 0` never fires. It decides with [`effective_challenge_prob`] (the
+/// decayed knob) and rolls ONE flip per (net, step): the trainer is handed a
+/// bool and owns what "challenged" means (see `RlContext.challenged`).
+pub(crate) fn challenge_fires(
+    run_seed: u64,
+    net_seed: u64,
+    step: usize,
+    prob: f32,
+    max_steps: Option<usize>,
+) -> bool {
+    let eff = effective_challenge_prob(prob, step, max_steps);
+    if eff <= 0.0 {
+        return false;
+    }
+    // Domain-separated seed: independent of every other per-step roll.
+    let mut rng = fastrand::Rng::with_seed(run_seed ^ net_seed.rotate_left(17) ^ ((step as u64) << 32));
+    rng.f32() < eff
 }
 
 /// Mode-specific knob set — the arm is carried in the TYPE (same split
@@ -401,26 +462,50 @@ impl ModeConfig {
         matches!(self, ModeConfig::Rl(_))
     }
 
-    /// Mutation catch-up (RL arm; `false` on the tabular arm — tabular
-    /// ALWAYS catches up, the shared-stream rule, so `false` is the honest
-    /// read for every consumer that only asks "would this net replay?").
+    /// Mutation catch-up for this arm — `false` means a mutation immigrant
+    /// keeps fresh weights and trains from the current clock.
     pub fn mutation_catch_up(&self) -> bool {
-        self.rl().map(|r| r.mutation_catch_up).unwrap_or(false)
+        match self {
+            ModeConfig::Tabular(t) => t.mutation_catch_up,
+            ModeConfig::Rl(r) => r.mutation_catch_up,
+        }
     }
 
-    /// Crossover catch-up (RL arm; `true` on the tabular arm — tabular
-    /// ALWAYS catches up and is always gated, so `true` is the honest read).
+    /// Crossover catch-up for this arm — `false` means a crossover child
+    /// skips replay AND the checkpoint gate.
     pub fn crossover_catch_up(&self) -> bool {
-        self.rl().map(|r| r.crossover_catch_up).unwrap_or(true)
+        match self {
+            ModeConfig::Tabular(t) => t.crossover_catch_up,
+            ModeConfig::Rl(r) => r.crossover_catch_up,
+        }
+    }
+
+    /// Population rejoin catch-up for this arm (reserved; see
+    /// [`TabularConfig::run_pop_catch_up`]).
+    pub fn run_pop_catch_up(&self) -> bool {
+        match self {
+            ModeConfig::Tabular(t) => t.run_pop_catch_up,
+            ModeConfig::Rl(r) => r.run_pop_catch_up,
+        }
     }
 }
 
-/// Tabular-only knobs. Currently empty — every knob so far turned out to be
-/// shared (stream geometry is trainer/`RunSpec`-owned by design, see the
-/// batch-stream note on [`RaceConfig`]). The arm exists so future tabular
-/// knobs (split strategy, eval cadence) have a home without re-plumbing.
+/// Tabular-only knobs: the same catch-up family RL carries, so a tabular run
+/// can opt out of replaying a newborn through the shared stream (see
+/// [`RaceConfigBuilder::set_mutation_catch_up`]). Defaults keep the
+/// historical tabular behavior: crossover children replay + gate (`true`),
+/// mutation immigrants start at the current clock (`false`).
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct TabularConfig {}
+pub struct TabularConfig {
+    /// Mutation immigrants skip catch-up and start at the current clock.
+    pub mutation_catch_up: bool,
+    /// Whether a crossover child replays the training stream (and passes the
+    /// checkpoint gate on the replayed history) before insertion.
+    pub crossover_catch_up: bool,
+    /// Whether a population net rejoining the group step replays missed
+    /// training (reserved; no consumer in the default flow today).
+    pub run_pop_catch_up: bool,
+}
 
 impl TabularConfig {
     /// Builder for the tabular-only knob surface.
@@ -431,19 +516,36 @@ impl TabularConfig {
 
 /// Builder for [`TabularConfig`].
 #[derive(Debug, Default)]
-pub struct TabularConfigBuilder {}
+pub struct TabularConfigBuilder {
+    cfg: TabularConfig,
+}
 
 impl TabularConfigBuilder {
+    /// Mutation immigrants skip catch-up (see [`TabularConfig::mutation_catch_up`]).
+    pub fn set_mutation_catch_up(mut self, yes: bool) -> Self {
+        self.cfg.mutation_catch_up = yes;
+        self
+    }
+    /// Crossover children skip catch-up (see [`TabularConfig::crossover_catch_up`]).
+    pub fn set_crossover_catch_up(mut self, yes: bool) -> Self {
+        self.cfg.crossover_catch_up = yes;
+        self
+    }
+    /// Population rejoin replay toggle (see [`TabularConfig::run_pop_catch_up`]).
+    pub fn set_run_pop_catch_up(mut self, yes: bool) -> Self {
+        self.cfg.run_pop_catch_up = yes;
+        self
+    }
     /// Finalize the tabular arm.
     pub fn build(self) -> TabularConfig {
-        TabularConfig {}
+        self.cfg
     }
 }
 
-/// RL-only knobs: the catch-up family. Catch-up exists so a net becomes
-/// comparable to the population before ranking against it; in tabular that
-/// comparability is sacred (one shared data stream — every net replays the
-/// same batches), so the toggles only make sense where streams don't exist.
+/// RL knobs: the catch-up family. The tabular arm carries an identical copy
+/// ([`TabularConfig`]) so both modes expose the same toggles; RL kept its own
+/// arm because these started life as RL-only and the wire format already
+/// carries them here.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RlConfig {
     /// Mutation/crossover immigrants skip catch-up and start at the current
@@ -472,7 +574,7 @@ impl Default for RlConfig {
 }
 
 impl RlConfig {
-    /// Builder for the RL-only knob surface.
+    /// Builder for the RL knob surface.
     pub fn builder() -> RlConfigBuilder {
         RlConfigBuilder::default()
     }
@@ -604,7 +706,6 @@ impl RaceConfig {
             mode_specific: ModeConfig::Tabular(TabularConfig::default()),
             crossover_ops_pool: Vec::new(),
             max_steps: None,
-            max_target_fitness: None,
             hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
             hidden_dim_stride: 16,
             combine_op_pool: Vec::new(),
@@ -616,6 +717,7 @@ impl RaceConfig {
             custom_stop: None,
             metrics: Vec::new(),
             log_level: LogLevel::default(),
+            trace_file: false,
             mode: RunMode::Tabular,
             csv_export: true,
             history_flush_each: false,
@@ -628,6 +730,7 @@ impl RaceConfig {
             run_topologies: Vec::new(),
             elite_checkpoint_weights: true,
             mutation_probation_steps: 0,
+            challenge_prob: 0.0,
         }
     }
 
@@ -636,8 +739,8 @@ impl RaceConfig {
     /// the finished config.
     ///
     /// The arm starts TABULAR (the `Default` arm). For an RL run prefer the
-    /// mode front door [`RlRaceConfig::builder`] — it pre-stamps the RL arm
-    /// so the RL-only setters (`set_*_catch_up`) apply without ceremony.
+    /// mode front door [`RlRaceConfig::builder`] — it pre-stamps the RL arm so
+    /// the RL-side catch-up copies are the ones a `ModeConfig` read sees.
     /// (Whatever arm the builder carries, the `RunSpec` constructor stamps
     /// its own — the front door just makes the call site honest.)
     pub fn builder() -> RaceConfigBuilder {
@@ -649,15 +752,14 @@ impl RaceConfig {
 }
 
 /// Typed front door for RL runs: `RlRaceConfig::builder()` is
-/// [`RaceConfig::builder`] with the RL arm pre-stamped, so the RL-only
-/// setters (`set_crossover_catch_up` / `set_mutation_catch_up` /
-/// `set_run_pop_catch_up`) apply without panics or arm ceremony. The shared
-/// setters are exactly [`RaceConfigBuilder`]'s — same struct underneath, so
-/// `RunSpec::rl(..)` consumes the built config unchanged.
+/// [`RaceConfig::builder`] with the RL arm pre-stamped, so the RL-side
+/// catch-up copies are the ones the engine reads. The setters are exactly
+/// [`RaceConfigBuilder`]'s — same struct underneath, so `RunSpec::rl(..)`
+/// consumes the built config unchanged.
 pub type RlRaceConfig = RaceConfig;
 
 /// Typed front door for tabular runs (reads well at the call site; the
-/// catch-up setters are RL-only and panic on this arm).
+/// catch-up setters write the tabular arm's own copy).
 pub type TabularRaceConfig = RaceConfig;
 
 /// `TabularRaceConfig::builder()` — the tabular front door: a free function
@@ -678,8 +780,7 @@ pub fn tabular_race_config_builder() -> RaceConfigBuilder {
 /// `RlRaceConfig::builder()` — the RL front door: a free function so the
 /// type alias can't shadow [`RaceConfig::builder`]. Starts from
 /// [`RaceConfig::defaults`] with the RL arm pre-stamped
-/// (`ModeConfig::Rl(RlConfig::default())`), so the RL-only catch-up setters
-/// on the returned builder apply directly.
+/// (`ModeConfig::Rl(RlConfig::default())`), so RL-side reads see the RL copy.
 // NOTE: a free function, not an inherent impl on the alias — `RlRaceConfig`
 // IS `RaceConfig`, so an inherent `builder()` there would collide with the
 // one above (two applicable items in scope).
@@ -815,25 +916,18 @@ impl RaceConfigBuilder {
     /// weights and trains from the current clock on (the old
     /// "fresh-start" behavior, now the default).
     ///
-    /// **RL-effective only.** Catch-up exists so a net is *comparable* to the
-    /// population: same step count, same weight-update history. In Tabular
-    /// that is sacred — everyone shares one data stream, and a net that missed
-    /// steps missed DATA, so tabular runs ALWAYS catch up regardless of this
-    /// flag. In RL there is no shared stream: every net's matches are
-    /// generated fresh from its own seeds, so starting at step k misses no
-    /// data, only k updates. With catch-up off the immigrant's rolling
-    /// buffers start empty ("no verdict yet") — it cannot be culled or
-    /// crowned before its first step, and its first verdict is ~baseline
-    /// random (it competes from birth rather than from a replayed adulthood).
-    ///
-    /// Panics if the config's mode arm is Tabular (see [`ModeConfig`] — the
-    /// knob is RL-only; build the arm with [`RlConfig::builder`]).
+    /// **Both modes** (the tabular arm carries its own copy — see
+    /// [`TabularConfig`]). Catch-up exists so a net is *comparable* to the
+    /// population: same step count, same weight-update history. The
+    /// historical tabular answer was "always catch up" (one shared data
+    /// stream, and a net should not start having missed DATA); `true` restores
+    /// that. With catch-up off the immigrant's rolling buffers start empty
+    /// ("no verdict yet") — it cannot be culled or crowned before its first
+    /// step, and its first verdict reflects only its fresh weights.
     pub fn set_mutation_catch_up(mut self, yes: bool) -> Self {
         match &mut self.cfg.mode_specific {
             ModeConfig::Rl(rl) => rl.mutation_catch_up = yes,
-            ModeConfig::Tabular(_) => panic!(
-                "set_mutation_catch_up is RL-only — this config carries the Tabular arm"
-            ),
+            ModeConfig::Tabular(t) => t.mutation_catch_up = yes,
         }
         self
     }
@@ -847,16 +941,12 @@ impl RaceConfigBuilder {
     /// only sound reading) and trains from the current clock like a mutation
     /// immigrant, competing from birth.
     ///
-    /// **RL-effective only** — tabular runs always catch up (shared data
-    /// stream; see [`Self::set_mutation_catch_up`]).
-    ///
-    /// Panics if the config's mode arm is Tabular (see [`ModeConfig`]).
+    /// **Both modes** (the tabular arm carries its own copy; see
+    /// [`Self::set_mutation_catch_up`]). Default `true`.
     pub fn set_crossover_catch_up(mut self, yes: bool) -> Self {
         match &mut self.cfg.mode_specific {
             ModeConfig::Rl(rl) => rl.crossover_catch_up = yes,
-            ModeConfig::Tabular(_) => panic!(
-                "set_crossover_catch_up is RL-only — this config carries the Tabular arm"
-            ),
+            ModeConfig::Tabular(t) => t.crossover_catch_up = yes,
         }
         self
     }
@@ -868,17 +958,13 @@ impl RaceConfigBuilder {
     /// fall behind the clock and nothing re-enters with a gap — this knob is
     /// reserved for future rejoin paths.
     ///
-    /// **RL-effective only** — tabular runs always catch up. RESUME IS
-    /// EXEMPT: resume always replays (weights are never persisted; replay
-    /// parity is the resume contract regardless of this flag).
-    ///
-    /// Panics if the config's mode arm is Tabular (see [`ModeConfig`]).
+    /// **Both modes.** RESUME IS EXEMPT: resume always replays (weights are
+    /// never persisted; replay parity is the resume contract regardless of
+    /// this flag).
     pub fn set_run_pop_catch_up(mut self, yes: bool) -> Self {
         match &mut self.cfg.mode_specific {
             ModeConfig::Rl(rl) => rl.run_pop_catch_up = yes,
-            ModeConfig::Tabular(_) => panic!(
-                "set_run_pop_catch_up is RL-only — this config carries the Tabular arm"
-            ),
+            ModeConfig::Tabular(t) => t.run_pop_catch_up = yes,
         }
         self
     }
@@ -930,16 +1016,6 @@ impl RaceConfigBuilder {
     /// is overridden by a later flag, not combined with it).
     pub fn set_stop_max_steps(mut self, n: impl Into<Option<usize>>) -> Self {
         self.cfg.max_steps = n.into();
-        self.cfg.max_target_fitness = None;
-        self
-    }
-    /// Max target fitness: stop when the best smoothed fitness reaches `v`.
-    /// Mutually exclusive with [`Self::set_stop_max_steps`] — exactly one stop
-    /// criterion. Accepts a bare value or an `Option`.
-    /// Setting this CLEARS any previously-set max steps (see above).
-    pub fn set_stop_target_fitness(mut self, v: impl Into<Option<f32>>) -> Self {
-        self.cfg.max_target_fitness = v.into();
-        self.cfg.max_steps = None;
         self
     }
     /// Whole-bundle stop criteria — DELETED: the two field setters
@@ -1102,17 +1178,13 @@ impl RaceConfigBuilder {
         self.cfg.mutate_prob = v;
         self
     }
-    /// Extra informative (non-ranking) metrics recorded in history.csv.
-    /// Accepts anything that converts into a [`Metric`]: a plain label
-    /// (`"f1"`), a `Metric::new(label)`, or a `Metric::custom(label, closure)`
-    /// with your own scoring function. These NEVER affect selection/culling —
-    /// the ranking fitness is set separately via `Fitness`.
-    pub fn set_run_metrics<I, M>(mut self, metrics: I) -> Self
-    where
-        I: IntoIterator<Item = M>,
-        M: Into<Metric>,
-    {
-        self.cfg.metrics = metrics.into_iter().map(|m| m.into()).collect();
+    /// Extra informative (non-ranking) metrics recorded in history.csv and
+    /// engine.json. Each is a `Metric::custom(label, closure)` — there are no
+    /// built-in labels, so what gets measured is always explicit. These NEVER
+    /// affect selection/culling — the ranking fitness is set separately via
+    /// `Fitness`.
+    pub fn set_run_metrics(mut self, metrics: Vec<Metric>) -> Self {
+        self.cfg.metrics = metrics;
         self
     }
 
@@ -1127,6 +1199,13 @@ impl RaceConfigBuilder {
     /// (also dumps every per-net detail line each step).
     pub fn set_run_log_level(mut self, level: LogLevel) -> Self {
         self.cfg.log_level = level;
+        self
+    }
+    /// Also write the run's event stream to `<run_dir>/telemetry.jsonl` (one
+    /// JSON record per event, full fidelity). Off by default: the console
+    /// stays the human view, this is the machine-readable record beside it.
+    pub fn set_run_trace_file(mut self, enabled: bool) -> Self {
+        self.cfg.trace_file = enabled;
         self
     }
     // NOTE: no `set_run_mode` — the RunMode is DERIVED from the RunSpec
@@ -1161,6 +1240,20 @@ impl RaceConfigBuilder {
         self.cfg.mutation_probation_steps = k;
         self
     }
+    /// Per-step, per-net chance an anti-plateau challenge fires. `0.0`
+    /// (default) = challenges OFF. On a fired step the trainer is handed
+    /// `ctx.challenged = true` and owns what that means: RL forces a drawn
+    /// action on the trajectory, tabular jitters its batch — whatever the
+    /// scheme decides (a trainer that ignores the flag keeps the knob at 0).
+    /// The challenged step's fitness ranks like any other. Replay re-derives
+    /// the same trigger from (run_seed, net_seed, step), so resume stays
+    /// bit-exact. A future ramp (min_prob → max_prob approaching max_steps)
+    /// is tracked in TODO.md.
+    pub fn set_run_challenge_prob(mut self, p: f32) -> Self {
+        assert!((0.0..=1.0).contains(&p), "challenge_prob must be in [0, 1]");
+        self.cfg.challenge_prob = p;
+        self
+    }
     /// At stop, save the elite's topology markdown (`elite-<hash>.md`).
     /// Default true.
     pub fn set_elite_save_topology(mut self, enabled: bool) -> Self {
@@ -1186,20 +1279,10 @@ impl RaceConfigBuilder {
         self.cfg.worst_save_safetensors = enabled;
         self
     }
-    /// Validate the stop-criteria surface: `max_steps` and
-    /// `max_target_fitness` are **exclusive** — only one stop criterion at a
-    /// time. The field setters already enforce this (each write clears its
-    /// sibling), so this is a belt-and-suspenders check for configs built by
-    /// hand (struct literal) rather than through the builder — both would
-    /// fight for different things (a budget vs. a quality bar), and whichever
-    /// fired first would silently mask the other. A config with both panics
-    /// at `build()`.
-    pub(crate) fn validate_single_stop(cfg: &RaceConfig) -> Result<(), String> {
-        if cfg.max_steps.is_some() && cfg.max_target_fitness.is_some() {
-            return Err(
-                "only one stop criteria can be used at a time: max_steps and max_target_fitness are mutually exclusive".into(),
-            );
-        }
+    /// Validate the stop-criteria surface. Kept as a no-op hook after the
+    /// `max_target_fitness` deletion: the exclusivity check lost its subject
+    /// (only `max_steps` + `custom_stop` remain, and those compose).
+    pub(crate) fn validate_single_stop(_cfg: &RaceConfig) -> Result<(), String> {
         Ok(())
     }
 
@@ -1208,7 +1291,7 @@ impl RaceConfigBuilder {
         // Params set by the pruner setters while the switch was still off:
         // surfaced loudly (a silent no-op would hide the misconfig).
         if let Some(p) = self.pending_pruner.take() {
-            log::warn!(
+            tracing::warn!(
                 "set_pruner_method({:?})/set_pruner_steps({}) were called without set_pruner_enabled(true) — pruner is OFF",
                 p.method,
                 p.steps
@@ -1336,7 +1419,56 @@ impl RaceConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogLevel, RaceConfig};
+    use super::{LogLevel, RaceConfig, challenge_fires, effective_challenge_prob, run_progress};
+    use crate::utils::seed::derive_seed;
+
+    /// One decay convention for the whole crate: linear to 0 at the budget,
+    /// clamped, and flat when the run is unbounded. The SAME function feeds the
+    /// trigger (`challenge_fires`) and the log
+    /// (`CoreEngine::effective_challenge_prob`) — a schedule that shows one
+    /// number and decides with another is worse than no schedule at all.
+    #[test]
+    fn run_progress_and_challenge_decay_share_one_convention() {
+        assert_eq!(run_progress(0, Some(10)), Some(0.0));
+        assert_eq!(run_progress(5, Some(10)), Some(0.5));
+        assert_eq!(run_progress(10, Some(10)), Some(1.0));
+        // Overshoot clamps: a run resumed past its budget must not go negative.
+        assert_eq!(run_progress(99, Some(10)), Some(1.0));
+        // No budget (or a degenerate one) = no schedule at all.
+        assert_eq!(run_progress(3, None), None);
+        assert_eq!(run_progress(3, Some(0)), None);
+
+        // Halfway through the budget the knob is halved; unbounded is flat.
+        assert!((effective_challenge_prob(0.2, 5, Some(10)) - 0.1).abs() < 1e-6);
+        assert_eq!(effective_challenge_prob(0.2, 5, None), 0.2);
+        // The run ends challenge-free by construction.
+        assert_eq!(effective_challenge_prob(0.2, 10, Some(10)), 0.0);
+        // The trigger's boundary agrees with the logged knob: past the budget the
+        // knob is exactly 0 and the roll can never fire, whatever the seed.
+        for step in 10..14 {
+            for net_seed in 0..50u64 {
+                assert!(
+                    !challenge_fires(1, net_seed, step, 1.0, Some(10)),
+                    "step {step} is past the budget — the knob is 0"
+                );
+            }
+        }
+        // prob = 1.0 at step 0 (eff exactly 1.0) → the roll always fires.
+        for net_seed in 0..50u64 {
+            assert!(challenge_fires(1, net_seed, 0, 1.0, Some(10)));
+        }
+        // While the knob is alive the trigger is PROBABILISTIC — one flip per
+        // (net, step), not per population-step. At step 5 (eff 0.5) a 200-net
+        // sample must contain both outcomes; a constant here would mean the roll
+        // had stopped depending on the seed.
+        let fired = (0..200u64)
+            .filter(|net_seed| challenge_fires(1, *net_seed, 5, 1.0, Some(10)))
+            .count();
+        assert!(
+            fired > 0 && fired < 200,
+            "eff 0.5 over 200 independent net-steps should mix, got {fired}"
+        );
+    }
 
     /// The examples' `--log-level` vocabulary must parse: handed to env_logger
     /// verbatim, `summ` is read as a module name and mutes the whole run, so
@@ -1364,23 +1496,26 @@ mod tests {
     /// whole-bundle setter).
     #[test]
     fn stop_setters_are_exclusive_last_writer_wins() {
-        // const default: steps... then a flag asks for the fitness bar instead.
+        // (the old max_target_fitness exclusivity test shrank with the
+        // feature's deletion — only the step budget remains)
         let cfg = RaceConfig::builder()
-            .set_stop_max_steps(15)
-            .set_stop_target_fitness(3050.0)
-            .build();
-        assert_eq!(cfg.max_steps, None, "fitness flag cleared the step budget");
-        assert_eq!(cfg.max_target_fitness, Some(3050.0));
-
-        // and the reverse order: fitness default... then a flag asks for steps.
-        let cfg = RaceConfig::builder()
-            .set_stop_target_fitness(3050.0)
             .set_stop_max_steps(15)
             .build();
         assert_eq!(cfg.max_steps, Some(15));
-        assert_eq!(
-            cfg.max_target_fitness, None,
-            "step flag cleared the fitness bar"
+    }
+
+    /// The trigger is per-NET, not per-step: at one step with `p = 0.5` a
+    /// population of distinct seeds must split roughly in half. A single
+    /// shared seed (the founder-seed bug) made it all-or-nothing, so `⚔`
+    /// only ever appeared on the steps where that one seed happened to fire.
+    #[test]
+    fn challenge_trigger_is_per_net_not_per_step() {
+        let fired = (0..64usize)
+            .filter(|i| challenge_fires(42, derive_seed(42, *i), 3, 0.5,None))
+            .count();
+        assert!(
+            (16..=48).contains(&fired),
+            "trigger must track prob across nets, fired {fired}/64"
         );
     }
 }

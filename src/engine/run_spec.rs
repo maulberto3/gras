@@ -140,7 +140,6 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
             run_dir,
         })
     }
-
     /// Convenience: build a spec with the trainer auto-boxed. Accepts any
     /// `U: TabularStep + 'static` so callers can write
     /// `.with_trainer(TabularTrainer::new(loss).with_learning_rate(1e-3))`
@@ -169,71 +168,10 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
     }
 }
 
-/// Ergonomic helper that builds the most common training setup from just a
-/// loss closure: a [`TabularTrainer`] (Adam, one train + one eval batch per
-/// step) with sensible defaults. Use this when you want the engine's default
-/// training recipe but still want it self-contained inside the trainer — no
-/// stream shape to wire, no config knobs, no engine responsibility.
-///
-/// Swap in your own `Trainer` impl any time you need something else (SGD,
-/// warmup, multi-minibatch, RL, image, NLP — the engine only sees the
-/// [`Trainer`] contract).
-pub struct DefaultTrainerBuilder {
-    loss: Option<crate::trainer::BoxedLossFn>,
-    learning_rate: f32,
-    grad_clip: f32,
-}
-
-impl Default for DefaultTrainerBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DefaultTrainerBuilder {
-    pub fn new() -> Self {
-        Self {
-            loss: None,
-            learning_rate: 1e-3,
-            grad_clip: 1.0,
-        }
-    }
-
-    pub fn loss(
-        mut self,
-        loss: impl Fn(&flodl::Variable, &flodl::Variable) -> flodl::tensor::Result<flodl::Variable>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        self.loss = Some(Box::new(loss));
-        self
-    }
-
-    pub fn with_learning_rate(mut self, lr: f32) -> Self {
-        self.learning_rate = lr;
-        self
-    }
-
-    pub fn with_grad_clip(mut self, clip: f32) -> Self {
-        self.grad_clip = clip;
-        self
-    }
-
-    /// Build the boxed [`TabularStep`] trainer. The loss is required — a run
-    /// without a loss has no training signal. The default loss fallback is
-    /// cross-entropy (so `Default` stays usable for tests that don't care).
-    pub fn build(self) -> Box<dyn crate::trainer::TabularStep> {
-        let loss = self.loss.unwrap_or_else(|| {
-            Box::new(crate::utils::score::cross_entropy_onehot_loss)
-        });
-        Box::new(
-            crate::trainer::TabularTrainer::new(loss)
-                .with_learning_rate(self.learning_rate)
-                .with_grad_clip(self.grad_clip),
-        )
-    }
-}
+// NOTE: there is deliberately no engine-side "default trainer" builder. The
+// engine never constructs a concrete recipe — a run without a trainer is a
+// type error, and the reference recipes live in `examples/` (the caller's
+// copy to own and edit). See `examples/mnist.rs` and `examples/ref_trainer/`.
 
 /// Stream shape request — what the trainer wants the shared batch stream to
 /// look like. Returned from [`crate::trainer::TabularStep::stream_shape`]; the

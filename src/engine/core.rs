@@ -49,14 +49,13 @@
 
 use flodl::nn::Optimizer;
 use flodl::tensor::Result;
-use log::info;
 use std::collections::HashMap;
+use tracing::info;
 
 use crate::engine::fitness::{Fitness, FitnessLabel, Metric};
 use crate::graph::network::Network;
 use crate::state::{
-    ConfigSnapshot, NetMetrics, NetState, RaceState, RunConfig, RunHeader, write_engine_json,
-    write_net_state,
+    ConfigSnapshot, NetState, RaceState, RunConfig, RunHeader, write_engine_json, write_net_state,
 };
 use crate::trainer::stream::{BatchStream, PoolSplit};
 
@@ -85,6 +84,8 @@ impl crate::trainer::EngineTrainer for NoopPopTrainer {
         _env: crate::trainer::StepEnv,
         _net_hash: &str,
         _net_seed: u64,
+        _challenged: bool,
+        _challenge_prob: f32,
     ) -> flodl::tensor::Result<crate::trainer::StepReport> {
         unreachable!("NoopPopTrainer is a placeholder only for the pop-wide phase")
     }
@@ -95,99 +96,8 @@ impl crate::trainer::EngineTrainer for NoopPopTrainer {
         None
     }
 }
-// Used by the debug contract probe in `step_one_net` and by the checkpoint
-// surprise exam (`run_checkpoint_exam`) — the exam runs in release too, so
-// this import is NOT debug-gated.
-use crate::utils::race_steps::eval_one_step;
-
-// ── Build identity ──────────────────────────────────────────────────────────
-
-/// One-line description of the RUNNING binary: crate version, profile, and
-/// the executable path + its mtime. Printed at start and recorded in
-/// `engine.json`.
-///
-/// Why the mtime matters: an artifact error (or a "parity failed") is often a
-/// STALE PROCESS, not stale logic — a long run started before a fix keeps the
-/// old behavior for hours, and its artifacts look wrong for no visible
-/// reason. Stamping the exe + build time makes "was this the new code?" a
-/// one-glance question instead of an investigation.
-pub(crate) fn build_stamp() -> String {
-    let exe = std::env::current_exe().ok();
-    let built = exe
-        .as_ref()
-        .and_then(|p| std::fs::metadata(p).ok())
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| {
-            let secs = d.as_secs();
-            // Compact, timezone-free UTC stamp (YYYY-MM-DD HH:MM:SS).
-            let (days, rem) = (secs / 86_400, secs % 86_400);
-            let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-            let (y, mo, d) = civil_from_days(days as i64);
-            format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}Z")
-        })
-        .unwrap_or_else(|| "unknown".into());
-    let path = exe
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "-".into());
-    format!(
-        "gras {} [{}] built {built} — exe {path}",
-        env!("CARGO_PKG_VERSION"),
-        if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        }
-    )
-}
-
-/// Days-since-epoch → (year, month, day), proleptic Gregorian (Howard Hinnant's
-/// `civil_from_days`). Self-contained so the engine needs no date dependency.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-// ── Display helpers ─────────────────────────────────────────────────────────
-
-/// Format a float to 2 decimals for the **console log only**. Artifacts
-/// (`engine.json`, `nets/<hash>.json`, `history.csv`, `checkpoints.json`) are
-/// always written from the raw `f32` — serde and `Display` emit the shortest
-/// decimal that round-trips, i.e. full precision. Never route anything
-/// persisted through this function.
-fn fmt2(v: f32) -> String {
-    format!("{v:.2}")
-}
-
-/// Format an optional float to 2 decimals — plain `—` when unset (never
-/// `Some(...)` in user-facing logs).
-fn fmt_opt2(v: &Option<f32>) -> String {
-    v.as_ref()
-        .map(|x| format!("{x:.2}"))
-        .unwrap_or_else(|| "—".into())
-}
-
-/// RFC4180-quote a CSV field when it holds a delimiter, quote, or newline.
-/// Lineage strings (`crossover:parents=h1,h2`) contain commas, so this is not
-/// optional — an unquoted lineage would shift every later column.
-fn csv_field(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
-    }
-}
-
-use super::child::RaceChild;
-use super::config::{RaceConfig, RaceSnapshot, StopReason};
+use super::config::{RaceConfig, StopReason};
+use super::format::{build_stamp, csv_field};
 use super::smoothing::{RollingBuffer, rolling_mean};
 
 /// One entry in the checkpoint ledger: the population-mean smoothed fitness
@@ -258,6 +168,32 @@ pub struct CoreEngine {
     /// stepped this clock. Reset at the top of each step; consumed by the
     /// same step's rollup line / `Minimal` table. Stays zero in Tabular mode.
     pub(crate) step_rl: RlVolume,
+    /// Run-total of challenged turns (live path only — a resume's replay
+    /// mirrors history and does not re-count). Surfaced in the stop summary
+    /// next to the turns actually played, so the challenge rate is directly
+    /// readable as a fraction. Not persisted: a resumed run counts only its
+    /// own post-resume turns.
+    pub(crate) total_challenged_turns: usize,
+    /// Run-total of the TRAIN turns those challenged turns came out of — the
+    /// denominator `total_challenged_turns` is only meaningful against (eval
+    /// turns are never challengeable). Same live-only accounting.
+    pub(crate) total_train_turns: usize,
+    /// Run-total of the turns the trigger was expected to force: summed
+    /// `p_eff(step) × train_turns(step)`. Decay-aware, so it is directly
+    /// comparable to `total_challenged_turns` — how far the run's realized
+    /// challenge footprint sits from what the knob asked for.
+    pub(crate) expected_challenged_turns: f32,
+    /// Per-step count of individual INPUT VALUES challenged (jittered) by the
+    /// tabular trainers this clock — the element-level volume the trainers
+    /// reported. Reset each step.
+    pub(crate) step_challenged_inputs: usize,
+    /// Run-total challenged input values (live path only). Surfaced in the
+    /// stop summary for tabular runs, where environment turns don't exist.
+    pub(crate) total_challenged_inputs: usize,
+    /// Run-total of the EXPECTED challenged input values: summed
+    /// `p_eff(step) × rows × features` over every tabular net-step, directly
+    /// comparable to `total_challenged_inputs`.
+    pub(crate) expected_challenged_inputs: f32,
     /// Full hashes of the elite set exported at stop (top-`elite_count` by
     /// smoothed fitness) — the single source of truth for "which nets are the
     /// champions". Populated by both `write_champion_*` writers so post-race
@@ -384,38 +320,101 @@ impl flodl::nn::optim::Optimizer for NoopOptimizer {
 }
 
 /// Per-step RL volume, summed over every net that stepped this clock — the
-/// environment work the population actually did. `matches`/`turns` come from
-/// `StepReport.rl` (see [`crate::trainer::RlStepMeta`]); `nets` counts the nets
-/// that reported, so a trainer which forgets to report shows as `—` instead of
-/// a silent `0`. Always zero in Tabular mode.
+/// environment work the population actually did. `matches`/`train_turns`/
+/// `eval_turns` come from `StepReport.rl` (see
+/// [`crate::trainer::RlStepMeta`]); `nets` counts the nets that reported, so a
+/// trainer which forgets to report shows as `—` instead of a silent `0`.
+/// Always zero in Tabular mode.
+///
+/// The train/eval split is kept apart because the challenge can only force
+/// train turns: the rollup's expected `⚔` is `p_chall × train_turns`, so the
+/// two halves must be summed separately to state that denominator honestly.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RlVolume {
     /// Nets that reported `StepReport.rl` this step.
     pub nets: usize,
-    /// Matches played by those nets, summed.
+    /// Matches played by those nets, summed (train + eval).
     pub matches: usize,
-    /// Environment turns played by those nets, summed.
-    pub turns: usize,
+    /// Train turns played by those nets, summed — the challengeable turns.
+    pub train_turns: usize,
+    /// Eval turns played by those nets, summed (never challenged).
+    pub eval_turns: usize,
+    /// Turns played under a forced action this step, summed (what the
+    /// trainers reported in `RlStepReport.challenged_turns`). 0 = none.
+    pub challenged_turns: usize,
 }
 
 impl RlVolume {
+    /// Add this step's challenged turns to the volume (called from the step
+    /// path as reports land).
+    pub(crate) fn add_challenged(&mut self, turns: usize) {
+        self.challenged_turns += turns;
+    }
+
+    /// Total environment turns this step (train + eval) — the `turns/match`
+    /// numerator.
+    pub(crate) fn turns(&self) -> usize {
+        self.train_turns + self.eval_turns
+    }
+
     /// The RL middle column of the per-step rollup, e.g.
-    /// `matches 100 │ turns 14400 │ turns/match 144`. `—` when no net reported
-    /// any match (Tabular mode, or a mis-wired RL trainer).
-    fn label(&self) -> String {
+    /// `matches 300 │ train 1331 │ eval 2662 │ p_chall 0.100 │ ⚔ 75 (exp 133)
+    /// │ turns/match 13`. `—` when no net reported any match (Tabular mode, or
+    /// a mis-wired RL trainer).
+    ///
+    /// `eff_prob` is the CURRENT effective challenge probability (post-decay).
+    /// Two derived cells hang off it, each hidden when it would lie: `p_chall`
+    /// only when the knob is on, and `⚔ <n> (exp <m>)` only when the trainer
+    /// reported challenged turns — where `<m> = eff_prob × train_turns` is the
+    /// expectation under the per-(net, step) trigger. That lets the reader
+    /// judge the draw without doing decay math (and watch the knob decay
+    /// toward 0 step by step).
+    pub(crate) fn label(&self, eff_prob: f32) -> String {
         if self.nets == 0 || self.matches == 0 {
-            return "matches — │ turns — │ turns/match —".to_string();
+            return "matches — │ train — │ eval — │ turns/match —".to_string();
         }
+        let prob = if eff_prob > 0.0 {
+            format!(" │ p_chall {:.3}", eff_prob)
+        } else {
+            String::new()
+        };
+        // Only train turns can be challenged, so the expectation is taken over
+        // them alone — never over the train+eval total.
+        let challenged = if self.challenged_turns > 0 {
+            let expected = if eff_prob > 0.0 {
+                format!(" (exp {:.0})", eff_prob * self.train_turns as f32)
+            } else {
+                String::new()
+            };
+            format!(" │ ⚔ {}{}", self.challenged_turns, expected)
+        } else {
+            String::new()
+        };
         format!(
-            "matches {} │ turns {} │ turns/match {:.0}",
+            "matches {} │ train {} │ eval {}{}{} │ turns/match {:.0}",
             self.matches,
-            self.turns,
-            self.turns as f32 / self.matches as f32
+            self.train_turns,
+            self.eval_turns,
+            prob,
+            challenged,
+            self.turns() as f32 / self.matches as f32
         )
     }
 }
 
 impl CoreEngine {
+    /// The CURRENT effective challenge probability (post-decay). Delegates to
+    /// [`crate::engine::config::effective_challenge_prob`] — the SAME function
+    /// `challenge_fires` decides with — so the rollup line, the checkpoint
+    /// line and the trigger can never disagree about the knob's value.
+    pub(crate) fn effective_challenge_prob(&self, clock: usize) -> f32 {
+        crate::engine::config::effective_challenge_prob(
+            self.config.challenge_prob,
+            clock,
+            self.config.max_steps,
+        )
+    }
+
     /// True when per-step detail lines (evolve rollup, per-child gate/cull/
     /// insert lines, checkpoint line, race-start line) should be emitted —
     /// i.e. every level except `Minimal` (table only) and `None` (silent).
@@ -568,6 +567,11 @@ impl CoreEngine {
             .into());
         }
         let metrics = config.metrics.clone();
+        // Challenge contract: `challenge_prob` is validated at the TRIGGER,
+        // not here — a fired trigger is handed to the trainer as
+        // `ctx.challenged`, and the trainer owns the response (RL forces an
+        // action, tabular jitters its batch). A trainer that ignores the flag
+        // keeps the knob at its default 0.
         let train_eval_split_ratio = 0.2f32;
         let held_out_eval_rows = 256usize;
         let default_batch_size = 16usize;
@@ -627,6 +631,11 @@ impl CoreEngine {
                 .to_string(),
         );
         write_engine_json(&run_dir, &header)?;
+        // Settle the log sinks now that the run dir exists: `trace_file` opens
+        // the sidecar and flushes the buffered start-up block into it, the
+        // default closes that buffer instead. Either way the knob is the dir's
+        // only consumer — logging itself never guesses it.
+        super::logging::settle_run_dir(&run_dir, config.trace_file);
 
         // Seed the initial population internally — transparent to the user,
         // like the old generational engine where `run` was the only call.
@@ -699,6 +708,12 @@ impl CoreEngine {
             children_born_at_clock: HashMap::new(),
             step_evolve: StepEvolve::default(),
             step_rl: RlVolume::default(),
+            total_challenged_turns: 0,
+            total_train_turns: 0,
+            expected_challenged_turns: 0.0,
+            step_challenged_inputs: 0,
+            total_challenged_inputs: 0,
+            expected_challenged_inputs: 0.0,
             champions: Vec::new(),
             checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),
@@ -805,6 +820,21 @@ impl CoreEngine {
                 self.header.config.smoothing_window
             )).into());
         }
+        // Same contract for the challenge trigger: it re-fires from
+        // (run_seed, net_seed, step, challenge_prob), so a resumed prob that
+        // differs from the recorded one would replay a DIFFERENT challenge
+        // pattern and break bit-exact parity.
+        if self.config.challenge_prob != self.header.config.challenge_prob {
+            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                "resume: challenge_prob mismatch — run recorded {} but the resume config sets {} — \
+                 the challenged-step replay pattern would diverge; set set_run_challenge_prob({}) \
+                 (or omit) to resume",
+                self.header.config.challenge_prob,
+                self.config.challenge_prob,
+                self.header.config.challenge_prob
+            ))
+            .into());
+        }
         let run_dir = self.run_dir.clone();
         let nets_dir = run_dir.join("nets");
         let mut loaded = 0usize;
@@ -832,7 +862,7 @@ impl CoreEngine {
             })?;
             let state = NetState::from_json(&raw)?;
             if !state.is_alive {
-                log::debug!(
+                tracing::debug!(
                     "race resume: skipping tombstone net {} (culled)",
                     state.hash
                 );
@@ -848,7 +878,7 @@ impl CoreEngine {
             if entered > 0 {
                 if let Some(lm) = state.last_metrics.as_ref() {
                     if entered > lm.step + 1 {
-                        log::warn!(
+                        tracing::warn!(
                             "race resume: skipping GHOST net {} (entered_at_step {} but last trained clock {} — a gate-rejected provisional child that leaked into nets/)",
                             state.hash,
                             entered,
@@ -1078,6 +1108,7 @@ impl CoreEngine {
             // Per-step accumulators start empty; the rollup at the END of this
             // step reads them (it is the last line printed for the step).
             self.step_rl = RlVolume::default();
+            self.step_challenged_inputs = 0;
 
             // ── 1. group step: every live net on the same shared batch ──────
             let hashes = self.state.live_hashes();
@@ -1189,10 +1220,10 @@ impl CoreEngine {
                     exam_mean_fitness: exam_mean,
                 });
                 if let Err(e) = self.write_checkpoints() {
-                    log::warn!("checkpoint ledger write failed: {e}");
+                    tracing::warn!("checkpoint ledger write failed: {e}");
                 }
                 if let Err(e) = self.write_live_frontier_states() {
-                    log::warn!("checkpoint live states write failed: {e}");
+                    tracing::warn!("checkpoint live states write failed: {e}");
                 }
                 // Elite weight snapshot (hard-kill durability): the frontier
                 // states above already carry topology + step counters every
@@ -1200,14 +1231,14 @@ impl CoreEngine {
                 // `kill -9` loses at most one checkpoint interval of them.
                 if self.config.elite_checkpoint_weights {
                     if let Err(e) = self.write_checkpoint_elite_safetensors() {
-                        log::warn!("checkpoint elite snapshot failed: {e}");
+                        tracing::warn!("checkpoint elite snapshot failed: {e}");
                     }
                 }
                 // Flush metrics at the checkpoint too: an interrupted run then
                 // keeps the per-step history up to its last checkpoint instead
                 // of losing the whole in-memory buffer.
                 if let Err(e) = self.flush_metrics_csv() {
-                    log::warn!("checkpoint metrics flush failed: {e}");
+                    tracing::warn!("checkpoint metrics flush failed: {e}");
                 }
                 if self.verbose_detail() {
                     let arrow = self.fitness.direction().arrow();
@@ -1235,14 +1266,27 @@ impl CoreEngine {
                     } else {
                         "—".to_string()
                     };
+                    // The challenge knob's CURRENT effective probability —
+                    // it decays linearly to 0 at the run's step budget (see
+                    // `challenge_fires`), so each checkpoint line shows the
+                    // reader where in the decay they are.
+                    let challenge_txt = if self.config.challenge_prob > 0.0 {
+                        format!(
+                            " │ challenge_prob {:.3}",
+                            self.effective_challenge_prob(clock)
+                        )
+                    } else {
+                        String::new()
+                    };
                     info!(
-                        "step {} │ checkpoint │ pop_mean_fitness {} {:.4} │ {}exam_mean_fitness {} (ledger: {} entries)",
+                        "step {} │ checkpoint │ pop_mean_fitness {} {:.4} │ {}exam_mean_fitness {} (ledger: {} entries){}",
                         clock,
                         arrow,
                         mean,
                         bar_txt,
                         exam_txt,
                         self.checkpoints.len(),
+                        challenge_txt,
                     );
                 }
             }
@@ -1417,1007 +1461,8 @@ impl CoreEngine {
         header.run_elapsed_secs = self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs();
         header.children_born_at_clock = self.children_born_at_clock.clone();
         if let Err(e) = crate::state::write_engine_json(&self.run_dir, &header) {
-            log::warn!("engine.json counter persistence failed: {e}");
+            tracing::warn!("engine.json counter persistence failed: {e}");
         }
-    }
-
-    /// Post-race pruner phase (Hard method): cull all but the top
-    /// `elite_count` live nets, then keep training the survivors for
-    /// `pruner.steps` extra steps with evolution and stop criteria off.
-    ///
-    /// The survivors continue through the SAME per-net step path (`step_one_net`)
-    /// with the SAME trainer, optimizer state, and shared stream — only the
-    /// orchestration differs: no evolve rolls fire (the race is over), and
-    /// `check_stop` is not consulted (its signals are population-level and
-    /// meaningless on 1–2 nets; std on a 1-net population is literally 0).
-    /// Every solo step is recorded exactly like a race step — history.csv
-    /// metric rows and the survivors' `nets/<hash>.json` step counters — so
-    /// the post-race extension is a visible, replayable part of the run.
-    fn run_pruner_phase(
-        &mut self,
-        reason: StopReason,
-        clock: usize,
-        pruner: crate::engine::config::PopPruner,
-    ) -> Result<StopReason> {
-        // Keep the top-k elites (k = max(1, elite_count)) — the same ranking
-        // the elite guard uses, so "who survives" is exactly "who was elite".
-        let keep = {
-            let k = self.config.elite_count.max(1).min(self.state.live_count());
-            let direction = self.fitness.direction();
-            let mut ranked: Vec<(String, f32)> = self
-                .state
-                .live_hashes()
-                .iter()
-                .filter_map(|h| {
-                    self.rolling_fitness
-                        .get(h)
-                        .filter(|b| !b.is_empty())
-                        .map(|b| (h.clone(), rolling_mean(b)))
-                })
-                .collect();
-            ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
-            ranked
-                .into_iter()
-                .take(k)
-                .map(|(h, _)| h)
-                .collect::<Vec<_>>()
-        };
-        // Worst-net dump BEFORE the cull: the anti-champion only exists
-        // while the full field is alive — after culling to elites there is
-        // no "worst" left to distinguish from the elite.
-        self.write_worst_artifacts()?;
-        let victims: Vec<String> = self
-            .state
-            .live_hashes()
-            .into_iter()
-            .filter(|h| !keep.contains(h))
-            .collect();
-        if self.verbose_detail() {
-            info!(
-                "── pruner phase ── race stop: {:?} at step {} → keeping top-{} ({}), culling {} → solo training for {} steps (freeze bypassed — real weight updates)",
-                reason,
-                clock,
-                keep.len(),
-                keep.iter()
-                    .map(|h| h[..8].to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                victims.len(),
-                pruner.steps,
-            );
-        }
-        for v in &victims {
-            // Attempt row first (victim identity readable), then the cull —
-            // same discipline as the crossover insert path.
-            let victim_seed = self.state.net(v).map(|s| s.net_seed);
-            self.record_attempt(
-                clock,
-                "pruner",
-                0,
-                None,
-                None,
-                "pruned",
-                "pruned",
-                None,
-                None,
-                None,
-                Some(v.as_str()),
-                victim_seed,
-            );
-            self.cull_net(v, clock, "pruned")?;
-        }
-        if !victims.is_empty() {
-            self.flush_metrics_csv()?;
-            self.write_live_frontier_states()?;
-        }
-        if pruner.steps == 0 {
-            self.write_champion_markdown()?;
-            self.write_champion_safetensors()?;
-            if self.verbose_detail() {
-                info!("  pruner phase: 0 steps configured — nothing further to train");
-            }
-            return Ok(reason);
-        }
-        // Solo extension: the same group-step shape, minus evolution and stop
-        // checks. Optimizer state is intact (nothing rebuilt) — the elites
-        // simply keep learning at the same LR/hyperparams. Elite freeze is
-        // BYPASSED (see `pruner_solo_active`): every survivor IS an elite,
-        // so freezing here would reduce the whole post-race workout to
-        // act-and-measure steps with zero weight updates.
-        self.pruner_solo_active = true;
-        for offset in 0..pruner.steps {
-            let step = clock + 1 + offset;
-            // Solo steps evolve nothing: both per-step accumulators start
-            // clean, so the rollup reports this step's own RL volume and the
-            // (already logged) pruner culls are not re-counted every step.
-            self.step_evolve = StepEvolve::default();
-            self.step_rl = RlVolume::default();
-            // The rollup's `took` must be THIS step's cost. The race loop
-            // resets the clock at the top of every iteration; the pruner
-            // loop had no reset, so its lines reported cumulative wall time
-            // since the race started (a pop-2 solo step showing "took 52.3s"
-            // when it really took ~0.9s). Same reset, same meaning.
-            self.step_started_at_wall = std::time::Instant::now();
-            let hashes = self.state.live_hashes();
-            if hashes.is_empty() {
-                break;
-            }
-            for hash in &hashes {
-                self.step_one_net(hash, step)?;
-            }
-            self.append_metrics_csv(step)?;
-            if self.log_level != crate::engine::config::LogLevel::None {
-                self.log_step_rollup(step);
-            }
-        }
-        let final_step = clock + pruner.steps;
-        self.pruner_solo_active = false;
-        self.write_champion_markdown()?;
-        self.write_champion_safetensors()?;
-        // NOTE: no worst dump here — the population was already culled to
-        // elites above (the worst was dumped pre-cull, before that).
-        if self.verbose_detail() {
-            info!(
-                "── pruner phase complete ── trained to step {} ({} solo step(s))",
-                final_step, pruner.steps,
-            );
-            self.log_stop_summary(final_step)?;
-        }
-        self.write_live_frontier_states()?;
-        self.flush_metrics_csv()?;
-        Ok(reason)
-    }
-
-    // ── One net's step ──────────────────────────────────────────────────────
-
-    /// Stop-time summary: which JSONs were written as the live frontier and
-    /// the resume command to continue from here.
-    fn log_stop_summary(&self, clock: usize) -> Result<()> {
-        let live = self.state.live_hashes();
-        info!(
-            "  wrote {} frontier snapshot(s) → nets/<hash>.json (one per live net)",
-            live.len(),
-        );
-        // The population size is part of the resume call (the engine refuses a
-        // mismatch instead of silently patching it), so print the number the
-        // caller must pass — not just the directory.
-        info!(
-            "  {} live net(s) at step {} → resume with: --resume {} --pop {}",
-            live.len(),
-            clock,
-            self.run_dir.display(),
-            live.len(),
-        );
-
-        // Final elite report: the top-k nets by smoothed fitness, with their
-        // metadata — the run's champions at stop time. Elite = rank, not
-        // identity, so this is "who holds the top-k right now".
-        let k = self.config.elite_count.max(1); // report at least the champion
-        let mut ranked: Vec<(String, f32, usize, Option<f32>)> = live // (hash, smoothed, step, eval_loss)
-            .iter()
-            .filter_map(|h| {
-                let buf = self.rolling_fitness.get(h)?;
-                if buf.is_empty() {
-                    return None;
-                }
-                let step = self
-                    .state
-                    .net(h)
-                    .and_then(|s| s.last_metrics.as_ref())
-                    .map(|m| m.step)
-                    .unwrap_or(0);
-                let eval_loss = self
-                    .state
-                    .net(h)
-                    .and_then(|s| s.last_metrics.as_ref())
-                    .and_then(|m| m.eval_loss);
-                Some((h.clone(), rolling_mean(buf), step, eval_loss))
-            })
-            .collect();
-        let direction = self.fitness.direction();
-        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
-        let arrow = direction.arrow();
-        info!("  ── final elites (top-{k}, fitness{arrow} smoothed) ──");
-        for (rank, (h, fit, step, eval_loss)) in ranked.iter().take(k).enumerate() {
-            // A frozen elite's last_metrics.step stays at its FIRST record
-            // (training is skipped, so nothing advances the recorded clock).
-            // Plain `last_step 0` therefore reads like "never played again"
-            // — say `frozen@0` instead: measured once, carried since.
-            let step_label = if self.config.freeze_elites && self.frozen_crown.contains(h) {
-                format!("frozen@{step}")
-            } else {
-                format!("last_step {step}")
-            };
-            // ± std over the smoothing window, same framing as the holdout
-            // guardrail: the mean alone hides the mix of raw values behind it
-            // (two elites at 500 can be 500-always vs 500-by-luck). A wide ±
-            // means the smoothed value rests on noisy raw steps — and at race
-            // end, that the ORDERING of this list itself is luck-sensitive.
-            // When std > mean/2, say so instead of trusting the reader to
-            // compare the two numbers.
-            let std_note = match self.rolling_fitness.get(h) {
-                Some(buf) if buf.len() > 1 => {
-                    let m = *fit;
-                    let var = buf
-                        .iter()
-                        .map(|&v| {
-                            let d = v - m;
-                            d * d
-                        })
-                        .sum::<f32>()
-                        / buf.len() as f32;
-                    let std = var.sqrt();
-                    let wide = std > m.abs() / 2.0;
-                    format!(
-                        " ± {std:.4}{}",
-                        if wide { " (noisy — rank not decisive)" } else { "" }
-                    )
-                }
-                _ => String::new(),
-            };
-            let meta = self.state.net(h).map(|s| {
-                // Trained-vs-acted split: with act-and-measure freeze a net's
-                // step count mixes real training updates with frozen passes,
-                // so the raw number hides how much it actually learned.
-                // trained + acted(frozen) always sums to the net's recorded
-                // step clock (= `last_step`/`frozen@N` on this line).
-                let frozen = s.frozen_spans.iter().map(|(a, b)| b - a + 1).sum::<usize>();
-                let acted = frozen.min(s.step);
-                let trained = s.step - acted;
-                format!(
-                    "origin={} born@{} params={} trained={} acted(frozen)={}",
-                    s.created_from.clone().unwrap_or_else(|| "?".into()),
-                    s.entered_at_step,
-                    s.meta
-                        .params
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "?".into()),
-                    trained,
-                    acted,
-                )
-            });
-            // eval_loss: `—` when the mode doesn't produce one (RL trainers
-            // report fitness only). `None` is Rust-speak; a dash reads as
-            // "not applicable", which is the truth.
-            let eval_label = eval_loss
-                .map(|v| format!("{v:.6}"))
-                .unwrap_or_else(|| "—".to_string());
-            info!(
-                "  #{} {} fitness{arrow} {:.4}{} │ eval_loss {} │ {} │ {}",
-                rank + 1,
-                &h[..8.min(h.len())],
-                fit,
-                std_note,
-                eval_label,
-                step_label,
-                meta.unwrap_or_default(),
-            );
-        }
-        Ok(())
-    }
-
-    /// Write the top-k elites' topology markdown to the run dir, one file
-    /// per elite (`elite-<hash>.md`), k = `elite_count` (min 1). The user
-    /// configured more than one elite — they get more than one artifact.
-    /// UNCONDITIONAL — called at stop regardless of log level: the `.md` file
-    /// is a run artifact (like `nets/<hash>.json` and `history.csv`), not a
-    /// log line. Prints a confirmation only when per-step detail is on.
-    fn write_champion_markdown(&mut self) -> Result<()> {
-        if !self.config.elite_save_topology {
-            return Ok(());
-        }
-        self.record_champions();
-        let ranked = self.champion_ranked();
-        let k = ranked.len();
-        for (rank, (hash, fitness)) in ranked.iter().enumerate() {
-            let Some(state) = self.state.net(hash) else {
-                continue;
-            };
-            let Ok(topo) = state.topology() else {
-                continue;
-            };
-            let short = &hash[..8.min(hash.len())];
-            let path = self.run_dir.join(format!("elite-{short}.md"));
-            let label = if k <= 1 {
-                "Elite".to_string()
-            } else {
-                format!("Elite #{}", rank + 1)
-            };
-            let md = format!(
-                "**{label} · fitness {} (smoothed) = {:.4}**\n\n{}",
-                self.fitness.direction().arrow(),
-                fitness,
-                crate::utils::markdown::topology_markdown(&topo, None),
-            );
-            match std::fs::write(&path, &md) {
-                Ok(()) => {
-                    if self.verbose_detail() {
-                        info!(
-                            "  elite topology → {} (markdown, ready to view)",
-                            path.display()
-                        );
-                    }
-                }
-                Err(source) => log::warn!(
-                    "elite markdown write failed: {}",
-                    crate::utils::error::EngineError::Io {
-                        path: path.display().to_string(),
-                        source,
-                    }
-                ),
-            }
-        }
-        Ok(())
-    }
-
-    /// Write the top-k elites' weights as `.safetensors`, one file per elite
-    /// (`elite-<hash>.safetensors`), k = `elite_count` (min 1). UNCONDITIONAL
-    /// — same artifact discipline as [`Self::write_champion_markdown`]: lands
-    /// on disk at every log level. Exports each elite's live in-memory
-    /// `Network` — byte-faithful coefficients, exactly what the race left
-    /// them with.
-    fn write_champion_safetensors(&mut self) -> Result<()> {
-        if !self.config.elite_save_safetensors {
-            return Ok(());
-        }
-        self.record_champions();
-        let ranked = self.champion_ranked();
-        for (hash, _) in &ranked {
-            let short = &hash[..8.min(hash.len())];
-            let path = self.run_dir.join(format!("elite-{short}.safetensors"));
-            // The elite's live Network is still in memory at stop — export
-            // it directly, no rebuild/replay needed. Its coefficients are the
-            // exact ones the race left it with (byte-faithful by construction).
-            match self.networks.get(hash.as_str()) {
-                Some(net) => {
-                    if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
-                        log::warn!("elite safetensors export failed: {e}");
-                    } else if self.verbose_detail() {
-                        info!("  elite weights → {} (safetensors)", path.display());
-                    }
-                }
-                None => log::warn!("elite safetensors export failed: live network missing"),
-            }
-        }
-        Ok(())
-    }
-
-    /// Per-checkpoint elite weight snapshot (hard-kill durability). Writes
-    /// each top-`elite_count` net's weights as
-    /// `checkpoint-elite-<hash>.safetensors`, OVERWRITTEN every checkpoint —
-    /// latest wins, so the run dir never accumulates one file per era. The
-    /// stop-time `elite-<hash>.safetensors` artifacts stay separate (they are
-    /// the run's headline output; a mid-run snapshot must never shadow them).
-    /// Fires every checkpoint behind `elite_checkpoint_weights`.
-    fn write_checkpoint_elite_safetensors(&mut self) -> Result<()> {
-        self.record_champions();
-        for (hash, _) in self.champion_ranked() {
-            let short = &hash[..8.min(hash.len())];
-            let path = self
-                .run_dir
-                .join(format!("checkpoint-elite-{short}.safetensors"));
-            match self.networks.get(hash.as_str()) {
-                Some(net) => {
-                    if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
-                        log::warn!("checkpoint elite snapshot failed: {e}");
-                    } else if self.verbose_detail() {
-                        log::debug!("  checkpoint elite weights → {}", path.display());
-                    }
-                }
-                None => log::warn!("checkpoint elite snapshot: live network missing"),
-            }
-        }
-        Ok(())
-    }
-
-    /// Full hashes of the elite set exported at stop — the single source of
-    /// truth for "which nets are the champions". Read this (not file mtimes,
-    /// not glob order) when post-race tooling needs the champion: the frontier
-    /// snapshot writes all live nets in HashMap order, so "latest file" is
-    /// arbitrary. Empty until the first champion dump.
-    pub fn champion_hashes(&self) -> &[String] {
-        &self.champions
-    }
-
-    /// The champion set: top-`elite_count` live hashes by smoothed fitness.
-    /// The ONE ranking both elite writers consume, so `elite-<hash>.md`,
-    /// `elite-<hash>.safetensors` and `champion_hashes()` can never disagree.
-    fn champion_ranked(&self) -> Vec<(String, f32)> {
-        let k = self.config.elite_count.max(1);
-        self.rank_live().into_iter().take(k).collect()
-    }
-
-    /// Snapshot the current champion set into `self.champions` before any
-    /// artifact writing, so `champion_hashes()` reflects exactly the set the
-    /// writers iterate — even if an individual file write fails.
-    fn record_champions(&mut self) {
-        self.champions = self.champion_ranked().into_iter().map(|(h, _)| h).collect();
-    }
-
-    /// Rank live nets by smoothed fitness, best first. Shared by the elite
-    /// artifact writers and (with `.last()`) the worst-net dump.
-    fn rank_live(&self) -> Vec<(String, f32)> {
-        let mut ranked: Vec<(String, f32)> = self
-            .state
-            .live_hashes()
-            .iter()
-            .filter_map(|h| {
-                let buf = self.rolling_fitness.get(h)?;
-                if buf.is_empty() {
-                    return None;
-                }
-                Some((h.clone(), rolling_mean(buf)))
-            })
-            .collect();
-        let direction = self.fitness.direction();
-        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
-        ranked
-    }
-
-    /// When any `worst_save_*` flag is set: save the WORST live net's
-    /// artifacts — `worst-<hash>.md` (topology markdown) and/or
-    /// `worst-<hash>.safetensors` (weights), each behind its own flag. The
-    /// anti-champion is the net the search avoided — its topology is often
-    /// the cheapest way to see what the fitness signal rejected.
-    ///
-    /// MUST be called BEFORE any cull shrinks the population: the worst is
-    /// ranked over the full pre-cull field (e.g. the pop_pruner culls to
-    /// elites, so a post-cull call would find no worst to dump).
-    fn write_worst_artifacts(&self) -> Result<()> {
-        if !self.config.worst_save_topology && !self.config.worst_save_safetensors {
-            return Ok(());
-        }
-        let ranked = self.rank_live();
-        let Some((worst, worst_fitness)) = ranked.last() else {
-            return Ok(()); // nothing ever scored — nothing to dump
-        };
-        let short = &worst[..8.min(worst.len())];
-        if self.config.worst_save_topology {
-            if let Some(state) = self.state.net(worst) {
-                if let Ok(topo) = state.topology() {
-                    let path = self.run_dir.join(format!("worst-{short}.md"));
-                    let md = format!(
-                        "**Worst · fitness {} (smoothed) = {:.4}**\n\n{}",
-                        self.fitness.direction().arrow(),
-                        worst_fitness,
-                        crate::utils::markdown::topology_markdown(&topo, None),
-                    );
-                    if let Err(source) = std::fs::write(&path, &md) {
-                        log::warn!(
-                            "worst markdown write failed: {}",
-                            crate::utils::error::EngineError::Io {
-                                path: path.display().to_string(),
-                                source,
-                            }
-                        );
-                    }
-                }
-            }
-        }
-        if self.config.worst_save_safetensors {
-            let path = self.run_dir.join(format!("worst-{short}.safetensors"));
-            match self.networks.get(worst.as_str()) {
-                Some(net) => {
-                    if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
-                        log::warn!("worst safetensors export failed: {e}");
-                    } else if self.verbose_detail() {
-                        info!("  worst-net artifacts → worst-{short}.md / .safetensors");
-                    }
-                }
-                None => log::warn!("worst safetensors export failed: live network missing"),
-            }
-        }
-        Ok(())
-    }
-
-    /// Step one live net at the given step_clock: train on the shared train
-    /// batch, eval on the shared eval batch, record metrics into `RaceState`,
-    /// push fitness into the rolling buffer, overwrite `nets/<hash>.json`,
-    /// log one per-net line.
-    ///
-    /// The net's `Network` + `Optimizer` live in the engine's maps and are
-    /// mutated in place — coefficients evolve across steps, optimizer state
-    /// carries forward. **Not rebuilt each step** (that would lose optimizer
-    /// state and forget prior training).
-    fn step_one_net(&mut self, hash: &str, clock: usize) -> Result<()> {
-        // ANTI-DEVOLUTION A — elite freeze (computed BEFORE the optimizer
-        // borrow): top-k nets skip the trainer call entirely. Their skill is
-        // the frozen state, so the "report" is the last recorded metrics —
-        // re-measuring would require re-running the trainer, which is
-        // exactly what we're skipping. Scoring, ranking, parent selection
-        // all proceed as normal off the carried metrics.
-        // The pruner phase bypasses freeze entirely: it keeps ONLY elites,
-        // so with freeze active every solo step would be a no-op-optimizer
-        // act-and-measure and the post-race workout would train nothing
-        // (plus every crown flip would fire the dethrone optimizer reset,
-        // repeatedly erasing the survivor's momentum).
-        let frozen = !self.pruner_solo_active
-            && self.config.freeze_elites
-            && self.elite_hashes().contains(&hash.to_string());
-        if frozen && !self.frozen_crown.contains(hash) {
-            // Crown transition: this net newly joined the frozen set (first
-            // crowning or a child trained past a frozen elite). One info
-            // line, only on the transition; stable steps are silent (the ★
-            // badge on the rollup line carries the state).
-            let fitness = self
-                .state
-                .net(hash)
-                .and_then(|s| s.last_metrics.as_ref().map(|m| m.fitness));
-            let seat = self.elite_hashes().len();
-            let pos = self
-                .elite_hashes()
-                .iter()
-                .position(|h| h == hash)
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            if seat == 1 {
-                // Single-elite wording (the common case): crown moves as one.
-                if self.frozen_crown.is_empty() {
-                    info!(
-                        "step {} │ freeze │ champion {} crowned (fitness{} {}) — weight updates paused (act+measure continues)",
-                        clock,
-                        &hash[..8.min(hash.len())],
-                        self.fitness.direction().arrow(),
-                        fitness.map(fmt2).unwrap_or_else(|| "—".into()),
-                    );
-                } else {
-                    let prev = self.frozen_crown.iter().next().cloned().unwrap_or_default();
-                    info!(
-                        "step {} │ freeze │ crown moved {} → {} (fitness{} {}) — previous champion resumes weight updates",
-                        clock,
-                        &prev[..8.min(prev.len())],
-                        &hash[..8.min(hash.len())],
-                        self.fitness.direction().arrow(),
-                        fitness.map(fmt2).unwrap_or_else(|| "—".into()),
-                    );
-                }
-            } else {
-                // Multi-elite: say WHICH seat the net just took. No
-                // "crown moved" language — with k seats, one joining does
-                // not imply another was dethroned.
-                info!(
-                    "step {} │ freeze │ elite seat {pos}/{seat}: {} frozen (fitness{} {}) — weight updates paused (act+measure continues)",
-                    clock,
-                    &hash[..8.min(hash.len())],
-                    self.fitness.direction().arrow(),
-                    fitness.map(fmt2).unwrap_or_else(|| "—".into()),
-                );
-            }
-            self.frozen_crown.insert(hash.to_string());
-        }
-        // A net that LOST the crown (it sits in `frozen_crown` but is no
-        // longer in the elite set) simply resumes normal stepping: frozen
-        // nets ACT and MEASURE every step (below), so they never fall behind
-        // the clock — there is no catch-up gauntlet on dethrone.
-        if !frozen && self.frozen_crown.contains(hash) {
-            self.frozen_crown.remove(hash);
-            // Fair-warm-up on dethrone: the optimizer STATE (momentum/velocity/
-            // step counters) is stale — its notes describe the gradient
-            // landscape of the frozen era. Resetting keeps all the weights
-            // (the frozen skill) and all the hyperparameters, but forgets the
-            // stale trend, so the first reclaim updates are clean-scaled.
-            // Say WHO took the seat: the new elite set minus the dethroned
-            // net (the seats just re-dealt). First non-dethroned elite.
-            let taker = self
-                .elite_hashes()
-                .into_iter()
-                .find(|h| h != hash)
-                .unwrap_or_default();
-            info!(
-                "step {} │ freeze │ {} dethroned (seat → {}) — resumes training with its last optimizer state (was acting/measuring while frozen, no catch-up needed)",
-                clock,
-                &hash[..8.min(hash.len())],
-                if taker.is_empty() {
-                    "?".to_string()
-                } else {
-                    taker[..8.min(taker.len())].to_string()
-                },
-            );
-        }
-        if frozen {
-            // ACT-AND-MEASURE freeze: the elite plays its normal step against
-            // the current clock (fresh batch / fresh env matches — the fitness
-            // input is real, so its standing stays honest and the pack can
-            // pass it) but the weight update is DISCARDED: the step runs
-            // through a no-op optimizer, leaving the frozen weights and the
-            // real optimizer's moments untouched.
-            let mut noop = NoopOptimizer;
-            let report = self.run_trainer_step(hash, clock, &mut noop)?;
-            let metrics = crate::state::NetMetrics {
-                step: clock,
-                train_loss: report.train_loss,
-                eval_loss: report.eval_loss,
-                fitness: report.fitness,
-                informative: report.informative,
-                frozen: true,
-            };
-            if let Some(buf) = self.rolling_fitness.get_mut(hash) {
-                buf.push(metrics.fitness);
-            }
-            if let Some(buf) = self.rolling_train.get_mut(hash) {
-                buf.push(metrics.train_loss);
-            }
-            if let Some(buf) = self.rolling_eval.get_mut(hash) {
-                if let Some(e) = metrics.eval_loss {
-                    buf.push(e);
-                }
-            }
-            self.state.record_step(hash, metrics.clone())?;
-            // Persist the act-and-measure marker: replay must re-run this
-            // clock through the no-op optimizer (see catch_up_step).
-            if let Some(s) = self.state.net_mut(hash) {
-                s.record_frozen_step(clock);
-            }
-            log::debug!(
-                "step {} │ net {} │ FROZEN (elite) — acted+measured fitness{} {} (no weight update)",
-                clock,
-                &hash[..8.min(hash.len())],
-                self.fitness.direction().arrow(),
-                fmt2(metrics.fitness),
-            );
-            return Ok(());
-        }
-        // One step = whatever the caller's training scheme does for one step
-        // clock. The engine only consumes the returned report.
-        let optimizer_ok = self.optimizers.contains_key(hash);
-        if !optimizer_ok {
-            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "race: net {hash} not live (no Optimizer in memory)"
-            ))
-            .into());
-        }
-        let report = self.run_trainer_step_with_real_optimizer(hash, clock)?;
-        let metrics = NetMetrics {
-            step: clock,
-            train_loss: report.train_loss,
-            eval_loss: report.eval_loss,
-            fitness: report.fitness,
-            informative: report.informative,
-            frozen: false,
-        };
-        self.state.record_step(hash, metrics.clone())?;
-        if let Some(buf) = self.rolling_fitness.get_mut(hash) {
-            buf.push(metrics.fitness);
-        }
-        if let Some(buf) = self.rolling_train.get_mut(hash) {
-            buf.push(metrics.train_loss);
-        }
-        if let Some(buf) = self.rolling_eval.get_mut(hash) {
-            if let Some(e) = metrics.eval_loss {
-                buf.push(e);
-            }
-        }
-        // Per-net detail is debug-only (Plan A: the user log shows one rollup
-        // line per step — see `run`). All values remain in nets/<hash>.json.
-        let dir = self.fitness.direction().arrow();
-        log::debug!(
-            "step {} │ net {} │ train_loss↓ {} │ eval_loss↓ {} │ fitness{} {}",
-            clock,
-            hash,
-            fmt2(metrics.train_loss),
-            fmt_opt2(&metrics.eval_loss),
-            dir,
-            fmt2(metrics.fitness),
-        );
-        Ok(())
-    }
-
-    /// The normal group step: drive one trainer step through the net's REAL
-    /// optimizer (weights update, momentum carries forward).
-    fn run_trainer_step_with_real_optimizer(
-        &mut self,
-        hash: &str,
-        clock: usize,
-    ) -> Result<crate::trainer::StepReport> {
-        let mut optimizer = self.optimizers.remove(hash).ok_or_else(|| {
-            crate::utils::error::EngineError::InvalidOptions(format!(
-                "race: net {hash} not live (no Optimizer in memory)"
-            ))
-        })?;
-        let report = self.run_trainer_step(hash, clock, optimizer.as_mut())?;
-        self.optimizers.insert(hash.to_string(), optimizer);
-        Ok(report)
-    }
-
-    /// Drive one trainer step for the live net `hash` at `clock` through the
-    /// given optimizer — the shared body of the normal group step and the
-    /// act-and-measure freeze pass (which passes a [`NoopOptimizer`]). Seeds
-    /// the step RNGs, runs the trainer, runs the debug contract probe, and
-    /// accumulates RL volume; recording metrics/buffers is the CALLER's job
-    /// (the freeze pass records before returning early).
-    fn run_trainer_step(
-        &mut self,
-        hash: &str,
-        clock: usize,
-        optimizer: &mut dyn flodl::nn::optim::Optimizer,
-    ) -> Result<crate::trainer::StepReport> {
-        let net_seed = self.state.net(hash).map(|s| s.net_seed as u64).unwrap_or(0);
-        // The mode decides the context: Tabular receives the run's data
-        // handle (guaranteed present by construction), RL receives none.
-        let run_data = self
-            .dataset
-            .as_ref()
-            .zip(self.stream.as_ref())
-            .map(|(dataset, stream)| crate::trainer::RunData { dataset, stream });
-        let env = crate::trainer::StepEnv {
-            step: clock,
-            run_seed: self.header.run_seed,
-            pop_size: self.config.pop_size,
-            live_count: self.state.live_count(),
-            checkpoint_every: self.config.checkpoint_every,
-            smoothing_window: self.config.smoothing_window,
-        };
-        let net = self.networks.get_mut(hash).ok_or_else(|| {
-            crate::utils::error::EngineError::InvalidOptions(format!(
-                "race: net {hash} not live (no Network in memory)"
-            ))
-        })?;
-        // Seed BOTH RNGs for this (net, step) before the trainer runs: gras's
-        // fastrand stream and libtorch's global RNG (dropout masks). Without
-        // the libtorch seed a `dropout_prob > 0` net redraws different masks
-        // on replay and breaks resume parity. The engine owns this because
-        // the trainer — any trainer — may draw masks inside `train_step`.
-        crate::utils::race_steps::seed_step_randomness(net_seed, clock as u64, 0);
-        let report = self.trainer.train_step(
-            net,
-            optimizer,
-            clock,
-            run_data.as_ref(),
-            &self.fitness,
-            &self.metrics,
-            env,
-            hash,
-            net_seed,
-        )?;
-        // Debug-only contract probe: the Trainer's per-step clause says the
-        // report describes the net AFTER this step's training. Re-score the
-        // net on the step's eval batch and check the reported eval loss is
-        // what this net actually scores — catches a stale/fabricated report
-        // at development time. Zero cost in release.
-        #[cfg(debug_assertions)]
-        // Tabular-only: the probe needs an eval batch + a computed fitness
-        // scorer. RL mode has neither (reported fitness, no dataset).
-        if let (Some(reported), Some(net), Some(stream), Some(dataset), true) = (
-            report.eval_loss,
-            self.networks.get_mut(hash),
-            self.stream.as_ref(),
-            self.dataset.as_ref(),
-            self.fitness.is_computed(),
-        ) {
-            let eval_batch = stream
-                .eval_batch(dataset, clock as u64)
-                .expect("probe: eval batch");
-            if let (Some(loss), Some(fit)) = (
-                self.trainer.tabular_loss(),
-                Some(&self.fitness),
-            ) {
-                if let Ok(actual) = eval_one_step(net, loss, fit, &self.metrics, &eval_batch) {
-                    if let Some(actual_loss) = actual.eval_loss {
-                        let rel = ((reported - actual_loss).abs()) / actual_loss.abs().max(1e-6);
-                        assert!(
-                            rel < 1e-3,
-                            "trainer contract violated: step {clock} net {hash} reported eval_loss {reported:.6} but the net scores {actual_loss:.6} — the StepReport must describe the net's state at the end of this step"
-                        );
-                    }
-                }
-            }
-        }
-        // RL volume: the trainer's reported environment work for this step
-        // accumulates across the group so the rollup can show the step's real
-        // workload (matches + turns). Tabular trainers report `None`.
-        if let Some(rl) = report.rl {
-            self.step_rl.nets += 1;
-            self.step_rl.matches += rl.matches;
-            self.step_rl.turns += rl.turns;
-        }
-        Ok(report)
-    }
-
-    /// One rollup line per step: pop size, the train-loss mean ± std, the
-    /// mode's middle column, and the fitness column in the same shape. Two
-    /// decimals throughout — the spread is the signal worth reading, the
-    /// extremes are noise. Printed LAST for the step (see the run loop), so
-    /// it lands at the bottom of the terminal.
-    ///
-    /// Middle column by mode: Tabular = held-out `eval_loss`; RL = the step's
-    /// environment volume (`matches`/`turns`, from [`RlVolume`]) — an RL net
-    /// has no held-out batch, and the volume is what explains the wall time.
-    fn log_step_rollup(&mut self, clock: usize) {
-        // Smoothed (K-step rolling mean) population stats — raw per-step
-        // values bounce with batch difficulty; the trend is what matters.
-        let mut trains = Vec::new();
-        let mut evals = Vec::new();
-        for h in self.state.live_hashes() {
-            if let Some(buf) = self.rolling_train.get(h.as_str()) {
-                trains.push(rolling_mean(buf));
-            }
-            if let Some(buf) = self.rolling_eval.get(h.as_str()) {
-                if !buf.is_empty() {
-                    evals.push(rolling_mean(buf));
-                }
-            }
-        }
-        // Population mean ± population std, 2 decimals.
-        let stats = |v: &[f32]| {
-            if v.is_empty() {
-                "—".to_string()
-            } else {
-                let n = v.len() as f32;
-                let mean = v.iter().sum::<f32>() / n;
-                let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
-                format!("{mean:.2} ± {:.2}", var.sqrt())
-            }
-        };
-        // Per-step wall time: the step's own cost (train + evolve), not time
-        // since run start. Matters most in RL (one step = many full matches).
-        let step_secs = self.step_started_at_wall.elapsed().as_secs_f32();
-        // Fitness column: same mean ± std shape so all three read alike.
-        let fits: Vec<f32> = self
-            .state
-            .live_hashes()
-            .iter()
-            .filter_map(|h| {
-                self.rolling_fitness
-                    .get(h.as_str())
-                    .filter(|b| !b.is_empty())
-            })
-            .map(rolling_mean)
-            .collect();
-        let fit_stats = stats(&fits);
-        // The mode's middle column: tabular reports the held-out eval loss,
-        // RL reports the environment volume it actually played.
-        let mid = if !self.trainer.is_rl() {
-            format!("eval_loss↓ {}", stats(&evals))
-        } else {
-            self.step_rl.label()
-        };
-        // Per-step rollup: Summ = compact one-liner; Minimal = framed table
-        // (from step 2 — deltas need a prior step). The ★ badge names the
-        // CURRENT elite set (top-`elite_count` by smoothed fitness this
-        // step) — it explains who is immune to culls right now. With
-        // `freeze_elites` on, every elite seat is frozen each step, so the
-        // set needs no per-net marker: the badge lists the names alone.
-        let freeze_badge = {
-            let elites = self.elite_hashes();
-            if elites.is_empty() {
-                String::new()
-            } else {
-                let mut names: Vec<String> = elites
-                    .iter()
-                    .map(|h| h[..8.min(h.len())].to_string())
-                    .collect();
-                names.sort();
-                format!(" │ ★ {}", names.join(" "))
-            }
-        };
-        if self.log_level == crate::engine::config::LogLevel::Minimal {
-            self.log_minimal_table(&trains, &evals, &fits, step_secs);
-        } else {
-            info!(
-                "step {} │ pop {} │ train_loss↓ {} │ {} │ fitness{} {} │ took {:.1}s{}",
-                clock,
-                self.state.live_count(),
-                stats(&trains),
-                mid,
-                self.fitness.direction().arrow(),
-                fit_stats,
-                step_secs,
-                freeze_badge,
-            );
-        }
-    }
-
-    /// `Minimal` mode: one comfy framed table per step (starting at step 2 —
-    /// step 1 has no prior step to diff against). Values "update in place":
-    /// the shape is identical every step, only the numbers move. Deltas reuse
-    /// what the engine already reports (population-mean smoothed values vs the
-    /// last step); a zero delta drops the parenthetical. The evolve counters
-    /// and the best-net footer are plain current values — no delta on the
-    /// footer. Nothing else is printed per step in this mode.
-    ///
-    /// Row 1's tail is mode-dependent, exactly like the `Summ` line: tabular
-    /// shows the held-out `eval_loss`, RL shows the step's environment volume
-    /// (`matches`/`turns`). Rendered at the END of the step, so the evolve
-    /// counters in the frame are this step's own.
-    fn log_minimal_table(&mut self, trains: &[f32], evals: &[f32], fits: &[f32], step_secs: f32) {
-        let mean = |v: &[f32]| {
-            if v.is_empty() {
-                f32::NAN
-            } else {
-                v.iter().sum::<f32>() / v.len() as f32
-            }
-        };
-        let (train_m, eval_m, fit_m) = (mean(trains), mean(evals), mean(fits));
-        // Delta vs the previous step's mean; omitted entirely when 0. The
-        // first table render (step 2) sets the baseline without deltas.
-        // Only surface a delta that survives 2-decimal rounding, so the table
-        // never shows a meaningless `(∆+0.00)`.
-        let delta = |cur: f32, prev: Option<f32>| match prev {
-            Some(p) if (cur - p).abs() >= 5e-3 => format!(" (∆{:+.2})", cur - p),
-            _ => String::new(),
-        };
-        let (pt, pe, pf) = self
-            .minimal_prev_means
-            .unwrap_or((f32::NAN, f32::NAN, f32::NAN));
-        let pop = self.state.live_count();
-        let e = self.step_evolve;
-        // Build the rows first, THEN size the box: a fixed width overflowed
-        // on long delta lines, swallowed the right border, and glued rows
-        // together on one terminal line. Padding is char-count based — the
-        // content itself is ASCII (the ↓/↑/∆ glyphs are terminal-drawn in
-        // the labels, and the pad uses the raw byte length which matches
-        // since every glyph here is 3-byte UTF-8 but consistently present
-        // per column) — so alignment holds.
-        let mut rows: Vec<String> = vec![
-            if !self.trainer.is_rl() {
-                format!(
-                    "pop {:>3} │ train_loss↓ {:.2}{} │ eval_loss↓ {:.2}{}",
-                    pop,
-                    train_m,
-                    delta(train_m, Some(pt)),
-                    eval_m,
-                    delta(eval_m, Some(pe)),
-                )
-            } else {
-                format!(
-                    "pop {:>3} │ train_loss↓ {:.2}{} │ {}",
-                    pop,
-                    train_m,
-                    delta(train_m, Some(pt)),
-                    self.step_rl.label(),
-                )
-            },
-            format!(
-                "fitness{} {:.2}{} │ culls {} │ inserts {}",
-                self.fitness.direction().arrow(),
-                fit_m,
-                delta(fit_m, Some(pf)),
-                e.culls,
-                e.inserts,
-            ),
-            format!(
-                "crossover fired {} ({} inserted, {} spent) │ mutation rolled {} ({} immigrant(s))",
-                e.cross_fired, e.cross_survived, e.cross_discarded, e.mutate_fired, e.mutate_fired,
-            ),
-            format!("step took {:.1}s", step_secs),
-        ];
-        // Anti-devolution row — only when a knob is on (zero noise by
-        // default): the elite set and/or the current demotion count. Same
-        // annotation style as the Summ line's badge.
-        let mut guard_cells: Vec<String> = Vec::new();
-        if self.config.freeze_elites || self.config.elite_count > 0 {
-            let elites = self.elite_hashes();
-            let mut names: Vec<String> = elites
-                .iter()
-                .map(|h| h[..8.min(h.len())].to_string())
-                .collect();
-            names.sort();
-            guard_cells.push(format!("elite: {}", names.join(" ")));
-        }
-        if !guard_cells.is_empty() {
-            rows.push(guard_cells.join(" │ "));
-        }
-        // Display width: count chars, not bytes (↓/↑/∆ are 3 bytes, 1 char).
-        let inner = rows
-            .iter()
-            .map(|r| r.chars().count())
-            .max()
-            .unwrap_or(0)
-            .max(20);
-        let pad = |s: &String| {
-            let visible = s.chars().count();
-            format!("│ {}{}│", s, " ".repeat(inner.saturating_sub(visible)))
-        };
-        let top = format!("┌{}┐", "-".repeat(inner + 2));
-        let bot = format!("└{}┘", "-".repeat(inner + 2));
-
-        println!("\x1b[2K\r{}", top);
-        for r in &rows {
-            println!("\x1b[2K\r{}", pad(r));
-        }
-        println!("\x1b[2K\r{}", bot);
-        // Baseline for the next step's deltas.
-        self.minimal_prev_means = Some((train_m, eval_m, fit_m));
     }
 
     // ── Smoothed fitness ────────────────────────────────────────────────────
@@ -2425,7 +1470,7 @@ impl CoreEngine {
     /// Per-net rolling-mean fitness over the live population, in
     /// `live_hashes()` order — the shared input for the checkpoint ledger,
     /// cull/insert ranking, and `RaceSnapshot`.
-    fn smoothed_fitness_values(&self) -> Vec<f32> {
+    pub(crate) fn smoothed_fitness_values(&self) -> Vec<f32> {
         // Only nets with a non-empty rolling buffer get a smoothed value. A
         // freshly caught-up child's buffer is populated during catch-up
         // (replayed fitness for steps 0..clock), so it IS included immediately
@@ -2456,925 +1501,40 @@ impl CoreEngine {
     }
 
     /// The post-race holdout guardrail: reload the champion's TRAINED
-    /// weights from this run's exports and play `matches` fresh unseen games
-    /// through the user's `ChampionScorer` (play one game, same units as the
-    /// reported fitness). The engine fills in everything run-specific — run
-    /// dir, champion hash, the race's smoothed fitness for the verdict — so
-    /// the user call is just `engine.guardrail(&mut scorer, matches, device)`.
+    /// weights from this run's exports and play fresh unseen games through
+    /// the run's OWN trainer (`holdout_score` — one game per call, same
+    /// units as the reported fitness). No scorer object to wire: the engine
+    /// owns the trainer, so the whole call is `engine.guardrail(device)`.
+    /// Game count defaults to the trainer's own measurement batch shape
+    /// (`holdout_matches`); pass `Some(n)` to override.
     ///
-    /// `None` = the champion could not be reloaded (missing/unloadable
-    /// weights — the verdict would be about a stranger) or every game
-    /// failed; both log a warning.
+    /// `None` = no champion was ever exported, the champion could not be
+    /// reloaded (missing/unloadable weights — the verdict would be about a
+    /// stranger), or every game failed; each logs a warning.
     pub fn guardrail(
-        &self,
-        scorer: &mut dyn crate::engine::guardrail::ChampionScorer,
-        matches: usize,
+        &mut self,
         device: flodl::Device,
+        matches: Option<usize>,
     ) -> Option<crate::engine::guardrail::GuardrailVerdict> {
         let champion = self.champions.first()?;
+        let matches = matches.unwrap_or_else(|| self.trainer.holdout_matches().unwrap_or(16));
         let race_smoothed = self.smoothed_fitness_of(champion);
-        crate::engine::guardrail::check_champion(
+        crate::engine::guardrail::score_with(
             &self.run_dir,
             champion,
             race_smoothed,
-            scorer,
             matches,
             device,
+            &mut self.trainer,
+            |t, net, game_i| crate::trainer::EngineTrainer::holdout_score(&mut **t, net, game_i),
         )
-    }
-
-    /// The best smoothed fitness in the live population (under the fitness
-    /// direction).
-    fn best_smoothed_fitness(&self) -> f32 {
-        let hashes = self.state.live_hashes();
-        if hashes.is_empty() {
-            return 0.0;
-        }
-        let direction = self.fitness.direction();
-        let mut best = rolling_mean(self.rolling_fitness.get(&hashes[0]).unwrap());
-        for h in &hashes[1..] {
-            let v = rolling_mean(self.rolling_fitness.get(h).unwrap());
-            if direction.is_better(v, best) {
-                best = v;
-            }
-        }
-        best
-    }
-
-    // ── Cull + insert ───────────────────────────────────────────────────────
-
-    /// Fresh empty rolling buffer for a net about to be caught up, so
-    /// catch-up's per-step pushes land somewhere — a live net must never be
-    /// without a buffer entry.
-    fn pre_insert_buffer(&mut self, hash: &str) {
-        self.rolling_fitness.insert(
-            hash.to_string(),
-            RollingBuffer::new(self.config.smoothing_window),
-        );
-        self.rolling_train.insert(
-            hash.to_string(),
-            RollingBuffer::new(self.config.smoothing_window),
-        );
-        self.rolling_eval.insert(
-            hash.to_string(),
-            RollingBuffer::new(self.config.smoothing_window),
-        );
-    }
-
-    /// A guaranteed-fresh random child (mutation path): roll `random_child`
-    /// directly (bypassing the crossover/mutation dispatch, which the caller
-    /// has already resolved), re-rolling on duplicate hashes (bounded).
-    fn generate_random_at(&mut self, clock: usize, start_idx: usize) -> Result<RaceChild> {
-        for attempt in 0..8 {
-            let child = self.random_child(clock, start_idx + attempt)?;
-            if !self.state.net(&child.state.hash).is_some() {
-                // consume the ordinal(s) we used
-                *self.children_born_at_clock.get_mut(&clock).unwrap() = start_idx + attempt + 1;
-                return Ok(child);
-            }
-            if self.verbose_detail() {
-                info!(
-                    "step {} │ random child {} is a duplicate topology → re-rolling unique seed",
-                    clock,
-                    &child.state.hash[..8],
-                );
-            }
-        }
-        Err(flodl::tensor::TensorError::new(
-            "race: could not generate a unique random child after 8 attempts",
-        ))
-    }
-
-    /// Insert a caught-up child into the live maps (state, network, optimizer;
-    /// its rolling buffer was pre-inserted before catch-up and is NOT reset).
-    fn insert_child(&mut self, child: RaceChild, _clock: usize, _group: &str) {
-        // NO per-event log here: inserts are reported on the calling roll's
-        // single line — one roll, one line.
-        let child_fitness = child.state.last_metrics.as_ref().map(|m| m.fitness);
-        self.state.insert(child.state.clone(), child_fitness);
-        self.networks.insert(child.state.hash.clone(), child.net);
-        self.optimizers
-            .insert(child.state.hash.clone(), child.optimizer);
-    }
-
-    /// One evolution roll of the crossover branch: generate a child, run the
-    /// checkpoint-gated catch-up (early-out discard on the first failed
-    /// gate), and on success cull one slot per the cull policy + insert the
-    /// child. A failed child culls nothing — the gate IS the cull, and a
-    /// failed attempt is a SPENT ROLL: no random fallback (random whole nets
-    /// enter exclusively via the mutation rolls).
-    /// Returns the roll outcome (survived + log detail); `attempt` is the
-    /// 1-based retry ordinal (for history.csv).
-    fn evolve_crossover_child(
-        &mut self,
-        clock: usize,
-        _roll: usize,
-        attempt: usize,
-    ) -> Result<RollOutcome> {
-        let idx = self.next_child_ordinal(clock);
-        // Ok(spent) = spent roll (crossover produced nothing viable or a
-        // duplicate of a live net): no cull, no insert, move on.
-        let mut child = match self.generate_child(clock, idx)? {
-            Some(c) => c,
-            None => {
-                return Ok(RollOutcome::spent(format!(
-                    "no child: {} parent-pairing draw(s) × {} gate attempt(s) all incompatible (no compatible pivot/dims)",
-                    crate::engine::child::MAX_PARENT_PAIRINGS,
-                    attempt,
-                )));
-            }
-        };
-        if self.state.net(&child.state.hash).is_some() {
-            // Duplicate of a live topology (crossover recreated an existing
-            // net) → the roll is spent: discard, no replacement. Random
-            // whole nets enter only via the mutation path.
-            self.record_attempt(
-                clock,
-                "crossover",
-                attempt,
-                None,
-                None,
-                "duplicate-discarded",
-                "rejected_duplicate",
-                None,
-                None,
-                None,
-                None,
-                None,
-            );
-            return Ok(RollOutcome::spent(format!(
-                "child {} duplicates a live topology → discarded",
-                &child.state.hash[..8.min(child.state.hash.len())],
-            )));
-        }
-
-        // Checkpoint-gated catch-up: the child must beat the recorded
-        // population mean at the checkpoints between its birth and now
-        // (Hard: every gate; Soft: the aggregate mean of the gate means).
-        // Children born before any checkpoint exists skip the gate entirely.
-        // With `crossover_catch_up` OFF (RL only), the child skips catch-up
-        // AND the gate: a net with no replayed history has nothing to compare
-        // against the historical bars — gating off is the only sound reading.
-        // It trains from the current clock like a mutation immigrant.
-        self.pre_insert_buffer(&child.state.hash);
-        if !self.config.mode_specific.crossover_catch_up() {
-            child.state.step = 0;
-            child.state.last_metrics = None;
-            let inserted_hash = child.state.hash[..8.min(child.state.hash.len())].to_string();
-            let lineage = child
-                .state
-                .created_from
-                .clone()
-                .unwrap_or_else(|| "?".into());
-            let victim_for_log: Option<String> = match self.config.crossover_cull_policy {
-                crate::engine::config::CrossCullPolicy::Worst => {
-                    self.select_crossover_worst_victim(clock)?
-                }
-                crate::engine::config::CrossCullPolicy::Random => {
-                    Some(self.select_random_victim(clock)?)
-                }
-            };
-            let victim_net_seed = victim_for_log
-                .as_ref()
-                .and_then(|v| self.state.net(v))
-                .map(|s| s.net_seed);
-            self.record_attempt(
-                clock,
-                "crossover",
-                attempt,
-                Some(&child.state.hash),
-                Some(child.state.net_seed),
-                &child.state.created_from.clone().unwrap_or_default(),
-                "inserted",
-                None,
-                None,
-                None,
-                victim_for_log.as_deref(),
-                victim_net_seed,
-            );
-            match self.config.crossover_cull_policy {
-                crate::engine::config::CrossCullPolicy::Worst => {
-                    if let Some(victim) = &victim_for_log {
-                        self.cull_net(victim, clock, "crossover")?;
-                    }
-                }
-                crate::engine::config::CrossCullPolicy::Random => {
-                    if let Some(victim) = &victim_for_log {
-                        self.cull_net(victim, clock, "crossover-random")?;
-                    }
-                }
-            }
-            self.insert_child(child, clock, "crossover");
-            return Ok(RollOutcome::survived(format!(
-                "child {} ({}) inserted, gate n/a (crossover_catch_up=off), caught up 0, victim {} culled ({})",
-                inserted_hash,
-                lineage,
-                victim_for_log
-                    .as_deref()
-                    .map(|v| v[..8.min(v.len())].to_string())
-                    .unwrap_or_else(|| "none".into()),
-                    match self.config.crossover_cull_policy {
-                        crate::engine::config::CrossCullPolicy::Worst => "worst",
-                        crate::engine::config::CrossCullPolicy::Random => "random",
-                    },
-            )));
-        }
-        let mut replayed_to = 0usize;
-        let mut last_checkpoint_step = 0usize;
-        let mut child_fit_at_gate = f32::NAN;
-        // Gate window: both gates read only the last `crossover_gate_window`
-        // RECORDED checkpoints (0 = all — the unbounded legacy behavior).
-        // Bars are historical; the window keeps them local to the population's
-        // current era instead of averaging the run's whole life. Indices are
-        // preserved (`relevant` keeps its ledger position) so Hard's
-        // per-checkpoint replay sites stay exact.
-        let relevant_all: Vec<(usize, Checkpoint)> = self
-            .checkpoints
-            .iter()
-            .enumerate()
-            .filter(|(_, chk)| chk.step <= clock)
-            .map(|(i, chk)| (i, *chk))
-            .collect();
-        let gate_k = self.config.crossover_gate_window;
-        let relevant: Vec<(usize, Checkpoint)> = if gate_k == 0 || relevant_all.len() <= gate_k {
-            relevant_all
-        } else {
-            relevant_all[relevant_all.len() - gate_k..].to_vec()
-        };
-        let checkpoint_count = relevant.len();
-        let mut failed_gate: Option<(usize, usize, f32, f32)> = None; // (i+1, chk.step, child, mean)
-        match self.config.crossover_gate {
-            crate::engine::config::CrossoverGate::Hard => {
-                // Evaluate gate-by-gate: replay to each checkpoint, compare.
-                // PROVISIONAL replay: a rejected candidate must leave no
-                // state file behind (the ghost-file resume bug).
-                for (i, chk) in &relevant {
-                    self.catch_up_range_provisional(&mut child, replayed_to, chk.step)?;
-                    replayed_to = chk.step;
-                    last_checkpoint_step = chk.step;
-                    let child_fit = self
-                        .rolling_fitness
-                        .get(&child.state.hash)
-                        .map(rolling_mean)
-                        .unwrap_or(f32::NAN);
-                    child_fit_at_gate = child_fit;
-                    let beat = self
-                        .fitness
-                        .direction()
-                        .is_better(child_fit, chk.pop_mean_fitness);
-                    if !beat {
-                        failed_gate = Some((i + 1, chk.step, child_fit, chk.pop_mean_fitness));
-                        break;
-                    }
-                }
-            }
-            crate::engine::config::CrossoverGate::Soft => {
-                // One aggregate bar: beat the mean of the checkpoint means.
-                // Replay straight to the last relevant checkpoint, compare once.
-                if let Some((_, last)) = relevant.last() {
-                    self.catch_up_range_provisional(&mut child, replayed_to, last.step)?;
-                    replayed_to = last.step;
-                    last_checkpoint_step = last.step;
-                    let mean_of_means = relevant
-                        .iter()
-                        .map(|(_, c)| c.pop_mean_fitness)
-                        .sum::<f32>()
-                        / checkpoint_count as f32;
-                    let child_fit = self
-                        .rolling_fitness
-                        .get(&child.state.hash)
-                        .map(rolling_mean)
-                        .unwrap_or(f32::NAN);
-                    child_fit_at_gate = child_fit;
-                    let beat = self.fitness.direction().is_better(child_fit, mean_of_means);
-                    if !beat {
-                        failed_gate = Some((checkpoint_count, last.step, child_fit, mean_of_means));
-                    }
-                }
-            }
-        }
-        if let Some((gate_i, gate_step, child_fit, bar)) = failed_gate {
-            // "discarded" = the child was rejected by the checkpoint gate and
-            // never joined the population; the pop did NOT shrink.
-            // Record the rejected attempt (cx_retry_full measurement).
-            self.record_attempt(
-                clock,
-                "crossover",
-                attempt,
-                Some(&child.state.hash),
-                Some(child.state.net_seed),
-                &child.state.created_from.clone().unwrap_or_default(),
-                "rejected_gate",
-                Some(gate_i),
-                Some(child_fit),
-                Some(bar),
-                None,
-                None,
-            );
-            // Drop the child's provisional buffers — it never joined.
-            self.rolling_fitness.remove(&child.state.hash);
-            self.rolling_train.remove(&child.state.hash);
-            self.rolling_eval.remove(&child.state.hash);
-            return Ok(RollOutcome::spent(format!(
-                "child {} rejected by {} gate {}/{} ({}{:.4} vs bar {:.4}) → discarded at step {}",
-                &child.state.hash[..8.min(child.state.hash.len())],
-                match self.config.crossover_gate {
-                    crate::engine::config::CrossoverGate::Hard => "hard",
-                    crate::engine::config::CrossoverGate::Soft => "soft",
-                },
-                gate_i,
-                checkpoint_count,
-                self.fitness.direction().arrow(),
-                child_fit,
-                bar,
-                gate_step,
-            )));
-        }
-        let _ = last_checkpoint_step;
-        // Passed every gate — finish the replay to the clock, resolve the
-        // victim, record the attempt, then cull + insert.
-        self.catch_up_range(&mut child, replayed_to, clock)?;
-        // Slot eviction per CrossCullPolicy (crossover-only — the immigrant
-        // channel has its own fitness-inverse victim selection): Worst =
-        // merit-based (default); Random = uniform (diversity-first). In both
-        // cases the elite guard excludes the top-k nets from victim status.
-        // The victim is resolved BEFORE recording, so the attempt row can
-        // carry its identity (fills the previously-empty `victim` column).
-        let victim_for_log: Option<String> = match self.config.crossover_cull_policy {
-            crate::engine::config::CrossCullPolicy::Worst => {
-                self.select_crossover_worst_victim(clock)?
-            }
-            crate::engine::config::CrossCullPolicy::Random => {
-                Some(self.select_random_victim(clock)?)
-            }
-        };
-        // Record the admitted attempt (cx_retry_full measurement) — before
-        // the cull/insert, while both victim and child states are readable.
-        let victim_net_seed = victim_for_log
-            .as_ref()
-            .and_then(|v| self.state.net(v))
-            .map(|s| s.net_seed);
-        self.record_attempt(
-            clock,
-            "crossover",
-            attempt,
-            Some(&child.state.hash),
-            Some(child.state.net_seed),
-            &child.state.created_from.clone().unwrap_or_default(),
-            "inserted",
-            None,
-            Some(child_fit_at_gate),
-            None,
-            victim_for_log.as_deref(),
-            victim_net_seed,
-        );
-        match self.config.crossover_cull_policy {
-            crate::engine::config::CrossCullPolicy::Worst => {
-                if let Some(victim) = &victim_for_log {
-                    self.cull_net(victim, clock, "crossover")?;
-                }
-            }
-            crate::engine::config::CrossCullPolicy::Random => {
-                if let Some(victim) = &victim_for_log {
-                    self.cull_net(victim, clock, "crossover-random")?;
-                }
-            }
-        }
-        // The gate verdict belongs on the SUCCESS line too: what the child
-        // scored vs the bar it beat, WHICH gate, and how many bars — the
-        // whole admission story, correlated to the `set_crossover_*` knobs.
-        let gate_note = if checkpoint_count > 0 {
-            let gate_name = match self.config.crossover_gate {
-                crate::engine::config::CrossoverGate::Hard => "hard",
-                crate::engine::config::CrossoverGate::Soft => "soft",
-            };
-            let bar = match self.config.crossover_gate {
-                crate::engine::config::CrossoverGate::Hard => {
-                    // Hard gate: the LAST checkpoint's bar was the final one beaten.
-                    relevant
-                        .last()
-                        .map(|(_, c)| c.pop_mean_fitness)
-                        .unwrap_or(f32::NAN)
-                }
-                crate::engine::config::CrossoverGate::Soft => {
-                    // Soft gate: one aggregate bar — the mean of the checkpoint means.
-                    relevant
-                        .iter()
-                        .map(|(_, c)| c.pop_mean_fitness)
-                        .sum::<f32>()
-                        / checkpoint_count.max(1) as f32
-                }
-            };
-            // bars-beaten shown per configured gate: Hard beat ALL of the
-            // `checkpoint_count` bars; Soft beat the 1 aggregate of them.
-            let bars = match self.config.crossover_gate {
-                crate::engine::config::CrossoverGate::Hard => checkpoint_count,
-                crate::engine::config::CrossoverGate::Soft => 1,
-            };
-            format!(
-                " | gate {} {bars}/{bars} bars: {:.4} vs {:.4}{}",
-                gate_name,
-                child_fit_at_gate,
-                bar,
-                if gate_k > 0 {
-                    format!(" (window {gate_k}, {checkpoint_count} in window)")
-                } else {
-                    String::new()
-                },
-            )
-        } else {
-            // No checkpoints yet — the gate was NOT supposed to apply. Stated
-            // so "no gate" never reads as "passed a gate".
-            " | gate n/a (no checkpoints yet)".to_string()
-        };
-        let inserted_hash = child.state.hash[..8.min(child.state.hash.len())].to_string();
-        let lineage = child
-            .state
-            .created_from
-            .clone()
-            .unwrap_or_else(|| "?".into());
-        // Catch-up status on the success line: a gated child has ALWAYS
-        // replayed the full history (0..clock) — that's what the gate judged.
-        let catchup_note = format!("caught up {clock} step(s)");
-        // Victim with its POLICY (which `set_crossover_cull_policy` chose it).
-        let victim_note = match victim_for_log.as_deref() {
-            Some(v) => format!(
-                "victim {} culled ({})",
-                &v[..8.min(v.len())],
-                match self.config.crossover_cull_policy {
-                    crate::engine::config::CrossCullPolicy::Worst => "worst",
-                    crate::engine::config::CrossCullPolicy::Random => "random",
-                },
-            ),
-            None => "victim none".to_string(),
-        };
-        self.insert_child(child, clock, "crossover");
-        Ok(RollOutcome::survived(format!(
-            "child {} ({}) inserted{}, {}, {}",
-            inserted_hash,
-            lineage,
-            gate_note,
-            catchup_note,
-            victim_note,
-        )))
-    }
-
-    /// Append one evolution-event row to the history.csv buffer (cx_retry_full
-    /// measurement). Every crossover/mutation attempt is recorded — inserted or
-    /// rejected — so gate-failure rate, operator yield, and retry economics are
-    /// queryable after the run. Buffered, flushed at the same points as the
-    /// per-step metric rows (they share the unified history.csv).
-    #[allow(clippy::too_many_arguments)] // one row of the attempt ledger — fields, not logic
-    fn record_attempt(
-        &mut self,
-        step: usize,
-        branch: &str,
-        attempt: usize,
-        child_hash: Option<&str>,
-        child_net_seed: Option<usize>,
-        origin: &str,
-        outcome: &str,
-        gate_index: Option<usize>,
-        child_fitness: Option<f32>,
-        bar: Option<f32>,
-        victim: Option<&str>,
-        victim_net_seed: Option<usize>,
-    ) {
-        if !self.config.csv_export {
-            return;
-        }
-        // Attempt rows align with the unified header: type,step,hash,net_seed,
-        // origin, then empty metric columns (entered_at_step/train_loss/
-        // eval_loss/... — attempts have no per-step training state), then the
-        // attempt tail (branch,attempt,outcome,gate_index,child_fitness,bar,
-        // victim,victim_net_seed,pop).
-        // FULL hashes + net_seed here (no truncation): (hash, net_seed) is the
-        // unique individual key — the same topology hash can legitimately
-        // appear in multiple attempt rows (regenerated children) and across
-        // eras, so the log must not manufacture collisions.
-        // entered_at_step + 3 metric cols + informative cols = empty slots.
-        let empty_metrics = ",".repeat(4 + self.metrics.len());
-        let row = format!(
-            "attempt,{},{},{},{},{},\"{}\",{},{},{},{},{},{},{},{}\n",
-            step,
-            child_hash.unwrap_or_default(),
-            child_net_seed.map(|s| s.to_string()).unwrap_or_default(),
-            csv_field(origin),
-            empty_metrics,
-            branch,
-            attempt,
-            outcome,
-            gate_index.map(|g| g.to_string()).unwrap_or_default(),
-            child_fitness.map(|v| v.to_string()).unwrap_or_default(),
-            bar.map(|v| v.to_string()).unwrap_or_default(),
-            victim.unwrap_or_default(),
-            victim_net_seed.map(|s| s.to_string()).unwrap_or_default(),
-            self.state.live_count(),
-        );
-        self.history_csv_buffer.push_str(&row);
-    }
-
-    /// Uniformly random **cullable** live net — the `Random` arm of BOTH cull
-    /// policies (crossover children and mutation immigrants). Deterministic:
-    /// derived from `(run_seed, clock, salt)` so replays and resume pick the
-    /// same victim. Elite nets are excluded from the draw (no child —
-    /// crossover or immigrant — can evict an elite).
-    ///
-    /// `salt` separates the several rolls that fire within one clock: without
-    /// it every roll of the same step would draw the same index.
-    fn select_random_victim_at(&self, clock: usize, salt: usize) -> Result<String> {
-        let elite = self.elite_hashes();
-        // The param `clock` is the SALTED seed input; the probation check
-        // needs the CURRENT race clock. Prefer off-probation victims; break
-        // probation only when every non-elite net is fresh (a firing roll
-        // must always find a slot).
-        let now = self.step_clock();
-        let all: Vec<String> = self
-            .state
-            .live_hashes()
-            .into_iter()
-            .filter(|h| !elite.contains(h))
-            .collect();
-        let mut hashes: Vec<String> = all
-            .iter()
-            .filter(|h| !self.on_probation(h, now))
-            .cloned()
-            .collect();
-        if hashes.is_empty() {
-            hashes = all;
-        }
-        if hashes.is_empty() {
-            return Err(crate::utils::error::EngineError::InvalidOptions(
-                "random cull: no cullable (non-elite) live net".into(),
-            )
-            .into());
-        }
-        let seed = crate::utils::seed::derive_seed(
-            self.header.run_seed,
-            clock.wrapping_mul(7919).wrapping_add(salt),
-        );
-        let idx = fastrand::Rng::with_seed(seed).usize(..hashes.len());
-        Ok(hashes[idx].clone())
-    }
-
-    /// [`Self::select_random_victim_at`] with salt 0 — the crossover path's
-    /// original derivation, kept verbatim so its victim draws (and the tests
-    /// pinning them) are unchanged.
-    fn select_random_victim(&self, clock: usize) -> Result<String> {
-        self.select_random_victim_at(clock, 0)
-    }
-
-    /// The mutation channel's victim, per [`crate::engine::config::MutationCullPolicy`].
-    /// Every arm falls back to the same two last resorts (worst-net when no
-    /// net has a fitness verdict yet, then first live) so a firing roll ALWAYS
-    /// finds a slot for its immigrant. `roll` salts the `Random` arm so the
-    /// rolls of one step don't all draw the same net.
-    fn select_mutation_victim(&self, clock: usize, roll: usize) -> Result<String> {
-        use crate::engine::config::MutationCullPolicy;
-        let picked = match self.config.mutation_cull_policy {
-            MutationCullPolicy::InverseFitness => self
-                .select_inverse_proportional()?
-                .or_else(|| self.mutation_victim_fallback()),
-            MutationCullPolicy::Worst => self.mutation_victim_fallback(),
-            // Salt `roll + 1`: the crossover path draws with salt 0, so a
-            // mutation roll never silently mirrors a crossover victim.
-            MutationCullPolicy::Random => self
-                .select_random_victim_at(clock, roll + 1)
-                .ok()
-                .or_else(|| self.mutation_victim_fallback()),
-        };
-        picked.ok_or_else(|| {
-            crate::utils::error::EngineError::InvalidOptions(
-                "mutation cull: no live net to evict".into(),
-            )
-            .into()
-        })
-    }
-
-    /// Mutation victim last resorts: the worst net by smoothed fitness, else
-    /// the first live hash. `None` only when the population is empty (a firing
-    /// roll cannot happen then). Probation-aware: off-probation victims are
-    /// preferred, but a firing roll ALWAYS finds a slot — if every
-    /// non-elite net is on probation (window ≥ pop − elite, an unusual
-    /// config), the protection is broken for this pick.
-    fn mutation_victim_fallback(&self) -> Option<String> {
-        let clock = self.step_clock();
-        let elite = self.elite_hashes();
-        let eligible = |h: &String| !elite.contains(h);
-        let off_probation = |h: &String| !self.on_probation(h, clock);
-        let live = self.state.live_hashes();
-        // Preferred: worst among non-elite, off-probation nets.
-        if let Some(worst) = self
-            .worst_nets_by_smoothed_fitness(live.len())
-            .ok()?
-            .into_iter()
-            .find(|h| eligible(h) && off_probation(h))
-        {
-            return Some(worst);
-        }
-        // Last resort: probation broken — first non-elite live net (the
-        // cull log's reason field is where this shows up, see the caller).
-        live.into_iter().find(|h| eligible(h))
-    }
-
-    /// One evolution roll of the mutation branch: cull a net selected
-    /// inversely-proportionate to fitness and insert a fully-random
-    /// immigrant (no checkpoint gate — a random topology could never clear
-    /// historical means; its job is diversity).
-    ///
-    /// When no net has a fitness verdict yet (fresh population, empty rolling
-    /// buffers), falls back to culling the first live net — the immigrant
-    /// still needs a slot, and a random cull is the only honest option when
-    /// nothing distinguishes the population yet.
-    fn evolve_random_immigrant(&mut self, clock: usize, roll: usize) -> Result<String> {
-        // Pick a victim per the mutation cull policy (`InverseFitness` by
-        // default — the historical fitness-inverse roulette; `Worst` for a
-        // deterministic merit cull; `Random` for uniform turnover). The elite
-        // guard makes the top-k immune in every arm.
-        let victim = self.select_mutation_victim(clock, roll)?;
-        self.cull_net(&victim, clock, "immigrant-slot")?;
-        let idx = self.next_child_ordinal(clock);
-        let mut child = self.generate_random_at(clock, idx)?;
-        self.pre_insert_buffer(&child.state.hash);
-        // Catch-up toggle (`mutation_catch_up`, default FALSE — no
-        // handicap): with it off the immigrant keeps its fresh-init weights
-        // and trains from the current clock on. Sound in RL (no shared data
-        // stream to have missed — see the knob's docs); tabular always
-        // catches up regardless of the flag. Its empty rolling buffers
-        // already mean "no verdict yet", so it cannot be culled or crowned
-        // before its first step.
-        let fresh_start = !self.config.mode_specific.mutation_catch_up();
-        if fresh_start {
-            child.state.step = 0;
-            child.state.last_metrics = None;
-        } else {
-            self.catch_up(&mut child, clock)?;
-        }
-        let detail = if fresh_start {
-            format!(
-                "victim {} culled (immigrant-slot), immigrant {} inserted (no gate, NO catch-up — trains from step {clock})",
-                &victim[..8.min(victim.len())],
-                &child.state.hash[..8.min(child.state.hash.len())],
-            )
-        } else {
-            format!(
-                "victim {} culled (immigrant-slot), immigrant {} inserted (no gate, caught up {clock} step(s))",
-                &victim[..8.min(victim.len())],
-                &child.state.hash[..8.min(child.state.hash.len())],
-            )
-        };
-        let victim_net_seed = self.state.net(&victim).map(|s| s.net_seed);
-        self.record_attempt(
-            clock,
-            "mutation",
-            1,
-            Some(&child.state.hash),
-            Some(child.state.net_seed),
-            &child.state.created_from.clone().unwrap_or_default(),
-            "inserted",
-            None,
-            child.state.last_metrics.as_ref().map(|m| m.fitness),
-            None,
-            Some(&victim),
-            victim_net_seed,
-        );
-        self.insert_child(child, clock, "mutation");
-        Ok(detail)
-    }
-
-    /// The next child ordinal at this clock (across all evolution branches).
-    fn next_child_ordinal(&mut self, clock: usize) -> usize {
-        let idx = *self.children_born_at_clock.entry(clock).or_insert(0);
-        *self.children_born_at_clock.get_mut(&clock).unwrap() = idx + 1;
-        idx
-    }
-
-    /// Cull one net: final state snapshot to disk, drop from all live maps.
-    fn cull_net(&mut self, hash: &str, clock: usize, reason: &str) -> Result<()> {
-        // NO per-event log here: culls are reported on the calling roll's
-        // single line (crossover/mutation/pruned) — one roll, one line.
-        let smoothed = self
-            .rolling_fitness
-            .get(hash)
-            .map(rolling_mean)
-            .unwrap_or(f32::NAN);
-        if let Some(mut state) = self.state.net(hash).cloned() {
-            state.is_alive = false;
-            // Cull metadata turns the tombstone into a complete record of
-            // when/why this net left the population, not just a dead snapshot.
-            state.culled_at_step = Some(clock);
-            state.cull_reason = Some(reason.to_string());
-            state.final_smoothed_fitness = Some(smoothed);
-            write_net_state(&self.run_dir, &state)?;
-        }
-        self.state.remove(hash);
-        self.networks.remove(hash);
-        self.optimizers.remove(hash);
-        self.rolling_fitness.remove(hash);
-        self.rolling_train.remove(hash);
-        self.rolling_eval.remove(hash);
-        // Decision-lag bookkeeping dies with the net: the shadow and its
-        // promotion clock are per-individual state.
-        // A culled frozen elite leaves the crown (the `stepped X/N` log line
-        // counts crown members as skipped — a stale entry would corrupt it).
-        self.frozen_crown.remove(hash);
-        self.culls += 1;
-        Ok(())
-    }
-
-    /// Population-mean smoothed fitness — the value recorded at each
-    /// checkpoint and the bar a crossover child must beat.
-    fn population_mean_smoothed_fitness(&self) -> f32 {
-        let values = self.smoothed_fitness_values();
-        if values.is_empty() {
-            return 0.0;
-        }
-        values.iter().sum::<f32>() / values.len() as f32
-    }
-
-    /// Whether this run has a surprise-exam batch at all: it needs BOTH a
-    /// dataset/stream and a tabular trainer, so RL runs (and any run without
-    /// data) do not. The ledger still stores 0.0 for those; this predicate is
-    /// what lets the log print `—` instead of a fabricated score.
-    fn exam_available(&self) -> bool {
-        self.stream.is_some() && self.dataset.is_some() && !self.trainer.is_rl()
-    }
-
-    /// The gate bar a crossover child faces at `clock` — the exact quantity
-    /// [`Self::evolve_crossover_child`] compares against (`relevant` = every
-    /// checkpoint with `step <= clock`; Hard takes the last one, Soft the mean
-    /// of them). `None` when no checkpoint exists yet. Printed on the
-    /// checkpoint line so the ledger entry and the gate lines can be read
-    /// together (a Soft bar is a historical AVERAGE, not the newest mean).
-    fn current_gate_bar(&self, clock: usize) -> Option<f32> {
-        let relevant: Vec<&Checkpoint> = self
-            .checkpoints
-            .iter()
-            .filter(|c| c.step <= clock)
-            .collect();
-        if relevant.is_empty() {
-            return None;
-        }
-        Some(match self.config.crossover_gate {
-            crate::engine::config::CrossoverGate::Hard => relevant
-                .last()
-                .map(|c| c.pop_mean_fitness)
-                .unwrap_or(f32::NAN),
-            crate::engine::config::CrossoverGate::Soft => {
-                relevant.iter().map(|c| c.pop_mean_fitness).sum::<f32>() / relevant.len() as f32
-            }
-        })
-    }
-
-    /// Run the checkpoint "surprise exam": score every live net on the given
-    /// era's gating-pool batch (rows never used for training or per-step
-    /// eval). Returns the population's mean exam fitness — a generalization
-    /// diagnostic recorded in the checkpoint ledger, never used for ranking,
-    /// culling, or gating (so the replay contract is untouched). Nets are
-    /// scored in eval mode (no gradients); a net whose eval-mode forward has
-    /// side effects would violate the Trainer contract anyway.
-    ///
-    /// Returns `0.0` when [`Self::exam_available`] is false (RL): the ledger
-    /// field is unconditional, but the log omits it rather than showing it.
-    fn run_checkpoint_exam(&mut self, era: u64) -> Result<f32> {
-        // RL mode has no dataset to examine — the exam is a generalization
-        // diagnostic over held-out DATA rows, meaningless without data. Also
-        // requires a Tabular trainer (the loss to score with).
-        let (stream, dataset, loss) = match (
-            self.stream.as_ref(),
-            self.dataset.as_ref(),
-            self.trainer.tabular_loss(),
-        ) {
-            (Some(s), Some(d), Some(t)) => (s, d, t),
-            _ => return Ok(0.0),
-        };
-        let exam_batch = stream.exam_batch(dataset, era)?;
-        let direction = self.fitness.direction();
-        let mut scores: Vec<f32> = Vec::new();
-        // Collect hashes first to avoid borrowing self.networks while calling
-        // eval_one_step (which needs &mut Network).
-        let hashes = self.state.live_hashes();
-        for hash in &hashes {
-            if let Some(net) = self.networks.get_mut(hash) {
-                if let Ok(report) =
-                    eval_one_step(net, loss, &self.fitness, &self.metrics, &exam_batch)
-                {
-                    scores.push(report.fitness);
-                }
-            }
-        }
-        let _ = direction; // direction-aware comparison happens upstream if needed
-        if scores.is_empty() {
-            return Ok(0.0);
-        }
-        Ok(scores.iter().sum::<f32>() / scores.len() as f32)
-    }
-
-    /// Select a live net inversely-proportionate to smoothed fitness (worst
-    /// nets most likely) — the `MutationCullPolicy::InverseFitness` arm. Elite
-    /// nets (top-`config.elite_count`) are excluded entirely — they can never
-    /// be mutation victims; nets on mutation probation are excluded too (the
-    /// clock is the CURRENT race clock). Returns `None` when no cullable
-    /// candidate remains (empty/single-net pop, or all elite/on-probation).
-    fn select_inverse_proportional(&self) -> Result<Option<String>> {
-        let hashes = self.state.live_hashes();
-        if hashes.len() < 2 {
-            return Ok(None);
-        }
-        let direction = self.fitness.direction();
-        let elite = self.elite_hashes();
-        let clock = self.step_clock();
-        // Inverse fitness: weight = (adjusted best) − (adjusted value) ≥ 0 —
-        // the worst net gets the largest weight, the best gets zero. (The
-        // previous `value − worst` weighting was inverted: it targeted the
-        // FITTEST net — fixed; the confused "wait, inverted" comment is gone.)
-        let scored: Vec<(String, f32)> = hashes
-            .iter()
-            .filter(|h| !elite.contains(h))
-            .filter(|h| !self.on_probation(h, clock))
-            .filter(|h| {
-                self.rolling_fitness
-                    .get(*h)
-                    .map(|b| b.iter().count() > 0)
-                    .unwrap_or(false)
-            })
-            .map(|h| {
-                (
-                    h.clone(),
-                    rolling_mean(self.rolling_fitness.get(h).unwrap()),
-                )
-            })
-            .collect();
-        if scored.len() < 2 {
-            return Ok(None);
-        }
-        let adjusted = |v: f32| match direction {
-            crate::engine::fitness::Direction::Maximize => v,
-            crate::engine::fitness::Direction::Minimize => -v,
-        };
-        let adj_best = scored
-            .iter()
-            .map(|(_, v)| adjusted(*v))
-            .fold(f32::NEG_INFINITY, f32::max);
-        let weights: Vec<(String, f32)> = scored
-            .into_iter()
-            .map(|(h, v)| (h, adj_best - adjusted(v)))
-            .collect();
-        let total: f32 = weights.iter().map(|(_, w)| w).sum();
-        if total <= 0.0 {
-            // All-equal (non-elite) population: uniform draw.
-            let i = fastrand::usize(0..weights.len());
-            return Ok(weights.into_iter().nth(i).map(|(h, _)| h));
-        }
-        let mut pick = fastrand::f32() * total;
-        for (h, w) in &weights {
-            pick -= w;
-            if pick <= 0.0 {
-                return Ok(Some(h.clone()));
-            }
-        }
-        Ok(weights.last().map(|(h, _)| h.clone()))
-    }
-
-    /// Whether `hash` is on mutation probation at `clock`: cull-IMMUNE for
-    /// its first `mutation_probation_steps` clocks (measured from
-    /// `entered_at_step`, which is already persisted — no new state,
-    /// resume-safe). With window 0 nobody is ever on probation (the default
-    /// — only the built-in empty-buffer step-0 immunity remains).
-    /// Probation is a STATUS, not a queue: the net still trains, measures,
-    /// and can rank — it just cannot be a cull VICTIM while fresh.
-    fn on_probation(&self, hash: &str, clock: usize) -> bool {
-        let window = self.config.mutation_probation_steps;
-        if window == 0 {
-            return false;
-        }
-        self.state
-            .net(hash)
-            .map(|s| clock.saturating_sub(s.entered_at_step) < window)
-            .unwrap_or(false)
-    }
-
-    /// The crossover Worst-policy victim: worst by smoothed fitness, with the
-    /// SAME probation discipline as the mutation channel (off-probation first;
-    /// protection broken when every non-elite net is fresh — an admitted child
-    /// must always get its slot). `None` only when no net has ever scored.
-    fn select_crossover_worst_victim(&self, clock: usize) -> Result<Option<String>> {
-        let worst = self.worst_nets_by_smoothed_fitness(self.state.live_count())?;
-        let victim = worst.into_iter().find(|h| !self.on_probation(h, clock)).or_else(|| {
-            // Probation broken: fall back to the plain worst (which may be
-            // on probation — an admitted child must get its slot).
-            self.worst_nets_by_smoothed_fitness(1)
-                .ok()
-                .and_then(|v| v.into_iter().next())
-        });
-        Ok(victim)
     }
 
     /// The elite set: the top `config.elite_count` live nets by smoothed
     /// fitness (direction-aware). Protected from ALL culls — crossover (any
     /// policy) and mutation alike. Always leaves at least one cullable net:
     /// the effective guard size is `min(elite_count, live − 1)`.
-    fn elite_hashes(&self) -> Vec<String> {
+    pub(crate) fn elite_hashes(&self) -> Vec<String> {
         let k = self
             .config
             .elite_count
@@ -3429,7 +1589,7 @@ impl CoreEngine {
 
     /// The worst live net hashes by smoothed fitness (opposite of fittest).
     /// Uses the live smoothed fitness; only cullable nets are candidates.
-    fn worst_nets_by_smoothed_fitness(&self, count: usize) -> Result<Vec<String>> {
+    pub(crate) fn worst_nets_by_smoothed_fitness(&self, count: usize) -> Result<Vec<String>> {
         let hashes = self.state.live_hashes();
         if hashes.is_empty() {
             return Ok(Vec::new());
@@ -3467,123 +1627,10 @@ impl CoreEngine {
 
     // ── Shared batch materialization ────────────────────────────────────────
 
-    // ── Stop criteria ───────────────────────────────────────────────────────
-
-    /// Check stop criteria at the given step. Returns `Some(reason)` if one
-    /// fires, `None` if the run should continue.
-    ///
-    /// `max_steps` and `max_target_fitness` are mutually exclusive (enforced
-    /// at `build()` — exactly one may be set). `custom_stop` is independent
-    /// and always evaluated last, joining whichever built-in was chosen.
-    fn check_stop(&mut self, step: usize) -> Option<StopReason> {
-        // 0. Ctrl+C (checked FIRST — the user's intent outranks every bar;
-        // abandoning flows through the SAME artifact path as a natural stop).
-        // The in-flight step IS completed (we are between steps here), then
-        // the whole post-race sequence runs.
-        if let Some(flag) = &self.interrupt_flag {
-            if flag.load(std::sync::atomic::Ordering::SeqCst) {
-                info!(
-                    "race: Ctrl+C — shutting down gracefully after step {}",
-                    step
-                );
-                return Some(StopReason::Interrupted);
-            }
-        }
-        // 1. Explicit step budget (fires only if set).
-        if let Some(max) = self.config.max_steps {
-            if step >= max {
-                return Some(StopReason::MaxSteps);
-            }
-        }
-        // 2. Best smoothed fitness reached the target (fires only if set).
-        if let Some(target) = self.config.max_target_fitness {
-            let best = self.best_smoothed_fitness();
-            if self.fitness.direction().is_better(best, target) {
-                return Some(StopReason::TargetScore);
-            }
-        }
-        // 3. Custom stop: joins the race **in addition** to the built-ins, so
-        // a user policy can stop the run on criteria the built-ins don't
-        // model.
-        if let Some(stop) = self.config.custom_stop.as_ref() {
-            if stop(&self.snapshot(step)) {
-                return Some(StopReason::CustomStop);
-            }
-        }
-        None
-    }
-
-    /// Build the read-only `RaceSnapshot` handed to a custom stop closure.
-    /// `best`/`worst` are direction-aware (the fitness direction decides which
-    /// end of the spread is "best"); `mean` is the plain arithmetic mean.
-    fn snapshot(&self, step: usize) -> RaceSnapshot {
-        let smoothed = self.smoothed_fitness_values();
-        let (best, worst, mean) = if smoothed.is_empty() {
-            (0.0, 0.0, 0.0)
-        } else {
-            let direction = self.fitness.direction();
-            let mut best = smoothed[0];
-            let mut worst = smoothed[0];
-            for &v in &smoothed[1..] {
-                if direction.is_better(v, best) {
-                    best = v;
-                }
-                if direction.is_better(worst, v) {
-                    worst = v;
-                }
-            }
-            let mean = smoothed.iter().sum::<f32>() / smoothed.len() as f32;
-            (best, worst, mean)
-        };
-        RaceSnapshot {
-            live_count: self.state.live_count(),
-            step,
-            best_smoothed_fitness: best,
-            worst_smoothed_fitness: worst,
-            mean_smoothed_fitness: mean,
-            culls: self.culls,
-            elapsed_seconds: self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs(),
-        }
-    }
-
     // ── Instrumentals ───────────────────────────────────────────────────────
 
-    /// Persist the checkpoint ledger to `checkpoints.json` (sidecar next to
-    /// `engine.json`). Overwritten on every record — small file, atomic
-    /// enough for analysis purposes.
-    fn write_checkpoints(&self) -> Result<()> {
-        let path = self.run_dir.join("checkpoints.json");
-        let v: Vec<serde_json::Value> = self
-            .checkpoints
-            .iter()
-            .map(|c| {
-                serde_json::Value::Object({
-                    let mut m = serde_json::Map::new();
-                    m.insert("step".into(), serde_json::Value::from(c.step));
-                    m.insert(
-                        "pop_mean_fitness".into(),
-                        serde_json::Value::from(c.pop_mean_fitness),
-                    );
-                    m.insert(
-                        "exam_mean_fitness".into(),
-                        serde_json::Value::from(c.exam_mean_fitness),
-                    );
-                    m
-                })
-            })
-            .collect();
-        let raw = serde_json::to_string_pretty(&v).map_err(|e| {
-            crate::utils::error::EngineError::Json(format!("checkpoints serialize: {e}"))
-        })?;
-        std::fs::write(&path, raw).map_err(|source| crate::utils::error::EngineError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        Ok(())
-    }
-
     /// Write the NetState file for every currently active, live net.
-    fn write_live_frontier_states(&self) -> Result<()> {
+    pub(crate) fn write_live_frontier_states(&self) -> Result<()> {
         let live = self.state.live_hashes();
         for h in &live {
             if let Some(state) = self.state.net(h) {
@@ -3596,7 +1643,7 @@ impl CoreEngine {
     /// Append a step's metrics for all live nets to the history buffer.
     /// Rows are typed `metric` in the unified history.csv (evolution events
     /// are typed `attempt` — see `record_attempt`).
-    fn append_metrics_csv(&mut self, step: usize) -> Result<()> {
+    pub(crate) fn append_metrics_csv(&mut self, step: usize) -> Result<()> {
         if !self.config.csv_export {
             return Ok(());
         }
@@ -3632,7 +1679,7 @@ impl CoreEngine {
     /// Flush the buffered history rows to `history.csv` — the unified event
     /// log (per-step `metric` rows + evolution `attempt` rows). Same cadence:
     /// checkpoints + stop, gated by `csv_export`.
-    fn flush_metrics_csv(&mut self) -> Result<()> {
+    pub(crate) fn flush_metrics_csv(&mut self) -> Result<()> {
         if !self.config.csv_export || self.history_csv_buffer.is_empty() {
             return Ok(());
         }
@@ -3692,45 +1739,6 @@ impl CoreEngine {
             })?;
 
         self.history_csv_buffer.clear();
-        Ok(())
-    }
-
-    /// Load a checkpoint ledger written by [`Self::write_checkpoints`]
-    /// (resume path). Missing file = fresh run, empty ledger.
-    pub(crate) fn load_checkpoints(&mut self) -> Result<()> {
-        let path = self.run_dir.join("checkpoints.json");
-        if !path.exists() {
-            return Ok(());
-        }
-        let raw = std::fs::read_to_string(&path).map_err(|source| {
-            crate::utils::error::EngineError::Io {
-                path: path.display().to_string(),
-                source,
-            }
-        })?;
-        let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            crate::utils::error::EngineError::Json(format!("checkpoints parse: {e}"))
-        })?;
-        let mut checkpoints = Vec::new();
-        if let Some(arr) = v.as_array() {
-            for entry in arr {
-                let step = entry.get("step").and_then(|f| f.as_u64()).unwrap_or(0) as usize;
-                let pop_mean_fitness = entry
-                    .get("pop_mean_fitness")
-                    .and_then(|f| f.as_f64())
-                    .unwrap_or(0.0) as f32;
-                let exam_mean_fitness = entry
-                    .get("exam_mean_fitness")
-                    .and_then(|f| f.as_f64())
-                    .unwrap_or(0.0) as f32;
-                checkpoints.push(Checkpoint {
-                    step,
-                    pop_mean_fitness,
-                    exam_mean_fitness,
-                });
-            }
-        }
-        self.checkpoints = checkpoints;
         Ok(())
     }
 
@@ -3889,28 +1897,53 @@ mod tests {
 
     use crate::engine::config::DEFAULT_CHECKPOINT_EVERY;
 
-    /// The RL volume label is the RL middle column of the per-step rollup:
-    /// totals plus the mean turns/match. A population that reported nothing
-    /// (Tabular, or a mis-wired RL trainer) must read as `—`, never as a
-    /// silent `0`.
+    /// The RL volume label is the RL middle column of the per-step rollup: the
+    /// train/eval turn split, the mean turns/match, and — when the challenge
+    /// fired — the observed ⚔ next to what the trigger promised. A population
+    /// that reported nothing (Tabular, or a mis-wired RL trainer) must read as
+    /// `—`, never as a silent `0`.
     #[test]
     fn rl_volume_label_formats_and_never_lies() {
         let empty = RlVolume::default();
-        assert!(empty.label().contains('—'), "{}", empty.label());
+        assert!(empty.label(0.1).contains('—'), "{}", empty.label(0.1));
         let pop = RlVolume {
             nets: 3,
             matches: 3,
-            turns: 432,
+            train_turns: 432,
+            eval_turns: 108,
+            challenged_turns: 0,
         };
-        assert_eq!(pop.label(), "matches 3 │ turns 432 │ turns/match 144");
+        assert_eq!(
+            pop.label(0.0),
+            "matches 3 │ train 432 │ eval 108 │ turns/match 180",
+            "p_chall cell hidden when the knob is off"
+        );
         // Matches with zero turns is still a real report (every match died on
         // turn 0) — it reads as a mean of 0, not as `—`.
         let zero_turns = RlVolume {
             nets: 1,
             matches: 1,
-            turns: 0,
+            train_turns: 0,
+            eval_turns: 0,
+            challenged_turns: 0,
         };
-        assert_eq!(zero_turns.label(), "matches 1 │ turns 0 │ turns/match 0");
+        assert_eq!(
+            zero_turns.label(0.0),
+            "matches 1 │ train 0 │ eval 0 │ turns/match 0"
+        );
+        // The ⚔ cell carries the expectation too: p_eff × TRAIN turns, not the
+        // whole volume — eval turns are never challengeable.
+        let challenged = RlVolume {
+            nets: 50,
+            matches: 300,
+            train_turns: 1331,
+            eval_turns: 2662,
+            challenged_turns: 75,
+        };
+        assert_eq!(
+            challenged.label(0.1),
+            "matches 300 │ train 1331 │ eval 2662 │ p_chall 0.100 │ ⚔ 75 (exp 133) │ turns/match 13"
+        );
     }
 
     fn tiny_dataset() -> crate::utils::tabular_data::Dataset {
@@ -4058,7 +2091,6 @@ mod tests {
         // (engine infrastructure), not on RaceConfig — verified by the
         // stream_shape / stream_info contract instead.
         assert_eq!(cfg.max_steps, None, "budgets inactive by default");
-        assert!(cfg.max_target_fitness.is_none());
         assert!(cfg.hidden_dim_pool.is_some());
         assert_eq!(cfg.pop_size, 5);
     }
@@ -4274,7 +2306,13 @@ mod tests {
         eng.step_one_net(&hs[1], 5).unwrap();
         let after = eng.rolling_fitness.get(&hs[1]).unwrap();
         assert_eq!(after.len(), before_len + 1, "fresh measurement appended");
-        let last_metrics = eng.state.net(&hs[1]).unwrap().last_metrics.as_ref().unwrap();
+        let last_metrics = eng
+            .state
+            .net(&hs[1])
+            .unwrap()
+            .last_metrics
+            .as_ref()
+            .unwrap();
         assert_eq!(
             last_metrics.step, 5,
             "frozen net acted at the CURRENT clock (act-and-measure)"
@@ -4319,7 +2357,13 @@ mod tests {
         eng.step_one_net(&hs[1], 5).unwrap();
         assert!(eng.frozen_crown.contains(&hs[1]));
         assert_eq!(
-            eng.state.net(&hs[1]).unwrap().last_metrics.as_ref().unwrap().step,
+            eng.state
+                .net(&hs[1])
+                .unwrap()
+                .last_metrics
+                .as_ref()
+                .unwrap()
+                .step,
             5,
             "frozen net acted at clock 5 (kept current)"
         );
@@ -4341,7 +2385,13 @@ mod tests {
         // B's next step is a NORMAL train step at the current clock — one
         // clock past its last acted clock (no catch-up replay span).
         eng.step_one_net(&hs[1], 8).unwrap();
-        let b_last = eng.state.net(&hs[1]).unwrap().last_metrics.as_ref().unwrap();
+        let b_last = eng
+            .state
+            .net(&hs[1])
+            .unwrap()
+            .last_metrics
+            .as_ref()
+            .unwrap();
         assert_eq!(
             b_last.step, 8,
             "dethroned net stepped once at the current clock (no catch-up)"
@@ -4440,18 +2490,20 @@ mod tests {
             .find(|h| !hs.contains(h))
             .expect("a new immigrant hash exists");
         let s = eng.state.net(&newcomer).unwrap();
-        assert_eq!(s.step, 0, "catch-up off (default): no replayed training count");
+        assert_eq!(
+            s.step, 0,
+            "catch-up off (default): no replayed training count"
+        );
         assert!(
             s.last_metrics.is_none(),
             "catch-up off (default): no replayed metrics"
         );
         // Flip the flag: the next immigrant catches up to the clock.
-        eng.config.mode_specific = crate::engine::config::ModeConfig::Rl(
-            crate::engine::config::RlConfig {
+        eng.config.mode_specific =
+            crate::engine::config::ModeConfig::Rl(crate::engine::config::RlConfig {
                 mutation_catch_up: true,
                 ..crate::engine::config::RlConfig::default()
-            },
-        );
+            });
         let before = eng.state.live_hashes();
         eng.evolve_random_immigrant(7, 0).unwrap();
         let newcomer2 = eng
@@ -4461,10 +2513,7 @@ mod tests {
             .find(|h| !before.contains(h))
             .expect("a second immigrant hash exists");
         let s2 = eng.state.net(&newcomer2).unwrap();
-        assert_eq!(
-            s2.step, 7,
-            "catch-up on: immigrant replayed to the clock"
-        );
+        assert_eq!(s2.step, 7, "catch-up on: immigrant replayed to the clock");
         assert!(s2.last_metrics.is_some(), "catch-up on: replayed metrics");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4644,6 +2693,7 @@ mod tests {
                 train_loss: 0.0,
                 fitness: 1.0,
                 informative: Vec::new(),
+                challenged_turns: 0,
                 rl: None,
             })
         }
@@ -4672,9 +2722,11 @@ mod tests {
                 train_loss: step as f32 * 0.5,
                 fitness,
                 informative: Vec::new(),
+                challenged_turns: 0,
                 rl: Some(crate::trainer::RlStepMeta {
                     matches: 2,
-                    turns: 20 + step,
+                    train_turns: 12 + step,
+                    eval_turns: 8,
                 }),
             })
         }
@@ -4696,6 +2748,43 @@ mod tests {
         }
     }
 
+    /// RL trainer that HONORS the challenge SIGNAL: when `ctx.challenged` is
+    /// true it reports a fitness of −1000 (a sentinel no normal step ever
+    /// reports) plus 5 challenged turns, so tests can observe exactly which
+    /// steps ran challenged.
+    struct ChallengingRlTrainer;
+    impl crate::trainer::StepTrainer for ChallengingRlTrainer {
+        fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
+            use flodl::nn::Module;
+            Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
+        }
+    }
+    impl crate::trainer::RlStep for ChallengingRlTrainer {
+        fn train_step(
+            &mut self,
+            _net: &mut Network,
+            _optimizer: &mut dyn Optimizer,
+            step: usize,
+            ctx: &crate::trainer::RlContext<'_>,
+        ) -> flodl::tensor::Result<crate::trainer::RlStepReport> {
+            let (fitness, challenged_turns) = if ctx.challenged {
+                (-1000.0, 5)
+            } else {
+                (step as f32 + 1.0, 0)
+            };
+            Ok(crate::trainer::RlStepReport {
+                train_loss: step as f32 * 0.5,
+                fitness,
+                informative: Vec::new(),
+                challenged_turns,
+                rl: Some(crate::trainer::RlStepMeta {
+                    matches: 1,
+                    train_turns: 5,
+                    eval_turns: 0,
+                }),
+            })
+        }
+    }
     /// RL-mode engine harness: no dataset, no stream, `RunMode::Rl`.
     fn rl_engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::RlEngine> {
         crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
@@ -4772,6 +2861,206 @@ mod tests {
         for (hash, metrics) in &want {
             let got = resumed.state.net(hash).unwrap().last_metrics.clone();
             assert_eq!(&got, metrics, "RL resume diverged for net {hash}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// The challenge SIGNAL: with prob 1.0 every step fires, so a trainer
+    /// honoring `ctx.challenged` reports its sentinel fitness and challenged
+    /// turns on EVERY step; a trainer ignoring the signal is simply never
+    /// challenged (no error — the knob is a signal, the trainer decides).
+    #[test]
+    fn challenge_signal_reaches_the_trainer_and_ignoring_is_legal() {
+        let dir = std::env::temp_dir().join("gras-challenge-signal");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = rl_config(0);
+        cfg.challenge_prob = 1.0; // every step fires
+        let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
+            cfg,
+            crate::engine::fitness::Fitness::reported(
+                crate::engine::fitness::Direction::Maximize,
+                "reward",
+            ),
+            ChallengingRlTrainer, // honors the flag → sentinel on every step
+            Some(1),
+            Some(dir.clone()),
+        ))
+        .unwrap();
+        eng.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+            .unwrap();
+        let hash = eng.state.live_hashes()[0].clone();
+        eng.step_one_net(&hash, 0).unwrap();
+        let lm = eng.state.net(&hash).unwrap().last_metrics.clone().unwrap();
+        assert_eq!(lm.fitness, -1000.0, "honored flag → challenged step");
+        // The rollup's ⚔ accounting counts what the trainer reported.
+        assert_eq!(eng.step_rl.challenged_turns, 5);
+        assert_eq!(eng.total_challenged_turns, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Ignoring the signal is legal: SeededRlTrainer never reads the flag.
+        let dir2 = std::env::temp_dir().join("gras-challenge-ignored");
+        let _ = std::fs::remove_dir_all(&dir2);
+        let mut cfg2 = rl_config(0);
+        cfg2.challenge_prob = 1.0;
+        let mut eng2 = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
+            cfg2,
+            crate::engine::fitness::Fitness::reported(
+                crate::engine::fitness::Direction::Maximize,
+                "reward",
+            ),
+            SeededRlTrainer,
+            Some(1),
+            Some(dir2.clone()),
+        ))
+        .unwrap();
+        eng2.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+            .unwrap();
+        let hash2 = eng2.state.live_hashes()[0].clone();
+        eng2.step_one_net(&hash2, 0).unwrap(); // must NOT error
+        let lm2 = eng2
+            .state
+            .net(&hash2)
+            .unwrap()
+            .last_metrics
+            .clone()
+            .unwrap();
+        assert_ne!(
+            lm2.fitness, -1000.0,
+            "an ignoring trainer is never challenged"
+        );
+        assert_eq!(
+            eng2.total_challenged_turns, 0,
+            "no challenged turns were reported"
+        );
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// A challenge is just another step: its fitness (measured under the
+    /// forced action) RANKS like any other — recorded in metrics AND fed to
+    /// the ranking buffers.
+    #[test]
+    fn challenged_fitness_ranks_like_any_other_step() {
+        let dir = std::env::temp_dir().join("gras-challenge-honesty");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = rl_config(0);
+        cfg.challenge_prob = 1.0; // every step fires → fully deterministic
+        cfg.freeze_elites = false; // isolate the challenge from the freeze
+        let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
+            cfg,
+            crate::engine::fitness::Fitness::reported(
+                crate::engine::fitness::Direction::Maximize,
+                "reward",
+            ),
+            ChallengingRlTrainer,
+            Some(7),
+            Some(dir.clone()),
+        ))
+        .unwrap();
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        let hashes = eng.state.live_hashes();
+        for clock in 0..3 {
+            for h in &hashes {
+                eng.step_one_net(h, clock).unwrap();
+            }
+        }
+        for h in &hashes {
+            // Recorded: the challenged sentinel fitness is on every step.
+            let lm = eng.state.net(h).unwrap().last_metrics.clone().unwrap();
+            assert_eq!(lm.fitness, -1000.0, "challenged metrics must be recorded");
+            // Ranks: the sentinel IS in the ranking buffer — a challenge is
+            // just another step, no exclusion.
+            let buf = eng.rolling_fitness.get(h.as_str()).unwrap();
+            assert_eq!(
+                buf.iter().count(),
+                3,
+                "every step (challenged included) must feed the ranking buffer"
+            );
+            assert!(
+                buf.iter().all(|&f| f == -1000.0),
+                "the challenged sentinel must be the buffered value"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Replay parity under challenges: an interrupted run with
+    /// `challenge_prob = 1.0` (every step challenged) resumed mid-run lands
+    /// on the twin's metrics — the catch-up mirror re-fires the same
+    /// challenges through the same `challenge_step`.
+    #[test]
+    fn challenge_resume_then_continue_matches_uninterrupted_twin() {
+        let dir_a = std::env::temp_dir().join("gras-rl-challenge-a");
+        let dir_b = std::env::temp_dir().join("gras-rl-challenge-b");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+
+        let challenge_cfg = |pop: usize| {
+            let mut cfg = rl_config(pop);
+            cfg.challenge_prob = 1.0;
+            cfg.freeze_elites = false;
+            cfg
+        };
+        let run = |dir: &std::path::Path,
+                   steps: usize|
+         -> Vec<(String, Option<crate::state::NetMetrics>)> {
+            let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
+                challenge_cfg(0),
+                crate::engine::fitness::Fitness::reported(
+                    crate::engine::fitness::Direction::Maximize,
+                    "reward",
+                ),
+                ChallengingRlTrainer,
+                Some(4242),
+                Some(dir.to_path_buf()),
+            ))
+            .unwrap();
+            eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+                .unwrap();
+            let hashes = eng.state.live_hashes();
+            for clock in 0..steps {
+                for h in &hashes {
+                    eng.step_one_net(h, clock).unwrap();
+                }
+            }
+            let out = hashes
+                .iter()
+                .map(|h| (h.clone(), eng.state.net(h).unwrap().last_metrics.clone()))
+                .collect();
+            for h in &hashes {
+                let state = eng.state.net(h).cloned().unwrap();
+                crate::state::write_net_state(dir, &state).unwrap();
+            }
+            out
+        };
+
+        let want = run(&dir_a, 5);
+        // Sanity: the twin itself ran challenged steps (sentinel fitness).
+        assert_eq!(want[0].1.as_ref().unwrap().fitness, -1000.0);
+
+        run(&dir_b, 3);
+        let mut resumed = crate::engine::RlEngine::resume(
+            dir_b.clone(),
+            challenge_cfg(2),
+            crate::engine::fitness::Fitness::reported(
+                crate::engine::fitness::Direction::Maximize,
+                "reward",
+            ),
+            ChallengingRlTrainer,
+        )
+        .unwrap();
+        assert_eq!(resumed.state.live_count(), 2, "RL frontier restored");
+        let hashes = resumed.state.live_hashes();
+        for clock in 3..5 {
+            for h in &hashes {
+                resumed.step_one_net(h, clock).unwrap();
+            }
+        }
+        for (hash, metrics) in &want {
+            let got = resumed.state.net(hash).unwrap().last_metrics.clone();
+            assert_eq!(&got, metrics, "challenge resume diverged for net {hash}");
         }
 
         let _ = std::fs::remove_dir_all(&dir_a);
@@ -5610,26 +3899,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "only one stop criteria can be used at a time")]
-    fn stop_criteria_both_set_panics_at_build() {
-        // max_steps + max_target_fitness together are a config error — a
-        // HAND-BUILT config can still carry both (the field setters each
-        // clear their sibling, but a struct literal bypasses them), so
-        // `build()` panics with the exclusive-criteria message.
-        let mut cfg = RaceConfig::defaults();
-        cfg.max_steps = Some(20);
-        cfg.max_target_fitness = Some(0.5);
-        // Route the hand-built config through build()'s validation by
-        // rebuilding it from the same fields the builder would have written.
-        let b = RaceConfig::builder().set_run_pop_size(2);
-        let mut rebuilt = b.build();
-        rebuilt.max_steps = cfg.max_steps;
-        rebuilt.max_target_fitness = cfg.max_target_fitness;
-        crate::engine::config::RaceConfigBuilder::validate_single_stop(&rebuilt)
-            .unwrap_or_else(|e| panic!("invalid RaceConfig: {e}"));
-    }
-
-    #[test]
     fn stop_criteria_single_each_fires() {
         // max_steps alone: fires at its own step.
         let run_dir = std::env::temp_dir().join("gras-race-steps");
@@ -5640,15 +3909,6 @@ mod tests {
         seed_raw_fitness(&mut eng, 0.5);
         assert_eq!(eng.check_stop(19), None, "not fired yet");
         assert_eq!(eng.check_stop(20), Some(StopReason::MaxSteps));
-
-        // max_target_fitness alone: fires once best smoothed crosses it.
-        let run_dir = std::env::temp_dir().join("gras-race-target");
-        let mut eng = engine(&run_dir, 5).unwrap();
-        eng.config.max_target_fitness = Some(0.6); // Minimize: fires once best smoothed (0.5) < 0.6
-        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-            .unwrap();
-        seed_raw_fitness(&mut eng, 0.5);
-        assert_eq!(eng.check_stop(10), Some(StopReason::TargetScore));
     }
 
     #[test]
@@ -5898,17 +4158,16 @@ mod tests {
             run_topologies: vec![tiny_topology(11)],
             ..RaceConfig::defaults()
         };
-        let eng = crate::engine::TabularEngine::from_spec(
-            crate::engine::run_spec::RunSpec::tabular(
+        let eng =
+            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
                 data_dir,
                 config,
                 fitness(),
                 crate::trainer::TabularTrainer::new(loss_fn()),
                 Some(7),
                 Some(dir.clone()),
-            ),
-        )
-        .unwrap();
+            ))
+            .unwrap();
         let header = crate::state::load_engine_json(&dir).unwrap();
         assert_eq!(header.config.run_topology_count, 1);
         // Founder labels: the ordinal order of seeding is founders-first.
@@ -5933,16 +4192,14 @@ mod tests {
             .next()
             .unwrap()
             .path();
-        let topo =
-            crate::engine::population::run_topology_from_json_file(&state_path).unwrap();
+        let topo = crate::engine::population::run_topology_from_json_file(&state_path).unwrap();
         assert_eq!(
             topo.to_json().unwrap(),
             tiny_topology(7).to_json().unwrap(),
             "loader must reproduce the exact blueprint"
         );
         // Run-dir loader: one ranked founder from the same run.
-        let found =
-            crate::engine::population::run_topologies_from_run_dir(&dir, 1).unwrap();
+        let found = crate::engine::population::run_topologies_from_run_dir(&dir, 1).unwrap();
         assert_eq!(found.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5952,18 +4209,14 @@ mod tests {
     #[test]
     fn checkpoint_elite_snapshot_lands_and_flag_off_skips() {
         for (enabled, expect_file) in [(true, true), (false, false)] {
-            let dir =
-                std::env::temp_dir().join(format!("gras-ckpt-elite-{enabled}"));
+            let dir = std::env::temp_dir().join(format!("gras-ckpt-elite-{enabled}"));
             let _ = std::fs::remove_dir_all(&dir);
             let mut eng = engine(&dir, 7).unwrap();
             eng.config.checkpoint_every = 2;
             eng.config.max_steps = Some(4);
             eng.config.elite_checkpoint_weights = enabled;
-            eng.seed_population_internal(
-                vec![tiny_topology(7), tiny_topology(8)],
-                Some(0.5),
-            )
-            .unwrap();
+            eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+                .unwrap();
             eng.run().unwrap();
             if expect_file {
                 // Champion hash from the engine — the same source the
@@ -5980,7 +4233,9 @@ mod tests {
                     .unwrap()
                     .flatten()
                     .filter(|e| {
-                        e.file_name().to_string_lossy().starts_with("checkpoint-elite-")
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("checkpoint-elite-")
                     })
                     .count();
                 assert_eq!(snaps, 0, "flag off ⇒ no checkpoint elite files");
@@ -6057,7 +4312,10 @@ mod tests {
         let victim = eng.select_mutation_victim(5, 0).unwrap();
         // The elite (best = hashes[0]) must STILL be protected; the worst of
         // the two remaining probation nets takes the slot.
-        assert_ne!(victim, hashes[0], "probation never overrides the elite guard");
+        assert_ne!(
+            victim, hashes[0],
+            "probation never overrides the elite guard"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6070,16 +4328,14 @@ mod tests {
             mutation_probation_steps: 4,
             ..RaceConfig::defaults()
         };
-        crate::engine::TabularEngine::from_spec(
-            crate::engine::run_spec::RunSpec::tabular(
-                data_dir,
-                config,
-                fitness(),
-                crate::trainer::TabularTrainer::new(loss_fn()),
-                Some(7),
-                Some(dir.clone()),
-            ),
-        )
+        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+            data_dir,
+            config,
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+            Some(7),
+            Some(dir.clone()),
+        ))
         .unwrap();
         let header = crate::state::load_engine_json(&dir).unwrap();
         assert_eq!(header.config.mutation_probation_steps, 4);
@@ -6118,7 +4374,11 @@ mod tests {
         // the verdict input.
         let all_mean = all.iter().map(|(_, c)| c.pop_mean_fitness).sum::<f32>() / 5.0;
         assert!((all_mean - 3.0).abs() < 1e-6);
-        let win_mean = windowed.iter().map(|(_, c)| c.pop_mean_fitness).sum::<f32>() / 2.0;
+        let win_mean = windowed
+            .iter()
+            .map(|(_, c)| c.pop_mean_fitness)
+            .sum::<f32>()
+            / 2.0;
         assert!(
             (win_mean - 4.5).abs() < 1e-6,
             "last two bars are 4.0 and 5.0 → mean 4.5 (got {win_mean})"
@@ -6128,8 +4388,7 @@ mod tests {
             crossover_gate_window: 7,
             ..crate::engine::config::RaceConfig::defaults()
         };
-        let snap =
-            crate::state::ConfigSnapshot::from_config(&cfg, Some(32), Some(32));
+        let snap = crate::state::ConfigSnapshot::from_config(&cfg, Some(32), Some(32));
         assert_eq!(snap.crossover_gate_window, 7);
         assert_eq!(
             crate::engine::config::RaceConfig::defaults().crossover_gate_window,

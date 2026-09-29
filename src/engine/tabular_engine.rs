@@ -1,10 +1,11 @@
 //! Tabular engine — the dataset-driven race constructor + resume.
 //!
-//! Split from `race_engine.rs` (2026-09-24 engine split, TODO.md). This file
-//! holds the TABULAR-specific constructors (`resume`, and the tabular arm of
-//! `new` lives in `race_engine.rs` until step 5 of the plan breaks the API).
-//! Everything else — the struct, the step loop, evolution, artifacts — lives
-//! in [`crate::engine::core::RaceEngine`] and is shared with the RL engine.
+//! One of the 2026-09-24 engine-split slices (TODO.md) out of what was the
+//! single `race_engine.rs` monolith. This file holds the TABULAR-specific
+//! constructors (`resume`); the tabular arm of `new` is built on the shared
+//! core. Everything else — the struct, the step loop, evolution, artifacts —
+//! lives in [`crate::engine::core::CoreEngine`] and is shared with the RL
+//! engine.
 
 use super::config::RaceConfig;
 use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
@@ -244,6 +245,12 @@ impl TabularEngine {
             children_born_at_clock: HashMap::new(),
             step_evolve: StepEvolve::default(),
             step_rl: RlVolume::default(),
+            total_challenged_turns: 0,
+            total_train_turns: 0,
+            expected_challenged_turns: 0.0,
+            step_challenged_inputs: 0,
+            total_challenged_inputs: 0,
+            expected_challenged_inputs: 0.0,
             champions: Vec::new(),
             checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),

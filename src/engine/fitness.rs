@@ -162,28 +162,19 @@ pub struct FitnessLabel(pub String);
 /// "f1". Carries only its label; the actual per-step values live in
 /// `NetMetrics::informative` (same order as the run's `Vec<Metric>`).
 ///
-/// Two flavors:
-/// - **Built-in** (`Metric("f1")` / `"f1".into()`): scored by
-///   `score_by_label` — the known-labels dispatcher in `utils/score`.
-/// - **Custom** (`Metric::custom("my_metric", |pred, y| ...)`): your own
-///   closure scores it; the label is used for history.csv/logs. The closure
-///   is code, not data, so engine.json records only the label.
-#[derive(Clone, Default)]
+/// There are no built-in labels: a metric IS a closure
+/// (`Metric::custom("my_metric", |pred, y| ...)`), so what gets measured is
+/// always explicit and never a name lookup that can silently drift. The label
+/// is for history.csv/logs only — the closure is code, not data, so engine.json
+/// records just the label.
+#[derive(Clone)]
 pub struct Metric {
     pub label: String,
-    custom: Option<std::sync::Arc<ScoreFn>>,
+    score_fn: std::sync::Arc<ScoreFn>,
 }
 
 impl Metric {
-    /// Built-in metric by label (scored via `score_by_label`).
-    pub fn new(label: impl Into<String>) -> Self {
-        Metric {
-            label: label.into(),
-            custom: None,
-        }
-    }
-
-    /// Custom informative metric: a label + your own scoring closure
+    /// The only way to build a metric: a label + your own scoring closure
     /// `(pred, target) -> f32`. Recorded by label in engine.json/history.csv,
     /// scored by the closure at eval time.
     pub fn custom<F>(label: impl Into<String>, score_fn: F) -> Self
@@ -192,7 +183,7 @@ impl Metric {
     {
         Metric {
             label: label.into(),
-            custom: Some(std::sync::Arc::new(score_fn)),
+            score_fn: std::sync::Arc::new(score_fn),
         }
     }
 
@@ -201,14 +192,9 @@ impl Metric {
         &self.label
     }
 
-    /// Score this metric: the custom closure when present, otherwise the
-    /// built-in `score_by_label` dispatcher (unknown labels error loudly —
-    /// a typo in the run config must surface immediately).
+    /// Score this metric with its own closure.
     pub fn score(&self, pred: &Variable, y: &Variable) -> Result<f32> {
-        match &self.custom {
-            Some(f) => f(pred, y),
-            None => crate::utils::score::score_by_label(&self.label, pred, y),
-        }
+        (self.score_fn)(pred, y)
     }
 }
 
@@ -222,19 +208,7 @@ impl std::fmt::Debug for Metric {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Metric")
             .field("label", &self.label)
-            .field("custom", &self.custom.is_some())
             .finish()
-    }
-}
-
-impl From<&str> for Metric {
-    fn from(s: &str) -> Self {
-        Metric::new(s)
-    }
-}
-impl From<String> for Metric {
-    fn from(s: String) -> Self {
-        Metric::new(s)
     }
 }
 
