@@ -27,15 +27,22 @@ You'll need a CUDA-enabled libtorch on disk and `LIBTORCH_PATH` (plus CUDA env v
 ## Quick Start
 
 The examples folder IS the quick start — each one is a complete, runnable
-program with every knob a const or a builder line (no CLI): edit, `cargo run
---release --example <name>`, done.
+program with every knob a const or a builder line: edit, `cargo run --release
+--example <name>`, done.
+
+Some examples also expose a thin CLI overlay for quick runs (`--pop`,
+`--max-steps`, …): a flag wins, otherwise the example's own const is used.
+`--help` lists exactly what that binary accepts. Cartpole deliberately exposes
+**only** `--pop` and `--max-steps` (its smoke-test surface); every other knob
+stays a const.
 
 | Example | Mode | What it shows |
 |---|---|---|
 | [`examples/cartpole.rs`](examples/cartpole.rs) | **RL** | The cleanest RL walkthrough: a pure-Rust CartPole env, a REINFORCE trainer (`RlStep`), reported fitness, and the post-race `engine.guardrail(..)` holdout. Start here. |
-| [`examples/mnist.rs`](examples/mnist.rs) | Tabular | Dataset + custom loss, the full config surface showcase, per-mode builder (`TabularRaceConfig`). |
+| [`examples/mnist.rs`](examples/mnist.rs) | Tabular | The full hand-rolled `TabularStep`: custom loss, custom metric, challenge jitter, real held-out guardrail, full config surface. |
 | [`examples/kaggle_kagiculture.rs`](examples/kaggle_kagiculture.rs) | RL | A multi-minute trainer (self-play matches), the decision-lag relay, log-level discipline. |
-| [`examples/custom_trainer.rs`](examples/custom_trainer.rs) | Tabular | Writing your own `TabularStep` from scratch (no `TabularTrainer` helper). |
+| [`examples/custom_trainer.rs`](examples/custom_trainer.rs) | Tabular | Writing your own `TabularStep` from scratch (SGD + warmup + gated eval). |
+| [`examples/ref_trainer/mod.rs`](examples/ref_trainer/mod.rs) | Tabular | The classic Adam recipe as an EXAMPLE-owned module the other examples/benches share — the library ships no scheme. |
 | [`examples/continuous.rs`](examples/continuous.rs) | Tabular | Regression targets (`Direction::Minimize`, MSE), synthetic data generation. |
 
 The shape is always the same, whatever the mode: **your closures → a config →
@@ -71,7 +78,8 @@ A few knobs worth knowing from step one:
 
 - **`TabularEngine` + `RunSpec::tabular(..)`:** dataset + `Fitness::new(scorer, ..)` + a `TabularStep` trainer — the engine loads the data, draws batches, and scores `(pred, target)` itself. A tabular trainer implements `TabularStep`: it owns a **required** loss (`fn loss()`), may shape the shared batch stream (`stream_shape`), and receives data via `TabularContext`.
 - **`RlEngine` + `RunSpec::rl(..)` (RL / environment):** **no dataset**. The trainer implements `RlStep` — there is **no loss method at all**: the training signal lives inside `train_step`, the trainer drives its own environment and reports the ranking scalar in `StepReport.fitness`; the fitness must be `Fitness::reported(direction, label)`. `RlContext` carries no data. (Typed-spec alternative: `RLSpec{..}` → `RlEngine::from_rl_spec`; tabular mirror `TabularSpec` → `from_tabular_spec`. See OPTIONS.md §7.)
-- Both mode traits extend `StepTrainer` (`make_optimizer`, `describe`). The engine dispatches through an internal `ModeTrainer` enum — a tabular step always carries data, an RL step never does.
+- Both mode traits extend `StepTrainer` (`make_optimizer`, `describe`). The engine dispatches through a per-mode `ModeAdapter` — a tabular step always carries data, an RL step never does.
+- **The library ships the contract only.** No concrete trainer is exported: you bring your own (MNIST hand-rolls one; `examples/ref_trainer/` is the shared example copy).
 
 Evolution (crossover, mutation, gates, culls) is identical in both modes.
 
@@ -82,14 +90,19 @@ Set once per run via the config builder: `.set_run_log_level(LogLevel::…)`.
 | Level | What you see per step | Use it when |
 |---|---|---|
 | `Summ` **(default)** | One compact line at the **end** of each step — `step N │ pop K │ train_loss↓ mean±std │ eval_loss↓ … │ fitness↑ … │ took …s` — plus one line per evolution roll that fired (crossover attempts/inserts, mutation immigrants, culls), plus start/stop/checkpoint/elite-save lines. Printed last on purpose: the summary stays at the bottom of the terminal. | Watching a run live; the everyday default. |
-| `Minimal` | A framed in-place table (from step 2 on): population means with deltas vs last step, evolve counters (culls, inserts, crossover attempted/passed/gated, mutation), current best net footer. **No other lines** — no per-roll detail, no start/checkpoint chatter. | Long runs on one terminal; the numbers move, the shape doesn't. |
+| `Minimal` | One **boxed vitals table** (from step 2 on), redrawn **in place** on a terminal — population means with deltas vs last step, evolve counters (culls, inserts, crossover attempted/passed/gated, mutation), and the elite seats. **No other lines** — no per-roll detail, no start/checkpoint chatter. Off a terminal (piped to a file) each frame prints plainly, with no escape codes. | Long runs on one terminal; the numbers move, the shape doesn't. |
 | `None` | Nothing per step. Only the run-start line and the final stop reason. | Power users who parse `engine.json`, `history.csv`, and the artifacts instead of watching the stream; fastest I/O path. |
 
 The middle column of that line is mode-dependent: **Tabular** reports the
 held-out `eval_loss`; **RL** has no eval batch, so it reports the step's
-environment volume instead — `matches N │ turns N │ turns/match N`, summed
-over the live population (each RL trainer reports it in `StepReport.rl`).
-That is what explains a step that took minutes.
+environment volume instead — `matches N │ train N │ eval N │ turns/match N`,
+summed over the live population (each RL trainer reports it in
+`StepReport.rl`). That is what explains a step that took minutes.
+
+Train and eval turns are listed apart on purpose: the anti-plateau challenge
+can only force **train** matches, so the `⚔` cell reads
+`⚔ <observed> (exp <p_chall × train turns>)` — the denominator for judging the
+trigger is the train column, never the total.
 
 Everything the log shows (and more) is recorded losslessly in `history.csv`
 and `nets/<hash>.json` — the log is a view, the files are the record.
@@ -116,6 +129,23 @@ kaggle_kagiculture) is a *different* axis — it sets the env_logger
 verbosity filter (`info`/`debug`/…), not the engine's line shape above.
 The engine's own names are accepted there too (`--log-level summ` / `minimal`
 / `none`), mapped onto the verbosity that lets those lines through.
+
+### Run telemetry (`telemetry.jsonl`)
+
+Logging is `tracing`-based: one event stream, three sinks — the console
+(stderr, `LogLevel`-filtered), the `Minimal` frame (stdout, redrawn in place),
+and the telemetry file. `.set_run_trace_file(true)` writes
+`<run_dir>/telemetry.jsonl`: one JSON record per engine event at full fidelity
+(debug included), **not** filtered by the console's `LogLevel`. Off by default.
+
+The engine owns that file, so it lands in the run dir and travels with the run;
+the start-up block is buffered until the dir exists, then flushed in place —
+the seam loses nothing. Pair it with `LogLevel::None` for a run that is silent
+on the console but fully recorded.
+
+Consumers still on `env_logger`/`RUST_LOG` keep seeing every line: `tracing`
+mirrors its events into `log`, so nothing breaks until you opt into a
+subscriber.
 
 ## Learn more
 

@@ -31,15 +31,36 @@ field — no aliases, no duplicate entry points.
 | `pruner_` | `enabled`, `method`, `steps`, `pruner(PopPruner)` umbrella | §3 |
 | `topology_` | `input_dim`, `output_dim`, `hidden_dim_range`, `hidden_dim_stride`, the six min/max bounds (`hidden_num_nodes`, `inputs_per_node`, `outputs_per_node`), the three NAS pools (`activation_pool`, `combine_op_pool`, `standardize_op_pool`), `options(TopologyOptions)` umbrella | §4, §5 |
 | `worst_` | `save_topology`, `save_safetensors` | §6 |
-| `run_` | `mode`, `name`, `log_level`, `csv_export`, `metrics` | §6 |
+| `run_` | `mode`, `name`, `log_level`, `csv_export`, `metrics`, `challenge_prob` | §6 |
 | `fitness_` | `smoothing_window` | §1, §6 |
 | *(singles)* | `run_pop_catch_up`, `crossover_catch_up`, `mutation_catch_up` — the catch-up toggle family | §6 |
 
 **Families on the roadmap (2026-09-27 TOP PRIORITY, see TODO.md):**
-`set_evolution_mode` (competitive/cooperative option family) and
-`set_challenge_*` (population-wide anti-plateau challenges: forced actions
-for RL, x-disruption for tabular). Names are reserved — do not take the
-prefixes for other knobs.
+`set_evolution_mode` (competitive/cooperative option family). The anti-plateau
+challenge family LANDED as the single signal knob
+`set_run_challenge_prob(p)` (**both modes**): the engine's seeded trigger
+(`challenge_fires`, a pure function of run/net/step) sets
+`RlContext.challenged` / `TabularContext.challenged` (plus
+`TabularContext.challenge_prob`, the effective per-(input, feature) rate) and
+the TRAINER decides what that means inside `train_step` (RL forces a drawn
+action, tabular jitters its inputs — the engine never verifies the flag was
+honored; a trainer that ignores it is simply never challenged). A tabular
+response reports how many individual input values it jittered in
+`TabularStepReport.challenged_inputs`, and the engine logs the sum against
+`p_eff × rows × features × live`. The probability DECAYS linearly to 0 at the step budget
+(`p_eff = p × (1 − step/max_steps)`; flat when `max_steps` is `None`), so
+the run ends challenge-free. Challenged fitness ranks like any other step —
+a challenge is just another action the net had to survive; the trigger
+replays bit-exactly. Visibility: the rollup's RL column splits `train` from
+`eval` turns (only TRAIN turns can be forced), shows `p_chall <eff>` every
+step, and shows `⚔ <observed> (exp <p_eff × train turns>)` when the trainer
+reported any; the tabular column shows `⚔ <jittered input values> (exp <p_eff
+× rows × features × live>)` (or `p_chall <eff>` while none has fired) and the
+stop summary prints `total challenged inputs: N of ~M expected`. The post-race guardrail needs no scorer object:
+implement `StepTrainer::holdout_score` (+ optional `holdout_matches`) on
+your trainer and call `engine.guardrail(device, None)`. The
+`set_challenge_*` prefix for further knobs is still reserved — do not take
+the prefix for other knobs. Tabular x-disruption remains parked (TODO.md).
 
 **Umbrella setters** take the whole struct in one call (`set_pruner(PopPruner)`) —
 the field setters remain available for one-knob tweaks. The topology blueprint
@@ -73,15 +94,19 @@ assert on the first replayed step):**
 - the **fitness function** — replayed and compared
 - the dataset at `data_dir` (shape errors at build; content drift fails parity)
 - `metrics` / informative metric set; `input_dim` / `output_dim`
+- `smoothing_window`, `challenge_prob` — hard-error on mismatch at resume
+  (both re-shape replayed steps: ranking semantics / which steps re-fire
+  challenged)
 - `run_seed`, `train_eval_split_ratio`, eval-row counts — **read from the
   persisted `engine.json` header, not your config** (you can't get them wrong)
 
 **Yours to change between runs (budget/log surface only — never touches a
 step's dynamics):**
 
-- stop criterion: keep, raise, or **swap** `max_steps` ↔ `max_target_fitness`
-  (still exclusive at `build()` — exactly one, same panic as a fresh run;
-  both are now persisted side by side in `engine.json` → `config`, which is
+- stop criterion: keep or raise `max_steps` (`max_target_fitness` was
+  DELETED — a quality bar nobody knows in advance; use `custom_stop` if you
+  need a target-like policy). The budget is persisted side by side in
+  `engine.json` → `config`, which is
   the authoritative copy — the root `max_steps` is just a convenience reader
   for tools that want the budget without opening `config`). The
   step budget is **absolute**, not per-process: interrupt at 17 with
@@ -218,9 +243,9 @@ Note: pruner solo steps **always train with the real optimizer** — elite freez
 | Smoothing window | `set_run_smoothing_window(k)` | `10` | Per-net rolling window (K) every ranking decision averages over. Load-bearing ranking semantics, so **resume-guarded** like `pop_size`. |
 | Elite freeze | `set_elite_freeze(false)` | `true` | **Anti-devolution A**: top-`elite_count` nets skip the trainer call — they score, rank, and parent crossovers, but their weights never change, so a bad training step can't erase the best skill found. Freeze follows rank, not identity: a child that trains past the frozen elite takes the crown. Motivated by on-policy RL self-collapse; dormant in tabular (guard only fires via ranking facts). Do **not** combine with the decision-lag relay (§8): a frozen net skips its `train_step`, which is where the shadow forks. |
 | Regression tol | *removed 2026-09-25* | — | **Anti-devolution D retired.** The personal-floor guard (net's first smoothed fitness as its fixed floor; falling more than `(1 − tol) × |floor|` below it ⇒ demotion) is gone. Culling via the ordinary roulette is the single regression story (a collapsed fitness up-weights a net there naturally), and elite freeze is now **act-and-measure**: a frozen elite plays its normal step every clock (fresh fitness recorded, standing stays honest) but runs through a no-op optimizer — weights never change, and dethroning needs no catch-up (the net never fell behind the clock). |
-| Crossover catch-up | `set_crossover_catch_up(true)` | `true` | Whether a crossover child replays the training stream (and passes the checkpoint gate on that replayed history) before insertion. `false` = no catch-up AND no gate (a net with no replayed history has nothing to compare against the historical bars); the child trains from the current clock. **RL-only** — these knobs live on the config's `RlConfig` arm (see below); the tabular arm has no such knob because tabular always catches up. |
-| Mutation catch-up | `set_mutation_catch_up(false)` | `false` | Whether a mutation immigrant replays catch-up before training at the current clock. Default `false` = no handicap: fresh weights, trains from the current clock, competes from birth (~baseline first verdict, empty buffers = "no verdict yet"). `true` = the old catch-up behavior. **RL-only.** |
-| Pop catch-up | `set_run_pop_catch_up(false)` | `false` | Whether a population net rejoining the group step replays missed training. Default `false` — every net works on its own. With act-and-measure freeze this has no consumer today (dethroned elites never fall behind the clock); reserved for future rejoin paths. RESUME IS EXEMPT: resume always replays (weights are never persisted). **RL-only.** |
+| Crossover catch-up | `set_crossover_catch_up(true)` | `true` | Whether a crossover child replays the training stream (and passes the checkpoint gate on that replayed history) before insertion. `false` = no catch-up AND no gate (a net with no replayed history has nothing to compare against the historical bars); the child trains from the current clock. **Both modes.** |
+| Mutation catch-up | `set_mutation_catch_up(false)` | `false` | Whether a mutation immigrant replays catch-up before training at the current clock. Default `false` = no handicap: fresh weights, trains from the current clock, competes from birth (~baseline first verdict, empty buffers = "no verdict yet"). `true` = the historical tabular behavior (replay the shared stream first). **Both modes.** |
+| Pop catch-up | `set_run_pop_catch_up(false)` | `false` | Whether a population net rejoining the group step replays missed training. Default `false` — every net works on its own. With act-and-measure freeze this has no consumer today (dethroned elites never fall behind the clock); reserved for future rejoin paths. RESUME IS EXEMPT: resume always replays (weights are never persisted). **Both modes.** |
 
 ### Mode-specific config arms
 
@@ -228,17 +253,19 @@ The config's mode-specific knobs live in a typed arm (`config.mode_specific`),
 the same split the `RunSpec` variants apply: the `RunSpec::tabular`/`rl`
 constructor stamps the matching arm (`ModeConfig::Tabular(TabularConfig)` or
 `ModeConfig::Rl(RlConfig)`), so a config can never disagree with its spec.
-The tabular arm is currently empty (stream geometry is trainer/spec-owned by
-design); the RL arm carries the three catch-up toggles. Calling an RL-only
-setter on a tabular-armed builder panics loudly. Tabular runs always catch up
-— the shared data stream is the point of the mode.
+Each arm carries its own copy of the three catch-up toggles (tabular and RL
+differ in what "catching up" even means, so the values are per-arm). Tabular
+defaults preserve the historical behavior — crossover children replay + gate,
+mutation immigrants start at the current clock. Stream geometry stays
+trainer/spec-owned by design.
 | Dethrone behavior | — (no knob; fixed behavior) | — | A dethroned elite resumes training with its LAST optimizer state — it kept acting and measuring while frozen, so nothing is stale and no reset is needed. (The old `set_dethrone_reset_optimizer_state` was deleted 2026-09-27.) |
 | Mutation probation | `set_mutation_probation_steps(k)` | `0` | Cull-immunity for a net's first `k` clocks (`clock − entered_at_step < k`). The lower-half analog of the elite guard: a fresh immigrant with 1–2 bad verdicts gets k steps to draw its arch-lottery ticket before the inverse-fitness roulette can claim it. Shields ALL cull channels (mutation roulette/fallbacks, crossover Worst and Random); a firing roll always finds a slot — if every non-elite net is on probation, the protection breaks for that pick. Probation is a STATUS, not a queue: the net still trains, measures, and ranks. Recorded in `engine.json`; state-free (uses the persisted `entered_at_step`). |
 | Founder topologies | `set_run_topologies(topos)` | `[]` | User-supplied founder blueprints (blueprint-ONLY — fresh weights + optimizer like every net) seeded into the population FIRST at step 0, in order; the random batch fills the remaining `pop_size` slots. Loaders: `population::run_topology_from_json_file` (topology JSON or a `nets/<hash>.json` state) and `population::run_topologies_from_run_dir` (a prior run's net states, ranked by final smoothed fitness, champion first). Count recorded as `run_topology_count` in `engine.json`. |
 | Checkpoint elite weights | `set_elite_checkpoint_weights(enabled)` | `true` | Every checkpoint, export top-`elite_count` weights as `checkpoint-elite-<hash>.safetensors` (overwritten — latest wins). Hard-kill durability: a `kill -9` loses at most one checkpoint interval of weights; the frontier states already carry topology + counters each checkpoint. The stop-time `elite-<hash>.safetensors` artifacts stay separate. |
 | Run name | `set_run_name(name)` | `None` (timestamp dir) | Human label; results land in `results/<run_name or timestamp>/`. |
-| Additional metrics | `set_run_metrics(metrics)` | `[]` | Informative (non-ranking) metrics; labels become extra columns in per-net metrics snapshots. |
-| Log level | `set_run_log_level(level)` | `LogLevel::Summ` | `None` = silent per step (artifacts still written); `Summ` = one line per step + one per evolution roll; `Minimal` = framed in-place table from step 2, nothing else. (`Full` was removed.) The step line is written **at the end** of the step; its middle column is `eval_loss` in Tabular and the environment volume (`matches`/`turns`/`turns-match`) in RL. |
+| Additional metrics | `set_run_metrics(vec![Metric::custom(label, closure)])` | `[]` | Informative (non-ranking) metrics. There are **no built-in labels** — each metric is an explicit closure `(pred, target) -> f32`, scored on the eval batch; its label becomes an extra `history.csv` column and is recorded in `engine.json`. Never affects ranking/culling. |
+| Log level | `set_run_log_level(level)` | `LogLevel::Summ` | `None` = silent per step (artifacts still written); `Summ` = one line per step + one per evolution roll; `Minimal` = the boxed vitals table from step 2, nothing else (redrawn in place on a terminal). (`Full` was removed.) Console lines go to **stderr**. The step line is written **at the end** of the step; its middle column is `eval_loss` in Tabular and the environment volume (`matches`/`train`/`eval`/`turns-match`) in RL. |
+| Run trace file | `set_run_trace_file(enabled)` | `false` | Also write `<run_dir>/telemetry.jsonl`: one JSON record per engine event at **full fidelity** (debug included, no `LogLevel` filtering — the console is the view, this is the record). Owned by the engine, so it lands in the run dir and travels with the run; the start-up block (race init / search space / build stamp) is buffered and flushed in place once the dir exists. Implies nothing about the console — pair it with `LogLevel::None` for a silent-on-console, recorded run. |
 | CSV export | `set_run_csv_export(enabled)` | `true` | Write `history.csv` (the lossless per-step record). |
 | Elite topology md | `set_elite_save_topology(enabled)` | `true` | Export elite `<hash>.md` (nodes table, edge list, ASCII + mermaid graphs). |
 | Elite safetensors | `set_elite_save_safetensors(enabled)` | `true` | Export elite `<hash>.safetensors` weights. |
@@ -271,7 +298,7 @@ TabularEngine::resume(dir, data_dir, ..)            // continue a stopped run
 ## 8. Related (examples-side, not engine) reminders
 
 - Engine-side defaults above are smoke-sized. **Signal volume** (matches per step, LR, grad clip, baseline/holdout counts) lives in each RL example's consts block — see `examples/kaggle_kagiculture.rs` §2–§5.
-- `max_steps` and `max_target_fitness` are exclusive by design — the panic message is: *only one stop criteria can be used at a time*.
+- `max_steps` is the only built-in stop budget (`max_target_fitness` was deleted; `custom_stop` composes with it).
 - The **decision-lag relay** (an RL experiment) is intentionally **not** an
   engine option — it is a trainer-level wrapper: `DecisionLagTrainer::new(trainer)`
   (`gras::trainer::DecisionLagTrainer`). Per step the net's current weights
