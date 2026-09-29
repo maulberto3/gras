@@ -27,7 +27,7 @@ field — no aliases, no duplicate entry points.
 | `mutate_` | `rolls`, `prob` | §1 |
 | `mutation_` | `probation_steps` (immigrant probation rename — note the `mutate_`/`mutation_` split: `mutate_*` = the roll, `mutation_*` = the immigrant channel's policy/probation) | §1 |
 | `checkpoint_` | `every` (the gate's replay cadence — not a crossover-only knob) | §2 |
-| `stop_` | `max_steps`, `target_fitness`, `custom` | §3 |
+| `stop_` | `max_steps`, `custom` | §3 |
 | `pruner_` | `enabled`, `method`, `steps`, `pruner(PopPruner)` umbrella | §3 |
 | `topology_` | `input_dim`, `output_dim`, `hidden_dim_range`, `hidden_dim_stride`, the six min/max bounds (`hidden_num_nodes`, `inputs_per_node`, `outputs_per_node`), the three NAS pools (`activation_pool`, `combine_op_pool`, `standardize_op_pool`), `options(TopologyOptions)` umbrella | §4, §5 |
 | `worst_` | `save_topology`, `save_safetensors` | §6 |
@@ -194,8 +194,7 @@ A child must prove itself over a replay window of past population means
 
 | Option | Setter | Default | What it controls |
 |---|---|---|---|
-| Max steps | `set_stop_max_steps(n)` | `None` | Stop after n engine steps. **Mutually exclusive** with target fitness — each setter CLEARS its sibling (last writer wins: a const default is overridden by a later flag, not combined); `build()` still panics if a hand-built struct literal carries both. |
-| Target fitness | `set_stop_target_fitness(v)` | `None` | Stop when the **best smoothed fitness** in the population crosses v (direction-aware). What happens at the fire moment: the race ends immediately for everyone — there is no "keep training that one net"; the **post-race pruner** (below) is the mechanism that continues solo training of the elite(s) after the race. |
+| Max steps | `set_stop_max_steps(n)` | `None` | Stop after n engine steps. The **only** built-in stop budget; `set_stop_custom` composes an extra criterion on top. When it fires the race ends immediately for everyone — there is no "keep training that one net"; the **post-race pruner** (below) is the mechanism that continues solo training of the elite(s) after the race. |
 | Custom stop | `set_stop_custom(fn)` | `None` | Pluggable extra criterion evaluated **in addition** to the built-in one; receives a read-only `RaceSnapshot` (best/worst/mean smoothed, step, pop size). Both examples set `\|s\| !s.best_smoothed_fitness.is_finite()` — a broken signal stops the race instead of spinning. |
 
 ### Post-race pruner (what happens after a stop fires)

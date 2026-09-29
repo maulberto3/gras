@@ -63,7 +63,7 @@ Two replacement channels, strictly separated:
 - **Crossover (exploit):** fires with `crossover_prob`; recombines two live nets and inserts the child only if it clears the checkpoint gate. A failed or not-fired roll is simply **spent** — nothing is inserted.
 - **Mutation (explore):** fires with `mutate_prob`; inserts a completely fresh random immigrant (no gate), culling a fitness-inverse-selected net. This is the **only** path random whole nets enter through.
 
-Stop criteria are exclusive: set `max_steps` **or** `max_target_fitness`, never both (it panics at build).
+The only built-in stop budget is `max_steps` (`max_target_fitness` was deleted — a quality bar nobody knows in advance). Add `set_stop_custom(fn)` for an extra criterion layered on top.
 
 A few knobs worth knowing from step one:
 
@@ -80,6 +80,7 @@ A few knobs worth knowing from step one:
 - **`RlEngine` + `RunSpec::rl(..)` (RL / environment):** **no dataset**. The trainer implements `RlStep` — there is **no loss method at all**: the training signal lives inside `train_step`, the trainer drives its own environment and reports the ranking scalar in `StepReport.fitness`; the fitness must be `Fitness::reported(direction, label)`. `RlContext` carries no data. (Typed-spec alternative: `RLSpec{..}` → `RlEngine::from_rl_spec`; tabular mirror `TabularSpec` → `from_tabular_spec`. See OPTIONS.md §7.)
 - Both mode traits extend `StepTrainer` (`make_optimizer`, `describe`). The engine dispatches through a per-mode `ModeAdapter` — a tabular step always carries data, an RL step never does.
 - **The library ships the contract only.** No concrete trainer is exported: you bring your own (MNIST hand-rolls one; `examples/ref_trainer/` is the shared example copy).
+- **`use gras::prelude::*;`** covers the common surface in one line — engine entry points, `Fitness`/`Direction`, the trainer contracts and their reports, the batch stream, `Network`/`Topology`, and the config enums an example actually touches. Niche paths stay explicit: `gras::engine::config` for the full knob surface, `gras::utils::*` for data/score/step helpers, `gras::flodl::tensor::Result` for the tensor result type.
 
 Evolution (crossover, mutation, gates, culls) is identical in both modes.
 
