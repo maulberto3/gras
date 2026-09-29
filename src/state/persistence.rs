@@ -57,17 +57,20 @@ pub struct ConfigSnapshot {
     pub crossover_ops_pool: Vec<String>,
     pub crossover_prob: f32,
     pub mutate_prob: f32,
-    /// Stop budgets as configured (`None` = no limit). The two are mutually
-    /// exclusive, so at most one is ever `Some`. `max_steps` is duplicated at
+    /// Stop budget as configured (`None` = no limit). Duplicated at
     /// the header root for readers that want the stop criterion without
     /// opening `config`; this copy is the authoritative one.
-    pub max_target_fitness: Option<f32>,
+    #[serde(default)]
     pub max_steps: Option<usize>,
     /// Whether a pluggable `custom_stop` closure was installed. The closure is
     /// code, not data, so only its presence is recordable.
     pub has_custom_stop: bool,
     /// Per-step verbosity (`"none"` | `"summ"` | `"minimal"`).
     pub log_level: String,
+    /// Whether the run wrote the `telemetry.jsonl` event sidecar
+    /// (`#[serde(default)]` so pre-knob `engine.json` files still load).
+    #[serde(default)]
+    pub trace_file: bool,
     /// Problem-space target (`"tabular"` | `"onecimage"` | `"threecimage"` |
     /// `"nlp"` | `"rl"`).
     pub mode: String,
@@ -100,10 +103,15 @@ pub struct ConfigSnapshot {
     /// Mutation catch-up toggle (`set_mutation_catch_up`, engine.json key
     /// kept as `fresh_immigrants`): `true` = immigrants replay catch-up.
     /// Replay-relevant — a resumed run must use the same insertion semantics
-    /// or the replayed population diverges. (RL-effective only; tabular
-    /// always catches up.)
+    /// or the replayed population diverges. Reads the active mode arm
+    /// (tabular and RL each carry their own copy).
     #[serde(default = "default_false")]
     pub fresh_immigrants: bool,
+    /// Crossover catch-up toggle (`set_crossover_catch_up`): `false` = a
+    /// crossover child skips replay AND the checkpoint gate. Replay-relevant
+    /// for the same reason as `fresh_immigrants`.
+    #[serde(default = "default_true")]
+    pub crossover_catch_up: bool,
     /// How many of the initial population slots were user-supplied run
     /// topologies (the founding batch) (`set_run_topologies`). Informational (lineage reads:
     /// ordinals `< run_topology_count` are imports, the rest are random draws).
@@ -119,6 +127,12 @@ pub struct ConfigSnapshot {
     /// WHICH nets get culled, so a resumed run must use the same window.
     #[serde(default)]
     pub mutation_probation_steps: usize,
+    /// Anti-plateau challenge probability (`set_run_challenge_prob`):
+    /// per-step, per-net chance a challenged step fires. Replay-relevant —
+    /// the trigger is re-derived from (run_seed, net_seed, step) on replay,
+    /// so a resumed run must roll the same probability.
+    #[serde(default)]
+    pub challenge_prob: f32,
     /// One-line identity of the binary that produced the run (`gras` version,
     /// profile, exe path, build time). Diagnostics only — lets a reader tell
     /// a stale-process artifact from a logic bug.
@@ -147,10 +161,10 @@ impl ConfigSnapshot {
             crossover_ops_pool: cfg.crossover_ops_pool.clone(),
             crossover_prob: cfg.crossover_prob,
             mutate_prob: cfg.mutate_prob,
-            max_target_fitness: cfg.max_target_fitness,
             max_steps: cfg.max_steps,
             has_custom_stop: cfg.custom_stop.is_some(),
             log_level: format!("{:?}", cfg.log_level).to_lowercase(),
+            trace_file: cfg.trace_file,
             mode: format!("{:?}", cfg.mode).to_lowercase(),
             batch_size,
             eval_batch_size,
@@ -168,10 +182,12 @@ impl ConfigSnapshot {
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
             fresh_immigrants: cfg.mode_specific.mutation_catch_up(),
+            crossover_catch_up: cfg.mode_specific.crossover_catch_up(),
             run_topology_count: cfg.run_topologies.len(),
             elite_checkpoint_weights: cfg.elite_checkpoint_weights,
             mutation_probation_steps: cfg.mutation_probation_steps,
-            build: crate::engine::core::build_stamp(),
+            challenge_prob: cfg.challenge_prob,
+            build: crate::engine::format::build_stamp(),
         }
     }
 }
@@ -1034,7 +1050,7 @@ mod tests {
             combine_op_pool: vec!["Mean".into(), "Min".into()],
             activation_pool: vec!["ReLU".into(), "SELU".into()],
             standardize_op_pool: vec!["Identity".into()],
-            informative_metrics: vec![Metric::new("dummy")],
+            informative_metrics: vec![Metric::custom("dummy", |_p, _y| Ok(0.0))],
             max_steps: Some(10_000),
             train_eval_split_ratio: Some(0.2),
             held_out_eval_rows: Some(256),
@@ -1131,10 +1147,9 @@ mod tests {
     fn schema_records_mode_appropriate_geometry_and_no_trainer_owned_fields() {
         // RL header: no stream, so geometry is genuinely absent (`null`), and
         // the step budget sits beside the fitness target in `config`.
-        let mut rl_cfg = crate::engine::RaceConfig {
+        let rl_cfg = crate::engine::RaceConfig {
             mode: crate::engine::config::RunMode::Rl,
             max_steps: Some(25),
-            max_target_fitness: None,
             ..Default::default()
         };
         let rl = ConfigSnapshot::from_config(&rl_cfg, None, None);
@@ -1144,11 +1159,6 @@ mod tests {
             rl.max_steps,
             Some(25),
             "step budget recorded with the stop criteria"
-        );
-        rl_cfg.max_target_fitness = Some(1.0); // exclusive pair, never both Some
-        assert_eq!(
-            ConfigSnapshot::from_config(&rl_cfg, None, None).max_steps,
-            Some(25)
         );
 
         // Tabular header: the stream shape the run actually used is recorded.
