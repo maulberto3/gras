@@ -133,6 +133,11 @@ pub struct ConfigSnapshot {
     /// so a resumed run must roll the same probability.
     #[serde(default)]
     pub challenge_prob: f32,
+    /// Fresh holdout games the post-race guardrail plays
+    /// (`set_guardrail_matches`). Diagnostic — it describes the verdict's
+    /// sample size, not replay semantics, so a change needs no resume guard.
+    #[serde(default = "default_guardrail_matches")]
+    pub guardrail_matches: usize,
     /// One-line identity of the binary that produced the run (`gras` version,
     /// profile, exe path, build time). Diagnostics only — lets a reader tell
     /// a stale-process artifact from a logic bug.
@@ -187,6 +192,7 @@ impl ConfigSnapshot {
             elite_checkpoint_weights: cfg.elite_checkpoint_weights,
             mutation_probation_steps: cfg.mutation_probation_steps,
             challenge_prob: cfg.challenge_prob,
+            guardrail_matches: cfg.guardrail_matches,
             build: crate::engine::format::build_stamp(),
         }
     }
@@ -531,6 +537,13 @@ fn default_true() -> bool {
     true
 }
 
+/// Pre-knob `engine.json` files carry no `guardrail_matches`; a bare
+/// `#[serde(default)]` would deserialize them as 0 games, so anchor the
+/// fallback on the config's own default.
+fn default_guardrail_matches() -> usize {
+    crate::engine::config::DEFAULT_GUARDRAIL_MATCHES
+}
+
 // ── Per-net state (nets/<hash>.json) ──────────────────────────────────────
 
 /// The last-known state of one live net. Written to `nets/<hash>.json` and
@@ -728,7 +741,9 @@ impl NetState {
 
     /// Whether `step` lies inside a recorded frozen span.
     pub fn is_frozen_step(&self, step: usize) -> bool {
-        self.frozen_spans.iter().any(|&(s, e)| step >= s && step <= e)
+        self.frozen_spans
+            .iter()
+            .any(|&(s, e)| step >= s && step <= e)
     }
 
     /// Serialize to pretty JSON for writing `nets/<hash>.json`.
