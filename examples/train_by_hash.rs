@@ -10,15 +10,12 @@
 //! training.
 
 use clap::Parser;
-use gras::engine::fitness::{Direction, Fitness};
-use gras::engine::{TabularEngine, TabularRaceConfig};
-use gras::graph::network::Network;
-use gras::graph::topology::Topology;
+use gras::prelude::*;
 use gras::state::{load_engine_json, load_net_state};
 #[path = "ref_trainer/mod.rs"]
 mod ref_trainer;
-use ref_trainer::TabularTrainer;
 use gras::utils::{score, tabular_data};
+use ref_trainer::TabularTrainer;
 use std::path::PathBuf;
 
 /// The command line: optional run/hash positionals (no args = demo run).

@@ -16,8 +16,7 @@ mod ref_trainer;
 use std::path::Path;
 
 use clap::Parser;
-use gras::engine::fitness::{Direction, Fitness, Metric};
-use gras::engine::{TabularEngine, TabularRaceConfig};
+use gras::prelude::*;
 use gras::utils::{score, tabular_data};
 
 /// The command line: the shared engine flags (this example has no extra knobs).

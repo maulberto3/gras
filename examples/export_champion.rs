@@ -38,13 +38,12 @@
 //! net (tombstones included) by replaying its history.
 
 use clap::Parser;
-use gras::graph::network::Network;
-use gras::graph::topology::Topology;
+use gras::prelude::*;
 use gras::state::load_net_state;
 #[path = "ref_trainer/mod.rs"]
 mod ref_trainer;
-use ref_trainer::TabularTrainer;
 use gras::utils::{score, tabular_data};
+use ref_trainer::TabularTrainer;
 use std::path::PathBuf;
 
 /// The command line: run + net identity + the replay recipe.

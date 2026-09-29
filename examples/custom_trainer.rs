@@ -36,15 +36,7 @@ mod cli;
 use std::path::Path;
 
 use clap::Parser;
-use gras::flodl::Tensor;
-use gras::flodl::nn::Module;
-use gras::flodl::nn::optim::Optimizer;
-
-use gras::Variable;
-use gras::engine::fitness::{Direction, Fitness, Metric};
-use gras::engine::{TabularEngine, TabularRaceConfig};
-use gras::graph::network::Network;
-use gras::trainer::{StepTrainer, TabularContext, TabularStep, TabularStepReport};
+use gras::prelude::*;
 use gras::utils::{score, tabular_data};
 
 // ── 1. The custom trainer ────────────────────────────────────────────────────

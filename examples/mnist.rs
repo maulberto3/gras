@@ -19,18 +19,10 @@ mod cli;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use gras::engine::config::LogLevel;
-use gras::engine::fitness::{Direction, Fitness, Metric};
-use gras::engine::{TabularEngine, TabularRaceConfig};
-use gras::flodl::Tensor;
-use gras::flodl::nn::Module;
-use gras::flodl::nn::optim::Optimizer;
 use gras::flodl::tensor::{Result as TensorResult, TensorError};
-use gras::graph::network::Network;
-use gras::trainer::{StepTrainer, StreamShape, TabularContext, TabularStep, TabularStepReport};
+use gras::prelude::*;
 use gras::utils::race_steps::{deterministic_train_step, eval_one_step};
 use gras::utils::{score, tabular_data};
-use gras::{BatchStream, PoolSplit, Variable};
 
 // ═══ 1. DATA ════════════════════════════════════════════════════════════
 
@@ -67,8 +59,10 @@ struct MnistTrainer {
     /// Last eval accuracy (from the previous step's report) — the metric that
     /// scales challenge jitter.
     last_accuracy: f32,
-    /// `(test set, deterministic stream over it, draws)` — the guardrail half.
-    holdout: Option<(tabular_data::Dataset, BatchStream, usize)>,
+    /// `(test set, deterministic stream over it)` — the guardrail half. How
+    /// many draws it makes is the RUN's knob (`set_guardrail_matches`),
+    /// not this trainer's.
+    holdout: Option<(tabular_data::Dataset, BatchStream)>,
 }
 
 impl MnistTrainer {
@@ -87,13 +81,13 @@ impl MnistTrainer {
         }
     }
 
-    /// Install the guardrail: score the champion on `rows` rows of `dataset`,
-    /// `matches` times. Measurement only — it must never learn.
-    fn with_holdout(mut self, dataset: tabular_data::Dataset, rows: usize, matches: usize) -> Self {
+    /// Install the guardrail: score the champion on `rows` rows of `dataset`
+    /// per draw. Measurement only — it must never learn.
+    fn with_holdout(mut self, dataset: tabular_data::Dataset, rows: usize) -> Self {
         let seed = 0xBEEF; // disjoint from the run seed's pool
         let split = PoolSplit::of(&dataset, 0.1, seed);
         let stream = BatchStream::new(seed, rows, split).with_eval_batch_size(rows);
-        self.holdout = Some((dataset, stream, matches));
+        self.holdout = Some((dataset, stream));
         self
     }
 }
@@ -122,7 +116,7 @@ impl StepTrainer for MnistTrainer {
 
     /// Score ONE holdout draw — `game_i` seeds which rows.
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> TensorResult<f32> {
-        let (dataset, stream, _) = self
+        let (dataset, stream) = self
             .holdout
             .as_ref()
             .ok_or_else(|| TensorError::new("mnist: no holdout installed"))?;
@@ -131,10 +125,6 @@ impl StepTrainer for MnistTrainer {
         let pred = net.forward(&Variable::new(x, false))?;
         net.train();
         score::accuracy_score(&pred, &Variable::new(y, false))
-    }
-
-    fn holdout_matches(&self) -> Option<usize> {
-        self.holdout.as_ref().map(|(_, _, m)| *m)
     }
 }
 
@@ -330,7 +320,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut trainer = MnistTrainer::new(cli.label_smoothing.unwrap_or(LABEL_SMOOTHING));
     trainer.learning_rate = cli.learning_rate.unwrap_or(LEARNING_RATE);
     trainer.train_batch = cli.batch_size.unwrap_or(BATCH_SIZE);
-    let trainer = trainer.with_holdout(holdout, HOLDOUT_ROWS, HOLDOUT_MATCHES);
+    let trainer = trainer.with_holdout(holdout, HOLDOUT_ROWS);
 
     // ── STEP C — the config surface.
     let pop = cli.engine.pop.unwrap_or(POP_SIZE);
@@ -376,6 +366,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_pruner_enabled(POP_PRUNER)
         .set_pruner_method(gras::engine::config::PopPrunerMethod::Hard)
         .set_pruner_steps(PRUNER_STEPS)
+        // --- Guardrail (post-race honesty check) ---
+        .set_guardrail_matches(HOLDOUT_MATCHES) // fresh holdout draws behind the champion verdict
         // --- Topology & network search boundaries ---
         .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(15)

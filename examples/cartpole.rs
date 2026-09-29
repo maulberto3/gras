@@ -13,15 +13,7 @@
 mod cartpole_tests;
 
 use fastrand::Rng;
-use gras::Variable;
-use gras::engine::config::{CrossCullPolicy, CrossoverGate, LogLevel, MutationCullPolicy};
-use gras::engine::fitness::{Direction, Fitness};
-use gras::engine::{RlEngine, RunSpec, rl_race_config_builder};
-use gras::flodl::nn::Module;
-use gras::flodl::nn::optim::Optimizer;
-use gras::flodl::{Device, Tensor};
-use gras::graph::network::Network;
-use gras::trainer::{RlContext, RlStep, RlStepMeta, RlStepReport, StepTrainer};
+use gras::prelude::*;
 use gras::utils::race_steps::train_one_step_pred_only;
 
 type Transition = ([f32; 4], usize);
@@ -89,7 +81,7 @@ impl CartPole {
 // SECTION 2 — THE TRAINER (the gras contract: StepTrainer + RlStep)
 // ═══════════════════════════════════════════════════════════════════════
 
-const RUN_SEED: u64 = 1;
+const RUN_SEED: u64 = 42;
 const HOLDOUT_SEED: u64 = 2;
 const HOLDOUT_MATCHES: usize = 10;
 const LEARNING_RATE: f32 = 1e-3;
@@ -278,11 +270,6 @@ impl StepTrainer for CartPoleTrainer {
         let (_, survival) = self.play_episode(net, seed, None)?;
         Ok(survival as f32)
     }
-
-    /// 10 fresh games per guardrail run.
-    fn holdout_matches(&self) -> Option<usize> {
-        Some(HOLDOUT_MATCHES)
-    }
 }
 
 impl RlStep for CartPoleTrainer {
@@ -377,7 +364,7 @@ impl RlStep for CartPoleTrainer {
 
 // ═══════════════════════════════════════════════════════════════════════
 // SECTION 3 — THE GUARDRAIL (fresh unseen games, engine-driven)
-// The measurement half (`holdout_score` / `holdout_matches`) lives in the
+// The measurement half (`holdout_score`) lives in the
 // StepTrainer impl above — the engine calls the run's OWN trainer, so there
 // is no second scorer object to build.
 // ═══════════════════════════════════════════════════════════════════════
@@ -392,10 +379,10 @@ impl RlStep for CartPoleTrainer {
 // is the RL front door — RlRaceConfig::builder() silently resolves to the
 // shared (Tabular-arm) builder and RL-only setters would panic at build.
 const POP: usize = 50;
-const RACE_STEPS: usize = 25;
+const RACE_STEPS: usize = 20;
 const CHALLENGE_PROB: f32 = 0.25;
 const MATCHES_PER_STEP: usize = 2;
-const EVAL_MATCHES_PER_STEP: usize = 4;
+const EVAL_MATCHES_PER_STEP: usize = 2;
 
 /// The smoke-test CLI: deliberately just two flags. Everything else is a
 /// const above — clap rejects any other flag at the usage line.
@@ -435,7 +422,7 @@ fn main() {
         .set_run_log_level(LOG_LEVEL)
         // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
         .set_run_pop_size(pop)
-        .set_run_smoothing_window(10)
+        .set_run_smoothing_window(5)
         .set_run_pop_catch_up(false)
         .set_run_checkpoint_every(2)
         .set_run_challenge_prob(CHALLENGE_PROB)
@@ -447,12 +434,14 @@ fn main() {
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
         .set_crossover_catch_up(true)
         .set_crossover_gate(CrossoverGate::Soft)
-        .set_crossover_gate_window(10)
+        .set_crossover_gate_window(5)
         .set_mutate_prob(0.5)
         .set_mutate_rolls(pop / 5)
         .set_mutation_catch_up(false)
         .set_mutation_cull_policy(MutationCullPolicy::InverseFitness)
         .set_mutation_probation_steps(5)
+        // --- Guardrail (post-race honesty check): fresh unseen games ---
+        .set_guardrail_matches(HOLDOUT_MATCHES)
         .set_topology_dropout_prob(DROPOUT_PROB)
         .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(15)
@@ -521,13 +510,14 @@ fn main() {
         Err(e) => eprintln!("race error: {e}"),
     }
 
-    // STEP D — guardrail: 10 FRESH games (HOLDOUT_SEED, seen by no step) —
-    // per-step fitness ranks nets against each other; this asks the absolute
-    // question (is the champion actually good? see CARTPOLE_EXPERIMENTS.md
-    // for the false-SOLVED verdict that motivated it). The run's OWN trainer
-    // scores the holdout (holdout_score above); `None` just means no
-    // champion was exported — the honest skip, not an error.
-    match engine.guardrail(device, Some(HOLDOUT_MATCHES)) {
+    // STEP D — guardrail: HOLDOUT_MATCHES FRESH games (HOLDOUT_SEED, seen by
+    // no step) — per-step fitness ranks nets against each other; this asks the
+    // absolute question (is the champion actually good? see
+    // CARTPOLE_EXPERIMENTS.md for the false-SOLVED verdict that motivated it).
+    // The run's OWN trainer scores the holdout (holdout_score above), and the
+    // count comes from the config's `set_guardrail_matches`; returning `None`
+    // just means no champion was exported — the honest skip, not an error.
+    match engine.guardrail(device, None) {
         Some(v) => {
             let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
             let smoothed_note = v

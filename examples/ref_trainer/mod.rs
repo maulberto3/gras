@@ -11,11 +11,8 @@
 
 #![allow(dead_code)]
 
-use gras::flodl::nn::optim::Optimizer;
 use gras::flodl::tensor::Result;
-use gras::flodl::{Tensor, Variable};
-use gras::graph::network::Network;
-use gras::trainer::{StepTrainer, TabularContext, TabularStep};
+use gras::prelude::*;
 use gras::utils::race_steps::{deterministic_train_step, eval_one_step};
 
 /// Classic tabular scheme. Owns everything about how a net learns: the loss
@@ -35,10 +32,7 @@ pub struct TabularTrainer {
 }
 
 /// The installed holdout scorer (see [`TabularTrainer::with_holdout_scorer`]).
-type HoldoutScorer = (
-    Box<dyn Fn(&mut Network, usize) -> Result<f32> + Send>,
-    usize,
-);
+type HoldoutScorer = Box<dyn Fn(&mut Network, usize) -> Result<f32> + Send>;
 
 impl TabularTrainer {
     /// A tabular scheme is defined by its loss — constructor takes it.
@@ -98,9 +92,8 @@ impl TabularTrainer {
     pub fn with_holdout_scorer(
         mut self,
         scorer: impl Fn(&mut Network, usize) -> Result<f32> + Send + 'static,
-        matches: usize,
     ) -> Self {
-        self.holdout = Some((Box::new(scorer), matches));
+        self.holdout = Some(Box::new(scorer));
         self
     }
 }
@@ -145,13 +138,9 @@ impl StepTrainer for TabularTrainer {
 
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> Result<f32> {
         match &self.holdout {
-            Some((scorer, _)) => scorer(net, game_i),
+            Some(scorer) => scorer(net, game_i),
             None => gras::trainer::StepTrainer::holdout_score(self, net, game_i),
         }
-    }
-
-    fn holdout_matches(&self) -> Option<usize> {
-        self.holdout.as_ref().map(|(_, n)| *n)
     }
 }
 
