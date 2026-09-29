@@ -20,7 +20,7 @@
 //! 5. One per-step rollup line (or the `Minimal` frame) describing the step
 //!    that just ended — logged LAST on purpose, so it always sits at the bottom
 //!    of the terminal.
-//! 6. Stop criteria checked (max_steps, max_target_fitness, custom_stop) —
+//! 6. Stop criteria checked (max_steps, custom_stop) —
 //!    log which fired.
 //! 7. Repeat — the loop's clock is the nets' recorded steps (every net is at
 //!    the same step after the group steps, so reading any live net's step
@@ -1505,8 +1505,9 @@ impl CoreEngine {
     /// the run's OWN trainer (`holdout_score` — one game per call, same
     /// units as the reported fitness). No scorer object to wire: the engine
     /// owns the trainer, so the whole call is `engine.guardrail(device)`.
-    /// Game count defaults to the trainer's own measurement batch shape
-    /// (`holdout_matches`); pass `Some(n)` to override.
+    /// Game count is the run's `guardrail_matches`
+    /// (`set_guardrail_matches`, default 16); pass `Some(n)` to override it
+    /// for one call — useful when a close verdict deserves a bigger sample.
     ///
     /// `None` = no champion was ever exported, the champion could not be
     /// reloaded (missing/unloadable weights — the verdict would be about a
@@ -1517,7 +1518,7 @@ impl CoreEngine {
         matches: Option<usize>,
     ) -> Option<crate::engine::guardrail::GuardrailVerdict> {
         let champion = self.champions.first()?;
-        let matches = matches.unwrap_or_else(|| self.trainer.holdout_matches().unwrap_or(16));
+        let matches = matches.unwrap_or(self.config.guardrail_matches);
         let race_smoothed = self.smoothed_fitness_of(champion);
         crate::engine::guardrail::score_with(
             &self.run_dir,

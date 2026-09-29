@@ -100,11 +100,10 @@ impl TabularEngine {
     /// **Yours to change** between runs (budget/log surface only — never
     /// touches a step's dynamics):
     ///
-    /// - stop criterion: keep, raise, or **swap** `max_steps` ↔
-    ///   `max_target_fitness` (still exclusive at `build()` — exactly one,
-    ///   same panic as a fresh run). The step budget is **absolute**, not
-    ///   per-process: interrupt at 17 with `max_steps: 20` and the resumed
-    ///   run goes 3 more steps, not 20.
+    /// - stop criterion: keep or raise `max_steps` (`max_target_fitness` was
+    ///   deleted — use `custom_stop` for a target-like policy). The step budget
+    ///   is **absolute**, not per-process: interrupt at 17 with
+    ///   `max_steps: 20` and the resumed run goes 3 more steps, not 20.
     /// - `log_level`, `checkpoint_every`
     ///
     /// Also worth knowing: `step_clock()` reads the **max step across live

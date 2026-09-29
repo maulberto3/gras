@@ -108,6 +108,26 @@ impl Fitness {
         }
     }
 
+    /// Lower-is-better scorer — shorthand for
+    /// `Fitness::new(score_fn, Direction::Minimize, label)` that reads as the
+    /// intent: `Fitness::minimize("mse", mse_loss_score)`.
+    pub fn minimize<F>(label: &str, score_fn: F) -> Self
+    where
+        F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
+    {
+        Fitness::new(score_fn, Direction::Minimize, label)
+    }
+
+    /// Higher-is-better scorer — shorthand for
+    /// `Fitness::new(score_fn, Direction::Maximize, label)`:
+    /// `Fitness::maximize("f1", f1_score)`.
+    pub fn maximize<F>(label: &str, score_fn: F) -> Self
+    where
+        F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
+    {
+        Fitness::new(score_fn, Direction::Maximize, label)
+    }
+
     /// Score prediction against target — engine-computed ranking metric.
     ///
     /// Errors on a [`Fitness::Reported`] (the trainer owns the value there —
@@ -272,6 +292,32 @@ mod tests {
         let f = Fitness::new(mse_loss_score, Direction::Minimize, "mse");
         assert!(f.is_computed());
         assert!(!f.is_reported());
+    }
+
+    #[test]
+    fn test_fitness_minimize_maximize_shorthand() {
+        let lo = Fitness::minimize("mse", mse_loss_score);
+        assert!(lo.is_computed());
+        assert_eq!(lo.direction(), Direction::Minimize);
+        assert_eq!(lo.label(), "mse");
+
+        let hi = Fitness::maximize("f1", f1_score);
+        assert!(hi.is_computed());
+        assert_eq!(hi.direction(), Direction::Maximize);
+        assert_eq!(hi.label(), "f1");
+
+        // The shorthand must score identically to the long form.
+        let net = tiny_net();
+        let x = input(&[1.0, 2.0, 3.0]);
+        let y = input(&[1.0, 2.0, 3.0]);
+        let pred = net.forward(&x).unwrap();
+        let short = Fitness::minimize("mse", mse_loss_score)
+            .score(&pred, &y)
+            .unwrap();
+        let long = Fitness::new(mse_loss_score, Direction::Minimize, "mse")
+            .score(&pred, &y)
+            .unwrap();
+        assert!((short - long).abs() < 1e-9);
     }
 
     #[test]

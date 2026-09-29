@@ -31,6 +31,10 @@ pub const DEFAULT_CHECKPOINT_EVERY: usize = 10;
 /// Learning rate default for the Adam optimizers.
 pub const DEFAULT_LR: f32 = 1e-3;
 
+/// Default number of fresh holdout games the post-race guardrail plays
+/// ([`RaceConfigBuilder::set_guardrail_matches`]).
+pub const DEFAULT_GUARDRAIL_MATCHES: usize = 16;
+
 /// Per-step log verbosity for the race engine.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LogLevel {
@@ -369,6 +373,12 @@ pub struct RaceConfig {
     /// (default) = the mechanism is OFF. A single knob by design — the
     /// trainer owns the action draw itself (no engine-side script/ledger).
     pub challenge_prob: f32,
+    /// Fresh holdout games the post-race guardrail plays
+    /// (`set_guardrail_matches`): the sample size of the honesty check, used
+    /// when `CoreEngine::guardrail` is called with `None`. Diagnostic only —
+    /// it never touches a step's dynamics. Default
+    /// [`DEFAULT_GUARDRAIL_MATCHES`].
+    pub guardrail_matches: usize,
 }
 
 /// How far through its step budget a run is, `0.0` → `1.0` (clamped), or
@@ -422,7 +432,8 @@ pub(crate) fn challenge_fires(
         return false;
     }
     // Domain-separated seed: independent of every other per-step roll.
-    let mut rng = fastrand::Rng::with_seed(run_seed ^ net_seed.rotate_left(17) ^ ((step as u64) << 32));
+    let mut rng =
+        fastrand::Rng::with_seed(run_seed ^ net_seed.rotate_left(17) ^ ((step as u64) << 32));
     rng.f32() < eff
 }
 
@@ -731,6 +742,7 @@ impl RaceConfig {
             elite_checkpoint_weights: true,
             mutation_probation_steps: 0,
             challenge_prob: 0.0,
+            guardrail_matches: DEFAULT_GUARDRAIL_MATCHES,
         }
     }
 
@@ -985,8 +997,8 @@ impl RaceConfigBuilder {
         self
     }
     /// A user-supplied stop predicate, consulted every step alongside
-    /// `max_steps` / `max_target_fitness`: returning `true` ends the race
-    /// with stop reason `Custom`. Receives a [`RaceSnapshot`] of the current
+    /// `max_steps`: returning `true` ends the race with stop reason
+    /// `Custom`. Receives a [`RaceSnapshot`] of the current
     /// population. Example: stop when the population mean plateaus.
     pub fn set_stop_custom(
         mut self,
@@ -1008,20 +1020,14 @@ impl RaceConfigBuilder {
         self.cfg.crossover_ops_pool = ops.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
-    /// Explicit step budget. Mutually exclusive with
-    /// [`Self::set_stop_target_fitness`] — exactly one stop criterion.
-    /// Accepts a bare value or an `Option` (`impl Into<Option<usize>>`).
-    /// Setting this CLEARS any previously-set target fitness: the two are
-    /// exclusive by construction, so the last writer wins (a const default
-    /// is overridden by a later flag, not combined with it).
+    /// Explicit step budget — the only built-in stop criterion
+    /// ([`Self::set_stop_custom`] composes an extra one on top of it).
+    /// Accepts a bare value or an `Option` (`impl Into<Option<usize>>`);
+    /// `None` (default) = run until externally stopped.
     pub fn set_stop_max_steps(mut self, n: impl Into<Option<usize>>) -> Self {
         self.cfg.max_steps = n.into();
         self
     }
-    /// Whole-bundle stop criteria — DELETED: the two field setters
-    /// ([`Self::set_stop_max_steps`] / [`Self::set_stop_target_fitness`]) are
-    /// the whole surface, and each clears its sibling on write (last writer
-    /// wins), which made the struct form redundant.
     /// Whole-bundle pruner — the struct form of [`Self::set_pruner_enabled`] /
     /// [`Self::set_pruner_method`] / [`Self::set_pruner_steps`]:
     ///
@@ -1252,6 +1258,16 @@ impl RaceConfigBuilder {
     pub fn set_run_challenge_prob(mut self, p: f32) -> Self {
         assert!((0.0..=1.0).contains(&p), "challenge_prob must be in [0, 1]");
         self.cfg.challenge_prob = p;
+        self
+    }
+    /// Fresh holdout games the post-race guardrail plays
+    /// ([`DEFAULT_GUARDRAIL_MATCHES`] = 16): the tighter the verdict has to
+    /// be, the more games — the mean's standard error falls as √N, and each
+    /// game costs about one race step. Diagnostic only (never touches a
+    /// step's dynamics); `CoreEngine::guardrail`'s explicit count overrides
+    /// it for one call.
+    pub fn set_guardrail_matches(mut self, n: usize) -> Self {
+        self.cfg.guardrail_matches = n.max(1);
         self
     }
     /// At stop, save the elite's topology markdown (`elite-<hash>.md`).
@@ -1498,9 +1514,7 @@ mod tests {
     fn stop_setters_are_exclusive_last_writer_wins() {
         // (the old max_target_fitness exclusivity test shrank with the
         // feature's deletion — only the step budget remains)
-        let cfg = RaceConfig::builder()
-            .set_stop_max_steps(15)
-            .build();
+        let cfg = RaceConfig::builder().set_stop_max_steps(15).build();
         assert_eq!(cfg.max_steps, Some(15));
     }
 
@@ -1511,7 +1525,7 @@ mod tests {
     #[test]
     fn challenge_trigger_is_per_net_not_per_step() {
         let fired = (0..64usize)
-            .filter(|i| challenge_fires(42, derive_seed(42, *i), 3, 0.5,None))
+            .filter(|i| challenge_fires(42, derive_seed(42, *i), 3, 0.5, None))
             .count();
         assert!(
             (16..=48).contains(&fired),
