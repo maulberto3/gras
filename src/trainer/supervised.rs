@@ -51,7 +51,14 @@ pub struct TabularTrainer {
     /// still looks plausible, so those tools refuse an unlabeled scheme rather
     /// than guess.
     pub loss_label: Option<String>,
+    pub(crate) holdout: Option<HoldoutScorer>,
 }
+
+/// The installed holdout scorer (see [`TabularTrainer::with_holdout_scorer`]).
+type HoldoutScorer = (
+    Box<dyn Fn(&mut Network, usize) -> Result<f32> + Send>,
+    usize,
+);
 
 impl TabularTrainer {
     /// A tabular scheme is defined by its loss — constructor takes it.
@@ -115,6 +122,21 @@ impl TabularTrainer {
         self.lr_schedule = Some(Box::new(schedule));
         self
     }
+
+    /// Make this trainer guardrail-capable: the scorer draws ONE fresh
+    /// holdout batch (rows no training/eval/gating step ever touches — keep
+    /// them OUT of `data_dir`'s pools; a separate file or synthetic slice)
+    /// and scores the net in the SAME units as the run's fitness. The
+    /// engine's `guardrail()` then needs no second object. `game_i` is the
+    /// deterministic game index — seed your draw from it.
+    pub fn with_holdout_scorer(
+        mut self,
+        scorer: impl Fn(&mut Network, usize) -> Result<f32> + Send + 'static,
+        matches: usize,
+    ) -> Self {
+        self.holdout = Some((Box::new(scorer), matches));
+        self
+    }
 }
 
 impl Default for TabularTrainer {
@@ -131,6 +153,7 @@ impl Default for TabularTrainer {
             // silence is the honest record. `with_loss_label` names it.
             loss_label: None,
             lr_schedule: None,
+            holdout: None,
         }
     }
 }
@@ -157,6 +180,20 @@ impl StepTrainer for TabularTrainer {
             "eval_batch_size": self.eval_batch_size,
             "lr_schedule": self.lr_schedule.is_some(),
         }))
+    }
+
+    /// Guardrail measurement half: run the trainer's holdout scorer when one
+    /// was installed via `with_holdout_scorer`; without one, fail with the
+    /// trait's contract panic.
+    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> Result<f32> {
+        match &self.holdout {
+            Some((scorer, _)) => scorer(net, game_i),
+            None => crate::trainer::StepTrainer::holdout_score(self, net, game_i),
+        }
+    }
+
+    fn holdout_matches(&self) -> Option<usize> {
+        self.holdout.as_ref().map(|(_, n)| *n)
     }
 }
 
@@ -223,6 +260,7 @@ impl TabularStep for TabularTrainer {
             eval_loss: report.eval_loss,
             fitness: report.fitness,
             informative: report.metrics,
+            challenged_inputs: 0,
         })
     }
 }

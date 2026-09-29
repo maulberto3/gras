@@ -42,6 +42,15 @@ pub struct StepReport {
     pub fitness: f32,
     /// Extra non-ranking/informative scores configured for the run, if any.
     pub informative: Vec<f32>,
+    /// Tabular-only challenge volume: how many individual INPUT VALUES this
+    /// net jittered this step (the trainer's report — see
+    /// [`TabularStepReport::challenged_inputs`]). `0` when no challenge fired.
+    #[serde(default)]
+    pub challenged_inputs: usize,
+    /// RL-only challenge volume: turns played under a FORCED action this step
+    /// (see [`RlStepReport::challenged_turns`]). `0` when no challenge fired.
+    #[serde(default)]
+    pub challenged_turns: usize,
     /// RL-only environment volume for this step — see [`RlStepMeta`]. `None`
     /// in Tabular (no environment) and from RL trainers that don't report it
     /// (the log then prints `—` in the RL columns).
@@ -64,6 +73,13 @@ pub struct TabularStepReport {
     pub fitness: f32,
     /// Extra non-ranking/informative scores configured for the run, if any.
     pub informative: Vec<f32>,
+    /// Challenge volume: how many individual INPUT VALUES this net jittered
+    /// this step. The engine only keeps the books — it sums what the trainer
+    /// reports, exactly like RL's `RlStepReport.challenged_turns`. Seed it from
+    /// [`TabularContext::challenge_prob`], which is the effective (decayed)
+    /// per-input-feature probability; leave `0` when the knob is off.
+    #[serde(default)]
+    pub challenged_inputs: usize,
 }
 
 /// The report an [`RlStep`] trainer returns. RL-shaped: no `eval_loss` field
@@ -79,8 +95,15 @@ pub struct RlStepReport {
     pub fitness: f32,
     /// Extra non-ranking/informative scores configured for the run, if any.
     pub informative: Vec<f32>,
-    /// Environment volume for this step — feeds the `matches`/`turns` rollup
-    /// columns. `None` = not reported (the log prints `—`).
+    /// Challenge volume: turns played under a FORCED action this step (the
+    /// `ctx.challenged` signal honored). The engine sums these into the
+    /// rollup's `⚔` column; normally a subset of `rl.train_turns`. `0` when no
+    /// challenge fired (or the trainer ignores the signal). Direct scalar, the
+    /// same shape as [`TabularStepReport::challenged_inputs`].
+    #[serde(default)]
+    pub challenged_turns: usize,
+    /// Environment volume for this step — feeds the `matches`/`train`/`eval`
+    /// rollup columns. `None` = not reported (the log prints `—`).
     pub rl: Option<RlStepMeta>,
 }
 
@@ -95,7 +118,9 @@ impl From<TabularStepReport> for StepReport {
             eval_loss: r.eval_loss,
             fitness: r.fitness,
             informative: r.informative,
-            rl: None, // tabular: no environment, so no volume to report
+            challenged_inputs: r.challenged_inputs,
+            challenged_turns: 0, // tabular: challenge volume is in input values
+            rl: None,            // tabular: no environment, so no volume to report
         }
     }
 }
@@ -107,6 +132,8 @@ impl From<RlStepReport> for StepReport {
             eval_loss: None, // RL: no (pred, target) held-out loss exists
             fitness: r.fitness,
             informative: r.informative,
+            challenged_inputs: 0, // RL reports turns, not input values
+            challenged_turns: r.challenged_turns,
             rl: r.rl,
         }
     }
@@ -121,16 +148,37 @@ impl From<RlStepReport> for StepReport {
 /// inside a match. CartPole calls them episodes/timesteps; the engine log says
 /// match/turn throughout.
 ///
+/// Train and eval turns are reported SEPARATELY, because a challenge can only
+/// ever force TRAIN turns: the trigger is a per-(net, step) probability, so
+/// the expected `⚔` is `p_eff × train_turns` — read against the total it
+/// would overstate the denominator by the eval share. The rollup prints both
+/// halves and the expectation itself (`⚔ <n> (exp <m>)`).
+///
 /// The engine sums these over the live population per clock-step and prints
-/// `matches <total> │ turns <total> │ turns/match <mean>` in the per-step
-/// rollup — so a long RL step shows *why* it took long, and a changing match
-/// length (e.g. `MatchLength::RandomNumTurns`) is visible as it happens.
+/// `matches <total> │ train <total> │ eval <total> │ turns/match <mean>` in
+/// the per-step rollup — so a long RL step shows *why* it took long, and a
+/// changing match length (e.g. `MatchLength::RandomNumTurns`) is visible as it
+/// happens.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RlStepMeta {
-    /// Matches (episodes) this net's trainer played this step.
+    /// Matches (episodes) this net's trainer played this step (train + eval).
     pub matches: usize,
-    /// Environment turns played across those matches.
-    pub turns: usize,
+    /// Turns played in this step's TRAIN matches — the only turns a challenge
+    /// can force, and the denominator of the rollup's expected `⚔`.
+    #[serde(default)]
+    pub train_turns: usize,
+    /// Turns played in this step's EVAL matches. Never challenged — evaluation
+    /// must keep measuring the net's own policy.
+    #[serde(default)]
+    pub eval_turns: usize,
+}
+
+impl RlStepMeta {
+    /// Total environment turns this step (train + eval) — what the rollup's
+    /// `turns/match` mean averages over.
+    pub fn turns(&self) -> usize {
+        self.train_turns + self.eval_turns
+    }
 }
 
 /// Lightweight engine-metadata snapshot handed to the trainer each step.
@@ -149,6 +197,25 @@ pub struct StepEnv {
     pub checkpoint_every: usize,
     /// The per-net fitness smoothing window, in steps (K).
     pub smoothing_window: usize,
+    /// The run's step budget as configured (`None` = unbounded). Carried so a
+    /// trainer can derive its own progress and anneal schedule-shaped things
+    /// (learning rate, entropy bonus, epsilon, exploration temperature)
+    /// WITHOUT a new config knob and without inventing a private counter.
+    pub max_steps: Option<usize>,
+}
+
+impl StepEnv {
+    /// Fraction of the run's step budget consumed (`0.0` → `1.0`), or `None`
+    /// when the run is unbounded — see
+    /// [`crate::engine::config::run_progress`], the single definition both the
+    /// engine and trainers share.
+    ///
+    /// Pure arithmetic on the clock: no stored state, so a replayed step,
+    /// a catch-up step and a resumed step all compute the identical value —
+    /// which is what keeps an annealed schedule replay-safe.
+    pub fn progress(&self) -> Option<f32> {
+        crate::engine::config::run_progress(self.step, self.max_steps)
+    }
 }
 
 /// The dataset + shared batch stream, bundled. Only ever present in a
@@ -187,6 +254,19 @@ pub struct TabularContext<'a> {
     pub net_hash: &'a str,
     /// Deterministic net-specific weight initialization/dropout seed.
     pub net_seed: u64,
+    /// The challenge SIGNAL (anti-plateau): true when the engine's seeded
+    /// trigger fired for this (net, step) — `set_run_challenge_prob` > 0.
+    /// The TRAINER owns the response: jitter its batch, swap in harder rows,
+    /// drop features, … (or ignore the flag entirely — keep the knob at 0 so
+    /// it never fires). Replay-safe: the flag is a pure function of
+    /// run/net/step, so catch-up re-derives it identically.
+    pub challenged: bool,
+    /// The EFFECTIVE (decay-adjusted) challenge probability for this step —
+    /// the per-(input, feature) rate for an element-level response. Roll it
+    /// yourself (seeded from `net_seed`/`step` so replay matches) and report
+    /// how many values you jittered in
+    /// [`TabularStepReport::challenged_inputs`]. `0.0` = challenges off.
+    pub challenge_prob: f32,
 }
 
 /// The context handed to an [`RlStep`] on every step. There is **no** data
@@ -204,6 +284,16 @@ pub struct RlContext<'a> {
     pub net_hash: &'a str,
     /// Deterministic net-specific weight initialization/dropout seed.
     pub net_seed: u64,
+    /// The challenge SIGNAL (anti-plateau): true when the engine's seeded
+    /// trigger fired for this (net, step) — `set_run_challenge_prob` > 0.
+    /// The TRAINER decides what to do with it: branch to a forced/Exploration
+    /// action inside `train_step` (replay-safe — the flag is a pure function
+    /// of run/net/step, so catch-up re-derives it identically), or ignore it
+    /// (a trainer without challenge logic never looks at the flag — keep the
+    /// knob at 0 so it never fires). Whatever the trainer reports in
+    /// `RlStepReport.challenged_turns` is what the log shows; the engine
+    /// does not verify the flag was honored.
+    pub challenged: bool,
 }
 
 /// The batch shape requested by a tabular trainer (defaults to batch_size).
@@ -256,6 +346,29 @@ pub trait StepTrainer: Send {
     /// The engine never interprets the contents; it only persists them.
     /// `None` (the default) means "no description available".
     fn describe(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// The guardrail's measurement half: score ONE fresh holdout game with
+    /// the given (champion-reloaded) net, in the SAME units and estimator
+    /// as the fitness reported in the step report. Implement this (plus
+    /// `holdout_matches` when the default doesn't fit) to make the trainer
+    /// guardrail-capable — the engine's `guardrail()` then needs no second
+    /// scorer object: `engine.guardrail()` is the whole call.
+    ///
+    /// Default: unimplemented (calling `guardrail()` without a scorer
+    /// panics with this contract text — loud, not silent).
+    fn holdout_score(&mut self, _net: &mut Network, _game_i: usize) -> flodl::tensor::Result<f32> {
+        unimplemented!(
+            "holdout_score is not implemented for this trainer — implement it (one fresh \
+             game, same units as the reported fitness) to use engine.guardrail()"
+        )
+    }
+
+    /// How many holdout games `guardrail()` plays. Default `None` = the
+    /// engine falls back to 16. Override when your measurement batch has a
+    /// natural size (e.g. the example's HOLDOUT_MATCHES const).
+    fn holdout_matches(&self) -> Option<usize> {
         None
     }
 }
@@ -352,6 +465,9 @@ pub trait EngineTrainer: Send {
     /// RL pop-wide phase (no-op for tabular): see [`RlStep::pop_phase`].
     fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize);
     /// One training step — the mode decides which context type to build.
+    /// `challenged` is the engine's challenge SIGNAL (both modes; `false`
+    /// when the knob is off) — the adapter folds it into the context it
+    /// builds.
     #[allow(clippy::too_many_arguments)]
     fn train_step(
         &mut self,
@@ -364,7 +480,24 @@ pub trait EngineTrainer: Send {
         env: StepEnv,
         net_hash: &str,
         net_seed: u64,
+        challenged: bool,
+        challenge_prob: f32,
     ) -> flodl::tensor::Result<StepReport>;
+    /// Guardrail dispatch — forwards to the inner trainer's
+    /// `StepTrainer::holdout_score` (see the adapters).
+    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
+        let _ = (net, game_i);
+        unimplemented!(
+            "holdout_score is not implemented for this trainer — implement it (one fresh \
+             game, same units as the reported fitness) to use engine.guardrail()"
+        )
+    }
+    /// Guardrail dispatch — forwards to the inner trainer's
+    /// `StepTrainer::holdout_matches` (see the adapters). None here (no
+    /// stream) → the engine falls back to 16.
+    fn holdout_matches(&self) -> Option<usize> {
+        None
+    }
     /// Mode tag (drives the engine's log columns and RL-only phases).
     fn is_rl(&self) -> bool;
     /// The tabular loss, when this is a tabular trainer (checkpoint exam).
@@ -413,6 +546,8 @@ impl EngineTrainer for ModeAdapter<Box<dyn TabularStep>> {
         env: StepEnv,
         net_hash: &str,
         net_seed: u64,
+        challenged: bool,
+        challenge_prob: f32,
     ) -> flodl::tensor::Result<StepReport> {
         let data =
             data.expect("Tabular step without data — engine construction invariant violated");
@@ -426,8 +561,21 @@ impl EngineTrainer for ModeAdapter<Box<dyn TabularStep>> {
             env,
             net_hash,
             net_seed,
+            challenged,
+            challenge_prob,
         };
         Ok(self.inner.train_step(net, optimizer, step, &ctx)?.into())
+    }
+    /// Guardrail dispatch — WITHOUT this the `EngineTrainer` default runs
+    /// (`unimplemented!()`), so `engine.guardrail()` panicked even for a
+    /// library trainer that HAD a scorer installed
+    /// (`TabularTrainer::with_holdout_scorer`). The RL adapter below always
+    /// forwarded these; this one was missing them.
+    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
+        self.inner.holdout_score(net, game_i)
+    }
+    fn holdout_matches(&self) -> Option<usize> {
+        self.inner.holdout_matches()
     }
     fn is_rl(&self) -> bool {
         false
@@ -461,6 +609,8 @@ impl EngineTrainer for ModeAdapter<Box<dyn RlStep>> {
         env: StepEnv,
         net_hash: &str,
         net_seed: u64,
+        challenged: bool,
+        _challenge_prob: f32,
     ) -> flodl::tensor::Result<StepReport> {
         let ctx = RlContext {
             fitness,
@@ -468,8 +618,15 @@ impl EngineTrainer for ModeAdapter<Box<dyn RlStep>> {
             env,
             net_hash,
             net_seed,
+            challenged,
         };
         Ok(self.inner.train_step(net, optimizer, step, &ctx)?.into())
+    }
+    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
+        self.inner.holdout_score(net, game_i)
+    }
+    fn holdout_matches(&self) -> Option<usize> {
+        self.inner.holdout_matches()
     }
     fn is_rl(&self) -> bool {
         true
@@ -484,6 +641,16 @@ impl StepTrainer for Box<dyn StepTrainer> {
     }
     fn describe(&self) -> Option<serde_json::Value> {
         self.as_ref().describe()
+    }
+    /// Guardrail: forward through the box. Omitting these is a silent trap —
+    /// `self.inner.holdout_score(..)` on a `Box<dyn _>` resolves to the BOX's
+    /// impl (found before the autoderef to `dyn _`), whose default is
+    /// `unimplemented!()`. Every boxed impl below must forward both halves.
+    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
+        self.as_mut().holdout_score(net, game_i)
+    }
+    fn holdout_matches(&self) -> Option<usize> {
+        self.as_ref().holdout_matches()
     }
 }
 
@@ -532,6 +699,13 @@ impl StepTrainer for Box<dyn TabularStep> {
     fn describe(&self) -> Option<serde_json::Value> {
         self.as_ref().describe()
     }
+    /// Guardrail forwarding — see the `Box<dyn StepTrainer>` impl above.
+    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
+        self.as_mut().holdout_score(net, game_i)
+    }
+    fn holdout_matches(&self) -> Option<usize> {
+        self.as_ref().holdout_matches()
+    }
 }
 
 impl StepTrainer for Box<dyn RlStep> {
@@ -540,6 +714,16 @@ impl StepTrainer for Box<dyn RlStep> {
     }
     fn describe(&self) -> Option<serde_json::Value> {
         self.as_ref().describe()
+    }
+    /// Guardrail forwarding — see the `Box<dyn StepTrainer>` impl above. This
+    /// was the hole that made `examples/cartpole` panic AFTER its run:
+    /// `ModeAdapter<Box<dyn RlStep>>::holdout_score` forwards to here, and an
+    /// absent override here means the trait default `unimplemented!()` runs.
+    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
+        self.as_mut().holdout_score(net, game_i)
+    }
+    fn holdout_matches(&self) -> Option<usize> {
+        self.as_ref().holdout_matches()
     }
 }
 
@@ -551,5 +735,132 @@ pub trait IntoBoxedTrainer {
 impl<T: StepTrainer + 'static> IntoBoxedTrainer for T {
     fn into_boxed(self) -> Box<dyn StepTrainer> {
         Box::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::node::Node;
+    use crate::graph::topology::Topology;
+    use flodl::Device;
+    // `Module` provides `Network::parameters()`, used by `make_optimizer`.
+    use flodl::Module;
+
+    /// A trainer that ANSWERS the guardrail with a sentinel, so a test can tell
+    /// "the override ran" from "the trait default panicked".
+    struct SentinelRl;
+
+    impl StepTrainer for SentinelRl {
+        fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
+            Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
+        }
+        fn holdout_score(
+            &mut self,
+            _net: &mut Network,
+            game_i: usize,
+        ) -> flodl::tensor::Result<f32> {
+            Ok(100.0 + game_i as f32)
+        }
+        fn holdout_matches(&self) -> Option<usize> {
+            Some(3)
+        }
+    }
+
+    impl RlStep for SentinelRl {
+        fn train_step(
+            &mut self,
+            _net: &mut Network,
+            _optimizer: &mut dyn flodl::nn::optim::Optimizer,
+            _step: usize,
+            _ctx: &RlContext<'_>,
+        ) -> flodl::tensor::Result<RlStepReport> {
+            unimplemented!("the guardrail dispatch test never trains")
+        }
+    }
+
+    /// The ctx carries the run clock (`step` + `max_steps`), so a trainer can
+    /// derive progress and anneal its own schedules without a private counter —
+    /// and `None` means "unbounded: no schedule", the same convention the
+    /// engine's challenge decay uses.
+    #[test]
+    fn step_env_progress_reads_the_run_clock() {
+        let env = StepEnv {
+            step: 25,
+            run_seed: 1,
+            pop_size: 2,
+            live_count: 2,
+            checkpoint_every: 10,
+            smoothing_window: 5,
+            max_steps: Some(100),
+        };
+        assert_eq!(env.progress(), Some(0.25));
+        // Past the budget clamps rather than overshooting.
+        assert_eq!(StepEnv { step: 400, ..env }.progress(), Some(1.0));
+        // Unbounded: the trainer gets no schedule signal at all.
+        assert_eq!(
+            StepEnv {
+                max_steps: None,
+                ..env
+            }
+            .progress(),
+            None
+        );
+    }
+
+    /// The smallest net that satisfies the guardrail's signature — the
+    /// sentinel never touches it, but a `&mut Network` is required to call.
+    fn tiny_net() -> Network {
+        let mut graph = Topology::new(0, None);
+        graph.nodes.push(Node::new_input(0, 2));
+        graph.nodes.push(Node::new_hidden(1, 3, 2));
+        graph.nodes.push(Node::new_output(2, 2, 1));
+        graph.refresh_labels();
+        graph.finalize();
+        Network::build(&graph, Device::CPU).unwrap()
+    }
+
+    /// REGRESSION (cartpole's post-run abort): `engine.guardrail()` must reach
+    /// the trainer's OWN `holdout_score` through every box in the chain. It did
+    /// not — `Box<dyn RlStep>` resolves `holdout_score` to its own
+    /// `StepTrainer` impl (found before the autoderef to `dyn RlStep`), and that
+    /// impl forwarded only `make_optimizer`/`describe`, so the trait DEFAULT
+    /// ran and `unimplemented!()` killed a race that had already finished.
+    #[test]
+    fn guardrail_forwarding_survives_boxing_rl() {
+        let mut net = tiny_net();
+        // ModeAdapter<Box<dyn RlStep>> -> Box<dyn RlStep> -> SentinelRl.
+        let mut adapter = ModeAdapter::rl(Box::new(SentinelRl));
+        assert_eq!(
+            EngineTrainer::holdout_score(&mut adapter, &mut net, 1).unwrap(),
+            101.0,
+            "the boxed trainer's override must run, not the trait default"
+        );
+        assert_eq!(EngineTrainer::holdout_matches(&adapter), Some(3));
+    }
+
+    /// The tabular half of the same bug: `ModeAdapter<Box<dyn TabularStep>>`
+    /// omitted the holdout forward entirely, so even a library trainer WITH a
+    /// scorer installed (`TabularTrainer::with_holdout_scorer` — the MNIST
+    /// path) hit the `EngineTrainer` default panic.
+    #[test]
+    fn guardrail_forwarding_survives_boxing_tabular() {
+        let trainer = crate::trainer::TabularTrainer::new(
+            |_pred, _y| -> flodl::tensor::Result<flodl::Variable> {
+                unimplemented!("the guardrail dispatch test never trains")
+            },
+        )
+        .with_holdout_scorer(
+            |_net, game_i| -> flodl::tensor::Result<f32> { Ok(7.0 + game_i as f32) },
+            5,
+        );
+        let mut adapter = ModeAdapter::tabular(Box::new(trainer));
+        let mut net = tiny_net();
+        assert_eq!(
+            EngineTrainer::holdout_score(&mut adapter, &mut net, 2).unwrap(),
+            9.0,
+            "the installed scorer must run through the tabular adapter"
+        );
+        assert_eq!(EngineTrainer::holdout_matches(&adapter), Some(5));
     }
 }

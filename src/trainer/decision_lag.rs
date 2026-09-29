@@ -206,7 +206,7 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
         // measured from the end of the grace period). Counters and the
         // activation banner start at engagement, not during the warm-up.
         if step < self.grace {
-            log::debug!(
+            tracing::debug!(
                 "decision-lag grace step {step}/{}: plain per-net training (relay engages at step {})",
                 self.grace,
                 self.grace
@@ -227,7 +227,7 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
         // stall is a WARN either way (visible at every level).
         if self.relay.step != Some(step) {
             if let Some(prev) = self.relay.step {
-                log::debug!(
+                tracing::debug!(
                     "decision-lag step {} (lag {}): {} face decision(s) on frozen weights │ {} shadow promotion(s) │ {} stalled",
                     prev,
                     self.lag,
@@ -241,7 +241,7 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
                 } else {
                     String::new()
                 };
-                log::info!(
+                tracing::info!(
                     "decision-lag relay active (lag {} engine step(s){}): each net DECIDES and ranks on held (frozen) weights while a shadow forked from them takes its optimizer step(s) and is promoted at the cycle boundary — ≈2× env per step",
                     self.lag,
                     grace_note
@@ -307,6 +307,8 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
                     metrics: ctx.metrics,
                     env: StepEnv { step: s, ..ctx.env },
                     net_hash: ctx.net_hash,
+                    // Shadow steps are measurement, never challenges.
+                    challenged: false,
                     net_seed: ctx
                         .net_seed
                         .wrapping_add(0x9E37_79B9_7F4A_7C15)
@@ -334,13 +336,13 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
                 // per-net detail at DEBUG.
                 if promoted == face_weights_before {
                     self.relay.stalled += 1;
-                    log::warn!(
+                    tracing::warn!(
                         "decision-lag [{}] step {step}: shadow promotion changed no weights — the relay is NOT learning (lr 0? saturated net?); the face will not evolve",
                         ctx.net_hash,
                     );
                 } else {
                     self.relay.promoted += 1;
-                    log::debug!(
+                    tracing::debug!(
                         "decision-lag [{}] step {step}: face fit {:.4} (deciding pass on held weights) → shadow took {lag} step(s) & was promoted",
                         ctx.net_hash,
                         face_report.fitness,
@@ -349,7 +351,7 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
             }
             None => {
                 self.steps_since_promotion += 1;
-                log::debug!(
+                tracing::debug!(
                     "decision-lag [{}] step {step}: face decided on held weights; shadow trains at the cycle boundary (lag {lag})",
                     ctx.net_hash,
                 );
@@ -415,6 +417,7 @@ mod tests {
                 train_loss: 0.0,
                 fitness: fit,
                 informative: vec![],
+                challenged_turns: 0,
                 rl: None,
             })
         }
@@ -430,6 +433,7 @@ mod tests {
         RlContext {
             fitness,
             metrics,
+            challenged: false,
             env: StepEnv {
                 step,
                 run_seed: 42,
@@ -437,6 +441,7 @@ mod tests {
                 live_count: 2,
                 checkpoint_every: 100,
                 smoothing_window: 10,
+                max_steps: Some(100),
             },
             net_hash: "probe",
             net_seed: 7,
