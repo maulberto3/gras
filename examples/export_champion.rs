@@ -41,7 +41,9 @@ use clap::Parser;
 use gras::graph::network::Network;
 use gras::graph::topology::Topology;
 use gras::state::load_net_state;
-use gras::trainer::TabularTrainer;
+#[path = "ref_trainer/mod.rs"]
+mod ref_trainer;
+use ref_trainer::TabularTrainer;
 use gras::utils::{score, tabular_data};
 use std::path::PathBuf;
 

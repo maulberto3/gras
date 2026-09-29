@@ -10,6 +10,8 @@
 
 #[path = "cli/mod.rs"]
 mod cli;
+#[path = "ref_trainer/mod.rs"]
+mod ref_trainer;
 
 use std::path::Path;
 
@@ -58,7 +60,7 @@ fn main() {
 
     // 2. Fitness — MSE under Minimize (lower = better).
     let fitness = Fitness::new(score::mse_loss_score, Direction::Minimize, "mse");
-    let metrics = vec![Metric::new("mae")];
+    let metrics = vec![Metric::custom("mae", score::l1_loss_score)];
 
     // 3. Config — small defaults (this is a showpiece), overridable by flags.
     //    Topology: 1 input feature, 1 output value.
@@ -86,7 +88,7 @@ fn main() {
         fitness,
         // Name the objective: replay tools (export_champion) rebuild weights
         // only if they can reproduce this exact loss.
-        gras::TabularTrainer::new(loss_fn).with_loss_label("mse"),
+        ref_trainer::TabularTrainer::new(loss_fn).with_loss_label("mse"),
         cli.engine.seed_or(Some(run_seed)),
         cli.engine.run_dir_or(Some(run_dir)),
     ))

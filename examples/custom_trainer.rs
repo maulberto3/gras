@@ -205,6 +205,7 @@ impl TabularStep for WarmupSgdTrainer {
             eval_loss,
             fitness,
             informative,
+            challenged_inputs: 0,
         })
     }
 }
@@ -253,7 +254,7 @@ fn main() {
     // is engine business (drives cull/insert ranking).
     let loss_fn = |pred: &Variable, y: &Variable| score::cross_entropy_onehot_loss(pred, y);
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
-    let metrics = vec![Metric::new("accuracy")];
+    let metrics = vec![Metric::custom("accuracy", score::accuracy_score)];
 
     // Topology — 2 features in, 2 one-hot classes out (setters, no struct).
 

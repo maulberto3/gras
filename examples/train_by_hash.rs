@@ -15,7 +15,9 @@ use gras::engine::{TabularEngine, TabularRaceConfig};
 use gras::graph::network::Network;
 use gras::graph::topology::Topology;
 use gras::state::{load_engine_json, load_net_state};
-use gras::trainer::TabularTrainer;
+#[path = "ref_trainer/mod.rs"]
+mod ref_trainer;
+use ref_trainer::TabularTrainer;
 use gras::utils::{score, tabular_data};
 use std::path::PathBuf;
 
@@ -42,7 +44,7 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    gras::engine::logging::init(gras::engine::config::LogLevel::Summ, None);
 
     let (run_dir, net_hash, data_dir) = match (cli.run_dir, cli.net_hash) {
         (Some(dir), Some(hash)) => (dir, hash, cli.data_dir),

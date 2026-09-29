@@ -90,14 +90,31 @@ mod tests {
     fn holdout_namespace_is_fresh() {
         for game_i in 0..8u64 {
             let holdout = episode_start_seed(HOLDOUT_SEED, 0, game_i);
-            assert_ne!(
-                holdout,
-                episode_start_seed(RUN_SEED + 1000, 0, game_i)
-            );
+            assert_ne!(holdout, episode_start_seed(RUN_SEED + 1000, 0, game_i));
             for net_seed in [42u64, 111, 999] {
                 assert_ne!(holdout, episode_start_seed(net_seed, 0, game_i));
             }
         }
+    }
+
+    /// challenge_step's draw is a pure function of (net_seed, step): replay
+    /// re-forces the identical action, so a challenged step is bit-exact.
+    #[test]
+    fn challenge_action_draw_is_replay_stable() {
+        let draw = |net_seed: u64, step: usize| {
+            let mut rng =
+                Rng::with_seed(net_seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            rng.usize(..2)
+        };
+        for net_seed in [1u64, 42, 999] {
+            for step in 0..8usize {
+                assert_eq!(draw(net_seed, step), draw(net_seed, step));
+                assert!(draw(net_seed, step) < 2);
+            }
+        }
+        // The draw actually varies — it is not accidentally constant.
+        let draws: std::collections::HashSet<usize> = (0..16).map(|step| draw(42, step)).collect();
+        assert_eq!(draws.len(), 2, "draw must hit both actions over 16 steps");
     }
 
     /// The REINFORCE loss is a finite scalar and actually changes weights

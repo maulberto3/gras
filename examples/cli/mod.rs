@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! cargo run --release --example cartpole -- --pop 32 --max-steps 20 --log-level minimal
-//! cargo run --release --example mnist   -- --pop 50 --max-target-fitness 0.9 --seed 7
+//! cargo run --release --example mnist   -- --pop 50 --max-steps 15 --seed 7
 //! ```
 //!
 //! Precedence is simple and explicit: **a flag wins; otherwise the example's
@@ -24,9 +24,9 @@ use gras::engine::config::{LogLevel, RaceConfigBuilder};
 ///
 /// Reuses the engine's own vocabulary (`LogLevel::parse`) instead of inventing
 /// a second set of names: `--log-level summ` is exactly what `engine.json`
-/// records, and it is translated to an `env_logger` filter by
-/// [`Self::init_logger`] — typing `summ` straight into `env_logger` would be
-/// read as a *module* name and mute everything.
+/// records, and [`Self::init_logger`] translates it into the console sink's
+/// filter — typing `summ` straight into a filter string would be read as a
+/// *module* name and mute everything.
 fn parse_log_level(raw: &str) -> Result<LogLevel, String> {
     LogLevel::parse(raw).ok_or_else(|| {
         format!("unknown log level \"{raw}\" — expected one of: none, summ, minimal")
@@ -40,14 +40,9 @@ pub struct EngineArgs {
     #[arg(long, value_name = "N")]
     pub pop: Option<usize>,
 
-    /// Stop after this many steps. Mutually exclusive with
-    /// `--max-target-fitness` (exactly one stop criterion at a time).
-    #[arg(long, value_name = "N", conflicts_with = "max_target_fitness")]
+    /// Stop after this many steps.
+    #[arg(long, value_name = "N")]
     pub max_steps: Option<usize>,
-
-    /// Stop once the best smoothed fitness crosses this value.
-    #[arg(long, value_name = "FITNESS")]
-    pub max_target_fitness: Option<f32>,
 
     /// RNG seed. Omit for a random seed (recorded in `engine.json`).
     #[arg(long, value_name = "U64")]
@@ -217,7 +212,7 @@ impl RlEngineArgs {
     }
 
     /// Delegate: logger init (see [`EngineArgs::init_logger`]).
-    pub fn init_logger(&self, default_level: LogLevel) {
+    pub fn init_logger(&self, default_level: LogLevel) -> bool {
         self.engine.init_logger(default_level)
     }
 }
@@ -231,9 +226,6 @@ impl EngineArgs {
         }
         if let Some(steps) = self.max_steps {
             b = b.set_stop_max_steps(steps);
-        }
-        if let Some(target) = self.max_target_fitness {
-            b = b.set_stop_target_fitness(target);
         }
         if let Some(k) = self.elite_count {
             b = b.set_elite_count(k);
@@ -337,18 +329,13 @@ impl EngineArgs {
         self.run_dir.clone().or(default)
     }
 
-    /// Initialize `env_logger` with the engine's vocabulary. `default_level`
-    /// is used when `--log-level` is absent (each example passes its own const).
+    /// Install the run's log sinks: the console lines, the `Minimal` frame, and
+    /// the telemetry file when the run sets `set_run_trace_file(true)` — the
+    /// ENGINE settles that one, since only it knows the run dir.
     ///
-    /// RUST_LOG still wins when set, so power users keep the fine-grained
-    /// `module=level` filtering they expect.
-    pub fn init_logger(&self, default_level: LogLevel) {
-        use std::io::Write;
-        let level = self.log_level.unwrap_or(default_level);
-        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| level.env_filter().to_string());
-        let _ = env_logger::Builder::new()
-            .parse_filters(&filter)
-            .format(|buf, record| writeln!(buf, "{}", record.args()))
-            .try_init();
+    /// `--log-level` overrides `default_level`; RUST_LOG still wins over both,
+    /// so power users keep the fine-grained `module=level` filtering.
+    pub fn init_logger(&self, default_level: LogLevel) -> bool {
+        gras::engine::logging::init(default_level, self.log_level.map(LogLevel::env_filter))
     }
 }

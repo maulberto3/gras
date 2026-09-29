@@ -10,6 +10,8 @@
 
 #[path = "cli/mod.rs"]
 mod cli;
+#[path = "ref_trainer/mod.rs"]
+mod ref_trainer;
 
 use std::path::Path;
 
@@ -58,7 +60,7 @@ fn main() {
     // 2. Fitness — accuracy, maximize. Informative metrics ride along but
     //    never drive ranking/culling.
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
-    let metrics = vec![Metric::new("f1")];
+    let metrics = vec![Metric::custom("f1", score::f1_score)];
 
     // 3. Config — budgets inactive unless set; here a step budget only.
     //    Topology dims must match the dataset (16 features → 4 classes).
@@ -77,7 +79,7 @@ fn main() {
         data_dir,
         config,
         fitness,
-        gras::TabularTrainer::new(score::cross_entropy_onehot_loss),
+        ref_trainer::TabularTrainer::new(score::cross_entropy_onehot_loss),
         cli.engine.seed_or(Some(run_seed)),
         cli.engine.run_dir_or(Some(run_dir)),
     ))

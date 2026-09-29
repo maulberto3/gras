@@ -38,6 +38,9 @@ use gras::engine::fitness::{Direction, Fitness};
 use gras::engine::{RaceConfig, TabularEngine};
 use gras::utils::{score, tabular_data};
 
+#[path = "../examples/ref_trainer/mod.rs"]
+mod ref_trainer;
+
 const SEED: u64 = 42;
 const POP: usize = 10;
 
@@ -95,7 +98,7 @@ fn main() {
         data_dir.to_path_buf(),
         config,
         Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy"),
-        gras::TabularTrainer::new(score::cross_entropy_onehot_loss),
+        ref_trainer::TabularTrainer::new(score::cross_entropy_onehot_loss),
         Some(SEED),
         Some(run_dir.to_path_buf()),
     ))
