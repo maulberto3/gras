@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use flodl::nn::{Linear, Module, Parameter};
 use flodl::{DType, Device, Tensor, Variable};
-use log::debug;
+use tracing::debug;
 
 use crate::utils::error::NetworkError;
 

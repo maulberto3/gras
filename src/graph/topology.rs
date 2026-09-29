@@ -7,7 +7,7 @@
 //! fed by network input. `validate()` checks all of them.
 
 use fastrand::Rng;
-use log::debug;
+use tracing::debug;
 use serde::{Deserialize, Serialize};
 
 use crate::utils::error::TopologyError;
