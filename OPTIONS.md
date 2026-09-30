@@ -57,8 +57,9 @@ step, and shows `⚔ <observed> (exp <p_eff × train turns>)` when the trainer
 reported any; the tabular column shows `⚔ <jittered input values> (exp <p_eff
 × rows × features × live>)` (or `p_chall <eff>` while none has fired) and the
 stop summary prints `total challenged inputs: N of ~M expected`. The post-race guardrail needs no scorer object:
-implement `StepTrainer::holdout_score` (+ optional `holdout_matches`) on
-your trainer and call `engine.guardrail(device, None)`. The
+implement `StepTrainer::holdout_score` on your trainer and call
+`engine.guardrail(device)` — how many games it plays is the run's
+`set_guardrail_matches(n)` (default 16), persisted in `engine.json`. The
 `set_challenge_*` prefix for further knobs is still reserved — do not take
 the prefix for other knobs. Tabular x-disruption remains parked (TODO.md).
 

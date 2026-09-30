@@ -30,11 +30,13 @@ The examples folder IS the quick start — each one is a complete, runnable
 program with every knob a const or a builder line: edit, `cargo run --release
 --example <name>`, done.
 
-Some examples also expose a thin CLI overlay for quick runs (`--pop`,
-`--max-steps`, …): a flag wins, otherwise the example's own const is used.
-`--help` lists exactly what that binary accepts. Cartpole deliberately exposes
-**only** `--pop` and `--max-steps` (its smoke-test surface); every other knob
-stays a const.
+Every example exposes the same thin CLI overlay for quick runs: **`--pop` and
+`--max-steps`, nothing else** — a flag wins, otherwise the example's own const
+is used, and every other knob stays a const at the top of the file. `mnist`
+adds `--data-dir`, since it has a real dataset to point at. The one long-run
+example (`kaggle_kagiculture`) keeps the fuller engine surface (`--log-level`,
+`--seed`, `--resume`, the evolution knobs). `--help` lists exactly what that
+binary accepts.
 
 | Example | Mode | What it shows |
 |---|---|---|
@@ -125,9 +127,10 @@ Three step-line extras worth decoding:
   trained this clock and who was skipped as a frozen elite (freeze runs
   only).
 
-Note: the `--log-level` CLI flag on the RL examples (cartpole,
-kaggle_kagiculture) is a *different* axis — it sets the env_logger
-verbosity filter (`info`/`debug`/…), not the engine's line shape above.
+Note: the `--log-level` CLI flag (on `kaggle_kagiculture`, the example that
+keeps the full engine flag surface) is a *different* axis — it sets the
+env_logger verbosity filter (`info`/`debug`/…), not the engine's line shape
+above.
 The engine's own names are accepted there too (`--log-level summ` / `minimal`
 / `none`), mapped onto the verbosity that lets those lines through.
 
