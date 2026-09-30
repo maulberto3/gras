@@ -239,37 +239,22 @@ const CHALLENGE_PROB: f32 = 0.15;
 const MUTATE_PROB: f32 = 0.5;
 const LOG_LEVEL: LogLevel = LogLevel::Summ;
 
-/// The CLI is an OVERLAY on the consts, never a second source of truth.
+/// The CLI is an OVERLAY on the consts, never a second source of truth: the
+/// shared two-flag smoke surface, plus the one real input (where the data is).
 #[derive(Parser, Debug)]
 #[command(name = "mnist", about = "Hand-rolled tabular trainer on MNIST.")]
 struct Cli {
     #[command(flatten)]
-    engine: cli::EngineArgs,
-
-    /// Continue a previous run from its saved frontier (`results/<timestamp>`).
-    #[arg(long, value_name = "RUN_DIR")]
-    resume: Option<PathBuf>,
+    smoke: cli::SmokeArgs,
 
     /// Dataset directory (any gras-format dataset works).
     #[arg(long, value_name = "DIR")]
     data_dir: Option<PathBuf>,
-
-    /// Learning rate for the trainer's Adam optimizer.
-    #[arg(long, value_name = "LR")]
-    learning_rate: Option<f32>,
-
-    /// Training batch size (rows per net per step).
-    #[arg(long, value_name = "N")]
-    batch_size: Option<usize>,
-
-    /// Label-smoothing epsilon (0.0 = plain cross-entropy).
-    #[arg(long, value_name = "EPS")]
-    label_smoothing: Option<f32>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    cli.engine.init_logger(LOG_LEVEL);
+    cli::init_logger(LOG_LEVEL);
 
     // ── STEP A — data: generate if missing so the example runs out of the box.
     let data_dir_arg = cli
@@ -317,13 +302,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── STEP B — fitness, trainer, guardrail.
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
-    let mut trainer = MnistTrainer::new(cli.label_smoothing.unwrap_or(LABEL_SMOOTHING));
-    trainer.learning_rate = cli.learning_rate.unwrap_or(LEARNING_RATE);
-    trainer.train_batch = cli.batch_size.unwrap_or(BATCH_SIZE);
-    let trainer = trainer.with_holdout(holdout, HOLDOUT_ROWS);
+    let trainer = MnistTrainer::new(LABEL_SMOOTHING).with_holdout(holdout, HOLDOUT_ROWS);
 
     // ── STEP C — the config surface.
-    let pop = cli.engine.pop.unwrap_or(POP_SIZE);
+    let pop = cli.smoke.pop.unwrap_or(POP_SIZE);
+    let max_steps = cli.smoke.max_steps.or(MAX_STEPS);
     let metrics = vec![
         // Informative (non-ranking) custom metric: mean gap between the top-1
         // and runner-up logit — one extra history.csv column. There are no
@@ -346,7 +329,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_run_pop_size(pop)
         .set_run_log_level(LOG_LEVEL)
         .set_run_metrics(metrics)
-        .set_stop_max_steps(MAX_STEPS)
+        .set_stop_max_steps(max_steps)
         .set_run_checkpoint_every(CHECKPOINT_EVERY)
         .set_elite_count(5)
         .set_elite_freeze(true)
@@ -385,36 +368,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(true)
         .set_elite_checkpoint_weights(true);
-    let config = cli.engine.apply(builder).build();
+    let config = builder.build();
 
-    // ── STEP D — run (or resume), then the guardrail.
-    let mut engine = match &cli.resume {
-        Some(dir) => {
-            println!("Resuming from {}", dir.display());
-            TabularEngine::resume(
-                dir.clone(),
-                data_dir.to_path_buf(),
-                config,
-                fitness,
-                trainer,
-            )?
-        }
-        None => TabularEngine::from_spec(gras::engine::RunSpec::tabular(
-            data_dir,
-            config,
-            fitness,
-            trainer,
-            cli.engine.seed_or(RUN_SEED),
-            cli.engine.run_dir_or(None),
-        ))?,
-    };
+    // ── STEP D — run, then the guardrail.
+    let mut engine = TabularEngine::from_spec(gras::engine::RunSpec::tabular(
+        data_dir,
+        config,
+        fitness,
+        trainer,
+        RUN_SEED,
+        None::<&str>, // run dir: the engine picks results/<timestamp>
+    ))?;
     println!("Run Dir: {}", engine.run_dir().display());
     match engine.run() {
         Ok(reason) => println!("Race stopped successfully: {reason:?}"),
         Err(e) => eprintln!("Race encountered an error: {e}"),
     }
 
-    match engine.guardrail(gras::auto_device(), None) {
+    match engine.guardrail(gras::auto_device()) {
         Some(v) => {
             let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
             let smoothed = v

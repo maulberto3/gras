@@ -27,8 +27,8 @@
 //! surface as any other run: the training scheme is the only seam.
 //!
 //! Run: `source env_setup.sh && cargo run --example custom_trainer`
-//! Flags: the shared engine set (`--pop`, `--max-steps`, `--seed`,
-//! `--log-level`, `--run-dir`, …) — run with `--help` for the full list.
+//! Flags: the shared TWO-FLAG smoke surface (`--pop`, `--max-steps`) — run
+//! with `--help` for the exact list.
 
 #[path = "cli/mod.rs"]
 mod cli;
@@ -204,7 +204,12 @@ impl TabularStep for WarmupSgdTrainer {
 
 // ── 2. The run — plain public surface, like any other example ────────────────
 
-/// The command line: the shared engine flags (this example has no extra knobs).
+/// Population size behind the smoke surface's `--pop` default.
+const POP: usize = 4;
+/// Step budget behind the smoke surface's `--max-steps` default.
+const RACE_STEPS: usize = 30;
+
+/// The command line: the shared two-flag smoke surface.
 #[derive(Parser, Debug)]
 #[command(
     name = "custom_trainer",
@@ -212,12 +217,12 @@ impl TabularStep for WarmupSgdTrainer {
 )]
 struct Cli {
     #[command(flatten)]
-    engine: cli::EngineArgs,
+    smoke: cli::SmokeArgs,
 }
 
 fn main() {
     let cli = Cli::parse();
-    cli.engine.init_logger(gras::engine::config::LogLevel::Summ);
+    cli::init_logger(gras::engine::config::LogLevel::Summ);
 
     // Data — XOR: 4 rows, 2 features, 2 one-hot classes. Persisted so the
     // engine's deterministic-split contract holds even for tiny data.
@@ -252,16 +257,18 @@ fn main() {
 
     // Config — note there are NO training knobs here anymore (no learning
     // rate, no grad clip): those live on the trainer below.
+    let pop = cli.smoke.pop.unwrap_or(POP);
+    let race_steps = cli.smoke.max_steps.unwrap_or(RACE_STEPS);
     let builder = TabularRaceConfig::builder()
-        .set_run_pop_size(4)
-        .set_stop_max_steps(30)
+        .set_run_pop_size(pop)
+        .set_stop_max_steps(race_steps)
         .set_run_checkpoint_every(5)
         .set_topology_input_dim(2)
         .set_topology_output_dim(2)
         .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(4)
         .set_run_metrics(metrics.clone());
-    let config = cli.engine.apply(builder).build();
+    let config = builder.build();
 
     // Run — the ONLY difference from a default run is the trainer argument:
     let run_seed = 42u64;
@@ -271,8 +278,8 @@ fn main() {
         fitness,
         // Our scheme instead of TabularTrainer — that's the whole swap.
         WarmupSgdTrainer::new(loss_fn, 0.05, 0.9),
-        cli.engine.seed_or(Some(run_seed)),
-        cli.engine.run_dir_or(Some(run_dir)),
+        Some(run_seed),
+        Some(run_dir),
     ))
     .unwrap();
     match engine.run() {

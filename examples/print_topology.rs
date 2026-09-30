@@ -11,7 +11,7 @@
 //! The full hash is the net's identity: no prefix matching, no guessing.
 
 use clap::Parser;
-use gras::graph::topology::Topology;
+use gras::prelude::*;
 use gras::state::load_net_state;
 use std::path::PathBuf;
 

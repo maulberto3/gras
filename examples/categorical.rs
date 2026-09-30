@@ -5,8 +5,8 @@
 //! informative metrics, per-step evolve rolls.
 //!
 //! Run: `source env_setup.sh && cargo run --example categorical`
-//! Flags: the shared engine set (`--pop`, `--max-steps`, `--seed`,
-//! `--log-level`, `--run-dir`, …) — run with `--help` for the full list.
+//! Flags: the shared TWO-FLAG smoke surface (`--pop`, `--max-steps`) — run
+//! with `--help` for the exact list.
 
 #[path = "cli/mod.rs"]
 mod cli;
@@ -19,7 +19,12 @@ use clap::Parser;
 use gras::prelude::*;
 use gras::utils::{score, tabular_data};
 
-/// The command line: the shared engine flags (this example has no extra knobs).
+/// Population size behind the smoke surface's `--pop` default.
+const POP: usize = 6;
+/// Step budget behind the smoke surface's `--max-steps` default.
+const RACE_STEPS: usize = 50;
+
+/// The command line: the shared two-flag smoke surface.
 #[derive(Parser, Debug)]
 #[command(
     name = "categorical",
@@ -27,12 +32,12 @@ use gras::utils::{score, tabular_data};
 )]
 struct Cli {
     #[command(flatten)]
-    engine: cli::EngineArgs,
+    smoke: cli::SmokeArgs,
 }
 
 fn main() {
     let cli = Cli::parse();
-    cli.engine.init_logger(gras::engine::config::LogLevel::Summ);
+    cli::init_logger(gras::engine::config::LogLevel::Summ);
 
     // 1. Data — synthetic classification, persisted so the engine's
     //    reproducibility contract (deterministic split from run_seed) holds.
@@ -63,14 +68,16 @@ fn main() {
 
     // 3. Config — budgets inactive unless set; here a step budget only.
     //    Topology dims must match the dataset (16 features → 4 classes).
+    let pop = cli.smoke.pop.unwrap_or(POP);
+    let race_steps = cli.smoke.max_steps.unwrap_or(RACE_STEPS);
     let builder = TabularRaceConfig::builder()
-        .set_run_pop_size(6)
-        .set_stop_max_steps(50)
+        .set_run_pop_size(pop)
+        .set_stop_max_steps(race_steps)
         .set_topology_hidden_dim_range(4, 8)
         .set_topology_input_dim(d_in)
         .set_topology_output_dim(d_out)
         .set_run_metrics(metrics.clone());
-    let config = cli.engine.apply(builder).build();
+    let config = builder.build();
 
     // 4. Run — one RunSpec; the cross-entropy loss lives inside the trainer.
     let run_seed = 42u64;
@@ -79,8 +86,8 @@ fn main() {
         config,
         fitness,
         ref_trainer::TabularTrainer::new(score::cross_entropy_onehot_loss),
-        cli.engine.seed_or(Some(run_seed)),
-        cli.engine.run_dir_or(Some(run_dir)),
+        Some(run_seed),
+        Some(run_dir),
     ))
     .unwrap();
     match engine.run() {

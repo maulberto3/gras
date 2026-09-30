@@ -260,7 +260,7 @@ impl StepTrainer for CartPoleTrainer {
     /// Guardrail measurement half (SECTION 3): play ONE fresh holdout game.
     /// Same units as the reported fitness (survival turns) — ranking and
     /// holdout agree by construction. The engine calls this through the run's
-    /// own trainer, so `engine.guardrail(device, None)` is the whole call.
+    /// own trainer, so `engine.guardrail(device)` is the whole call.
     fn holdout_score(
         &mut self,
         net: &mut Network,
@@ -378,7 +378,7 @@ impl RlStep for CartPoleTrainer {
 // at construction: no dataset to score against). rl_race_config_builder()
 // is the RL front door — RlRaceConfig::builder() silently resolves to the
 // shared (Tabular-arm) builder and RL-only setters would panic at build.
-const POP: usize = 50;
+const POP: usize = 100;
 const RACE_STEPS: usize = 20;
 const CHALLENGE_PROB: f32 = 0.25;
 const MATCHES_PER_STEP: usize = 2;
@@ -517,7 +517,7 @@ fn main() {
     // The run's OWN trainer scores the holdout (holdout_score above), and the
     // count comes from the config's `set_guardrail_matches`; returning `None`
     // just means no champion was exported — the honest skip, not an error.
-    match engine.guardrail(device, None) {
+    match engine.guardrail(device) {
         Some(v) => {
             let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
             let smoothed_note = v
