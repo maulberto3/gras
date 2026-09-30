@@ -363,10 +363,9 @@ pub trait StepTrainer: Send {
     /// second scorer object: `engine.guardrail()` is the whole call.
     ///
     /// How MANY games are played is the run's business, not the trainer's:
-    /// the config's `set_guardrail_matches` (default 16), or an explicit
-    /// count on the `guardrail` call. The contract is index-based (`game_i`),
-    /// so any count works — seed the draw from `game_i` and the games stay
-    /// independent.
+    /// the config's `set_guardrail_matches` (default 16). The contract is
+    /// index-based (`game_i`), so any count works — seed the draw from
+    /// `game_i` and the games stay independent.
     ///
     /// Default: unimplemented (calling `guardrail()` without a scorer
     /// panics with this contract text — loud, not silent).

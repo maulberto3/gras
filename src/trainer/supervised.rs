@@ -128,8 +128,7 @@ impl TabularTrainer {
     /// deterministic game index — seed your draw from it.
     ///
     /// How many games get played is the RUN's business, not this
-    /// constructor's: `set_guardrail_matches` (default 16) or an explicit
-    /// count on the `guardrail` call.
+    /// constructor's: `set_guardrail_matches` (default 16).
     pub fn with_holdout_scorer(
         mut self,
         scorer: impl Fn(&mut Network, usize) -> Result<f32> + Send + 'static,
