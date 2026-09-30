@@ -374,9 +374,8 @@ pub struct RaceConfig {
     /// trainer owns the action draw itself (no engine-side script/ledger).
     pub challenge_prob: f32,
     /// Fresh holdout games the post-race guardrail plays
-    /// (`set_guardrail_matches`): the sample size of the honesty check, used
-    /// when `CoreEngine::guardrail` is called with `None`. Diagnostic only —
-    /// it never touches a step's dynamics. Default
+    /// (`set_guardrail_matches`): the sample size of the honesty check.
+    /// Diagnostic only — it never touches a step's dynamics. Default
     /// [`DEFAULT_GUARDRAIL_MATCHES`].
     pub guardrail_matches: usize,
 }
@@ -1263,9 +1262,8 @@ impl RaceConfigBuilder {
     /// Fresh holdout games the post-race guardrail plays
     /// ([`DEFAULT_GUARDRAIL_MATCHES`] = 16): the tighter the verdict has to
     /// be, the more games — the mean's standard error falls as √N, and each
-    /// game costs about one race step. Diagnostic only (never touches a
-    /// step's dynamics); `CoreEngine::guardrail`'s explicit count overrides
-    /// it for one call.
+    /// game costs about one race step. Diagnostic only — this never touches a
+    /// step's dynamics.
     pub fn set_guardrail_matches(mut self, n: usize) -> Self {
         self.cfg.guardrail_matches = n.max(1);
         self
@@ -1295,13 +1293,6 @@ impl RaceConfigBuilder {
         self.cfg.worst_save_safetensors = enabled;
         self
     }
-    /// Validate the stop-criteria surface. Kept as a no-op hook after the
-    /// `max_target_fitness` deletion: the exclusivity check lost its subject
-    /// (only `max_steps` + `custom_stop` remain, and those compose).
-    pub(crate) fn validate_single_stop(_cfg: &RaceConfig) -> Result<(), String> {
-        Ok(())
-    }
-
     pub fn build(mut self) -> RaceConfig {
         let cfg = self.cfg;
         // Params set by the pruner setters while the switch was still off:
@@ -1313,7 +1304,6 @@ impl RaceConfigBuilder {
                 p.steps
             );
         }
-        Self::validate_single_stop(&cfg).unwrap_or_else(|e| panic!("invalid RaceConfig: {e}"));
         cfg
     }
 }

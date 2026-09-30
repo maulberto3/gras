@@ -66,7 +66,11 @@ impl CoreEngine {
         // The mode's middle column: tabular reports the held-out eval loss,
         // RL reports the environment volume it actually played.
         let mid = if !self.trainer.is_rl() {
-            format!("eval_loss↓ {}{}", stats(&evals), self.tabular_challenge_cell(clock))
+            format!(
+                "eval_loss↓ {}{}",
+                stats(&evals),
+                self.tabular_challenge_cell(clock)
+            )
         } else {
             self.step_rl.label(self.effective_challenge_prob(clock))
         };
@@ -284,9 +288,11 @@ impl CoreEngine {
         }
         // The population size is part of the resume call (the engine refuses a
         // mismatch instead of silently patching it), so print the number the
-        // caller must pass — not just the directory.
+        // caller must pass — not just the directory. Phrased in ENGINE terms,
+        // not CLI flags: only the long-run example keeps a `--resume` flag, so
+        // a flag spelling here would be wrong for most runs.
         info!(
-            "  {} live net(s) at step {} → resume with: --resume {} --pop {}",
+            "  {} live net(s) at step {} → resume from {} with pop_size {}",
             live.len(),
             clock,
             self.run_dir.display(),
@@ -354,7 +360,11 @@ impl CoreEngine {
                     let wide = std > m.abs() / 2.0;
                     format!(
                         " ± {std:.4}{}",
-                        if wide { " (noisy — rank not decisive)" } else { "" }
+                        if wide {
+                            " (noisy — rank not decisive)"
+                        } else {
+                            ""
+                        }
                     )
                 }
                 _ => String::new(),

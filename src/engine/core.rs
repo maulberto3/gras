@@ -1504,10 +1504,9 @@ impl CoreEngine {
     /// weights from this run's exports and play fresh unseen games through
     /// the run's OWN trainer (`holdout_score` — one game per call, same
     /// units as the reported fitness). No scorer object to wire: the engine
-    /// owns the trainer, so the whole call is `engine.guardrail(device)`.
-    /// Game count is the run's `guardrail_matches`
-    /// (`set_guardrail_matches`, default 16); pass `Some(n)` to override it
-    /// for one call — useful when a close verdict deserves a bigger sample.
+    /// owns the trainer, so `engine.guardrail(device)` is the whole call.
+    /// How many games it plays is the run's `set_guardrail_matches`
+    /// (default 16) — one knob, set where the rest of the run is configured.
     ///
     /// `None` = no champion was ever exported, the champion could not be
     /// reloaded (missing/unloadable weights — the verdict would be about a
@@ -1515,10 +1514,9 @@ impl CoreEngine {
     pub fn guardrail(
         &mut self,
         device: flodl::Device,
-        matches: Option<usize>,
     ) -> Option<crate::engine::guardrail::GuardrailVerdict> {
         let champion = self.champions.first()?;
-        let matches = matches.unwrap_or(self.config.guardrail_matches);
+        let matches = self.config.guardrail_matches;
         let race_smoothed = self.smoothed_fitness_of(champion);
         crate::engine::guardrail::score_with(
             &self.run_dir,
