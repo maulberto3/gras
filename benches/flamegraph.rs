@@ -28,9 +28,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use gras::engine::config::LogLevel;
-use gras::engine::fitness::{Direction, Fitness};
-use gras::engine::{RaceConfig, TabularEngine};
+use gras::prelude::*;
 use gras::utils::{score, tabular_data};
 
 #[path = "../examples/ref_trainer/mod.rs"]
@@ -69,12 +67,12 @@ fn main() {
     );
     drop(peeked);
 
-
     let mut builder = RaceConfig::builder()
         .set_run_pop_size(POP)
         .set_stop_max_steps(steps)
         .set_topology_hidden_dim_range(4, 16)
-        .set_topology_input_dim(d_in).set_topology_output_dim(d_out)
+        .set_topology_input_dim(d_in)
+        .set_topology_output_dim(d_out)
         .set_run_log_level(LogLevel::None)
         // No checkpoint inside the run ⇒ no nets/*.json or checkpoints.json
         // writes, and no history.csv flush, to pollute the profile.

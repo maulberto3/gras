@@ -33,9 +33,7 @@ use std::path::Path;
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use gras::engine::config::LogLevel;
-use gras::engine::fitness::{Direction, Fitness};
-use gras::engine::{RaceConfig, TabularEngine};
+use gras::prelude::*;
 use gras::utils::{score, tabular_data};
 
 #[path = "../examples/ref_trainer/mod.rs"]
@@ -77,12 +75,12 @@ fn main() {
     );
     drop(peeked);
 
-
     let mut builder = RaceConfig::builder()
         .set_run_pop_size(POP)
         .set_stop_max_steps(steps)
         .set_topology_hidden_dim_range(4, 16)
-        .set_topology_input_dim(d_in).set_topology_output_dim(d_out)
+        .set_topology_input_dim(d_in)
+        .set_topology_output_dim(d_out)
         .set_run_log_level(LogLevel::None)
         .set_run_checkpoint_every(steps + 1);
     if evolve {

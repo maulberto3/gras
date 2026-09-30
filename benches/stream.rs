@@ -25,14 +25,8 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use flodl::nn::Module;
-use flodl::nn::optim::Optimizer;
-use gras::Device;
-use gras::engine::RaceConfig;
-use gras::engine::fitness::{Direction, Fitness};
 use gras::engine::population::initial_population;
-use gras::graph::network::Network;
-use gras::trainer::stream::{BatchStream, PoolSplit};
+use gras::prelude::*;
 use gras::utils::race_steps::{eval_one_step, train_one_step};
 use gras::utils::{score, tabular_data};
 
