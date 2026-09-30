@@ -1,11 +1,20 @@
-//! Shared CLI surface for the examples — the knobs that every example has.
+//! Shared CLI surface for the examples.
 //!
-//! Every example flattens [`EngineArgs`] into its own `clap` parser, so the
-//! same engine-level flags work everywhere:
+//! Two surfaces live here:
+//!
+//! - [`SmokeArgs`] — the TWO-FLAG surface the examples flatten (`--pop`,
+//!   `--max-steps`): enough for a quick smoke test, nothing to read past.
+//!   Every other knob is a `const` at the top of the example, visible in the
+//!   source rather than behind a flag. Used by cartpole, categorical,
+//!   continuous, custom_trainer and mnist (which adds its own `--data-dir`).
+//! - [`EngineArgs`] / [`RlEngineArgs`] — the fuller engine surface
+//!   (`--log-level`, `--seed`, `--resume`, the evolution knobs, …), kept for
+//!   the one example whose runs are long enough to need it:
+//!   `kaggle_kagiculture`.
 //!
 //! ```text
-//! cargo run --release --example cartpole -- --pop 32 --max-steps 20 --log-level minimal
-//! cargo run --release --example mnist   -- --pop 50 --max-steps 15 --seed 7
+//! cargo run --release --example cartpole -- --pop 32 --max-steps 20
+//! cargo run --release --example mnist    -- --pop 50 --max-steps 15
 //! ```
 //!
 //! Precedence is simple and explicit: **a flag wins; otherwise the example's
@@ -14,11 +23,40 @@
 //!
 //! This directory has no `main.rs`, so Cargo does not treat it as an example
 //! binary — examples pull it in with `#[path = "cli/mod.rs"] mod cli;`.
+//!
+//! `dead_code` is allowed module-wide: every includer uses a different subset
+//! of this module, so an unused helper is expected rather than a smell.
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 
 use clap::Parser;
-use gras::engine::config::{LogLevel, RaceConfigBuilder};
+use gras::prelude::*;
+
+/// The two-flag smoke surface the examples share: population size and the step
+/// budget, nothing else.
+///
+/// `--pop 8 --max-steps 2` is all a quick smoke test needs. Every other knob
+/// lives in the example's own consts and builder chain, where it is visible in
+/// the source rather than behind another flag. An example with a genuine extra
+/// input (mnist's dataset directory) declares that one flag itself.
+#[derive(Parser, Debug)]
+pub struct SmokeArgs {
+    /// Population size (default: the example's own const).
+    #[arg(long, value_name = "N")]
+    pub pop: Option<usize>,
+    /// Stop after this many engine steps (default: the example's own const).
+    #[arg(long = "max-steps", value_name = "N")]
+    pub max_steps: Option<usize>,
+}
+
+/// Turn on the engine logger at `level`.
+///
+/// The smoke surface deliberately has no `--log-level` — pass the example's own
+/// const, exactly as a reader of the source would expect.
+pub fn init_logger(level: LogLevel) -> bool {
+    gras::engine::logging::init(level, None)
+}
 
 /// Parse an engine log level (`none` | `summ` | `minimal`) on the CLI.
 ///
@@ -143,13 +181,6 @@ pub struct EngineArgs {
     /// keep training.
     #[arg(long = "no-freeze-elites", action = clap::ArgAction::SetFalse)]
     pub freeze_elites: bool,
-
-    /// Fresh games the post-race guardrail plays to judge the champion
-    /// (cartpole default 10; each game runs to the env's max turns). Raise
-    /// it when two finalists sit close together and the verdict matters —
-    /// the mean tightens as √N. Costs ~one race step per 10 games.
-    #[arg(long, value_name = "N", default_value_t = 10)]
-    pub holdout_matches: usize,
 
     /// How often buffered history.csv rows hit disk: `checkpoint` (default,
     /// every `--checkpoint-every` steps and at stop — a `kill -9` loses at
