@@ -141,12 +141,22 @@ struct CartPoleTrainer {
 }
 
 impl CartPoleTrainer {
+    /// `sample = true` (train matches) draws the action from
+    /// softmax(logits) using the match's OWN rng — the on-policy requirement
+    /// of REINFORCE. With argmax, a deterministic policy replays THE SAME
+    /// trajectory every match: identical outcomes, zero advantage variance,
+    /// weights that never move (the zero-gradient trap — sampling is what
+    /// gives the update something to learn from). `sample = false`
+    /// (eval/holdout) stays argmax: fitness must measure the deterministic
+    /// policy, not a lucky draw.
+    ///
     /// `forced = Some(action)` plays THAT action on every turn (challenge:
-    /// train matches of a fired step only); `None` = the policy decides.
+    /// train matches of a fired step only); overrides sampling entirely.
     fn play_episode(
         &self,
         net: &mut Network,
         start_seed: u64,
+        sample: bool,
         forced: Option<usize>,
     ) -> gras::flodl::tensor::Result<(Vec<Transition>, usize)> {
         let mut rng = Rng::with_seed(start_seed);
@@ -160,6 +170,24 @@ impl CartPoleTrainer {
             let logits = pred.data().to_f32_vec()?;
             let action = match forced {
                 Some(a) => a,
+                None if sample => {
+                    // softmax(logits), drawn from this match's rng. No
+                    // temperature: T = 1 keeps the policy distribution
+                    // honest (T → 0 would re-freeze into argmax).
+                    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
+                    let sum: f32 = exps.iter().sum();
+                    let mut draw = rng.f32() * sum;
+                    let mut picked = exps.len() - 1;
+                    for (j, e) in exps.iter().enumerate() {
+                        draw -= e;
+                        if draw <= 0.0 {
+                            picked = j;
+                            break;
+                        }
+                    }
+                    picked
+                }
                 None => {
                     if logits[1] > logits[0] {
                         1
@@ -286,7 +314,7 @@ impl StepTrainer for CartPoleTrainer {
         game_i: usize,
     ) -> gras::flodl::tensor::Result<f32> {
         let seed = shared_start_seed(HOLDOUT_SEED, 0, game_i as u64);
-        let (_, survival) = self.play_episode(net, seed, None)?;
+        let (_, survival) = self.play_episode(net, seed, false, None)?;
         Ok(survival as f32)
     }
 }
@@ -320,7 +348,7 @@ impl RlStep for CartPoleTrainer {
         let mut survivals: Vec<usize> = Vec::with_capacity(self.matches_per_step);
         for match_i in 0..self.matches_per_step {
             let seed = episode_start_seed(ctx.net_seed, step, match_i as u64);
-            let (traj, survival) = self.play_episode(net, seed, forced)?;
+            let (traj, survival) = self.play_episode(net, seed, true, forced)?;
             let offset = all_transitions.len();
             all_transitions.extend(traj);
             matches.push((offset, survival));
@@ -353,7 +381,7 @@ impl RlStep for CartPoleTrainer {
         let mut eval_survivals: Vec<usize> = Vec::with_capacity(self.eval_matches_per_step);
         for match_i in 0..self.eval_matches_per_step {
             let seed = shared_start_seed(RUN_SEED + 1000, step, match_i as u64);
-            let (_, survival) = self.play_episode(net, seed, None)?;
+            let (_, survival) = self.play_episode(net, seed, false, None)?;
             eval_survivals.push(survival);
         }
 
@@ -400,6 +428,7 @@ impl RlStep for CartPoleTrainer {
 const POP: usize = 100;
 const RACE_STEPS: usize = 20;
 const CHALLENGE_PROB: f32 = 0.25;
+const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 const MATCHES_PER_STEP: usize = 2;
 const EVAL_MATCHES_PER_STEP: usize = 2;
 
@@ -445,6 +474,9 @@ fn main() {
         .set_run_pop_catch_up(false)
         .set_run_checkpoint_every(2)
         .set_run_challenge_prob(CHALLENGE_PROB)
+        .set_run_challenge_decay(ChallengeDecay::Custom {
+            exponent: CHALLENGE_DECAY_EXPONENT,
+        })
         .set_stop_max_steps(Some(race_steps))
         // .set_stop_custom(|snap: &RaceSnapshot| {
         //     snap.best_smoothed_fitness > 400.0

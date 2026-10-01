@@ -103,9 +103,10 @@ pub use flodl;
 pub mod prelude {
     // Engine config + entry points.
     pub use crate::engine::config::{
-        CrossCullPolicy, CrossoverGate, LogLevel, MutationCullPolicy, PopPruner, PopPrunerMethod,
-        RaceConfig, RaceConfigBuilder, RaceSnapshot, RlConfig, RlRaceConfig, RunMode, StopReason,
-        TabularConfig, TabularRaceConfig, rl_race_config_builder, tabular_race_config_builder,
+        ChallengeDecay, CrossCullPolicy, CrossoverGate, LogLevel, MutationCullPolicy, PopPruner,
+        PopPrunerMethod, RaceConfig, RaceConfigBuilder, RaceSnapshot, RlConfig, RlRaceConfig,
+        RunMode, StopReason, TabularConfig, TabularRaceConfig, rl_race_config_builder,
+        tabular_race_config_builder,
     };
     pub use crate::engine::fitness::Metric;
     pub use crate::engine::guardrail::{ChampionScorer, GuardrailVerdict, check_champion};
