@@ -94,7 +94,7 @@ Set once per run via the config builder: `.set_run_log_level(LogLevel::…)`.
 |---|---|---|
 | `Summ` **(default)** | One compact line at the **end** of each step — `step N │ pop K │ train_loss↓ mean±std │ eval_loss↓ … │ fitness↑ … │ took …s` — plus one line per evolution roll that fired (crossover attempts/inserts, mutation immigrants, culls), plus start/stop/checkpoint/elite-save lines. Printed last on purpose: the summary stays at the bottom of the terminal. | Watching a run live; the everyday default. |
 | `Minimal` | One **boxed vitals table** (from step 2 on), redrawn **in place** on a terminal — population means with deltas vs last step, evolve counters (culls, inserts, crossover attempted/passed/gated, mutation), and the elite seats. **No other lines** — no per-roll detail, no start/checkpoint chatter. Off a terminal (piped to a file) each frame prints plainly, with no escape codes. | Long runs on one terminal; the numbers move, the shape doesn't. |
-| `None` | Nothing per step. Only the run-start line and the final stop reason. | Power users who parse `engine.json`, `history.csv`, and the artifacts instead of watching the stream; fastest I/O path. |
+| `None` | Nothing per step. Only the run-start line and the final stop reason. | Power users who parse `engine.json`, the CSV logs, and the artifacts instead of watching the stream; fastest I/O path. |
 
 The middle column of that line is mode-dependent: **Tabular** reports the
 held-out `eval_loss`; **RL** has no eval batch, so it reports the step's
@@ -107,8 +107,11 @@ can only force **train** matches, so the `⚔` cell reads
 `⚔ <observed> (exp <p_chall × train turns>)` — the denominator for judging the
 trigger is the train column, never the total.
 
-Everything the log shows (and more) is recorded losslessly in `history.csv`
-and `nets/<hash>.json` — the log is a view, the files are the record.
+Everything the log shows (and more) is recorded losslessly in the CSV
+logs — `history.csv` (one row per step with losses/fitness/metrics) and
+`attempts.csv` (one row per evolution attempt: branch, outcome, child,
+gate, bar, victim) — plus `nets/<hash>.json`. The log is a view, the
+files are the record.
 
 Three step-line extras worth decoding:
 - **`★ <hash> <hash> …`** — the *freeze crown* (only with `--freeze-elites`):

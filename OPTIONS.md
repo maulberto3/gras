@@ -22,7 +22,7 @@ field — no aliases, no duplicate entry points.
 | Family | Members | Section |
 |---|---|---|
 | `pop_` | `size` | §1 |
-| `elite_` | `count`, `freeze`, `save_topology`, `save_safetensors` | §1, §6 |
+| `elite_` | `count`, `freeze`, `save_topology`, `save_safetensors`, `checkpoint_weights`, `guardrail_matches` (the guardrail scores the exported elite) | §1, §3, §6 |
 | `crossover_` | `gate`, `gate_window`, `rolls`, `prob`, `retries`, `cull_policy`, `ops_pool` | §1, §2 |
 | `mutate_` | `rolls`, `prob` | §1 |
 | `mutation_` | `probation_steps` (immigrant probation rename — note the `mutate_`/`mutation_` split: `mutate_*` = the roll, `mutation_*` = the immigrant channel's policy/probation) | §1 |
@@ -59,7 +59,8 @@ reported any; the tabular column shows `⚔ <jittered input values> (exp <p_eff
 stop summary prints `total challenged inputs: N of ~M expected`. The post-race guardrail needs no scorer object:
 implement `StepTrainer::holdout_score` on your trainer and call
 `engine.guardrail(device)` — how many games it plays is the run's
-`set_guardrail_matches(n)` (default 16), persisted in `engine.json`. The
+`set_elite_guardrail_matches(n)` (default 16; `elite_*` family — it scores the
+exported champion), persisted in `engine.json` as `guardrail_matches`. The
 `set_challenge_*` prefix for further knobs is still reserved — do not take
 the prefix for other knobs. Tabular x-disruption remains parked (TODO.md).
 
@@ -206,7 +207,29 @@ A child must prove itself over a replay window of past population means
 | Pruner method | `set_pruner_method(m)` | `PopPrunerMethod::Hard` | Currently the only variant: keep the top `elite_count` survivors (min 1 — with the default `elite_count = 1` that is the champion alone), plain solo training for all of them. There is **no `Soft` pruner** — the `Hard`/`Soft` pair belongs to the *crossover gate* (§2), a different knob. A soft/gradual pruner (population shrinking *during* the race) is a design-only idea: see TODO "Population reducer". |
 | Pruner steps | `set_pruner_steps(n)` | `0` | How many solo-training steps the survivor gets post-race (outside evolution machinery — no crossover/mutation/stop checks). |
 
-Note: pruner solo steps **always train with the real optimizer** — elite freeze is bypassed for the phase (every survivor IS an elite, so freezing would mean zero post-race weight updates; no crown/dethrone lines fire either). `freeze_elites` applies to race steps only.
+Note: pruner solo steps **always train with the real optimizer** — elite freeze is bypassed for the phase (every survivor IS an elite, so freezing would mean zero post-race weight updates, and no crown/dethrone lines fire). `freeze_elites` applies to race steps only.
+
+### Phase map — what is active when
+
+The pruner turns a stop into a transition, so every other mechanism is
+"race phase" or "solo phase". Nothing here is a separate switch; it is the
+consequence of the loop the phase runs.
+
+| Mechanism | Race phase | Pruner solo phase |
+|---|---|---|
+| Step clock | `max_steps` budget | continues past the stop (`clock+1 … clock+pruner_steps`) |
+| Stop criteria (`set_stop_max_steps`, `set_stop_custom`) | checked each step | **not consulted** — the phase has a fixed length |
+| Ctrl+C | honored at a step boundary | **not consulted** — the phase runs to completion, then the run ends |
+| Evolution rolls (crossover, mutation/immigrants) | every step | **off** |
+| `set_mutation_probation_steps` | cull immunity for a net's first k clocks | **not consulted** — the pruner's opening cull is a direct cull and keeps only the top-`elite_count` by smoothed fitness |
+| `set_elite_freeze` | on (act-and-measure) | **bypassed** — real weight updates (that is the point of the phase) |
+| `set_run_challenge_prob` | fires per (net, step), decayed by run progress (`p_eff = p·(1 − step/max_steps)`) | **never fires** — the phase is challenge-free by construction (the trigger is suppressed and `p_eff` reads `0.0`, so the logged/expected counts zero out too). The decay alone would not be enough: an early `custom_stop`/Ctrl+C, or `max_steps = None`, leaves `p_eff` at the full knob past the stop |
+| Checkpoint recording (`set_run_checkpoint_every`, surprise exam, gate bars, `checkpoint-elite-*.safetensors`) | every n steps | **none** — no new checkpoint, no new gate bar, no new weight snapshot |
+| Smoothing window / ranking buffers | fed per step | fed per solo step (ranking stays honest, but nothing races) |
+| `history.csv` / `nets/<hash>.json` | per-step rows | rows continue for the solo steps (`attempts.csv` gains the culls, `branch=pruner`) |
+| Champion artifacts (`elite-*.md` / `-*.safetensors`), worst dump | at stop / checkpoints | worst dumped before the cull; champion written at phase end |
+| Run counters in `engine.json` (`culls`, elapsed) | stamped at every stop | stamped by the phase itself (it returns before the normal stamp) |
+| Guardrail (`set_elite_guardrail_matches`) | — | runs after the whole race+pruner; the champion is the best survivor |
 
 ## 4. Network architecture (per-individual)
 
@@ -266,7 +289,7 @@ trainer/spec-owned by design.
 | Additional metrics | `set_run_metrics(vec![Metric::custom(label, closure)])` | `[]` | Informative (non-ranking) metrics. There are **no built-in labels** — each metric is an explicit closure `(pred, target) -> f32`, scored on the eval batch; its label becomes an extra `history.csv` column and is recorded in `engine.json`. Never affects ranking/culling. |
 | Log level | `set_run_log_level(level)` | `LogLevel::Summ` | `None` = silent per step (artifacts still written); `Summ` = one line per step + one per evolution roll; `Minimal` = the boxed vitals table from step 2, nothing else (redrawn in place on a terminal). (`Full` was removed.) Console lines go to **stderr**. The step line is written **at the end** of the step; its middle column is `eval_loss` in Tabular and the environment volume (`matches`/`train`/`eval`/`turns-match`) in RL. |
 | Run trace file | `set_run_trace_file(enabled)` | `false` | Also write `<run_dir>/telemetry.jsonl`: one JSON record per engine event at **full fidelity** (debug included, no `LogLevel` filtering — the console is the view, this is the record). Owned by the engine, so it lands in the run dir and travels with the run; the start-up block (race init / search space / build stamp) is buffered and flushed in place once the dir exists. Implies nothing about the console — pair it with `LogLevel::None` for a silent-on-console, recorded run. |
-| CSV export | `set_run_csv_export(enabled)` | `true` | Write `history.csv` (the lossless per-step record). |
+| CSV export | `set_run_csv_export(enabled)` | `true` | Write the lossless records: `history.csv` (one row per live net per step) and `attempts.csv` (one row per evolution attempt — inserted or rejected). Separate files with separate headers, so a row never pads empty columns. |
 | Elite topology md | `set_elite_save_topology(enabled)` | `true` | Export elite `<hash>.md` (nodes table, edge list, ASCII + mermaid graphs). |
 | Elite safetensors | `set_elite_save_safetensors(enabled)` | `true` | Export elite `<hash>.safetensors` weights. |
 | Worst topology md | `set_worst_save_topology(enabled)` | `false` | Same as elite but for the worst net (debugging what loses). |
