@@ -9,9 +9,7 @@
 use super::config::RaceConfig;
 use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
 use crate::engine::fitness::Fitness;
-use crate::state::{
-    RaceState, RunHeader,
-};
+use crate::state::{RaceState, RunHeader};
 use flodl::tensor::Result;
 use std::collections::HashMap;
 
@@ -157,10 +155,12 @@ impl RlEngine {
             meta_ctx,
             stream: None,
             dataset: None,
+            explicit_test_rows: None,
             fitness,
             metrics,
             state: RaceState::new(),
             history_csv_buffer: String::new(),
+            attempts_csv_buffer: String::new(),
             networks: HashMap::new(),
             optimizers: HashMap::new(),
             rolling_fitness: HashMap::new(),

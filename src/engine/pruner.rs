@@ -2,8 +2,8 @@
 //! transition, not an exit.
 //!
 //! Culls everything but the top `elite_count` nets (min 1) and keeps training
-//! those solo for `pruner.steps` more steps — evolution rolls and stop checks
-//! are phase-locked OFF. The survivors run through the SAME per-net step path
+//! those solo for `pruner.steps` more steps — evolution rolls, stop checks,
+//! Ctrl+C and per-step challenges are phase-locked OFF. The survivors run through the SAME per-net step path
 //! (`step_one_net`) with their live optimizer state and the shared stream, so
 //! the extension is a visible, replayable part of the run.
 
@@ -101,7 +101,7 @@ impl CoreEngine {
             self.cull_net(v, clock, "pruned")?;
         }
         if !victims.is_empty() {
-            self.flush_metrics_csv()?;
+            self.flush_csv_exports()?;
             self.write_live_frontier_states()?;
         }
         if pruner.steps == 0 {
@@ -110,6 +110,7 @@ impl CoreEngine {
             if self.verbose_detail() {
                 info!("  pruner phase: 0 steps configured — nothing further to train");
             }
+            self.persist_run_counters();
             return Ok(reason);
         }
         // Solo extension: the same group-step shape, minus evolution and stop
@@ -158,7 +159,11 @@ impl CoreEngine {
             self.log_stop_summary(final_step)?;
         }
         self.write_live_frontier_states()?;
-        self.flush_metrics_csv()?;
+        self.flush_csv_exports()?;
+        // This path RETURNS from `finish_race` before its own counter stamp,
+        // so the pruner culls and the phase's wall time must be persisted
+        // here or `engine.json` undercounts both.
+        self.persist_run_counters();
         Ok(reason)
     }
 }

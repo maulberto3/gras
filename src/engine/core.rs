@@ -44,8 +44,8 @@
 //!   During the run, live nets are held only in memory. An interrupted run
 //!   leaves `engine.json` + the culled nets' JSONs on disk; resume
 //!   reconstructs the live frontier from those + replays each net's stream.
-//!   There is no per-step file write during the run, and no separate
-//!   `history.csv` or `culled.log` artifact.
+//!   `history.csv` (per-step metric rows) and `attempts.csv` (evolution
+//!   events) are the run's logs, flushed at checkpoints and at stop.
 
 use flodl::nn::Optimizer;
 use flodl::tensor::Result;
@@ -140,6 +140,11 @@ pub struct CoreEngine {
     pub(crate) stream: Option<BatchStream>,
     /// The run's dataset (Tabular mode). `None` in RL mode.
     pub(crate) dataset: Option<crate::utils::tabular_data::Dataset>,
+    /// Explicit two-dataset layout marker: `Some(test_len)` when the run was
+    /// built from `{train, test}` dirs (test rows concatenated after train
+    /// rows in `dataset`). Drives the pool construction AND the header
+    /// record so resume rebuilds identical pools. `None` = single-pool split.
+    pub(crate) explicit_test_rows: Option<usize>,
     pub(crate) fitness: Fitness,
     pub(crate) metrics: Vec<Metric>,
     /// The caller-supplied training scheme, boxed per mode. The engine never
@@ -260,11 +265,15 @@ pub struct CoreEngine {
     /// so the framed table can show what changed this step. `None` until the
     /// first table render (the table itself starts at step 2 for this reason).
     pub(crate) minimal_prev_means: Option<(f32, f32, f32)>,
-    /// Buffer history rows in memory to minimize slow disk I/O writes. One
-    /// unified event log (`history.csv`): per-step live-net metric rows AND
-    /// evolution attempt rows (inserted or rejected), distinguished by the
-    /// leading `type` column.
+    /// Buffer history rows in memory to minimize slow disk I/O writes.
+    /// `history.csv`: one row per live net per step (`append_metrics_csv`).
     pub(crate) history_csv_buffer: String,
+    /// Buffer for evolution-event rows. SEPARATE file (`attempts.csv`) with
+    /// its own header: an attempt row has none of a metric row's columns
+    /// (train_loss/eval_loss/informative) and a metric row has none of an
+    /// attempt's, so sharing one schema meant padding empty cells — and a
+    /// padded cell count that drifts silently shifts every later column.
+    pub(crate) attempts_csv_buffer: String,
 }
 
 // ── Construction ─────────────────────────────────────────────────────────────
@@ -407,11 +416,20 @@ impl CoreEngine {
     /// [`crate::engine::config::effective_challenge_prob`] — the SAME function
     /// `challenge_fires` decides with — so the rollup line, the checkpoint
     /// line and the trigger can never disagree about the knob's value.
+    ///
+    /// `0.0` in the pruner solo phase: the challenge knob is a RACE device
+    /// (anti-plateau exploration), and the phase is the final polish — the
+    /// trigger is likewise suppressed there, so the logged/expected counts
+    /// zero out with it.
     pub(crate) fn effective_challenge_prob(&self, clock: usize) -> f32 {
+        if self.pruner_solo_active {
+            return 0.0;
+        }
         crate::engine::config::effective_challenge_prob(
             self.config.challenge_prob,
             clock,
             self.config.max_steps,
+            self.config.challenge_decay,
         )
     }
 
@@ -497,12 +515,35 @@ impl CoreEngine {
         // there (documented on the setters) rather than erroring — the
         // DEFAULTS themselves (mutation off, crossover on) must not make every
         // tabular config fail construction.
-        let dataset = match &tabular_data_dir {
-            Some(data_dir) => Some(
-                crate::utils::tabular_data::resolve_dataset(data_dir)?
-                    .to_device(config.device())?,
-            ),
-            None => None,
+        //
+        // Data layout resolution: a directory with BOTH `train/` and `test/`
+        // subdirs (each the usual inputs+targets shape) is the EXPLICIT
+        // two-dataset layout — `resolve_train_test_datasets` reads them and
+        // the engine guarantees the test rows never touch training. Anything
+        // else falls back to the single-pool `resolve_dataset` (seeded
+        // internal split). Dims are validated against the TRAIN side (the
+        // side the networks actually fit).
+        let (dataset, explicit_test_rows) = match &tabular_data_dir {
+            Some(data_dir) => {
+                let train_dir = data_dir.join("train");
+                let test_dir = data_dir.join("test");
+                if train_dir.exists() && test_dir.exists() {
+                    let (train, test) =
+                        crate::utils::tabular_data::resolve_train_test_datasets(data_dir)?;
+                    let test_len = test.len();
+                    let combined = train.concat(&test)?.to_device(config.device())?;
+                    (Some(combined), Some(test_len))
+                } else {
+                    (
+                        Some(
+                            crate::utils::tabular_data::resolve_dataset(data_dir)?
+                                .to_device(config.device())?,
+                        ),
+                        None,
+                    )
+                }
+            }
+            None => (None, None),
         };
         // Random seed when omitted: time ^ fastrand (recorded in engine.json).
         let run_seed = seed.unwrap_or_else(|| {
@@ -618,6 +659,7 @@ impl CoreEngine {
                 max_steps: config.max_steps,
                 train_eval_split_ratio: Some(train_eval_split_ratio),
                 held_out_eval_rows: Some(held_out_eval_rows),
+                explicit_test_rows,
                 culls: 0,
                 run_elapsed_secs: 0,
                 children_born_at_clock: HashMap::new(),
@@ -662,7 +704,17 @@ impl CoreEngine {
         // fully responsible for its own experience (the env it drives).
         let batch_stream = match &dataset {
             Some(dataset) => {
-                let split = PoolSplit::of(dataset, train_eval_split_ratio, run_seed);
+                // Two stream layouts (see the resolution above):
+                // - explicit `{train, test}` dirs → pools BY CONSTRUCTION:
+                //   train pool = every train row, eval+gating = seeded split
+                //   of the test rows (no training row can leak into eval).
+                // - single pool → the classic seeded shuffle split.
+                let split = match explicit_test_rows {
+                    Some(test_len) => {
+                        PoolSplit::explicit(dataset.len() - test_len, test_len, run_seed)
+                    }
+                    None => PoolSplit::of(dataset, train_eval_split_ratio, run_seed),
+                };
                 Some(
                     BatchStream::new(run_seed, batch_size.unwrap_or(default_batch_size), split)
                         .with_eval_batch_size(eval_batch_size.unwrap_or(default_batch_size))
@@ -689,6 +741,7 @@ impl CoreEngine {
             run_dir,
             header,
             dataset,
+            explicit_test_rows,
             config: RaceConfig { ..config },
             meta_ctx,
             stream: batch_stream,
@@ -696,6 +749,7 @@ impl CoreEngine {
             metrics,
             state: RaceState::new(),
             history_csv_buffer: String::new(),
+            attempts_csv_buffer: String::new(),
             networks: HashMap::new(),
             optimizers: HashMap::new(),
             rolling_fitness: HashMap::new(),
@@ -832,6 +886,20 @@ impl CoreEngine {
                 self.header.config.challenge_prob,
                 self.config.challenge_prob,
                 self.header.config.challenge_prob
+            ))
+            .into());
+        }
+        // The decay SHAPE is replay state too: the trigger re-derives its
+        // probability from (prob, shape, step), so a changed shape would
+        // re-fire a different challenge pattern. Same contract as above.
+        if self.config.challenge_decay != self.header.config.challenge_decay {
+            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                "resume: challenge_decay mismatch — run recorded '{}' but the resume config sets '{}' — \
+                 the challenged-step replay pattern would diverge; set set_run_challenge_decay(ChallengeDecay::{:?}) \
+                 (or omit) to resume",
+                self.header.config.challenge_decay,
+                self.config.challenge_decay,
+                self.header.config.challenge_decay
             ))
             .into());
         }
@@ -1237,8 +1305,8 @@ impl CoreEngine {
                 // Flush metrics at the checkpoint too: an interrupted run then
                 // keeps the per-step history up to its last checkpoint instead
                 // of losing the whole in-memory buffer.
-                if let Err(e) = self.flush_metrics_csv() {
-                    tracing::warn!("checkpoint metrics flush failed: {e}");
+                if let Err(e) = self.flush_csv_exports() {
+                    tracing::warn!("checkpoint CSV flush failed: {e}");
                 }
                 if self.verbose_detail() {
                     let arrow = self.fitness.direction().arrow();
@@ -1425,9 +1493,9 @@ impl CoreEngine {
         // Post-race pruner (pop_pruner): the stop reason becomes a
         // TRANSITION, not an exit — cull everything except the top
         // `elite_count` nets (min 1) and keep training them solo for
-        // `pruner.steps` more steps. Evolution and stop criteria are
-        // phase-locked OFF: they are evolution-phase concerns and the
-        // surviving nets race no one.
+        // `pruner.steps` more steps. Evolution, stop criteria and per-step
+        // challenges are phase-locked OFF: they are race-phase concerns and
+        // the surviving nets race no one.
         if let Some(pruner) = self.config.pop_pruner {
             let reason = self.run_pruner_phase(reason, clock, pruner)?;
             return Ok(reason);
@@ -1444,7 +1512,7 @@ impl CoreEngine {
             self.log_stop_summary(clock)?;
         }
         self.write_live_frontier_states()?;
-        self.flush_metrics_csv()?;
+        self.flush_csv_exports()?;
         self.persist_run_counters();
         Ok(reason)
     }
@@ -1455,7 +1523,7 @@ impl CoreEngine {
     /// cull budget, wall-clock age, and child-seed disambiguation state.
     /// Best-effort: a write failure is a warning, not a stop failure (the
     /// frontier and ledger are already safely on disk at this point).
-    fn persist_run_counters(&self) {
+    pub(crate) fn persist_run_counters(&self) {
         let mut header = self.header.clone();
         header.culls = self.culls;
         header.run_elapsed_secs = self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs();
@@ -1505,7 +1573,7 @@ impl CoreEngine {
     /// the run's OWN trainer (`holdout_score` — one game per call, same
     /// units as the reported fitness). No scorer object to wire: the engine
     /// owns the trainer, so `engine.guardrail(device)` is the whole call.
-    /// How many games it plays is the run's `set_guardrail_matches`
+    /// How many games it plays is the run's `set_elite_guardrail_matches`
     /// (default 16) — one knob, set where the rest of the run is configured.
     ///
     /// `None` = no champion was ever exported, the champion could not be
@@ -1555,6 +1623,28 @@ impl CoreEngine {
             .collect();
         ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
         ranked.into_iter().take(k).map(|(h, _)| h).collect()
+    }
+
+    /// The net's 1-based rank among ALL live nets (not just the elite seats)
+    /// by smoothed fitness — the same direction-aware sort `elite_hashes`
+    /// uses, so `rank_position(h) <= elite_count` ⇔ `h` is elite. `None` when
+    /// the hash is unknown or has no fitness yet. Used by the dethrone log
+    /// (was-rank → out) and any future rank-delta reporting.
+    pub(crate) fn rank_position(&self, hash: &str) -> Option<usize> {
+        let direction = self.fitness.direction();
+        let mut ranked: Vec<(String, f32)> = self
+            .state
+            .live_hashes()
+            .iter()
+            .filter_map(|h| {
+                self.rolling_fitness
+                    .get(h)
+                    .filter(|b| !b.is_empty())
+                    .map(|b| (h.clone(), rolling_mean(b)))
+            })
+            .collect();
+        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
+        ranked.iter().position(|(h, _)| h == hash).map(|p| p + 1)
     }
 
     // ── Selection helpers ───────────────────────────────────────────────────
@@ -1640,8 +1730,9 @@ impl CoreEngine {
     }
 
     /// Append a step's metrics for all live nets to the history buffer.
-    /// Rows are typed `metric` in the unified history.csv (evolution events
-    /// are typed `attempt` — see `record_attempt`).
+    /// `history.csv` carries ONLY these rows — evolution events live in their
+    /// own `attempts.csv` (`record_attempt`), so neither schema needs the
+    /// other's columns padded out.
     pub(crate) fn append_metrics_csv(&mut self, step: usize) -> Result<()> {
         if !self.config.csv_export {
             return Ok(());
@@ -1651,7 +1742,7 @@ impl CoreEngine {
                 if let Some(m) = &net_state.last_metrics {
                     let origin = net_state.created_from.clone().unwrap_or_default();
                     let mut row = format!(
-                        "metric,{},{},{},{},{},{},{},{}",
+                        "{},{},{},{},{},{},{},{}",
                         step,
                         hash,
                         net_state.net_seed,
@@ -1675,14 +1766,37 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Flush the buffered history rows to `history.csv` — the unified event
-    /// log (per-step `metric` rows + evolution `attempt` rows). Same cadence:
-    /// checkpoints + stop, gated by `csv_export`.
-    pub(crate) fn flush_metrics_csv(&mut self) -> Result<()> {
-        if !self.config.csv_export || self.history_csv_buffer.is_empty() {
+    /// Flush both buffered CSV exports — `history.csv` (per-step metric rows)
+    /// and `attempts.csv` (evolution events). Each file has its own header, so
+    /// neither schema pads out the other's columns. Same cadence: checkpoints
+    /// + stop, gated by `csv_export`.
+    pub(crate) fn flush_csv_exports(&mut self) -> Result<()> {
+        if !self.config.csv_export {
             return Ok(());
         }
-        let path = self.run_dir.join("history.csv");
+        // `net_seed` completes the individual identity: (hash, net_seed)
+        // uniquely distinguishes re-born individuals that share a topology
+        // hash across eras.
+        let mut history_header =
+            "step,hash,net_seed,origin,entered_at_step,train_loss,eval_loss,fitness".to_string();
+        for m in &self.metrics {
+            history_header.push(',');
+            history_header.push_str(m.label());
+        }
+        let attempts_header = "step,branch,attempt,outcome,child_hash,child_net_seed,child_origin,gate_index,child_fitness,bar,victim,victim_net_seed,pop_size";
+        let history_body = std::mem::take(&mut self.history_csv_buffer);
+        let attempts_body = std::mem::take(&mut self.attempts_csv_buffer);
+        self.append_csv_file("history.csv", &history_header, &history_body)?;
+        self.append_csv_file("attempts.csv", attempts_header, &attempts_body)
+    }
+
+    /// Append `body` to `<run_dir>/<file>`, writing `header` first when the
+    /// file does not exist yet. A no-op for an empty body.
+    fn append_csv_file(&self, file: &str, header: &str, body: &str) -> Result<()> {
+        if body.is_empty() {
+            return Ok(());
+        }
+        let path = self.run_dir.join(file);
         let exists = path.exists();
 
         use std::fs::OpenOptions;
@@ -1697,7 +1811,7 @@ impl CoreEngine {
             })?;
         }
 
-        let mut file = OpenOptions::new()
+        let mut f = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
@@ -1707,37 +1821,20 @@ impl CoreEngine {
             })?;
 
         if !exists {
-            // Unified header: the `type` column discriminates the row shape
-            // (`metric` = per-step live-net snapshot; `attempt` = evolution
-            // event). Downstream columns overlap where they can; a reader
-            // filters by type first.
-            // `net_seed` completes the individual identity: (hash, net_seed)
-            // uniquely distinguishes re-born individuals that share a
-            // topology hash across eras.
-            let mut headers =
-                "type,step,hash,net_seed,origin,entered_at_step,train_loss,eval_loss,fitness"
-                    .to_string();
-            for m in &self.metrics {
-                headers.push(',');
-                headers.push_str(m.label());
-            }
-            headers.push_str(",branch,attempt,outcome,gate_index,child_fitness,bar,victim,victim_net_seed,pop_size");
-            headers.push('\n');
-            file.write_all(headers.as_bytes()).map_err(|source| {
-                crate::utils::error::EngineError::Io {
+            let mut h = header.to_string();
+            h.push('\n');
+            f.write_all(h.as_bytes())
+                .map_err(|source| crate::utils::error::EngineError::Io {
                     path: path.display().to_string(),
                     source,
-                }
-            })?;
+                })?;
         }
 
-        file.write_all(self.history_csv_buffer.as_bytes())
+        f.write_all(body.as_bytes())
             .map_err(|source| crate::utils::error::EngineError::Io {
                 path: path.display().to_string(),
                 source,
             })?;
-
-        self.history_csv_buffer.clear();
         Ok(())
     }
 
@@ -1778,6 +1875,7 @@ impl CoreEngine {
                     .map(|s| s.held_out_eval_rows())
                     .unwrap_or(256),
             ),
+            explicit_test_rows: self.explicit_test_rows,
             culls: self.culls,
             run_elapsed_secs: self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs(),
             children_born_at_clock: self.children_born_at_clock.clone(),
@@ -3991,16 +4089,20 @@ mod tests {
         assert_eq!(live.len(), 1, "Hard pruner keeps only the top-1");
         let survivor = eng.state.net(&live[0]).unwrap();
         assert_eq!(survivor.step, 3 + 3, "survivor advanced through solo phase");
-        // History recorded the pruner phase too (culls marked `pruned`).
+        // The pruner phase is recorded too: culls as `pruner` rows in
+        // attempts.csv, solo steps as ordinary history.csv metric rows.
         let history = std::fs::read_to_string(run_dir.join("history.csv")).unwrap();
+        let attempts = std::fs::read_to_string(run_dir.join("attempts.csv")).unwrap();
         assert!(
-            history.contains("pruner"),
+            attempts.lines().any(|l| l.contains("pruner")),
             "culls are recorded as pruner attempt rows"
         );
         for solo_step in [3usize, 4, 5] {
             assert!(
-                history.contains(&format!("metric,{solo_step},")),
-                "solo step {solo_step} appears as a metric row"
+                history
+                    .lines()
+                    .any(|l| l.starts_with(&format!("{solo_step},"))),
+                "solo step {solo_step} appears as a history.csv metric row"
             );
         }
         // Freeze bypass: with freeze_elites on (the default), the survivor is
@@ -4013,6 +4115,17 @@ mod tests {
                 "solo step {solo_step} must be a REAL trained step, not frozen"
             );
         }
+        // The pruner path RETURNS from `finish_race` before its own counter
+        // stamp, so the phase persists them itself: the culls it performed
+        // must be in engine.json, not only in the in-memory counter.
+        let json = std::fs::read_to_string(run_dir.join("engine.json")).unwrap();
+        let header: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            header["culls"].as_u64().unwrap() as usize,
+            eng.culls,
+            "pruner culls are stamped into engine.json"
+        );
+        assert!(eng.culls > 0, "the pruner did cull someone");
     }
 
     #[test]
@@ -4078,6 +4191,249 @@ mod tests {
             2,
             "elite_count=2 keeps two nets racing"
         );
+    }
+
+    #[test]
+    fn pruner_phase_never_fires_challenges() {
+        let dir = std::env::temp_dir().join("gras-pruner-no-challenge");
+        let _ = std::fs::remove_dir_all(&dir);
+        // The decay ALONE would not save us here: `max_steps = None` keeps
+        // `p_eff` at the full knob for every step, and the race stops early
+        // via `custom_stop`. So any solo challenge would have to come from an
+        // explicit suppression, which is what this pins.
+        let mut config = rl_config(0);
+        config.pop_size = 2;
+        config.challenge_prob = 1.0;
+        config.max_steps = None;
+        config.crossover_rolls = 0;
+        config.mutate_rolls = 0;
+        config.custom_stop = Some(Box::new(|snap: &crate::engine::config::RaceSnapshot| {
+            snap.step >= 2
+        }));
+        config.pop_pruner = Some(crate::engine::config::PopPruner {
+            method: crate::engine::config::PopPrunerMethod::Hard,
+            steps: 3,
+        });
+        let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
+            config,
+            crate::engine::fitness::Fitness::reported(
+                crate::engine::fitness::Direction::Maximize,
+                "reward",
+            ),
+            ChallengingRlTrainer,
+            Some(11),
+            Some(dir.clone()),
+        ))
+        .unwrap();
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        assert_eq!(eng.run().unwrap(), StopReason::CustomStop);
+        // history.csv carries a fitness per (step, net): the sentinel −1000
+        // marks a challenged step (ChallengingRlTrainer), and the solo steps
+        // 3..=5 must be free of it. No evolve rolls ⇒ every row is a founder
+        // (plain `founder-N` origin, no quoting to parse around).
+        let history = std::fs::read_to_string(dir.join("history.csv")).unwrap();
+        let mut race_sentinels = 0usize;
+        let mut solo_rows = 0usize;
+        for line in history.lines().skip(1) {
+            let cols: Vec<&str> = line.split(',').collect();
+            let step: usize = cols[0].parse().unwrap();
+            let fitness: f32 = cols[7].parse().unwrap();
+            if step >= 3 {
+                solo_rows += 1;
+                assert_ne!(
+                    fitness, -1000.0,
+                    "pruner solo step {step} fired a challenge"
+                );
+            } else if fitness == -1000.0 {
+                race_sentinels += 1;
+            }
+        }
+        assert!(solo_rows > 0, "the pruner phase recorded solo rows");
+        assert!(
+            race_sentinels > 0,
+            "the knob WAS live during the race (p_eff = 1.0)"
+        );
+        assert_eq!(
+            eng.total_challenged_turns,
+            race_sentinels * 5,
+            "challenged-turn total counts race steps only"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both CSV exports must be self-consistent: every data row has exactly as
+    /// many fields as its own header. The old single-file layout padded
+    /// attempt rows with a hand-counted run of commas; one comma too many
+    /// shifted `branch`…`pop_size` a column left for every attempt row (and
+    /// left the real live count with no header). Field-count equality is the
+    /// invariant that catches that class of bug.
+    #[test]
+    fn csv_exports_have_aligned_columns() {
+        fn fields(line: &str) -> usize {
+            // Quote-aware counter: `csv_field` wraps origins containing commas.
+            let mut n = 1;
+            let mut quoted = false;
+            for ch in line.chars() {
+                match ch {
+                    '"' => quoted = !quoted,
+                    ',' if !quoted => n += 1,
+                    _ => {}
+                }
+            }
+            n
+        }
+        let run_dir = std::env::temp_dir().join("gras-csv-alignment");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let mut eng = pruned_engine(&run_dir, 42, 1, 2);
+        // A configured metric widens the history header — the shape most
+        // likely to drift from the attempt layout.
+        eng.metrics = vec![crate::engine::fitness::Metric::custom("dummy", |_p, _y| {
+            Ok(0.0)
+        })];
+        eng.seed_population_internal(
+            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+            Some(0.5),
+        )
+        .unwrap();
+        eng.run().unwrap();
+        for file in ["history.csv", "attempts.csv"] {
+            let text = std::fs::read_to_string(run_dir.join(file)).unwrap();
+            let mut lines = text.lines();
+            let expected = fields(lines.next().expect("header"));
+            assert_eq!(expected, fields(lines.clone().next().unwrap_or_default()));
+            let mut rows = 0;
+            for line in lines {
+                assert_eq!(
+                    fields(line),
+                    expected,
+                    "{file} row has the wrong field count: {line}"
+                );
+                rows += 1;
+            }
+            assert!(rows > 0, "{file} has data rows");
+        }
+        // The attempt ledger really landed in its own file (the pruner culls).
+        let attempts = std::fs::read_to_string(run_dir.join("attempts.csv")).unwrap();
+        assert!(attempts.lines().any(|l| l.contains("pruner")));
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    /// Smoke test for the explicit `{train, test}` two-dataset layout: a
+    /// data dir holding both subdirs resolves through
+    /// `resolve_train_test_datasets`, the stream's eval/gating pools contain
+    /// ONLY test rows (train/eval disjointness is guaranteed by the layout,
+    /// not a shuffle), and the header records `explicit_test_rows` so resume
+    /// rebuilds the same pools.
+    #[test]
+    fn explicit_train_test_dirs_build_disjoint_pools() {
+        // Build a data dir with train/ (80 rows) + test/ (20 rows) — same
+        // distribution, disjoint ROW SETS (train rows 0..80, test rows 80..100
+        // of one synthetic pool; the point is the DIRECTORY layout, not the
+        // values).
+        let pool =
+            crate::utils::tabular_data::synthetic_classification(100, 2, 2, 9, flodl::Device::CPU)
+                .unwrap();
+        let split_at = 80;
+        let inputs = pool.inputs.to_f32_vec().unwrap();
+        let targets = pool.targets.to_f32_vec().unwrap();
+        let in_dim = 2usize;
+        let out_dim = 2usize;
+        let slice = |rows: std::ops::Range<usize>| {
+            let xi: Vec<f32> = rows
+                .clone()
+                .flat_map(|r| inputs[r * in_dim..(r + 1) * in_dim].to_vec())
+                .collect();
+            let yi: Vec<f32> = rows
+                .clone()
+                .flat_map(|r| targets[r * out_dim..(r + 1) * out_dim].to_vec())
+                .collect();
+            crate::utils::tabular_data::Dataset {
+                inputs: flodl::Tensor::from_f32(
+                    &xi,
+                    &[(rows.len()) as i64, in_dim as i64],
+                    flodl::Device::CPU,
+                )
+                .unwrap(),
+                targets: flodl::Tensor::from_f32(
+                    &yi,
+                    &[(rows.len()) as i64, out_dim as i64],
+                    flodl::Device::CPU,
+                )
+                .unwrap(),
+            }
+        };
+        let data_dir = std::env::temp_dir().join(format!("gras-train-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        crate::utils::tabular_data::save_dataset(&data_dir.join("train"), &slice(0..split_at))
+            .unwrap();
+        crate::utils::tabular_data::save_dataset(&data_dir.join("test"), &slice(split_at..100))
+            .unwrap();
+
+        let run_dir = std::env::temp_dir().join("gras-train-test-run");
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let config = RaceConfig {
+            pop_size: 0,
+            max_steps: Some(2),
+            ..RaceConfig::defaults()
+        };
+        let mut eng =
+            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+                data_dir.clone(),
+                config,
+                fitness(),
+                crate::trainer::TabularTrainer::new(loss_fn()),
+                Some(7),
+                Some(run_dir.clone()),
+            ))
+            .unwrap();
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        eng.run().unwrap();
+
+        // The engine took the explicit path: header records the test-row count.
+        let header = crate::state::load_engine_json(&run_dir).unwrap();
+        assert_eq!(
+            header.explicit_test_rows,
+            Some(100 - split_at),
+            "engine.json must record the explicit layout"
+        );
+        // The stream's pools are disjoint BY CONSTRUCTION: eval pool rows all
+        // sit in the test range [80..100) of the combined dataset.
+        let stream = eng.stream.as_ref().unwrap();
+        let (train_pool, eval_pool, gating_pool) = stream.pools();
+        let test_start = split_at as i64;
+        for row in eval_pool {
+            assert!(
+                *row >= test_start,
+                "eval pool row {row} leaks into the train range"
+            );
+        }
+        for row in gating_pool {
+            assert!(*row >= test_start, "gating row {row} leaks into train");
+        }
+        for row in train_pool {
+            assert!(*row < test_start, "train pool row {row} enters test range");
+        }
+        // Resume rebuilds the SAME pools from the header (no re-detection).
+        let resumed = crate::engine::TabularEngine::resume(
+            run_dir.clone(),
+            data_dir.clone(),
+            RaceConfig {
+                pop_size: 2,
+                ..RaceConfig::defaults()
+            },
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        )
+        .unwrap();
+        let rs = resumed.stream.as_ref().unwrap().pools();
+        assert_eq!(eval_pool, rs.1, "resume: identical eval pool");
+        assert_eq!(gating_pool, rs.2, "resume: identical gating pool");
+        assert_eq!(train_pool, rs.0);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 
     #[test]

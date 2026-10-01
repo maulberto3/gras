@@ -192,10 +192,10 @@ impl CoreEngine {
                     .as_deref()
                     .map(|v| v[..8.min(v.len())].to_string())
                     .unwrap_or_else(|| "none".into()),
-                    match self.config.crossover_cull_policy {
-                        crate::engine::config::CrossCullPolicy::Worst => "worst",
-                        crate::engine::config::CrossCullPolicy::Random => "random",
-                    },
+                match self.config.crossover_cull_policy {
+                    crate::engine::config::CrossCullPolicy::Worst => "worst",
+                    crate::engine::config::CrossCullPolicy::Random => "random",
+                },
             )));
         }
         let mut replayed_to = 0usize;
@@ -430,19 +430,16 @@ impl CoreEngine {
         self.insert_child(child, clock, "crossover");
         Ok(RollOutcome::survived(format!(
             "child {} ({}) inserted{}, {}, {}",
-            inserted_hash,
-            lineage,
-            gate_note,
-            catchup_note,
-            victim_note,
+            inserted_hash, lineage, gate_note, catchup_note, victim_note,
         )))
     }
 
-    /// Append one evolution-event row to the history.csv buffer (cx_retry_full
-    /// measurement). Every crossover/mutation attempt is recorded — inserted or
-    /// rejected — so gate-failure rate, operator yield, and retry economics are
-    /// queryable after the run. Buffered, flushed at the same points as the
-    /// per-step metric rows (they share the unified history.csv).
+    /// Append one evolution-event row to the `attempts.csv` buffer
+    /// (cx_retry_full measurement). Every crossover/mutation attempt is
+    /// recorded — inserted or rejected — so gate-failure rate, operator yield,
+    /// and retry economics are queryable after the run. Own file, own header:
+    /// an attempt has none of a metric row's columns, so there is nothing to
+    /// pad — a shared schema was exactly what let the two shapes drift.
     #[allow(clippy::too_many_arguments)] // one row of the attempt ledger — fields, not logic
     pub(crate) fn record_attempt(
         &mut self,
@@ -462,27 +459,22 @@ impl CoreEngine {
         if !self.config.csv_export {
             return;
         }
-        // Attempt rows align with the unified header: type,step,hash,net_seed,
-        // origin, then empty metric columns (entered_at_step/train_loss/
-        // eval_loss/... — attempts have no per-step training state), then the
-        // attempt tail (branch,attempt,outcome,gate_index,child_fitness,bar,
-        // victim,victim_net_seed,pop).
+        // `attempts.csv` columns, in header order (see `flush_csv_exports`):
+        // step,branch,attempt,outcome,child_hash,child_net_seed,child_origin,
+        // gate_index,child_fitness,bar,victim,victim_net_seed,pop_size.
         // FULL hashes + net_seed here (no truncation): (hash, net_seed) is the
         // unique individual key — the same topology hash can legitimately
         // appear in multiple attempt rows (regenerated children) and across
         // eras, so the log must not manufacture collisions.
-        // entered_at_step + 3 metric cols + informative cols = empty slots.
-        let empty_metrics = ",".repeat(4 + self.metrics.len());
         let row = format!(
-            "attempt,{},{},{},{},{},\"{}\",{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             step,
-            child_hash.unwrap_or_default(),
-            child_net_seed.map(|s| s.to_string()).unwrap_or_default(),
-            csv_field(origin),
-            empty_metrics,
             branch,
             attempt,
             outcome,
+            child_hash.unwrap_or_default(),
+            child_net_seed.map(|s| s.to_string()).unwrap_or_default(),
+            csv_field(origin),
             gate_index.map(|g| g.to_string()).unwrap_or_default(),
             child_fitness.map(|v| v.to_string()).unwrap_or_default(),
             bar.map(|v| v.to_string()).unwrap_or_default(),
@@ -490,7 +482,7 @@ impl CoreEngine {
             victim_net_seed.map(|s| s.to_string()).unwrap_or_default(),
             self.state.live_count(),
         );
-        self.history_csv_buffer.push_str(&row);
+        self.attempts_csv_buffer.push_str(&row);
     }
 
     /// Uniformly random **cullable** live net — the `Random` arm of BOTH cull
@@ -579,8 +571,13 @@ impl CoreEngine {
     fn mutation_victim_fallback(&self) -> Option<String> {
         let clock = self.step_clock();
         let elite = self.elite_hashes();
-        let eligible = |h: &String| !elite.contains(h);
-        let off_probation = |h: &String| !self.on_probation(h, clock);
+        // EFFICIENCY NOTE (Tier 1 — `&str` over `&String`): the closures only
+        // look up / re-borrow the hash; `&str` derefs from `&String` for free
+        // (auto-coercion at the call site). `elite` is a tiny Vec (elite_count
+        // entries), so a linear `iter().any` on `&str` beats forcing the
+        // closure to take `&String` just to satisfy `Vec::contains`.
+        let eligible = |h: &str| !elite.iter().any(|e| e == h);
+        let off_probation = |h: &str| !self.on_probation(h, clock);
         let live = self.state.live_hashes();
         // Preferred: worst among non-elite, off-probation nets.
         if let Some(worst) = self
@@ -791,13 +788,16 @@ impl CoreEngine {
     /// must always get its slot). `None` only when no net has ever scored.
     fn select_crossover_worst_victim(&self, clock: usize) -> Result<Option<String>> {
         let worst = self.worst_nets_by_smoothed_fitness(self.state.live_count())?;
-        let victim = worst.into_iter().find(|h| !self.on_probation(h, clock)).or_else(|| {
-            // Probation broken: fall back to the plain worst (which may be
-            // on probation — an admitted child must get its slot).
-            self.worst_nets_by_smoothed_fitness(1)
-                .ok()
-                .and_then(|v| v.into_iter().next())
-        });
+        let victim = worst
+            .into_iter()
+            .find(|h| !self.on_probation(h, clock))
+            .or_else(|| {
+                // Probation broken: fall back to the plain worst (which may be
+                // on probation — an admitted child must get its slot).
+                self.worst_nets_by_smoothed_fitness(1)
+                    .ok()
+                    .and_then(|v| v.into_iter().next())
+            });
         Ok(victim)
     }
 }

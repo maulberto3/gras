@@ -23,10 +23,11 @@ impl CoreEngine {
             return Ok(());
         }
         self.record_champions();
-        let ranked = self.champion_ranked();
-        let k = ranked.len();
-        for (rank, (hash, fitness)) in ranked.iter().enumerate() {
-            let Some(state) = self.state.net(hash) else {
+        // The champion count is known without consuming the iterator — read
+        // it from the config (the same k the iterator caps at).
+        let k = self.config.elite_count.max(1);
+        for (rank, (hash, fitness)) in self.champion_ranked().enumerate() {
+            let Some(state) = self.state.net(&hash) else {
                 continue;
             };
             let Ok(topo) = state.topology() else {
@@ -77,8 +78,7 @@ impl CoreEngine {
             return Ok(());
         }
         self.record_champions();
-        let ranked = self.champion_ranked();
-        for (hash, _) in &ranked {
+        for (hash, _) in self.champion_ranked() {
             let short = &hash[..8.min(hash.len())];
             let path = self.run_dir.join(format!("elite-{short}.safetensors"));
             // The elite's live Network is still in memory at stop — export
@@ -138,16 +138,25 @@ impl CoreEngine {
     /// The champion set: top-`elite_count` live hashes by smoothed fitness.
     /// The ONE ranking both elite writers consume, so `elite-<hash>.md`,
     /// `elite-<hash>.safetensors` and `champion_hashes()` can never disagree.
-    fn champion_ranked(&self) -> Vec<(String, f32)> {
+    ///
+    /// EFFICIENCY NOTE (Tier 2 — `impl Iterator` from ranking helpers): the
+    /// ranking is lazily returned as an iterator so each caller takes only
+    /// what it needs (`take(k)`, `.last()`, `map + collect`) without ever
+    /// materializing the full ranked population in a `Vec` first. Perk: for
+    /// pop-500 runs the champion writers allocate 5 entries instead of 500.
+    /// Cost: the sort inside still allocates once (unavoidable — the ranking
+    /// needs total order), but the full-`Vec` handoff to every consumer is
+    /// gone.
+    fn champion_ranked(&self) -> impl Iterator<Item = (String, f32)> {
         let k = self.config.elite_count.max(1);
-        self.rank_live().into_iter().take(k).collect()
+        self.rank_live().into_iter().take(k)
     }
 
     /// Snapshot the current champion set into `self.champions` before any
     /// artifact writing, so `champion_hashes()` reflects exactly the set the
     /// writers iterate — even if an individual file write fails.
     pub(crate) fn record_champions(&mut self) {
-        self.champions = self.champion_ranked().into_iter().map(|(h, _)| h).collect();
+        self.champions = self.champion_ranked().map(|(h, _)| h).collect();
     }
 
     /// Rank live nets by smoothed fitness, best first. Shared by the elite
@@ -183,13 +192,14 @@ impl CoreEngine {
         if !self.config.worst_save_topology && !self.config.worst_save_safetensors {
             return Ok(());
         }
-        let ranked = self.rank_live();
-        let Some((worst, worst_fitness)) = ranked.last() else {
+        // `.last()` on the ranked iterator: the worst net O(n) without a
+        // full `Vec` clone of the ranking (see the champion_ranked note).
+        let Some((worst, worst_fitness)) = self.rank_live().into_iter().last() else {
             return Ok(()); // nothing ever scored — nothing to dump
         };
         let short = &worst[..8.min(worst.len())];
         if self.config.worst_save_topology {
-            if let Some(state) = self.state.net(worst) {
+            if let Some(state) = self.state.net(&worst) {
                 if let Ok(topo) = state.topology() {
                     let path = self.run_dir.join(format!("worst-{short}.md"));
                     let md = format!(

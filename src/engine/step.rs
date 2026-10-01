@@ -68,25 +68,44 @@ impl CoreEngine {
                 .position(|h| h == hash)
                 .map(|p| p + 1)
                 .unwrap_or(0);
+            // Freeze-line extras (value + brevity): the net's AGE (steps lived
+            // in the run — a hot newcomer vs a long-standing champion) and its
+            // parameter estimate (search-space signal). `—` placeholders keep
+            // the line shape stable when a value is unavailable.
+            let age = self
+                .state
+                .net(hash)
+                .map(|s| clock.saturating_sub(s.entered_at_step));
+            let params = self
+                .networks
+                .get(hash)
+                .map(|n| n.topology_blueprint().param_estimate());
+            let extras = format!(
+                ", age {}, {}p",
+                age.map(|a| a.to_string()).unwrap_or_else(|| "—".into()),
+                params.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
+            );
             if seat == 1 {
                 // Single-elite wording (the common case): crown moves as one.
                 if self.frozen_crown.is_empty() {
                     info!(
-                        "step {} │ freeze │ champion {} crowned (fitness{} {}) — weight updates paused (act+measure continues)",
+                        "step {} │ freeze │ champion {} crowned (fitness{} {}{}) — w paused (a+m continues)",
                         clock,
                         &hash[..8.min(hash.len())],
                         self.fitness.direction().arrow(),
                         fitness.map(fmt2).unwrap_or_else(|| "—".into()),
+                        extras,
                     );
                 } else {
                     let prev = self.frozen_crown.iter().next().cloned().unwrap_or_default();
                     info!(
-                        "step {} │ freeze │ crown moved {} → {} (fitness{} {}) — previous champion resumes weight updates",
+                        "step {} │ freeze │ crown moved {} → {} (fitness{} {}{}) — previous champion resumes w updates",
                         clock,
                         &prev[..8.min(prev.len())],
                         &hash[..8.min(hash.len())],
                         self.fitness.direction().arrow(),
                         fitness.map(fmt2).unwrap_or_else(|| "—".into()),
+                        extras,
                     );
                 }
             } else {
@@ -94,11 +113,12 @@ impl CoreEngine {
                 // "crown moved" language — with k seats, one joining does
                 // not imply another was dethroned.
                 info!(
-                    "step {} │ freeze │ elite seat {pos}/{seat}: {} frozen (fitness{} {}) — weight updates paused (act+measure continues)",
+                    "step {} │ freeze │ elite seat {pos}/{seat}: {} frozen (fitness{} {}{}) — w paused (a+m continues)",
                     clock,
                     &hash[..8.min(hash.len())],
                     self.fitness.direction().arrow(),
                     fitness.map(fmt2).unwrap_or_else(|| "—".into()),
+                    extras,
                 );
             }
             self.frozen_crown.insert(hash.to_string());
@@ -109,28 +129,75 @@ impl CoreEngine {
         // the clock — there is no catch-up gauntlet on dethrone.
         if !frozen && self.frozen_crown.contains(hash) {
             self.frozen_crown.remove(hash);
-            // Fair-warm-up on dethrone: the optimizer STATE (momentum/velocity/
-            // step counters) is stale — its notes describe the gradient
-            // landscape of the frozen era. Resetting keeps all the weights
-            // (the frozen skill) and all the hyperparameters, but forgets the
-            // stale trend, so the first reclaim updates are clean-scaled.
-            // Say WHO took the seat: the new elite set minus the dethroned
-            // net (the seats just re-dealt). First non-dethroned elite.
-            let taker = self
-                .elite_hashes()
-                .into_iter()
-                .find(|h| h != hash)
-                .unwrap_or_default();
-            info!(
-                "step {} │ freeze │ {} dethroned (seat → {}) — resumes training with its last optimizer state (was acting/measuring while frozen, no catch-up needed)",
-                clock,
-                &hash[..8.min(hash.len())],
-                if taker.is_empty() {
-                    "?".to_string()
+            // Bookkeeping only in the pruner phase: freeze is bypassed there
+            // by design, so every survivor would otherwise print a
+            // "dethroned" line on its first solo step — nothing dethroned it.
+            if !self.pruner_solo_active {
+                // Rank delta (was-rank → now-rank) instead of naming a
+                // "successor": with k seats the set just re-dealt, so no
+                // single net took THIS net's place — the delta says what
+                // actually happened (how far the net fell, or that the pack
+                // shrank around it).
+                let old_rank = {
+                    // Rank AT FREEZE TIME: elite membership when this net was
+                    // frozen, reconstructed from the current elite set minus
+                    // itself is wrong if the set changed since — the honest
+                    // figure is its live ranking position (direction-aware,
+                    // same sort `elite_hashes` uses) at dethrone moment.
+                    // `?` → the net left the state entirely; skip the delta.
+                    self.rank_position(hash).map(|r| r.to_string())
+                };
+                // Say WHO is elite now (first surviving elite) plus BOTH
+                // fitnesses: the dethroned net's own last smoothed value (the
+                // freeze line showed the same figure) and the taker's — the
+                // gap `out → in` shows what the exchange cost/won.
+                let taker = self
+                    .elite_hashes()
+                    .into_iter()
+                    .find(|h| h != hash)
+                    .unwrap_or_default();
+                // Mirror the freeze line's fitness figure so the dethrone
+                // event is comparable at a glance (the net is still in
+                // state at this point, so its last measured value is here).
+                let fit = self
+                    .state
+                    .net(hash)
+                    .and_then(|s| s.last_metrics.as_ref().map(|m| m.fitness));
+                let taker_fit = if taker.is_empty() {
+                    None
                 } else {
-                    taker[..8.min(taker.len())].to_string()
-                },
-            );
+                    self.smoothed_fitness_of(&taker)
+                };
+                let rank_txt = match old_rank {
+                    Some(r) => format!("rank {r} → out, "),
+                    None => String::new(),
+                };
+                let gap_txt = match (fit, taker_fit) {
+                    (Some(a), Some(b)) => format!(
+                        ", fitness {} {} → {} {}",
+                        self.fitness.direction().arrow(),
+                        fmt2(a),
+                        self.fitness.direction().arrow(),
+                        fmt2(b)
+                    ),
+                    (Some(a), None) => {
+                        format!(", fitness{} {}", self.fitness.direction().arrow(), fmt2(a))
+                    }
+                    _ => String::new(),
+                };
+                info!(
+                    "step {} │ freeze │ {} dethroned ({}seat → {}{}) — resumes w updates, opt-state intact (no catch-up needed)",
+                    clock,
+                    &hash[..8.min(hash.len())],
+                    rank_txt,
+                    if taker.is_empty() {
+                        "?".to_string()
+                    } else {
+                        taker[..8.min(taker.len())].to_string()
+                    },
+                    gap_txt,
+                );
+            }
         }
         if frozen {
             // ACT-AND-MEASURE freeze: the elite plays its normal step against
@@ -190,14 +257,19 @@ impl CoreEngine {
         // runs with the trainer forcing a drawn action. `prob = 0` (default)
         // never fires. The roll is a pure function of (run, net, step) — see
         // `challenge_fires` — so replay/catch-up re-fires identical triggers.
+        // NEVER in the pruner solo phase: that phase is the final polish, and
+        // the decay alone would not suffice (an early `custom_stop`, or
+        // `max_steps = None`, leaves `p_eff > 0` past the stop).
         let net_seed = self.state.net(hash).map(|s| s.net_seed as u64).unwrap_or(0);
-        let challenged = crate::engine::config::challenge_fires(
-            self.header.run_seed,
-            net_seed,
-            clock,
-            self.config.challenge_prob,
-            self.config.max_steps,
-        );
+        let challenged = !self.pruner_solo_active
+            && crate::engine::config::challenge_fires(
+                self.header.run_seed,
+                net_seed,
+                clock,
+                self.config.challenge_prob,
+                self.config.max_steps,
+                self.config.challenge_decay,
+            );
         let report = self.run_trainer_step_with_real_optimizer(hash, clock, challenged)?;
         // Tabular challenge accounting: the trainer reports how many INPUT
         // VALUES it jittered (an element-level draw), and its expectation is

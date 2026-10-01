@@ -235,7 +235,12 @@ impl CoreEngine {
             .max()
             .unwrap_or(0)
             .max(20);
-        let pad = |s: &String| {
+        // EFFICIENCY NOTE (Tier 1 — `&str` over `&String`): a `&String` is a
+        // double pointer (ptr + len + capacity); the closure only READS the
+        // text, so `&str` suffices and accepts string literals too. Perk:
+        // one deref less and the borrower's `String` needn't exist — borrow
+        // the `&str` view directly.
+        let pad = |s: &str| {
             let visible = s.chars().count();
             format!("│ {}{} │", s, " ".repeat(inner.saturating_sub(visible)))
         };

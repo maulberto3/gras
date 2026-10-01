@@ -10,9 +10,7 @@
 use super::config::RaceConfig;
 use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
 use crate::engine::fitness::Fitness;
-use crate::state::{
-    RaceState, RunHeader,
-};
+use crate::state::{RaceState, RunHeader};
 use crate::trainer::stream::{BatchStream, PoolSplit};
 use flodl::tensor::Result;
 use std::collections::HashMap;
@@ -178,8 +176,20 @@ impl TabularEngine {
             }
         }
         assert_trainer_blob_matches(&header.trainer, trainer.as_ref(), "resume")?;
-        let dataset =
-            crate::utils::tabular_data::resolve_dataset(&data_dir)?.to_device(config.device())?;
+        // Data layout comes from the HEADER (explicit_test_rows), not from
+        // re-detecting the directory: a run started on the explicit
+        // `{train, test}` layout replays against the SAME pools even if the
+        // dirs were renamed/moved afterward. `Some(n)` = the combined dataset
+        // is `train rows [0..len-n)` + `test rows [len-n..len)` (same
+        // resolution order as construction, so row order — and thus the
+        // pools — is identical).
+        let explicit_test_rows = header.explicit_test_rows;
+        let dataset = if explicit_test_rows.is_some() {
+            let (train, test) = crate::utils::tabular_data::resolve_train_test_datasets(&data_dir)?;
+            train.concat(&test)?.to_device(config.device())?
+        } else {
+            crate::utils::tabular_data::resolve_dataset(&data_dir)?.to_device(config.device())?
+        };
         let metrics = config.metrics.clone();
         let run_seed = header.run_seed;
         // On resume, stream shape comes from the run header (data integrity),
@@ -198,7 +208,20 @@ impl TabularEngine {
         };
         // Resume always has a stream by construction (tabular-only today), so
         // the recorded geometry is genuinely `Some` here.
-        let split = PoolSplit::of(&dataset, header_stream_ratio, run_seed);
+        let split = match explicit_test_rows {
+            Some(test_len) => {
+                if test_len == 0 || test_len >= dataset.len() {
+                    return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                        "resume: header records explicit_test_rows = {test_len} but the dataset at {} holds {} rows — the run dir and data dir disagree",
+                        data_dir.display(),
+                        dataset.len(),
+                    ))
+                    .into());
+                }
+                PoolSplit::explicit(dataset.len() - test_len, test_len, run_seed)
+            }
+            None => PoolSplit::of(&dataset, header_stream_ratio, run_seed),
+        };
         // Resume is Tabular-only today (a persisted run carries a dataset);
         // both fields are wrapped in Some to satisfy the Option'd struct.
         let stream = Some(
@@ -228,10 +251,12 @@ impl TabularEngine {
             meta_ctx,
             stream,
             dataset,
+            explicit_test_rows,
             fitness,
             metrics,
             state: RaceState::new(),
             history_csv_buffer: String::new(),
+            attempts_csv_buffer: String::new(),
             networks: HashMap::new(),
             optimizers: HashMap::new(),
             rolling_fitness: HashMap::new(),

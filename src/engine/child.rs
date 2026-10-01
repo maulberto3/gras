@@ -172,9 +172,13 @@ impl CoreEngine {
                         .next()
                 })
                 .collect();
-            if n_parents == 2 && parent_positions.len() == 2 && parent_positions[0] == parent_positions[1] {
-                let others: Vec<usize> =
-                    (0..scores.len()).filter(|&p| p != parent_positions[0]).collect();
+            if n_parents == 2
+                && parent_positions.len() == 2
+                && parent_positions[0] == parent_positions[1]
+            {
+                let others: Vec<usize> = (0..scores.len())
+                    .filter(|&p| p != parent_positions[0])
+                    .collect();
                 if !others.is_empty() {
                     parent_positions[1] = others[rng.usize(..others.len())];
                 }
@@ -294,6 +298,10 @@ impl CoreEngine {
             .config
             .resolved_standardize_pool()
             .unwrap_or_else(|_| crate::evolution::pools::all_standardize_ops());
+        // Transform pool is OPT-IN: empty ⇒ no node carries a transform
+        // (identity). Non-empty ⇒ each hidden node draws from it (with the
+        // empty string never appearing — the pool holds only real transforms).
+        let transforms = self.config.resolved_transform_pool().unwrap_or_default();
         let hidden_dim_pool = self.config.hidden_dim_pool.clone().unwrap_or(4..=8);
         let stride = self.config.hidden_dim_stride.max(1);
         for node in &mut graph.nodes {
@@ -303,6 +311,11 @@ impl CoreEngine {
                 node.activation = activation[rng.usize(0..activation.len())];
                 node.combine_op = Some(combine[rng.usize(0..combine.len())]);
                 node.standardize = Some(standardize[rng.usize(0..standardize.len())]);
+                node.transform = if transforms.is_empty() {
+                    None
+                } else {
+                    Some(transforms[rng.usize(0..transforms.len())])
+                };
             }
         }
         graph.refresh_labels();
@@ -462,6 +475,7 @@ impl CoreEngine {
             step,
             self.config.challenge_prob,
             self.config.max_steps,
+            self.config.challenge_decay,
         );
         // The effective (decay-adjusted) probability for this step — the
         // same value the live path handed the trainer, so an element-level
@@ -470,6 +484,7 @@ impl CoreEngine {
             self.config.challenge_prob,
             step,
             self.config.max_steps,
+            self.config.challenge_decay,
         );
         let mut noop = crate::engine::core::NoopOptimizer;
         let optimizer: &mut dyn flodl::nn::optim::Optimizer = if frozen_step {
