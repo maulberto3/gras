@@ -191,6 +191,32 @@ pub enum StandardizeOp {
     /// params + stateful stats would break the replay contract). Stateless:
     /// replay-safe.
     InstanceNorm,
+    /// Group normalization over the feature dimension with a FIXED 4-group
+    /// partition (features are split into 4 contiguous chunks; each row is
+    /// z-scored within its chunk). Middle ground between LayerNorm (one
+    /// group = all features) and InstanceNorm (one group per feature):
+    /// gives the network per-chunk scale discipline without collapsing all
+    /// channels together. Stateless (no learnable affine, no running
+    /// stats): replay-safe. Feature counts not divisible by 4 are handled
+    /// by an uneven last group (the split is contiguous ranges, so every
+    /// feature belongs to exactly one group and the math stays well-
+    /// defined for any feature count ≥ 1).
+    GroupNorm,
+}
+
+/// Same Tier-2 idiom as `Transform`: the label parse lives with the enum.
+impl TryFrom<&str> for StandardizeOp {
+    type Error = String;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        Ok(match s.to_lowercase().as_str() {
+            "identity" => StandardizeOp::Identity,
+            "layernorm" => StandardizeOp::LayerNorm,
+            "rmsnorm" | "rms_norm" => StandardizeOp::RmsNorm,
+            "instancenorm" | "instance_norm" => StandardizeOp::InstanceNorm,
+            "groupnorm" | "group_norm" => StandardizeOp::GroupNorm,
+            other => return Err(format!("unknown standardize op '{other}'")),
+        })
+    }
 }
 
 impl StandardizeOp {
@@ -225,6 +251,150 @@ impl StandardizeOp {
                 let std = var.add_scalar(1e-5)?.sqrt()?;
                 Ok(centered.div(&std)?)
             }
+            StandardizeOp::GroupNorm => {
+                // GroupNorm with a fixed 4-group partition, hand-rolled to
+                // stay pure f(x) (the flodl nn module carries state).
+                // Implementation: pad the feature axis to a multiple of 4,
+                // reshape [batch, 4, feats/4], z-score per (sample, group),
+                // then undo the reshape/pad. Padding is deterministic
+                // (zeros at the END of the feature axis), so the same input
+                // always yields the same output — the replay contract holds.
+                let shape = x.data().shape();
+                let feats = shape[shape.len() - 1] as usize;
+                let group = 4usize;
+                if feats <= group {
+                    // Degenerate: as many groups as features ⇒ InstanceNorm.
+                    let mean = x.mean_dim(-1, true)?;
+                    let centered = x.sub(&mean)?;
+                    let var = centered.mul(&centered)?.mean_dim(-1, true)?;
+                    let std = var.add_scalar(1e-5)?.sqrt()?;
+                    return Ok(centered.div(&std)?);
+                }
+                let pad = (group - feats % group) % group;
+                let padded: flodl::Tensor = if pad > 0 {
+                    // Zero-pad the feature axis so it divides evenly.
+                    let flat = x.data().reshape(&[
+                        -1i64,
+                        feats as i64,
+                    ])?; // [batch, feats]
+                    let rows = flat.shape()[0];
+                    let zeros = flodl::Tensor::from_f32(
+                        &vec![0.0_f32; (rows as usize) * pad],
+                        &[rows, pad as i64],
+                        x.data().device(),
+                    )?;
+                    flat.cat(&zeros, 1)? // [batch, feats + pad]
+                } else {
+                    x.data().reshape(&[-1i64, feats as i64])?
+                };
+                let padded_feats = (feats + pad) as i64;
+                let g = padded
+                    .reshape(&[-1i64, group as i64, padded_feats / group as i64])?;
+                let mean = g.mean_dim(-1, true)?; // [batch, group, 1]
+                let centered = g.sub(&mean)?;
+                let var = centered.mul(&centered)?.mean_dim(-1, true)?;
+                let std = var.add_scalar(1e-5)?.sqrt()?;
+                let normed = centered.div(&std)?; // [batch, group, feats/group]
+                let normed = normed.reshape(&[-1i64, padded_feats])?;
+                let flat_out = if pad > 0 {
+                    // Slice the padding back off: keep the first `feats` cols.
+                    normed.narrow(-1, 0, feats as i64)?
+                } else {
+                    normed
+                };
+                Ok(Variable::new(flat_out.reshape(&shape)?, false))
+            }
+        }
+    }
+}
+
+/// Per-node elementwise FEATURE transform, applied to the linear output
+/// AFTER standardize, BEFORE activation. Distinct from the activation pool in
+/// kind, not just label: these are shape-of-signal transforms a human would
+/// hand-design for a feature (log1p on income-like magnitudes, sign as a
+/// hard two-state switch) — no saturation/competition semantics. All are
+/// pure `f(x)` — stateless, no learnable params — so the replay/catch-up
+/// contract holds. `None` on the node = identity (the default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Transform {
+    /// ln(1 + x) — compresses income-like heavy tails while keeping order.
+    /// Numerically stable for x > -1; the apply guard clamps below -1.
+    Log1p,
+    /// √|x| · sign(x) — signed square root: gentler compression than log.
+    Sqrt,
+    /// x clamped to [-1, 1] — hard saturation rail.
+    Clamp,
+    /// sign(x) in {-1, 0, +1} — a hard three-state quantizer.
+    Sign,
+    /// 1/x guarded (x clamped away from 0 by ±1e-6 before the divide) —
+    /// inverse-magnitude feature (rarity weighting).
+    Reciprocal,
+    /// e^x clamped at input to [-10, 10] — smooth expansion with an
+    /// overflow rail.
+    Exp,
+}
+
+// EFFICIENCY NOTE (Tier 2 — `TryFrom<&str>` on enums): config pools store
+// labels as strings (`vec!["log1p", "sqrt"]`); the parse used to be a
+// private fn in the config. Living ON the enum, `TryFrom<&str>` is reusable
+// by any tooling, is the standard-library idiom for fallible string→enum,
+// and keeps every new arm's label in ONE place next to the variant itself.
+impl TryFrom<&str> for Transform {
+    type Error = String;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        Ok(match s.to_lowercase().as_str() {
+            "log1p" => Transform::Log1p,
+            "sqrt" => Transform::Sqrt,
+            "clamp" => Transform::Clamp,
+            "sign" => Transform::Sign,
+            "reciprocal" => Transform::Reciprocal,
+            "exp" => Transform::Exp,
+            other => return Err(format!("unknown transform '{other}'")),
+        })
+    }
+}
+
+impl Transform {
+    /// Apply this transform. Every branch is elementwise and stateless —
+    /// the same input always yields the same output (replay contract).
+    pub fn apply(&self, x: &Variable) -> flodl::tensor::Result<Variable> {
+        match self {
+            // log1p needs x > -1: clamp into the stable domain first. The
+            // upper rail (1e9) only exists to keep extreme inputs finite —
+            // ln(1+1e9) ≈ 20.7, still comfortably representable.
+            Transform::Log1p => x.clamp(-0.999_999_f64, 1.0e9_f64)?.log1p(),
+            // Signed sqrt: sign(x) · √|x|.
+            Transform::Sqrt => {
+                let sign = x.data().sign()?;
+                let abs_sqrt = x.data().abs()?.sqrt()?;
+                let out = sign.mul(&abs_sqrt)?;
+                Ok(Variable::new(out, false))
+            }
+            Transform::Clamp => x.clamp(-1.0_f64, 1.0_f64),
+            Transform::Sign => x.sign(),
+            // Divide-safe: sign-preserving, |x| clamped above 1e-6.
+            Transform::Reciprocal => {
+                let sign = x.data().sign()?;
+                let abs = x.data().abs()?.clamp_min(1e-6_f64)?;
+                let inv = abs.reciprocal()?;
+                let out = sign.mul(&inv)?;
+                Ok(Variable::new(out, false))
+            }
+            // Rail the input: e^x overflows quickly; ±10 (e^10 ≈ 22026)
+            // keeps every finite input finite.
+            Transform::Exp => x.clamp(-10.0_f64, 10.0_f64)?.exp(),
+        }
+    }
+
+    /// The `Display`-form label (config pools / topology JSON are strings).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Transform::Log1p => "log1p",
+            Transform::Sqrt => "sqrt",
+            Transform::Clamp => "clamp",
+            Transform::Sign => "sign",
+            Transform::Reciprocal => "reciprocal",
+            Transform::Exp => "exp",
         }
     }
 }
@@ -263,6 +433,11 @@ pub struct Node {
     /// activation (`None` = inherit the graph's `standardize_op`).
     #[serde(default)]
     pub standardize: Option<StandardizeOp>,
+    /// Per-node elementwise feature transform (see [`Transform`]), applied
+    /// after standardize, before activation. `None` = identity (default;
+    /// `#[serde(default)]` keeps older topology JSON loadable).
+    #[serde(default)]
+    pub transform: Option<Transform>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -285,6 +460,7 @@ impl Node {
             port_activations: None,
             combine_op: None,
             standardize: None,
+            transform: None,
         }
     }
 
@@ -300,6 +476,7 @@ impl Node {
             port_activations: None,
             combine_op: None,
             standardize: None,
+            transform: None,
         }
     }
 
@@ -315,6 +492,7 @@ impl Node {
             port_activations: None,
             combine_op: None,
             standardize: None,
+            transform: None,
         }
     }
 
@@ -327,6 +505,12 @@ impl Node {
     /// Set combine-op override (builder style).
     pub fn with_combine_op(mut self, combine_op: CombineOp) -> Self {
         self.combine_op = Some(combine_op);
+        self
+    }
+
+    /// Set per-node elementwise feature transform (builder style).
+    pub fn with_transform(mut self, transform: Transform) -> Self {
+        self.transform = Some(transform);
         self
     }
 
@@ -408,6 +592,151 @@ mod tests {
         let i = StandardizeOp::InstanceNorm.apply(&x).unwrap();
         let m = i.data().mean().unwrap().item().unwrap() as f32;
         assert!(m.abs() < 1e-5, "instancenorm per-row mean ≈ 0 (got {m})");
+
+        // GroupNorm (fixed 4 groups) — the TRUE group regime needs feats > 4:
+        // 12 features → 4 contiguous groups of 3. Row-major [2, 12]: row 0 =
+        // [1, 2, 3,  4, 5, 6,  7, 8, 9,  10, 11, 12] → groups {1,2,3},
+        // {4,5,6}, {7,8,9}, {10,11,12}; each z-scored independently. A
+        // 3-element arithmetic sequence z-scores to [-1.22, 0, 1.22] — so
+        // EVERY group of row 0 lands on the same pattern, which is exactly
+        // what distinguishes GroupNorm from InstanceNorm (whose whole-row
+        // z-score would be [-1.59, -1.31, …, 1.59], a ramp, not a sawtooth).
+        let x12 = flodl::Tensor::from_f32(
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                -1.0, 0.0, 1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0,
+            ],
+            &[2, 12],
+            flodl::Device::CPU,
+        )
+        .unwrap();
+        let x12 = flodl::Variable::new(x12, false);
+        let g = StandardizeOp::GroupNorm.apply(&x12).unwrap();
+        assert_eq!(g.data().shape(), x12.data().shape());
+        let gd = g.data().to_f32_vec().unwrap();
+        let r0 = &gd[0..12]; // row 0
+        for (gi, chunk) in r0.chunks(3).enumerate() {
+            let mean: f32 = chunk.iter().sum::<f32>() / 3.0;
+            assert!(
+                mean.abs() < 1e-4,
+                "groupnorm row-0 group-{gi} mean ≈ 0 (got {mean})"
+            );
+            let var: f32 = chunk.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / 3.0;
+            assert!((var.sqrt() - 1.0).abs() < 1e-3, "groupnorm group-{gi} std ≈ 1");
+        }
+        // Sawtooth, not ramp — group boundaries reset to ±√(3/2) ≈ ±1.2247:
+        assert!((r0[0] - r0[3]).abs() < 1e-4, "group 0 and 1 start identically");
+        assert!(
+            (r0[2] - 1.2247).abs() < 1e-3,
+            "3-element z-score ends at √(3/2) ≈ 1.2247"
+        );
+        // And it genuinely differs from InstanceNorm on the same input:
+        let inst = StandardizeOp::InstanceNorm.apply(&x12).unwrap();
+        let id = inst.data().to_f32_vec().unwrap();
+        assert_ne!(r0.to_vec(), id[0..12].to_vec(), "GroupNorm ≠ InstanceNorm");
+
+        // Degenerate regime: feats ≤ 4 falls back to the InstanceNorm shape
+        // (a single-feature group would z-score to 0/0 — the guard prevents
+        // the useless all-zeros output).
+        let g4 = StandardizeOp::GroupNorm.apply(&x).unwrap();
+        let gd4 = g4.data().to_f32_vec().unwrap();
+        let i4 = StandardizeOp::InstanceNorm.apply(&x).unwrap();
+        let id4 = i4.data().to_f32_vec().unwrap();
+        assert_eq!(gd4.to_vec(), id4.to_vec(), "feats=4 ⇒ InstanceNorm fallback");
+
+        // NON-divisible feature count: 10 feats → groups {3,3,3,1+pad}; the
+        // zero-pad lands only in the LAST group, so groups 0-2 stay exact
+        // z-scores of their true members and the shape comes back unchanged.
+        let x10 = flodl::Tensor::from_f32(
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+                2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0,
+            ],
+            &[2, 10],
+            flodl::Device::CPU,
+        )
+        .unwrap();
+        let x10 = flodl::Variable::new(x10, false);
+        let g10 = StandardizeOp::GroupNorm.apply(&x10).unwrap();
+        assert_eq!(g10.data().shape(), x10.data().shape(), "uneven feature count");
+        let g10d = g10.data().to_f32_vec().unwrap();
+        let r10 = &g10d[0..10]; // row 0: [1..=10]
+        // Group 0 = {1, 2, 3} → z-score [-1.22, 0, 1.22].
+        assert!((r10[0] + 1.2247).abs() < 1e-3, "uneven group 0 start");
+        assert!(r10[1].abs() < 1e-4, "uneven group 0 middle");
+        assert!((r10[2] - 1.2247).abs() < 1e-3, "uneven group 0 end");
+        // Groups 1-2 are {4,5,6}/{7,8,9}: same sawtooth pattern.
+        assert!((r10[3] - r10[0]).abs() < 1e-4);
+        assert!((r10[6] - r10[0]).abs() < 1e-4);
+    }
+
+    #[test]
+    fn transform_ops_are_pure_and_bounded() {
+        let x = flodl::Tensor::from_f32(
+            &[0.0, 1.0, -2.0, 100.0, -100.0, 3.0],
+            &[2, 3],
+            flodl::Device::CPU,
+        )
+        .unwrap();
+        let x = flodl::Variable::new(x, false);
+
+        // log1p: clamped domain, ln(1+x) for the safe parts.
+        let l = Transform::Log1p.apply(&x).unwrap().data().to_f32_vec().unwrap();
+        assert!((l[0] - 0.0).abs() < 1e-6); // ln(1)
+        assert!((l[1] - 2.0_f32.ln()).abs() < 1e-5); // ln(3)?? no — row flat
+        assert!(!l.iter().any(|v| v.is_nan()), "log1p must never NaN");
+
+        // Sign: exactly {-1, 0, 1}.
+        let s = Transform::Sign.apply(&x).unwrap().data().to_f32_vec().unwrap();
+        assert_eq!(s, vec![0.0, 1.0, -1.0, 1.0, -1.0, 1.0]);
+
+        // Clamp: rails at ±1.
+        let c = Transform::Clamp.apply(&x).unwrap().data().to_f32_vec().unwrap();
+        assert_eq!(c, vec![0.0, 1.0, -1.0, 1.0, -1.0, 1.0]);
+
+        // Sqrt: signed root of |x|.
+        let sq = Transform::Sqrt.apply(&x).unwrap().data().to_f32_vec().unwrap();
+        assert!((sq[0] - 0.0).abs() < 1e-6);
+        assert!((sq[1] - 1.0).abs() < 1e-6);
+        assert!((sq[2] + 2.0_f32.sqrt()).abs() < 1e-6);
+        assert!((sq[3] - 10.0).abs() < 1e-5);
+
+        // Reciprocal: never overflows even at x→0 (guard clamps |x| ≥ 1e-6).
+        let r = Transform::Reciprocal.apply(&x).unwrap().data().to_f32_vec().unwrap();
+        assert!(r[0].abs() <= 1e6 + 1.0, "guarded 1/0 must be finite (got {})", r[0]);
+        assert!((r[1] - 1.0).abs() < 1e-5);
+        assert!((r[2] + 0.5).abs() < 1e-6);
+
+        // Exp: input railed at ±10, output always finite.
+        let e = Transform::Exp.apply(&x).unwrap().data().to_f32_vec().unwrap();
+        assert!(!e.iter().any(|v| v.is_infinite() || v.is_nan()));
+        assert!((e[0] - 1.0).abs() < 1e-6); // e^0
+        assert!((e[4] - (-100.0_f32).exp().min(10.0_f32.exp())).abs() < 1e-3);
+
+        // Purity: applying twice gives identical values (replay contract).
+        let twice = Transform::Sign.apply(&Transform::Sign.apply(&x).unwrap())
+            .unwrap()
+            .data()
+            .to_f32_vec()
+            .unwrap();
+        assert_eq!(s, twice);
+    }
+
+    #[test]
+    fn node_transform_survives_json_roundtrip() {
+        let node = Node::new_hidden(1, 2, 2).with_transform(Transform::Log1p);
+        assert_eq!(node.transform, Some(Transform::Log1p));
+        let json = serde_json::to_string(&node).unwrap();
+        let back: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.transform, Some(Transform::Log1p));
+        // Legacy topology JSON (no `transform` field) loads as None.
+        let legacy = serde_json::json!({
+            "id": 1, "num_inputs": 2, "num_outputs": 2, "kind": "Hidden",
+            "hidden_dim": null, "activation": "Identity",
+            "port_activations": null, "combine_op": null, "standardize": null,
+        });
+        let old: Node = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.transform, None, "serde default keeps old JSON loadable");
     }
 
     /// Arbitrary valid node metadata (port counts, kind, id).
@@ -427,6 +756,7 @@ mod tests {
                 port_activations: None,
                 combine_op: None,
                 standardize: None,
+                transform: None,
             },
         )
     }

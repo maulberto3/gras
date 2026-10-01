@@ -91,6 +91,67 @@ pub fn deterministic_train_step(
     train_one_step(net, optimizer, loss_fn, batch, grad_clip)
 }
 
+// ── Generic (`F: Fn`) siblings ──────────────────────────────────────────────
+//
+// EFFICIENCY NOTE (Tier 2 — `F: Fn` beside `&dyn Fn`): the `&dyn Fn` forms
+// above are what the ENGINE uses (the loss arrives through a boxed trait,
+// so a generic would just re-box). These generic siblings exist for the
+// EXAMPLE/user side, where the loss is a concrete closure: monomorphization
+// gives a direct call (no vtable indirection) and the closure can inline
+// into the hot forward+backward path. Same replay contract — pick the form
+// that matches where your closure comes from.
+
+/// Generic sibling of [`deterministic_train_step`]: monomorphized loss
+/// closure (direct call, inlinable — no vtable). See the note above.
+#[allow(clippy::too_many_arguments)]
+pub fn deterministic_train_step_fn<F>(
+    net_seed: u64,
+    step: u64,
+    call_index: u64,
+    net: &mut Network,
+    optimizer: &mut dyn Optimizer,
+    loss_fn: F,
+    batch: &(Tensor, Tensor),
+    grad_clip: f32,
+) -> Result<f32>
+where
+    F: Fn(&Variable, &Variable) -> Result<Variable>,
+{
+    let _guard = rng_lock();
+    seed_step_randomness(net_seed, step, call_index);
+    train_one_step(net, optimizer, &loss_fn, batch, grad_clip)
+}
+
+/// Generic sibling of [`train_one_step`] — same contract, monomorphized
+/// loss. See the note above.
+pub fn train_one_step_fn<F>(
+    net: &mut Network,
+    optimizer: &mut dyn Optimizer,
+    loss_fn: F,
+    batch: &(Tensor, Tensor),
+    grad_clip: f32,
+) -> Result<f32>
+where
+    F: Fn(&Variable, &Variable) -> Result<Variable>,
+{
+    train_one_step(net, optimizer, &loss_fn, batch, grad_clip)
+}
+
+/// Generic sibling of [`eval_one_step`] — same contract, monomorphized
+/// loss. See the note above.
+pub fn eval_one_step_fn<F>(
+    net: &mut Network,
+    loss_fn: F,
+    fitness: &Fitness,
+    informative: &[Metric],
+    batch: &(Tensor, Tensor),
+) -> Result<EvalReport>
+where
+    F: Fn(&Variable, &Variable) -> Result<Variable>,
+{
+    eval_one_step(net, &loss_fn, fitness, informative, batch)
+}
+
 /// One train step: forward + loss + backward + optimizer step on a single
 /// batch. Returns the batch's training loss.
 pub fn train_one_step(

@@ -293,6 +293,8 @@ pub struct RlContext<'a> {
     pub net_seed: u64,
     /// The challenge SIGNAL (anti-plateau): true when the engine's seeded
     /// trigger fired for this (net, step) — `set_run_challenge_prob` > 0.
+    /// Never true for a frozen (act-and-measure) step or in the post-race
+    /// pruner's solo phase: the knob is a race device.
     /// The TRAINER decides what to do with it: branch to a forced/Exploration
     /// action inside `train_step` (replay-safe — the flag is a pure function
     /// of run/net/step, so catch-up re-derives it identically), or ignore it
@@ -363,7 +365,7 @@ pub trait StepTrainer: Send {
     /// second scorer object: `engine.guardrail()` is the whole call.
     ///
     /// How MANY games are played is the run's business, not the trainer's:
-    /// the config's `set_guardrail_matches` (default 16). The contract is
+    /// the config's `set_elite_guardrail_matches` (default 16). The contract is
     /// index-based (`game_i`), so any count works — seed the draw from
     /// `game_i` and the games stay independent.
     ///

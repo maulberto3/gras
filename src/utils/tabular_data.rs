@@ -83,6 +83,20 @@ impl Dataset {
             targets: transfer(&self.targets)?,
         })
     }
+
+    /// Row-concatenate two datasets into one (`train rows first, then
+    /// `other`'s`). Both must share feature and target dims (the caller —
+    /// [`resolve_train_test_datasets`] — already validated them) and sit on
+    /// the same device. Used by the engine's explicit train/test layout: the
+    /// combined dataset goes into the shared stream, and the stream's pools
+    /// are built BY CONSTRUCTION over the two row ranges instead of by a
+    /// random split of one pool (see `PoolSplit::explicit`).
+    pub fn concat(&self, other: &Dataset) -> Result<Dataset> {
+        Ok(Dataset {
+            inputs: Tensor::cat_many(&[&self.inputs, &other.inputs], 0)?,
+            targets: Tensor::cat_many(&[&self.targets, &other.targets], 0)?,
+        })
+    }
 }
 
 // ── the binary tensor format ─────────────────────────────────────────────
@@ -205,7 +219,11 @@ pub enum DataFormat {
 /// over [`save_dataset`] (`.bin`) and [`save_csv_dataset`] (`.csv`).
 /// With [`DataFormat::Both`] the directory ends up with `inputs.bin` +
 /// `targets.bin` + `inputs.csv` + `targets.csv`.
-pub fn save_dataset_as(dir: &Path, ds: &Dataset, format: DataFormat) -> Result<()> {
+pub fn save_dataset_as(dir: impl AsRef<Path>, ds: &Dataset, format: DataFormat) -> Result<()> {
+    // `impl AsRef<Path>` is an owned generic — normalize to `&Path` ONCE, up
+    // front, then reuse the borrow (a generic moved twice would be a compile
+    // error; this is also why `&str`/`&Path` wrappers around it are free).
+    let dir = dir.as_ref();
     match format {
         DataFormat::Bin => save_dataset(dir, ds),
         DataFormat::Csv => save_csv_dataset(dir, &ds.inputs, &ds.targets),
@@ -221,7 +239,8 @@ pub fn save_dataset_as(dir: &Path, ds: &Dataset, format: DataFormat) -> Result<(
 /// `inputs.csv`; errors if the directory holds neither. Unlike
 /// [`resolve_dataset`] it does no CSV→bin caching — pure "read what's
 /// there".
-pub fn load_dataset_auto(dir: &Path) -> Result<Dataset> {
+pub fn load_dataset_auto(dir: impl AsRef<Path>) -> Result<Dataset> {
+    let dir = dir.as_ref();
     if dir.join("inputs.bin").exists() {
         return load_dataset(dir);
     }
@@ -240,7 +259,8 @@ pub fn load_dataset_auto(dir: &Path) -> Result<Dataset> {
 
 /// Save a dataset into `dir` as `inputs.bin` + `targets.bin`, plus a
 /// human-readable `meta.json` with the tensor shapes (informational only).
-pub fn save_dataset(dir: &Path, ds: &Dataset) -> Result<()> {
+pub fn save_dataset(dir: impl AsRef<Path>, ds: &Dataset) -> Result<()> {
+    let dir = dir.as_ref();
     fs::create_dir_all(dir).map_err(|source| DataError::Io {
         path: dir.display().to_string(),
         source,
@@ -261,7 +281,15 @@ pub fn save_dataset(dir: &Path, ds: &Dataset) -> Result<()> {
 }
 
 /// Load a dataset written by [`save_dataset`].
-pub fn load_dataset(dir: &Path) -> Result<Dataset> {
+///
+/// EFFICIENCY NOTE (Tier 1 — `impl AsRef<Path>`): a `&Path` parameter forces
+/// callers with a `String`/`&str`/`PathBuf` to build a `Path` first
+/// (`Path::new(HOLDOUT_DIR)`). `impl AsRef<Path>` accepts ALL of them — the
+/// generic monomorphizes to a cheap `.as_ref()` at compile time (zero
+/// runtime cost, since `AsRef<Path> for &Path` is a no-op) — so the loader
+/// is callable as `load_dataset("data/mnist")` directly.
+pub fn load_dataset(dir: impl AsRef<Path>) -> Result<Dataset> {
+    let dir = dir.as_ref();
     let inputs = load_tensor(&dir.join("inputs.bin"))?;
     let targets = load_tensor(&dir.join("targets.bin"))?;
     Ok(Dataset { inputs, targets })
@@ -280,7 +308,7 @@ pub fn load_dataset(dir: &Path) -> Result<Dataset> {
 ///
 /// Errors loudly if the directory holds no recognizable dataset — there is
 /// deliberately NO synthetic fallback: silent made-up data corrupts runs.
-pub fn resolve_dataset(dir: &Path) -> Result<Dataset> {
+pub fn resolve_dataset(dir: impl AsRef<Path>) -> Result<Dataset> {
     resolve_inputs_targets_datasets(dir)
 }
 
@@ -291,7 +319,8 @@ pub fn resolve_dataset(dir: &Path) -> Result<Dataset> {
 /// internally into train/eval/gating (90/10-style seeded split).
 ///
 /// Errors loudly if nothing recognizable is present — no synthetic fallback.
-pub fn resolve_inputs_targets_datasets(dir: &Path) -> Result<Dataset> {
+pub fn resolve_inputs_targets_datasets(dir: impl AsRef<Path>) -> Result<Dataset> {
+    let dir = dir.as_ref();
     let cache_dir = dir.join("flodl_data");
 
     // Priority 1: cached .bin
@@ -337,7 +366,8 @@ pub fn resolve_inputs_targets_datasets(dir: &Path) -> Result<Dataset> {
 ///
 /// Errors loudly if either split is missing or unreadable — no synthetic
 /// fallback, a half-present dataset must stop the run before it starts.
-pub fn resolve_train_test_datasets(dir: &Path) -> Result<(Dataset, Dataset)> {
+pub fn resolve_train_test_datasets(dir: impl AsRef<Path>) -> Result<(Dataset, Dataset)> {
+    let dir = dir.as_ref();
     let train_dir = dir.join("train");
     let test_dir = dir.join("test");
     for sub in [&train_dir, &test_dir] {
@@ -385,7 +415,8 @@ pub fn resolve_train_test_datasets(dir: &Path) -> Result<(Dataset, Dataset)> {
 /// Headers are auto-detected (skipped if first row contains non-numeric values).
 /// Lines starting with `#` are treated as comments and skipped.
 /// All data rows must have the same number of columns.
-pub fn load_csv_dataset(dir: &Path) -> Result<Dataset> {
+pub fn load_csv_dataset(dir: impl AsRef<Path>) -> Result<Dataset> {
+    let dir = dir.as_ref();
     let inputs_path = dir.join("inputs.csv");
     let targets_path = dir.join("targets.csv");
 
@@ -522,7 +553,8 @@ pub fn load_csv_dataset(dir: &Path) -> Result<Dataset> {
 /// Save tensors as CSV files (`inputs.csv` + `targets.csv`).
 ///
 /// Each row is one sample, values comma-separated.
-pub fn save_csv_dataset(dir: &Path, inputs: &Tensor, targets: &Tensor) -> Result<()> {
+pub fn save_csv_dataset(dir: impl AsRef<Path>, inputs: &Tensor, targets: &Tensor) -> Result<()> {
+    let dir = dir.as_ref();
     fs::create_dir_all(dir).map_err(|source| DataError::Io {
         path: dir.display().to_string(),
         source,

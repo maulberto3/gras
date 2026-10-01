@@ -133,8 +133,14 @@ pub struct ConfigSnapshot {
     /// so a resumed run must roll the same probability.
     #[serde(default)]
     pub challenge_prob: f32,
+    /// Decay shape of the challenge knob (`set_run_challenge_decay`):
+    /// `eff = prob × (1 − progress)^k`. Replay-relevant — the trigger
+    /// re-derives its probability from the shape, so a resumed run must use
+    /// the same one (resume-guarded alongside `challenge_prob`).
+    #[serde(default)]
+    pub challenge_decay: crate::engine::config::ChallengeDecay,
     /// Fresh holdout games the post-race guardrail plays
-    /// (`set_guardrail_matches`). Diagnostic — it describes the verdict's
+    /// (`set_elite_guardrail_matches`). Diagnostic — it describes the verdict's
     /// sample size, not replay semantics, so a change needs no resume guard.
     #[serde(default = "default_guardrail_matches")]
     pub guardrail_matches: usize,
@@ -192,6 +198,7 @@ impl ConfigSnapshot {
             elite_checkpoint_weights: cfg.elite_checkpoint_weights,
             mutation_probation_steps: cfg.mutation_probation_steps,
             challenge_prob: cfg.challenge_prob,
+            challenge_decay: cfg.challenge_decay,
             guardrail_matches: cfg.guardrail_matches,
             build: crate::engine::format::build_stamp(),
         }
@@ -263,6 +270,13 @@ pub struct RunHeader {
     /// distinct child seeds). Restored on resume; empty on legacy files.
     #[serde(default)]
     pub children_born_at_clock: std::collections::HashMap<usize, usize>,
+    /// Data layout the run was built on: `None` = single-pool seeded split
+    /// (default), `Some(n)` = explicit `{train, test}` two-dataset layout
+    /// where `n` test rows were concatenated AFTER the train rows — the
+    /// stream's eval/gating pools live entirely in `[len-n..len)`. Recorded
+    /// so resume rebuilds the SAME pools without re-detecting the layout.
+    #[serde(default)]
+    pub explicit_test_rows: Option<usize>,
     /// The run's complete configuration (see [`ConfigSnapshot`]). This is the
     /// authoritative settings record — `engine.json` alone reproduces a run.
     #[serde(default)]
@@ -297,6 +311,8 @@ pub struct RunConfig {
     pub max_steps: Option<usize>,
     pub train_eval_split_ratio: Option<f32>,
     pub held_out_eval_rows: Option<usize>,
+    /// See [`RunHeader::explicit_test_rows`].
+    pub explicit_test_rows: Option<usize>,
     pub culls: usize,
     pub run_elapsed_secs: u64,
     pub children_born_at_clock: std::collections::HashMap<usize, usize>,
@@ -327,6 +343,7 @@ impl RunHeader {
             max_steps,
             train_eval_split_ratio,
             held_out_eval_rows,
+            explicit_test_rows,
             culls,
             run_elapsed_secs,
             children_born_at_clock,
@@ -355,6 +372,7 @@ impl RunHeader {
             started_at: None,
             train_eval_split_ratio,
             held_out_eval_rows,
+            explicit_test_rows,
             culls,
             run_elapsed_secs,
             children_born_at_clock,
@@ -451,6 +469,10 @@ impl RunHeader {
             .get("held_out_eval_rows")
             .and_then(|f| f.as_u64())
             .map(|n| n as usize);
+        let explicit_test_rows = v
+            .get("explicit_test_rows")
+            .and_then(|f| f.as_u64())
+            .map(|n| n as usize);
         // Counter persistence (written at stop; legacy files read as fresh).
         let culls = v.get("culls").and_then(|f| f.as_u64()).unwrap_or(0) as usize;
         let run_elapsed_secs = v
@@ -516,6 +538,7 @@ impl RunHeader {
             started_at,
             train_eval_split_ratio,
             held_out_eval_rows,
+            explicit_test_rows,
             culls,
             run_elapsed_secs,
             children_born_at_clock,
@@ -1052,6 +1075,7 @@ mod tests {
 
     fn baseline_header(run_id: &str) -> RunHeader {
         RunHeader::from_race_options(RunConfig {
+            explicit_test_rows: None,
             run_id: run_id.to_string(),
             engine_mode: Some("tabular".into()),
             run_seed: 42,

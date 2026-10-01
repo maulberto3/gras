@@ -92,6 +92,49 @@ impl PoolSplit {
     pub fn of(dataset: &Dataset, train_eval_split_ratio: f32, seed: u64) -> Self {
         Self::new(dataset.len(), train_eval_split_ratio, seed)
     }
+
+    /// Split from an EXPLICIT train/test layout — the engine's
+    /// `{train, test}` two-dataset mode (`resolve_train_test_datasets`).
+    ///
+    /// The combined dataset is `train rows [0..train_len)` followed by
+    /// `test rows [train_len..total)`. Instead of shuffling one pool, the
+    /// pools are built BY CONSTRUCTION:
+    /// - `train` = ALL train-dataset rows (the engine trains on exactly
+    ///   what the user's train/ directory holds — no silent reshuffle),
+    /// - `eval` + `gating` = a seeded split of ALL test-dataset rows,
+    ///   same 50/50 division of the held-out side as [`PoolSplit::new`].
+    ///
+    /// Row DISJOINTNESS between train and eval is now guaranteed by the
+    /// directory layout (the test rows were never in the training pool at
+    /// all), not by the shuffle — and the replay contract is untouched:
+    /// the pools are still a pure function of `(train_len, test_len,
+    /// run_seed)`, both of which the run header records.
+    pub fn explicit(train_len: usize, test_len: usize, seed: u64) -> Self {
+        assert!(test_len > 0, "explicit split needs a non-empty test pool");
+        let train: Vec<i64> = (0..train_len as i64).collect();
+        let test_rows: Vec<i64> = (train_len as i64..(train_len + test_len) as i64).collect();
+        // Seeded shuffle of the TEST rows only, then the same half/half
+        // division `PoolSplit::new` uses: half per-step eval pool, half
+        // checkpoint surprise-exam pool.
+        let mut rest = test_rows;
+        let mut rng = fastrand::Rng::with_seed(seed);
+        for i in (1..rest.len()).rev() {
+            let j = rng.usize(0..=i);
+            rest.swap(i, j);
+        }
+        let half = rest.len() / 2;
+        let (eval, gating) = if half == 0 {
+            // Degenerate: a single test row doubles as eval + gating.
+            (rest.clone(), rest.clone())
+        } else {
+            (rest[..half].to_vec(), rest[half..].to_vec())
+        };
+        PoolSplit {
+            train,
+            eval,
+            gating,
+        }
+    }
 }
 
 // ── BatchStream ─────────────────────────────────────────────────────────────
@@ -183,6 +226,14 @@ impl BatchStream {
     /// Rows per best-net held-out reading.
     pub fn held_out_eval_rows(&self) -> usize {
         self.held_out_eval_rows
+    }
+
+    /// The three pool index vectors this stream draws from (train, eval,
+    /// gating) — row indices into the run's (combined) dataset. Read-only
+    /// view for tests and tooling; the stream never mutates them after
+    /// construction.
+    pub fn pools(&self) -> (&[i64], &[i64], &[i64]) {
+        (&self.train_pool, &self.eval_pool, &self.gating_pool)
     }
 
     /// Gather `indices` into one `(inputs, targets)` batch tensor pair.
@@ -332,6 +383,41 @@ mod tests {
         assert_eq!(a.train, b.train);
         assert_eq!(a.eval, b.eval);
         assert_ne!(a.train, c.train, "different seed ⇒ different split");
+    }
+
+    #[test]
+    fn explicit_split_separates_layouts_by_construction() {
+        let split = PoolSplit::explicit(80, 20, 42);
+        // Train pool = EXACTLY the train rows, in order, unshuffled.
+        assert_eq!(
+            split.train,
+            (0..80).collect::<Vec<i64>>(),
+            "every train row is a training row"
+        );
+        // Eval + gating = EXACTLY the test rows — disjoint from train by
+        // construction, covering all of them.
+        let mut held: Vec<i64> = split.eval.clone();
+        held.extend(split.gating.clone());
+        held.sort();
+        assert_eq!(held, (80..100).collect::<Vec<i64>>());
+        // Seeded: same (train_len, test_len, seed) ⇒ same split; a different
+        // seed re-shuffles the test side only.
+        let again = PoolSplit::explicit(80, 20, 42);
+        assert_eq!(split.eval, again.eval);
+        assert_eq!(split.gating, again.gating);
+        let other = PoolSplit::explicit(80, 20, 43);
+        assert_ne!(split.eval, other.eval, "seed re-shuffles the test pool");
+        // The shuffled side still covers exactly the test rows.
+        let mut other_held: Vec<i64> = other.eval.clone();
+        other_held.extend(other.gating.clone());
+        other_held.sort();
+        assert_eq!(other_held, (80..100).collect::<Vec<i64>>());
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty test pool")]
+    fn explicit_split_rejects_empty_test_pool() {
+        let _ = PoolSplit::explicit(80, 0, 42);
     }
 
     #[test]

@@ -527,6 +527,15 @@ impl Network {
         }
     }
 
+    /// Step 5b: Apply the node's elementwise feature transform
+    /// ([`Transform`], or identity when unset).
+    fn transform(&self, node_id: usize, x: Variable) -> flodl::tensor::Result<Variable> {
+        match self.nodes[node_id].transform {
+            Some(t) => t.apply(&x),
+            None => Ok(x),
+        }
+    }
+
     /// Step 6: Apply dropout (hidden nodes only, training mode only).
     ///
     /// Applied to the node's SHARED base tensor in `forward`, before the
@@ -819,11 +828,12 @@ impl Module for Network {
                 let gathered = self.gather_inputs(&port_outputs, node_id)?;
                 let combined = self.combine_inputs(gathered, &port_outputs, node_id)?;
                 let transformed = self.layers[node_id].forward(&combined)?;
-                // Standardize + dropout BEFORE the port split, so every port
-                // of the node sees the same shared tensor, and the dropout
-                // mask draw count stays one-per-node (replay-safe).
+                // Standardize + transform + dropout BEFORE the port split, so
+                // every port of the node sees the same shared tensor, and the
+                // dropout mask draw count stays one-per-node (replay-safe).
                 let standardized = self.standardize(node_id, transformed)?;
-                self.apply_dropout(node_id, standardized)?
+                let transformed = self.transform(node_id, standardized)?;
+                self.apply_dropout(node_id, transformed)?
             };
 
             // Per-port activation: port i applies its own non-linearity to

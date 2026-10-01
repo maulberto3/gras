@@ -108,6 +108,21 @@ impl Display for crate::graph::node::StandardizeOp {
             crate::graph::node::StandardizeOp::LayerNorm => "layernorm",
             crate::graph::node::StandardizeOp::RmsNorm => "rmsnorm",
             crate::graph::node::StandardizeOp::InstanceNorm => "instancenorm",
+            crate::graph::node::StandardizeOp::GroupNorm => "groupnorm",
+        };
+        write!(f, "{name}")
+    }
+}
+
+impl Display for crate::graph::node::Transform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            crate::graph::node::Transform::Log1p => "log1p",
+            crate::graph::node::Transform::Sqrt => "sqrt",
+            crate::graph::node::Transform::Clamp => "clamp",
+            crate::graph::node::Transform::Sign => "sign",
+            crate::graph::node::Transform::Reciprocal => "reciprocal",
+            crate::graph::node::Transform::Exp => "exp",
         };
         write!(f, "{name}")
     }
@@ -181,6 +196,9 @@ impl Display for MutationMethod {
             }
             MutationMethod::Standardize { prob } => {
                 write!(f, "mut_standardize(p={:.0}%)", prob * 100.0)
+            }
+            MutationMethod::Transform { prob } => {
+                write!(f, "mut_transform(p={:.0}%)", prob * 100.0)
             }
             MutationMethod::PortActivation { prob } => {
                 write!(f, "mut_port_activation(p={:.0}%)", prob * 100.0)

@@ -76,8 +76,8 @@ pub use utils::score::{
 
 // ── step primitives ──────────────────────────────────────────────────
 pub use utils::race_steps::{
-    deterministic_train_step, eval_one_step, seed_step_randomness, train_one_step,
-    train_one_step_pred_only,
+    deterministic_train_step, deterministic_train_step_fn, eval_one_step, eval_one_step_fn,
+    seed_step_randomness, train_one_step, train_one_step_fn, train_one_step_pred_only,
 };
 
 // ── flodl — the tensor backend ───────────────────────────────────────
