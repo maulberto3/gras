@@ -427,7 +427,7 @@ impl RlStep for CartPoleTrainer {
 // shared (Tabular-arm) builder and RL-only setters would panic at build.
 const POP: usize = 100;
 const RACE_STEPS: usize = 20;
-const CHALLENGE_PROB: f32 = 0.25;
+const CHALLENGE_PROB: f32 = 0.05; // softmax already does some exploration
 const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 const MATCHES_PER_STEP: usize = 2;
 const EVAL_MATCHES_PER_STEP: usize = 2;
@@ -547,7 +547,7 @@ fn main() {
         .set_elite_count(pop / 10)
         .set_elite_save_topology(true)
         .set_elite_save_safetensors(false)
-        .set_elite_checkpoint_weights(true)
+        .set_elite_checkpoint_weights(false)
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(false)
         .set_pruner_enabled(false)

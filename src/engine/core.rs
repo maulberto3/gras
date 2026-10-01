@@ -1317,7 +1317,7 @@ impl CoreEngine {
                     // two numbers are never mistaken for each other.
                     let bar_txt = match self.current_gate_bar(clock) {
                         Some(bar) => format!(
-                            "gate bar({}) {} {:.4} │ ",
+                            "gate bar({}) {} avg{:.4} │ ",
                             match self.config.crossover_gate {
                                 crate::engine::config::CrossoverGate::Hard => "hard",
                                 crate::engine::config::CrossoverGate::Soft => "soft",
@@ -1346,8 +1346,11 @@ impl CoreEngine {
                     } else {
                         String::new()
                     };
+                    // `smt` tag: the population mean is a mean of SMOOTHED
+                    // per-net fitnesses (a historical aggregate for the gate
+                    // bar) — tagged so it is never misread as a raw step value.
                     info!(
-                        "step {} │ checkpoint │ pop_mean_fitness {} {:.4} │ {}exam_mean_fitness {} (ledger: {} entries){}",
+                        "step {} │ checkpoint │ pop_mean_fitness {} smt{:.4} │ {}exam_mean_fitness {} (ledger: {} entries){}",
                         clock,
                         arrow,
                         mean,

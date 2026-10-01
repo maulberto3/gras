@@ -75,6 +75,27 @@ pub(crate) fn fmt_opt2(v: &Option<f32>) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
+/// Value-unit tags — every fitness number on a log line names its KIND, so a
+/// smoothed mean is never misread as a raw last-step value (or vice versa).
+/// Three kinds appear on engine lines:
+/// - `smt` — smoothed (rolling mean of the recent raw steps); what ranking,
+///   freeze/dethrone and the gates DECIDE on.
+/// - `avg` — average of checkpoint means (gate bars, population ledger
+///   rollups); a historical aggregate, not this step's signal.
+/// - bare — raw last-step value (a single measurement, no tag).
+/// `fmt2_*` pairs each tag with the 2-decimal console rounding of `fmt2`.
+pub(crate) fn fmt2_smt(v: f32) -> String {
+    format!("smt{:.2}", v)
+}
+
+pub(crate) fn fmt2_avg(v: f32) -> String {
+    format!("avg{:.2}", v)
+}
+
+pub(crate) fn fmt2_raw(v: f32) -> String {
+    format!("raw{:.2}", v)
+}
+
 /// RFC4180-quote a CSV field when it holds a delimiter, quote, or newline.
 /// Lineage strings (`crossover:parents=h1,h2`) contain commas, so this is not
 /// optional — an unquoted lineage would shift every later column.

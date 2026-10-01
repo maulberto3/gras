@@ -294,15 +294,25 @@ impl CoreEngine {
             self.rolling_fitness.remove(&child.state.hash);
             self.rolling_train.remove(&child.state.hash);
             self.rolling_eval.remove(&child.state.hash);
+            // k/N uses the SAME convention as the success line: Soft has ONE
+            // aggregate bar (the mean of the window's checkpoint means), so a
+            // soft rejection reads `1/1` — the 5 checkpoints that FORMED the
+            // bar are named separately by `(window 5)`. Hard is gate-by-gate,
+            // so its k/N is the real per-bar count (`3/5` = failed on the 3rd
+            // of 5). (Previously the rejection line printed
+            // `checkpoint_count` for Soft — `rejected by soft gate 5/5` —
+            // contradicting the success line's `gate soft 1/1 bars`.)
+            let (k, n) = match self.config.crossover_gate {
+                crate::engine::config::CrossoverGate::Hard => (gate_i, checkpoint_count),
+                crate::engine::config::CrossoverGate::Soft => (1, 1),
+            };
             return Ok(RollOutcome::spent(format!(
-                "child {} rejected by {} gate {}/{} ({}{:.4} vs bar {:.4}) → discarded at step {}",
+                "child {} rejected by {} gate {k}/{n} ({}{:.4} vs bar avg{:.4}, window {checkpoint_count}) → discarded at step {}",
                 &child.state.hash[..8.min(child.state.hash.len())],
                 match self.config.crossover_gate {
                     crate::engine::config::CrossoverGate::Hard => "hard",
                     crate::engine::config::CrossoverGate::Soft => "soft",
                 },
-                gate_i,
-                checkpoint_count,
                 self.fitness.direction().arrow(),
                 child_fit,
                 bar,
@@ -390,8 +400,12 @@ impl CoreEngine {
                 crate::engine::config::CrossoverGate::Hard => checkpoint_count,
                 crate::engine::config::CrossoverGate::Soft => 1,
             };
+            // The bar's value is TAGGED `avg` (mean of checkpoint means for
+            // Soft, the newest recorded mean for Hard — both historical
+            // aggregates); the child's figure is its post-catch-up smoothed
+            // fitness, tagged `smt`. Same units on both sides of the `vs`.
             format!(
-                " | gate {} {bars}/{bars} bars: {:.4} vs {:.4}{}",
+                " | gate {} {bars}/{bars} bars: smt{:.4} vs avg{:.4}{}",
                 gate_name,
                 child_fit_at_gate,
                 bar,

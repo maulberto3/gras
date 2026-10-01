@@ -22,7 +22,7 @@ use flodl::tensor::Result;
 use tracing::info;
 
 use super::core::{CoreEngine, NoopOptimizer};
-use super::format::{fmt_opt2, fmt2};
+use super::format::{fmt_opt2, fmt2, fmt2_raw, fmt2_smt};
 use crate::state::NetMetrics;
 #[cfg(debug_assertions)]
 use crate::utils::race_steps::eval_one_step;
@@ -49,9 +49,16 @@ impl CoreEngine {
         // act-and-measure and the post-race workout would train nothing
         // (plus every crown flip would fire the dethrone optimizer reset,
         // repeatedly erasing the survivor's momentum).
+        // EFFICIENCY NOTE (Tier 1 — one ranking per net, not four): the
+        // elite set is a full O(n log n) sort of the population, and this
+        // runs once per NET per step — computing it inline in each check
+        // below would make the step O(n² log n) and allocate a String per
+        // `contains`. Compute once, borrow for all four uses (freeze check,
+        // seat count, seat position, taker pick).
+        let elite_set = self.elite_hashes();
         let frozen = !self.pruner_solo_active
             && self.config.freeze_elites
-            && self.elite_hashes().contains(&hash.to_string());
+            && elite_set.iter().any(|e| e == hash);
         if frozen && !self.frozen_crown.contains(hash) {
             // Crown transition: this net newly joined the frozen set (first
             // crowning or a child trained past a frozen elite). One info
@@ -61,9 +68,8 @@ impl CoreEngine {
                 .state
                 .net(hash)
                 .and_then(|s| s.last_metrics.as_ref().map(|m| m.fitness));
-            let seat = self.elite_hashes().len();
-            let pos = self
-                .elite_hashes()
+            let seat = elite_set.len();
+            let pos = elite_set
                 .iter()
                 .position(|h| h == hash)
                 .map(|p| p + 1)
@@ -87,13 +93,16 @@ impl CoreEngine {
             );
             if seat == 1 {
                 // Single-elite wording (the common case): crown moves as one.
+                // Fitness figures are TAGGED (fmt2_smt/raw): smoothed means
+                // rank, raw last-step numbers display — never print one where
+                // the reader expects the other (see format.rs).
                 if self.frozen_crown.is_empty() {
                     info!(
                         "step {} │ freeze │ champion {} crowned (fitness{} {}{}) — w paused (a+m continues)",
                         clock,
                         &hash[..8.min(hash.len())],
                         self.fitness.direction().arrow(),
-                        fitness.map(fmt2).unwrap_or_else(|| "—".into()),
+                        fitness.map(fmt2_raw).unwrap_or_else(|| "—".into()),
                         extras,
                     );
                 } else {
@@ -104,7 +113,7 @@ impl CoreEngine {
                         &prev[..8.min(prev.len())],
                         &hash[..8.min(hash.len())],
                         self.fitness.direction().arrow(),
-                        fitness.map(fmt2).unwrap_or_else(|| "—".into()),
+                        fitness.map(fmt2_raw).unwrap_or_else(|| "—".into()),
                         extras,
                     );
                 }
@@ -117,7 +126,7 @@ impl CoreEngine {
                     clock,
                     &hash[..8.min(hash.len())],
                     self.fitness.direction().arrow(),
-                    fitness.map(fmt2).unwrap_or_else(|| "—".into()),
+                    fitness.map(fmt2_raw).unwrap_or_else(|| "—".into()),
                     extras,
                 );
             }
@@ -148,21 +157,18 @@ impl CoreEngine {
                     self.rank_position(hash).map(|r| r.to_string())
                 };
                 // Say WHO is elite now (first surviving elite) plus BOTH
-                // fitnesses: the dethroned net's own last smoothed value (the
-                // freeze line showed the same figure) and the taker's — the
-                // gap `out → in` shows what the exchange cost/won.
-                let taker = self
-                    .elite_hashes()
-                    .into_iter()
-                    .find(|h| h != hash)
+                // fitnesses — both SMOOTHED, so the gap is a fair comparison:
+                // the dethroned net's last smoothed value (what the ranking
+                // saw) vs the taker's smoothed value. (Previously this printed
+                // loser-RAW vs taker-smoothed — an apples-to-oranges gap.)
+                let taker = elite_set
+                    .iter()
+                    .find(|h| *h != hash)
+                    .cloned()
                     .unwrap_or_default();
-                // Mirror the freeze line's fitness figure so the dethrone
-                // event is comparable at a glance (the net is still in
-                // state at this point, so its last measured value is here).
-                let fit = self
-                    .state
-                    .net(hash)
-                    .and_then(|s| s.last_metrics.as_ref().map(|m| m.fitness));
+                // The loser's smoothed value (its last_metrics figure is the
+                // RAW step; ranking read the rolling mean).
+                let fit = self.smoothed_fitness_of(hash);
                 let taker_fit = if taker.is_empty() {
                     None
                 } else {
@@ -176,12 +182,16 @@ impl CoreEngine {
                     (Some(a), Some(b)) => format!(
                         ", fitness {} {} → {} {}",
                         self.fitness.direction().arrow(),
-                        fmt2(a),
+                        fmt2_smt(a),
                         self.fitness.direction().arrow(),
-                        fmt2(b)
+                        fmt2_smt(b)
                     ),
                     (Some(a), None) => {
-                        format!(", fitness{} {}", self.fitness.direction().arrow(), fmt2(a))
+                        format!(
+                            ", fitness{} {}",
+                            self.fitness.direction().arrow(),
+                            fmt2_smt(a)
+                        )
                     }
                     _ => String::new(),
                 };

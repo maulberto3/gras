@@ -198,8 +198,11 @@ impl CoreEngine {
                     self.step_rl.label(self.effective_challenge_prob(clock)),
                 )
             },
+            // `smt` tag: this rollup cell is the population MEAN of smoothed
+            // per-net fitness — tagged so the rollup and the per-net raw
+            // values on other lines are never confused.
             format!(
-                "fitness{} {:.2}{} │ culls {} │ inserts {}",
+                "fitness{} smt{:.2}{} │ culls {} │ inserts {}",
                 self.fitness.direction().arrow(),
                 fit_m,
                 delta(fit_m, Some(pf)),
@@ -401,8 +404,10 @@ impl CoreEngine {
             let eval_label = eval_loss
                 .map(|v| format!("{v:.6}"))
                 .unwrap_or_else(|| "—".to_string());
+            // `smt` tag: the ranked figure is the smoothed fitness (ranking
+            // decided on it); the ± note is the spread of RAW steps behind it.
             info!(
-                "  #{} {} fitness{arrow} {:.4}{} │ eval_loss {} │ {} │ {}",
+                "  #{} {} fitness{arrow} smt{:.4}{} │ eval_loss {} │ {} │ {}",
                 rank + 1,
                 &h[..8.min(h.len())],
                 fit,
