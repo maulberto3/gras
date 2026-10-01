@@ -117,6 +117,30 @@ mod tests {
         assert_eq!(draws.len(), 2, "draw must hit both actions over 16 steps");
     }
 
+    /// The informative metric is scored by the TRAINER (RL has no
+    /// (pred, target) batch): the closure sees the eval survivals as a 1-D
+    /// tensor, and no configured metrics means no extra columns.
+    #[test]
+    fn trainer_scores_informative_metrics() -> gras::flodl::tensor::Result<()> {
+        let trainer = CartPoleTrainer {
+            device: gras::auto_device(),
+            matches_per_step: 1,
+            eval_matches_per_step: 1,
+        };
+        let metrics = vec![Metric::custom("mean", |survivals, _| {
+            let v = survivals.data().to_f32_vec()?;
+            Ok(if v.is_empty() {
+                0.0
+            } else {
+                v.iter().sum::<f32>() / v.len() as f32
+            })
+        })];
+        assert_eq!(trainer.score_metrics(&metrics, &[10, 20, 30])?, vec![20.0]);
+        assert_eq!(trainer.score_metrics(&metrics, &[])?, vec![0.0]);
+        assert!(trainer.score_metrics(&[], &[10])?.is_empty());
+        Ok(())
+    }
+
     /// The REINFORCE loss is a finite scalar and actually changes weights
     /// (gradients flow) — the core learning loop works.
     #[test]

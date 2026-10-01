@@ -28,7 +28,14 @@ use gras::utils::{score, tabular_data};
 
 /// Any gras-format dataset works — dims are auto-peeked. Real MNIST lives
 /// here after `cargo run --example mnist_data`.
-const DATA_DIR: &str = "data/mnist/train";
+///
+/// EXPLICIT TRAIN/TEST LAYOUT: point the engine at the PARENT dir
+/// (`data/mnist`) and it resolves `train/` + `test/` through
+/// `resolve_train_test_datasets` — the race trains ONLY on train rows and
+/// evals ONLY on test rows, by construction. A single-pool dataset dir
+/// (no train/test subdirs) still works: the engine falls back to its
+/// seeded internal split.
+const DATA_DIR: &str = "data/mnist";
 /// The GUARDRAIL's held-out split. Real MNIST's own test set — rows no race
 /// batch ever trains on. Never point this at `DATA_DIR`.
 const HOLDOUT_DIR: &str = "data/mnist/test";
@@ -60,7 +67,7 @@ struct MnistTrainer {
     /// scales challenge jitter.
     last_accuracy: f32,
     /// `(test set, deterministic stream over it)` — the guardrail half. How
-    /// many draws it makes is the RUN's knob (`set_guardrail_matches`),
+    /// many draws it makes is the RUN's knob (`set_elite_guardrail_matches`),
     /// not this trainer's.
     holdout: Option<(tabular_data::Dataset, BatchStream)>,
 }
@@ -262,27 +269,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| PathBuf::from(DATA_DIR));
     let data_dir: &Path = &data_dir_arg;
-    if !data_dir.exists() {
+    // The engine accepts BOTH layouts at this path: a parent dir holding
+    // `train/` + `test/` (real MNIST after mnist_data) — the explicit
+    // two-dataset mode — or a single-pool dataset dir (synthetic fallback
+    // below) — the classic seeded split.
+    let explicit_layout = data_dir.join("train").exists() && data_dir.join("test").exists();
+    if !explicit_layout && !data_dir.exists() {
         println!(
-            "  {} not found — generating synthetic data",
+            "  {} not found — generating synthetic single-pool data",
             data_dir.display()
         );
     }
-    if !data_dir.exists() {
+    if !explicit_layout && !data_dir.exists() {
         let ds =
             tabular_data::synthetic_classification(1024, 784, 10, 42, gras::auto_device()).unwrap();
         tabular_data::save_dataset(data_dir, &ds).unwrap();
     }
-    let peeked = tabular_data::resolve_dataset(data_dir).unwrap();
+    // Dims peek: train side of the explicit layout, or the single pool.
+    let peeked = if explicit_layout {
+        let (train, _test) = tabular_data::resolve_train_test_datasets(data_dir).unwrap();
+        train
+    } else {
+        tabular_data::resolve_dataset(data_dir).unwrap()
+    };
     let d_in = peeked.inputs.shape()[1] as usize;
     let d_out = peeked.targets.shape()[1] as usize;
     drop(peeked);
+    if explicit_layout {
+        println!(
+            "  explicit train/test layout at {} — eval rows come ONLY from test/ (no train/eval overlap by construction)",
+            data_dir.display()
+        );
+    }
 
     // The guardrail's held-out rows. Real MNIST test split when present;
     // otherwise synthetic noise — which is random-labeled, so a chance-level
     // verdict is the only honest outcome (and is warned about below).
-    let holdout = if Path::new(HOLDOUT_DIR).exists() {
-        tabular_data::resolve_dataset(Path::new(HOLDOUT_DIR)).unwrap()
+    // EFFICIENCY NOTE (Tier 1 — `impl AsRef<Path>`): the loaders take
+    // `impl AsRef<Path>`, so the `&str` const passes directly — no
+    // `Path::new(...)` wrapper needed at any call site.
+    let holdout_exists = Path::new(HOLDOUT_DIR).exists();
+    let holdout = if holdout_exists {
+        tabular_data::resolve_dataset(HOLDOUT_DIR).unwrap()
     } else {
         tabular_data::synthetic_classification(
             HOLDOUT_ROWS * HOLDOUT_MATCHES,
@@ -293,7 +321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .unwrap()
     };
-    if !Path::new(HOLDOUT_DIR).exists() {
+    if !holdout_exists {
         println!(
             "  ⚠ no {} — the guardrail will score SYNTHETIC random labels (chance by construction)",
             HOLDOUT_DIR
@@ -350,7 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_pruner_method(gras::engine::config::PopPrunerMethod::Hard)
         .set_pruner_steps(PRUNER_STEPS)
         // --- Guardrail (post-race honesty check) ---
-        .set_guardrail_matches(HOLDOUT_MATCHES) // fresh holdout draws behind the champion verdict
+        .set_elite_guardrail_matches(HOLDOUT_MATCHES) // fresh holdout draws behind the champion verdict
         // --- Topology & network search boundaries ---
         .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(15)

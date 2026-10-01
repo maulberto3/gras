@@ -234,6 +234,25 @@ impl CartPoleTrainer {
             GRAD_CLIP,
         )
     }
+
+    /// Score the run's informative metrics on this step's eval survivals.
+    /// RL has no `(pred, target)` batch for the engine to score against, so
+    /// the TRAINER owns the call: the engine only names the history.csv
+    /// column (`set_run_metrics`), exactly like the tabular side where
+    /// `eval_one_step` does this in the trainer.
+    fn score_metrics(
+        &self,
+        metrics: &[Metric],
+        survivals: &[usize],
+    ) -> gras::flodl::tensor::Result<Vec<f32>> {
+        if metrics.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vals: Vec<f32> = survivals.iter().map(|s| *s as f32).collect();
+        let t = Tensor::from_f32(&vals, &[vals.len() as i64], self.device)?;
+        let (pred, target) = (Variable::new(t.clone(), false), Variable::new(t, false));
+        metrics.iter().map(|m| m.score(&pred, &target)).collect()
+    }
 }
 
 impl StepTrainer for CartPoleTrainer {
@@ -311,7 +330,7 @@ impl RlStep for CartPoleTrainer {
             return Ok(RlStepReport {
                 train_loss: 0.0,
                 fitness: 0.0,
-                informative: Vec::new(),
+                informative: self.score_metrics(ctx.metrics, &[])?,
                 challenged_turns: 0,
                 rl: Some(RlStepMeta {
                     matches: self.matches_per_step,
@@ -345,7 +364,7 @@ impl RlStep for CartPoleTrainer {
         Ok(RlStepReport {
             train_loss,
             fitness: fitness_from_survivals(&eval_survivals),
-            informative: Vec::new(),
+            informative: self.score_metrics(ctx.metrics, &eval_survivals)?,
             challenged_turns: if forced.is_some() {
                 survivals.iter().sum()
             } else {
@@ -427,6 +446,22 @@ fn main() {
         .set_run_checkpoint_every(2)
         .set_run_challenge_prob(CHALLENGE_PROB)
         .set_stop_max_steps(Some(race_steps))
+        // .set_stop_custom(|snap: &RaceSnapshot| {
+        //     snap.best_smoothed_fitness > 400.0
+        // })
+        // .set_pruner_enabled(true)          // … or post-race: cull to elites, solo-train
+        // .set_pruner_method(PopPrunerMethod::Hard)
+        // .set_pruner_steps(10)              // solo-phase length in steps
+        // .set_run_topologies(vec![])        // founder blueprints filling slots first
+        // .set_topology_seed(7)              // pin the topology-draw RNG (else run_seed-derived)
+        .set_run_metrics(vec![Metric::custom("eval_survival_min", |survivals, _| {
+            let v = survivals.data().to_f32_vec()?;
+            Ok(if v.is_empty() {
+                0.0
+            } else {
+                v.iter().copied().fold(f32::INFINITY, f32::min)
+            })
+        })])
         .set_crossover_prob(0.5)
         .set_crossover_retries(2)
         .set_crossover_rolls(pop / 2)
@@ -440,8 +475,7 @@ fn main() {
         .set_mutation_catch_up(false)
         .set_mutation_cull_policy(MutationCullPolicy::InverseFitness)
         .set_mutation_probation_steps(5)
-        // --- Guardrail (post-race honesty check): fresh unseen games ---
-        .set_guardrail_matches(HOLDOUT_MATCHES)
+        .set_elite_guardrail_matches(HOLDOUT_MATCHES)
         .set_topology_dropout_prob(DROPOUT_PROB)
         .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(15)
@@ -451,7 +485,7 @@ fn main() {
         .set_topology_max_outputs_per_node(15)
         .set_topology_input_dim(4)
         .set_topology_output_dim(2)
-        .set_topology_hidden_dim_range(16, 128)
+        .set_topology_hidden_dim_range(16, 64)
         .set_topology_hidden_dim_stride(16)
         .set_topology_combine_op_pool([
             "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
@@ -515,7 +549,7 @@ fn main() {
     // absolute question (is the champion actually good? see
     // CARTPOLE_EXPERIMENTS.md for the false-SOLVED verdict that motivated it).
     // The run's OWN trainer scores the holdout (holdout_score above), and the
-    // count comes from the config's `set_guardrail_matches`; returning `None`
+    // count comes from the config's `set_elite_guardrail_matches`; returning `None`
     // just means no champion was exported — the honest skip, not an error.
     match engine.guardrail(device) {
         Some(v) => {
