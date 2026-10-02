@@ -1604,6 +1604,46 @@ impl CoreEngine {
         )
     }
 
+    /// THE ranking primitive: live nets paired with smoothed fitness, ordered
+    /// best-first (direction-aware). Every selection site reads this one list
+    /// and layers its own eligibility filters and output shape on top — the
+    /// sort and the smoothing live here once. Need only values? map over it.
+    /// Need one net's place? `position`. Need the worst? read it `.rev()`.
+    ///
+    /// `require_measured` selects the eligibility contract:
+    /// - `true` (`ranked_live`) — only nets whose rolling buffer is non-empty,
+    ///   i.e. that already have a verdict; what elite/cull/gate/report rank.
+    /// - `false` (`ranked_live_all`) — every live net; a net with no
+    ///   measurement yet counts as the empty-buffer mean (0.0). Parent
+    ///   selection uses this: any live net is eligible to breed.
+    fn ranked_live_impl(&self, require_measured: bool) -> Vec<(String, f32)> {
+        let direction = self.fitness.direction();
+        let mut ranked: Vec<(String, f32)> = self
+            .state
+            .live_hashes()
+            .into_iter()
+            .filter_map(|h| match self.rolling_fitness.get(&h) {
+                Some(b) if !require_measured || !b.is_empty() => Some((h, rolling_mean(b))),
+                Some(_) => None,
+                None if !require_measured => Some((h, 0.0)),
+                None => None,
+            })
+            .collect();
+        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
+        ranked
+    }
+
+    /// Live nets that have a measured (non-empty) rolling buffer, best-first.
+    pub(crate) fn ranked_live(&self) -> Vec<(String, f32)> {
+        self.ranked_live_impl(true)
+    }
+
+    /// Every live net, best-first; a net with no measurement yet counts as
+    /// 0.0 — the parent-selection contract.
+    pub(crate) fn ranked_live_all(&self) -> Vec<(String, f32)> {
+        self.ranked_live_impl(false)
+    }
+
     /// The elite set: the top `config.elite_count` live nets by smoothed
     /// fitness (direction-aware). Protected from ALL culls — crossover (any
     /// policy) and mutation alike. Always leaves at least one cullable net:
@@ -1616,20 +1656,11 @@ impl CoreEngine {
         if k == 0 {
             return Vec::new();
         }
-        let direction = self.fitness.direction();
-        let mut ranked: Vec<(String, f32)> = self
-            .state
-            .live_hashes()
-            .iter()
-            .filter_map(|h| {
-                self.rolling_fitness
-                    .get(h)
-                    .filter(|b| !b.is_empty())
-                    .map(|b| (h.clone(), rolling_mean(b)))
-            })
-            .collect();
-        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
-        ranked.into_iter().take(k).map(|(h, _)| h).collect()
+        self.ranked_live()
+            .into_iter()
+            .take(k)
+            .map(|(h, _)| h)
+            .collect()
     }
 
     /// KISS crown refresh (the FREEZE-ELITES model, in one place): the crown
@@ -1746,20 +1777,10 @@ impl CoreEngine {
     /// the hash is unknown or has no fitness yet. Used by the dethrone log
     /// (was-rank → out) and any future rank-delta reporting.
     pub(crate) fn rank_position(&self, hash: &str) -> Option<usize> {
-        let direction = self.fitness.direction();
-        let mut ranked: Vec<(String, f32)> = self
-            .state
-            .live_hashes()
+        self.ranked_live()
             .iter()
-            .filter_map(|h| {
-                self.rolling_fitness
-                    .get(h)
-                    .filter(|b| !b.is_empty())
-                    .map(|b| (h.clone(), rolling_mean(b)))
-            })
-            .collect();
-        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
-        ranked.iter().position(|(h, _)| h == hash).map(|p| p + 1)
+            .position(|(h, _)| h == hash)
+            .map(|p| p + 1)
     }
 
     // ── Selection helpers ───────────────────────────────────────────────────
@@ -1772,61 +1793,31 @@ impl CoreEngine {
     pub(crate) fn fittest_net_hash(
         &self,
     ) -> std::result::Result<String, crate::utils::error::EngineError> {
-        let hashes = self.state.live_hashes();
-        if hashes.is_empty() {
-            return Err(crate::utils::error::EngineError::InvalidOptions(
+        match self.ranked_live_all().into_iter().next() {
+            Some((h, _)) => Ok(h),
+            None => Err(crate::utils::error::EngineError::InvalidOptions(
                 "race: no live nets to select fittest from".into(),
-            ));
+            )),
         }
-        let direction = self.fitness.direction();
-        let mut best_hash = hashes[0].clone();
-        let mut best_val = rolling_mean(self.rolling_fitness.get(&best_hash).unwrap());
-        for hash in &hashes[1..] {
-            let val = rolling_mean(self.rolling_fitness.get(hash).unwrap());
-            if direction.is_better(val, best_val) {
-                best_val = val;
-                best_hash = hash.clone();
-            }
-        }
-        Ok(best_hash)
     }
 
     /// The worst live net hashes by smoothed fitness (opposite of fittest).
     /// Uses the live smoothed fitness; only cullable nets are candidates.
     pub(crate) fn worst_nets_by_smoothed_fitness(&self, count: usize) -> Result<Vec<String>> {
-        let hashes = self.state.live_hashes();
-        if hashes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let direction = self.fitness.direction();
         // The elite guard applies HERE too: this selector feeds the
         // crossover-Worst victim (and the mutation fallback), and an elite
         // must never be a victim under either. (Its comment used to claim
         // this exclusion while the code didn't do it.)
         let elite = self.elite_hashes();
-        let mut scored: Vec<(String, f32)> = hashes
-            .iter()
-            // Nets with an empty rolling buffer (never trained at this
-            // clock) are not cullable — no verdict yet.
-            .filter(|h| {
-                self.rolling_fitness
-                    .get(*h)
-                    .map(|b| b.iter().count() > 0)
-                    .unwrap_or(false)
-            })
-            .filter(|h| !elite.contains(*h))
-            .map(|h| {
-                (
-                    h.clone(),
-                    rolling_mean(self.rolling_fitness.get(h).unwrap()),
-                )
-            })
-            .collect();
-        // Sort worst-first: `Direction::cmp(a, b)` orders ascending for
-        // Maximize (smallest = worst first) and descending for Minimize
-        // (largest = worst first). `take(count)` then culls the worst.
-        scored.sort_by(|a, b| direction.cmp(a.1, b.1));
-        Ok(scored.into_iter().map(|(h, _)| h).take(count).collect())
+        // `ranked_live()` is best-first, so the worst is its reverse.
+        Ok(self
+            .ranked_live()
+            .into_iter()
+            .rev()
+            .filter(|(h, _)| !elite.contains(h))
+            .map(|(h, _)| h)
+            .take(count)
+            .collect())
     }
 
     // ── Shared batch materialization ────────────────────────────────────────

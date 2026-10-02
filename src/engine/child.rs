@@ -26,7 +26,6 @@ use crate::state::{NetMetrics, NetState, write_net_state};
 use crate::utils::seed::derive_seed;
 
 use super::core::CoreEngine;
-use super::smoothing::rolling_mean;
 
 /// A freshly-built child net being caught up solo before it rejoins the group.
 ///
@@ -108,24 +107,16 @@ impl CoreEngine {
     ) -> Result<Option<RaceChild>> {
         // Ok(None) = the roll produced no child (no compatible pairing); the
         // caller treats it as a spent roll, not an error path.
-        // 1. Ranking: live hashes ordered best-first by smoothed fitness.
-        let hashes = self.state.live_hashes();
-        if hashes.is_empty() {
+        // 1. Ranking: live nets ordered best-first by smoothed fitness.
+        if self.state.live_hashes().is_empty() {
             return Err(flodl::tensor::TensorError::new(
                 "race: no live nets to select parents from",
             ));
         }
         let direction = self.fitness.direction();
-        let mut ranked: Vec<(String, f32)> = hashes
-            .iter()
-            .map(|h| {
-                (
-                    h.clone(),
-                    rolling_mean(self.rolling_fitness.get(h).unwrap()),
-                )
-            })
-            .collect();
-        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
+        // Parent selection ranks EVERY live net (a net with no measurement yet
+        // counts as 0.0) — unlike cull/elite sites, which need a verdict.
+        let ranked = self.ranked_live_all();
         let scores: Vec<f32> = ranked.iter().map(|(_, s)| *s).collect();
 
         // 3. Crossover: up to 3 attempts; a no-op (incompatible dims) retries

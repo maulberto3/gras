@@ -12,7 +12,6 @@ use tracing::info;
 
 use super::config::{PopPruner, StopReason};
 use super::core::{CoreEngine, RlVolume, StepEvolve};
-use crate::engine::smoothing::rolling_mean;
 
 impl CoreEngine {
     /// Post-race pruner phase (Hard method): cull all but the top
@@ -35,27 +34,12 @@ impl CoreEngine {
     ) -> Result<StopReason> {
         // Keep the top-k elites (k = max(1, elite_count)) — the same ranking
         // the elite guard uses, so "who survives" is exactly "who was elite".
-        let keep = {
-            let k = self.config.elite_count.max(1).min(self.state.live_count());
-            let direction = self.fitness.direction();
-            let mut ranked: Vec<(String, f32)> = self
-                .state
-                .live_hashes()
-                .iter()
-                .filter_map(|h| {
-                    self.rolling_fitness
-                        .get(h)
-                        .filter(|b| !b.is_empty())
-                        .map(|b| (h.clone(), rolling_mean(b)))
-                })
-                .collect();
-            ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
-            ranked
-                .into_iter()
-                .take(k)
-                .map(|(h, _)| h)
-                .collect::<Vec<_>>()
-        };
+        let keep: Vec<String> = self
+            .ranked_live()
+            .into_iter()
+            .take(self.config.elite_count.max(1).min(self.state.live_count()))
+            .map(|(h, _)| h)
+            .collect();
         // Worst-net dump BEFORE the cull: the anti-champion only exists
         // while the full field is alive — after culling to elites there is
         // no "worst" left to distinguish from the elite.

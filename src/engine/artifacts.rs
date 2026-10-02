@@ -1,13 +1,13 @@
 //! Run artifacts: the champion (elite) and anti-champion (worst) dumps.
 //!
 //! These write files to the run dir — they are artifacts, not log lines, so
-//! they land at every log level. The ranking helpers (`rank_live`,
-//! `champion_ranked`, `record_champions`) live here because they exist only
-//! to feed the writers; `champion_hashes()` is the public read-back so post-
-//! race tooling never has to guess champions from file mtimes or glob order.
+//! they land at every log level. The ranking helpers (`champion_ranked`,
+//! `record_champions`) live here because they exist only to feed the writers;
+//! both read the shared `ranked_live()` primitive from `core`. The public
+//! `champion_hashes()` read-back means post-race tooling never has to guess
+//! champions from file mtimes or glob order.
 
 use super::core::CoreEngine;
-use crate::engine::smoothing::rolling_mean;
 use flodl::tensor::Result;
 use tracing::info;
 
@@ -149,7 +149,7 @@ impl CoreEngine {
     /// gone.
     fn champion_ranked(&self) -> impl Iterator<Item = (String, f32)> {
         let k = self.config.elite_count.max(1);
-        self.rank_live().into_iter().take(k)
+        self.ranked_live().into_iter().take(k)
     }
 
     /// Snapshot the current champion set into `self.champions` before any
@@ -157,26 +157,6 @@ impl CoreEngine {
     /// writers iterate — even if an individual file write fails.
     pub(crate) fn record_champions(&mut self) {
         self.champions = self.champion_ranked().map(|(h, _)| h).collect();
-    }
-
-    /// Rank live nets by smoothed fitness, best first. Shared by the elite
-    /// artifact writers and (with `.last()`) the worst-net dump.
-    fn rank_live(&self) -> Vec<(String, f32)> {
-        let mut ranked: Vec<(String, f32)> = self
-            .state
-            .live_hashes()
-            .iter()
-            .filter_map(|h| {
-                let buf = self.rolling_fitness.get(h)?;
-                if buf.is_empty() {
-                    return None;
-                }
-                Some((h.clone(), rolling_mean(buf)))
-            })
-            .collect();
-        let direction = self.fitness.direction();
-        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
-        ranked
     }
 
     /// When any `worst_save_*` flag is set: save the WORST live net's
@@ -194,7 +174,7 @@ impl CoreEngine {
         }
         // `.last()` on the ranked iterator: the worst net O(n) without a
         // full `Vec` clone of the ranking (see the champion_ranked note).
-        let Some((worst, worst_fitness)) = self.rank_live().into_iter().last() else {
+        let Some((worst, worst_fitness)) = self.ranked_live().into_iter().last() else {
             return Ok(()); // nothing ever scored — nothing to dump
         };
         let short = &worst[..8.min(worst.len())];

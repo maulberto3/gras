@@ -311,29 +311,18 @@ impl CoreEngine {
         // metadata — the run's champions at stop time. Elite = rank, not
         // identity, so this is "who holds the top-k right now".
         let k = self.config.elite_count.max(1); // report at least the champion
-        let mut ranked: Vec<(String, f32, usize, Option<f32>)> = live // (hash, smoothed, step, eval_loss)
-            .iter()
-            .filter_map(|h| {
-                let buf = self.rolling_fitness.get(h)?;
-                if buf.is_empty() {
-                    return None;
-                }
-                let step = self
-                    .state
-                    .net(h)
-                    .and_then(|s| s.last_metrics.as_ref())
-                    .map(|m| m.step)
-                    .unwrap_or(0);
-                let eval_loss = self
-                    .state
-                    .net(h)
-                    .and_then(|s| s.last_metrics.as_ref())
-                    .and_then(|m| m.eval_loss);
-                Some((h.clone(), rolling_mean(buf), step, eval_loss))
+        // (hash, smoothed, step, eval_loss)
+        let ranked: Vec<(String, f32, usize, Option<f32>)> = self
+            .ranked_live()
+            .into_iter()
+            .map(|(h, fit)| {
+                let metrics = self.state.net(&h).and_then(|s| s.last_metrics.as_ref());
+                let step = metrics.map(|m| m.step).unwrap_or(0);
+                let eval_loss = metrics.and_then(|m| m.eval_loss);
+                (h, fit, step, eval_loss)
             })
             .collect();
         let direction = self.fitness.direction();
-        ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
         let arrow = direction.arrow();
         info!("  ── final elites (top-{k}, fitness{arrow} smoothed) ──");
         for (rank, (h, fit, step, eval_loss)) in ranked.iter().take(k).enumerate() {
