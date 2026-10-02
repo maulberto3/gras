@@ -161,7 +161,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("```\n");
     out.push_str("\n> **Legend**:\n");
     out.push_str("> - I=input  H=hidden  O=output\n");
-    out.push_str("> - `4w→2i/1o→5w` = wires→input ports / output ports→wires (a port may carry several wires; the combine op merges them)\n");
+    out.push_str("> - `4w→2i/1o→5w` = wires→input ports / output ports→wires; a port with several wires is drawn once per wire with a suffix letter (`o1a o1b`), so every marker maps to exactly one wire\n");
     out.push_str("> - ->dim = output dimension\n");
     out.push_str("> - ▶ connected output  ◀ connected input  * orphaned port\n");
 

@@ -3,7 +3,7 @@
 //! only the pieces markdown needs survive.
 
 use crate::graph::node::NodeKind;
-use crate::graph::topology::{Connection, Port, Topology};
+use crate::graph::topology::{Connection, Topology};
 
 /// Per-node description consumed by [`render_wire_diagram`].
 #[derive(Clone, Copy)]
@@ -58,17 +58,124 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         .collect();
 
     let label_w = labels.iter().map(|l| l.chars().count()).max().unwrap_or(0) + 2;
-    let max_in = nodes.iter().map(|n| n.num_inputs).max().unwrap_or(0);
-    let max_out = nodes.iter().map(|n| n.num_outputs).max().unwrap_or(0);
+
+    // ── 2. Track & Row Allocation ──
+    let valid: Vec<bool> = connections
+        .iter()
+        .map(|c| c.from.node < c.to.node && c.to.node < nodes.len() && c.to.node > 0)
+        .collect();
+
+    // ── Port slots: ONE PER WIRE, so every wire is drawn one-to-one. ──
+    // A port can carry several wires (the Input node fans out; any node's
+    // fan-in is merged by the combine op). Drawing the port once made those
+    // wires share a column and split ambiguously — a `> ` with three wires
+    // leaving it read as one signal, not three. Instead each wire gets its
+    // OWN slot, labelled with its port index plus a suffix letter when the
+    // port is shared (`o1a o1b` = two wires off output 1), so every
+    // `>`/`<` marker maps to exactly one wire and the text diagram matches
+    // the mermaid edge list visually. A port with no wires still gets one
+    // slot (an orphan `*`).
+    let mut out_slots: Vec<Vec<(usize, Option<usize>)>> = Vec::with_capacity(nodes.len());
+    let mut in_slots: Vec<Vec<(usize, Option<usize>)>> = Vec::with_capacity(nodes.len());
+    let mut src_slot = vec![0usize; connections.len()];
+    let mut tgt_slot = vec![0usize; connections.len()];
+    for (i, node) in nodes.iter().enumerate() {
+        let mut slots: Vec<(usize, Option<usize>)> = Vec::new();
+        for p in 0..node.num_outputs {
+            let mut wired = false;
+            for (j, c) in connections.iter().enumerate() {
+                if valid[j] && c.from.node == i && c.from.index == p {
+                    src_slot[j] = slots.len();
+                    slots.push((p, Some(j)));
+                    wired = true;
+                }
+            }
+            if !wired {
+                slots.push((p, None));
+            }
+        }
+        out_slots.push(slots);
+    }
+    for (i, node) in nodes.iter().enumerate() {
+        let mut slots: Vec<(usize, Option<usize>)> = Vec::new();
+        for p in 0..node.num_inputs {
+            let mut wired = false;
+            for (j, c) in connections.iter().enumerate() {
+                if valid[j] && c.to.node == i && c.to.index == p {
+                    tgt_slot[j] = slots.len();
+                    slots.push((p, Some(j)));
+                    wired = true;
+                }
+            }
+            if !wired {
+                slots.push((p, None));
+            }
+        }
+        in_slots.push(slots);
+    }
+    // Slot labels: `o<port>` for a lone wire, `o<port><letter>` when the
+    // port carries several (`o1a o1b`) — every wire's marker pair is then
+    // uniquely named. Suffix runs a, b, c… (numeric fallback past 26).
+    let slot_labels = |prefix: char, ports: &[usize]| -> Vec<String> {
+        let mut labels = Vec::with_capacity(ports.len());
+        for (q, &p) in ports.iter().enumerate() {
+            let total = ports.iter().filter(|&&x| x == p).count();
+            if total <= 1 {
+                labels.push(format!("{prefix}{p}"));
+            } else {
+                let idx = ports[..q].iter().filter(|&&x| x == p).count();
+                let suffix = if idx < 26 {
+                    ((b'a' + idx as u8) as char).to_string()
+                } else {
+                    format!("{idx}")
+                };
+                labels.push(format!("{prefix}{p}{suffix}"));
+            }
+        }
+        labels
+    };
+    let out_labels: Vec<Vec<String>> = out_slots
+        .iter()
+        .map(|slots| {
+            let ports: Vec<usize> = slots.iter().map(|(p, _)| *p).collect();
+            slot_labels('o', &ports)
+        })
+        .collect();
+    let in_labels: Vec<Vec<String>> = in_slots
+        .iter()
+        .map(|slots| {
+            let ports: Vec<usize> = slots.iter().map(|(p, _)| *p).collect();
+            slot_labels('i', &ports)
+        })
+        .collect();
+    // Offset from a slot's column to its marker: the label's own width.
+    let out_off = |i: usize, q: usize| out_labels[i][q].chars().count();
+    let in_off = |i: usize, q: usize| in_labels[i][q].chars().count();
+
+    let max_in_slots = in_slots.iter().map(Vec::len).max().unwrap_or(0);
+    let max_out_slots = out_slots.iter().map(Vec::len).max().unwrap_or(0);
 
     let indent = 2usize;
-    let in_step = 4usize;
-    let out_step = 4usize;
+    // A slot's pitch must clear its label plus the `>`/`<` marker.
+    let max_in_label = in_labels
+        .iter()
+        .flatten()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(1);
+    let max_out_label = out_labels
+        .iter()
+        .flatten()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(1);
+    let in_step = 4usize.max(max_in_label + 2);
+    let out_step = 4usize.max(max_out_label + 2);
 
     let in_x0 = indent + label_w + 2;
-    let out_x0 =
-        (in_x0 + max_in * in_step + 2).max(indent + label_w + max_in * in_step + out_step + 4);
-    let lane_x0 = out_x0 + max_out * out_step + 2;
+    let out_x0 = (in_x0 + max_in_slots * in_step + 2)
+        .max(indent + label_w + max_in_slots * in_step + out_step + 4);
+    let lane_x0 = out_x0 + max_out_slots * out_step + 2;
 
     let n_wires = connections.len();
     let lane_step = if n_wires <= 10 {
@@ -84,13 +191,7 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
     let width = raw_width.min(max_width);
 
     let in_col = |q: usize| in_x0 + q * in_step;
-    let out_col = |p: usize| out_x0 + p * out_step;
-
-    // ── 2. Track & Row Allocation ──
-    let valid: Vec<bool> = connections
-        .iter()
-        .map(|c| c.from.node < c.to.node && c.to.node < nodes.len() && c.to.node > 0)
-        .collect();
+    let out_col = |q: usize| out_x0 + q * out_step;
 
     let out_deg = |i: usize| {
         connections
@@ -179,43 +280,23 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
     };
 
     // Render Labels & Ports
-    for (i, node) in nodes.iter().enumerate() {
+    for i in 0..nodes.len() {
         let r0 = block_row[i];
         for (k, ch) in labels[i].chars().enumerate() {
             put(&mut canvas, r0, indent + k, ch);
         }
-        for q in 0..node.num_inputs {
+        // One label per incoming WIRE (`i0`, or `i0a i0b` when shared).
+        for (q, label) in in_labels[i].iter().enumerate() {
             let c = in_col(q);
-            put(&mut canvas, r0 + 1, c, 'i');
-            if q < 10 {
-                put(
-                    &mut canvas,
-                    r0 + 1,
-                    c + 1,
-                    char::from_digit(q as u32, 10).unwrap_or('?'),
-                );
-            } else {
-                let dig = format!("{}", q);
-                for (k, ch) in dig.chars().enumerate() {
-                    put(&mut canvas, r0 + 1, c + 1 + k, ch);
-                }
+            for (k, ch) in label.chars().enumerate() {
+                put(&mut canvas, r0 + 1, c + k, ch);
             }
         }
-        for p in 0..node.num_outputs {
-            let c = out_col(p);
-            put(&mut canvas, r0 + 2, c, 'o');
-            if p < 10 {
-                put(
-                    &mut canvas,
-                    r0 + 2,
-                    c + 1,
-                    char::from_digit(p as u32, 10).unwrap_or('?'),
-                );
-            } else {
-                let dig = format!("{}", p);
-                for (k, ch) in dig.chars().enumerate() {
-                    put(&mut canvas, r0 + 2, c + 1 + k, ch);
-                }
+        // One label per outgoing WIRE (`o0`, or `o1a o1b` when shared).
+        for (q, label) in out_labels[i].iter().enumerate() {
+            let c = out_col(q);
+            for (k, ch) in label.chars().enumerate() {
+                put(&mut canvas, r0 + 2, c + k, ch);
             }
         }
     }
@@ -230,25 +311,16 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
 
     for (i, node) in nodes.iter().enumerate() {
         let r1 = block_row[i] + 1;
-        for q in 0..node.num_inputs {
-            let target = Port {
-                node: node.id,
-                index: q,
-            };
-            if !connections.iter().any(|c| c.to == target) {
-                put(&mut canvas, r1, in_col(q) + 2, '*');
+        for (q, &(_, conn)) in in_slots[i].iter().enumerate() {
+            if conn.is_none() {
+                put(&mut canvas, r1, in_col(q) + in_off(i, q), '*');
             }
         }
         if Some(node.id) != output_node {
             let r2 = block_row[i] + 2;
-            for p in 0..node.num_outputs {
-                let source = Port {
-                    node: node.id,
-                    index: p,
-                };
-                if !connections.iter().any(|c| c.from == source) {
-                    let marker_col = out_col(p) + if p < 10 { 2 } else { 3 };
-                    put(&mut canvas, r2, marker_col, '*');
+            for (q, &(_, conn)) in out_slots[i].iter().enumerate() {
+                if conn.is_none() {
+                    put(&mut canvas, r2, out_col(q) + out_off(i, q), '*');
                 }
             }
         }
@@ -261,9 +333,9 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         }
         let src_row = block_row[conn.from.node] + 2;
         let tgt_row = block_row[conn.to.node] + 1;
-        let arrow_col = out_col(conn.from.index) + if conn.from.index < 10 { 2 } else { 3 };
+        let arrow_col = out_col(src_slot[j]) + out_off(conn.from.node, src_slot[j]);
         put(&mut canvas, src_row, arrow_col, '>');
-        put(&mut canvas, tgt_row, in_col(conn.to.index) - 1, '<');
+        put(&mut canvas, tgt_row, in_col(tgt_slot[j]) - 1, '<');
     }
 
     // ── Phase 2: Complete Port Drops, Vertical Lanes & Corners ──
@@ -274,8 +346,8 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
 
         let src_row = block_row[conn.from.node] + 2;
         let tgt_row = block_row[conn.to.node] + 1;
-        let src = out_col(conn.from.index) + 2;
-        let tgt = in_col(conn.to.index) - 1;
+        let src = out_col(src_slot[j]) + out_off(conn.from.node, src_slot[j]);
+        let tgt = in_col(tgt_slot[j]) - 1;
         let lane = (lane_x0 + j * lane_step).min(width - 1);
         let st = src_track[j];
         let tt = tgt_track[j];
@@ -306,8 +378,8 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
             continue;
         }
 
-        let src = out_col(conn.from.index) + 2;
-        let tgt = in_col(conn.to.index) - 1;
+        let src = out_col(src_slot[j]) + out_off(conn.from.node, src_slot[j]);
+        let tgt = in_col(tgt_slot[j]) - 1;
         let lane = (lane_x0 + j * lane_step).min(width - 1);
 
         // East run from source port to lane
