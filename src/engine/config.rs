@@ -90,13 +90,20 @@ pub enum CrossoverGate {
     /// **Hard** — the child's smoothed fitness must beat the population's
     /// mean at **every** checkpoint it passes through. Brutal: forces
     /// children that truly outperform the pop at each historical point.
-    #[default]
     Hard,
-    /// **Soft** — the child must beat the **mean of the checkpoint means**
-    /// (one aggregate bar over the whole replay window), not each individual
-    /// checkpoint. A child that dips under one early gate but recovers can
-    /// still survive.
+    /// **Soft** (default) — the child must beat the **mean of the checkpoint
+    /// means** (one aggregate bar over the whole replay window), not each
+    /// individual checkpoint. A child that dips under one early gate but
+    /// recovers can still survive.
+    #[default]
     Soft,
+    /// **Off** — no gate: a caught-up child still replays the stream (so it
+    /// carries history and keeps training forward), but is ALWAYS inserted,
+    /// never rejected on the historical bars. This isolates the GATE from
+    /// catch-up itself: `crossover_catch_up=on` + `gate=Off` replays without
+    /// judging, whereas `crossover_catch_up=off` skips both. No bar is drawn
+    /// or logged (there is nothing to compare against).
+    Off,
 }
 
 /// Who gets evicted when a crossover child passes the gate and takes a slot.
@@ -206,9 +213,13 @@ pub enum RunMode {
 }
 
 /// Step-race knob surface. Defaults are conservative and small for quick
-/// testing (pop 5, checkpoint every 10, 1 crossover + 1 mutation roll,
-/// elite_count 1, mutate_prob 0.2, smoothing K = 10, hidden_dim_pool 4..=8)
-/// — the user runs bigger or explicitly overrides when it matters. Data
+/// testing on the SIZE axis (pop 5, checkpoint every 10, 1 crossover +
+/// 1 mutation roll, elite_count 1, smoothing K = 10, hidden_dim_pool 4..=8)
+/// — the user runs bigger or explicitly overrides when it matters — but the
+/// EVOLUTION semantics default to the tuned cartpole reference: `Soft` gate
+/// (window 5, 5 retries), `mutate_prob` 0.5, both cull policies `Worst`, and
+/// a 5-clock probation on the mutation, crossover and elite channels (see
+/// [`RaceConfig::mutation_probation_steps`] etc.). Data
 /// geometry (batch size, split ratio, held-out rows) is deliberately NOT
 /// here: it lives on `RunSpec::stream` (see the batch-stream note below).
 ///
@@ -384,17 +395,38 @@ pub struct RaceConfig {
     /// one checkpoint interval of weights; the frontier states already land
     /// every checkpoint. Default true (k is small, the files are small).
     pub elite_checkpoint_weights: bool,
-    /// Mutation probation: a net is cull-IMMUNE for its first
+    /// Mutation probation: a RANDOM immigrant is cull-IMMUNE for its first
     /// `mutation_probation_steps` clocks (while
     /// `clock − entered_at_step < window`). The lower-half analog of the
     /// elite guard: a fresh immigrant with 1–2 bad verdicts gets k steps to
     /// draw its arch-lottery ticket before the inverse-fitness roulette can
-    /// claim it. `0` (default) = today's behavior (only the empty-buffer
-    /// step-0 immunity). A firing roll ALWAYS yields a slot: if every
-    /// non-elite net is on probation, the protection is broken for that
-    /// pick (last resort, logged). See `entered_at_step` — no new state,
-    /// resume-safe by construction.
+    /// claim it. Crossover-born nets use `crossover_probation_steps` instead.
+    /// `0` (default) = today's behavior (only the empty-buffer step-0
+    /// immunity). A firing roll ALWAYS yields a slot: if every non-elite net
+    /// is on probation, the protection is broken for that pick (last resort,
+    /// logged). See `entered_at_step` — no new state, resume-safe by
+    /// construction.
     pub mutation_probation_steps: usize,
+    /// Crossover probation: a net BORN from crossover is cull-IMMUNE for its
+    /// first `crossover_probation_steps` clocks — the crossover channel's
+    /// counterpart to `mutation_probation_steps`. A recombined child needs a
+    /// few steps to train its fresh weights before the fitness roulette can
+    /// judge it. `0` (default) = crossover children carry only the
+    /// empty-buffer step-0 immunity. Same slot-guarantee and state-free
+    /// resume contract as the mutation window.
+    pub crossover_probation_steps: usize,
+    /// Elite probation: a net cannot join the ELITE set (the frozen crown AND
+    /// the cull guard) until it has aged `elite_probation_steps` clocks since
+    /// arrival (`clock − entered_at_step ≥ window`). Why: a caught-up crossover
+    /// child arrives with a FULL rolling buffer, so without this it can rank
+    /// straight into the top-`elite_count` and be FROZEN — act-and-measure,
+    /// zero training — on its first live step, benching fresh genetic material
+    /// at birth. `0` (default) = today's behavior. If EVERY rankable net is on
+    /// elite probation (tiny pop, all fresh), the crown would empty, so the
+    /// protection is BROKEN for that refresh (falls back to the plain top-k) —
+    /// the champion is never left unguarded. Same state-free, resume-safe
+    /// contract as the cull-probation windows.
+    pub elite_probation_steps: usize,
     /// Anti-plateau challenge probability (`set_run_challenge_prob`):
     /// per-step, per-net chance the engine hands the trainer a challenged
     /// step, decayed linearly to 0 by the end of the step budget
@@ -713,7 +745,10 @@ impl Default for RlConfig {
     fn default() -> Self {
         Self {
             mutation_catch_up: false,
-            crossover_catch_up: true,
+            // Default OFF (the cartpole reference): a crossover child trains
+            // forward like an immigrant. With catch-up ON the gate is live;
+            // set it explicitly to re-enable replay + gating.
+            crossover_catch_up: false,
             run_pop_catch_up: false,
         }
     }
@@ -842,10 +877,10 @@ impl RaceConfig {
             crossover_rolls: 1,
             mutate_rolls: 1,
             crossover_gate: CrossoverGate::default(),
-            crossover_gate_window: 0,
-            crossover_retries: 0,
+            crossover_gate_window: 5,
+            crossover_retries: 5,
             crossover_cull_policy: CrossCullPolicy::default(),
-            mutation_cull_policy: MutationCullPolicy::default(),
+            mutation_cull_policy: MutationCullPolicy::Worst,
             elite_count: 1,
             freeze_elites: true,
             smoothing_window: SMOOTHING_WINDOW,
@@ -860,7 +895,7 @@ impl RaceConfig {
             transform_pool: Vec::new(),
             topology_options: crate::graph::topology::TopologyOptions::default(),
             crossover_prob: 0.5,
-            mutate_prob: 0.2,
+            mutate_prob: 0.5,
             custom_stop: None,
             metrics: Vec::new(),
             log_level: LogLevel::default(),
@@ -876,7 +911,9 @@ impl RaceConfig {
             run_name: None,
             run_topologies: Vec::new(),
             elite_checkpoint_weights: true,
-            mutation_probation_steps: 0,
+            mutation_probation_steps: 5,
+            crossover_probation_steps: 5,
+            elite_probation_steps: 5,
             challenge_prob: 0.0,
             challenge_decay: ChallengeDecay::Linear,
             guardrail_matches: DEFAULT_GUARDRAIL_MATCHES,
@@ -981,7 +1018,8 @@ impl RaceConfigBuilder {
     }
     /// Gate strictness for crossover children: `CrossoverGate::Hard` = beat
     /// every checkpoint bar in the gate window; `CrossoverGate::Soft` = beat
-    /// the mean of those bars.
+    /// the mean of those bars; `CrossoverGate::Off` = no gate at all (the
+    /// child still replays, it is just never rejected).
     pub fn set_crossover_gate(mut self, mode: CrossoverGate) -> Self {
         self.cfg.crossover_gate = mode;
         self
@@ -1391,10 +1429,23 @@ impl RaceConfigBuilder {
         self.cfg.elite_checkpoint_weights = enabled;
         self
     }
-    /// Mutation probation steps: cull-immunity for a net's first `k`
-    /// clocks (see [`RaceConfig::mutation_probation_steps`]). Default 0.
+    /// Mutation probation steps: cull-immunity for a random immigrant's first
+    /// `k` clocks (see [`RaceConfig::mutation_probation_steps`]). Default 0.
     pub fn set_mutation_probation_steps(mut self, k: usize) -> Self {
         self.cfg.mutation_probation_steps = k;
+        self
+    }
+    /// Crossover probation steps: cull-immunity for a crossover child's first
+    /// `k` clocks (see [`RaceConfig::crossover_probation_steps`]). Default 0.
+    pub fn set_crossover_probation_steps(mut self, k: usize) -> Self {
+        self.cfg.crossover_probation_steps = k;
+        self
+    }
+    /// Elite probation steps: a net cannot become an ELITE (frozen crown or
+    /// cull guard) until it has aged `k` clocks since arrival (see
+    /// [`RaceConfig::elite_probation_steps`]). Default 0.
+    pub fn set_elite_probation_steps(mut self, k: usize) -> Self {
+        self.cfg.elite_probation_steps = k;
         self
     }
     /// Per-step, per-net chance an anti-plateau challenge fires. `0.0`

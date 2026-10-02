@@ -1133,7 +1133,7 @@ impl CoreEngine {
             // front so a resumed command can be reconstructed from the log
             // alone (and so a stale binary is visible before it misleads).
             info!(
-                "race knobs: gate={:?} cull_policy={:?} retries={} dropout={} freeze_elites={} fresh_immigrants={} elite_save={} worst_save={} probation_steps={}",
+                "race knobs: gate={:?} cull_policy={:?} retries={} dropout={} freeze_elites={} fresh_immigrants={} elite_save={} worst_save={} probation_steps={} crossover_probation_steps={} elite_probation_steps={}",
                 self.config.crossover_gate,
                 self.config.crossover_cull_policy,
                 self.config.crossover_retries,
@@ -1143,6 +1143,8 @@ impl CoreEngine {
                 self.config.elite_save_topology,
                 self.config.worst_save_topology,
                 self.config.mutation_probation_steps,
+                self.config.crossover_probation_steps,
+                self.config.elite_probation_steps,
             );
             info!("  {}", build_stamp());
         }
@@ -1325,6 +1327,7 @@ impl CoreEngine {
                             match self.config.crossover_gate {
                                 crate::engine::config::CrossoverGate::Hard => "hard",
                                 crate::engine::config::CrossoverGate::Soft => "soft",
+                                crate::engine::config::CrossoverGate::Off => "off",
                             },
                             arrow,
                             bar,
@@ -1656,11 +1659,33 @@ impl CoreEngine {
         if k == 0 {
             return Vec::new();
         }
-        self.ranked_live()
-            .into_iter()
+        let ranked = self.ranked_live();
+        let window = self.config.elite_probation_steps;
+        if window == 0 {
+            return ranked.into_iter().take(k).map(|(h, _)| h).collect();
+        }
+        // Elite probation (see `elite_probation_steps`): a net that arrived
+        // fewer than `window` clocks ago cannot take an elite seat — a
+        // caught-up child with a full buffer cannot freeze on arrival.
+        let clock = self.step_clock();
+        let eligible: Vec<String> = ranked
+            .iter()
+            .filter(|(h, _)| {
+                self.state
+                    .net(h)
+                    .map(|s| clock.saturating_sub(s.entered_at_step) >= window)
+                    .unwrap_or(true)
+            })
             .take(k)
-            .map(|(h, _)| h)
-            .collect()
+            .map(|(h, _)| h.clone())
+            .collect();
+        if eligible.is_empty() {
+            // Every rankable net is on probation — break protection for this
+            // refresh (mirror cull probation's last resort): the plain top-k,
+            // so the champion is never left unguarded.
+            return ranked.into_iter().take(k).map(|(h, _)| h).collect();
+        }
+        eligible
     }
 
     /// KISS crown refresh (the FREEZE-ELITES model, in one place): the crown
@@ -1698,7 +1723,7 @@ impl CoreEngine {
         });
         leaving.sort();
         let seat = new_crown.len();
-        for h in &entering {
+        for (idx, h) in entering.iter().enumerate() {
             let pos = self.rank_position(h).unwrap_or(0);
             let fit = self.smoothed_fitness_of(h);
             let age = self
@@ -1709,10 +1734,26 @@ impl CoreEngine {
                 .networks
                 .get(h)
                 .map(|n| n.topology_blueprint().param_estimate());
+            // Pair the seat with the net it displaced this same step (if any),
+            // so a swap reads as one event: who took the seat AND whose smt it
+            // beat out. Display-only — the set was re-dealt, no net "owns" it.
+            let displaced = leaving
+                .get(idx)
+                .and_then(|d| {
+                    self.smoothed_fitness_of(d).map(|f| {
+                        format!(
+                            ", displaced {} {}",
+                            &d[..8.min(d.len())],
+                            crate::engine::format::fmt2_smt(f)
+                        )
+                    })
+                })
+                .unwrap_or_default();
             let extras = format!(
-                ", age {}, {}p",
+                ", age {}, {}p{}",
                 age.map(|a| a.to_string()).unwrap_or_else(|| "—".into()),
                 params.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
+                displaced,
             );
             info!(
                 "step {} │ freeze │ elite seat {pos}/{seat}: {} frozen (fitness{} {}{}) — w paused (a+m continues)",
@@ -2281,10 +2322,22 @@ mod tests {
         assert_eq!(cfg.checkpoint_every, DEFAULT_CHECKPOINT_EVERY);
         assert_eq!(cfg.crossover_rolls, 1);
         assert_eq!(cfg.mutate_rolls, 1);
+        // Evolution semantics default to the cartpole reference (only the
+        // SIZE axis stays small/conservative).
         assert_eq!(
             cfg.crossover_gate,
-            crate::engine::config::CrossoverGate::Hard
+            crate::engine::config::CrossoverGate::Soft
         );
+        assert_eq!(cfg.crossover_gate_window, 5);
+        assert_eq!(cfg.crossover_retries, 5);
+        assert_eq!(cfg.mutate_prob, 0.5);
+        assert_eq!(
+            cfg.mutation_cull_policy,
+            crate::engine::config::MutationCullPolicy::Worst
+        );
+        assert_eq!(cfg.mutation_probation_steps, 5);
+        assert_eq!(cfg.crossover_probation_steps, 5);
+        assert_eq!(cfg.elite_probation_steps, 5);
         assert_eq!(
             cfg.crossover_cull_policy,
             crate::engine::config::CrossCullPolicy::Worst
@@ -4793,6 +4846,8 @@ mod tests {
         let data_dir = tiny_dataset_dir("probation-json");
         let config = RaceConfig {
             mutation_probation_steps: 4,
+            crossover_probation_steps: 6,
+            elite_probation_steps: 5,
             ..RaceConfig::defaults()
         };
         crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
@@ -4806,7 +4861,116 @@ mod tests {
         .unwrap();
         let header = crate::state::load_engine_json(&dir).unwrap();
         assert_eq!(header.config.mutation_probation_steps, 4);
+        assert_eq!(header.config.crossover_probation_steps, 6);
+        assert_eq!(header.config.elite_probation_steps, 5);
         assert!(header.config.elite_checkpoint_weights);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn elite_probation_keeps_fresh_nets_out_of_the_crown() {
+        // A caught-up child arrives rankable (full buffer). With elite
+        // probation on it cannot take a seat while fresh, so it trains
+        // instead of freezing on arrival. Test fitness is Minimize, so the
+        // LOWEST smoothed score is the best net.
+        let dir = std::env::temp_dir().join("gras-elite-probation");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        eng.config.elite_count = 1;
+        eng.config.elite_probation_steps = 3;
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        let mut hashes = eng.state.live_hashes();
+        hashes.sort();
+        // Step a few clocks so `step_clock()` is past the probation window and
+        // both nets carry a verdict.
+        for clock in 0..4 {
+            for h in &hashes {
+                eng.step_one_net(h, clock).unwrap();
+            }
+        }
+        assert_eq!(eng.step_clock(), 4, "clock advanced by the group steps");
+        // `hashes[0]` is the BEST net but FRESH; `hashes[1]` is worse but old.
+        let best_vals = [0.1_f32, 0.9];
+        for (i, h) in hashes.iter().enumerate() {
+            let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+            buf.push(best_vals[i]);
+            *eng.rolling_fitness.get_mut(h).unwrap() = buf;
+        }
+        eng.state.net_mut(&hashes[0]).unwrap().entered_at_step = 4; // age 0
+        eng.state.net_mut(&hashes[1]).unwrap().entered_at_step = 0; // age 4
+        // Fresh best net is BARRED; the older worst net takes the seat.
+        assert_eq!(
+            eng.elite_hashes(),
+            vec![hashes[1].clone()],
+            "a fresh net cannot be an elite (would freeze on arrival)"
+        );
+        // Age it past the window: the genuinely-best net becomes the elite.
+        eng.state.net_mut(&hashes[0]).unwrap().entered_at_step = 0;
+        assert_eq!(
+            eng.elite_hashes(),
+            vec![hashes[0].clone()],
+            "protection lifts once the net has aged k clocks"
+        );
+        // If EVERY rankable net is fresh, protection breaks for that refresh
+        // (plain top-k) rather than leaving the crown empty / champion
+        // unguarded.
+        for h in &hashes {
+            eng.state.net_mut(h).unwrap().entered_at_step = 4;
+        }
+        assert_eq!(
+            eng.elite_hashes(),
+            vec![hashes[0].clone()],
+            "all-fresh fallback keeps the top-k guard (champion never unguarded)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crossover_probation_shields_crossover_children_with_its_own_window() {
+        let dir = std::env::temp_dir().join("gras-crossover-probation");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        eng.config.mutation_probation_steps = 3;
+        eng.config.crossover_probation_steps = 7;
+        eng.seed_population_internal(
+            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+            Some(0.5),
+        )
+        .unwrap();
+        let mut hashes = eng.state.live_hashes();
+        hashes.sort();
+        // Same birth clock for all three; only the ORIGIN picks the window.
+        for h in &hashes {
+            eng.state.net_mut(h).unwrap().entered_at_step = 10;
+        }
+        eng.state.net_mut(&hashes[0]).unwrap().created_from =
+            Some("crossover-one-point:parents=a,b".into());
+        eng.state.net_mut(&hashes[1]).unwrap().created_from = Some("random".into());
+        eng.state.net_mut(&hashes[2]).unwrap().created_from = Some("founder-2".into());
+
+        // 1 clock fresh: each net's own window covers it.
+        assert!(eng.on_probation(&hashes[0], 11), "crossover window is 7");
+        assert!(eng.on_probation(&hashes[1], 11), "mutation window is 3");
+        // 3 clocks fresh: the mutation window has expired, the crossover one has not.
+        let c = 13;
+        assert!(
+            eng.on_probation(&hashes[0], c),
+            "crossover child still fresh at 3 (window 7)"
+        );
+        assert!(
+            !eng.on_probation(&hashes[1], c),
+            "random immigrant's 3-clock window is done"
+        );
+        assert!(
+            !eng.on_probation(&hashes[2], c),
+            "a founder uses the mutation window, not the crossover one"
+        );
+        // 7 clocks fresh: the crossover window expires too.
+        assert!(
+            !eng.on_probation(&hashes[0], 17),
+            "crossover window expires after k clocks"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4859,9 +5023,71 @@ mod tests {
         assert_eq!(snap.crossover_gate_window, 7);
         assert_eq!(
             crate::engine::config::RaceConfig::defaults().crossover_gate_window,
-            0,
-            "default = unbounded (legacy behavior)"
+            5,
+            "default gate window = 5 (cartpole reference)"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crossover_gate_off_catches_up_without_gating() {
+        // `Off` must still CATCH UP the child (replay 0..clock) but never
+        // reject it: under an impossible Hard bar the same child is discarded,
+        // while `Off` admits it. This is the gate/catch-up separation the
+        // variant exists for — `crossover_catch_up=off` skips BOTH.
+        let dir = std::env::temp_dir().join("gras-cx-gate-off");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = seed_two_parents(&dir, 21);
+        eng.config.crossover_prob = 1.0;
+        // The tabular arm defaults catch-up OFF, so the gate is never reached;
+        // turn catch-up ON to exercise the gated path this test is about.
+        eng.config.mode_specific =
+            crate::engine::config::ModeConfig::Tabular(crate::engine::config::TabularConfig {
+                crossover_catch_up: true,
+                ..Default::default()
+            });
+        let hashes = eng.state.live_hashes();
+        for clock in 0..3 {
+            for h in &hashes {
+                eng.step_one_net(h, clock).unwrap();
+            }
+        }
+        // An impossible bar: the test fitness is Minimize (lower = better), so
+        // a bar of −1e9 can never be beaten by a replayed child (its mse ≥ 0).
+        eng.checkpoints.push(Checkpoint {
+            step: 2,
+            pop_mean_fitness: -1.0e9,
+            exam_mean_fitness: 0.0,
+        });
+        assert!(
+            eng.current_gate_bar(3).is_some(),
+            "Hard/Soft draw a bar from the ledger"
+        );
+
+        eng.config.crossover_gate = crate::engine::config::CrossoverGate::Hard;
+        let hard = eng.evolve_crossover_child(3, 0, 1).unwrap();
+        assert!(
+            !hard.survived && hard.detail.contains("rejected by hard gate"),
+            "hard gate rejects under an impossible bar: {}",
+            hard.detail
+        );
+
+        eng.config.crossover_gate = crate::engine::config::CrossoverGate::Off;
+        assert_eq!(eng.current_gate_bar(3), None, "Off draws no bar");
+        let off = eng.evolve_crossover_child(3, 0, 1).unwrap();
+        assert!(
+            off.survived && off.detail.contains("gate off"),
+            "Off catches the child up but never rejects it: {}",
+            off.detail
+        );
+
+        // The knob is replay-relevant and round-trips as `off`.
+        let cfg = crate::engine::config::RaceConfig {
+            crossover_gate: crate::engine::config::CrossoverGate::Off,
+            ..crate::engine::config::RaceConfig::defaults()
+        };
+        let snap = crate::state::ConfigSnapshot::from_config(&cfg, Some(2), Some(2));
+        assert_eq!(snap.crossover_gate, "off");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

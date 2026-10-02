@@ -49,15 +49,19 @@ impl CoreEngine {
         if relevant.is_empty() {
             return None;
         }
-        Some(match self.config.crossover_gate {
-            crate::engine::config::CrossoverGate::Hard => relevant
-                .last()
-                .map(|c| c.pop_mean_fitness)
-                .unwrap_or(f32::NAN),
-            crate::engine::config::CrossoverGate::Soft => {
-                relevant.iter().map(|c| c.pop_mean_fitness).sum::<f32>() / relevant.len() as f32
-            }
-        })
+        match self.config.crossover_gate {
+            // No gate ⇒ no bar to print or compare against.
+            crate::engine::config::CrossoverGate::Off => None,
+            crate::engine::config::CrossoverGate::Hard => Some(
+                relevant
+                    .last()
+                    .map(|c| c.pop_mean_fitness)
+                    .unwrap_or(f32::NAN),
+            ),
+            crate::engine::config::CrossoverGate::Soft => Some(
+                relevant.iter().map(|c| c.pop_mean_fitness).sum::<f32>() / relevant.len() as f32,
+            ),
+        }
     }
 
     /// Run the checkpoint "surprise exam": score every live net on the given

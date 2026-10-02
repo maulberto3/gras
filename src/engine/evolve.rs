@@ -21,6 +21,13 @@ use super::smoothing::RollingBuffer;
 use crate::engine::smoothing::rolling_mean;
 use crate::state::write_net_state;
 
+/// Whether a lineage string names a crossover-born net (`crossover-one-point`,
+/// `crossover-uniform`, …). Founders and random immigrants are not crossover —
+/// they carry the mutation probation window, not the crossover one.
+fn is_crossover_origin(created_from: Option<&str>) -> bool {
+    created_from.is_some_and(|s| s.starts_with("crossover"))
+}
+
 impl CoreEngine {
     /// Fresh empty rolling buffer for a net about to be caught up, so
     /// catch-up's per-step pushes land somewhere — a live net must never be
@@ -135,6 +142,9 @@ impl CoreEngine {
         // AND the gate: a net with no replayed history has nothing to compare
         // against the historical bars — gating off is the only sound reading.
         // It trains from the current clock like a mutation immigrant.
+        // With `crossover_gate = Off` (catch-up still ON), the child replays
+        // the full stream but is never rejected: the gate is isolated from
+        // catch-up so the two effects can be told apart.
         self.pre_insert_buffer(&child.state.hash);
         if !self.config.mode_specific.crossover_catch_up() {
             child.state.step = 0;
@@ -271,6 +281,10 @@ impl CoreEngine {
                     }
                 }
             }
+            crate::engine::config::CrossoverGate::Off => {
+                // No gate: the child is always admitted. `replayed_to` stays 0
+                // so the full replay below runs; `failed_gate` stays None.
+            }
         }
         if let Some((gate_i, gate_step, child_fit, bar)) = failed_gate {
             // "discarded" = the child was rejected by the checkpoint gate and
@@ -305,6 +319,8 @@ impl CoreEngine {
             let (k, n) = match self.config.crossover_gate {
                 crate::engine::config::CrossoverGate::Hard => (gate_i, checkpoint_count),
                 crate::engine::config::CrossoverGate::Soft => (1, 1),
+                // Unreachable: `Off` never sets `failed_gate`.
+                crate::engine::config::CrossoverGate::Off => (1, 1),
             };
             return Ok(RollOutcome::spent(format!(
                 "child {} rejected by {} gate {k}/{n} ({}{:.4} vs bar avg{:.4}, window {checkpoint_count}) → discarded at step {}",
@@ -312,6 +328,7 @@ impl CoreEngine {
                 match self.config.crossover_gate {
                     crate::engine::config::CrossoverGate::Hard => "hard",
                     crate::engine::config::CrossoverGate::Soft => "soft",
+                    crate::engine::config::CrossoverGate::Off => "off",
                 },
                 self.fitness.direction().arrow(),
                 child_fit,
@@ -323,6 +340,18 @@ impl CoreEngine {
         // Passed every gate — finish the replay to the clock, resolve the
         // victim, record the attempt, then cull + insert.
         self.catch_up_range(&mut child, replayed_to, clock)?;
+        // With the gate off nothing was measured mid-replay, so read the
+        // child's post-catch-up fitness once here for the attempt row.
+        if matches!(
+            self.config.crossover_gate,
+            crate::engine::config::CrossoverGate::Off
+        ) {
+            child_fit_at_gate = self
+                .rolling_fitness
+                .get(&child.state.hash)
+                .map(rolling_mean)
+                .unwrap_or(f32::NAN);
+        }
         // Slot eviction per CrossCullPolicy (crossover-only — the immigrant
         // channel has its own fitness-inverse victim selection): Worst =
         // merit-based (default); Random = uniform (diversity-first). In both
@@ -372,12 +401,20 @@ impl CoreEngine {
         // The gate verdict belongs on the SUCCESS line too: what the child
         // scored vs the bar it beat, WHICH gate, and how many bars — the
         // whole admission story, correlated to the `set_crossover_*` knobs.
-        let gate_note = if checkpoint_count > 0 {
+        let gate_note = if matches!(
+            self.config.crossover_gate,
+            crate::engine::config::CrossoverGate::Off
+        ) {
+            // Gate off: there is no bar to beat and no verdict to report.
+            " | gate off (crossover_catch_up=on, always inserted)".to_string()
+        } else if checkpoint_count > 0 {
             let gate_name = match self.config.crossover_gate {
                 crate::engine::config::CrossoverGate::Hard => "hard",
                 crate::engine::config::CrossoverGate::Soft => "soft",
+                crate::engine::config::CrossoverGate::Off => "off",
             };
             let bar = match self.config.crossover_gate {
+                crate::engine::config::CrossoverGate::Off => f32::NAN,
                 crate::engine::config::CrossoverGate::Hard => {
                     // Hard gate: the LAST checkpoint's bar was the final one beaten.
                     relevant
@@ -399,6 +436,7 @@ impl CoreEngine {
             let bars = match self.config.crossover_gate {
                 crate::engine::config::CrossoverGate::Hard => checkpoint_count,
                 crate::engine::config::CrossoverGate::Soft => 1,
+                crate::engine::config::CrossoverGate::Off => 0,
             };
             // The bar's value is TAGGED `avg` (mean of checkpoint means for
             // Soft, the newest recorded mean for Hard — both historical
@@ -778,22 +816,25 @@ impl CoreEngine {
         Ok(weights.last().map(|(h, _)| h.clone()))
     }
 
-    /// Whether `hash` is on mutation probation at `clock`: cull-IMMUNE for
-    /// its first `mutation_probation_steps` clocks (measured from
-    /// `entered_at_step`, which is already persisted — no new state,
-    /// resume-safe). With window 0 nobody is ever on probation (the default
-    /// — only the built-in empty-buffer step-0 immunity remains).
-    /// Probation is a STATUS, not a queue: the net still trains, measures,
-    /// and can rank — it just cannot be a cull VICTIM while fresh.
+    /// Whether `hash` is on probation at `clock`: cull-IMMUNE for its first
+    /// few clocks (measured from `entered_at_step`, which is already persisted
+    /// — no new state, resume-safe). The window depends on HOW the net was
+    /// born: a crossover child uses `crossover_probation_steps`, everything
+    /// else (random immigrants) uses `mutation_probation_steps`. Either window
+    /// at 0 means that channel's fresh nets carry only the built-in
+    /// empty-buffer step-0 immunity (the default). Probation is a STATUS, not a
+    /// queue: the net still trains, measures, and can rank — it just cannot be
+    /// a cull VICTIM while fresh.
     pub(crate) fn on_probation(&self, hash: &str, clock: usize) -> bool {
-        let window = self.config.mutation_probation_steps;
-        if window == 0 {
+        let Some(state) = self.state.net(hash) else {
             return false;
-        }
-        self.state
-            .net(hash)
-            .map(|s| clock.saturating_sub(s.entered_at_step) < window)
-            .unwrap_or(false)
+        };
+        let window = if is_crossover_origin(state.created_from.as_deref()) {
+            self.config.crossover_probation_steps
+        } else {
+            self.config.mutation_probation_steps
+        };
+        window > 0 && clock.saturating_sub(state.entered_at_step) < window
     }
 
     /// The crossover Worst-policy victim: worst by smoothed fitness, with the
