@@ -1,165 +1,57 @@
 # gras
 
-**Neural Architecture Search via a Continuous Step-Race** — a lightweight, high-performance neuroevolution library that evolves neural network topologies in Rust. No rigid generations: all networks train and evaluate synchronously on a shared deterministic stream, with culling and birth happening on every step.
+**Neuroevolution for Rust** — evolve neural-network architectures while they
+train, on one continuous, deterministic stream.
 
-### Why this crate?
+Hand-designing neural architectures is slow, error-prone, and biased. `gras`
+searches that space for you — continuously and reproducibly — and hands back
+a champion you can actually trust.
 
-- **Hand-designing architectures is slow, error-prone, and biased.** `gras` automates discovery: each hidden node evolves its own width, activation, merge operation, and normalization — wired dynamically and evaluated in real time.
-- **Generation boundaries waste compute.** The step-race evolves continuously, so weak candidates are culled the moment they fall behind instead of surviving until the next generation.
-- **Evolution you can trust.** 100% deterministic: the same `run_seed` and config guarantee bit-identical weights, batches, and evolutionary history — and you can resume any run, or any single network, exactly.
+## Why gras?
 
----
+- **Discover architectures — don't hand-design them.** Evolution searches
+  width, activations, merges, and normalization while every candidate keeps
+  learning.
+- **No generation boundaries.** Weak candidates are culled the moment they
+  fall behind, so no network sits idle waiting for a reshuffle.
+- **Reproducible by design.** The same seed replays the entire run — weights,
+  batches, and history — bit for bit.
+- **Your learning loop, our search loop.** Bring your own loss, optimizer,
+  environment, and fitness; the crate owns the search around them.
+- **Results you can trust.** Champions are re-tested on data they never
+  trained on before you rely on them.
 
-## Installation
+## How it works
+
+`gras` runs a continuous step-race: a population of candidate networks trains
+and is evaluated on one shared, seeded stream, and selection happens every
+step rather than at generation boundaries. Weak candidates are culled as soon
+as they fall behind; strong ones hold their place and keep learning; new
+candidates are born continuously. Because the whole run is a pure function of
+its seed, any run replays exactly — and the surviving champion is measured
+against fresh, unseen data at the end.
+
+## Install
 
 ```bash
 cargo add gras
 ```
 
-That's it. For **CUDA** (GPU) support, enable the feature and point flodl at a CUDA libtorch build:
+For **CUDA (GPU)** support, enable the `cuda` feature and point
+`LIBTORCH_PATH` at a CUDA-enabled libtorch build before compiling:
 
 ```bash
 cargo add gras --features cuda
 ```
 
-You'll need a CUDA-enabled libtorch on disk and `LIBTORCH_PATH` (plus CUDA env vars) set before building — `env_setup.sh` in this repo wires it up, or point the vars at your own libtorch install.
+`gras` links against libtorch, so a local CPU or CUDA build is required.
 
-## Quick Start
+## Get started
 
-The examples folder IS the quick start — each one is a complete, runnable
-program with every knob a const or a builder line: edit, `cargo run --release
---example <name>`, done.
+Runnable examples, the full API, and the design notes all live in the
+repository:
 
-Every example exposes the same thin CLI overlay for quick runs: **`--pop` and
-`--max-steps`, nothing else** — a flag wins, otherwise the example's own const
-is used, and every other knob stays a const at the top of the file. `mnist`
-adds `--data-dir`, since it has a real dataset to point at. The one long-run
-example (`kaggle_kagiculture`) keeps the fuller engine surface (`--log-level`,
-`--seed`, `--resume`, the evolution knobs). `--help` lists exactly what that
-binary accepts.
-
-| Example | Mode | What it shows |
-|---|---|---|
-| [`examples/cartpole.rs`](examples/cartpole.rs) | **RL** | The cleanest RL walkthrough: a pure-Rust CartPole env, a REINFORCE trainer (`RlStep`), reported fitness, and the post-race `engine.guardrail(..)` holdout. Start here. |
-| [`examples/mnist.rs`](examples/mnist.rs) | Tabular | The full hand-rolled `TabularStep`: custom loss, custom metric, challenge jitter, real held-out guardrail, full config surface. |
-| [`examples/kaggle_kagiculture.rs`](examples/kaggle_kagiculture.rs) | RL | A multi-minute trainer (self-play matches), the decision-lag relay, log-level discipline. |
-| [`examples/custom_trainer.rs`](examples/custom_trainer.rs) | Tabular | Writing your own `TabularStep` from scratch (SGD + warmup + gated eval). |
-| [`examples/ref_trainer/mod.rs`](examples/ref_trainer/mod.rs) | Tabular | The classic Adam recipe as an EXAMPLE-owned module the other examples/benches share — the library ships no scheme. |
-| [`examples/continuous.rs`](examples/continuous.rs) | Tabular | Regression targets (`Direction::Minimize`, MSE), synthetic data generation. |
-
-The shape is always the same, whatever the mode: **your closures → a config →
-a `RunSpec` → `engine.run()`**. The spec variant you pick
-(`RunSpec::tabular` vs `RunSpec::rl`) IS the mode declaration — wrong
-flavor combinations are compile errors, not runtime surprises.
-
-The one conceptual split to internalize before reading: the engine owns the
-**when/who** of racing (population, culls, gates, freezes, artifacts — all in
-`RaceConfig`); you own the **what** of learning (loss, optimizer, environment,
-fitness definition — all in your trainer). Nothing training-related exists on
-`RaceConfig`.
-
-## Evolution model
-
-Two replacement channels, strictly separated:
-
-- **Crossover (exploit):** fires with `crossover_prob`; recombines two live nets and inserts the child only if it clears the checkpoint gate. A failed or not-fired roll is simply **spent** — nothing is inserted.
-- **Mutation (explore):** fires with `mutate_prob`; inserts a completely fresh random immigrant (no gate), culling a fitness-inverse-selected net. This is the **only** path random whole nets enter through.
-
-The only built-in stop budget is `max_steps` (`max_target_fitness` was deleted — a quality bar nobody knows in advance). Add `set_stop_custom(fn)` for an extra criterion layered on top.
-
-A few knobs worth knowing from step one:
-
-- **Elite freeze (act-and-measure):** the top-`elite_count` nets keep their crowns but keep MEASURING — each clock a frozen elite plays its normal step with weights frozen (fresh fitness recorded through a no-op optimizer), so a declining champion is dethroned by rank, not by a bad luck streak. A dethroned elite resumes training with its last optimizer state — nothing was stale while it was frozen.
-- **Crossover gate:** a child must beat the population's recorded checkpoint means before it takes a slot — `Hard` (every bar) or `Soft` (their mean), optionally limited to the last `k` checkpoints via `set_crossover_gate_window(k)` so a long run's bars stay local to the current era.
-- **Mutation probation:** `set_mutation_probation_steps(k)` makes a fresh immigrant cull-immune for its first `k` clocks — time to draw its architecture-lottery ticket before the fitness roulette can claim it.
-- **Guardrail:** after the race, `gras::engine::guardrail::check_champion` reloads the champion's trained weights and scores it on fresh holdout games through your `ChampionScorer` — the honesty check that the race fitness wasn't batch luck.
-
-## Run modes
-
-`RunSpec` has one variant per mode, each self-contained — and the trainer trait is split to match, so a wrong flavor combination is a **compile error**, not a runtime surprise:
-
-- **`TabularEngine` + `RunSpec::tabular(..)`:** dataset + `Fitness::new(scorer, ..)` + a `TabularStep` trainer — the engine loads the data, draws batches, and scores `(pred, target)` itself. A tabular trainer implements `TabularStep`: it owns a **required** loss (`fn loss()`), may shape the shared batch stream (`stream_shape`), and receives data via `TabularContext`.
-- **`RlEngine` + `RunSpec::rl(..)` (RL / environment):** **no dataset**. The trainer implements `RlStep` — there is **no loss method at all**: the training signal lives inside `train_step`, the trainer drives its own environment and reports the ranking scalar in `StepReport.fitness`; the fitness must be `Fitness::reported(direction, label)`. `RlContext` carries no data. (Typed-spec alternative: `RLSpec{..}` → `RlEngine::from_rl_spec`; tabular mirror `TabularSpec` → `from_tabular_spec`. See OPTIONS.md §7.)
-- Both mode traits extend `StepTrainer` (`make_optimizer`, `describe`). The engine dispatches through a per-mode `ModeAdapter` — a tabular step always carries data, an RL step never does.
-- **The library ships the contract only.** No concrete trainer is exported: you bring your own (MNIST hand-rolls one; `examples/ref_trainer/` is the shared example copy).
-- **`use gras::prelude::*;`** covers the common surface in one line — engine entry points, `Fitness`/`Direction`, the trainer contracts and their reports, the batch stream, `Network`/`Topology`, and the config enums an example actually touches. Niche paths stay explicit: `gras::engine::config` for the full knob surface, `gras::utils::*` for data/score/step helpers, `gras::flodl::tensor::Result` for the tensor result type.
-
-Evolution (crossover, mutation, gates, culls) is identical in both modes.
-
-## Log levels
-
-Set once per run via the config builder: `.set_run_log_level(LogLevel::…)`.
-
-| Level | What you see per step | Use it when |
-|---|---|---|
-| `Summ` **(default)** | One compact line at the **end** of each step — `step N │ pop K │ train_loss↓ mean±std │ eval_loss↓ … │ fitness↑ … │ took …s` — plus one line per evolution roll that fired (crossover attempts/inserts, mutation immigrants, culls), plus start/stop/checkpoint/elite-save lines. Printed last on purpose: the summary stays at the bottom of the terminal. | Watching a run live; the everyday default. |
-| `Minimal` | One **boxed vitals table** (from step 2 on), redrawn **in place** on a terminal — population means with deltas vs last step, evolve counters (culls, inserts, crossover attempted/passed/gated, mutation), and the elite seats. **No other lines** — no per-roll detail, no start/checkpoint chatter. Off a terminal (piped to a file) each frame prints plainly, with no escape codes. | Long runs on one terminal; the numbers move, the shape doesn't. |
-| `None` | Nothing per step. Only the run-start line and the final stop reason. | Power users who parse `engine.json`, the CSV logs, and the artifacts instead of watching the stream; fastest I/O path. |
-
-The middle column of that line is mode-dependent: **Tabular** reports the
-held-out `eval_loss`; **RL** has no eval batch, so it reports the step's
-environment volume instead — `matches N │ train N │ eval N │ turns/match N`,
-summed over the live population (each RL trainer reports it in
-`StepReport.rl`). That is what explains a step that took minutes.
-
-Train and eval turns are listed apart on purpose: the anti-plateau challenge
-can only force **train** matches, so the `⚔` cell reads
-`⚔ <observed> (exp <p_chall × train turns>)` — the denominator for judging the
-trigger is the train column, never the total.
-
-Everything the log shows (and more) is recorded losslessly in the CSV
-logs — `history.csv` (one row per step with losses/fitness/metrics) and
-`attempts.csv` (one row per evolution attempt: branch, outcome, child,
-gate, bar, victim) — plus `nets/<hash>.json`. The log is a view, the
-files are the record.
-
-Three step-line extras worth decoding:
-- **`★ <hash> <hash> …`** — the *freeze crown* (only with `--freeze-elites`):
-  the nets currently holding elite seats, i.e. skipping training. It follows
-  RANK, so names churn as fitness moves — it is not the population or the
-  survivor list.
-- **`frozen@N`** (final-elites listing) — the last step at which the net
-  held/won a crown seat.
-- **`<hash> dethroned (seat → …) — resumes training…`** — a net that lost its freeze
-  crown goes back to normal stepping with a weight update. While frozen it
-  ACTED and MEASURED every clock (fresh fitness recorded through a no-op
-  optimizer — weights frozen, standing honest), so it never fell behind and
-  no catch-up is needed. A declining net's collapsed fitness up-weights it
-  in the ordinary cull roulette.
-- **`stepped 5/6 │ frozen (act+measure, no update): <hash> …`** — who
-  trained this clock and who was skipped as a frozen elite (freeze runs
-  only).
-
-Note: the `--log-level` CLI flag (on `kaggle_kagiculture`, the example that
-keeps the full engine flag surface) is a *different* axis — it sets the
-env_logger verbosity filter (`info`/`debug`/…), not the engine's line shape
-above.
-The engine's own names are accepted there too (`--log-level summ` / `minimal`
-/ `none`), mapped onto the verbosity that lets those lines through.
-
-### Run telemetry (`telemetry.jsonl`)
-
-Logging is `tracing`-based: one event stream, three sinks — the console
-(stderr, `LogLevel`-filtered), the `Minimal` frame (stdout, redrawn in place),
-and the telemetry file. `.set_run_trace_file(true)` writes
-`<run_dir>/telemetry.jsonl`: one JSON record per engine event at full fidelity
-(debug included), **not** filtered by the console's `LogLevel`. Off by default.
-
-The engine owns that file, so it lands in the run dir and travels with the run;
-the start-up block is buffered until the dir exists, then flushed in place —
-the seam loses nothing. Pair it with `LogLevel::None` for a run that is silent
-on the console but fully recorded.
-
-Consumers still on `env_logger`/`RUST_LOG` keep seeing every line: `tracing`
-mirrors its events into `log`, so nothing breaks until you opt into a
-subscriber.
-
-## Learn more
-
-- [STDIO_BRIDGE.md](STDIO_BRIDGE.md) — the stdin/stdout two-language bridge trick, with examples beyond kagiculture (including why Rust plays parent)
-- [OPTIONS.md](OPTIONS.md) — every engine option and its default
-- [AGENTS.md](AGENTS.md) — repo conventions (also useful to humans: example layout, trainer contract, engine lifecycle)
-- [TODO.md](TODO.md) — plan of record for open work
+**https://github.com/maulberto3/gras** · API docs: **https://docs.rs/gras**
 
 ## License
 

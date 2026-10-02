@@ -519,7 +519,7 @@ fn main() {
         .set_crossover_rolls(pop / 2)
         .set_crossover_ops_pool(["one_point", "uniform"])
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
-        .set_crossover_catch_up(true)
+        .set_crossover_catch_up(false)
         .set_crossover_gate(CrossoverGate::Soft)
         .set_crossover_gate_window(5)
         .set_mutate_prob(0.5)
