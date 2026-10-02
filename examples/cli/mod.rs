@@ -293,8 +293,9 @@ impl EngineArgs {
             b = b.set_crossover_gate(match mode.trim().to_ascii_lowercase().as_str() {
                 "hard" => gras::engine::config::CrossoverGate::Hard,
                 "soft" => gras::engine::config::CrossoverGate::Soft,
+                "off" => gras::engine::config::CrossoverGate::Off,
                 other => {
-                    eprintln!("--crossover-gate {other}: expected `hard` or `soft`");
+                    eprintln!("--crossover-gate {other}: expected `hard`, `soft`, or `off`");
                     std::process::exit(2);
                 }
             });

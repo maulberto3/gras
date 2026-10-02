@@ -217,7 +217,7 @@ impl CartPoleTrainer {
         let mut flat = Vec::with_capacity(total * 4);
         let mut mask = vec![0.0f32; total * 2];
         let mut returns = Vec::with_capacity(total);
-        // eli5: returns are the remaining survival steps for each transition. 
+        // eli5: returns are the remaining survival steps for each transition.
         for (offset, survival) in matches {
             for t in 0..*survival {
                 let i = offset + t;
@@ -520,12 +520,14 @@ fn main() {
         .set_crossover_ops_pool(["one_point", "uniform"])
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
         .set_crossover_catch_up(false)
-        .set_crossover_gate(CrossoverGate::Soft)
+        // .set_crossover_gate(CrossoverGate::Soft)
         .set_crossover_gate_window(5)
+        .set_crossover_probation_steps(5)
+        .set_elite_probation_steps(5)
         .set_mutate_prob(0.5)
         .set_mutate_rolls(pop / 10)
         .set_mutation_catch_up(false)
-        .set_mutation_cull_policy(MutationCullPolicy::InverseFitness)
+        .set_mutation_cull_policy(MutationCullPolicy::Worst)
         .set_mutation_probation_steps(5)
         .set_elite_guardrail_matches(HOLDOUT_MATCHES)
         .set_topology_dropout_prob(DROPOUT_PROB)
@@ -565,8 +567,9 @@ fn main() {
         .set_topology_standardize_op_pool(["Identity", "LayerNorm", "RmsNorm", "InstanceNorm"])
         .set_elite_freeze(true)
         .set_elite_count(pop / 10)
+        // .set_elite_probation_steps(5)
         .set_elite_save_topology(true)
-        .set_elite_save_safetensors(false)
+        .set_elite_save_safetensors(true)
         .set_elite_checkpoint_weights(false)
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(false)
