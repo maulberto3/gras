@@ -70,11 +70,10 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
     // fan-in is merged by the combine op). Drawing the port once made those
     // wires share a column and split ambiguously — a `> ` with three wires
     // leaving it read as one signal, not three. Instead each wire gets its
-    // OWN slot, labelled with its port index plus a suffix letter when the
-    // port is shared (`o1a o1b` = two wires off output 1), so every
-    // `>`/`<` marker maps to exactly one wire and the text diagram matches
-    // the mermaid edge list visually. A port with no wires still gets one
-    // slot (an orphan `*`).
+    // OWN slot, labelled with its port index (a shared port's label simply
+    // repeats: `o1 o1` = two wires off output 1), so every `>`/`<` marker
+    // maps to exactly one wire and the text diagram matches the mermaid edge
+    // list visually. A port with no wires still gets one slot (an orphan `*`).
     let mut out_slots: Vec<Vec<(usize, Option<usize>)>> = Vec::with_capacity(nodes.len());
     let mut in_slots: Vec<Vec<(usize, Option<usize>)>> = Vec::with_capacity(nodes.len());
     let mut src_slot = vec![0usize; connections.len()];
@@ -113,26 +112,11 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         }
         in_slots.push(slots);
     }
-    // Slot labels: `o<port>` for a lone wire, `o<port><letter>` when the
-    // port carries several (`o1a o1b`) — every wire's marker pair is then
-    // uniquely named. Suffix runs a, b, c… (numeric fallback past 26).
+    // Slot labels: each wire is labelled with its PORT index, so a port that
+    // carries several wires shows its label repeated (`o1 o1` = two wires off
+    // output 1). One marker per wire — the repeat IS the fan-out.
     let slot_labels = |prefix: char, ports: &[usize]| -> Vec<String> {
-        let mut labels = Vec::with_capacity(ports.len());
-        for (q, &p) in ports.iter().enumerate() {
-            let total = ports.iter().filter(|&&x| x == p).count();
-            if total <= 1 {
-                labels.push(format!("{prefix}{p}"));
-            } else {
-                let idx = ports[..q].iter().filter(|&&x| x == p).count();
-                let suffix = if idx < 26 {
-                    ((b'a' + idx as u8) as char).to_string()
-                } else {
-                    format!("{idx}")
-                };
-                labels.push(format!("{prefix}{p}{suffix}"));
-            }
-        }
-        labels
+        ports.iter().map(|p| format!("{prefix}{p}")).collect()
     };
     let out_labels: Vec<Vec<String>> = out_slots
         .iter()
@@ -285,14 +269,14 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         for (k, ch) in labels[i].chars().enumerate() {
             put(&mut canvas, r0, indent + k, ch);
         }
-        // One label per incoming WIRE (`i0`, or `i0a i0b` when shared).
+        // One label per incoming WIRE (`i0 i0` when the port is shared).
         for (q, label) in in_labels[i].iter().enumerate() {
             let c = in_col(q);
             for (k, ch) in label.chars().enumerate() {
                 put(&mut canvas, r0 + 1, c + k, ch);
             }
         }
-        // One label per outgoing WIRE (`o0`, or `o1a o1b` when shared).
+        // One label per outgoing WIRE (`o1 o1` when the port is shared).
         for (q, label) in out_labels[i].iter().enumerate() {
             let c = out_col(q);
             for (k, ch) in label.chars().enumerate() {
