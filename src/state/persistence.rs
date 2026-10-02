@@ -123,10 +123,23 @@ pub struct ConfigSnapshot {
     #[serde(default = "default_true")]
     pub elite_checkpoint_weights: bool,
     /// Mutation probation steps (`set_mutation_probation_steps`):
-    /// cull-immunity for a net's first k clocks. Replay-relevant — it changes
-    /// WHICH nets get culled, so a resumed run must use the same window.
+    /// cull-immunity for a random immigrant's first k clocks. Replay-relevant
+    /// — it changes WHICH nets get culled, so a resumed run must use the same
+    /// window.
     #[serde(default)]
     pub mutation_probation_steps: usize,
+    /// Crossover probation steps (`set_crossover_probation_steps`):
+    /// cull-immunity for a crossover child's first k clocks. Replay-relevant —
+    /// it changes WHICH nets get culled, so a resumed run must use the same
+    /// window.
+    #[serde(default)]
+    pub crossover_probation_steps: usize,
+    /// Elite probation steps (`set_elite_probation_steps`): a net cannot
+    /// become an elite (frozen crown or cull guard) until it has aged k
+    /// clocks. Replay-relevant — it changes WHO freezes and WHO is guarded,
+    /// hence who trains, so a resumed run must use the same window.
+    #[serde(default)]
+    pub elite_probation_steps: usize,
     /// Anti-plateau challenge probability (`set_run_challenge_prob`):
     /// per-step, per-net chance a challenged step fires. Replay-relevant —
     /// the trigger is re-derived from (run_seed, net_seed, step) on replay,
@@ -197,6 +210,8 @@ impl ConfigSnapshot {
             run_topology_count: cfg.run_topologies.len(),
             elite_checkpoint_weights: cfg.elite_checkpoint_weights,
             mutation_probation_steps: cfg.mutation_probation_steps,
+            crossover_probation_steps: cfg.crossover_probation_steps,
+            elite_probation_steps: cfg.elite_probation_steps,
             challenge_prob: cfg.challenge_prob,
             challenge_decay: cfg.challenge_decay,
             guardrail_matches: cfg.guardrail_matches,
