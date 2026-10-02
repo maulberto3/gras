@@ -83,17 +83,11 @@ pub(crate) fn fmt_opt2(v: &Option<f32>) -> String {
 /// - `avg` — average of checkpoint means (gate bars, population ledger
 ///   rollups); a historical aggregate, not this step's signal.
 /// - bare — raw last-step value (a single measurement, no tag).
-/// `fmt2_*` pairs each tag with the 2-decimal console rounding of `fmt2`.
+/// Tags are written inline in the log format string (`smt{:.2}`, `avg{:.4}`,
+/// …) so each site picks its own precision; `fmt2_smt` is for sites that
+/// build the tagged value as a `String` before splicing it in.
 pub(crate) fn fmt2_smt(v: f32) -> String {
     format!("smt{:.2}", v)
-}
-
-pub(crate) fn fmt2_avg(v: f32) -> String {
-    format!("avg{:.2}", v)
-}
-
-pub(crate) fn fmt2_raw(v: f32) -> String {
-    format!("raw{:.2}", v)
 }
 
 /// RFC4180-quote a CSV field when it holds a delimiter, quote, or newline.

@@ -122,6 +122,11 @@ impl CoreEngine {
         self.pruner_solo_active = true;
         for offset in 0..pruner.steps {
             let step = clock + 1 + offset;
+            // FREEZE BYPASS: refresh the crown (which CLEARS it while
+            // `pruner_solo_active`) so no stale race-phase crown membership
+            // can make a survivor act-and-measure. Every solo step is a real
+            // trained step.
+            self.refresh_crown(step);
             // Solo steps evolve nothing: both per-step accumulators start
             // clean, so the rollup reports this step's own RL volume and the
             // (already logged) pruner culls are not re-counted every step.

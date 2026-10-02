@@ -19,10 +19,9 @@
 //! update).
 
 use flodl::tensor::Result;
-use tracing::info;
 
 use super::core::{CoreEngine, NoopOptimizer};
-use super::format::{fmt_opt2, fmt2, fmt2_raw, fmt2_smt};
+use super::format::{fmt_opt2, fmt2};
 use crate::state::NetMetrics;
 #[cfg(debug_assertions)]
 use crate::utils::race_steps::eval_one_step;
@@ -38,177 +37,19 @@ impl CoreEngine {
     /// carries forward. **Not rebuilt each step** (that would lose optimizer
     /// state and forget prior training).
     pub(crate) fn step_one_net(&mut self, hash: &str, clock: usize) -> Result<()> {
-        // ANTI-DEVOLUTION A — elite freeze (computed BEFORE the optimizer
-        // borrow): top-k nets skip the trainer call entirely. Their skill is
+        // ANTI-DEVOLUTION A — elite freeze: the crown (the take-k elite set,
+        // recomputed at group-step start in core.rs — see the "KISS crown"
+        // block there) holds the nets that skip the trainer update this
+        // step. Membership and its freeze/dethrone LINES were settled before
+        // the loop; this function only obeys the membership. Their skill is
         // the frozen state, so the "report" is the last recorded metrics —
         // re-measuring would require re-running the trainer, which is
         // exactly what we're skipping. Scoring, ranking, parent selection
         // all proceed as normal off the carried metrics.
         // The pruner phase bypasses freeze entirely: it keeps ONLY elites,
         // so with freeze active every solo step would be a no-op-optimizer
-        // act-and-measure and the post-race workout would train nothing
-        // (plus every crown flip would fire the dethrone optimizer reset,
-        // repeatedly erasing the survivor's momentum).
-        // EFFICIENCY NOTE (Tier 1 — one ranking per net, not four): the
-        // elite set is a full O(n log n) sort of the population, and this
-        // runs once per NET per step — computing it inline in each check
-        // below would make the step O(n² log n) and allocate a String per
-        // `contains`. Compute once, borrow for all four uses (freeze check,
-        // seat count, seat position, taker pick).
-        let elite_set = self.elite_hashes();
-        let frozen = !self.pruner_solo_active
-            && self.config.freeze_elites
-            && elite_set.iter().any(|e| e == hash);
-        if frozen && !self.frozen_crown.contains(hash) {
-            // Crown transition: this net newly joined the frozen set (first
-            // crowning or a child trained past a frozen elite). One info
-            // line, only on the transition; stable steps are silent (the ★
-            // badge on the rollup line carries the state).
-            let fitness = self
-                .state
-                .net(hash)
-                .and_then(|s| s.last_metrics.as_ref().map(|m| m.fitness));
-            let seat = elite_set.len();
-            let pos = elite_set
-                .iter()
-                .position(|h| h == hash)
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            // Freeze-line extras (value + brevity): the net's AGE (steps lived
-            // in the run — a hot newcomer vs a long-standing champion) and its
-            // parameter estimate (search-space signal). `—` placeholders keep
-            // the line shape stable when a value is unavailable.
-            let age = self
-                .state
-                .net(hash)
-                .map(|s| clock.saturating_sub(s.entered_at_step));
-            let params = self
-                .networks
-                .get(hash)
-                .map(|n| n.topology_blueprint().param_estimate());
-            let extras = format!(
-                ", age {}, {}p",
-                age.map(|a| a.to_string()).unwrap_or_else(|| "—".into()),
-                params.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
-            );
-            if seat == 1 {
-                // Single-elite wording (the common case): crown moves as one.
-                // Fitness figures are TAGGED (fmt2_smt/raw): smoothed means
-                // rank, raw last-step numbers display — never print one where
-                // the reader expects the other (see format.rs).
-                if self.frozen_crown.is_empty() {
-                    info!(
-                        "step {} │ freeze │ champion {} crowned (fitness{} {}{}) — w paused (a+m continues)",
-                        clock,
-                        &hash[..8.min(hash.len())],
-                        self.fitness.direction().arrow(),
-                        fitness.map(fmt2_raw).unwrap_or_else(|| "—".into()),
-                        extras,
-                    );
-                } else {
-                    let prev = self.frozen_crown.iter().next().cloned().unwrap_or_default();
-                    info!(
-                        "step {} │ freeze │ crown moved {} → {} (fitness{} {}{}) — previous champion resumes w updates",
-                        clock,
-                        &prev[..8.min(prev.len())],
-                        &hash[..8.min(hash.len())],
-                        self.fitness.direction().arrow(),
-                        fitness.map(fmt2_raw).unwrap_or_else(|| "—".into()),
-                        extras,
-                    );
-                }
-            } else {
-                // Multi-elite: say WHICH seat the net just took. No
-                // "crown moved" language — with k seats, one joining does
-                // not imply another was dethroned.
-                info!(
-                    "step {} │ freeze │ elite seat {pos}/{seat}: {} frozen (fitness{} {}{}) — w paused (a+m continues)",
-                    clock,
-                    &hash[..8.min(hash.len())],
-                    self.fitness.direction().arrow(),
-                    fitness.map(fmt2_raw).unwrap_or_else(|| "—".into()),
-                    extras,
-                );
-            }
-            self.frozen_crown.insert(hash.to_string());
-        }
-        // A net that LOST the crown (it sits in `frozen_crown` but is no
-        // longer in the elite set) simply resumes normal stepping: frozen
-        // nets ACT and MEASURE every step (below), so they never fall behind
-        // the clock — there is no catch-up gauntlet on dethrone.
-        if !frozen && self.frozen_crown.contains(hash) {
-            self.frozen_crown.remove(hash);
-            // Bookkeeping only in the pruner phase: freeze is bypassed there
-            // by design, so every survivor would otherwise print a
-            // "dethroned" line on its first solo step — nothing dethroned it.
-            if !self.pruner_solo_active {
-                // Rank delta (was-rank → now-rank) instead of naming a
-                // "successor": with k seats the set just re-dealt, so no
-                // single net took THIS net's place — the delta says what
-                // actually happened (how far the net fell, or that the pack
-                // shrank around it).
-                let old_rank = {
-                    // Rank AT FREEZE TIME: elite membership when this net was
-                    // frozen, reconstructed from the current elite set minus
-                    // itself is wrong if the set changed since — the honest
-                    // figure is its live ranking position (direction-aware,
-                    // same sort `elite_hashes` uses) at dethrone moment.
-                    // `?` → the net left the state entirely; skip the delta.
-                    self.rank_position(hash).map(|r| r.to_string())
-                };
-                // Say WHO is elite now (first surviving elite) plus BOTH
-                // fitnesses — both SMOOTHED, so the gap is a fair comparison:
-                // the dethroned net's last smoothed value (what the ranking
-                // saw) vs the taker's smoothed value. (Previously this printed
-                // loser-RAW vs taker-smoothed — an apples-to-oranges gap.)
-                let taker = elite_set
-                    .iter()
-                    .find(|h| *h != hash)
-                    .cloned()
-                    .unwrap_or_default();
-                // The loser's smoothed value (its last_metrics figure is the
-                // RAW step; ranking read the rolling mean).
-                let fit = self.smoothed_fitness_of(hash);
-                let taker_fit = if taker.is_empty() {
-                    None
-                } else {
-                    self.smoothed_fitness_of(&taker)
-                };
-                let rank_txt = match old_rank {
-                    Some(r) => format!("rank {r} → out, "),
-                    None => String::new(),
-                };
-                let gap_txt = match (fit, taker_fit) {
-                    (Some(a), Some(b)) => format!(
-                        ", fitness {} {} → {} {}",
-                        self.fitness.direction().arrow(),
-                        fmt2_smt(a),
-                        self.fitness.direction().arrow(),
-                        fmt2_smt(b)
-                    ),
-                    (Some(a), None) => {
-                        format!(
-                            ", fitness{} {}",
-                            self.fitness.direction().arrow(),
-                            fmt2_smt(a)
-                        )
-                    }
-                    _ => String::new(),
-                };
-                info!(
-                    "step {} │ freeze │ {} dethroned ({}seat → {}{}) — resumes w updates, opt-state intact (no catch-up needed)",
-                    clock,
-                    &hash[..8.min(hash.len())],
-                    rank_txt,
-                    if taker.is_empty() {
-                        "?".to_string()
-                    } else {
-                        taker[..8.min(taker.len())].to_string()
-                    },
-                    gap_txt,
-                );
-            }
-        }
+        // act-and-measure and the post-race workout would train nothing.
+        let frozen = self.frozen_crown.contains(hash);
         if frozen {
             // ACT-AND-MEASURE freeze: the elite plays its normal step against
             // the current clock (fresh batch / fresh env matches — the fitness

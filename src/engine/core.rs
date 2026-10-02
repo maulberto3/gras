@@ -1184,6 +1184,10 @@ impl CoreEngine {
                 info!("race: population empty — stopping");
                 return Ok(StopReason::MaxSteps);
             }
+            // 1-pre. KISS crown: the crown IS the elite take(k) set,
+            // recomputed fresh every step (see refresh_crown — membership
+            // diffs print the freeze/dethrone lines up front).
+            self.refresh_crown(clock);
             // 1a. pop-wide phase (RL only): hand the trainer the whole live
             // population ONCE per step, before any per-net step. Pop-level
             // schemes (pop-mean action anchors, distillation) build their
@@ -1626,6 +1630,114 @@ impl CoreEngine {
             .collect();
         ranked.sort_by(|a, b| direction.cmp(b.1, a.1));
         ranked.into_iter().take(k).map(|(h, _)| h).collect()
+    }
+
+    /// KISS crown refresh (the FREEZE-ELITES model, in one place): the crown
+    /// IS the elite take(k) set, recomputed fresh EVERY step — nothing is
+    /// ever "held" or "occupying a seat". The membership diff against last
+    /// step's set prints exactly one freeze line per net ENTERING and one
+    /// dethrone line per net LEAVING, up front on that step; a net that holds
+    /// rank is silent. With freeze OFF (or in the pruner solo phase, which
+    /// bypasses freeze by design) the crown stays empty and this no-ops.
+    /// Called at group-step start in `run()`; tests call it directly.
+    pub(crate) fn refresh_crown(&mut self, clock: usize) {
+        if !self.config.freeze_elites || self.pruner_solo_active {
+            self.frozen_crown.clear();
+            return;
+        }
+        let new_crown: std::collections::HashSet<String> =
+            self.elite_hashes().into_iter().collect();
+        let mut entering: Vec<String> = new_crown
+            .iter()
+            .filter(|h| !self.frozen_crown.contains(*h))
+            .cloned()
+            .collect();
+        let mut leaving: Vec<String> = self
+            .frozen_crown
+            .iter()
+            .filter(|h| !new_crown.contains(*h))
+            .cloned()
+            .collect();
+        // Print order: seats then exits, each in rank order — the log reads
+        // as one deal of the crown, not k scattered events.
+        entering.sort_by(|a, b| {
+            self.rank_position(a)
+                .unwrap_or(usize::MAX)
+                .cmp(&self.rank_position(b).unwrap_or(usize::MAX))
+        });
+        leaving.sort();
+        let seat = new_crown.len();
+        for h in &entering {
+            let pos = self.rank_position(h).unwrap_or(0);
+            let fit = self.smoothed_fitness_of(h);
+            let age = self
+                .state
+                .net(h)
+                .map(|s| clock.saturating_sub(s.entered_at_step));
+            let params = self
+                .networks
+                .get(h)
+                .map(|n| n.topology_blueprint().param_estimate());
+            let extras = format!(
+                ", age {}, {}p",
+                age.map(|a| a.to_string()).unwrap_or_else(|| "—".into()),
+                params.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
+            );
+            info!(
+                "step {} │ freeze │ elite seat {pos}/{seat}: {} frozen (fitness{} {}{}) — w paused (a+m continues)",
+                clock,
+                &h[..8.min(h.len())],
+                self.fitness.direction().arrow(),
+                fit.map(crate::engine::format::fmt2_smt)
+                    .unwrap_or_else(|| "—".into()),
+                extras,
+            );
+        }
+        for h in &leaving {
+            // Rank delta + smoothed-vs-smoothed gap to the current best
+            // surviving elite (display only — the set re-dealt, no single
+            // net "took" the seat).
+            let old_rank = self.rank_position(h).map(|r| r.to_string());
+            let taker = new_crown.iter().next().cloned().unwrap_or_default();
+            let fit = self.smoothed_fitness_of(h);
+            let taker_fit = if taker.is_empty() {
+                None
+            } else {
+                self.smoothed_fitness_of(&taker)
+            };
+            let rank_txt = match old_rank {
+                Some(r) => format!("rank {r} → out, "),
+                None => String::new(),
+            };
+            let gap_txt = match (fit, taker_fit) {
+                (Some(a), Some(b)) => format!(
+                    ", fitness {} {} → {} {}",
+                    self.fitness.direction().arrow(),
+                    crate::engine::format::fmt2_smt(a),
+                    self.fitness.direction().arrow(),
+                    crate::engine::format::fmt2_smt(b)
+                ),
+                (Some(a), None) => format!(
+                    ", fitness{} {}",
+                    self.fitness.direction().arrow(),
+                    crate::engine::format::fmt2_smt(a)
+                ),
+                _ => String::new(),
+            };
+            info!(
+                "step {} │ freeze │ {} dethroned ({}seat → {}{}) — resumes w updates, opt-state intact (no catch-up needed)",
+                clock,
+                &h[..8.min(h.len())],
+                rank_txt,
+                if taker.is_empty() {
+                    "?".to_string()
+                } else {
+                    taker[..8.min(taker.len())].to_string()
+                },
+                gap_txt,
+            );
+        }
+        self.frozen_crown = new_crown;
     }
 
     /// The net's 1-based rank among ALL live nets (not just the elite seats)
@@ -2454,6 +2566,7 @@ mod tests {
             frozen: false,
         };
         eng.state.record_step(&hs[1], m).unwrap();
+        eng.refresh_crown(5);
         eng.step_one_net(&hs[1], 5).unwrap();
         assert!(eng.frozen_crown.contains(&hs[1]));
         assert_eq!(
@@ -2480,7 +2593,7 @@ mod tests {
             frozen: false,
         };
         eng.state.record_step(&hs[0], m2).unwrap();
-        eng.step_one_net(&hs[0], 7).unwrap();
+        eng.refresh_crown(7);
         assert!(eng.frozen_crown.contains(&hs[0]), "crown moved to A");
         // B's next step is a NORMAL train step at the current clock — one
         // clock past its last acted clock (no catch-up replay span).
@@ -2529,7 +2642,7 @@ mod tests {
         // Net B (lower smoothed = fitter under Minimize) is the freeze target.
         eng.rolling_fitness.get_mut(&hs[1]).unwrap().push(0.1);
         assert_eq!(eng.elite_hashes(), vec![hs[1].clone()]);
-        // First frozen step: crown set (info line "champion crowned" fires).
+        // First frozen step: crown set (info line "elite seat" fires).
         let m = crate::state::NetMetrics {
             step: 3,
             train_loss: 0.0,
@@ -2539,13 +2652,14 @@ mod tests {
             frozen: false,
         };
         eng.state.record_step(&hs[1], m).unwrap();
-        eng.step_one_net(&hs[1], 5).unwrap();
+        eng.refresh_crown(5);
         assert!(eng.frozen_crown.contains(&hs[1]));
-        // Second frozen step, same champion: NO transition — crown unchanged.
-        eng.step_one_net(&hs[1], 6).unwrap();
+        // Second refresh, same champion: NO transition — crown unchanged and
+        // no new line would print (membership diff is empty).
+        eng.refresh_crown(6);
         assert!(eng.frozen_crown.contains(&hs[1]));
         // Crown migration: net A trains past the frozen champion, becomes
-        // elite (and thus frozen) — crown moves ("crown moved" line fires).
+        // elite — the diff moves the crown ("elite seat" + "dethroned" pair).
         eng.rolling_fitness.get_mut(&hs[0]).unwrap().push(0.05);
         let m2 = crate::state::NetMetrics {
             step: 6,
@@ -2556,10 +2670,14 @@ mod tests {
             frozen: false,
         };
         eng.state.record_step(&hs[0], m2).unwrap();
-        eng.step_one_net(&hs[0], 7).unwrap();
+        eng.refresh_crown(7);
         assert!(
             eng.frozen_crown.contains(&hs[0]),
             "crown moved to the new champion"
+        );
+        assert!(
+            !eng.frozen_crown.contains(&hs[1]),
+            "old champion left the crown in the same deal"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
