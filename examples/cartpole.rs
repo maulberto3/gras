@@ -83,11 +83,9 @@ impl CartPole {
 
 const RUN_SEED: u64 = 42;
 const HOLDOUT_SEED: u64 = 2;
-const HOLDOUT_MATCHES: usize = 10;
 const LEARNING_RATE: f32 = 1e-3;
 const DROPOUT_PROB: f32 = 0.25;
 const GRAD_CLIP: f32 = 2.0;
-const LOG_LEVEL: LogLevel = LogLevel::Summ;
 
 /// Pure function of (net_seed, step, match_i) — the replay-determinism
 /// contract for RL resume.
@@ -219,6 +217,7 @@ impl CartPoleTrainer {
         let mut flat = Vec::with_capacity(total * 4);
         let mut mask = vec![0.0f32; total * 2];
         let mut returns = Vec::with_capacity(total);
+        // eli5: returns are the remaining survival steps for each transition. 
         for (offset, survival) in matches {
             for t in 0..*survival {
                 let i = offset + t;
@@ -227,8 +226,11 @@ impl CartPoleTrainer {
                 returns.push((*survival - t) as f32);
             }
         }
+        // eli5: the baseline is the average return across all transitions.
         let baseline = returns.iter().sum::<f32>() / returns.len() as f32;
+        // eli5: the advantages are the returns minus the baseline.
         let advantages: Vec<f32> = returns.iter().map(|g| g - baseline).collect();
+        // eli5: the standard deviation of the advantages, used for scaling to unit variance.
         let adv_std =
             (advantages.iter().map(|a| a * a).sum::<f32>() / advantages.len() as f32).sqrt();
         let scale = 1.0 / adv_std.max(1e-6);
@@ -238,16 +240,31 @@ impl CartPoleTrainer {
             Tensor::from_f32(&flat, &[total as i64, 4], self.device)?,
             true,
         );
+        // x shape: [total, 4], pred shape: [total, 2]
         let pred = net.forward(&x)?;
+        // Compute the log probabilities of the actions.
+        // shape: [total, 2] — log probabilities for each action (0 or 1) for each transition.
         let logp = pred.data().log_softmax(1)?;
+        // Mask out the log probabilities of the actions not taken.
+        // shape: [total, 2] — mask for the actions taken (1 for taken, 0 for not taken).
         let m = Tensor::from_f32(&mask, &[total as i64, 2], self.device)?;
+        // Element-wise multiply the log probabilities by the mask to zero out the actions not taken.
+        // shape: [total, 2] — log probabilities for the actions taken (0 for not taken, logp for taken).
         let chosen = logp.mul(&m)?;
+        // eli5: advantages are the returns minus the baseline, scaled to have unit variance.
+        // shape: [total, 1] — advantages for each transition.
         let adv = Tensor::from_f32(&advantages, &[total as i64, 1], self.device)?;
+        // eli5: multiply the log probabilities of the chosen actions by the advantages.
+        // shape: [total, 1] — weighted log probabilities for each transition.
         let weighted = chosen
             .sum_dims(&[1], false)?
             .reshape(&[total as i64, 1])?
             .mul(&adv)?;
+        // eli5: scale the weighted log probabilities by the inverse of the advantages' standard deviation.
+        // shape: [1] — the scaling factor for the weighted log probabilities.
         let s = Tensor::from_f32(&[scale], &[1], self.device)?;
+        // eli5: multiply the weighted log probabilities by the scaling factor.
+        // shape: [1] — the final loss value after summing and scaling.
         let loss = Variable::new(weighted.sum()?.mul(&s)?, false);
         net.eval();
 
@@ -427,7 +444,7 @@ impl RlStep for CartPoleTrainer {
 // shared (Tabular-arm) builder and RL-only setters would panic at build.
 const POP: usize = 100;
 const RACE_STEPS: usize = 20;
-const CHALLENGE_PROB: f32 = 0.05; // softmax already does some exploration
+const CHALLENGE_PROB: f32 = 0.0; // softmax already does some exploration
 const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 const MATCHES_PER_STEP: usize = 2;
 const EVAL_MATCHES_PER_STEP: usize = 2;
@@ -449,6 +466,9 @@ struct Cli {
 }
 
 fn main() {
+    const LOG_LEVEL: LogLevel = LogLevel::Summ;
+    const HOLDOUT_MATCHES: usize = 100;
+
     let cli = <Cli as clap::Parser>::parse();
     let pop = cli.pop.unwrap_or(POP);
     let race_steps = cli.max_steps.unwrap_or(RACE_STEPS);
@@ -495,7 +515,7 @@ fn main() {
             })
         })])
         .set_crossover_prob(0.5)
-        .set_crossover_retries(2)
+        .set_crossover_retries(5)
         .set_crossover_rolls(pop / 2)
         .set_crossover_ops_pool(["one_point", "uniform"])
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
@@ -503,7 +523,7 @@ fn main() {
         .set_crossover_gate(CrossoverGate::Soft)
         .set_crossover_gate_window(5)
         .set_mutate_prob(0.5)
-        .set_mutate_rolls(pop / 5)
+        .set_mutate_rolls(pop / 10)
         .set_mutation_catch_up(false)
         .set_mutation_cull_policy(MutationCullPolicy::InverseFitness)
         .set_mutation_probation_steps(5)
