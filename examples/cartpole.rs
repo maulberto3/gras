@@ -87,6 +87,23 @@ const LEARNING_RATE: f32 = 1e-3;
 const DROPOUT_PROB: f32 = 0.25;
 const GRAD_CLIP: f32 = 2.0;
 
+/// The action head used for **TRAIN matches only** (eval and holdout are
+/// always argmax — fitness must measure the deterministic policy):
+///
+/// * `true` — draw `a_t ~ softmax(logits)` from the match's own rng. This is
+///   the on-policy sampling REINFORCE requires, and the behavior since
+///   commit 500f9ca ("softmax on-policy sampling for RL trainers").
+/// * `false` — `a_t = argmax(logits)`, a deterministic greedy policy. This is
+///   the pre-500f9ca behavior, kept reachable as a toggle because a greedy
+///   policy replays the same trajectory for every match: identical outcomes,
+///   near-zero advantage variance, weights that may never move (the
+///   zero-gradient trap the sampling change fixed).
+///
+/// The REINFORCE update is unaffected either way — it still scores
+/// `log_softmax(pred)` for whichever action was taken; this knob only decides
+/// how that action was chosen.
+const LOG_SOFTMAX_HEAD: bool = false;
+
 /// Pure function of (net_seed, step, match_i) — the replay-determinism
 /// contract for RL resume.
 fn episode_start_seed(net_seed: u64, step: usize, match_i: u64) -> u64 {
@@ -139,14 +156,16 @@ struct CartPoleTrainer {
 }
 
 impl CartPoleTrainer {
-    /// `sample = true` (train matches) draws the action from
-    /// softmax(logits) using the match's OWN rng — the on-policy requirement
-    /// of REINFORCE. With argmax, a deterministic policy replays THE SAME
-    /// trajectory every match: identical outcomes, zero advantage variance,
-    /// weights that never move (the zero-gradient trap — sampling is what
-    /// gives the update something to learn from). `sample = false`
-    /// (eval/holdout) stays argmax: fitness must measure the deterministic
-    /// policy, not a lucky draw.
+    /// `sample = true` draws the action from softmax(logits) using the
+    /// match's OWN rng — the on-policy requirement of REINFORCE. With argmax,
+    /// a deterministic policy replays THE SAME trajectory every match:
+    /// identical outcomes, zero advantage variance, weights that never move
+    /// (the zero-gradient trap — sampling is what gives the update something
+    /// to learn from). Train matches pass `LOG_SOFTMAX_HEAD` (true by default,
+    /// so sampled); `sample = false` is argmax — the eval/holdout setting, and
+    /// the opt-in greedy training mode when `LOG_SOFTMAX_HEAD` is off.
+    /// Fitness must measure the deterministic policy, not a lucky draw, so
+    /// eval/holdout never sample regardless of the toggle.
     ///
     /// `forced = Some(action)` plays THAT action on every turn (challenge:
     /// train matches of a fired step only); overrides sampling entirely.
@@ -313,6 +332,13 @@ impl StepTrainer for CartPoleTrainer {
             "trainer": "cartpole",
             "env": "CartPole-v1 physics (pure Rust), 500-turn cap",
             "update": "REINFORCE (log_softmax autodiff), baseline + per-turn returns + adv normalization",
+            // Which action head the TRAIN matches ran — a run is only
+            // reproducible if this is recorded alongside the seeds.
+            "action_head": if LOG_SOFTMAX_HEAD {
+                "log_softmax_sample"
+            } else {
+                "argmax"
+            },
             "matches_per_step": self.matches_per_step,
             "eval_matches_per_step": self.eval_matches_per_step,
             "learning_rate": LEARNING_RATE,
@@ -365,7 +391,7 @@ impl RlStep for CartPoleTrainer {
         let mut survivals: Vec<usize> = Vec::with_capacity(self.matches_per_step);
         for match_i in 0..self.matches_per_step {
             let seed = episode_start_seed(ctx.net_seed, step, match_i as u64);
-            let (traj, survival) = self.play_episode(net, seed, true, forced)?;
+            let (traj, survival) = self.play_episode(net, seed, LOG_SOFTMAX_HEAD, forced)?;
             let offset = all_transitions.len();
             all_transitions.extend(traj);
             matches.push((offset, survival));
@@ -444,9 +470,9 @@ impl RlStep for CartPoleTrainer {
 // shared (Tabular-arm) builder and RL-only setters would panic at build.
 const POP: usize = 100;
 const RACE_STEPS: usize = 20;
-const CHALLENGE_PROB: f32 = 0.0; // softmax already does some exploration
+const CHALLENGE_PROB: f32 = 0.2; // softmax already does some exploration
 const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
-const MATCHES_PER_STEP: usize = 2;
+const MATCHES_PER_STEP: usize = 1;
 const EVAL_MATCHES_PER_STEP: usize = 2;
 
 /// The smoke-test CLI: deliberately just two flags. Everything else is a
@@ -492,11 +518,19 @@ fn main() {
         .set_run_pop_size(pop)
         .set_run_smoothing_window(5)
         .set_run_pop_catch_up(false)
-        .set_run_checkpoint_every(2)
-        .set_run_challenge_prob(CHALLENGE_PROB)
+        .set_run_checkpoint_every(5)
+        .set_run_challenge_prob(CHALLENGE_PROB) // works with argmax for actions
         .set_run_challenge_decay(ChallengeDecay::Custom {
             exponent: CHALLENGE_DECAY_EXPONENT,
         })
+        // .set_run_metrics(vec![Metric::custom("eval_survival_min", |survivals, _| {
+        //     let v = survivals.data().to_f32_vec()?;
+        //     Ok(if v.is_empty() {
+        //         0.0
+        //     } else {
+        //         v.iter().copied().fold(f32::INFINITY, f32::min)
+        //     })
+        // })])
         .set_stop_max_steps(Some(race_steps))
         // .set_stop_custom(|snap: &RaceSnapshot| {
         //     snap.best_smoothed_fitness > 400.0
@@ -505,31 +539,26 @@ fn main() {
         // .set_pruner_method(PopPrunerMethod::Hard)
         // .set_pruner_steps(10)              // solo-phase length in steps
         // .set_run_topologies(vec![])        // founder blueprints filling slots first
+        // Seed slot 0 from the newest compatible prior run's guardrail champion
+        // (topology-only; the rest of the pop stays random). Unset dir ⇒
+        // `results/`; a failure prints why and runs all-random.
+        // .set_run_seed_previous(true)
+        // .set_run_seed_previous_dir("assets/1790920031289_500")
         // .set_topology_seed(7)              // pin the topology-draw RNG (else run_seed-derived)
-        .set_run_metrics(vec![Metric::custom("eval_survival_min", |survivals, _| {
-            let v = survivals.data().to_f32_vec()?;
-            Ok(if v.is_empty() {
-                0.0
-            } else {
-                v.iter().copied().fold(f32::INFINITY, f32::min)
-            })
-        })])
         .set_crossover_prob(0.5)
         .set_crossover_retries(5)
         .set_crossover_rolls(pop / 2)
         .set_crossover_ops_pool(["one_point", "uniform"])
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
         .set_crossover_catch_up(false)
-        // .set_crossover_gate(CrossoverGate::Soft)
-        .set_crossover_gate_window(5)
+        // .set_crossover_gate(CrossoverGate::Off)
+        // .set_crossover_gate_window(5)
         .set_crossover_probation_steps(5)
-        .set_elite_probation_steps(5)
         .set_mutate_prob(0.5)
         .set_mutate_rolls(pop / 10)
         .set_mutation_catch_up(false)
         .set_mutation_cull_policy(MutationCullPolicy::Worst)
         .set_mutation_probation_steps(5)
-        .set_elite_guardrail_matches(HOLDOUT_MATCHES)
         .set_topology_dropout_prob(DROPOUT_PROB)
         .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(15)
@@ -543,37 +572,40 @@ fn main() {
         .set_topology_hidden_dim_stride(16)
         .set_topology_combine_op_pool([
             "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
-        ])
-        .set_topology_activation_pool([
-            "Identity",
-            "ReLU",
-            "GeLU",
-            "SiLU",
-            "SELU",
-            "Tanh",
-            "Sigmoid",
-            "Mish",
-            "LeakyReLU",
-            "ELU",
-            "GeluTanh",
-            "Softplus",
-            "HardSwish",
-            "HardSigmoid",
-            "Sin",
-            "Cos",
-            "Softmax",
-            "LogSoftmax",
-        ])
-        .set_topology_standardize_op_pool(["Identity", "LayerNorm", "RmsNorm", "InstanceNorm"])
+            ])
+        // .set_topology_activation_pool([
+        //     "Identity",
+        //     "ReLU",
+        //     "GeLU",
+        //     "SiLU",
+        //     "SELU",
+        //     "Tanh",
+        //     "Sigmoid",
+        //     "Mish",
+        //     "LeakyReLU",
+        //     "ELU",
+        //     "GeluTanh",
+        //     "Softplus",
+        //     "HardSwish",
+        //     "HardSigmoid",
+        //     "Sin",
+        //     "Cos",
+        //     "Softmax",
+        //     "LogSoftmax",
+        //     ])
+        // .set_topology_standardize_op_pool(["Identity", "LayerNorm", "RmsNorm", "InstanceNorm"])
         .set_elite_freeze(true)
         .set_elite_count(pop / 10)
-        // .set_elite_probation_steps(5)
+        .set_elite_probation_steps(5) // 0 -> 500 returns
         .set_elite_save_topology(true)
+        // Weights are the engine's strongest output AND the prerequisite for a
+        // guardrail verdict (a run cannot certify a champion it never saved),
+        // i.e. for `set_run_seed_previous` to inherit anything from this run.
         .set_elite_save_safetensors(true)
         .set_elite_checkpoint_weights(false)
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(false)
-        .set_pruner_enabled(false)
+        .set_elite_guardrail_matches(HOLDOUT_MATCHES)
         .build();
 
     let fitness = Fitness::reported(Direction::Maximize, "match_survival");
