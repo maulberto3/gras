@@ -112,6 +112,91 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
     out
 }
 
+/// Build the founder batch from explicit blueprints + random draws, deduped by
+/// topology hash and always landing on `target` nets.
+///
+/// `founders` fill the first slots IN ORDER (an imported champion first, then
+/// any user `run_topologies`), then random draws fill the rest. A draw that
+/// collides with a founder — or with an earlier draw — is RE-ROLLED at
+/// ordinals past both the initial batch and [`initial_population`]'s own
+/// re-roll window, so the two sets of re-rolls cannot collide by construction.
+///
+/// Re-rolling is what the caller used to only *promise*: the old mix was
+/// `truncate`d, so a random draw duplicating an imported blueprint silently
+/// landed the population a net short for the whole run.
+///
+/// Empty `founders` ⇒ [`initial_population`] verbatim, so the no-import path
+/// stays bit-identical to what it always was.
+pub fn fill_unique(
+    config: &RaceConfig,
+    run_seed: u64,
+    founders: Vec<Topology>,
+    target: usize,
+) -> Vec<Topology> {
+    if founders.is_empty() {
+        return initial_population(config, run_seed);
+    }
+    let target = target.max(founders.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<Topology> = Vec::with_capacity(target);
+    for topo in founders {
+        let json = match topo.to_json() {
+            Ok(json) => json,
+            Err(_) => {
+                out.push(topo);
+                continue;
+            }
+        };
+        if seen.insert(topo_hash(&json)) {
+            out.push(topo);
+        } else {
+            tracing::warn!(
+                "founder batch: duplicate founder blueprint → dropped (the batch keeps its first copy)"
+            );
+        }
+    }
+    for topo in initial_population(config, run_seed) {
+        if out.len() >= target {
+            break;
+        }
+        let json = match topo.to_json() {
+            Ok(json) => json,
+            Err(_) => {
+                out.push(topo);
+                continue;
+            }
+        };
+        if seen.insert(topo_hash(&json)) {
+            out.push(topo);
+            continue;
+        }
+        tracing::info!(
+            "founder batch: random draw duplicates a founder → re-rolling a unique seed"
+        );
+        let mut replaced = false;
+        for attempt in 0..8 {
+            // Ordinals past `initial_population`'s own re-roll window
+            // (`pop_size + 0..8`) — the two re-roll sets must not overlap.
+            let candidate = draw_topology(config, run_seed, config.pop_size + 64 + attempt);
+            let Ok(json) = candidate.to_json() else {
+                continue;
+            };
+            if seen.insert(topo_hash(&json)) {
+                out.push(candidate);
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            tracing::warn!(
+                "founder batch: could not replace a duplicate draw after 8 attempts — \
+                 population runs one short"
+            );
+        }
+    }
+    out
+}
+
 /// Same shape as [`initial_population`], seeded from the run header's
 /// recorded split ratio so a resumed run's new entrants see the same
 /// train/eval pools as the run that wrote the checkpoint.
@@ -139,13 +224,18 @@ pub fn run_topology_from_json_file(path: &std::path::Path) -> Result<Topology, S
     if let Ok(topo) = Topology::from_json(&raw) {
         return Ok(topo);
     }
-    let state: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("run-topology {}: not topology or net-state JSON: {e}", path.display()))?;
+    let state: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "run-topology {}: not topology or net-state JSON: {e}",
+            path.display()
+        )
+    })?;
     let topo_json = state
         .get("topology")
         .and_then(|t| t.as_str())
         .ok_or_else(|| format!("run-topology {}: no `topology` field", path.display()))?;
-    Topology::from_json(topo_json).map_err(|e| format!("run-topology {}: bad topology: {e}", path.display()))
+    Topology::from_json(topo_json)
+        .map_err(|e| format!("run-topology {}: bad topology: {e}", path.display()))
 }
 
 /// Load run topologies from a PRIOR RUN's directory: every
@@ -154,20 +244,31 @@ pub fn run_topology_from_json_file(path: &std::path::Path) -> Result<Topology, S
 /// blueprints verbatim — the new run's topology pools don't constrain them
 /// (the run topologies are proven architectures; re-rolling their nodes would
 /// defeat the point). Fails only when NO state parses.
-pub fn run_topologies_from_run_dir(dir: &std::path::Path, max: usize) -> Result<Vec<Topology>, String> {
+pub fn run_topologies_from_run_dir(
+    dir: &std::path::Path,
+    max: usize,
+) -> Result<Vec<Topology>, String> {
     let nets_dir = dir.join("nets");
     let mut scored: Vec<(Option<f32>, Topology)> = Vec::new();
-    let entries = std::fs::read_dir(&nets_dir)
-        .map_err(|e| format!("{}: {e}", nets_dir.display()))?;
+    let entries =
+        std::fs::read_dir(&nets_dir).map_err(|e| format!("{}: {e}", nets_dir.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
-        let Ok(state) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
-        let Some(topo_json) = state.get("topology").and_then(|t| t.as_str()) else { continue };
-        let Ok(topo) = Topology::from_json(topo_json) else { continue };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(topo_json) = state.get("topology").and_then(|t| t.as_str()) else {
+            continue;
+        };
+        let Ok(topo) = Topology::from_json(topo_json) else {
+            continue;
+        };
         let fitness = state
             .get("final_smoothed_fitness")
             .and_then(|f| f.as_f64())
@@ -230,6 +331,55 @@ mod tests {
         assert_eq!(hashes.len(), total, "no two topologies may share a hash");
     }
 
+    /// An import (a previous run's champion) that DUPLICATES a random draw
+    /// must not shrink the population: the colliding draw is re-rolled, so the
+    /// batch still lands on `pop_size` unique topologies with the import in
+    /// slot 0. The old `truncate` mix left the population a net short for the
+    /// whole run — the bug this closes.
+    #[test]
+    fn fill_unique_keeps_pop_size_when_a_draw_collides_with_an_import() {
+        let cfg = tiny_config(6);
+        let draws = initial_population(&cfg, 42);
+        // Force the collision: import the topology the random batch itself
+        // draws first (same config + run seed ⇒ same ordinal-0 draw).
+        let colliding = draws[0].clone();
+        let out = fill_unique(&cfg, 42, vec![colliding.clone()], 6);
+        assert_eq!(
+            out.len(),
+            6,
+            "a colliding draw must be re-rolled, not silently dropped"
+        );
+        let mut hashes: Vec<String> = out
+            .iter()
+            .map(|t| topo_hash(&t.to_json().unwrap()))
+            .collect();
+        let total = hashes.len();
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(hashes.len(), total, "the batch must stay unique");
+        assert_eq!(
+            out[0].to_json().unwrap(),
+            colliding.to_json().unwrap(),
+            "imports keep the first slots"
+        );
+    }
+
+    /// With no imports the batch is `initial_population` verbatim, so the
+    /// no-seed path stays bit-identical to what it always was.
+    #[test]
+    fn fill_unique_without_founders_is_the_plain_population() {
+        let cfg = tiny_config(6);
+        let plain: Vec<String> = initial_population(&cfg, 42)
+            .iter()
+            .map(|t| t.to_json().unwrap())
+            .collect();
+        let mixed: Vec<String> = fill_unique(&cfg, 42, Vec::new(), 6)
+            .iter()
+            .map(|t| t.to_json().unwrap())
+            .collect();
+        assert_eq!(plain, mixed);
+    }
+
     #[test]
     fn population_is_deterministic_given_seed() {
         let cfg = tiny_config(6);
@@ -268,6 +418,10 @@ mod tests {
         let mut seeds: Vec<usize> = topos.iter().map(|t| t.options.topology_seed).collect();
         seeds.sort_unstable();
         seeds.dedup();
-        assert_eq!(seeds.len(), 8, "each founder must carry a distinct net_seed");
+        assert_eq!(
+            seeds.len(),
+            8,
+            "each founder must carry a distinct net_seed"
+        );
     }
 }

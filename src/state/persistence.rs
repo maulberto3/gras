@@ -157,6 +157,17 @@ pub struct ConfigSnapshot {
     /// sample size, not replay semantics, so a change needs no resume guard.
     #[serde(default = "default_guardrail_matches")]
     pub guardrail_matches: usize,
+    /// Seed the population from a PREVIOUS experiment's guardrail champion
+    /// (`set_run_seed_previous`). Recorded for the same reason
+    /// `run_topology_count` is: it decides what the founder batch IS, so a
+    /// reader can tell where slot 0 came from. Default false.
+    #[serde(default)]
+    pub seed_previous_run: bool,
+    /// Where that previous experiment is looked up
+    /// (`set_run_seed_previous_dir`): a run dir, or a directory of run dirs
+    /// (newest run id wins). `None` ⇒ the default root `results/`.
+    #[serde(default)]
+    pub seed_previous_run_dir: Option<String>,
     /// One-line identity of the binary that produced the run (`gras` version,
     /// profile, exe path, build time). Diagnostics only — lets a reader tell
     /// a stale-process artifact from a logic bug.
@@ -208,6 +219,11 @@ impl ConfigSnapshot {
             fresh_immigrants: cfg.mode_specific.mutation_catch_up(),
             crossover_catch_up: cfg.mode_specific.crossover_catch_up(),
             run_topology_count: cfg.run_topologies.len(),
+            seed_previous_run: cfg.seed_previous_run,
+            seed_previous_run_dir: cfg
+                .seed_previous_run_dir
+                .as_ref()
+                .map(|p| p.display().to_string()),
             elite_checkpoint_weights: cfg.elite_checkpoint_weights,
             mutation_probation_steps: cfg.mutation_probation_steps,
             crossover_probation_steps: cfg.crossover_probation_steps,
@@ -220,12 +236,77 @@ impl ConfigSnapshot {
     }
 }
 
+/// The post-race guardrail's record of the run's certified champion.
+///
+/// This is the ONE field of `engine.json` that is **not** launch
+/// configuration: the guardrail runs after the race, and its verdict is a run
+/// OUTPUT — arguably the strongest one, since it is the only reading taken on
+/// games no net ever trained on. `CoreEngine::guardrail` stamps it back into
+/// `engine.json` (and `refresh_header`/resume preserve it).
+///
+/// It is what makes seeding possible: `RaceConfig::seed_previous_run` reads
+/// exactly this block to carry the champion's TOPOLOGY into the next
+/// experiment.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GuardrailRecord {
+    /// Full hash of the champion that was scored.
+    pub champion_hash: String,
+    /// Trainable parameter count of that net (elements). The tie-break key:
+    /// on equal smoothed race fitness the SMALLEST champion is scored and
+    /// recorded.
+    #[serde(default)]
+    pub champion_params: Option<i64>,
+    /// The champion's smoothed race fitness — the reference the holdout
+    /// reading is compared against. `None` if the run recorded no verdict.
+    #[serde(default)]
+    pub race_smoothed: Option<f32>,
+    /// Mean holdout score over the games that actually produced one.
+    #[serde(default)]
+    pub holdout_mean: Option<f32>,
+    /// Population std of those scores.
+    #[serde(default)]
+    pub holdout_std: Option<f32>,
+    /// Games that produced a score (per-game failures are skipped, so this can
+    /// be less than `config.guardrail_matches`).
+    #[serde(default)]
+    pub matches_scored: usize,
+    /// Unit-free agreement between the race reading and the holdout
+    /// ([`crate::engine::guardrail::agreement_verdict`]). Informational — the
+    /// task-specific wording stays in the example's own print.
+    #[serde(default)]
+    pub verdict: String,
+}
+
+/// Which previous experiment this run's founder batch was seeded from
+/// (`RaceConfig::seed_previous_run`) — the run's inheritance receipt.
+///
+/// Informational (the copied topology is recorded per net like any founder);
+/// it exists so a reader can answer "where did slot 0 come from?" without
+/// diffing populations.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SeedSourceRecord {
+    /// The source run's id (its `results/<id>` directory name).
+    pub source_run_id: String,
+    /// Directory the source was read from (as resolved).
+    pub source_dir: String,
+    /// The guardrail-certified champion that was copied.
+    pub champion_hash: String,
+    /// That champion's parameter count (the tie-break key).
+    #[serde(default)]
+    pub champion_params: Option<i64>,
+    /// Its holdout mean, carried for readability (the champion's pedigree).
+    #[serde(default)]
+    pub guardrail_mean: Option<f32>,
+}
+
 /// The reproducible run header, serialized as `engine.json` in the run dir.
 ///
 /// This is the "who are we, what rules are we running under" snapshot. It is
 /// overwritten whenever the config that affects reproducibility changes — it
 /// does **not** accumulate history. The live population lives in
-/// `nets/<hash>.json` files, not here.
+/// `nets/<hash>.json` files, not here. The one exception is the post-race
+/// [`GuardrailRecord`], stamped in after the race and preserved by every
+/// header rewrite.
 #[derive(Clone, Debug, Serialize)]
 pub struct RunHeader {
     /// User-visible run id (directory name or CLI-chosen label).
@@ -302,6 +383,15 @@ pub struct RunHeader {
     /// the trainer doesn't implement the hook (or on legacy `engine.json`).
     #[serde(default)]
     pub trainer: Option<serde_json::Value>,
+    /// The post-race guardrail's certified champion (see [`GuardrailRecord`]).
+    /// Written AFTER the race — absent on a running or legacy run, and
+    /// preserved by `refresh_header`/resume so a resumed run never erases it.
+    #[serde(default)]
+    pub guardrail: Option<GuardrailRecord>,
+    /// The previous experiment this run's founder batch was seeded from (see
+    /// [`SeedSourceRecord`]). `None` = an all-random + user-blueprint batch.
+    #[serde(default)]
+    pub run_topology_source: Option<SeedSourceRecord>,
 }
 
 /// Everything that defines a step-race run's reproducible configuration —
@@ -393,7 +483,19 @@ impl RunHeader {
             children_born_at_clock,
             config,
             trainer,
+            // Both are post-construction facts: the guardrail hasn't run at
+            // launch, and the seed source is stamped in right after the
+            // population is resolved (`CoreEngine::from_spec`).
+            guardrail: None,
+            run_topology_source: None,
         }
+    }
+
+    /// Record the guardrail's certified champion (see [`GuardrailRecord`]).
+    /// Called by `CoreEngine::guardrail` so every later header rewrite keeps
+    /// it.
+    pub fn set_guardrail(&mut self, record: Option<GuardrailRecord>) {
+        self.guardrail = record;
     }
 
     /// Like `from_race_options`, but also stamps `started_at`.
@@ -516,6 +618,16 @@ impl RunHeader {
         // Trainer self-description (see `Trainer::describe`). Absent on legacy
         // files and on trainers that don't implement the hook.
         let trainer = v.get("trainer").cloned();
+        // Post-race facts. Absent on a running run, on legacy files, and on
+        // runs whose guardrail never scored a champion.
+        let guardrail: Option<GuardrailRecord> = v
+            .get("guardrail")
+            .cloned()
+            .and_then(|g| serde_json::from_value(g).ok());
+        let run_topology_source: Option<SeedSourceRecord> = v
+            .get("run_topology_source")
+            .cloned()
+            .and_then(|s| serde_json::from_value(s).ok());
         // Migration (engine split, TODO.md step 6): legacy shared-shape
         // headers have no root `engine_mode` — derive it from `config.mode`
         // (same vocabulary, always present). New headers carry it at the
@@ -559,6 +671,8 @@ impl RunHeader {
             children_born_at_clock,
             config,
             trainer,
+            guardrail,
+            run_topology_source,
         })
     }
 }
@@ -1005,6 +1119,44 @@ pub fn write_engine_json(dir: &Path, header: &RunHeader) -> Result<()> {
     })?;
     let path = dir.join("engine.json");
     let json = header.to_json()?;
+    std::fs::write(&path, json).map_err(|source| EngineError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Stamp the post-race guardrail record into an EXISTING `engine.json`.
+///
+/// Read-modify-write on the raw JSON, deliberately: the guardrail runs after
+/// the race, so this must not re-serialize a freshly built header (that would
+/// drop any field this version doesn't model, and hand-edited notes with
+/// them). Missing file = no-op success would hide a real bug, so it errors.
+pub fn write_guardrail_record(dir: &Path, record: &GuardrailRecord) -> Result<()> {
+    stamp_engine_json_key(
+        dir,
+        "guardrail",
+        serde_json::to_value(record)
+            .map_err(|e| EngineError::Json(format!("guardrail record serialize: {e}")))?,
+    )
+}
+
+/// Insert/replace one key in `engine.json`, preserving everything else
+/// verbatim. Shared by the post-race stamps.
+fn stamp_engine_json_key(dir: &Path, key: &str, value: serde_json::Value) -> Result<()> {
+    let path = dir.join("engine.json");
+    let raw = std::fs::read_to_string(&path).map_err(|source| EngineError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    let mut doc: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| EngineError::Json(format!("engine.json parse: {e}")))?;
+    let obj = doc
+        .as_object_mut()
+        .ok_or_else(|| EngineError::Json("engine.json is not a JSON object".into()))?;
+    obj.insert(key.to_string(), value);
+    let json = serde_json::to_string_pretty(&doc)
+        .map_err(|e| EngineError::Json(format!("engine.json serialize: {e}")))?;
     std::fs::write(&path, json).map_err(|source| EngineError::Io {
         path: path.display().to_string(),
         source,

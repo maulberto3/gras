@@ -388,6 +388,30 @@ pub struct RaceConfig {
     /// batch (or within the run-topology list) are re-rolled like the standard
     /// duplicate gate. Recorded in `engine.json` as `run_topology_count`.
     pub run_topologies: Vec<crate::graph::topology::Topology>,
+    /// Seed slot 0 of the founder batch with the guardrail-certified champion
+    /// of a PREVIOUS experiment (topology-only). `false` (default) = every run
+    /// is self-contained; `true` = the newest compatible prior run contributes
+    /// one proven ARCHITECTURE, and the other `pop_size − 1` slots stay random
+    /// draws exactly as before.
+    ///
+    /// "Compatible" is read from the candidate's `engine.json` header alone:
+    /// same `engine_mode`, same `input_dim`/`output_dim`, same trainer name
+    /// (`engine.json` → `trainer.trainer`) when both sides declare one. The
+    /// champion is the net the source's GUARDRAIL certified — never a filename
+    /// guess or a race-fitness ranking — and on equal smoothed race fitness it
+    /// is the SMALLEST one (see `CoreEngine::guardrail`).
+    ///
+    /// Any failure (nothing found, incompatible, no guardrail champion, its
+    /// `nets/<hash>.json` unreadable) prints a reason and runs with an
+    /// all-random population: there is no fallback chain and no fatal error.
+    /// Because the knob only changes the initial population, a resumed run is
+    /// unaffected (its population is already on disk).
+    pub seed_previous_run: bool,
+    /// Where `seed_previous_run` looks: a run directory, or a directory of run
+    /// directories (newest numeric run id wins — handles both
+    /// `results/<id>` and the archived `assets/<id>_<label>` layout). `None`
+    /// (default) ⇒ `results/` (see `engine::seed::DEFAULT_RESULTS_ROOT`).
+    pub seed_previous_run_dir: Option<std::path::PathBuf>,
     /// Per-checkpoint elite weight snapshot: every `checkpoint_every` steps,
     /// export each top-`elite_count` net's weights as
     /// `checkpoint-elite-<hash>.safetensors` (overwritten each checkpoint —
@@ -422,10 +446,10 @@ pub struct RaceConfig {
     /// straight into the top-`elite_count` and be FROZEN — act-and-measure,
     /// zero training — on its first live step, benching fresh genetic material
     /// at birth. `0` (default) = today's behavior. If EVERY rankable net is on
-    /// elite probation (tiny pop, all fresh), the crown would empty, so the
-    /// protection is BROKEN for that refresh (falls back to the plain top-k) —
-    /// the champion is never left unguarded. Same state-free, resume-safe
-    /// contract as the cull-probation windows.
+    /// elite probation (tiny pop, all fresh), the crown is simply EMPTY — no
+    /// fallback, so nothing is crowned/frozen until a net has aged `k` clocks.
+    /// Fresh nets stay cull-safe via the channel-probation windows. Same
+    /// state-free, resume-safe contract as the cull-probation windows.
     pub elite_probation_steps: usize,
     /// Anti-plateau challenge probability (`set_run_challenge_prob`):
     /// per-step, per-net chance the engine hands the trainer a challenged
@@ -910,10 +934,15 @@ impl RaceConfig {
             pop_pruner: None,
             run_name: None,
             run_topologies: Vec::new(),
+            seed_previous_run: false,
+            seed_previous_run_dir: None,
             elite_checkpoint_weights: true,
             mutation_probation_steps: 5,
             crossover_probation_steps: 5,
-            elite_probation_steps: 5,
+            // Empirically HARMFUL on cartpole: it benched the pre-trained
+            // crossover child that became the 500-turn champion (7be54180,
+            // born@23, trained 1 step, frozen). Opt-in only.
+            elite_probation_steps: 0,
             challenge_prob: 0.0,
             challenge_decay: ChallengeDecay::Linear,
             guardrail_matches: DEFAULT_GUARDRAIL_MATCHES,
@@ -1420,6 +1449,24 @@ impl RaceConfigBuilder {
     /// to re-run a prior run's elite architectures.
     pub fn set_run_topologies(mut self, topos: Vec<crate::graph::topology::Topology>) -> Self {
         self.cfg.run_topologies = topos;
+        self
+    }
+    /// Seed slot 0 of the founder batch with the guardrail-certified champion
+    /// of a previous experiment, topology-only (see
+    /// [`RaceConfig::seed_previous_run`]). The champion enters as an ordinary
+    /// founder: same `make_optimizer`, same step clock, cullable like any
+    /// other net. Default false.
+    pub fn set_run_seed_previous(mut self, enabled: bool) -> Self {
+        self.cfg.seed_previous_run = enabled;
+        self
+    }
+    /// Where [`set_run_seed_previous`] looks for that previous experiment: a
+    /// run directory, or a directory of run directories (the newest numeric
+    /// run id wins). Unset ⇒ `results/`.
+    ///
+    /// [`set_run_seed_previous`]: Self::set_run_seed_previous
+    pub fn set_run_seed_previous_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.cfg.seed_previous_run_dir = Some(dir.into());
         self
     }
     /// Per-checkpoint elite weight snapshot

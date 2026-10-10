@@ -17,6 +17,7 @@
 //! in `StepReport` — mean-of-batch vs best-of-batch disagreements are how a
 //! race signal hides its own collapse.
 
+use crate::engine::fitness::Direction;
 use crate::graph::network::Network;
 
 /// The user-owned half of the guardrail: score ONE fresh holdout game.
@@ -101,7 +102,8 @@ pub fn reload_champion(
     hash: &str,
     device: flodl::Device,
 ) -> Option<Network> {
-    let state_raw = std::fs::read_to_string(run_dir.join("nets").join(format!("{hash}.json"))).ok()?;
+    let state_raw =
+        std::fs::read_to_string(run_dir.join("nets").join(format!("{hash}.json"))).ok()?;
     let topo_json = serde_json::from_str::<serde_json::Value>(&state_raw)
         .ok()?
         .get("topology")
@@ -123,16 +125,53 @@ pub fn reload_champion(
         return None;
     }
     if let Err(e) = crate::utils::safetensors::load_safetensors(&mut net, &weights) {
-        tracing::warn!("guardrail: loading {} failed ({e}) — refusing to score a partially-loaded net", weights.display());
+        tracing::warn!(
+            "guardrail: loading {} failed ({e}) — refusing to score a partially-loaded net",
+            weights.display()
+        );
         return None;
     }
     Some(net)
 }
 
+/// Unit-free agreement between the race reading and the holdout mean.
+///
+/// The engine cannot know what the numbers MEAN (survival turns, accuracy,
+/// loss), so this is the honest generic statement: how far the holdout landed
+/// below what the race claimed, relative to the race reading's own magnitude.
+/// Task-specific wording ("SOLVED ✅") stays in the example's print; this is
+/// what gets recorded in `engine.json`.
+pub fn agreement_verdict(
+    race_smoothed: Option<f32>,
+    holdout_mean: Option<f32>,
+    direction: Direction,
+) -> String {
+    let (Some(race), Some(hold)) = (race_smoothed, holdout_mean) else {
+        return "unscored (no race reference or no holdout games)".to_string();
+    };
+    // Direction-aware shortfall of the holdout vs the race reading.
+    let shortfall = match direction {
+        Direction::Maximize => race - hold,
+        Direction::Minimize => hold - race,
+    };
+    let rel = shortfall / race.abs().max(1e-6);
+    if rel <= 0.0 {
+        "consistent with the race signal ✅".to_string()
+    } else if rel <= 0.10 {
+        "holdout ≤10% below the race signal".to_string()
+    } else {
+        format!(
+            "weak — the holdout disagrees with the race signal ❌ ({:.0}% below)",
+            rel * 100.0
+        )
+    }
+}
+
 /// Score a SAVED champion without an engine (the `--score-only` path):
-/// reload from `run_dir`, play `matches` fresh games, aggregate. Same
-/// semantics as [`check_champion`] but you name the hash yourself and there
-/// is no race-smoothed value to compare against.
+/// reload from `run_dir`, play `matches` fresh games, aggregate, and stamp the
+/// result into `engine.json` (best-effort — the verdict is returned either
+/// way). Same semantics as [`check_champion`] but you name the hash yourself
+/// and the race-smoothed reference comes from the run's own record, if any.
 pub fn score_saved(
     run_dir: &std::path::Path,
     champion_hash: &str,
@@ -140,7 +179,42 @@ pub fn score_saved(
     matches: usize,
     device: flodl::Device,
 ) -> Option<GuardrailVerdict> {
-    check_champion(run_dir, champion_hash, None, scorer, matches, device)
+    let verdict = check_champion(run_dir, champion_hash, None, scorer, matches, device)?;
+    record_guardrail(run_dir, champion_hash, &verdict);
+    Some(verdict)
+}
+
+/// Stamp a scored saved-run champion into the run's `engine.json`.
+///
+/// Best-effort by design: a run dir whose `engine.json` is unreadable should
+/// still hand back the verdict (the scoring already happened) — the recording
+/// failure is a warning, not a silent downgrade of the answer.
+fn record_guardrail(run_dir: &std::path::Path, champion_hash: &str, verdict: &GuardrailVerdict) {
+    let header = crate::state::load_engine_json(run_dir).ok();
+    let direction = header
+        .as_ref()
+        .map(|h| h.fitness_direction)
+        .unwrap_or(Direction::Maximize);
+    // The race reference, when the run already recorded one.
+    let race_smoothed = header
+        .as_ref()
+        .and_then(|h| h.guardrail.as_ref())
+        .and_then(|g| g.race_smoothed);
+    let params = crate::state::load_net_state(run_dir, champion_hash)
+        .ok()
+        .and_then(|s| s.meta.params);
+    let record = crate::state::GuardrailRecord {
+        champion_hash: champion_hash.to_string(),
+        champion_params: params,
+        race_smoothed,
+        holdout_mean: verdict.mean(),
+        holdout_std: verdict.std(),
+        matches_scored: verdict.scores.len(),
+        verdict: agreement_verdict(race_smoothed, verdict.mean(), direction),
+    };
+    if let Err(e) = crate::state::write_guardrail_record(run_dir, &record) {
+        tracing::warn!("engine.json guardrail record failed: {e}");
+    }
 }
 
 /// The engine's seam: reload + play + aggregate, where the scorer IS the
@@ -234,6 +308,30 @@ mod tests {
             scores: vec![],
         };
         assert!(empty.mean().is_none() && empty.std().is_none());
+    }
+
+    /// The generic verdict is direction-aware and unit-free: a holdout at or
+    /// above the race reading is consistent, a large relative shortfall is
+    /// weak — in BOTH directions (maximize and minimize runs read correctly
+    /// from the same formula).
+    #[test]
+    fn agreement_verdict_is_direction_aware() {
+        use Direction::{Maximize, Minimize};
+        // Maximize: race 500, holdout 495 → consistent-ish (≤10%).
+        let v = agreement_verdict(Some(500.0), Some(495.0), Maximize);
+        assert!(v.contains("≤10%"), "{v}");
+        let v = agreement_verdict(Some(500.0), Some(100.0), Maximize);
+        assert!(v.contains("weak"), "{v}");
+        // Above the race reading is never a shortfall.
+        let v = agreement_verdict(Some(0.5), Some(0.9), Maximize);
+        assert!(v.contains("consistent"), "{v}");
+        // Minimize: a HOLDout worse (higher) than the race loss is the bad case.
+        let v = agreement_verdict(Some(0.1), Some(0.5), Minimize);
+        assert!(v.contains("weak"), "{v}");
+        let v = agreement_verdict(Some(0.1), Some(0.05), Minimize);
+        assert!(v.contains("consistent"), "{v}");
+        // No reference → honest "unscored", never a fake pass.
+        assert!(agreement_verdict(None, Some(1.0), Maximize).contains("unscored"));
     }
 
     /// The reload path must refuse when no weights exist — a fresh-init net

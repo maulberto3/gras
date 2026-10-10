@@ -633,7 +633,7 @@ impl CoreEngine {
                 topology_options.output_dim.unwrap_or(0),
             ),
         };
-        let header = RunHeader::from_race_options_at(
+        let mut header = RunHeader::from_race_options_at(
             RunConfig {
                 run_id: run_id.clone(),
                 engine_mode: Some(
@@ -682,19 +682,87 @@ impl CoreEngine {
         // Seed the initial population internally — transparent to the user,
         // like the old generational engine where `run` was the only call.
         // Generated before the engine consumes the config.
-        let initial_topologies = super::population::initial_population(&config, run_seed);
-        // User run-topologies fill slots FIRST (blueprint-only, fresh weights);
-        // the random batch fills the rest and re-rolls any draw that collides
-        // with a run topology (same dedupe discipline as the random batch itself).
+        // Founder batch: [imported champion?] + user run-topologies + random
+        // draws. `fill_unique` keeps the two import sources first, dedupes by
+        // hash and re-rolls a random draw that collides with an import, so the
+        // population always lands at `pop_size` (the old truncate left it a net
+        // short whenever a draw duplicated an import).
         let run_topology_count = config.run_topologies.len();
-        let initial_topologies = if run_topology_count > 0 {
-            let mut mixed = config.run_topologies.clone();
-            mixed.extend(initial_topologies);
-            mixed.truncate(config.pop_size.max(run_topology_count));
-            mixed
-        } else {
+        let mut founders: Vec<crate::graph::topology::Topology> =
+            Vec::with_capacity(run_topology_count + 1);
+        let mut seed_source: Option<crate::state::SeedSourceRecord> = None;
+        if config.seed_previous_run {
+            // The compatibility gate reads the candidate's engine.json header,
+            // so this run's own header (mode, dims, trainer name) is the input.
+            let trainer_name = header
+                .trainer
+                .as_ref()
+                .and_then(|t| t.get("trainer"))
+                .and_then(|v| v.as_str());
+            match super::seed::resolve(
+                config.seed_previous_run_dir.as_deref(),
+                // This run's own dir already exists on disk (the header is
+                // written above), so it would otherwise be "the newest run".
+                Some(run_dir.as_path()),
+                header.engine_mode.as_deref().unwrap_or(""),
+                header.input_dim,
+                header.output_dim,
+                trainer_name,
+            ) {
+                super::seed::SeedOutcome::Seeded(pick) => {
+                    let short = &pick.champion_hash[..8.min(pick.champion_hash.len())];
+                    info!(
+                        "seed_previous_run: slot 0 ← guardrail champion {short} of run {} ({}{})",
+                        pick.source_run_id,
+                        pick.source_dir.display(),
+                        pick.guardrail_mean
+                            .map(|m| format!(", holdout {m:.4}"))
+                            .unwrap_or_default(),
+                    );
+                    founders.push(pick.topology.clone());
+                    seed_source = Some(crate::state::SeedSourceRecord {
+                        source_run_id: pick.source_run_id.clone(),
+                        source_dir: pick.source_dir.display().to_string(),
+                        champion_hash: pick.champion_hash.clone(),
+                        champion_params: pick.champion_params,
+                        guardrail_mean: pick.guardrail_mean,
+                    });
+                }
+                super::seed::SeedOutcome::Skipped(why) => {
+                    // Deliberately a plain println: this is a fact about what
+                    // the run INHERITED, and it must be visible at any log
+                    // level. The run continues all-random either way.
+                    println!("seed_previous_run: {why} — starting from an all-random population");
+                }
+            }
+        }
+        founders.extend(config.run_topologies.clone());
+        let initial_topologies =
+            super::population::fill_unique(&config, run_seed, founders, config.pop_size);
+        // Slot 0 of a seeded run is labeled by origin, so `nets/*.json` and
+        // `attempts.csv` say where it came from instead of a bare `founder-0`.
+        let initial_topologies: Vec<(crate::graph::topology::Topology, Option<String>)> =
             initial_topologies
-        };
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, topo)| {
+                    let label = match (&seed_source, ordinal) {
+                        (Some(rec), 0) => Some(format!(
+                            "seed:{}:{}",
+                            rec.source_run_id,
+                            &rec.champion_hash[..8.min(rec.champion_hash.len())]
+                        )),
+                        _ => None,
+                    };
+                    (topo, label)
+                })
+                .collect();
+        // Provenance goes in the header — including on disk, hence the second
+        // write (the first happened before the population was resolved).
+        if seed_source.is_some() {
+            header.run_topology_source = seed_source.clone();
+            write_engine_json(&run_dir, &header)?;
+        }
 
         // Shared batch stream — engine infrastructure (Tabular only). The
         // trainer may shape batch sizes (`Trainer::stream_shape`) but the
@@ -780,7 +848,7 @@ impl CoreEngine {
 
         // Seed the initial population internally — transparent to the user,
         // like the old generational engine where `run` was the only call.
-        engine.seed_population_internal(initial_topologies, None)?;
+        engine.seed_population_labeled(initial_topologies, None)?;
 
         Ok(engine)
     }
@@ -1010,17 +1078,37 @@ impl CoreEngine {
     /// seed + dropout_prob (read from `topology.options` by `Network::build`),
     /// and gets a fresh Adam optimizer. The topologies must already be
     /// finalized (the engine calls `Network::build`, which re-validates).
+    /// Convenience wrapper over [`Self::seed_population_labeled`] for callers
+    /// with no per-slot lineage (the tests, which seed ad-hoc topologies).
+    #[cfg(test)]
     fn seed_population_internal(
         &mut self,
         topologies: Vec<crate::graph::topology::Topology>,
         initial_fitness: Option<f32>,
     ) -> Result<()> {
-        for (ordinal, topo) in topologies.iter().enumerate() {
+        let labeled = topologies.into_iter().map(|t| (t, None)).collect();
+        self.seed_population_labeled(labeled, initial_fitness)
+    }
+
+    /// [`Self::seed_population_internal`] with per-slot lineage labels: slot 0
+    /// of a run seeded from a previous experiment carries
+    /// `seed:<source run id>:<champion hash>` instead of `founder-0`, so the
+    /// inheritance is readable from `nets/*.json` alone.
+    fn seed_population_labeled(
+        &mut self,
+        topologies: Vec<(crate::graph::topology::Topology, Option<String>)>,
+        initial_fitness: Option<f32>,
+    ) -> Result<()> {
+        for (ordinal, (topo, label)) in topologies.iter().enumerate() {
             let net = Network::build(topo, self.config.device())?;
             // Lineage: founders are labeled `founder-<ordinal>` — a readable
             // "part of the original population" marker, distinct from
-            // `random`/`crossover-*` origins children carry.
-            let mut state = NetState::new(topo, 0, Some(format!("founder-{ordinal}")))?;
+            // `random`/`crossover-*` origins children carry. A label supplied
+            // by the caller (the imported champion) wins.
+            let origin = label
+                .clone()
+                .unwrap_or_else(|| format!("founder-{ordinal}"));
+            let mut state = NetState::new(topo, 0, Some(origin))?;
             state.stamp_meta(&net, &self.meta_ctx);
             let hash = state.hash.clone();
             let opt = self.trainer.make_optimizer(&net);
@@ -1254,29 +1342,30 @@ impl CoreEngine {
             }
             self.append_metrics_csv(clock)?;
 
-            // ── 1b. stepped log: who trained this clock, who didn't ─────────
+            // ── 1b. stepped log: how many trained, how many froze ──────────
             // Crossover/mutation rolls get one line each; the GROUP step (the
             // thing every net does) got only the rollup stats. This line names
-            // the participation: `stepped 5/6` plus the frozen nets that were
-            // skipped — with act-and-measure freeze the skips are the frozen
-            // elites, so a reader can see exactly who did not learn.
-            if self.log_level == crate::engine::config::LogLevel::Summ
-                && self.config.freeze_elites
-                && !self.frozen_crown.is_empty()
+            // the participation: `stepped 5/6` plus the frozen (act-and-measure)
+            // elites that were skipped. It prints EVERY step — including while
+            // elite probation keeps the crown empty, where it reads `stepped N/N`
+            // (every net trained). The frozen nets are NOT named here: they are
+            // exactly the ★ elite badge on the rollup line, so listing the
+            // hashes twice was pure duplication.
+            if self.log_level == crate::engine::config::LogLevel::Summ && self.config.freeze_elites
             {
-                let mut skipped: Vec<String> = self
-                    .frozen_crown
-                    .iter()
-                    .map(|h| h[..8.min(h.len())].to_string())
-                    .collect();
-                skipped.sort();
-                info!(
-                    "step {} │ stepped {}/{} │ frozen (act+measure, no update): {}",
-                    clock,
-                    self.state.live_count() - self.frozen_crown.len(),
-                    self.state.live_count(),
-                    skipped.join(" "),
-                );
+                let live = self.state.live_count();
+                let frozen = self.frozen_crown.len();
+                if frozen == 0 {
+                    info!("step {} │ stepped {}/{}", clock, live, live);
+                } else {
+                    info!(
+                        "step {} │ stepped {}/{} │ {} frozen (act+measure, no update)",
+                        clock,
+                        live - frozen,
+                        live,
+                        frozen,
+                    );
+                }
             }
 
             // ── 2. record checkpoint (every `checkpoint_every` steps) ───────
@@ -1593,18 +1682,65 @@ impl CoreEngine {
         &mut self,
         device: flodl::Device,
     ) -> Option<crate::engine::guardrail::GuardrailVerdict> {
-        let champion = self.champions.first()?;
+        // The champion set is written by the stop-time artifact writers;
+        // recompute it when empty so the guardrail never depends on whether a
+        // writer happened to run.
+        if self.champions.is_empty() {
+            self.record_champions();
+        }
+        let champion = self.champion_for_guardrail()?;
         let matches = self.config.guardrail_matches;
-        let race_smoothed = self.smoothed_fitness_of(champion);
-        crate::engine::guardrail::score_with(
+        let race_smoothed = self.smoothed_fitness_of(&champion);
+        let verdict = crate::engine::guardrail::score_with(
             &self.run_dir,
-            champion,
+            &champion,
             race_smoothed,
             matches,
             device,
             &mut self.trainer,
             |t, net, game_i| crate::trainer::EngineTrainer::holdout_score(&mut **t, net, game_i),
-        )
+        )?;
+        // Record it: the guardrail is a run OUTPUT (the only reading taken on
+        // games no net trained on), so it lives in engine.json — and the next
+        // experiment's `seed_previous_run` reads exactly this block to inherit
+        // the certified champion's topology. Preserved by later header
+        // rewrites via `refresh_header`.
+        let record = crate::state::GuardrailRecord {
+            champion_hash: verdict.hash.clone(),
+            champion_params: self.net_params(&verdict.hash),
+            race_smoothed: verdict.race_smoothed,
+            holdout_mean: verdict.mean(),
+            holdout_std: verdict.std(),
+            matches_scored: verdict.scores.len(),
+            verdict: crate::engine::guardrail::agreement_verdict(
+                verdict.race_smoothed,
+                verdict.mean(),
+                self.fitness.direction(),
+            ),
+        };
+        self.header.set_guardrail(Some(record.clone()));
+        if let Err(e) = crate::state::write_guardrail_record(&self.run_dir, &record) {
+            tracing::warn!("engine.json guardrail record failed: {e}");
+        }
+        Some(verdict)
+    }
+
+    /// A live net's parameter count (`NetMeta::params`) — the guardrail
+    /// tie-break key.
+    fn net_params(&self, hash: &str) -> Option<i64> {
+        self.state.net(hash).and_then(|s| s.meta.params)
+    }
+
+    /// The net the guardrail certifies: the top of the recorded champion
+    /// ranking, with ties on smoothed fitness broken by the FEWEST parameters
+    /// (see [`pick_tie_broken`]).
+    fn champion_for_guardrail(&self) -> Option<String> {
+        let candidates: Vec<(String, Option<f32>, Option<i64>)> = self
+            .champions
+            .iter()
+            .map(|h| (h.clone(), self.smoothed_fitness_of(h), self.net_params(h)))
+            .collect();
+        pick_tie_broken(&candidates, CHAMPION_TIE_EPS).map(|h| h.to_string())
     }
 
     /// THE ranking primitive: live nets paired with smoothed fitness, ordered
@@ -1649,8 +1785,12 @@ impl CoreEngine {
 
     /// The elite set: the top `config.elite_count` live nets by smoothed
     /// fitness (direction-aware). Protected from ALL culls — crossover (any
-    /// policy) and mutation alike. Always leaves at least one cullable net:
-    /// the effective guard size is `min(elite_count, live − 1)`.
+    /// policy) and mutation alike. With `elite_probation_steps == 0` it is the
+    /// plain top-k and always leaves a cullable net (`min(elite_count, live − 1)`);
+    /// with probation ON it is strictly the AGE-ELIGIBLE top-k and may be EMPTY
+    /// (or short of `k`) while the population is young — there is NO fallback,
+    /// so a net younger than the window is never crowned/frozen. Fresh nets
+    /// stay cull-safe via the channel-probation windows.
     pub(crate) fn elite_hashes(&self) -> Vec<String> {
         let k = self
             .config
@@ -1679,12 +1819,9 @@ impl CoreEngine {
             .take(k)
             .map(|(h, _)| h.clone())
             .collect();
-        if eligible.is_empty() {
-            // Every rankable net is on probation — break protection for this
-            // refresh (mirror cull probation's last resort): the plain top-k,
-            // so the champion is never left unguarded.
-            return ranked.into_iter().take(k).map(|(h, _)| h).collect();
-        }
+        // NO fallback: a net younger than the window is simply not elite, so
+        // it can never be crowned/frozen on arrival. The set may be empty (or
+        // short of `k`) while the whole population is young.
         eligible
     }
 
@@ -2033,9 +2170,51 @@ impl CoreEngine {
             ),
             trainer: self.trainer.describe(),
         };
-        let header = RunHeader::from_race_options(cfg);
+        let mut header = RunHeader::from_race_options(cfg);
+        // Post-race facts are NOT launch config: re-deriving the header must
+        // never wipe the recorded guardrail champion or the seed receipt (a
+        // resumed run rewrites this file when it stops).
+        header.guardrail = self.header.guardrail.clone();
+        header.run_topology_source = self.header.run_topology_source.clone();
         write_engine_json(&self.run_dir, &header)
     }
+}
+
+/// Smoothed-fitness tolerance for "these nets are tied" (a solved cartpole
+/// population sits at `500.0000 ± 0.0000` for tens of steps, so exact equality
+/// is the norm, not an edge case).
+const CHAMPION_TIE_EPS: f32 = 1e-6;
+
+/// The champion among `candidates` as `(hash, smoothed fitness, params)`:
+/// best fitness first (callers pass the already-ranked list), ties broken by
+/// the FEWEST parameters.
+///
+/// Why tie-break at all: the guardrail certifies ONE net, and that net is what
+/// the next experiment inherits via `seed_previous_run`. When the measured
+/// skill is equal, the smaller architecture is the one worth certifying —
+/// equal standing for less machinery. A net whose parameter count is unknown
+/// (legacy state file) loses to any known count.
+fn pick_tie_broken(candidates: &[(String, Option<f32>, Option<i64>)], eps: f32) -> Option<&str> {
+    let (first, best, _) = candidates.first()?;
+    let mut pick: Option<(i64, &str)> = None;
+    for (hash, fit, params) in candidates {
+        let tied = match (best, fit) {
+            (Some(a), Some(b)) => (a - b).abs() <= eps,
+            (None, None) => true,
+            _ => false,
+        };
+        if !tied {
+            continue;
+        }
+        let p = params.unwrap_or(i64::MAX);
+        if pick.as_ref().map(|(best_p, _)| p < *best_p).unwrap_or(true) {
+            pick = Some((p, hash.as_str()));
+        }
+    }
+    Some(match pick {
+        Some((_, h)) => h,
+        None => first.as_str(),
+    })
 }
 
 /// Trainer-blob validation, the resume gate.
@@ -2337,7 +2516,7 @@ mod tests {
         );
         assert_eq!(cfg.mutation_probation_steps, 5);
         assert_eq!(cfg.crossover_probation_steps, 5);
-        assert_eq!(cfg.elite_probation_steps, 5);
+        assert_eq!(cfg.elite_probation_steps, 0);
         assert_eq!(
             cfg.crossover_cull_policy,
             crate::engine::config::CrossCullPolicy::Worst
@@ -2430,6 +2609,10 @@ mod tests {
         let dir = std::env::temp_dir().join("race_mutation_targets_worst");
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = engine(&dir, 42).unwrap();
+        // Isolate the ROULETTE WEIGHTS: the default probation windows would
+        // otherwise shield every fresh net and the draw would return None.
+        engine.config.mutation_probation_steps = 0;
+        engine.config.elite_probation_steps = 0;
         engine
             .seed_population_internal(
                 vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
@@ -4724,6 +4907,242 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── Seed from a previous run's guardrail champion ───────────────────
+
+    /// Write a prior-run fixture: `engine.json` (tabular, 2→2) + the champion's
+    /// `nets/<hash>.json`, optionally with a `guardrail` block. Returns the
+    /// champion topology so the caller can compare populations. No `trainer`
+    /// blob on purpose — the trainer-name check is skipped when absent (see
+    /// `seed::tests::a_missing_trainer_name_skips_that_check`).
+    fn write_prior_run(dir: &std::path::Path, run_id: &str, with_guardrail: bool) -> Topology {
+        std::fs::create_dir_all(dir.join("nets")).unwrap();
+        let topo = tiny_topology(999);
+        let hash = "feedfacefeedface";
+        std::fs::write(
+            dir.join("nets").join(format!("{hash}.json")),
+            serde_json::json!({ "topology": topo.to_json().unwrap() }).to_string(),
+        )
+        .unwrap();
+        let mut header = serde_json::json!({
+            "run_id": run_id,
+            "engine_mode": "tabular",
+            "run_seed": 7,
+            "fitness_label": "mse",
+            "fitness_direction": "Minimize",
+            "input_dim": 2,
+            "output_dim": 2,
+            "config": { "mode": "tabular" },
+        });
+        if with_guardrail {
+            header["guardrail"] = serde_json::json!({
+                "champion_hash": hash,
+                "champion_params": 4242,
+                "race_smoothed": 0.25,
+                "holdout_mean": 0.30,
+                "matches_scored": 16,
+            });
+        }
+        std::fs::write(dir.join("engine.json"), header.to_string()).unwrap();
+        topo
+    }
+
+    fn seeded_engine(
+        run_dir: &std::path::Path,
+        seed_root: &std::path::Path,
+    ) -> Result<crate::engine::TabularEngine> {
+        let data_dir = tiny_dataset_dir("seeded");
+        let config = RaceConfig {
+            pop_size: 3,
+            seed_previous_run: true,
+            seed_previous_run_dir: Some(seed_root.to_path_buf()),
+            ..RaceConfig::defaults()
+        };
+        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+            data_dir,
+            config,
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+            Some(7),
+            Some(run_dir.to_path_buf()),
+        ))
+    }
+
+    /// The happy path end to end: slot 0 carries the champion's exact
+    /// blueprint, the population is full, the lineage says where it came from,
+    /// and `engine.json` records the inheritance receipt.
+    #[test]
+    fn seed_previous_run_imports_the_certified_champion() {
+        let prior = std::env::temp_dir().join("gras-seedprior-good");
+        let _ = std::fs::remove_dir_all(&prior);
+        std::fs::create_dir_all(&prior).unwrap();
+        let champion = write_prior_run(&prior.join("1000"), "1000", true);
+
+        let dir = std::env::temp_dir().join("gras-seedprior-run");
+        let _ = std::fs::remove_dir_all(&dir);
+        let eng = seeded_engine(&dir, &prior).unwrap();
+
+        // 1. Population: full size, and the champion blueprint is IN it.
+        assert_eq!(eng.state.live_count(), 3, "seeding must not shrink the pop");
+        let champion_json = champion.to_json().unwrap();
+        let seeded: Vec<String> = eng
+            .state
+            .live_hashes()
+            .iter()
+            .filter(|h| {
+                eng.state
+                    .net(h)
+                    .map(|s| s.topology == champion_json)
+                    .unwrap_or(false)
+            })
+            .map(|h| h.clone())
+            .collect();
+        assert_eq!(seeded.len(), 1, "exactly one slot carries the champion");
+
+        // 2. Lineage: the imported founder names its source, not `founder-0`.
+        let origin = eng.state.net(&seeded[0]).unwrap().created_from.clone();
+        assert_eq!(origin.as_deref(), Some("seed:1000:feedface"));
+
+        // 3. Receipt: the header records which experiment was inherited, and
+        //    the run-topology count stays user-only (the import is not a
+        //    `run_topologies` entry).
+        let header = crate::state::load_engine_json(&dir).unwrap();
+        let source = header
+            .run_topology_source
+            .expect("a seeded run must record its source");
+        assert_eq!(source.source_run_id, "1000");
+        assert_eq!(source.champion_hash, "feedfacefeedface");
+        assert_eq!(source.champion_params, Some(4242));
+        assert_eq!(source.guardrail_mean, Some(0.30));
+        assert_eq!(header.config.run_topology_count, 0);
+        assert!(header.config.seed_previous_run);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&prior);
+    }
+
+    /// Every failure mode degrades to an all-random population of the right
+    /// size — no panic, no short population, and no `run_topology_source`
+    /// claiming an inheritance that didn't happen.
+    #[test]
+    fn seed_previous_run_failures_fall_back_to_random() {
+        // A prior run with NO guardrail champion recorded.
+        let prior = std::env::temp_dir().join("gras-seedprior-none");
+        let _ = std::fs::remove_dir_all(&prior);
+        std::fs::create_dir_all(&prior).unwrap();
+        write_prior_run(&prior.join("1000"), "1000", false);
+        let dir = std::env::temp_dir().join("gras-seedprior-none-run");
+        let _ = std::fs::remove_dir_all(&dir);
+        let eng = seeded_engine(&dir, &prior).unwrap();
+        assert_eq!(eng.state.live_count(), 3, "fallback still fills the pop");
+        assert!(
+            crate::state::load_engine_json(&dir)
+                .unwrap()
+                .run_topology_source
+                .is_none(),
+            "a skipped seed must not be recorded as an inheritance"
+        );
+
+        // A root that does not exist at all.
+        let dir2 = std::env::temp_dir().join("gras-seedprior-missing-run");
+        let _ = std::fs::remove_dir_all(&dir2);
+        let eng2 = seeded_engine(&dir2, &prior.join("nowhere")).unwrap();
+        assert_eq!(eng2.state.live_count(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+        let _ = std::fs::remove_dir_all(&prior);
+    }
+
+    /// The knob is OFF by default: an unconfigured run must behave exactly as
+    /// it always did (no lookup, no record, a full random population).
+    #[test]
+    fn seed_previous_run_is_off_by_default() {
+        let defaults = RaceConfig::defaults();
+        assert!(!defaults.seed_previous_run);
+        assert!(defaults.seed_previous_run_dir.is_none());
+
+        let dir = std::env::temp_dir().join("gras-seedprior-off");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        eng.config.pop_size = 2;
+        let topos = crate::engine::population::fill_unique(
+            &eng.config,
+            eng.run_seed(),
+            Vec::new(),
+            eng.config.pop_size,
+        );
+        assert_eq!(topos.len(), 2);
+        assert!(
+            crate::state::load_engine_json(&dir)
+                .unwrap()
+                .run_topology_source
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The champion tie-break: equal smoothed fitness ⇒ the SMALLEST net wins;
+    /// an unknown parameter count never beats a known one; a strictly better
+    /// fitness wins regardless of size.
+    #[test]
+    fn champion_tie_break_prefers_fewer_parameters() {
+        let c = |h: &str, fit: Option<f32>, params: Option<i64>| (h.to_string(), fit, params);
+        // Tied at 500 → fewest params.
+        let tied = vec![
+            c("big", Some(500.0), Some(20_000)),
+            c("small", Some(500.0), Some(10_000)),
+        ];
+        assert_eq!(pick_tie_broken(&tied, CHAMPION_TIE_EPS), Some("small"));
+        // Not tied → the better fitness wins even when it is huge.
+        let better = vec![
+            c("best", Some(510.0), Some(90_000)),
+            c("tiny", Some(500.0), Some(10)),
+        ];
+        assert_eq!(pick_tie_broken(&better, CHAMPION_TIE_EPS), Some("best"));
+        // Unknown params lose to known ones, and an all-unknown list keeps the
+        // ranking's own first entry (never invents a champion).
+        let unknown = vec![c("a", Some(1.0), None), c("b", Some(1.0), Some(5))];
+        assert_eq!(pick_tie_broken(&unknown, CHAMPION_TIE_EPS), Some("b"));
+        let all_unknown = vec![c("a", Some(1.0), None), c("b", Some(1.0), None)];
+        assert_eq!(pick_tie_broken(&all_unknown, CHAMPION_TIE_EPS), Some("a"));
+        assert_eq!(pick_tie_broken(&[], CHAMPION_TIE_EPS), None);
+    }
+
+    /// The guardrail record survives a header rewrite (`refresh_header` is what
+    /// a resume-then-stop does): a resumed run must never erase the champion
+    /// that the NEXT experiment would inherit.
+    #[test]
+    fn guardrail_record_rides_the_header_and_survives_a_refresh() {
+        let dir = std::env::temp_dir().join("gras-guardrail-record");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        let record = crate::state::GuardrailRecord {
+            champion_hash: "abcdefghabcdefgh".into(),
+            champion_params: Some(77),
+            race_smoothed: Some(0.5),
+            holdout_mean: Some(0.55),
+            holdout_std: Some(0.01),
+            matches_scored: 16,
+            verdict: "consistent with the race signal ✅".into(),
+        };
+        eng.header.set_guardrail(Some(record.clone()));
+        crate::state::write_guardrail_record(&dir, &record).unwrap();
+
+        // On disk…
+        let loaded = crate::state::load_engine_json(&dir).unwrap();
+        assert_eq!(loaded.guardrail, Some(record.clone()));
+        // …and still there after a header rebuild.
+        eng.refresh_header().unwrap();
+        let again = crate::state::load_engine_json(&dir).unwrap();
+        assert_eq!(again.guardrail, Some(record));
+
+        // A legacy header with no block loads as None (not as a fake champion).
+        std::fs::write(dir.join("engine.json"), r#"{"run_id":"legacy"}"#).unwrap();
+        let legacy = crate::state::load_engine_json(&dir).unwrap();
+        assert!(legacy.guardrail.is_none() && legacy.run_topology_source.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Checkpoint elite weight snapshot ────────────────────────────────
 
     #[test]
@@ -4912,16 +5331,15 @@ mod tests {
             vec![hashes[0].clone()],
             "protection lifts once the net has aged k clocks"
         );
-        // If EVERY rankable net is fresh, protection breaks for that refresh
-        // (plain top-k) rather than leaving the crown empty / champion
-        // unguarded.
+        // If EVERY rankable net is fresh the crown is EMPTY — no fallback, so
+        // nothing is crowned/frozen before it has aged `k` clocks (the whole
+        // point of the gate).
         for h in &hashes {
             eng.state.net_mut(h).unwrap().entered_at_step = 4;
         }
-        assert_eq!(
-            eng.elite_hashes(),
-            vec![hashes[0].clone()],
-            "all-fresh fallback keeps the top-k guard (champion never unguarded)"
+        assert!(
+            eng.elite_hashes().is_empty(),
+            "no net may be crowned/frozen while every net is younger than the window"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

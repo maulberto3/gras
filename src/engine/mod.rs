@@ -26,6 +26,7 @@
 //! - [`stop`] — stop criteria + `RaceSnapshot`
 //! - [`tabular_engine`] — tabular-mode constructors (`resume`)
 //! - [`rl_engine`] — RL-mode constructors (`resume_rl`)
+//! - [`seed`] — founder-batch seeding from a previous run's guardrail champion
 //! - [`fitness`] — `Fitness`, `Direction`, `Metric`, `FitnessLabel`
 
 pub mod artifacts;
@@ -45,6 +46,7 @@ pub mod step;
 pub mod stop;
 pub mod rl_engine;
 pub mod run_spec;
+pub mod seed;
 pub mod smoothing;
 pub mod tabular_engine;
 
@@ -58,4 +60,5 @@ pub use core::CoreEngine;
 pub use fitness::{Direction, Fitness, FitnessLabel};
 pub use rl_engine::RlEngine;
 pub use run_spec::{RLSpec, RunSpec, StreamShape, TabularSpec};
+pub use seed::{resolve as resolve_seed_source, SeedOutcome, SeedPick};
 pub use tabular_engine::TabularEngine;

@@ -5,6 +5,7 @@
 pub mod persistence;
 
 pub use persistence::{
-    ConfigSnapshot, NetMeta, NetMetrics, NetState, RaceState, RunConfig, RunHeader,
-    TopologyLifetime, load_engine_json, load_net_state, write_engine_json, write_net_state,
+    ConfigSnapshot, GuardrailRecord, NetMeta, NetMetrics, NetState, RaceState, RunConfig,
+    RunHeader, SeedSourceRecord, TopologyLifetime, load_engine_json, load_net_state,
+    write_engine_json, write_guardrail_record, write_net_state,
 };
