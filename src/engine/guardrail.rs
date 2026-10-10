@@ -4,11 +4,19 @@
 //! smoothed automatically) or via [`check_champion`] directly for saved-run
 //! scoring (`--score-only` style, no engine).
 //!
+//! Two ways to get the net to score, same aggregation:
+//! - [`score_net`] — a net the caller ALREADY holds (the engine's live
+//!   champion, still in memory at stop time). No files involved, so a run can
+//!   leave `elite_save_safetensors` off and still certify a champion.
+//! - [`score_with`] / [`check_champion`] — rebuild it from
+//!   `nets/<hash>.json` + load the TRAINED weights from
+//!   `elite-<hash>.safetensors` (or the `checkpoint-elite-*` fallback). This is
+//!   the path for saved runs with no live engine (`--score-only`).
+//!
 //! Ownership split:
-//! - **Module** (here): which net is the champion (`champion_hashes`),
-//!   rebuilding it from `nets/<hash>.json` + loading the TRAINED weights from
-//!   `elite-<hash>.safetensors` (or the `checkpoint-elite-*` fallback), and
-//!   aggregating per-game scores into a [`GuardrailVerdict`].
+//! - **Module** (here): which net is the champion (`champion_hashes`), getting
+//!   its trained state (live or reloaded), and aggregating per-game scores into
+//!   a [`GuardrailVerdict`].
 //! - **User** ([`ChampionScorer`]): play ONE fresh game with the given net —
 //!   only the trainer's domain code knows the environment.
 //!
@@ -217,10 +225,60 @@ fn record_guardrail(run_dir: &std::path::Path, champion_hash: &str, verdict: &Gu
     }
 }
 
-/// The engine's seam: reload + play + aggregate, where the scorer IS the
-/// run's own trainer (reached through the [`EngineTrainer`] dispatch). This
-/// is what `engine.guardrail(device, None)` calls — no second scorer object.
-/// Also available to embedders that hold a trainer in their own container.
+/// Play the `matches` holdout games on a net the CALLER already holds and
+/// aggregate the verdict.
+///
+/// This is the engine's path: at stop time the trained champion is still a live
+/// population member, so certification needs no `elite-*.safetensors` on disk.
+/// The caller owns the net's state — put it in the resting (eval) state first,
+/// exactly as a fresh [`reload_champion`] build would be: with dropout on, the
+/// 100 games stop being a measurement of the deterministic policy and become a
+/// sample of a random one.
+///
+/// `None` when every game failed; per-game failures are skipped and reflected
+/// in `verdict.scores.len() < matches`.
+pub fn score_net<T, F>(
+    net: &mut Network,
+    champion_hash: &str,
+    race_smoothed: Option<f32>,
+    matches: usize,
+    trainer: &mut T,
+    score: F,
+) -> Option<GuardrailVerdict>
+where
+    F: Fn(&mut T, &mut Network, usize) -> flodl::tensor::Result<f32>,
+{
+    let mut scores = Vec::with_capacity(matches);
+    for game_i in 0..matches {
+        match score(trainer, net, game_i) {
+            Ok(s) => scores.push(s),
+            Err(e) => tracing::warn!("guardrail: holdout game {game_i} failed ({e}) — skipped"),
+        }
+    }
+    verdict_from(champion_hash, race_smoothed, scores)
+}
+
+/// Assemble a verdict from collected scores — `None` when there were none (a
+/// failed run must read as "not scored", never as a fake 0).
+fn verdict_from(
+    champion_hash: &str,
+    race_smoothed: Option<f32>,
+    scores: Vec<f32>,
+) -> Option<GuardrailVerdict> {
+    if scores.is_empty() {
+        return None;
+    }
+    Some(GuardrailVerdict {
+        hash: champion_hash.to_string(),
+        race_smoothed,
+        scores,
+    })
+}
+
+/// The engine's DISK seam: reload + play + aggregate, where the scorer IS the
+/// run's own trainer (reached through the [`EngineTrainer`] dispatch). Used by
+/// embedders that hold a trainer and a run dir but no live engine, and as the
+/// engine's fallback when the champion is no longer in memory.
 pub fn score_with<T, F>(
     run_dir: &std::path::Path,
     champion_hash: &str,
@@ -234,21 +292,14 @@ where
     F: Fn(&mut T, &mut Network, usize) -> flodl::tensor::Result<f32>,
 {
     let mut net = reload_champion(run_dir, champion_hash, device)?;
-    let mut scores = Vec::with_capacity(matches);
-    for game_i in 0..matches {
-        match score(trainer, &mut net, game_i) {
-            Ok(s) => scores.push(s),
-            Err(e) => tracing::warn!("guardrail: holdout game {game_i} failed ({e}) — skipped"),
-        }
-    }
-    if scores.is_empty() {
-        return None;
-    }
-    Some(GuardrailVerdict {
-        hash: champion_hash.to_string(),
+    score_net(
+        &mut net,
+        champion_hash,
         race_smoothed,
-        scores,
-    })
+        matches,
+        trainer,
+        score,
+    )
 }
 
 /// Run the guardrail: reload the champion's TRAINED weights, play `matches`
@@ -275,14 +326,7 @@ pub fn check_champion(
             Err(e) => tracing::warn!("guardrail: holdout game {game_i} failed ({e}) — skipped"),
         }
     }
-    if scores.is_empty() {
-        return None;
-    }
-    Some(GuardrailVerdict {
-        hash: champion_hash.to_string(),
-        race_smoothed,
-        scores,
-    })
+    verdict_from(champion_hash, race_smoothed, scores)
 }
 
 #[cfg(test)]
@@ -332,6 +376,73 @@ mod tests {
         assert!(v.contains("consistent"), "{v}");
         // No reference → honest "unscored", never a fake pass.
         assert!(agreement_verdict(None, Some(1.0), Maximize).contains("unscored"));
+    }
+
+    /// Scoring a net the caller already holds needs no run dir and no weight
+    /// file — the engine's path, and the reason `elite_save_safetensors(false)`
+    /// no longer costs a run its guardrail verdict. Also pins the failure rule:
+    /// a batch where every game errors is `None`, not a zero verdict.
+    #[test]
+    fn score_net_needs_no_files_and_reports_failed_batches_as_none() {
+        /// A minimal wired 2→2 net (a bare `Topology::new` has no nodes).
+        fn tiny_net() -> Network {
+            use crate::graph::node::Node;
+            use crate::graph::topology::{Connection, Port, Topology, TopologyOptions};
+            let opts = TopologyOptions {
+                topology_seed: 7,
+                min_hidden_num_nodes: 1,
+                max_hidden_num_nodes: 1,
+                min_hidden_inputs_per_node: 1,
+                max_hidden_inputs_per_node: 1,
+                min_hidden_outputs_per_node: 1,
+                max_hidden_outputs_per_node: 1,
+                input_dim: Some(2),
+                output_dim: Some(2),
+                dropout_prob: 0.0,
+            };
+            let mut topo = Topology::new(7, Some(opts));
+            topo.nodes.push(Node::new_input(0, 2));
+            topo.nodes.push(Node::new_hidden(1, 2, 2));
+            topo.nodes.push(Node::new_output(2, 2, 2));
+            let port = |node: usize, index: usize| Port { node, index };
+            let conn = |from: (usize, usize), to: (usize, usize)| Connection {
+                from: port(from.0, from.1),
+                to: port(to.0, to.1),
+            };
+            // input(2 outs) → hidden(2 in, 2 outs) → output(2 in, 2 outs).
+            for i in 0..2 {
+                topo.connections.push(conn((0, i), (1, i)));
+                topo.connections.push(conn((1, i), (2, i)));
+            }
+            topo.refresh_labels();
+            topo.finalize();
+            Network::build(&topo, flodl::Device::CPU).unwrap()
+        }
+
+        let mut net = tiny_net();
+        flodl::Module::eval(&net);
+        let ok = score_net(
+            &mut net,
+            "cafebabe",
+            Some(0.25),
+            4,
+            &mut 0u8,
+            |_t: &mut u8, _net, game_i| Ok(game_i as f32),
+        )
+        .expect("a live net must be scoreable without any run dir");
+        assert_eq!(ok.hash, "cafebabe");
+        assert_eq!(ok.race_smoothed, Some(0.25));
+        assert_eq!(ok.scores, vec![0.0, 1.0, 2.0, 3.0]);
+
+        let failed = score_net(
+            &mut net,
+            "cafebabe",
+            None,
+            3,
+            &mut 0u8,
+            |_t: &mut u8, _net, _i| Err(flodl::tensor::TensorError::new("nope")),
+        );
+        assert!(failed.is_none(), "an all-failed batch is not a verdict");
     }
 
     /// The reload path must refuse when no weights exist — a fresh-init net

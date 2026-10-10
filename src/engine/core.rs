@@ -691,7 +691,18 @@ impl CoreEngine {
         let mut founders: Vec<crate::graph::topology::Topology> =
             Vec::with_capacity(run_topology_count + 1);
         let mut seed_source: Option<crate::state::SeedSourceRecord> = None;
-        if config.seed_previous_run {
+        // Manual founders WIN: `set_run_topologies` is the user naming the batch
+        // themselves, so the engine must not inject a net they did not ask for.
+        // Additive would also shift every ordinal (and every lineage key) and
+        // could silently dedupe when the champion is already in their list.
+        let manual_founders = !config.run_topologies.is_empty();
+        if config.seed_previous_run && manual_founders {
+            println!(
+                "seed_previous_run: skipped — {} founder blueprint(s) supplied via \
+                 set_run_topologies (manual founders win)",
+                config.run_topologies.len()
+            );
+        } else if config.seed_previous_run {
             // The compatibility gate reads the candidate's engine.json header,
             // so this run's own header (mode, dims, trainer name) is the input.
             let trainer_name = header
@@ -1129,11 +1140,35 @@ impl CoreEngine {
             self.state.insert(state, initial_fitness);
         }
         let count = self.state.live_count();
-        info!(
-            "race init: populated {} live nets into {}",
-            count,
-            self.run_dir.display()
-        );
+        // The init line names the inheritance: "populated 100 live nets" says
+        // nothing about whether one of them came from a previous experiment,
+        // and that is the whole point of `set_run_seed_previous`. Silent when
+        // the batch is all locks (the overwhelmingly common case).
+        let seeded_slots = topologies
+            .iter()
+            .filter(|(_, label)| label.is_some())
+            .count();
+        match (seeded_slots, self.header.run_topology_source.as_ref()) {
+            (0, _) => info!(
+                "race init: populated {} live nets into {}",
+                count,
+                self.run_dir.display()
+            ),
+            (n, Some(src)) => info!(
+                "race init: populated {} live nets into {} ({} seeded from run {}'s guardrail champion {})",
+                count,
+                self.run_dir.display(),
+                n,
+                src.source_run_id,
+                &src.champion_hash[..8.min(src.champion_hash.len())],
+            ),
+            (n, None) => info!(
+                "race init: populated {} live nets into {} ({} seeded from a previous experiment)",
+                count,
+                self.run_dir.display(),
+                n,
+            ),
+        }
         Ok(())
     }
 
@@ -1667,11 +1702,17 @@ impl CoreEngine {
         self.rolling_fitness.get(hash).map(rolling_mean)
     }
 
-    /// The post-race holdout guardrail: reload the champion's TRAINED
-    /// weights from this run's exports and play fresh unseen games through
-    /// the run's OWN trainer (`holdout_score` — one game per call, same
-    /// units as the reported fitness). No scorer object to wire: the engine
-    /// owns the trainer, so `engine.guardrail(device)` is the whole call.
+    /// The post-race holdout guardrail: score the champion on fresh unseen
+    /// games through the run's OWN trainer (`holdout_score` — one game per
+    /// call, same units as the reported fitness). No scorer object to wire: the
+    /// engine owns the trainer, so `engine.guardrail(device)` is the whole
+    /// call.
+    ///
+    /// The net scored is the LIVE champion (still a population member at stop
+    /// time), forced to its resting eval state first — so a run that keeps
+    /// `elite_save_safetensors` off can still certify a champion, and the next
+    /// run (`set_run_seed_previous`) still has something to inherit. The disk
+    /// reload stays as the fallback for a champion that is no longer in memory.
     /// How many games it plays is the run's `set_elite_guardrail_matches`
     /// (default 16) — one knob, set where the rest of the run is configured.
     ///
@@ -1691,15 +1732,36 @@ impl CoreEngine {
         let champion = self.champion_for_guardrail()?;
         let matches = self.config.guardrail_matches;
         let race_smoothed = self.smoothed_fitness_of(&champion);
-        let verdict = crate::engine::guardrail::score_with(
-            &self.run_dir,
-            &champion,
-            race_smoothed,
-            matches,
-            device,
-            &mut self.trainer,
-            |t, net, game_i| crate::trainer::EngineTrainer::holdout_score(&mut **t, net, game_i),
-        )?;
+        let verdict = match self.networks.get_mut(&champion) {
+            Some(net) => {
+                // `eval()` first: the resting state a fresh disk rebuild gets
+                // for free, and the state the holdout MUST be measured in —
+                // with dropout on the 100 games would sample a random policy
+                // instead of measuring the deterministic one.
+                flodl::Module::eval(net);
+                crate::engine::guardrail::score_net(
+                    net,
+                    &champion,
+                    race_smoothed,
+                    matches,
+                    &mut self.trainer,
+                    |t, net, game_i| {
+                        crate::trainer::EngineTrainer::holdout_score(&mut **t, net, game_i)
+                    },
+                )
+            }
+            None => crate::engine::guardrail::score_with(
+                &self.run_dir,
+                &champion,
+                race_smoothed,
+                matches,
+                device,
+                &mut self.trainer,
+                |t, net, game_i| {
+                    crate::trainer::EngineTrainer::holdout_score(&mut **t, net, game_i)
+                },
+            ),
+        }?;
         // Record it: the guardrail is a run OUTPUT (the only reading taken on
         // games no net trained on), so it lives in engine.json — and the next
         // experiment's `seed_previous_run` reads exactly this block to inherit
@@ -5050,6 +5112,133 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+        let _ = std::fs::remove_dir_all(&prior);
+    }
+
+    /// Certification needs no weight file: the champion is still live when
+    /// `guardrail()` runs, so the in-memory path scores it directly and the
+    /// record lands in `engine.json` anyway. This is what lets a run keep
+    /// `elite_save_safetensors` off and still be inheritable.
+    #[test]
+    fn guardrail_certifies_a_live_champion_without_weight_files() {
+        let dir = std::env::temp_dir().join("gras-guardrail-live");
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = tiny_dataset_dir("guardrail-live");
+        let config = RaceConfig {
+            // pop_size 0 ⇒ `from_spec` seeds nothing (the default pools draw
+            // topologies that a 2-dim dataset cannot feed); the test seeds two
+            // tiny ones explicitly below.
+            pop_size: 0,
+            max_steps: Some(2),
+            guardrail_matches: 3,
+            // The point of the test: NO weight export at all.
+            elite_save_safetensors: false,
+            elite_checkpoint_weights: false,
+            ..RaceConfig::defaults()
+        };
+        let trainer = crate::trainer::TabularTrainer::new(loss_fn())
+            .with_holdout_scorer(|_net, game_i| -> Result<f32> { Ok(game_i as f32 + 10.0) });
+        let mut eng =
+            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+                data_dir,
+                config,
+                fitness(),
+                trainer,
+                Some(7),
+                Some(dir.clone()),
+            ))
+            .unwrap();
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        eng.run().unwrap();
+        let exported = std::fs::read_dir(&dir).unwrap().flatten().any(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.starts_with("elite-") && n.ends_with(".safetensors")
+        });
+        assert!(
+            !exported,
+            "this test must prove certification without a weight file"
+        );
+
+        let verdict = eng
+            .guardrail(flodl::Device::CPU)
+            .expect("the live champion must be scoreable in memory");
+        assert_eq!(verdict.scores.len(), 3);
+        let record = crate::state::load_engine_json(&dir)
+            .unwrap()
+            .guardrail
+            .expect("the verdict must still be recorded");
+        assert_eq!(record.champion_hash, verdict.hash);
+        assert_eq!(record.matches_scored, 3);
+        assert_eq!(record.holdout_mean, verdict.mean());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `set_run_topologies` takes precedence: a user naming the founder batch
+    /// themselves must not get an extra net injected above their list (nor have
+    /// their ordinals shifted). The auto seed is skipped, the manual blueprints
+    /// are the batch, and nothing is recorded as inherited.
+    #[test]
+    fn manual_founders_win_over_the_previous_run_seed() {
+        let prior = std::env::temp_dir().join("gras-seedprior-manual");
+        let _ = std::fs::remove_dir_all(&prior);
+        std::fs::create_dir_all(&prior).unwrap();
+        let champion = write_prior_run(&prior.join("1000"), "1000", true);
+
+        let dir = std::env::temp_dir().join("gras-seedprior-manual-run");
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = tiny_dataset_dir("seeded-manual");
+        let manual = tiny_topology(11);
+        let config = RaceConfig {
+            pop_size: 3,
+            seed_previous_run: true,
+            seed_previous_run_dir: Some(prior.clone()),
+            run_topologies: vec![manual.clone()],
+            ..RaceConfig::defaults()
+        };
+        let eng =
+            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+                data_dir,
+                config,
+                fitness(),
+                crate::trainer::TabularTrainer::new(loss_fn()),
+                Some(7),
+                Some(dir.clone()),
+            ))
+            .unwrap();
+
+        assert_eq!(eng.state.live_count(), 3, "the batch stays pop_size strong");
+        let contains = |topo: &Topology| {
+            let json = topo.to_json().unwrap();
+            eng.state.live_hashes().iter().any(|h| {
+                eng.state
+                    .net(h)
+                    .map(|s| s.topology == json)
+                    .unwrap_or(false)
+            })
+        };
+        assert!(
+            contains(&manual),
+            "the manual blueprint must be in the batch"
+        );
+        assert!(
+            !contains(&champion),
+            "the auto seed must NOT be injected when founders are named manually"
+        );
+        assert!(
+            crate::state::load_engine_json(&dir)
+                .unwrap()
+                .run_topology_source
+                .is_none(),
+            "a skipped auto seed must not be recorded as an inheritance"
+        );
+        // The manual blueprint is slot 0 / `founder-0`, unshifted.
+        assert_eq!(
+            eng.champions.len(),
+            0,
+            "no champions recorded before any step"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&prior);
     }
 

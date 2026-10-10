@@ -31,6 +31,10 @@
 //! There is deliberately NO fallback chain: "no guardrail champion" means
 //! "nothing here was proven", not "use the runner-up". The caller prints the
 //! reason and runs with an all-random population.
+//!
+//! `RaceConfig::run_topologies` (manual founder blueprints) WINS over this
+//! path: a user naming the batch themselves gets exactly that batch, with no
+//! injected net and no shifted ordinals. See `CoreEngine::from_spec`.
 
 use std::path::{Path, PathBuf};
 
