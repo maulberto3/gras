@@ -539,10 +539,13 @@ fn main() {
         // .set_pruner_method(PopPrunerMethod::Hard)
         // .set_pruner_steps(10)              // solo-phase length in steps
         // .set_run_topologies(vec![])        // founder blueprints filling slots first
-        // Seed slot 0 from the newest compatible prior run's guardrail champion
-        // (topology-only; the rest of the pop stays random). Unset dir ⇒
-        // `results/`; a failure prints why and runs all-random.
-        // .set_run_seed_previous(true)
+        // SHOWCASE — slot 0 of the founder batch is the GUARDRAIL CHAMPION of the
+        // newest compatible prior run (topology-only; the other slots stay
+        // random draws). The engine logs `seed_previous_run: slot 0 ← guardrail
+        // champion …`, or prints why it inherited nothing and runs all-random.
+        // Unset dir ⇒ `results/` — see the "Seed:" line in main() for what this
+        // run actually received, and `engine.json` → `run_topology_source`.
+        .set_run_seed_previous(true)
         // .set_run_seed_previous_dir("assets/1790920031289_500")
         // .set_topology_seed(7)              // pin the topology-draw RNG (else run_seed-derived)
         .set_crossover_prob(0.5)
@@ -572,7 +575,7 @@ fn main() {
         .set_topology_hidden_dim_stride(16)
         .set_topology_combine_op_pool([
             "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
-            ])
+        ])
         // .set_topology_activation_pool([
         //     "Identity",
         //     "ReLU",
@@ -598,10 +601,11 @@ fn main() {
         .set_elite_count(pop / 10)
         .set_elite_probation_steps(5) // 0 -> 500 returns
         .set_elite_save_topology(true)
-        // Weights are the engine's strongest output AND the prerequisite for a
-        // guardrail verdict (a run cannot certify a champion it never saved),
-        // i.e. for `set_run_seed_previous` to inherit anything from this run.
-        .set_elite_save_safetensors(true)
+        // Save the champion's weights for LATER reuse by tools (`export_champion`,
+        // a `--score-only` re-check). NOT needed to certify this run: the guardrail
+        // scores the live in-memory champion, so a run with this off still records
+        // a `guardrail` verdict and is still inheritable by `set_run_seed_previous`.
+        .set_elite_save_safetensors(false)
         .set_elite_checkpoint_weights(false)
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(false)
@@ -626,6 +630,36 @@ fn main() {
 
     println!("Run Dir: {}", engine.run_dir().display());
 
+    // SHOWCASE — what `set_run_seed_previous(true)` above actually inherited.
+    // The receipt is `engine.json` → `run_topology_source`, written at
+    // construction: it names the source run and the certified champion whose
+    // blueprint took slot 0, and it is exactly what the NEXT run reads when it
+    // seeds from THIS one (chains work for free). `None` = nothing was
+    // inheritable (no prior run, an incompatible one, or one with no guardrail
+    // champion recorded) — the engine printed why, and the population is
+    // all-random.
+    match gras::state::load_engine_json(engine.run_dir())
+        .ok()
+        .and_then(|h| h.run_topology_source)
+    {
+        Some(src) => println!(
+            "Seed: slot 0 ← guardrail champion {} of run {} ({}, holdout {})",
+            &src.champion_hash[..8.min(src.champion_hash.len())],
+            src.source_run_id,
+            src.champion_params
+                .map(|p| format!("params {p}"))
+                .unwrap_or_else(|| "params unknown".to_string()),
+            src.guardrail_mean
+                .map(|m| format!("{m:.1}"))
+                .unwrap_or_else(|| "—".to_string()),
+        ),
+        None => println!(
+            "Seed: nothing inherited — population is all-random (a run is only \
+             inheritable once its guardrail certifies a champion; the engine \
+             printed the reason above)"
+        ),
+    }
+
     match engine.run() {
         Ok(reason) => println!("race stopped: {reason:?}"),
         Err(e) => eprintln!("race error: {e}"),
@@ -636,8 +670,10 @@ fn main() {
     // absolute question (is the champion actually good? see
     // CARTPOLE_EXPERIMENTS.md for the false-SOLVED verdict that motivated it).
     // The run's OWN trainer scores the holdout (holdout_score above), and the
-    // count comes from the config's `set_elite_guardrail_matches`; returning `None`
-    // just means no champion was exported — the honest skip, not an error.
+    // count comes from the config's `set_elite_guardrail_matches`. The champion
+    // is scored from the LIVE population (no weight file required) and the
+    // verdict is recorded in `engine.json`; `None` means no champion was ranked
+    // at all — the honest skip, not an error.
     match engine.guardrail(device) {
         Some(v) => {
             let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
@@ -656,6 +692,6 @@ fn main() {
                 "guardrail: holdout survival {holdout:.0} ± {std:.0}/{MAX_TURNS_PER_MATCH} turns{smoothed_note} — {verdict}"
             );
         }
-        None => println!("guardrail: no elite exported — skipped"),
+        None => println!("guardrail: no champion to score — skipped"),
     }
 }
