@@ -85,6 +85,29 @@ its **rebuild path**, and that path must be exercised end-to-end on a net with
 mixed dims (i.e. with bridges). Both are now covered by tests, and
 `load_safetensors` refuses partial files rather than half-applying them.
 
+## The action head — sampling vs argmax training (toggle kept)
+
+Before commit `500f9ca` ("softmax on-policy sampling for RL trainers"),
+**every** match — train included — used the greedy action `argmax(logits)`.
+That commit made train matches draw `a_t ~ softmax(logits)` and left eval /
+holdout on argmax; the reason in its message was the **zero-gradient trap**: a
+deterministic policy replays the same trajectory for every match, so the
+advantages carry ~no variance and the weights never move.
+
+The greedy mode is reachable again through one const — `LOG_SOFTMAX_HEAD` in
+`examples/cartpole.rs` (default `true` = sampled, the current behavior):
+
+| `LOG_SOFTMAX_HEAD` | train action | eval / holdout | notes |
+|---|---|---|---|
+| `true` (default) | `a_t ~ softmax(logits)` | argmax | on-policy REINFORCE; keeps trajectory variance |
+| `false` | `argmax(logits)` | argmax | the pre-500f9ca behavior; expect a frozen, low-variance batch |
+
+The toggle changes **action selection only**. `reinforce_update` still scores
+`log_softmax(pred)` of the taken action — REINFORCE needs `log P(a|s)` no
+matter how `a` was chosen. `describe()` records the choice as `action_head`, so
+a saved run says which mode produced it. Eval and holdout never sample: fitness
+must measure the deterministic policy, not a lucky draw.
+
 ## What survived into the codebase
 
 - `RlStep::pop_phase` — the pop-wide phase hook in the engine (generic, no-op

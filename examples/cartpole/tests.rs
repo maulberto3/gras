@@ -228,4 +228,67 @@ mod tests {
         assert_ne!(before, after, "REINFORCE step did not change weights");
         Ok(())
     }
+
+    /// The `LOG_SOFTMAX_HEAD` toggle is a real branch, not a dead const: with
+    /// `sample = false` the TRAIN matches play the greedy action, so every
+    /// recorded action equals `argmax(net logits)` at that observation — the
+    /// deterministic policy the pre-500f9ca trainer used. The RNG-drawn head
+    /// must NOT reduce to that: somewhere across a batch its action sequence
+    /// has to differ from the greedy one, or the toggle changes nothing.
+    #[test]
+    fn argmax_head_plays_greedy_actions() -> gras::flodl::tensor::Result<()> {
+        let device = gras::auto_device();
+        let trainer = CartPoleTrainer {
+            device,
+            matches_per_step: 1,
+            eval_matches_per_step: 1,
+        };
+        let topo = gras::TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(2),
+            ..Default::default()
+        };
+        let mut t = gras::graph::topology::Topology::new(1, Some(topo));
+        t.finalize();
+        let mut net = Network::build(&t, device)?;
+
+        // Greedy head: every action is argmax of the net's own logits.
+        let seed = episode_start_seed(1234, 0, 0);
+        let (greedy_traj, _) = trainer.play_episode(&mut net, seed, false, None)?;
+        assert!(!greedy_traj.is_empty(), "the greedy policy must play turns");
+        for (obs, action) in &greedy_traj {
+            let x = Tensor::from_f32(obs, &[1, 4], device)?;
+            let pred = net.forward(&Variable::new(x, false))?;
+            let logits = pred.data().to_f32_vec()?;
+            let greedy = if logits[1] > logits[0] { 1 } else { 0 };
+            assert_eq!(*action, greedy, "argmax head played a non-greedy action");
+        }
+        // Same seed ⇒ same greedy trajectory (the branch is replay-safe).
+        let (again, _) = trainer.play_episode(&mut net, seed, false, None)?;
+        let seq = |traj: &Vec<Transition>| traj.iter().map(|(_, a)| *a).collect::<Vec<_>>();
+        assert_eq!(
+            seq(&greedy_traj),
+            seq(&again),
+            "greedy replay must be exact"
+        );
+
+        // Sampled head: not greedy everywhere — otherwise the toggle is inert.
+        // Compare at the SAME seed, so the two branches share one start state
+        // and the only difference can be the action choice itself.
+        let mut differs = false;
+        for match_i in 0..8u64 {
+            let seed = episode_start_seed(1234, 0, match_i);
+            let (greedy, _) = trainer.play_episode(&mut net, seed, false, None)?;
+            let (sampled, _) = trainer.play_episode(&mut net, seed, true, None)?;
+            if seq(&sampled) != seq(&greedy) {
+                differs = true;
+                break;
+            }
+        }
+        assert!(
+            differs,
+            "sampled head never differed from greedy — the toggle would be inert"
+        );
+        Ok(())
+    }
 }
