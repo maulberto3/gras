@@ -134,24 +134,20 @@ pub struct ConfigSnapshot {
     /// window.
     #[serde(default)]
     pub crossover_probation_steps: usize,
-    /// Elite probation steps (`set_elite_probation_steps`): a net cannot
-    /// become an elite (frozen crown or cull guard) until it has aged k
-    /// clocks. Replay-relevant — it changes WHO freezes and WHO is guarded,
+    /// Elite join probation steps (`set_elite_join_probation_steps`):
+    /// cull-immunity for a random immigrant's first k clocks. Replay-relevant
+    /// — it changes WHO freezes and WHO is guarded, hence who trains, so a
+    /// resumed run must use the same window.
+    #[serde(default)]
+    pub elite_join_probation_steps: usize,
+    /// Elite crown lifetime steps (`set_elite_crown_lifetime_steps`):
+    /// a net on the crown is culled out of the crown after k clocks at peak,
+    /// so a long-lived best net does not monopolize the frozen state. A net
+    /// that ages out of the crown is still a live net and still ranks
+    /// normally. Replay-relevant — it changes WHO freezes and WHO is guarded,
     /// hence who trains, so a resumed run must use the same window.
     #[serde(default)]
-    pub elite_probation_steps: usize,
-    /// Anti-plateau challenge probability (`set_run_challenge_prob`):
-    /// per-step, per-net chance a challenged step fires. Replay-relevant —
-    /// the trigger is re-derived from (run_seed, net_seed, step) on replay,
-    /// so a resumed run must roll the same probability.
-    #[serde(default)]
-    pub challenge_prob: f32,
-    /// Decay shape of the challenge knob (`set_run_challenge_decay`):
-    /// `eff = prob × (1 − progress)^k`. Replay-relevant — the trigger
-    /// re-derives its probability from the shape, so a resumed run must use
-    /// the same one (resume-guarded alongside `challenge_prob`).
-    #[serde(default)]
-    pub challenge_decay: crate::engine::config::ChallengeDecay,
+    pub elite_crown_lifetime_steps: usize,
     /// Fresh holdout games the post-race guardrail plays
     /// (`set_elite_guardrail_matches`). Diagnostic — it describes the verdict's
     /// sample size, not replay semantics, so a change needs no resume guard.
@@ -227,9 +223,8 @@ impl ConfigSnapshot {
             elite_checkpoint_weights: cfg.elite_checkpoint_weights,
             mutation_probation_steps: cfg.mutation_probation_steps,
             crossover_probation_steps: cfg.crossover_probation_steps,
-            elite_probation_steps: cfg.elite_probation_steps,
-            challenge_prob: cfg.challenge_prob,
-            challenge_decay: cfg.challenge_decay,
+            elite_join_probation_steps: cfg.elite_join_probation_steps,
+            elite_crown_lifetime_steps: cfg.elite_crown_lifetime_steps,
             guardrail_matches: cfg.guardrail_matches,
             build: crate::engine::format::build_stamp(),
         }
@@ -281,8 +276,8 @@ pub struct GuardrailRecord {
 /// (`RaceConfig::seed_previous_run`) — the run's inheritance receipt.
 ///
 /// Informational (the copied topology is recorded per net like any founder);
-/// it exists so a reader can answer "where did slot 0 come from?" without
-/// diffing populations.
+/// it exists so a reader can answer "where did these founders come from?"
+/// without diffing populations.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SeedSourceRecord {
     /// The source run's id (its `results/<id>` directory name).
@@ -297,6 +292,12 @@ pub struct SeedSourceRecord {
     /// Its holdout mean, carried for readability (the champion's pedigree).
     #[serde(default)]
     pub guardrail_mean: Option<f32>,
+    /// Every elite that was reinstated here, ranked (best first, `[0]` ==
+    /// `champion_hash`). A run that inherited only the certified champion —
+    /// the source predates `elites.json` — carries exactly one entry.
+    /// Empty on a run that inherited nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub elite_hashes: Vec<String>,
 }
 
 /// The reproducible run header, serialized as `engine.json` in the run dir.
@@ -761,6 +762,30 @@ pub struct NetState {
     /// (serde default) and backfilled on first rewrite.
     #[serde(default)]
     pub meta: NetMeta,
+    /// When this net's weights were last updated (the last step it trained
+    /// with a real optimizer). New nets start at 0. Freeze-log only: an
+    /// act-and-measure step never rotates it, so the freeze/dethrone lines
+    /// can show "trained n clocks since last update" honestly. Never written
+    /// to disk; rebuilt from `last_metrics` on resume.
+    #[serde(skip)]
+    pub last_update_step: usize,
+    /// Elite probation clock — half of the KISS elite gate. Starts at 0 on
+    /// birth (and on ANY seat exit) and is ticked +1 every clock by
+    /// `CoreEngine::refresh_crown`. A net may hold an elite seat only once
+    /// `elite_probation_age >= elite_join_probation_steps` (k): a fresh net
+    /// must train k clocks before it can be crowned, and every seat exit
+    /// (age-out or rank dethrone) restarts the window — a lucky
+    /// founder/crossover child cannot live in the crown forever.
+    #[serde(default)]
+    pub elite_probation_age: usize,
+    /// Elite seat clock — the other half of the gate. 0 while the net holds
+    /// no seat; +1 per clock while seated. While seated the gate also
+    /// requires `elite_seat_age < elite_crown_lifetime_steps` (j): at j the
+    /// net is age-eliminated at peak even if it still ranks first
+    /// (`j = 0` disables the lifetime — crown held until rank moves). Reset
+    /// to 0 on seat exit together with `elite_probation_age`.
+    #[serde(default)]
+    pub elite_seat_age: usize,
 }
 
 /// Rich metadata for one individual, embedded in `nets/<hash>.json` under
@@ -879,11 +904,16 @@ impl NetState {
             last_metrics: None,
             frozen_spans: Vec::new(),
             meta: NetMeta::default(),
+            last_update_step: step,
+            elite_probation_age: 0,
+            elite_seat_age: 0,
         })
     }
 
     /// Record that clock `step` was an act-and-measure (frozen) step,
-    /// extending the last span when contiguous.
+    /// extending the last span when contiguous. A frozen step is never a
+    /// weight update, so `last_update_step` is NOT advanced by the freeze
+    /// pass (see `CoreEngine::step_one_net` — the live path records it).
     pub fn record_frozen_step(&mut self, step: usize) {
         match self.frozen_spans.last_mut() {
             Some((_, end)) if *end + 1 == step => *end = step,
@@ -929,9 +959,28 @@ impl NetState {
         self.last_metrics = Some(metrics);
     }
 
-    /// Advance the step counter (called after a net's step is fully recorded).
+    /// Advance the local step clock and record it as the last weight-update
+    /// step.
+    ///
+    /// This is the LIVE-path bookkeeping hook: a training step bumps the net's
+    /// local clock *and* records `last_update_step = clock`. A frozen elite
+    /// step calls a separate freeze-only path (see `CoreEngine::step_one_net`)
+    /// that does NOT bump the clock, so resume replay reproduces the original
+    /// step counts exactly: a net frozen at step k still carries step k after
+    /// a frozen act-and-measure step, and the resumed run continues from k+1
+    /// on its next live step.
     pub fn advance_step(&mut self) {
         self.step += 1;
+        self.last_update_step = self.step;
+    }
+
+    /// Whether this net currently holds an elite seat. Outside
+    /// `refresh_crown`'s own tick a seated net always carries a non-zero
+    /// seat age (the deal refresh ticks it immediately), so `> 0` is the
+    /// observable "sitting" flag; a net that just left the crown is reset
+    /// to 0 in the same refresh that drops it.
+    pub fn on_crown(&self) -> bool {
+        self.elite_seat_age > 0
     }
 
     /// Recover the topology from the embedded JSON.
@@ -1067,6 +1116,35 @@ impl RaceState {
         Ok(())
     }
 
+    /// Record an ACT-AND-MEASURE (frozen) step: metrics snapshot, lifetime
+    /// progress and the frozen span — but WITHOUT advancing the net's step
+    /// clock. An act is not a training: `state.step` keeps counting trainings
+    /// only (resume replay derives its clock set from that count), and
+    /// `last_update_step` stays put so the freeze logs report "trained n
+    /// clocks since last update" honestly. This is the freeze branch's
+    /// counterpart to [`Self::record_step`].
+    pub fn record_frozen_act(&mut self, hash: &str, metrics: NetMetrics) -> Result<()> {
+        let state = self.nets.get_mut(hash).ok_or_else(|| {
+            EngineError::InvalidOptions(format!("race state: net {hash} not live"))
+        })?;
+        state.record_metrics(metrics.clone());
+        // The span is how catch_up_step re-runs this clock through the
+        // no-op optimizer on resume.
+        state.record_frozen_step(metrics.step);
+        let fitness = metrics.fitness;
+        let fitness = if fitness.is_finite() {
+            Some(fitness)
+        } else {
+            None
+        };
+        let entry = self
+            .topology_lifetime
+            .entry(hash.to_string())
+            .or_insert_with(|| TopologyLifetime::new(state.entered_at_step, fitness));
+        entry.record_progress(metrics.step, fitness);
+        Ok(())
+    }
+
     pub fn net(&self, hash: &str) -> Option<&NetState> {
         self.nets.get(hash)
     }
@@ -1083,6 +1161,13 @@ impl RaceState {
 
     pub fn live_count(&self) -> usize {
         self.nets.len()
+    }
+
+    /// Mutable access to every live net, keyed by hash. Used by the per-clock
+    /// counter tick: the increments are commutative, so the map's iteration
+    /// order does not matter and no hash list/ordering has to be built.
+    pub fn live_mut(&mut self) -> impl Iterator<Item = (&String, &mut NetState)> {
+        self.nets.iter_mut()
     }
 
     /// Remove a net from the live set. The state is returned so the caller can
@@ -1499,17 +1584,15 @@ mod tests {
         let topo = tiny_topology();
         let state = NetState::new(&topo, 0, None).unwrap();
         write_net_state(&dir, &state).unwrap();
-        assert!(
-            dir.join("nets")
-                .join(format!("{}.json", state.hash))
-                .exists()
-        );
+        assert!(dir
+            .join("nets")
+            .join(format!("{}.json", state.hash))
+            .exists());
         remove_net_state(&dir, &state.hash).unwrap();
-        assert!(
-            !dir.join("nets")
-                .join(format!("{}.json", state.hash))
-                .exists()
-        );
+        assert!(!dir
+            .join("nets")
+            .join(format!("{}.json", state.hash))
+            .exists());
     }
 
     #[test]
