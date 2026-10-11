@@ -2032,16 +2032,12 @@ impl CoreEngine {
                 .networks
                 .get(h)
                 .map(|n| n.topology_blueprint().param_estimate());
-            // `seat` = this elite's seat index (0-based, its place in the
-            // top-k deal), not the net's global rank: the freeze log would be
-            // unreadable if a seat said `19` while the net sits in seat 0.
-            // `rank` is the net's global position, named next to the seat only
-            // when the two disagree (e.g. seat 0, rank 19 — a net that ranks
-            // top-10 but does not hold an elite seat).
             // Pair the seat with the net it displaced this same step (if any),
             // so a swap reads as one event: who took the seat AND whose smt it
             // beat out. Display-only — the set was re-dealt, no net "owns" it.
-            let _displaced = leaving
+            // (Read-only `leaving.get(idx)`; the dethrone lines below still
+            // iterate `&leaving`.)
+            let displaced = leaving
                 .get(idx)
                 .and_then(|d| {
                     self.smoothed_fitness_of(d).map(|f| {
@@ -2074,21 +2070,14 @@ impl CoreEngine {
                 ),
                 None => String::new(),
             };
-            let displaced_rendered = format!(
-                ", displaced {}",
-                leaving.len()
-            );
-            let gate_rendered = gate;
             let extras = format!(
-                ", age {}, {}/{}t, {}p{}{}{}{}",
+                "age {}, {}/{}t, {}p{}{}",
                 age.map(|a| a.to_string()).unwrap_or_else(|| "—".into()),
                 trained_here,
                 clock,
-                self.config.elite_join_probation_steps,
-                self.config.elite_crown_lifetime_steps,
                 params.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
-                gate_rendered,
-                displaced_rendered,
+                gate,
+                displaced,
             );
             info!(
                 "step {} │ freeze │ elite seat {}/{seat}: {} seated{} (fitness{} {} — {})",

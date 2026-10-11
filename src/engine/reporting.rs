@@ -315,17 +315,15 @@ impl CoreEngine {
         // nets that actually hold a seat, and one header row at the top.
         let mut table = comfy_table::Table::new();
         table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
-        table.set_header(vec![
-            "#",
-            "hash",
-            "smt",
-            "step",
-            "seat",
-            "born",
-            "params",
-            "origin",
-            "eval",
-        ]);
+        // RL trainers report fitness only — `eval_loss` is `None` for every
+        // net, and an all-`—` column is noise. Show it when at least one of the
+        // reported nets actually carries one (the tabular arm).
+        let has_eval = ranked.iter().take(k).any(|(_, _, _, e)| e.is_some());
+        let mut header = vec!["#", "hash", "smt", "step", "seat age", "born", "params", "origin"];
+        if has_eval {
+            header.push("eval");
+        }
+        table.set_header(header);
         for (rank, (h, fit, step, eval_loss)) in ranked.iter().take(k).enumerate() {
             // ± std over the smoothing window, same framing as the holdout
             // guardrail: the mean alone hides the mix of raw values behind it
@@ -351,24 +349,12 @@ impl CoreEngine {
             let born = state
                 .map(|ns| ns.entered_at_step.to_string())
                 .unwrap_or_else(|| "?".to_string());
-            let origin_label = state
-                .as_ref()
-                .and_then(|s| s.created_from.as_deref())
-                .unwrap_or("unknown")
-                .split(' ')
-                .next()
-                .unwrap_or("unknown")
-                .chars()
-                .take(8)
-                .collect::<String>();
+            let origin_label = origin_cell(state.as_ref().and_then(|s| s.created_from.as_deref()));
             let params_label = state
                 .and_then(|s| s.meta.params)
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
-            let eval = eval_loss
-                .map(|l| format!("{l:.4}"))
-                .unwrap_or_else(|| "—".to_string());
-            table.add_row(vec![
+            let mut row = vec![
                 (rank + 1).to_string(),
                 short.to_string(),
                 smt,
@@ -377,8 +363,15 @@ impl CoreEngine {
                 born,
                 params_label,
                 origin_label,
-                eval,
-            ]);
+            ];
+            if has_eval {
+                row.push(
+                    eval_loss
+                        .map(|l| format!("{l:.4}"))
+                        .unwrap_or_else(|| "—".to_string()),
+                );
+            }
+            table.add_row(row);
         }
         // comfy-table computes the widths; indent each line so the block
         // sits inside the summary's two-space margin.
@@ -398,5 +391,78 @@ impl CoreEngine {
             self.config.elite_crown_lifetime_steps,
         );
         Ok(())
+    }
+}
+
+/// One net's origin cell for the final elite table — the FULL lineage, only
+/// the hash-widths compacted. `created_from` carries shapes like
+/// `founder-2`, `seed:<run_id>:<champion_hash>`, `random`,
+/// `crossover:parents=<h1>,<h2>[+mut]`; the earlier `chars().take(8)` chop
+/// turned every one of those into an uninformative prefix (`crossove`,
+/// `founder-`). comfy-table sizes the column to the widest cell, so nothing
+/// needs truncation — but the 64-char hashes inside the lineage DO get
+/// shortened to 8, the same width the logs use everywhere else.
+fn origin_cell(created_from: Option<&str>) -> String {
+    let Some(raw) = created_from else {
+        return "unknown".to_string();
+    };
+    let short8 = |hash: &str| hash[..8.min(hash.len())].to_string();
+    if let Some(rest) = raw.strip_prefix("crossover:parents=") {
+        // `crossover:parents=<h1>,<h2>[+mut]` → `cx parents=abc,def[+mut]`
+        let (parents, mutated) = rest
+            .strip_suffix("+mut")
+            .map(|p| (p, true))
+            .unwrap_or((rest, false));
+        let list = parents
+            .split(',')
+            .map(short8)
+            .collect::<Vec<_>>()
+            .join(",");
+        return format!("cx parents={list}{}", if mutated { "+mut" } else { "" });
+    }
+    if let Some(rest) = raw.strip_prefix("seed:") {
+        // `seed:<run_id>:<champion_hash>` → `seed:<run_id>:<hash8>` — the
+        // run id is the provenance that matters for inheritance, keep it.
+        let mut parts = rest.splitn(2, ':');
+        let run_id = parts.next().unwrap_or("?");
+        return match parts.next() {
+            Some(hash) => format!("seed:{run_id}:{}", short8(hash)),
+            None => format!("seed:{run_id}"),
+        };
+    }
+    // `founder-N`, `random`, and anything else: verbatim.
+    raw.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_cell;
+
+    /// The origin cell keeps the WHOLE lineage (the info the reader needs):
+    /// run id for seeds, both parents for crossovers, the mutation flag.
+    /// Only hash widths are compacted.
+    #[test]
+    fn origin_cell_keeps_the_lineage_info() {
+        assert_eq!(origin_cell(None), "unknown");
+        assert_eq!(origin_cell(Some("random")), "random");
+        assert_eq!(origin_cell(Some("founder-2")), "founder-2");
+        // Seeds keep the source run id + the champion hash (short8).
+        assert_eq!(
+            origin_cell(Some("seed:1791759444988:257486c8abcdef")),
+            "seed:1791759444988:257486c8"
+        );
+        // Crossovers name BOTH parents; the `+mut` flag survives.
+        assert_eq!(
+            origin_cell(Some("crossover:parents=aaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbb")),
+            "cx parents=aaaaaaaa,bbbbbbbb"
+        );
+        assert_eq!(
+            origin_cell(Some(
+                "crossover:parents=aaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbb+mut"
+            )),
+            "cx parents=aaaaaaaa,bbbbbbbb+mut"
+        );
+        // Short hashes are not chopped further.
+        assert_eq!(origin_cell(Some("seed:42:abc")), "seed:42:abc");
     }
 }
