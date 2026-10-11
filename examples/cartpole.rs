@@ -629,16 +629,7 @@ fn main() {
         // .set_topology_standardize_op_pool(["Identity", "LayerNorm", "RmsNorm", "InstanceNorm"])
         .set_elite_freeze(true)
         .set_elite_count(pop / 10)
-        // Join gate: a newborn elite (e.g. a caught-up crossover child) cannot
-        // take a frozen seat until it has aged `k` clocks since arrival, so a
-        // full-buffer newcomer does not freeze on arrival at act-and-measure.
-        // 0 = today's behavior (a proven newborn may freeze immediately) — the
-        // A/B verdict on cartpole was HARMFUL at 5, so keep it 0 here.
         .set_elite_join_probation_steps(5)
-        // Lifetime gate: a net that has been on the frozen crown for `k` clocks
-        // at peak is culled OUT of the crown (age-eliminated at the top), even
-        // if it still holds the best smoothed fitness — the second half of the
-        // same running test. 0 = old "permanent crown until rank changes".
         .set_elite_crown_lifetime_steps(5)
         .set_elite_save_topology(true)
         // Save the champion's weights for LATER reuse by tools (`export_champion`,
