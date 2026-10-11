@@ -11,6 +11,11 @@
 mod tests {
     use crate::*;
 
+    /// The example draws a RANDOM run seed per launch (so consecutive runs
+    /// differ); the namespace checks below only need SOME seed to compare
+    /// against, so they pin one.
+    const RUN_SEED: u64 = 42;
+
     /// fitness_from_survivals is MEAN-of-batch: every match counts, one
     /// lucky max cannot inflate the step.
     #[test]

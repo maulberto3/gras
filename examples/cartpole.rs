@@ -81,7 +81,8 @@ impl CartPole {
 // SECTION 2 — THE TRAINER (the gras contract: StepTrainer + RlStep)
 // ═══════════════════════════════════════════════════════════════════════
 
-const RUN_SEED: u64 = 42;
+/// The guardrail's holdout games stay on a FIXED seed forever: verdicts have
+/// to be comparable across runs even though each run draws its own race seed.
 const HOLDOUT_SEED: u64 = 2;
 const LEARNING_RATE: f32 = 1e-3;
 const DROPOUT_PROB: f32 = 0.25;
@@ -511,11 +512,11 @@ struct Cli {
     /// Stop after this many steps (default: the `RACE_STEPS` const).
     #[arg(long, value_name = "N")]
     max_steps: Option<usize>,
-    /// Run seed (default: the `RUN_SEED` const). Change it to re-roll every
-    /// trajectory — including an INHERITED champion's, whose blueprint
-    /// carries its source run's net_seed (the trainer blends this seed into
-    /// its episode seeds so a new seed means fresh games for everyone).
-    /// Same seed ⇒ bit-identical replay (recorded in `engine.json`).
+    /// Pin the run seed. Without it the example draws a RANDOM one per launch
+    /// (the engine's reproducibility contract holds for a given seed — the
+    /// example just doesn't force the same seed on every run). Pin it to
+    /// re-run a specific race; the seed is always recorded in `engine.json`,
+    /// so any run is replayable after the fact.
     #[arg(long, value_name = "U64")]
     seed: Option<u64>,
 }
@@ -527,7 +528,9 @@ fn main() {
     let cli = <Cli as clap::Parser>::parse();
     let pop = cli.pop.unwrap_or(POP);
     let race_steps = cli.max_steps.unwrap_or(RACE_STEPS);
-    let run_seed = cli.seed.unwrap_or(RUN_SEED);
+    // A fresh seed per launch unless `--seed` pins it (engine reproducibility
+    // is a property of a fixed seed, not of the example's default).
+    let run_seed = cli.seed.unwrap_or_else(|| fastrand::u64(..));
 
     // Install the run's log sinks: the console lines at `LOG_LEVEL` and the
     // `Minimal` frame. Without this the console stays silent and the run LOOKS
@@ -569,18 +572,20 @@ fn main() {
         // .set_pruner_method(PopPrunerMethod::Hard)
         // .set_pruner_steps(10)              // solo-phase length in steps
         // .set_run_topologies(vec![])        // founder blueprints filling slots first
-        // SHOWCASE — slot 0 of the founder batch is the GUARDRAIL CHAMPION of the
-        // newest compatible prior run (topology-only; the other slots stay
-        // random draws). The engine logs `seed_previous_run: slot 0 ← guardrail
-        // champion …`, or prints why it inherited nothing and runs all-random.
-        // Unset dir ⇒ `results/` — see the "Seed:" line in main() for what this
-        // run actually received, and `engine.json` → `run_topology_source`.
+        // SHOWCASE — the founder batch OPENS with the ELITES of the newest
+        // compatible prior run (rank 1 = its guardrail champion, then its own
+        // ranking; topology-only, capped by `pop_size`, the remaining slots are
+        // random draws). The engine logs `seed_previous_run: ranks 1..N of run
+        // … → founder slot(s) 0-N`, or prints why it inherited nothing and runs
+        // all-random. Unset dir ⇒ `results/` — see the "Seed:" line in main()
+        // for what this run actually received, and `engine.json` →
+        // `run_topology_source`.
         .set_run_seed_previous(true)
         // .set_run_seed_previous_dir("assets/1790920031289_500")
         // .set_topology_seed(7)              // pin the topology-draw RNG (else run_seed-derived)
         .set_crossover_prob(0.5)
         .set_crossover_retries(5)
-        .set_crossover_rolls(pop / 2)
+        .set_crossover_rolls(pop / 5)
         .set_crossover_ops_pool(["one_point", "uniform"])
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
         .set_crossover_catch_up(false)
@@ -641,6 +646,23 @@ fn main() {
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(false)
         .set_elite_guardrail_matches(HOLDOUT_MATCHES)
+        // The knobs not used by cartpole today, declared for the record:
+        // .set_crossover_gate(CrossoverGate::Off)
+        // .set_crossover_gate_window(5)
+        // .set_run_challenge_prob(0.1)
+        // .set_run_challenge_decay(ChallengeDecay::Linear)
+        // .set_run_metrics(vec![Metric::custom("eval_survival_min", |survivals, _| {
+        //     let v = survivals.data().to_f32_vec()?;
+        //     Ok(if v.is_empty() {
+        //         0.0
+        //     } else {
+        //         v.iter().copied().fold(f32::INFINITY, f32::min)
+        //     })
+        // })])
+        // .set_run_topologies(vec![]) // founder blueprints filling slots first
+        // .set_checkpoint_elite_weights(true) // per-checkpoint elite weight snapshot
+        // .set_topology_activation_pool(["Identity", "ReLU", "GeLU", "SiLU", "Tanh", "Sigmoid", "Mish"])
+        // .set_topology_standardize_op_pool(["Identity", "LayerNorm", "RmsNorm", "InstanceNorm"])
         .build();
 
     let fitness = Fitness::reported(Direction::Maximize, "match_survival");
@@ -672,16 +694,27 @@ fn main() {
 
     // SHOWCASE — what `set_run_seed_previous(true)` above actually inherited.
     // The receipt is `engine.json` → `run_topology_source`, written at
-    // construction: it names the source run and the certified champion whose
-    // blueprint took slot 0, and it is exactly what the NEXT run reads when it
-    // seeds from THIS one (chains work for free). `None` = nothing was
-    // inheritable (no prior run, an incompatible one, or one with no guardrail
-    // champion recorded) — the engine printed why, and the population is
-    // all-random.
+    // construction: it names the source run, the certified champion that took
+    // slot 0, and every elite reinstated behind it (`elite_hashes`, ranked) —
+    // and it is exactly what the NEXT run reads when it seeds from THIS one
+    // (chains work for free). `None` = nothing was inheritable (no prior run,
+    // an incompatible one, or one with no guardrail champion recorded) — the
+    // engine printed why, and the population is all-random.
     match gras::state::load_engine_json(engine.run_dir())
         .ok()
         .and_then(|h| h.run_topology_source)
     {
+        Some(src) if src.elite_hashes.len() > 1 => println!(
+            "Seed: slots 0-{} ← ranks 1..{} of run {} (topology-only, \
+             champion {} certified, holdout {})",
+            src.elite_hashes.len() - 1,
+            src.elite_hashes.len(),
+            src.source_run_id,
+            &src.champion_hash[..8.min(src.champion_hash.len())],
+            src.guardrail_mean
+                .map(|m| format!("{m:.1}"))
+                .unwrap_or_else(|| "—".to_string()),
+        ),
         Some(src) => println!(
             "Seed: slot 0 ← guardrail champion {} of run {} ({}, holdout {})",
             &src.champion_hash[..8.min(src.champion_hash.len())],
