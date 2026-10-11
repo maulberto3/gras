@@ -552,10 +552,6 @@ fn main() {
         .set_run_smoothing_window(5)
         .set_run_pop_catch_up(false)
         .set_run_checkpoint_every(5)
-        // Challenges are TRAINER-owned since 2026-10-10: `CHALLENGE_PROB` /
-        // `CHALLENGE_DECAY_EXPONENT` live at the top of this file and roll
-        // inside `train_step` via `gras::trainer::challenge_fires` — no
-        // engine knob, no `set_run_challenge_*` setters.
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", |survivals, _| {
         //     let v = survivals.data().to_f32_vec()?;
         //     Ok(if v.is_empty() {
@@ -572,20 +568,12 @@ fn main() {
         // .set_pruner_method(PopPrunerMethod::Hard)
         // .set_pruner_steps(10)              // solo-phase length in steps
         // .set_run_topologies(vec![])        // founder blueprints filling slots first
-        // SHOWCASE — the founder batch OPENS with the ELITES of the newest
-        // compatible prior run (rank 1 = its guardrail champion, then its own
-        // ranking; topology-only, capped by `pop_size`, the remaining slots are
-        // random draws). The engine logs `seed_previous_run: ranks 1..N of run
-        // … → founder slot(s) 0-N`, or prints why it inherited nothing and runs
-        // all-random. Unset dir ⇒ `results/` — see the "Seed:" line in main()
-        // for what this run actually received, and `engine.json` →
-        // `run_topology_source`.
         .set_run_seed_previous(true)
         // .set_run_seed_previous_dir("assets/1790920031289_500")
         // .set_topology_seed(7)              // pin the topology-draw RNG (else run_seed-derived)
         .set_crossover_prob(0.5)
+        .set_crossover_rolls(pop / 10)
         .set_crossover_retries(5)
-        .set_crossover_rolls(pop / 5)
         .set_crossover_ops_pool(["one_point", "uniform"])
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
         .set_crossover_catch_up(false)
@@ -608,9 +596,9 @@ fn main() {
         .set_topology_output_dim(2)
         .set_topology_hidden_dim_range(16, 64)
         .set_topology_hidden_dim_stride(16)
-        .set_topology_combine_op_pool([
-            "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
-        ])
+        // .set_topology_combine_op_pool([
+        //     "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
+        // ])
         // .set_topology_activation_pool([
         //     "Identity",
         //     "ReLU",
@@ -649,8 +637,6 @@ fn main() {
         // The knobs not used by cartpole today, declared for the record:
         // .set_crossover_gate(CrossoverGate::Off)
         // .set_crossover_gate_window(5)
-        // .set_run_challenge_prob(0.1)
-        // .set_run_challenge_decay(ChallengeDecay::Linear)
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", |survivals, _| {
         //     let v = survivals.data().to_f32_vec()?;
         //     Ok(if v.is_empty() {
