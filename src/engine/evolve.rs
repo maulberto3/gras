@@ -97,6 +97,12 @@ impl CoreEngine {
         _roll: usize,
         attempt: usize,
     ) -> Result<RollOutcome> {
+        // HARD SHIELD before any work: with no cull-eligible slot the child
+        // would have nowhere to go (and generating it would burn the parent
+        // pairing + a full replay), so the roll is spent up front.
+        if !self.has_cull_eligible() {
+            return Ok(RollOutcome::no_slot(self.no_cull_slot_detail("crossover")));
+        }
         let idx = self.next_child_ordinal(clock);
         // Ok(spent) = spent roll (crossover produced nothing viable or a
         // duplicate of a live net): no cull, no insert, move on.
@@ -160,9 +166,19 @@ impl CoreEngine {
                     self.select_crossover_worst_victim(clock)?
                 }
                 crate::engine::config::CrossCullPolicy::Random => {
-                    Some(self.select_random_victim(clock)?)
+                    self.select_random_victim(clock)?
                 }
             };
+            // Defensive: the top-of-roll check saw an eligible slot, so a
+            // `None` here means the selection filter disagreed. Discard the
+            // child (and its provisional buffers) and spend the roll —
+            // probation is never broken to manufacture a victim.
+            if victim_for_log.is_none() {
+                self.rolling_fitness.remove(&child.state.hash);
+                self.rolling_train.remove(&child.state.hash);
+                self.rolling_eval.remove(&child.state.hash);
+                return Ok(RollOutcome::no_slot(self.no_cull_slot_detail("crossover")));
+            }
             let victim_net_seed = victim_for_log
                 .as_ref()
                 .and_then(|v| self.state.net(v))
@@ -363,9 +379,17 @@ impl CoreEngine {
                 self.select_crossover_worst_victim(clock)?
             }
             crate::engine::config::CrossCullPolicy::Random => {
-                Some(self.select_random_victim(clock)?)
+                self.select_random_victim(clock)?
             }
         };
+        // Defensive: see the catch-up-off path — a `None` here discards the
+        // (replayed) child and spends the roll rather than breaking probation.
+        if victim_for_log.is_none() {
+            self.rolling_fitness.remove(&child.state.hash);
+            self.rolling_train.remove(&child.state.hash);
+            self.rolling_eval.remove(&child.state.hash);
+            return Ok(RollOutcome::no_slot(self.no_cull_slot_detail("crossover")));
+        }
         // Record the admitted attempt (cx_retry_full measurement) — before
         // the cull/insert, while both victim and child states are readable.
         let victim_net_seed = victim_for_log
@@ -541,58 +565,80 @@ impl CoreEngine {
     /// policies (crossover children and mutation immigrants). Deterministic:
     /// derived from `(run_seed, clock, salt)` so replays and resume pick the
     /// same victim. Elite nets are excluded from the draw (no child —
-    /// crossover or immigrant — can evict an elite).
+    /// crossover or immigrant — can evict an elite), and so is every net still
+    /// inside its CHANNEL probation window: the shield is HARD — a roll with no
+    /// eligible victim is skipped by the caller, never satisfied by culling a
+    /// fresh net (a just-born net has no verdict to be judged on, and one
+    /// trained clock can turn it into the best candidate).
     ///
     /// `salt` separates the several rolls that fire within one clock: without
     /// it every roll of the same step would draw the same index.
-    fn select_random_victim_at(&self, clock: usize, salt: usize) -> Result<String> {
+    fn select_random_victim_at(&self, clock: usize, salt: usize) -> Result<Option<String>> {
         let elite = self.elite_hashes();
-        // The param `clock` is the SALTED seed input; the probation check
-        // needs the CURRENT race clock. Prefer off-probation victims; break
-        // probation only when every non-elite net is fresh (a firing roll
-        // must always find a slot).
+        // The param `clock` is the SALTED seed input; the probation check needs
+        // the CURRENT race clock.
         let now = self.step_clock();
-        let all: Vec<String> = self
+        let hashes: Vec<String> = self
             .state
             .live_hashes()
             .into_iter()
-            .filter(|h| !elite.contains(h))
-            .collect();
-        let mut hashes: Vec<String> = all
-            .iter()
-            .filter(|h| !self.on_probation(h, now))
-            .cloned()
+            .filter(|h| !elite.contains(h) && !self.on_probation(h, now))
             .collect();
         if hashes.is_empty() {
-            hashes = all;
-        }
-        if hashes.is_empty() {
-            return Err(crate::utils::error::EngineError::InvalidOptions(
-                "random cull: no cullable (non-elite) live net".into(),
-            )
-            .into());
+            return Ok(None);
         }
         let seed = crate::utils::seed::derive_seed(
             self.header.run_seed,
             clock.wrapping_mul(7919).wrapping_add(salt),
         );
         let idx = fastrand::Rng::with_seed(seed).usize(..hashes.len());
-        Ok(hashes[idx].clone())
+        Ok(Some(hashes[idx].clone()))
     }
 
     /// [`Self::select_random_victim_at`] with salt 0 — the crossover path's
     /// original derivation, kept verbatim so its victim draws (and the tests
     /// pinning them) are unchanged.
-    pub(crate) fn select_random_victim(&self, clock: usize) -> Result<String> {
+    pub(crate) fn select_random_victim(&self, clock: usize) -> Result<Option<String>> {
         self.select_random_victim_at(clock, 0)
     }
 
+    /// Whether ANY live net is cull-eligible right now: non-elite AND past its
+    /// channel probation window. The evolution branches consult this BEFORE
+    /// building a child — a child with no slot would be thrown away anyway, so
+    /// the check saves the generate/replay work. It applies exactly the victim
+    /// selectors' own filter, so the two can never disagree.
+    pub(crate) fn has_cull_eligible(&self) -> bool {
+        let elite = self.elite_hashes();
+        let now = self.step_clock();
+        self.state
+            .live_hashes()
+            .iter()
+            .any(|h| !elite.contains(h) && !self.on_probation(h, now))
+    }
+
+    /// The one-line detail for a roll skipped by the hard shield — shared by
+    /// both channels so the log reads identically.
+    pub(crate) fn no_cull_slot_detail(&self, branch: &str) -> String {
+        let k = if branch == "crossover" {
+            self.config.crossover_probation_steps
+        } else {
+            self.config.mutation_probation_steps
+        };
+        format!(
+            "no cull-eligible victim — every non-elite net is inside its {branch} probation window (k={k}) or elite; roll spent, nothing culled/inserted"
+        )
+    }
+
     /// The mutation channel's victim, per [`crate::engine::config::MutationCullPolicy`].
-    /// Every arm falls back to the same two last resorts (worst-net when no
-    /// net has a fitness verdict yet, then first live) so a firing roll ALWAYS
-    /// finds a slot for its immigrant. `roll` salts the `Random` arm so the
+    /// Every arm is probation-aware and the shield is HARD: `None` means no
+    /// cull-eligible net exists and the caller must SKIP the roll (nothing is
+    /// culled, no immigrant is built). `roll` salts the `Random` arm so the
     /// rolls of one step don't all draw the same net.
-    pub(crate) fn select_mutation_victim(&self, clock: usize, roll: usize) -> Result<String> {
+    pub(crate) fn select_mutation_victim(
+        &self,
+        clock: usize,
+        roll: usize,
+    ) -> Result<Option<String>> {
         use crate::engine::config::MutationCullPolicy;
         let picked = match self.config.mutation_cull_policy {
             MutationCullPolicy::InverseFitness => self
@@ -600,18 +646,13 @@ impl CoreEngine {
                 .or_else(|| self.mutation_victim_fallback()),
             MutationCullPolicy::Worst => self.mutation_victim_fallback(),
             // Salt `roll + 1`: the crossover path draws with salt 0, so a
-            // mutation roll never silently mirrors a crossover victim.
+            // mutation roll never silently mirrors a crossover victim. A `None`
+            // draw (everyone shielded) falls through to the same last resort.
             MutationCullPolicy::Random => self
-                .select_random_victim_at(clock, roll + 1)
-                .ok()
+                .select_random_victim_at(clock, roll + 1)?
                 .or_else(|| self.mutation_victim_fallback()),
         };
-        picked.ok_or_else(|| {
-            crate::utils::error::EngineError::InvalidOptions(
-                "mutation cull: no live net to evict".into(),
-            )
-            .into()
-        })
+        Ok(picked)
     }
 
     /// Mutation victim last resorts: the worst net by smoothed fitness, else
@@ -631,18 +672,14 @@ impl CoreEngine {
         let eligible = |h: &str| !elite.iter().any(|e| e == h);
         let off_probation = |h: &str| !self.on_probation(h, clock);
         let live = self.state.live_hashes();
-        // Preferred: worst among non-elite, off-probation nets.
-        if let Some(worst) = self
-            .worst_nets_by_smoothed_fitness(live.len())
+        // The worst non-elite net that has ALSO served its channel probation.
+        // No "first live" fallback: the shield is HARD, so when nobody
+        // qualifies the caller SKIPS the roll instead of destroying a fresh
+        // net that has not had a chance to prove itself yet.
+        self.worst_nets_by_smoothed_fitness(live.len())
             .ok()?
             .into_iter()
             .find(|h| eligible(h) && off_probation(h))
-        {
-            return Some(worst);
-        }
-        // Last resort: probation broken — first non-elite live net (the
-        // cull log's reason field is where this shows up, see the caller).
-        live.into_iter().find(|h| eligible(h))
     }
 
     /// One evolution roll of the mutation branch: cull a net selected
@@ -650,16 +687,26 @@ impl CoreEngine {
     /// immigrant (no checkpoint gate — a random topology could never clear
     /// historical means; its job is diversity).
     ///
-    /// When no net has a fitness verdict yet (fresh population, empty rolling
-    /// buffers), falls back to culling the first live net — the immigrant
-    /// still needs a slot, and a random cull is the only honest option when
-    /// nothing distinguishes the population yet.
-    pub(crate) fn evolve_random_immigrant(&mut self, clock: usize, roll: usize) -> Result<String> {
+    /// HARD SHIELD: `Ok(None)` means the roll was SKIPPED — there is no
+    /// cull-eligible victim (every non-elite net is inside its channel
+    /// probation window, or the whole population is elite), so nothing is
+    /// culled and no immigrant is built.
+    pub(crate) fn evolve_random_immigrant(
+        &mut self,
+        clock: usize,
+        roll: usize,
+    ) -> Result<Option<String>> {
+        // Checked BEFORE any work: a child with no slot would be discarded.
+        if !self.has_cull_eligible() {
+            return Ok(None);
+        }
         // Pick a victim per the mutation cull policy (`InverseFitness` by
         // default — the historical fitness-inverse roulette; `Worst` for a
         // deterministic merit cull; `Random` for uniform turnover). The elite
-        // guard makes the top-k immune in every arm.
-        let victim = self.select_mutation_victim(clock, roll)?;
+        // guard AND the probation shield apply in every arm.
+        let Some(victim) = self.select_mutation_victim(clock, roll)? else {
+            return Ok(None);
+        };
         self.cull_net(&victim, clock, "immigrant-slot")?;
         let idx = self.next_child_ordinal(clock);
         let mut child = self.generate_random_at(clock, idx)?;
@@ -707,7 +754,7 @@ impl CoreEngine {
             victim_net_seed,
         );
         self.insert_child(child, clock, "mutation");
-        Ok(detail)
+        Ok(Some(detail))
     }
 
     /// The next child ordinal at this clock (across all evolution branches).
@@ -837,22 +884,14 @@ impl CoreEngine {
         window > 0 && clock.saturating_sub(state.entered_at_step) < window
     }
 
-    /// The crossover Worst-policy victim: worst by smoothed fitness, with the
-    /// SAME probation discipline as the mutation channel (off-probation first;
-    /// protection broken when every non-elite net is fresh — an admitted child
-    /// must always get its slot). `None` only when no net has ever scored.
+    /// The crossover Worst-policy victim: the worst non-elite net that has
+    /// served its crossover probation. `None` when nobody is cullable — the
+    /// shield is HARD (no plain-worst fallback), so the roll is skipped rather
+    /// than paid for with a fresh net.
     fn select_crossover_worst_victim(&self, clock: usize) -> Result<Option<String>> {
-        let worst = self.worst_nets_by_smoothed_fitness(self.state.live_count())?;
-        let victim = worst
+        Ok(self
+            .worst_nets_by_smoothed_fitness(self.state.live_count())?
             .into_iter()
-            .find(|h| !self.on_probation(h, clock))
-            .or_else(|| {
-                // Probation broken: fall back to the plain worst (which may be
-                // on probation — an admitted child must get its slot).
-                self.worst_nets_by_smoothed_fitness(1)
-                    .ok()
-                    .and_then(|v| v.into_iter().next())
-            });
-        Ok(victim)
+            .find(|h| !self.on_probation(h, clock)))
     }
 }

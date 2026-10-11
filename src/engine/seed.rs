@@ -1,12 +1,21 @@
-//! Seed the founder batch from a PREVIOUS experiment's guardrail champion.
+//! Seed the founder batch from a PREVIOUS experiment's elites.
 //!
-//! `RaceConfig::seed_previous_run` turns this on: one slot of the initial
-//! population is a proven ARCHITECTURE copied out of the newest compatible
-//! prior run — the rest stay random draws, exactly as if the knob were off.
-//! TOPOLOGY ONLY: the blueprint brings its nodes, wiring, dims and its stored
+//! `RaceConfig::seed_previous_run` turns this on: the newest compatible prior
+//! run's ELITES are copied in as the first slots of the initial population, in
+//! rank order (best first), capped by the new run's `pop_size`; the rest stay
+//! random draws. The cap is what makes a small population work: with 10 elites
+//! and `pop_size = 4` the top 4 by rank come in, and the order is the source's
+//! own ranking (see `elites.json` below), never a file-mtime guess.
+//! TOPOLOGY ONLY: a blueprint brings its nodes, wiring, dims and its stored
 //! `topology_seed` (which is what `Network::build` derives weights from, so the
 //! imported net restarts from the same step-0 weight init its source had),
 //! never trained weights. Weight import is a separate, not-yet-landed path.
+//!
+//! WHICH elites: the source run writes `elites.json` at stop
+//! (`write_elite_index`) — `[{rank, hash, fitness, params, born}]`, best first,
+//! k = its `elite_count`. That is the list this module reads. A source that
+//! predates the file (or wrote an empty one) falls back to the single
+//! guardrail-certified champion, which is exactly the old behavior.
 //!
 //! Resolution (deterministic, and every failure is survivable):
 //! 1. root = `set_run_seed_previous_dir(path)`, else [`DEFAULT_RESULTS_ROOT`].
@@ -23,10 +32,12 @@
 //!    declare one (`engine.json` → `trainer.trainer`). Mode + dims alone can't
 //!    separate two environments that happen to share dims while measuring
 //!    different units (survival turns vs solve score).
-//! 3. the champion is read from the header's `guardrail` block — the net the
-//!    holdout actually certified. Never a filename guess, never a race-fitness
-//!    ranking.
-//! 4. its topology is read from `nets/<hash>.json`.
+//! 3. the GUARDRAIL gate: the header's `guardrail` block must exist (the run
+//!    had a champion the holdout certified). Rank 1 is that champion, so a run
+//!    whose champion was never verified inherits nothing at all — the gate is
+//!    about the source run's honesty, not about which net it ranked first.
+//! 4. the ranked list is then read from `elites.json` (fallback: the champion
+//!    alone), and each entry's topology from `nets/<hash>.json`.
 //!
 //! There is deliberately NO fallback chain: "no guardrail champion" means
 //! "nothing here was proven", not "use the runner-up". The caller prints the
@@ -45,36 +56,62 @@ use crate::state::RunHeader;
 /// output directory.
 pub const DEFAULT_RESULTS_ROOT: &str = "results";
 
-/// A resolved seed: which run, which certified net, and its blueprint.
+/// A resolved seed: which run, which ranked net, and its blueprint.
 #[derive(Clone, Debug)]
 pub struct SeedPick {
+    /// Rank within the source run's elite list (1 = its champion).
+    pub rank: usize,
     /// The source run's id (its run-directory name).
     pub source_run_id: String,
     /// The directory the source was read from.
     pub source_dir: PathBuf,
-    /// Full hash of the guardrail-certified champion that was copied.
+    /// Full hash of the net at this rank (rank 1 = the certified champion).
     pub champion_hash: String,
-    /// That champion's parameter count (the ranking tie-break key).
+    /// Its parameter count (the ranking tie-break key).
     pub champion_params: Option<i64>,
-    /// Its holdout mean, carried for the record's readability.
+    /// Its holdout mean, carried for the record's readability. Only the
+    /// rank-1 pick has one (only the champion was holdout-scored).
     pub guardrail_mean: Option<f32>,
-    /// The blueprint to seed into slot 0.
+    /// The blueprint to seed into this rank's slot.
     pub topology: Topology,
+}
+
+/// A resolved PLAN: the source run plus its elites in rank order, best first.
+///
+/// Always at least one pick when it is `Seeded` — a plan with no blueprints to
+/// load is a [`SeedOutcome::Skipped`], so the caller never has to handle "an
+/// inheritance that inherited nothing".
+#[derive(Clone, Debug)]
+pub struct SeedPlan {
+    /// The source run's id (its `results/<id>` directory name).
+    pub source_run_id: String,
+    /// The directory the source was read from.
+    pub source_dir: PathBuf,
+    /// Ranked picks, best first, already capped by the caller's `max_seeds`.
+    pub picks: Vec<SeedPick>,
+}
+
+impl SeedPlan {
+    /// The certified champion (rank 1) — the pick a single-slot inheritance
+    /// would have used.
+    pub fn champion(&self) -> &SeedPick {
+        &self.picks[0]
+    }
 }
 
 /// Result of a seed lookup.
 #[derive(Clone, Debug)]
 pub enum SeedOutcome {
-    /// A champion was found and its topology loaded.
-    Seeded(Box<SeedPick>),
+    /// A prior run was found and at least one elite topology loaded.
+    Seeded(Box<SeedPlan>),
     /// Nothing usable — the reason is printed by the caller and the run
     /// proceeds with an all-random founder batch.
     Skipped(String),
 }
 
 impl SeedOutcome {
-    /// The pick, if any.
-    pub fn seeded(&self) -> Option<&SeedPick> {
+    /// The plan, if any.
+    pub fn seeded(&self) -> Option<&SeedPlan> {
         match self {
             SeedOutcome::Seeded(p) => Some(p),
             SeedOutcome::Skipped(_) => None,
@@ -82,13 +119,22 @@ impl SeedOutcome {
     }
 }
 
-/// Resolve the previous experiment to inherit from.
-///
-/// `mode` is the NEW run's `engine_mode` (`"tabular"` | `"rl"`), `trainer_name`
-/// its `Trainer::describe()` name (`engine.json` → `trainer.trainer`), and the
-/// dims come from the new run's header — the candidate must match all of them.
-/// `exclude` is the new run's OWN directory (see the module doc: it exists on
-/// disk by the time this runs, and must never be treated as "a previous run").
+/// One entry of a source run's `elites.json` — the machine-readable ranking
+/// `CoreEngine::write_elite_index` (`src/engine/artifacts.rs`) leaves behind
+/// for the next experiment. `fitness`, `params` and `born` are in the file for
+/// a human reader; this module only needs the rank and the hash.
+#[derive(Clone, Debug, serde::Deserialize)]
+struct EliteIndexEntry {
+    /// 1-based rank in the source run's stop-time elite ranking.
+    rank: usize,
+    /// Full hash of the net (its `nets/<hash>.json`).
+    hash: String,
+}
+
+/// Resolve the previous experiment's CERTIFIED CHAMPION (rank 1 only) — the
+/// single-slot inheritance. Kept as the narrow entry point (`resolve_plan` with
+/// `max_seeds = 1`); the engine uses [`resolve_plan`] so a whole elite list can
+/// come over.
 pub fn resolve(
     root: Option<&Path>,
     exclude: Option<&Path>,
@@ -96,6 +142,33 @@ pub fn resolve(
     input_dim: usize,
     output_dim: usize,
     trainer_name: Option<&str>,
+) -> SeedOutcome {
+    resolve_plan(root, exclude, mode, input_dim, output_dim, trainer_name, 1)
+}
+
+/// Resolve the previous experiment to inherit from, and load its elites.
+///
+/// `mode` is the NEW run's `engine_mode` (`"tabular"` | `"rl"`), `trainer_name`
+/// its `Trainer::describe()` name (`engine.json` → `trainer.trainer`), and the
+/// dims come from the new run's header — the candidate must match all of them.
+/// `exclude` is the new run's OWN directory (see the module doc: it exists on
+/// disk by the time this runs, and must never be treated as "a previous run").
+/// `max_seeds` caps how many elites come over — the new run's `pop_size`, so a
+/// small population takes the TOP `max_seeds` ranks instead of overflowing.
+///
+/// Partial failures are survivable per elite: a rank whose `nets/<hash>.json`
+/// is missing (or whose blueprint declares the wrong dims) is dropped and the
+/// next rank is tried, because losing one blueprint must not sink an
+/// inheritance of ten. Rank 1 is the exception that keeps the old contract: if
+/// the CERTIFIED champion cannot be loaded, nothing is inherited at all.
+pub fn resolve_plan(
+    root: Option<&Path>,
+    exclude: Option<&Path>,
+    mode: &str,
+    input_dim: usize,
+    output_dim: usize,
+    trainer_name: Option<&str>,
+    max_seeds: usize,
 ) -> SeedOutcome {
     let root = root.unwrap_or(Path::new(DEFAULT_RESULTS_ROOT));
     let dirs = run_dirs(root, exclude);
@@ -140,38 +213,90 @@ pub fn resolve(
             "run {source_run_id} recorded an empty guardrail champion hash"
         ));
     }
-    // ── 4. its blueprint ───────────────────────────────────────────────────
-    let state_path = dir
-        .join("nets")
-        .join(format!("{}.json", record.champion_hash));
-    let topology = match crate::engine::population::run_topology_from_json_file(&state_path) {
-        Ok(t) => t,
-        Err(e) => {
-            return SeedOutcome::Skipped(format!(
-                "champion {} of run {source_run_id}: {e}",
-                &record.champion_hash[..8.min(record.champion_hash.len())]
-            ));
-        }
+    // ── 4. the ranked list: `elites.json`, else the champion alone ─────────
+    // The champion stays rank 1 either way, so an old source (no index) and a
+    // new one agree on which net is first.
+    let ranked: Vec<(usize, String)> = match read_elite_index(dir) {
+        Some(entries) if !entries.is_empty() => entries,
+        _ => vec![(1, record.champion_hash.clone())],
     };
-    // The header gate above proves the RUN matched; this proves the CHAMPION
-    // did too (a legacy blueprint may carry explicit dims that disagree).
-    let opts = &topology.options;
-    if opts.input_dim.is_some()
-        && (opts.input_dim != Some(input_dim) || opts.output_dim != Some(output_dim))
-    {
-        return SeedOutcome::Skipped(format!(
-            "champion blueprint of run {source_run_id} is {:?}→{:?}, this run is {input_dim}→{output_dim}",
-            opts.input_dim, opts.output_dim
-        ));
+    let cap = max_seeds.max(1);
+    let mut picks: Vec<SeedPick> = Vec::new();
+    let mut first_failure: Option<String> = None;
+    for (rank, hash) in ranked.into_iter().take(cap) {
+        let short = &hash[..8.min(hash.len())];
+        let state_path = dir.join("nets").join(format!("{hash}.json"));
+        let topology = match crate::engine::population::run_topology_from_json_file(&state_path) {
+            Ok(t) => t,
+            Err(e) => {
+                let why = if rank == 1 {
+                    format!("champion {short} of run {source_run_id}: {e}")
+                } else {
+                    format!("elite #{rank} {short} of run {source_run_id}: {e}")
+                };
+                first_failure.get_or_insert(why);
+                continue;
+            }
+        };
+        // The header gate above proves the RUN matched; this proves the
+        // BLUEPRINT did too (a legacy one may carry explicit dims that
+        // disagree). A mismatched rank is dropped like a missing file.
+        let opts = &topology.options;
+        if opts.input_dim.is_some()
+            && (opts.input_dim != Some(input_dim) || opts.output_dim != Some(output_dim))
+        {
+            first_failure.get_or_insert(format!(
+                "blueprint of rank {rank} ({short}) in run {source_run_id} is {:?}→{:?}, this run is {input_dim}→{output_dim}",
+                opts.input_dim, opts.output_dim
+            ));
+            continue;
+        }
+        picks.push(SeedPick {
+            rank,
+            source_run_id: source_run_id.clone(),
+            source_dir: dir.clone(),
+            champion_hash: hash,
+            // Only the certified champion carries a holdout mean and the
+            // champion's param count; the rest are the source's own ranking.
+            champion_params: (rank == 1).then_some(record.champion_params).flatten(),
+            guardrail_mean: (rank == 1).then_some(record.holdout_mean).flatten(),
+            topology,
+        });
     }
-    SeedOutcome::Seeded(Box::new(SeedPick {
+    if picks.is_empty() {
+        // Nothing loadable. The champion's own failure keeps the old message
+        // shape (and the old "nothing here was proven" contract).
+        return SeedOutcome::Skipped(first_failure.unwrap_or_else(|| {
+            format!("run {source_run_id} has no loadable elite blueprint")
+        }));
+    }
+    SeedOutcome::Seeded(Box::new(SeedPlan {
         source_run_id,
         source_dir: dir.clone(),
-        champion_hash: record.champion_hash.clone(),
-        champion_params: record.champion_params,
-        guardrail_mean: record.holdout_mean,
-        topology,
+        picks,
     }))
+}
+
+/// Read a source run's `elites.json` as `(rank, hash)` pairs, best first.
+///
+/// `None` when the file is absent, unreadable, unparsable, or empty — every one
+/// of those means "this source predates the index", and the caller falls back
+/// to the guardrail champion. Duplicate hashes (which would seed the same
+/// blueprint twice) are collapsed, keeping the better rank.
+fn read_elite_index(dir: &Path) -> Option<Vec<(usize, String)>> {
+    let raw = std::fs::read_to_string(dir.join("elites.json")).ok()?;
+    let mut entries: Vec<EliteIndexEntry> = serde_json::from_str(&raw).ok()?;
+    entries.retain(|e| !e.hash.is_empty());
+    // The file is written ranked already; sorting makes the reader
+    // independent of that (and of a hand-edited file).
+    entries.sort_by_key(|e| e.rank.max(1));
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let out: Vec<(usize, String)> = entries
+        .into_iter()
+        .filter(|e| seen.insert(e.hash.clone()))
+        .map(|e| (e.rank.max(1), e.hash))
+        .collect();
+    Some(out)
 }
 
 /// The trainer name a header's `trainer` blob declares, if any.
@@ -351,8 +476,11 @@ mod tests {
         std::fs::create_dir_all(root.join("notes")).unwrap();
         std::fs::write(root.join("loose.json"), "{}").unwrap();
         let out = resolve(Some(&root), None, "tabular", 2, 2, Some("toy"));
-        let pick = out.seeded().expect("newest run dir must be picked");
-        assert_eq!(pick.source_run_id, "2000_labelled");
+        let plan = out.seeded().expect("newest run dir must be picked");
+        assert_eq!(plan.source_run_id, "2000_labelled");
+        assert_eq!(plan.picks.len(), 1, "no index ⇒ the champion alone");
+        let pick = plan.champion();
+        assert_eq!(pick.rank, 1);
         assert_eq!(pick.champion_hash, "abcd1234abcd1234");
         assert_eq!(pick.champion_params, Some(123));
         assert_eq!(pick.guardrail_mean, Some(0.30));
@@ -478,7 +606,7 @@ mod tests {
         let root = tmp("exact");
         let topo = write_run(&root.join("1000"), "1000", "tabular", "toy", true);
         let out = resolve(Some(&root), None, "tabular", 2, 2, Some("toy"));
-        let pick = out.seeded().unwrap();
+        let pick = out.seeded().unwrap().champion().clone();
         assert_eq!(
             pick.topology.to_json().unwrap(),
             topo.to_json().unwrap(),
@@ -488,5 +616,87 @@ mod tests {
             pick.topology.options.topology_seed, topo.options.topology_seed,
             "the stored init seed travels with the topology"
         );
+    }
+
+    /// The widened inheritance: `elites.json` is read as the ranked list, the
+    /// cap takes the TOP ranks, and the champion is rank 1 either way.
+    #[test]
+    fn elites_json_is_read_ranked_and_capped() {
+        let root = tmp("index-ranked");
+        let dir = root.join("1000");
+        write_run(&dir, "1000", "tabular", "toy", true);
+        // Three elites: the certified champion (abcd…) plus two more
+        // blueprints, written in the index with their ranks.
+        let mut extra = Vec::new();
+        for (rank, hash, seed) in [(2usize, "beef0001beef0001", 11u64), (3, "beef0002beef0002", 12)] {
+            let mut topo = toy_topology();
+            topo.options.topology_seed = seed as usize;
+            let state = serde_json::json!({ "topology": topo.to_json().unwrap() });
+            std::fs::write(
+                dir.join("nets").join(format!("{hash}.json")),
+                state.to_string(),
+            )
+            .unwrap();
+            extra.push((rank, hash));
+        }
+        let index = serde_json::json!([
+            { "rank": 1, "hash": "abcd1234abcd1234", "fitness": 90.0 },
+            { "rank": 2, "hash": extra[0].1, "fitness": 80.0 },
+            { "rank": 3, "hash": extra[1].1, "fitness": 70.0 },
+        ]);
+        std::fs::write(dir.join("elites.json"), index.to_string()).unwrap();
+
+        // All three, in rank order.
+        let out = resolve_plan(Some(&root), None, "tabular", 2, 2, Some("toy"), 10);
+        let plan = out.seeded().expect("the index must be used");
+        assert_eq!(plan.picks.len(), 3);
+        assert_eq!(
+            plan.picks.iter().map(|p| p.rank).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(plan.champion().champion_hash, "abcd1234abcd1234");
+        assert_eq!(
+            plan.picks.iter().map(|p| p.champion_hash.as_str()).collect::<Vec<_>>(),
+            vec!["abcd1234abcd1234", extra[0].1, extra[1].1]
+        );
+        assert!(plan.picks[1].guardrail_mean.is_none(), "only rank 1 is certified");
+        assert_eq!(
+            plan.picks[1].topology.options.topology_seed, 11,
+            "each rank brings its own blueprint"
+        );
+
+        // A smaller population takes the TOP ranks, not a reshuffle.
+        let capped = resolve_plan(Some(&root), None, "tabular", 2, 2, Some("toy"), 2);
+        let plan = capped.seeded().unwrap();
+        assert_eq!(plan.picks.len(), 2);
+        assert_eq!(plan.champion().champion_hash, "abcd1234abcd1234");
+        assert_eq!(plan.picks[1].champion_hash, extra[0].1);
+    }
+
+    /// Rank 1 keeps the all-or-nothing contract (the certified champion is the
+    /// gate); a missing later rank is dropped and the rest still inherit.
+    #[test]
+    fn a_missing_later_rank_is_dropped_but_the_rest_inherit() {
+        let root = tmp("index-partial");
+        let dir = root.join("1000");
+        write_run(&dir, "1000", "tabular", "toy", true);
+        let index = serde_json::json!([
+            { "rank": 1, "hash": "abcd1234abcd1234" },
+            { "rank": 2, "hash": "9999dead9999dead" },
+        ]);
+        std::fs::write(dir.join("elites.json"), index.to_string()).unwrap();
+        let out = resolve_plan(Some(&root), None, "tabular", 2, 2, Some("toy"), 10);
+        let plan = out.seeded().expect("the champion still inherits");
+        assert_eq!(plan.picks.len(), 1, "the unloadable rank is dropped");
+        assert_eq!(plan.champion().champion_hash, "abcd1234abcd1234");
+
+        // …but a broken RANK 1 sinks the whole inheritance, as before.
+        let index = serde_json::json!([{ "rank": 1, "hash": "9999dead9999dead" }]);
+        std::fs::write(dir.join("elites.json"), index.to_string()).unwrap();
+        let reason = match resolve_plan(Some(&root), None, "tabular", 2, 2, Some("toy"), 10) {
+            SeedOutcome::Skipped(r) => r,
+            SeedOutcome::Seeded(_) => panic!("a champion with no blueprint must be skipped"),
+        };
+        assert!(reason.contains("run-topology"), "{reason}");
     }
 }

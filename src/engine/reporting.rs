@@ -75,15 +75,35 @@ impl CoreEngine {
         // CURRENT elite set (top-`elite_count` by smoothed fitness this
         // step) — it explains who is immune to culls right now. With
         // `freeze_elites` on, every elite seat is frozen each step, so the
-        // set needs no per-net marker: the badge lists the names alone.
+        // set needs no per-net marker: the badge lists the names, each with
+        // its SEAT AGE — `hash(seat/j)` — because the freeze lines only ever
+        // show an entrant's own age (always 0 at entry, printed before the
+        // tick), so without this the reader can never see how long a seated
+        // net has been sitting, i.e. how close it is to the lifetime age-out.
         let freeze_badge = {
             let elites = self.elite_hashes();
             if elites.is_empty() {
                 String::new()
             } else {
+                let j = self.config.elite_crown_lifetime_steps;
+                let seat_age = |h: &String| {
+                    self.state
+                        .net(h)
+                        .map(|s| s.elite_seat_age)
+                        .unwrap_or(0)
+                };
+                // `(seat/j)` only when the lifetime is armed (`j > 0`) — with
+                // j = 0 there is no age-out, so the number would mean nothing.
                 let mut names: Vec<String> = elites
                     .iter()
-                    .map(|h| h[..8.min(h.len())].to_string())
+                    .map(|h| {
+                        let short = &h[..8.min(h.len())];
+                        if j == 0 {
+                            short.to_string()
+                        } else {
+                            format!("{short}({}/{j})", seat_age(h))
+                        }
+                    })
                     .collect();
                 names.sort();
                 format!(" │ ★ {}", names.join(" "))
@@ -274,88 +294,109 @@ impl CoreEngine {
             .collect();
         let direction = self.fitness.direction();
         let arrow = direction.arrow();
-        info!("  ── final elites (top-{k}, fitness{arrow} smoothed) ──");
+        // The list below is RANK-top-k, not the crown: a net can rank top-k
+        // while still barred by the elite gate (it never held a seat). The
+        // gate numbers here say how the population actually split, and each
+        // line names that net's own seat state.
+        //
+        // Counted at the LAST DEALT clock — the report runs after the final
+        // group step, so `step_clock()` is one past it and would grade every
+        // net's born-window `k` clocks late (see `elite_gate_counts`).
+        let (eligible, probation, age_blocked) =
+            self.elite_gate_counts(self.step_clock().saturating_sub(1));
+        // Compact one-line-per-elite table, built with `comfy-table` so the
+        // column widths are computed from the actual cell content. The old
+        // hand-padded `format!` table had three defects: the separator's
+        // `┬` characters landed in the wrong columns, the footer header row
+        // was printed twice (once above the bottom border, once below it),
+        // and the `step` column actually printed `entered_at_step` (the net's
+        // birth clock) while the real last-metric step was never shown. The
+        // table below prints the true recorded step, the seat age only for
+        // nets that actually hold a seat, and one header row at the top.
+        let mut table = comfy_table::Table::new();
+        table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+        table.set_header(vec![
+            "#",
+            "hash",
+            "smt",
+            "step",
+            "seat",
+            "born",
+            "params",
+            "origin",
+            "eval",
+        ]);
         for (rank, (h, fit, step, eval_loss)) in ranked.iter().take(k).enumerate() {
-            // A frozen elite's last_metrics.step stays at its FIRST record
-            // (training is skipped, so nothing advances the recorded clock).
-            // Plain `last_step 0` therefore reads like "never played again"
-            // — say `frozen@0` instead: measured once, carried since.
-            let step_label = if self.config.freeze_elites && self.frozen_crown.contains(h) {
-                format!("frozen@{step}")
-            } else {
-                format!("last_step {step}")
-            };
             // ± std over the smoothing window, same framing as the holdout
             // guardrail: the mean alone hides the mix of raw values behind it
             // (two elites at 500 can be 500-always vs 500-by-luck). A wide ±
             // means the smoothed value rests on noisy raw steps — and at race
             // end, that the ORDERING of this list itself is luck-sensitive.
-            // When std > mean/2, say so instead of trusting the reader to
-            // compare the two numbers.
-            let std_note = match self.rolling_fitness.get(h) {
-                Some(buf) if buf.len() > 1 => {
-                    let m = *fit;
-                    let var = buf
-                        .iter()
-                        .map(|&v| {
-                            let d = v - m;
-                            d * d
-                        })
-                        .sum::<f32>()
-                        / buf.len() as f32;
-                    let std = var.sqrt();
-                    let wide = std > m.abs() / 2.0;
-                    format!(
-                        " ± {std:.4}{}",
-                        if wide {
-                            " (noisy — rank not decisive)"
-                        } else {
-                            ""
-                        }
-                    )
-                }
-                _ => String::new(),
-            };
-            let meta = self.state.net(h).map(|s| {
-                // Trained-vs-acted split: with act-and-measure freeze a net's
-                // step count mixes real training updates with frozen passes,
-                // so the raw number hides how much it actually learned.
-                // trained + acted(frozen) always sums to the net's recorded
-                // step clock (= `last_step`/`frozen@N` on this line).
-                let frozen = s.frozen_spans.iter().map(|(a, b)| b - a + 1).sum::<usize>();
-                let acted = frozen.min(s.step);
-                let trained = s.step - acted;
-                format!(
-                    "origin={} born@{} params={} trained={} acted(frozen)={}",
-                    s.created_from.clone().unwrap_or_else(|| "?".into()),
-                    s.entered_at_step,
-                    s.meta
-                        .params
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "?".into()),
-                    trained,
-                    acted,
-                )
-            });
             // eval_loss: `—` when the mode doesn't produce one (RL trainers
             // report fitness only). `None` is Rust-speak; a dash reads as
             // "not applicable", which is the truth.
-            let eval_label = eval_loss
-                .map(|v| format!("{v:.6}"))
+            // `smt` tag: the ranked figure is the smoothed fitness (decided on
+            // it); the ± note is the spread of RAW steps behind it.
+            let smt = crate::engine::format::fmt2_smt(*fit);
+            let short = &h[..8.min(h.len())];
+            let state = self.state.net(h);
+            let on_crown = self.config.freeze_elites && self.frozen_crown.contains(h);
+            let seat = if on_crown {
+                state
+                    .map(|ns| format!("{}", ns.elite_seat_age))
+                    .unwrap_or_else(|| "?".to_string())
+            } else {
+                "—".to_string()
+            };
+            let born = state
+                .map(|ns| ns.entered_at_step.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let origin_label = state
+                .as_ref()
+                .and_then(|s| s.created_from.as_deref())
+                .unwrap_or("unknown")
+                .split(' ')
+                .next()
+                .unwrap_or("unknown")
+                .chars()
+                .take(8)
+                .collect::<String>();
+            let params_label = state
+                .and_then(|s| s.meta.params)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let eval = eval_loss
+                .map(|l| format!("{l:.4}"))
                 .unwrap_or_else(|| "—".to_string());
-            // `smt` tag: the ranked figure is the smoothed fitness (ranking
-            // decided on it); the ± note is the spread of RAW steps behind it.
-            info!(
-                "  #{} {} fitness{arrow} smt{:.4}{} │ eval_loss {} │ {} │ {}",
-                rank + 1,
-                &h[..8.min(h.len())],
-                fit,
-                std_note,
-                eval_label,
-                step_label,
-                meta.unwrap_or_default(),
-            );
+            table.add_row(vec![
+                (rank + 1).to_string(),
+                short.to_string(),
+                smt,
+                step.to_string(),
+                seat,
+                born,
+                params_label,
+                origin_label,
+                eval,
+            ]);
         }
+        // comfy-table computes the widths; indent each line so the block
+        // sits inside the summary's two-space margin.
+        for line in table.to_string().lines() {
+            info!("  {line}");
+        }
+        info!(
+            "  ── final elites (top-{k}, fitness{arrow} smoothed) ── [crown {}/{} seats: {} eligible, {} on probation (k={}), {} age-blocked (j={})]",
+            self.frozen_crown.len(),
+            self.config
+                .elite_count
+                .min(self.state.live_count().saturating_sub(1)),
+            eligible,
+            probation,
+            self.config.elite_join_probation_steps,
+            age_blocked,
+            self.config.elite_crown_lifetime_steps,
+        );
         Ok(())
     }
 }

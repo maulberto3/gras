@@ -77,16 +77,12 @@ impl CoreEngine {
                     buf.push(e);
                 }
             }
-            self.state.record_step(hash, metrics.clone())?;
-            // A frozen net never trains, so its weight-latest clock stays at
-            // its birth clock — do NOT call advance_step here (that would
-            // rotate last_update_step and break the crown-lifetime running
-            // test's "trained k clocks since last update" check).
-            // Persist the act-and-measure marker: replay must re-run this
-            // clock through the no-op optimizer (see catch_up_step).
-            if let Some(s) = self.state.net_mut(hash) {
-                s.record_frozen_step(clock);
-            }
+            // Act-and-measure records WITHOUT advancing the clock: `state.step`
+            // counts TRAININGS (resume replay derives its clock set from that
+            // count), and `last_update_step` must not rotate — an act is not a
+            // weight update. The method also stamps the frozen span, which is
+            // how catch_up_step re-runs this clock through the no-op optimizer.
+            self.state.record_frozen_act(hash, metrics.clone())?;
             tracing::debug!(
                 "step {} │ net {} │ FROZEN (elite) — acted+measured fitness{} {} (no weight update)",
                 clock,

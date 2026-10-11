@@ -2,10 +2,12 @@
 //! transition, not an exit.
 //!
 //! Culls everything but the top `elite_count` nets (min 1) and keeps training
-//! those solo for `pruner.steps` more steps — evolution rolls, stop checks,
-//! Ctrl+C and per-step challenges are phase-locked OFF. The survivors run through the SAME per-net step path
-//! (`step_one_net`) with their live optimizer state and the shared stream, so
-//! the extension is a visible, replayable part of the run.
+//! those solo for `pruner.steps` more steps — evolution rolls, stop checks and
+//! Ctrl+C are phase-locked OFF. The survivors run through the SAME per-net step
+//! path (`step_one_net`) with their live optimizer state and the shared stream,
+//! so the extension is a visible, replayable part of the run. (Anti-plateau
+//! challenges are TRAINER-owned now: the trainer rolls its own trigger inside
+//! `train_step`, so the engine neither suppresses nor accounts for one here.)
 
 use flodl::tensor::Result;
 use tracing::info;
@@ -89,6 +91,7 @@ impl CoreEngine {
             self.write_live_frontier_states()?;
         }
         if pruner.steps == 0 {
+            self.write_elite_index()?;
             self.write_champion_markdown()?;
             self.write_champion_safetensors()?;
             if self.verbose_detail() {
@@ -136,6 +139,7 @@ impl CoreEngine {
         }
         let final_step = clock + pruner.steps;
         self.pruner_solo_active = false;
+        self.write_elite_index()?;
         self.write_champion_markdown()?;
         self.write_champion_safetensors()?;
         // NOTE: no worst dump here — the population was already culled to

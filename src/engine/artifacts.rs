@@ -12,6 +12,56 @@ use flodl::tensor::Result;
 use tracing::info;
 
 impl CoreEngine {
+    /// Write the MACHINE-READABLE elite ranking — `elites.json` in the run
+    /// dir: `[{rank, hash, fitness, params, born}]`, best first, k =
+    /// `elite_count` (min 1). The next experiment's `set_run_seed_previous`
+    /// reads THIS to reinstate every elite by rank; the `elite-<hash>.md`
+    /// dumps are the human view of the same ranking (their header even
+    /// carries the rank), but inheritance must never have to parse markdown.
+    ///
+    /// UNCONDITIONAL at stop — same artifact discipline as the guardrail
+    /// record: it is an inheritance receipt, not a log line, so it lands even
+    /// with every `elite_save_*` dump switched off (a run stays inheritable
+    /// whatever the user asked to see). Empty population ⇒ `[]`, which the
+    /// reader treats as "no elite ranking here" and falls back to the
+    /// certified champion.
+    pub(crate) fn write_elite_index(&mut self) -> Result<()> {
+        self.record_champions();
+        let entries: Vec<serde_json::Value> = self
+            .champion_ranked()
+            .enumerate()
+            .map(|(rank, (hash, fitness))| {
+                let state = self.state.net(&hash);
+                serde_json::json!({
+                    "rank": rank + 1,
+                    "hash": hash,
+                    "fitness": fitness,
+                    "params": state.and_then(|s| s.meta.params),
+                    "born": state.map(|s| s.entered_at_step),
+                })
+            })
+            .collect();
+        let path = self.run_dir.join("elites.json");
+        let body = serde_json::to_string_pretty(&entries)
+            .unwrap_or_else(|_| "[]".to_string());
+        if let Err(source) = std::fs::write(&path, body) {
+            tracing::warn!(
+                "elite index write failed: {}",
+                crate::utils::error::EngineError::Io {
+                    path: path.display().to_string(),
+                    source,
+                }
+            );
+        } else if self.verbose_detail() {
+            info!(
+                "  elite index → {} ({} ranked, inheritable by the next run)",
+                path.display(),
+                entries.len()
+            );
+        }
+        Ok(())
+    }
+
     /// Write the top-k elites' topology markdown to the run dir, one file
     /// per elite (`elite-<hash>.md`), k = `elite_count` (min 1). The user
     /// configured more than one elite — they get more than one artifact.

@@ -485,7 +485,13 @@ impl CoreEngine {
             frozen: frozen_step,
         };
         child.state.record_metrics(metrics.clone());
-        child.state.advance_step();
+        // Mirror the live contract: an act-and-measure records metrics but
+        // never advances the clock (`state.step` counts trainings only), so
+        // the replayed step count equals the original run's — and
+        // `last_update_step` stays on the last TRAINED clock.
+        if !frozen_step {
+            child.state.advance_step();
+        }
         // Keep the rolling buffer in sync (catch-up steps count toward the
         // child's smoothed fitness once it rejoins).
         if let Some(buf) = self.rolling_fitness.get_mut(&child.state.hash) {
@@ -518,7 +524,11 @@ impl CoreEngine {
     /// Returns a `RaceChild` ready for insertion into the live maps (same
     /// shape `generate_child` + `catch_up` produce for newborns).
     pub(crate) fn replay_loaded_net(&mut self, state: NetState) -> Result<RaceChild> {
-        let clock = state.step;
+        let clock = state
+            .last_metrics
+            .as_ref()
+            .map(|m| m.step)
+            .unwrap_or(state.step);
         let recorded = state.last_metrics.clone();
         let segments = replay_segments(&state);
         let mut child = self.build_child_from_state(state)?;
@@ -590,46 +600,80 @@ impl CoreEngine {
 /// The clocks a reconstructed net must replay, as contiguous `(from, to)`
 /// segments consumable by [`RaceEngine::catch_up_range`].
 ///
-/// A net trains at every clock in its life **except its birth clock**: the
-/// group step for the clock it joined ran *before* it existed (a joiner's
-/// first `history.csv` row is `entered_at_step + 1`). A founder predates clock
-/// 0, so nothing is skipped. `state.step` counts **trainings**, not clocks — so
-/// the skip is not visible there; it IS visible in the pair
-/// (`state.step`, recorded last clock):
-///   - `trainings == end_clock + 1` → nothing skipped (founder / seeded net),
-///   - `trainings == end_clock`     → exactly one skipped clock (the birth one).
+/// A net records a clock (a training OR an act-and-measure) at every clock in
+/// its life except its birth clock: the group step for the clock it joined ran
+/// *before* it existed (a joiner's first `history.csv` row is
+/// `entered_at_step + 1`). Additionally, a fresh joiner (`mutation_catch_up`
+/// off — the default) has NO history before birth at all: it starts from its
+/// birth weights, so replaying a pre-birth clock would train on a batch the
+/// original never saw at that point and drift the weights.
 ///
-/// Deriving it from the record (instead of assuming `entered_at_step == 0`
-/// means "founder") matters: a mutation immigrant inserted at the END of clock
-/// 0 also has `entered_at_step == 0`, but it trained clocks `1..=end`, not
-/// `0..=end-1`. Same count, different set — replaying the wrong one feeds a
-/// batch the net never saw and drops one it did (~1e-3…1e-2 weight drift).
+/// `state.step` counts trainings and `frozen_spans` the acts, so
+/// `recorded = step + acts`, and the gap `end + 1 − recorded` says which
+/// shape the record is:
+///   - `0` → founder/seeded: every clock `0..=end` was recorded;
+///   - `1` → joiner WITH pre-birth catch-up history: only the birth clock
+///     is missing;
+///   - `birth + 1` → fresh joiner: the birth clock AND every pre-birth clock
+///     is missing (nothing before birth was ever trained);
+///   - anything else → ambiguous (partial catch-up / corrupt record): use
+///     the conservative catch-up shape and let the parity check decide.
 ///
 /// Mirrored by `replay_plan` in `examples/export_champion.rs`, so resume and
 /// the export tool can never disagree about which steps a net saw.
 fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
-    let trainings = state.step;
-    if trainings == 0 {
-        return Vec::new(); // nothing trained yet
+    // Clocks with a recorded metrics row: trainings + act-and-measure acts.
+    let recorded = state.step + frozen_act_count(state);
+    if recorded == 0 {
+        return Vec::new(); // nothing recorded yet
     }
     // No recorded clock (legacy/aborted nets): the pre-existing contiguous walk.
     let Some(end) = state.last_metrics.as_ref().map(|m| m.step) else {
-        return vec![(0, trainings)];
+        return vec![(0, state.step)];
     };
-    let skipped = (end + 1).saturating_sub(trainings);
-    if skipped == 0 {
+    let unrecorded = (end + 1).saturating_sub(recorded);
+    let birth = state.entered_at_step;
+    if unrecorded == 0 {
+        // Founder / seeded: every clock in 0..=end was recorded.
         return vec![(0, end + 1)];
     }
-    let birth = state.entered_at_step;
-    let mut out = Vec::new();
-    // 0..birth — what the net caught up on before it was live …
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    if unrecorded == 1 {
+        // Exactly the birth clock is missing → full pre-birth catch-up.
+        if birth > 0 {
+            out.push((0, birth.min(end + 1)));
+        }
+        let after = birth + 1;
+        if after <= end {
+            out.push((after, end + 1));
+        }
+        return out;
+    }
+    if unrecorded == birth + 1 {
+        // Fresh joiner: nothing at or before birth was ever recorded.
+        return vec![(birth + 1, end + 1)];
+    }
+    tracing::warn!(
+        "resume: net {} recorded {} clocks over 0..={end} (birth {birth}) — ambiguous replay shape; using the catch-up plan",
+        state.hash,
+        recorded
+    );
     if birth > 0 {
         out.push((0, birth.min(end + 1)));
     }
-    // … and birth+1..=end — its live steps (the birth clock is skipped).
     let after = birth + 1;
     if after <= end {
         out.push((after, end + 1));
     }
     out
+}
+
+/// How many clocks sit inside `frozen_spans` — the act-and-measure passes.
+/// Spans are disjoint run-length by construction (`record_frozen_step`).
+fn frozen_act_count(state: &NetState) -> usize {
+    state
+        .frozen_spans
+        .iter()
+        .map(|&(s, e)| e.saturating_sub(s) + 1)
+        .sum()
 }
