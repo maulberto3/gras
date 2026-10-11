@@ -106,7 +106,8 @@ fn episode_start_seed(net_seed: u64, step: usize, match_i: u64) -> u64 {
         ^ match_i.wrapping_mul(0xBF58_476D_1CE4_E5B9)
 }
 
-/// Eval games use RUN_SEED + 1000 (shared across nets, never trained on);
+/// Eval games use the RUN SEED + 1000 (shared across nets, never trained
+/// on — the trainer reads it from `ctx.env.run_seed`);
 /// holdout games use HOLDOUT_SEED (disjoint from everything).
 fn shared_start_seed(seed_base: u64, step: usize, match_i: u64) -> u64 {
     episode_start_seed(seed_base, step, match_i)
@@ -179,6 +180,10 @@ struct MountainCarTrainer {
     device: Device,
     matches_per_step: usize,
     eval_matches_per_step: usize,
+    /// The trainer's own anti-plateau knob (see `CHALLENGE_PROB`). Rolled
+    /// inside `train_step` via `gras::trainer::challenge_fires` — the
+    /// engine never sees it (trainer-side since 2026-10-10).
+    challenge_prob: f32,
 }
 
 impl MountainCarTrainer {
@@ -453,11 +458,22 @@ impl RlStep for MountainCarTrainer {
         step: usize,
         ctx: &RlContext<'_>,
     ) -> gras::flodl::tensor::Result<RlStepReport> {
-        // Challenge signal (anti-plateau): on a fired (net, step), force ONE
-        // drawn action for the whole episode. Seeded from (net_seed, step)
-        // so replay re-forces the identical action. Ignoring the flag
-        // entirely is legal — keep the knob at 0.
-        let forced = if ctx.challenged {
+        // Challenge (anti-plateau, TRAINER-side): on a fired (net, step),
+        // force ONE drawn action for the whole episode. The trigger is a
+        // pure function of (run_seed, net_seed, step), and the forced draw
+        // is seeded from (net_seed, step) — replay re-fires and re-forces
+        // identically. Knob at 0 = never fires.
+        let challenged = gras::trainer::challenge_fires(
+            ctx.env.run_seed,
+            ctx.net_seed,
+            step,
+            self.challenge_prob,
+            ctx.env.max_steps,
+            ChallengeDecay::Custom {
+                exponent: CHALLENGE_DECAY_EXPONENT,
+            },
+        );
+        let forced = if challenged {
             let mut rng =
                 Rng::with_seed(ctx.net_seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             Some(rng.usize(..3))
@@ -466,9 +482,11 @@ impl RlStep for MountainCarTrainer {
         };
 
         // 1. Train batch: play ALL matches in LOCKSTEP (see the efficiency
-        // note on `play_episodes`) — per-net seeds, same as the sequential
-        // version. Challenged steps force ONE action on every train match.
-        let train_base = episode_start_seed(ctx.net_seed, step, 0);
+        // note on `play_episodes`) — per-net seeds blended with the run seed
+        // (an inherited champion carries its source run's net_seed; without
+        // the blend it would replay the source's exact trajectories).
+        // Challenged steps force ONE action on every train match.
+        let train_base = episode_start_seed(ctx.net_seed ^ ctx.env.run_seed, step, 0);
         let train_eps = self.play_episodes(net, train_base, self.matches_per_step, true, forced)?;
         let mut all_transitions: Vec<Transition> = Vec::new();
         let mut matches: Vec<(usize, bool, usize)> = Vec::with_capacity(self.matches_per_step);
@@ -484,7 +502,6 @@ impl RlStep for MountainCarTrainer {
                 train_loss: 0.0,
                 fitness: 0.0,
                 informative: self.score_metrics(ctx.metrics, &[])?,
-                challenged_turns: 0,
                 rl: Some(RlStepMeta {
                     matches: self.matches_per_step,
                     train_turns: 0,
@@ -502,7 +519,8 @@ impl RlStep for MountainCarTrainer {
         //    fitness measures what THIS net does on matches it didn't train
         //    on. (Runs on challenged steps too — a challenge is just another
         //    step, and the eval fitness is what ranks.) Lockstep batched.
-        let eval_base = shared_start_seed(RUN_SEED + 1000, step, 0);
+        //    The run seed (not a hard const) so a new seed re-rolls eval too.
+        let eval_base = shared_start_seed(ctx.env.run_seed + 1000, step, 0);
         let eval_eps =
             self.play_episodes(net, eval_base, self.eval_matches_per_step, false, None)?;
         let eval_solves: Vec<(bool, usize)> = eval_eps
@@ -511,22 +529,15 @@ impl RlStep for MountainCarTrainer {
             .collect();
 
         // 4. Report: fitness = eval-only, the same quantity the guardrail
-        //    measures. `challenged_turns` = train turns played under the
-        //    forced action (0 on a normal step) — the engine shows this
-        //    next to `turns`.
+        //    measures.
         Ok(RlStepReport {
             train_loss,
             fitness: fitness_from_solves(&eval_solves),
             informative: self.score_metrics(ctx.metrics, &eval_solves)?,
-            challenged_turns: if forced.is_some() {
-                solves.iter().map(|&(_, t)| t).sum()
-            } else {
-                0
-            },
             rl: Some(RlStepMeta {
                 matches: self.matches_per_step + self.eval_matches_per_step,
-                // The split matters: only the train matches can be forced,
-                // so the engine's expected `⚔` is p_eff × train_turns.
+                // The split matters: a trainer-side challenge can only
+                // force TRAIN matches, so `turns/match` stays honest.
                 train_turns: solves.iter().map(|&(_, t)| t).sum(),
                 eval_turns: eval_solves.iter().map(|&(_, t)| t).sum(),
             }),
@@ -600,14 +611,13 @@ fn main() {
         .set_run_smoothing_window(10)
         .set_run_pop_catch_up(false)
         .set_run_checkpoint_every(4)
-        .set_run_challenge_prob(CHALLENGE_PROB)
-        // THE MountainCar knob: front-loaded decay (Custom exponent 0.5 —
-        // fast decay early, long quiet tail). The momentum discovery must
-        // happen while exploration pressure is high; the final stretch
-        // measures the policy clean (see ChallengeDecay in the crate docs).
-        .set_run_challenge_decay(ChallengeDecay::Custom {
-            exponent: CHALLENGE_DECAY_EXPONENT,
-        })
+        // Challenges are TRAINER-owned since 2026-10-10: `CHALLENGE_PROB` /
+        // `CHALLENGE_DECAY_EXPONENT` (below) roll inside `train_step` via
+        // `gras::trainer::challenge_fires` — THE MountainCar knob: a
+        // front-loaded decay (Custom exponent 2.0 — holds high through
+        // mid-run, then a fast fall). The momentum discovery must happen
+        // while exploration pressure is high; the final stretch measures
+        // the policy clean.
         .set_stop_max_steps(Some(race_steps))
         .set_run_metrics(vec![Metric::custom("eval_solve_rate", |solves, _| {
             let v = solves.data().to_f32_vec()?;
@@ -686,13 +696,14 @@ fn main() {
         device,
         matches_per_step: MATCHES_PER_STEP,
         eval_matches_per_step: EVAL_MATCHES_PER_STEP,
+        challenge_prob: CHALLENGE_PROB,
     };
 
     let mut engine = RlEngine::from_spec(RunSpec::rl(
         config,
         fitness,
         trainer,
-        Some(42),
+        Some(RUN_SEED),
         None, // run dir: the engine picks results/<timestamp>
     ))
     .expect("engine construction (RL spec)");

@@ -97,8 +97,9 @@ mod tests {
         }
     }
 
-    /// challenge_step's draw is a pure function of (net_seed, step): replay
-    /// re-forces the identical action, so a challenged step is bit-exact.
+    /// The challenge forced-action draw is a pure function of
+    /// (net_seed, step): replay re-forces the identical action, so a
+    /// challenged step is bit-exact.
     #[test]
     fn challenge_action_draw_is_replay_stable() {
         let draw = |net_seed: u64, step: usize| {
@@ -126,6 +127,7 @@ mod tests {
             device: gras::auto_device(),
             matches_per_step: 1,
             eval_matches_per_step: 1,
+            challenge_prob: CHALLENGE_PROB,
         };
         let metrics = vec![Metric::custom("mean", |survivals, _| {
             let v = survivals.data().to_f32_vec()?;
@@ -242,6 +244,7 @@ mod tests {
             device,
             matches_per_step: 1,
             eval_matches_per_step: 1,
+            challenge_prob: CHALLENGE_PROB,
         };
         let topo = gras::TopologyOptions {
             input_dim: Some(4),

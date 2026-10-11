@@ -86,6 +86,15 @@ const HOLDOUT_SEED: u64 = 2;
 const LEARNING_RATE: f32 = 1e-3;
 const DROPOUT_PROB: f32 = 0.25;
 const GRAD_CLIP: f32 = 2.0;
+/// Anti-plateau challenge: per-step, per-net chance the TRAINER forces a
+/// drawn action on the train matches. Trainer-owned since 2026-10-10 — the
+/// engine no longer knows challenges exist; the trigger rolls inside
+/// `train_step` via `gras::trainer::challenge_fires` (replay-safe: pure
+/// function of run/net/step). 0.0 = off.
+const CHALLENGE_PROB: f32 = 0.2; // softmax already does some exploration
+/// Decay shape of the challenge knob above: `eff = p × (1 − progress^k)`.
+/// k = 0.5 front-loads the decay (the knob falls faster than linearly).
+const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 
 /// The action head used for **TRAIN matches only** (eval and holdout are
 /// always argmax — fitness must measure the deterministic policy):
@@ -105,15 +114,19 @@ const GRAD_CLIP: f32 = 2.0;
 const LOG_SOFTMAX_HEAD: bool = false;
 
 /// Pure function of (net_seed, step, match_i) — the replay-determinism
-/// contract for RL resume.
+/// contract for RL resume. The run seed is blended into the net seed by the
+/// caller (`ctx.net_seed ^ ctx.env.run_seed`): net_seed alone would replay
+/// the SAME trajectories in every experiment, which especially matters for
+/// an inherited champion (its blueprint carries the source run's net_seed).
 fn episode_start_seed(net_seed: u64, step: usize, match_i: u64) -> u64 {
     net_seed
         ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ match_i.wrapping_mul(0xBF58_476D_1CE4_E5B9)
 }
 
-/// Eval games use RUN_SEED + 1000 (shared across nets, never trained on);
-/// holdout games use HOLDOUT_SEED (disjoint from everything).
+/// Eval games use run_seed + 1000 (shared across nets, never trained on);
+/// holdout games use HOLDOUT_SEED (fixed forever — guardrail verdicts stay
+/// comparable across experiments).
 fn shared_start_seed(seed_base: u64, step: usize, match_i: u64) -> u64 {
     episode_start_seed(seed_base, step, match_i)
 }
@@ -153,6 +166,9 @@ struct CartPoleTrainer {
     device: Device,
     matches_per_step: usize,
     eval_matches_per_step: usize,
+    /// The trainer's own anti-plateau knob (see `CHALLENGE_PROB`). Rolled
+    /// inside `train_step` — the engine never sees it.
+    challenge_prob: f32,
 }
 
 impl CartPoleTrainer {
@@ -370,14 +386,25 @@ impl RlStep for CartPoleTrainer {
         step: usize,
         ctx: &RlContext<'_>,
     ) -> gras::flodl::tensor::Result<RlStepReport> {
-        // Challenge signal (anti-plateau): when the engine's seeded trigger
-        // fired for this (net, step), draw ONE random action (seeded from
-        // (net_seed, step) so replay re-forces the identical action) and
-        // force it on every turn of the TRAIN matches — the widened
-        // trajectory is what the net learns from. A challenge is just
-        // another action the net had to survive; its fitness ranks like any
-        // other. Ignoring the flag entirely is legal — keep the knob at 0.
-        let forced = if ctx.challenged {
+        // Challenge (anti-plateau, TRAINER-side): roll the trigger for this
+        // (net, step) — pure function of (run_seed, net_seed, step), so
+        // catch-up and resume re-fire the identical forces. On a fired step,
+        // draw ONE random action (seeded from (net_seed, step) so replay
+        // re-forces it) and force it on every turn of the TRAIN matches —
+        // the widened trajectory is what the net learns from. A challenge is
+        // just another action the net had to survive; its fitness ranks like
+        // any other. Knob at 0 = never fires.
+        let challenged = gras::trainer::challenge_fires(
+            ctx.env.run_seed,
+            ctx.net_seed,
+            step,
+            self.challenge_prob,
+            ctx.env.max_steps,
+            ChallengeDecay::Custom {
+                exponent: CHALLENGE_DECAY_EXPONENT,
+            },
+        );
+        let forced = if challenged {
             let mut rng =
                 Rng::with_seed(ctx.net_seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             Some(rng.usize(..2))
@@ -386,11 +413,15 @@ impl RlStep for CartPoleTrainer {
         };
 
         // 1. Train batch: play matches, per-net seeds (exploration diversity).
+        //    The run seed is blended in: an inherited champion keeps its
+        //    source run's net_seed, so without this it would replay the
+        //    source's exact trajectories in every new experiment.
         let mut all_transitions: Vec<Transition> = Vec::new();
         let mut matches: Vec<(usize, usize)> = Vec::with_capacity(self.matches_per_step);
         let mut survivals: Vec<usize> = Vec::with_capacity(self.matches_per_step);
+        let traj_seed_base = ctx.net_seed ^ ctx.env.run_seed;
         for match_i in 0..self.matches_per_step {
-            let seed = episode_start_seed(ctx.net_seed, step, match_i as u64);
+            let seed = episode_start_seed(traj_seed_base, step, match_i as u64);
             let (traj, survival) = self.play_episode(net, seed, LOG_SOFTMAX_HEAD, forced)?;
             let offset = all_transitions.len();
             all_transitions.extend(traj);
@@ -402,7 +433,6 @@ impl RlStep for CartPoleTrainer {
                 train_loss: 0.0,
                 fitness: 0.0,
                 informative: self.score_metrics(ctx.metrics, &[])?,
-                challenged_turns: 0,
                 rl: Some(RlStepMeta {
                     matches: self.matches_per_step,
                     train_turns: 0,
@@ -420,31 +450,25 @@ impl RlStep for CartPoleTrainer {
         // 3. Eval batch: AFTER the update, shared seeds, argmax policy —
         //    fitness measures what THIS net does on games it didn't train on.
         //    (Runs on challenged steps too — a challenge is just another
-        //    step, and the eval fitness is what ranks.)
+        //    step, and the eval fitness is what ranks.) The run seed (not a
+        //    hard const) so a new `--seed` re-rolls the eval games too.
         let mut eval_survivals: Vec<usize> = Vec::with_capacity(self.eval_matches_per_step);
         for match_i in 0..self.eval_matches_per_step {
-            let seed = shared_start_seed(RUN_SEED + 1000, step, match_i as u64);
+            let seed = shared_start_seed(ctx.env.run_seed + 1000, step, match_i as u64);
             let (_, survival) = self.play_episode(net, seed, false, None)?;
             eval_survivals.push(survival);
         }
 
         // 4. Report: fitness = eval-only, the same quantity the guardrail
         //    measures — ranking and holdout agree by construction.
-        //    `challenged_turns` = train turns played under the forced action
-        //    (0 on a normal step) — the engine shows this next to `turns`.
         Ok(RlStepReport {
             train_loss,
             fitness: fitness_from_survivals(&eval_survivals),
             informative: self.score_metrics(ctx.metrics, &eval_survivals)?,
-            challenged_turns: if forced.is_some() {
-                survivals.iter().sum()
-            } else {
-                0
-            },
             rl: Some(RlStepMeta {
                 matches: self.matches_per_step + self.eval_matches_per_step,
-                // The split matters: only the train matches can be forced, so
-                // the engine's expected `⚔` is p_eff × train_turns.
+                // The split matters: a challenge (trainer-side) can only
+                // force TRAIN matches, so `turns/match` stays honest.
                 train_turns: survivals.iter().sum(),
                 eval_turns: eval_survivals.iter().sum(),
             }),
@@ -470,8 +494,6 @@ impl RlStep for CartPoleTrainer {
 // shared (Tabular-arm) builder and RL-only setters would panic at build.
 const POP: usize = 100;
 const RACE_STEPS: usize = 20;
-const CHALLENGE_PROB: f32 = 0.2; // softmax already does some exploration
-const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 const MATCHES_PER_STEP: usize = 1;
 const EVAL_MATCHES_PER_STEP: usize = 2;
 
@@ -480,7 +502,7 @@ const EVAL_MATCHES_PER_STEP: usize = 2;
 #[derive(clap::Parser, Debug)]
 #[command(
     name = "cartpole",
-    about = "CartPole RL race. Smoke flags: --pop, --max-steps (all else is a const)."
+    about = "CartPole RL race. Smoke flags: --pop, --max-steps, --seed (all else is a const)."
 )]
 struct Cli {
     /// Live networks in the race (default: the `POP` const).
@@ -489,6 +511,13 @@ struct Cli {
     /// Stop after this many steps (default: the `RACE_STEPS` const).
     #[arg(long, value_name = "N")]
     max_steps: Option<usize>,
+    /// Run seed (default: the `RUN_SEED` const). Change it to re-roll every
+    /// trajectory — including an INHERITED champion's, whose blueprint
+    /// carries its source run's net_seed (the trainer blends this seed into
+    /// its episode seeds so a new seed means fresh games for everyone).
+    /// Same seed ⇒ bit-identical replay (recorded in `engine.json`).
+    #[arg(long, value_name = "U64")]
+    seed: Option<u64>,
 }
 
 fn main() {
@@ -498,6 +527,7 @@ fn main() {
     let cli = <Cli as clap::Parser>::parse();
     let pop = cli.pop.unwrap_or(POP);
     let race_steps = cli.max_steps.unwrap_or(RACE_STEPS);
+    let run_seed = cli.seed.unwrap_or(RUN_SEED);
 
     // Install the run's log sinks: the console lines at `LOG_LEVEL` and the
     // `Minimal` frame. Without this the console stays silent and the run LOOKS
@@ -519,10 +549,10 @@ fn main() {
         .set_run_smoothing_window(5)
         .set_run_pop_catch_up(false)
         .set_run_checkpoint_every(5)
-        .set_run_challenge_prob(CHALLENGE_PROB) // works with argmax for actions
-        .set_run_challenge_decay(ChallengeDecay::Custom {
-            exponent: CHALLENGE_DECAY_EXPONENT,
-        })
+        // Challenges are TRAINER-owned since 2026-10-10: `CHALLENGE_PROB` /
+        // `CHALLENGE_DECAY_EXPONENT` live at the top of this file and roll
+        // inside `train_step` via `gras::trainer::challenge_fires` — no
+        // engine knob, no `set_run_challenge_*` setters.
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", |survivals, _| {
         //     let v = survivals.data().to_f32_vec()?;
         //     Ok(if v.is_empty() {
@@ -599,7 +629,17 @@ fn main() {
         // .set_topology_standardize_op_pool(["Identity", "LayerNorm", "RmsNorm", "InstanceNorm"])
         .set_elite_freeze(true)
         .set_elite_count(pop / 10)
-        .set_elite_probation_steps(5) // 0 -> 500 returns
+        // Join gate: a newborn elite (e.g. a caught-up crossover child) cannot
+        // take a frozen seat until it has aged `k` clocks since arrival, so a
+        // full-buffer newcomer does not freeze on arrival at act-and-measure.
+        // 0 = today's behavior (a proven newborn may freeze immediately) — the
+        // A/B verdict on cartpole was HARMFUL at 5, so keep it 0 here.
+        .set_elite_join_probation_steps(5)
+        // Lifetime gate: a net that has been on the frozen crown for `k` clocks
+        // at peak is culled OUT of the crown (age-eliminated at the top), even
+        // if it still holds the best smoothed fitness — the second half of the
+        // same running test. 0 = old "permanent crown until rank changes".
+        .set_elite_crown_lifetime_steps(5)
         .set_elite_save_topology(true)
         // Save the champion's weights for LATER reuse by tools (`export_champion`,
         // a `--score-only` re-check). NOT needed to certify this run: the guardrail
@@ -617,18 +657,27 @@ fn main() {
         device,
         matches_per_step: MATCHES_PER_STEP,
         eval_matches_per_step: EVAL_MATCHES_PER_STEP,
+        challenge_prob: CHALLENGE_PROB,
     };
 
     let mut engine = RlEngine::from_spec(RunSpec::rl(
         config,
         fitness,
         trainer,
-        Some(42),
+        Some(run_seed),
         None, // run dir: the engine picks results/<timestamp>
     ))
     .expect("engine construction (RL spec)");
 
     println!("Run Dir: {}", engine.run_dir().display());
+    println!(
+        "Run Seed: {run_seed}{}",
+        if cli.seed.is_some() {
+            " (from --seed)"
+        } else {
+            " (const default)"
+        }
+    );
 
     // SHOWCASE — what `set_run_seed_previous(true)` above actually inherited.
     // The receipt is `engine.json` → `run_topology_source`, written at

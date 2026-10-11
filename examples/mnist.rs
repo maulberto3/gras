@@ -66,6 +66,12 @@ struct MnistTrainer {
     /// Last eval accuracy (from the previous step's report) — the metric that
     /// scales challenge jitter.
     last_accuracy: f32,
+    /// The trainer's own anti-plateau knob (see `CHALLENGE_PROB`). Tabular
+    /// response: every input value rolls independently at the DECAYED rate
+    /// (`gras::trainer::effective_challenge_prob`) each step — no per-step
+    /// gate, the element-level rolls ARE the challenge. Trainer-owned since
+    /// 2026-10-10; the engine never sees it.
+    challenge_prob: f32,
     /// `(test set, deterministic stream over it)` — the guardrail half. How
     /// many draws it makes is the RUN's knob (`set_elite_guardrail_matches`),
     /// not this trainer's.
@@ -84,6 +90,7 @@ impl MnistTrainer {
             eval_batch: EVAL_BATCH_SIZE,
             smoothing,
             last_accuracy: 0.0,
+            challenge_prob: CHALLENGE_PROB,
             holdout: None,
         }
     }
@@ -160,15 +167,22 @@ impl TabularStep for MnistTrainer {
         let loss_fn: gras::trainer::LossFn<'_> = &*self.loss_fn;
 
         let (x, y) = ctx.data.train_batch(step as u64)?;
-        // CHALLENGE: `challenge_prob` is the effective per-(input, feature)
-        // rate, so every value rolls independently; strength is scaled by the
-        // net's last accuracy — weak nets get pushed harder than strong ones.
-        // The count we jittered is reported back to the engine's books.
-        let (x, challenged_inputs) = if ctx.challenge_prob > 0.0 {
+        // CHALLENGE (trainer-side): `p_eff` is the decayed per-(input,
+        // feature) rate — every value rolls independently; strength is
+        // scaled by the net's last accuracy — weak nets get pushed harder
+        // than strong ones. Linear decay to 0 at the budget (the historical
+        // schedule), flat when unbounded.
+        let p_eff = gras::trainer::effective_challenge_prob(
+            self.challenge_prob,
+            step,
+            ctx.env.max_steps,
+            ChallengeDecay::Linear,
+        );
+        let x = if p_eff > 0.0 {
             let strength = JITTER_SCALE * (1.0 - self.last_accuracy).max(0.0);
-            jitter_inputs(&x, ctx.challenge_prob, strength, ctx.net_seed, step)?
+            jitter_inputs(&x, p_eff, strength, ctx.net_seed, step)?.0
         } else {
-            (x, 0)
+            x
         };
         let train_loss = deterministic_train_step(
             ctx.net_seed,
@@ -190,14 +204,14 @@ impl TabularStep for MnistTrainer {
             eval_loss: report.eval_loss,
             fitness: report.fitness,
             informative: report.metrics,
-            challenged_inputs,
         })
     }
 }
 
 /// Jitter each input value independently with probability `prob`, adding
 /// Gaussian noise of std `strength` when it fires. Returns the perturbed
-/// batch and how many values were jittered (the number the engine logs).
+/// batch (the jitter count was bookkeeping for the old engine-side challenge
+/// accounting — gone with it, 2026-10-10).
 /// The RNG is seeded from `(net_seed, step)` so a replay draws identically.
 fn jitter_inputs(
     x: &Tensor,
@@ -366,8 +380,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_crossover_rolls(pop / 2)
         .set_crossover_gate(gras::engine::config::CrossoverGate::Soft)
         .set_crossover_retries(3)
-        // --- Challenge (anti-plateau) ---
-        .set_run_challenge_prob(CHALLENGE_PROB) // trainer reads ctx.challenged and jitters
+        // --- Challenge (anti-plateau): TRAINER-owned since 2026-10-10 —
+        // `CHALLENGE_PROB` lives on the trainer and rolls inside `train_step`
+        // via `gras::trainer::effective_challenge_prob`. No engine knob.
         // --- Mutation & catch-up (both modes; the tabular arm carries its own copy) ---
         .set_mutate_prob(MUTATE_PROB) // per-roll chance a random immigrant is inserted
         .set_mutate_rolls(pop / 5)

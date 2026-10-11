@@ -103,6 +103,7 @@ fn trainer() -> MountainCarTrainer {
         device: gras::auto_device(),
         matches_per_step: 2,
         eval_matches_per_step: 2,
+        challenge_prob: CHALLENGE_PROB,
     }
 }
 
@@ -165,7 +166,6 @@ fn train_step_reports_rl_meta_and_eval_fitness() {
     let mut opt = gras::flodl::nn::Adam::new(&net.parameters(), LEARNING_RATE as f64);
     let mut t = trainer();
     let ctx = RlContext {
-        challenged: false,
         net_seed: 5,
         net_hash: "testnet",
         metrics: &[],
@@ -191,9 +191,5 @@ fn train_step_reports_rl_meta_and_eval_fitness() {
         (0.0..=1.0).contains(&report.fitness),
         "shaped solve score is a probability-like figure, got {}",
         report.fitness
-    );
-    assert_eq!(
-        report.challenged_turns, 0,
-        "unfired step challenges nothing"
     );
 }

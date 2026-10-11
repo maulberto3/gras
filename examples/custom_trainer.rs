@@ -75,9 +75,9 @@ struct WarmupSgdTrainer {
 impl WarmupSgdTrainer {
     fn new(
         loss_fn: impl Fn(&Variable, &Variable) -> gras::flodl::tensor::Result<Variable>
-        + Send
-        + Sync
-        + 'static,
+            + Send
+            + Sync
+            + 'static,
         peak_lr: f32,
         momentum: f32,
     ) -> Self {
@@ -197,7 +197,6 @@ impl TabularStep for WarmupSgdTrainer {
             eval_loss,
             fitness,
             informative,
-            challenged_inputs: 0,
         })
     }
 }

@@ -199,7 +199,6 @@ impl TabularStep for TabularTrainer {
             eval_loss: report.eval_loss,
             fitness: report.fitness,
             informative: report.metrics,
-            challenged_inputs: 0,
         })
     }
 }
