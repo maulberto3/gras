@@ -307,8 +307,6 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
                     metrics: ctx.metrics,
                     env: StepEnv { step: s, ..ctx.env },
                     net_hash: ctx.net_hash,
-                    // Shadow steps are measurement, never challenges.
-                    challenged: false,
                     net_seed: ctx
                         .net_seed
                         .wrapping_add(0x9E37_79B9_7F4A_7C15)
@@ -417,7 +415,6 @@ mod tests {
                 train_loss: 0.0,
                 fitness: fit,
                 informative: vec![],
-                challenged_turns: 0,
                 rl: None,
             })
         }
@@ -433,7 +430,6 @@ mod tests {
         RlContext {
             fitness,
             metrics,
-            challenged: false,
             env: StepEnv {
                 step,
                 run_seed: 42,

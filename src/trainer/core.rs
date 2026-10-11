@@ -45,15 +45,6 @@ pub struct StepReport {
     pub fitness: f32,
     /// Extra non-ranking/informative scores configured for the run, if any.
     pub informative: Vec<f32>,
-    /// Tabular-only challenge volume: how many individual INPUT VALUES this
-    /// net jittered this step (the trainer's report — see
-    /// [`TabularStepReport::challenged_inputs`]). `0` when no challenge fired.
-    #[serde(default)]
-    pub challenged_inputs: usize,
-    /// RL-only challenge volume: turns played under a FORCED action this step
-    /// (see [`RlStepReport::challenged_turns`]). `0` when no challenge fired.
-    #[serde(default)]
-    pub challenged_turns: usize,
     /// RL-only environment volume for this step — see [`RlStepMeta`]. `None`
     /// in Tabular (no environment) and from RL trainers that don't report it
     /// (the log then prints `—` in the RL columns).
@@ -78,13 +69,6 @@ pub struct TabularStepReport {
     pub fitness: f32,
     /// Extra non-ranking/informative scores configured for the run, if any.
     pub informative: Vec<f32>,
-    /// Challenge volume: how many individual INPUT VALUES this net jittered
-    /// this step. The engine only keeps the books — it sums what the trainer
-    /// reports, exactly like RL's `RlStepReport.challenged_turns`. Seed it from
-    /// [`TabularContext::challenge_prob`], which is the effective (decayed)
-    /// per-input-feature probability; leave `0` when the knob is off.
-    #[serde(default)]
-    pub challenged_inputs: usize,
 }
 
 /// The report an [`RlStep`] trainer returns. RL-shaped: no `eval_loss` field
@@ -102,13 +86,6 @@ pub struct RlStepReport {
     pub fitness: f32,
     /// Extra non-ranking/informative scores configured for the run, if any.
     pub informative: Vec<f32>,
-    /// Challenge volume: turns played under a FORCED action this step (the
-    /// `ctx.challenged` signal honored). The engine sums these into the
-    /// rollup's `⚔` column; normally a subset of `rl.train_turns`. `0` when no
-    /// challenge fired (or the trainer ignores the signal). Direct scalar, the
-    /// same shape as [`TabularStepReport::challenged_inputs`].
-    #[serde(default)]
-    pub challenged_turns: usize,
     /// Environment volume for this step — feeds the `matches`/`train`/`eval`
     /// rollup columns. `None` = not reported (the log prints `—`).
     pub rl: Option<RlStepMeta>,
@@ -125,9 +102,7 @@ impl From<TabularStepReport> for StepReport {
             eval_loss: r.eval_loss,
             fitness: r.fitness,
             informative: r.informative,
-            challenged_inputs: r.challenged_inputs,
-            challenged_turns: 0, // tabular: challenge volume is in input values
-            rl: None,            // tabular: no environment, so no volume to report
+            rl: None, // tabular: no environment, so no volume to report
         }
     }
 }
@@ -139,8 +114,6 @@ impl From<RlStepReport> for StepReport {
             eval_loss: None, // RL: no (pred, target) held-out loss exists
             fitness: r.fitness,
             informative: r.informative,
-            challenged_inputs: 0, // RL reports turns, not input values
-            challenged_turns: r.challenged_turns,
             rl: r.rl,
         }
     }
@@ -155,11 +128,9 @@ impl From<RlStepReport> for StepReport {
 /// inside a match. CartPole calls them episodes/timesteps; the engine log says
 /// match/turn throughout.
 ///
-/// Train and eval turns are reported SEPARATELY, because a challenge can only
-/// ever force TRAIN turns: the trigger is a per-(net, step) probability, so
-/// the expected `⚔` is `p_eff × train_turns` — read against the total it
-/// would overstate the denominator by the eval share. The rollup prints both
-/// halves and the expectation itself (`⚔ <n> (exp <m>)`).
+/// Train and eval turns are reported SEPARATELY — a trainer that forces
+/// actions (its own challenge recipe) only ever forces TRAIN turns, so the
+/// split keeps the rollup's `turns/match` denominator honest.
 ///
 /// The engine sums these over the live population per clock-step and prints
 /// `matches <total> │ train <total> │ eval <total> │ turns/match <mean>` in
@@ -170,12 +141,11 @@ impl From<RlStepReport> for StepReport {
 pub struct RlStepMeta {
     /// Matches (episodes) this net's trainer played this step (train + eval).
     pub matches: usize,
-    /// Turns played in this step's TRAIN matches — the only turns a challenge
-    /// can force, and the denominator of the rollup's expected `⚔`.
+    /// Turns played in this step's TRAIN matches.
     #[serde(default)]
     pub train_turns: usize,
-    /// Turns played in this step's EVAL matches. Never challenged — evaluation
-    /// must keep measuring the net's own policy.
+    /// Turns played in this step's EVAL matches — evaluation must keep
+    /// measuring the net's own policy.
     #[serde(default)]
     pub eval_turns: usize,
 }
@@ -261,19 +231,6 @@ pub struct TabularContext<'a> {
     pub net_hash: &'a str,
     /// Deterministic net-specific weight initialization/dropout seed.
     pub net_seed: u64,
-    /// The challenge SIGNAL (anti-plateau): true when the engine's seeded
-    /// trigger fired for this (net, step) — `set_run_challenge_prob` > 0.
-    /// The TRAINER owns the response: jitter its batch, swap in harder rows,
-    /// drop features, … (or ignore the flag entirely — keep the knob at 0 so
-    /// it never fires). Replay-safe: the flag is a pure function of
-    /// run/net/step, so catch-up re-derives it identically.
-    pub challenged: bool,
-    /// The EFFECTIVE (decay-adjusted) challenge probability for this step —
-    /// the per-(input, feature) rate for an element-level response. Roll it
-    /// yourself (seeded from `net_seed`/`step` so replay matches) and report
-    /// how many values you jittered in
-    /// [`TabularStepReport::challenged_inputs`]. `0.0` = challenges off.
-    pub challenge_prob: f32,
 }
 
 /// The context handed to an [`RlStep`] on every step. There is **no** data
@@ -291,18 +248,6 @@ pub struct RlContext<'a> {
     pub net_hash: &'a str,
     /// Deterministic net-specific weight initialization/dropout seed.
     pub net_seed: u64,
-    /// The challenge SIGNAL (anti-plateau): true when the engine's seeded
-    /// trigger fired for this (net, step) — `set_run_challenge_prob` > 0.
-    /// Never true for a frozen (act-and-measure) step or in the post-race
-    /// pruner's solo phase: the knob is a race device.
-    /// The TRAINER decides what to do with it: branch to a forced/Exploration
-    /// action inside `train_step` (replay-safe — the flag is a pure function
-    /// of run/net/step, so catch-up re-derives it identically), or ignore it
-    /// (a trainer without challenge logic never looks at the flag — keep the
-    /// knob at 0 so it never fires). Whatever the trainer reports in
-    /// `RlStepReport.challenged_turns` is what the log shows; the engine
-    /// does not verify the flag was honored.
-    pub challenged: bool,
 }
 
 /// The batch shape requested by a tabular trainer (defaults to batch_size).
@@ -471,9 +416,6 @@ pub trait EngineTrainer: Send {
     /// RL pop-wide phase (no-op for tabular): see [`RlStep::pop_phase`].
     fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize);
     /// One training step — the mode decides which context type to build.
-    /// `challenged` is the engine's challenge SIGNAL (both modes; `false`
-    /// when the knob is off) — the adapter folds it into the context it
-    /// builds.
     #[allow(clippy::too_many_arguments)]
     fn train_step(
         &mut self,
@@ -486,8 +428,6 @@ pub trait EngineTrainer: Send {
         env: StepEnv,
         net_hash: &str,
         net_seed: u64,
-        challenged: bool,
-        challenge_prob: f32,
     ) -> flodl::tensor::Result<StepReport>;
     /// Guardrail dispatch — forwards to the inner trainer's
     /// `StepTrainer::holdout_score` (see the adapters).
@@ -546,8 +486,6 @@ impl EngineTrainer for ModeAdapter<Box<dyn TabularStep>> {
         env: StepEnv,
         net_hash: &str,
         net_seed: u64,
-        challenged: bool,
-        challenge_prob: f32,
     ) -> flodl::tensor::Result<StepReport> {
         let data =
             data.expect("Tabular step without data — engine construction invariant violated");
@@ -561,8 +499,6 @@ impl EngineTrainer for ModeAdapter<Box<dyn TabularStep>> {
             env,
             net_hash,
             net_seed,
-            challenged,
-            challenge_prob,
         };
         Ok(self.inner.train_step(net, optimizer, step, &ctx)?.into())
     }
@@ -606,8 +542,6 @@ impl EngineTrainer for ModeAdapter<Box<dyn RlStep>> {
         env: StepEnv,
         net_hash: &str,
         net_seed: u64,
-        challenged: bool,
-        _challenge_prob: f32,
     ) -> flodl::tensor::Result<StepReport> {
         let ctx = RlContext {
             fitness,
@@ -615,7 +549,6 @@ impl EngineTrainer for ModeAdapter<Box<dyn RlStep>> {
             env,
             net_hash,
             net_seed,
-            challenged,
         };
         Ok(self.inner.train_step(net, optimizer, step, &ctx)?.into())
     }

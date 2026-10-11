@@ -3,6 +3,7 @@
 //! Sourced from the engine's data-agnostic training contract. Sibling file
 //! `trainer.rs` holds the core trait and context structures.
 
+pub mod challenge;
 pub mod core;
 pub mod decision_lag;
 pub mod stream;
@@ -18,6 +19,7 @@ pub mod supervised;
 #[cfg(test)]
 pub use supervised::TabularTrainer;
 
+pub use challenge::{challenge_fires, effective_challenge_prob, ChallengeDecay};
 pub use core::{
     EngineTrainer, IntoBoxedTrainer, ModeAdapter, RlContext, RlStep, RlStepMeta, RlStepReport,
     RunData, StepEnv, StepReport, StepTrainer, StreamShape, TabularContext, TabularStep,
@@ -28,11 +30,9 @@ pub use flodl::Variable;
 
 /// The loss-function signature, aliased for readability in the trait and
 /// context.
-pub type LossFn<'a> = &'a (
-        dyn Fn(&flodl::Variable, &flodl::Variable) -> flodl::tensor::Result<flodl::Variable>
-            + Send
-            + Sync
-    );
+pub type LossFn<'a> = &'a (dyn Fn(&flodl::Variable, &flodl::Variable) -> flodl::tensor::Result<flodl::Variable>
+         + Send
+         + Sync);
 
 /// Owned (boxed) form of the loss-function signature.
 pub type BoxedLossFn = Box<
