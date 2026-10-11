@@ -974,15 +974,6 @@ impl NetState {
         self.last_update_step = self.step;
     }
 
-    /// Whether this net currently holds an elite seat. Outside
-    /// `refresh_crown`'s own tick a seated net always carries a non-zero
-    /// seat age (the deal refresh ticks it immediately), so `> 0` is the
-    /// observable "sitting" flag; a net that just left the crown is reset
-    /// to 0 in the same refresh that drops it.
-    pub fn on_crown(&self) -> bool {
-        self.elite_seat_age > 0
-    }
-
     /// Recover the topology from the embedded JSON.
     pub fn topology(&self) -> Result<Topology> {
         Ok(Topology::from_json(&self.topology)
