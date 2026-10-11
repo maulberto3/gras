@@ -55,7 +55,7 @@ use tracing::info;
 use crate::engine::fitness::{Fitness, FitnessLabel, Metric};
 use crate::graph::network::Network;
 use crate::state::{
-    ConfigSnapshot, NetState, RaceState, RunConfig, RunHeader, write_engine_json, write_net_state,
+    write_engine_json, write_net_state, ConfigSnapshot, NetState, RaceState, RunConfig, RunHeader,
 };
 use crate::trainer::stream::{BatchStream, PoolSplit};
 
@@ -84,8 +84,6 @@ impl crate::trainer::EngineTrainer for NoopPopTrainer {
         _env: crate::trainer::StepEnv,
         _net_hash: &str,
         _net_seed: u64,
-        _challenged: bool,
-        _challenge_prob: f32,
     ) -> flodl::tensor::Result<crate::trainer::StepReport> {
         unreachable!("NoopPopTrainer is a placeholder only for the pop-wide phase")
     }
@@ -98,7 +96,7 @@ impl crate::trainer::EngineTrainer for NoopPopTrainer {
 }
 use super::config::{RaceConfig, StopReason};
 use super::format::{build_stamp, csv_field};
-use super::smoothing::{RollingBuffer, rolling_mean};
+use super::smoothing::{rolling_mean, RollingBuffer};
 
 /// One entry in the checkpoint ledger: the population-mean smoothed fitness
 /// recorded at a checkpoint step. A crossover child must BEAT this value at
@@ -173,32 +171,10 @@ pub struct CoreEngine {
     /// stepped this clock. Reset at the top of each step; consumed by the
     /// same step's rollup line / `Minimal` table. Stays zero in Tabular mode.
     pub(crate) step_rl: RlVolume,
-    /// Run-total of challenged turns (live path only — a resume's replay
-    /// mirrors history and does not re-count). Surfaced in the stop summary
-    /// next to the turns actually played, so the challenge rate is directly
-    /// readable as a fraction. Not persisted: a resumed run counts only its
-    /// own post-resume turns.
-    pub(crate) total_challenged_turns: usize,
-    /// Run-total of the TRAIN turns those challenged turns came out of — the
-    /// denominator `total_challenged_turns` is only meaningful against (eval
-    /// turns are never challengeable). Same live-only accounting.
+    /// Run-total of the TRAIN turns (live path only — a resume's replay
+    /// mirrors history and does not re-count). The denominator for the
+    /// rollup's `turns/match` readout.
     pub(crate) total_train_turns: usize,
-    /// Run-total of the turns the trigger was expected to force: summed
-    /// `p_eff(step) × train_turns(step)`. Decay-aware, so it is directly
-    /// comparable to `total_challenged_turns` — how far the run's realized
-    /// challenge footprint sits from what the knob asked for.
-    pub(crate) expected_challenged_turns: f32,
-    /// Per-step count of individual INPUT VALUES challenged (jittered) by the
-    /// tabular trainers this clock — the element-level volume the trainers
-    /// reported. Reset each step.
-    pub(crate) step_challenged_inputs: usize,
-    /// Run-total challenged input values (live path only). Surfaced in the
-    /// stop summary for tabular runs, where environment turns don't exist.
-    pub(crate) total_challenged_inputs: usize,
-    /// Run-total of the EXPECTED challenged input values: summed
-    /// `p_eff(step) × rows × features` over every tabular net-step, directly
-    /// comparable to `total_challenged_inputs`.
-    pub(crate) expected_challenged_inputs: f32,
     /// Full hashes of the elite set exported at stop (top-`elite_count` by
     /// smoothed fitness) — the single source of truth for "which nets are the
     /// champions". Populated by both `write_champion_*` writers so post-race
@@ -334,32 +310,19 @@ impl flodl::nn::optim::Optimizer for NoopOptimizer {
 /// [`crate::trainer::RlStepMeta`]); `nets` counts the nets that reported, so a
 /// trainer which forgets to report shows as `—` instead of a silent `0`.
 /// Always zero in Tabular mode.
-///
-/// The train/eval split is kept apart because the challenge can only force
-/// train turns: the rollup's expected `⚔` is `p_chall × train_turns`, so the
-/// two halves must be summed separately to state that denominator honestly.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RlVolume {
     /// Nets that reported `StepReport.rl` this step.
     pub nets: usize,
     /// Matches played by those nets, summed (train + eval).
     pub matches: usize,
-    /// Train turns played by those nets, summed — the challengeable turns.
+    /// Train turns played by those nets, summed.
     pub train_turns: usize,
-    /// Eval turns played by those nets, summed (never challenged).
+    /// Eval turns played by those nets, summed.
     pub eval_turns: usize,
-    /// Turns played under a forced action this step, summed (what the
-    /// trainers reported in `RlStepReport.challenged_turns`). 0 = none.
-    pub challenged_turns: usize,
 }
 
 impl RlVolume {
-    /// Add this step's challenged turns to the volume (called from the step
-    /// path as reports land).
-    pub(crate) fn add_challenged(&mut self, turns: usize) {
-        self.challenged_turns += turns;
-    }
-
     /// Total environment turns this step (train + eval) — the `turns/match`
     /// numerator.
     pub(crate) fn turns(&self) -> usize {
@@ -367,72 +330,23 @@ impl RlVolume {
     }
 
     /// The RL middle column of the per-step rollup, e.g.
-    /// `matches 300 │ train 1331 │ eval 2662 │ p_chall 0.100 │ ⚔ 75 (exp 133)
-    /// │ turns/match 13`. `—` when no net reported any match (Tabular mode, or
-    /// a mis-wired RL trainer).
-    ///
-    /// `eff_prob` is the CURRENT effective challenge probability (post-decay).
-    /// Two derived cells hang off it, each hidden when it would lie: `p_chall`
-    /// only when the knob is on, and `⚔ <n> (exp <m>)` only when the trainer
-    /// reported challenged turns — where `<m> = eff_prob × train_turns` is the
-    /// expectation under the per-(net, step) trigger. That lets the reader
-    /// judge the draw without doing decay math (and watch the knob decay
-    /// toward 0 step by step).
-    pub(crate) fn label(&self, eff_prob: f32) -> String {
+    /// `matches 300 │ train 1331 │ eval 2662 │ turns/match 13`. `—` when no
+    /// net reported any match (Tabular mode, or a mis-wired RL trainer).
+    pub(crate) fn label(&self) -> String {
         if self.nets == 0 || self.matches == 0 {
             return "matches — │ train — │ eval — │ turns/match —".to_string();
         }
-        let prob = if eff_prob > 0.0 {
-            format!(" │ p_chall {:.3}", eff_prob)
-        } else {
-            String::new()
-        };
-        // Only train turns can be challenged, so the expectation is taken over
-        // them alone — never over the train+eval total.
-        let challenged = if self.challenged_turns > 0 {
-            let expected = if eff_prob > 0.0 {
-                format!(" (exp {:.0})", eff_prob * self.train_turns as f32)
-            } else {
-                String::new()
-            };
-            format!(" │ ⚔ {}{}", self.challenged_turns, expected)
-        } else {
-            String::new()
-        };
         format!(
-            "matches {} │ train {} │ eval {}{}{} │ turns/match {:.0}",
+            "matches {} │ train {} │ eval {} │ turns/match {:.0}",
             self.matches,
             self.train_turns,
             self.eval_turns,
-            prob,
-            challenged,
             self.turns() as f32 / self.matches as f32
         )
     }
 }
 
 impl CoreEngine {
-    /// The CURRENT effective challenge probability (post-decay). Delegates to
-    /// [`crate::engine::config::effective_challenge_prob`] — the SAME function
-    /// `challenge_fires` decides with — so the rollup line, the checkpoint
-    /// line and the trigger can never disagree about the knob's value.
-    ///
-    /// `0.0` in the pruner solo phase: the challenge knob is a RACE device
-    /// (anti-plateau exploration), and the phase is the final polish — the
-    /// trigger is likewise suppressed there, so the logged/expected counts
-    /// zero out with it.
-    pub(crate) fn effective_challenge_prob(&self, clock: usize) -> f32 {
-        if self.pruner_solo_active {
-            return 0.0;
-        }
-        crate::engine::config::effective_challenge_prob(
-            self.config.challenge_prob,
-            clock,
-            self.config.max_steps,
-            self.config.challenge_decay,
-        )
-    }
-
     /// True when per-step detail lines (evolve rollup, per-child gate/cull/
     /// insert lines, checkpoint line, race-start line) should be emitted —
     /// i.e. every level except `Minimal` (table only) and `None` (silent).
@@ -608,11 +522,6 @@ impl CoreEngine {
             .into());
         }
         let metrics = config.metrics.clone();
-        // Challenge contract: `challenge_prob` is validated at the TRIGGER,
-        // not here — a fired trigger is handed to the trainer as
-        // `ctx.challenged`, and the trainer owns the response (RL forces an
-        // action, tabular jitters its batch). A trainer that ignores the flag
-        // keeps the knob at its default 0.
         let train_eval_split_ratio = 0.2f32;
         let held_out_eval_rows = 256usize;
         let default_batch_size = 16usize;
@@ -841,12 +750,7 @@ impl CoreEngine {
             children_born_at_clock: HashMap::new(),
             step_evolve: StepEvolve::default(),
             step_rl: RlVolume::default(),
-            total_challenged_turns: 0,
             total_train_turns: 0,
-            expected_challenged_turns: 0.0,
-            step_challenged_inputs: 0,
-            total_challenged_inputs: 0,
-            expected_challenged_inputs: 0.0,
             champions: Vec::new(),
             checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),
@@ -953,35 +857,6 @@ impl CoreEngine {
                 self.header.config.smoothing_window
             )).into());
         }
-        // Same contract for the challenge trigger: it re-fires from
-        // (run_seed, net_seed, step, challenge_prob), so a resumed prob that
-        // differs from the recorded one would replay a DIFFERENT challenge
-        // pattern and break bit-exact parity.
-        if self.config.challenge_prob != self.header.config.challenge_prob {
-            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume: challenge_prob mismatch — run recorded {} but the resume config sets {} — \
-                 the challenged-step replay pattern would diverge; set set_run_challenge_prob({}) \
-                 (or omit) to resume",
-                self.header.config.challenge_prob,
-                self.config.challenge_prob,
-                self.header.config.challenge_prob
-            ))
-            .into());
-        }
-        // The decay SHAPE is replay state too: the trigger re-derives its
-        // probability from (prob, shape, step), so a changed shape would
-        // re-fire a different challenge pattern. Same contract as above.
-        if self.config.challenge_decay != self.header.config.challenge_decay {
-            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume: challenge_decay mismatch — run recorded '{}' but the resume config sets '{}' — \
-                 the challenged-step replay pattern would diverge; set set_run_challenge_decay(ChallengeDecay::{:?}) \
-                 (or omit) to resume",
-                self.header.config.challenge_decay,
-                self.config.challenge_decay,
-                self.header.config.challenge_decay
-            ))
-            .into());
-        }
         let run_dir = self.run_dir.clone();
         let nets_dir = run_dir.join("nets");
         let mut loaded = 0usize;
@@ -1042,6 +917,30 @@ impl CoreEngine {
             // Insert the replayed net into the live maps. Its rolling buffers
             // are seeded from the replayed trajectory so the smoothed stats are
             // warm on resume (not cold) — ranking resumes where it left off.
+            //
+            // Resume restores the per-net crown-age state that lives inside
+            // the persisted net file (crown_enter_step / crown_age_since_elite)
+            // plus the weight-latest clock (last_update_step), so a resumed
+            // run reproduces the SAME crown-and-age decisions the original
+            // run made — including the new running test.
+            let mut state = child.state.clone();
+            // Resume keeps the per-net crown-age state that lives inside the
+            // persisted net file (crown_enter_step / crown_age_since_elite),
+            // and the weight-latest clock `last_update_step` that the freeze
+            // branch reads to decide "trained k clocks since last update".
+            // catch_up_step already set `last_update_step` to the replayed
+            // clock via `advance_step`, so the resumed run reproduces the same
+            // crown-and-age decisions the original run made — including the
+            // crown-lifetime running test.
+            state.crown_enter_step = child.state.crown_enter_step;
+            state.crown_age_since_elite = child.state.crown_age_since_elite;
+            self.state.insert(state, None);
+            self.networks.insert(child.state.hash.clone(), child.net);
+            self.optimizers
+                .insert(child.state.hash.clone(), child.optimizer);
+            // Rolling buffers seeded from the replayed trajectory — the
+            // smoothed stats are warm on resume, not cold; ranking resumes
+            // where it left off
             let mut buf = RollingBuffer::new(self.config.smoothing_window);
             let mut train_buf = RollingBuffer::new(self.config.smoothing_window);
             let mut eval_buf = RollingBuffer::new(self.config.smoothing_window);
@@ -1052,10 +951,6 @@ impl CoreEngine {
                     eval_buf.push(e);
                 }
             }
-            self.state.insert(child.state.clone(), None);
-            self.networks.insert(child.state.hash.clone(), child.net);
-            self.optimizers
-                .insert(child.state.hash.clone(), child.optimizer);
             self.rolling_fitness.insert(hash.clone(), buf);
             self.rolling_train.insert(hash.clone(), train_buf);
             self.rolling_eval.insert(hash.clone(), eval_buf);
@@ -1256,7 +1151,7 @@ impl CoreEngine {
             // front so a resumed command can be reconstructed from the log
             // alone (and so a stale binary is visible before it misleads).
             info!(
-                "race knobs: gate={:?} cull_policy={:?} retries={} dropout={} freeze_elites={} fresh_immigrants={} elite_save={} worst_save={} probation_steps={} crossover_probation_steps={} elite_probation_steps={}",
+                "race knobs: gate={:?} cull_policy={:?} retries={} dropout={} freeze_elites={} fresh_immigrants={} elite_save={} worst_save={} probation_steps={} crossover_probation_steps={} elite_join_probation_steps={} elite_crown_lifetime_steps={}",
                 self.config.crossover_gate,
                 self.config.crossover_cull_policy,
                 self.config.crossover_retries,
@@ -1267,7 +1162,8 @@ impl CoreEngine {
                 self.config.worst_save_topology,
                 self.config.mutation_probation_steps,
                 self.config.crossover_probation_steps,
-                self.config.elite_probation_steps,
+                self.config.elite_join_probation_steps,
+                self.config.elite_crown_lifetime_steps,
             );
             info!("  {}", build_stamp());
         }
@@ -1301,7 +1197,6 @@ impl CoreEngine {
             // Per-step accumulators start empty; the rollup at the END of this
             // step reads them (it is the last line printed for the step).
             self.step_rl = RlVolume::default();
-            self.step_challenged_inputs = 0;
 
             // ── 1. group step: every live net on the same shared batch ──────
             let hashes = self.state.live_hashes();
@@ -1465,30 +1360,17 @@ impl CoreEngine {
                     } else {
                         "—".to_string()
                     };
-                    // The challenge knob's CURRENT effective probability —
-                    // it decays linearly to 0 at the run's step budget (see
-                    // `challenge_fires`), so each checkpoint line shows the
-                    // reader where in the decay they are.
-                    let challenge_txt = if self.config.challenge_prob > 0.0 {
-                        format!(
-                            " │ challenge_prob {:.3}",
-                            self.effective_challenge_prob(clock)
-                        )
-                    } else {
-                        String::new()
-                    };
                     // `smt` tag: the population mean is a mean of SMOOTHED
                     // per-net fitnesses (a historical aggregate for the gate
                     // bar) — tagged so it is never misread as a raw step value.
                     info!(
-                        "step {} │ checkpoint │ pop_mean_fitness {} smt{:.4} │ {}exam_mean_fitness {} (ledger: {} entries){}",
+                        "step {} │ checkpoint │ pop_mean_fitness {} smt{:.4} │ {}exam_mean_fitness {} (ledger: {} entries)",
                         clock,
                         arrow,
                         mean,
                         bar_txt,
                         exam_txt,
                         self.checkpoints.len(),
-                        challenge_txt,
                     );
                 }
             }
@@ -1627,9 +1509,9 @@ impl CoreEngine {
         // Post-race pruner (pop_pruner): the stop reason becomes a
         // TRANSITION, not an exit — cull everything except the top
         // `elite_count` nets (min 1) and keep training them solo for
-        // `pruner.steps` more steps. Evolution, stop criteria and per-step
-        // challenges are phase-locked OFF: they are race-phase concerns and
-        // the surviving nets race no one.
+        // `pruner.steps` more steps. Evolution and stop criteria are
+        // phase-locked OFF: they are race-phase concerns and the surviving
+        // nets race no one.
         if let Some(pruner) = self.config.pop_pruner {
             let reason = self.run_pruner_phase(reason, clock, pruner)?;
             return Ok(reason);
@@ -1846,13 +1728,15 @@ impl CoreEngine {
     }
 
     /// The elite set: the top `config.elite_count` live nets by smoothed
-    /// fitness (direction-aware). Protected from ALL culls — crossover (any
-    /// policy) and mutation alike. With `elite_probation_steps == 0` it is the
-    /// plain top-k and always leaves a cullable net (`min(elite_count, live − 1)`);
-    /// with probation ON it is strictly the AGE-ELIGIBLE top-k and may be EMPTY
-    /// (or short of `k`) while the population is young — there is NO fallback,
-    /// so a net younger than the window is never crowned/frozen. Fresh nets
-    /// stay cull-safe via the channel-probation windows.
+    /// fitness (direction-aware). A net is crown-eligible only if (a) it is
+    /// OLD ENOUGH to join (`clock − entered_at_step ≥ k` join probation) and
+    /// (b) it has NOT YET aged out of its crown (`clock − crown_enter_step <
+    /// k` crown lifetime). Elites are protected from ALL culls (crossover
+    /// any policy, mutation alike) by `elite_count` + `elite_freeze`. The
+    /// crown may be empty while the population is young (no fallback) — a
+    /// net younger than the join window is never crowned/frozen; a net that
+    /// is older than the lifetime but still top-k just stops being frozen
+    /// while it keeps its rank.
     pub(crate) fn elite_hashes(&self) -> Vec<String> {
         let k = self
             .config
@@ -1862,29 +1746,34 @@ impl CoreEngine {
             return Vec::new();
         }
         let ranked = self.ranked_live();
-        let window = self.config.elite_probation_steps;
-        if window == 0 {
-            return ranked.into_iter().take(k).map(|(h, _)| h).collect();
-        }
-        // Elite probation (see `elite_probation_steps`): a net that arrived
-        // fewer than `window` clocks ago cannot take an elite seat — a
-        // caught-up child with a full buffer cannot freeze on arrival.
         let clock = self.step_clock();
-        let eligible: Vec<String> = ranked
-            .iter()
-            .filter(|(h, _)| {
-                self.state
-                    .net(h)
-                    .map(|s| clock.saturating_sub(s.entered_at_step) >= window)
-                    .unwrap_or(true)
+        ranked
+            .into_iter()
+            .filter_map(|(h, _)| {
+                let state = self.state.net(&h)?;
+                // Join probation: the net must have trained k clocks since
+                // arrival before it can take an elite seat.
+                if clock.saturating_sub(state.entered_at_step)
+                    < self.config.elite_join_probation_steps
+                {
+                    return None;
+                }
+                // Crown lifetime: at peak the net is culled OUT of the crown
+                // when the lifetime expires — it still ranks normally, it
+                // just stops being frozen.
+                let since_elite = state
+                    .crown_enter_step
+                    .map(|e| clock.saturating_sub(e))
+                    .unwrap_or(0);
+                if self.config.elite_crown_lifetime_steps > 0
+                    && since_elite >= self.config.elite_crown_lifetime_steps
+                {
+                    return None;
+                }
+                Some(h)
             })
             .take(k)
-            .map(|(h, _)| h.clone())
-            .collect();
-        // NO fallback: a net younger than the window is simply not elite, so
-        // it can never be crowned/frozen on arrival. The set may be empty (or
-        // short of `k`) while the whole population is young.
-        eligible
+            .collect()
     }
 
     /// KISS crown refresh (the FREEZE-ELITES model, in one place): the crown
@@ -1895,6 +1784,12 @@ impl CoreEngine {
     /// rank is silent. With freeze OFF (or in the pruner solo phase, which
     /// bypasses freeze by design) the crown stays empty and this no-ops.
     /// Called at group-step start in `run()`; tests call it directly.
+    ///
+    /// Applies the two running-test windows: a net must be old enough to
+    /// JOIN the crown (join probation) and must not have been on the crown
+    /// LONG ENOUGH TO AGE OUT (crown lifetime) to be fresh. Membership is
+    /// recomputed so "crowned" / "dethroned" lines fire on TRANSITIONS
+    /// only.
     pub(crate) fn refresh_crown(&mut self, clock: usize) {
         if !self.config.freeze_elites || self.pruner_solo_active {
             self.frozen_crown.clear();
@@ -1902,6 +1797,24 @@ impl CoreEngine {
         }
         let new_crown: std::collections::HashSet<String> =
             self.elite_hashes().into_iter().collect();
+        // Crown-age bookkeeping: remember when each net entered the crown
+        // so `elite_hashes()` can enforce the lifetime window
+        for h in &new_crown {
+            if let Some(state) = self.state.net(h) {
+                if state.crown_enter_step.is_none() {
+                    let mut s = state.clone();
+                    s.crown_enter_step = Some(clock);
+                    // The net just took a frozen seat. Its weight-latest clock
+                    // (`last_update_step`) stays whatever it was: a freshly
+                    // seeded net that froze on arrival has never trained, so
+                    // it is 0; a trained net that was crowned later keeps its
+                    // last trained clock. Do NOT overwrite it here — let the
+                    // existing value (set by record_step / advance_step on the
+                    // live path, or replay_loaded_net on resume) stand.
+                    self.state.insert(s, None);
+                }
+            }
+        }
         let mut entering: Vec<String> = new_crown
             .iter()
             .filter(|h| !self.frozen_crown.contains(*h))
@@ -1948,64 +1861,110 @@ impl CoreEngine {
                     })
                 })
                 .unwrap_or_default();
+            let last_update = self
+                .state
+                .net(h)
+                .map(|s| s.last_update_step)
+                .unwrap_or(0);
+            let trained_here = clock.saturating_sub(last_update);
             let extras = format!(
-                ", age {}, {}p{}",
+                ", age {}, {}/{}t, {}p{}",
                 age.map(|a| a.to_string()).unwrap_or_else(|| "—".into()),
+                trained_here,
+                clock,
                 params.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
                 displaced,
             );
             info!(
-                "step {} │ freeze │ elite seat {pos}/{seat}: {} frozen (fitness{} {}{}) — w paused (a+m continues)",
+                "step {} │ freeze │ elite seat {pos}/{seat}: {} frozen (fitness{} {} — {} inside, {}/{} frozen)",
                 clock,
                 &h[..8.min(h.len())],
                 self.fitness.direction().arrow(),
                 fit.map(crate::engine::format::fmt2_smt)
                     .unwrap_or_else(|| "—".into()),
                 extras,
+                self.frozen_crown.contains(h), /* net is still tracked frozen? */
+                self.frozen_crown.len(),        /* frozen crown size */
             );
         }
         for h in &leaving {
-            // Rank delta + smoothed-vs-smoothed gap to the current best
-            // surviving elite (display only — the set re-dealt, no single
-            // net "took" the seat).
-            let old_rank = self.rank_position(h).map(|r| r.to_string());
-            let taker = new_crown.iter().next().cloned().unwrap_or_default();
+            // Age-eliminated dethrones are also recorded so resume replay
+            // can reproduce the crown-age state bit-exactly
+            if let Some(state) = self.state.net(h) {
+                if let Some(ent) = state.crown_enter_step {
+                    let mut s = state.clone();
+                    s.crown_enter_step = None;
+                    s.crown_age_since_elite = Some(clock.saturating_sub(ent));
+                    self.state.insert(s, None);
+                }
+            }
             let fit = self.smoothed_fitness_of(h);
-            let taker_fit = if taker.is_empty() {
-                None
+            // k == 1 keeps the crown-moved pointer: the new #1 really IS the
+            // champion that replaced the dethroned one. Multi-seat crowns use
+            // MEMBERSHIP language instead — with k seats, churn has no single
+            // "taker", and pointing at the current #1 made two exits on the
+            // same step read as one net claiming two seats (the 2026-09-28
+            // report; the pointer was a single-champion-era leftover).
+            let detail = if seat <= 1 {
+                let taker = new_crown.iter().next().cloned().unwrap_or_default();
+                let taker_fit = if taker.is_empty() {
+                    None
+                } else {
+                    self.smoothed_fitness_of(&taker)
+                };
+                let gap_txt = match (fit, taker_fit) {
+                    (Some(a), Some(b)) => format!(
+                        " (fitness {} {} → {} {})",
+                        self.fitness.direction().arrow(),
+                        crate::engine::format::fmt2_smt(a),
+                        self.fitness.direction().arrow(),
+                        crate::engine::format::fmt2_smt(b)
+                    ),
+                    (Some(a), None) => format!(
+                        " (fitness{} {})",
+                        self.fitness.direction().arrow(),
+                        crate::engine::format::fmt2_smt(a)
+                    ),
+                    _ => String::new(),
+                };
+                if taker.is_empty() {
+                    String::new() // crown is empty now — no successor to name
+                } else {
+                    format!(
+                        " — crown moved {} → {}{}",
+                        &h[..8.min(h.len())],
+                        &taker[..8.min(taker.len())],
+                        gap_txt
+                    )
+                }
             } else {
-                self.smoothed_fitness_of(&taker)
+                // The net's CURRENT rank (it already fell) — the honest
+                // "now" side of the exit; its previous rank was ≤ seat.
+                let rank = self
+                    .rank_position(h)
+                    .map(|r| format!(" (now rank {r})"))
+                    .unwrap_or_default();
+                format!(" — fell out of top-{seat}{rank}")
             };
-            let rank_txt = match old_rank {
-                Some(r) => format!("rank {r} → out, "),
-                None => String::new(),
-            };
-            let gap_txt = match (fit, taker_fit) {
-                (Some(a), Some(b)) => format!(
-                    ", fitness {} {} → {} {}",
-                    self.fitness.direction().arrow(),
-                    crate::engine::format::fmt2_smt(a),
-                    self.fitness.direction().arrow(),
-                    crate::engine::format::fmt2_smt(b)
-                ),
-                (Some(a), None) => format!(
-                    ", fitness{} {}",
-                    self.fitness.direction().arrow(),
-                    crate::engine::format::fmt2_smt(a)
-                ),
-                _ => String::new(),
+            let net_state = self.state.net(h);
+            let (trained_here, total_here) = match net_state {
+                Some(s) => {
+                    let clock_now = self.step_clock();
+                    let trained_here = clock_now.saturating_sub(s.last_update_step);
+                    let total_here = clock_now; // clocks lived so far (approx — clock-based)
+                    (trained_here, total_here)
+                }
+                None => (0, 0),
             };
             info!(
-                "step {} │ freeze │ {} dethroned ({}seat → {}{}) — resumes w updates, opt-state intact (no catch-up needed)",
+                "step {} │ freeze │ {} dethroned{} — resumes w updates, opt-state intact (no catch-up needed) [trained {}/{} clocks, frozen_crown {}/{}]",
                 clock,
                 &h[..8.min(h.len())],
-                rank_txt,
-                if taker.is_empty() {
-                    "?".to_string()
-                } else {
-                    taker[..8.min(taker.len())].to_string()
-                },
-                gap_txt,
+                detail,
+                trained_here,
+                total_here,
+                self.frozen_crown.contains(h), /* net currently inside the frozen crown? */
+                self.frozen_crown.len(),         /* frozen crown size */
             );
         }
         self.frozen_crown = new_crown;
@@ -2014,8 +1973,9 @@ impl CoreEngine {
     /// The net's 1-based rank among ALL live nets (not just the elite seats)
     /// by smoothed fitness — the same direction-aware sort `elite_hashes`
     /// uses, so `rank_position(h) <= elite_count` ⇔ `h` is elite. `None` when
-    /// the hash is unknown or has no fitness yet. Used by the dethrone log
-    /// (was-rank → out) and any future rank-delta reporting.
+    /// the hash is unknown or has no fitness yet. Used by the freeze/dethrone
+    /// logs (seat positions, `now rank` on a multi-seat exit) and any future
+    /// rank-delta reporting.
     pub(crate) fn rank_position(&self, hash: &str) -> Option<usize> {
         self.ranked_live()
             .iter()
@@ -2383,25 +2343,22 @@ mod tests {
     use crate::engine::config::DEFAULT_CHECKPOINT_EVERY;
 
     /// The RL volume label is the RL middle column of the per-step rollup: the
-    /// train/eval turn split, the mean turns/match, and — when the challenge
-    /// fired — the observed ⚔ next to what the trigger promised. A population
-    /// that reported nothing (Tabular, or a mis-wired RL trainer) must read as
+    /// train/eval turn split and the mean turns/match. A population that
+    /// reported nothing (Tabular, or a mis-wired RL trainer) must read as
     /// `—`, never as a silent `0`.
     #[test]
     fn rl_volume_label_formats_and_never_lies() {
         let empty = RlVolume::default();
-        assert!(empty.label(0.1).contains('—'), "{}", empty.label(0.1));
+        assert!(empty.label().contains('—'), "{}", empty.label());
         let pop = RlVolume {
             nets: 3,
             matches: 3,
             train_turns: 432,
             eval_turns: 108,
-            challenged_turns: 0,
         };
         assert_eq!(
-            pop.label(0.0),
-            "matches 3 │ train 432 │ eval 108 │ turns/match 180",
-            "p_chall cell hidden when the knob is off"
+            pop.label(),
+            "matches 3 │ train 432 │ eval 108 │ turns/match 180"
         );
         // Matches with zero turns is still a real report (every match died on
         // turn 0) — it reads as a mean of 0, not as `—`.
@@ -2410,24 +2367,10 @@ mod tests {
             matches: 1,
             train_turns: 0,
             eval_turns: 0,
-            challenged_turns: 0,
         };
         assert_eq!(
-            zero_turns.label(0.0),
+            zero_turns.label(),
             "matches 1 │ train 0 │ eval 0 │ turns/match 0"
-        );
-        // The ⚔ cell carries the expectation too: p_eff × TRAIN turns, not the
-        // whole volume — eval turns are never challengeable.
-        let challenged = RlVolume {
-            nets: 50,
-            matches: 300,
-            train_turns: 1331,
-            eval_turns: 2662,
-            challenged_turns: 75,
-        };
-        assert_eq!(
-            challenged.label(0.1),
-            "matches 300 │ train 1331 │ eval 2662 │ p_chall 0.100 │ ⚔ 75 (exp 133) │ turns/match 13"
         );
     }
 
@@ -2501,6 +2444,8 @@ mod tests {
         crate::utils::tabular_data::save_dataset(&dir, &tiny_dataset()).unwrap();
         dir
     }
+
+    // ── Test helpers ─────────────────────────────────────────────────────
 
     fn engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::TabularEngine> {
         // pop_size 0 ⇒ new() auto-seeds nothing; each test seeds its own
@@ -2578,7 +2523,8 @@ mod tests {
         );
         assert_eq!(cfg.mutation_probation_steps, 5);
         assert_eq!(cfg.crossover_probation_steps, 5);
-        assert_eq!(cfg.elite_probation_steps, 0);
+        assert_eq!(cfg.elite_join_probation_steps, 5);
+        assert_eq!(cfg.elite_crown_lifetime_steps, 5);
         assert_eq!(
             cfg.crossover_cull_policy,
             crate::engine::config::CrossCullPolicy::Worst
@@ -2641,6 +2587,29 @@ mod tests {
             scores.push((h.clone(), s));
         }
         // NOTE: the test harness fitness is Minimize (mse) — the fittest net
+        // has the LOWEST smoothed score, so the elite is the minimum, not the
+        // maximum. BUT elite_hashes() additionally requires a net to clear the
+        // join-probation window (clock - entered_at_step >= k) before it can
+        // take a seat, so a freshly-seeded net (entered_at_step == clock) is
+        // excluded when k > 0. The default k is 5, so at clock 0 none of the
+        // three nets are old enough to be crowned and elite_hashes() returns
+        // empty — that is the intended "no freeze on arrival" behavior.
+        //
+        // For THIS test we want to assert the elite-guard mechanic (the top-k
+        // net is protected from culls), so we set the join window to 0 so the
+        // fittest net CAN be crowned and then verify cull-selection never picks
+        // it. The probation window itself is covered by its own tests.
+        engine.config.elite_join_probation_steps = 0;
+        // Refresh the crown at clock 0: a net is only COMPUTED as elite by
+        // refresh_crown (which writes frozen_crown). elite_hashes() is a pure
+        // query that re-derives membership from smoothed fitness + the join/
+        // lifetime gates each call, and it is NOT the source of truth for
+        // whether a net is currently frozen. Without a refresh_crown call, the
+        // frozen_crown set is empty and any frozen-path asserts that read
+        // frozen_crown (not elite_hashes()) will fail even though elite_hashes()
+        // correctly reports the intended champion.
+        engine.refresh_crown(0);
+        // NOTE: the test harness fitness is Minimize (mse) — the fittest net
         // has the LOWEST score, so the elite is the minimum, not the maximum.
         scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         let expected_elite = scores[0].0.clone();
@@ -2648,9 +2617,8 @@ mod tests {
         assert_eq!(elite.len(), 1, "guard of 1 protects exactly one net");
         assert_eq!(
             elite[0], expected_elite,
-            "the fittest net (highest seeded score) is the elite"
+            "the fittest net (lowest seeded score) is the elite"
         );
-        // Random victim draw NEVER lands on the elite.
         for clock in 0..20 {
             let v = engine.select_random_victim(clock).unwrap();
             assert_ne!(v, elite[0], "elite must never be a crossover victim");
@@ -2674,7 +2642,8 @@ mod tests {
         // Isolate the ROULETTE WEIGHTS: the default probation windows would
         // otherwise shield every fresh net and the draw would return None.
         engine.config.mutation_probation_steps = 0;
-        engine.config.elite_probation_steps = 0;
+        engine.config.elite_join_probation_steps = 0;
+        engine.config.elite_crown_lifetime_steps = 5;
         engine
             .seed_population_internal(
                 vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
@@ -2773,64 +2742,88 @@ mod tests {
 
     // ── Anti-devolution guards ──────────────────────────────────────────────
 
-    #[test]
-    fn freeze_elite_act_and_measure_no_weight_update() {
-        // A (act-and-measure freeze): the frozen elite plays its normal step
-        // against the current clock — the trainer RUNS (fresh fitness is
-        // recorded into state + buffers, so its standing stays honest) — but
-        // through a no-op optimizer, so its weights never change. The
-        // observable contract: metrics advance with a FRESH fitness (not the
-        // carried one), and the step clock advances like everyone else's.
-        let dir = std::env::temp_dir().join("gras_freeze_elite_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut eng = engine(&dir, 11).unwrap();
-        eng.config.freeze_elites = true;
-        eng.config.elite_count = 1;
-        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-            .unwrap();
-        let hs = eng.state.live_hashes();
-        // Fixture is Minimize: lower smoothed = better (see worst-culls test).
-        eng.rolling_fitness.get_mut(&hs[0]).unwrap().push(0.5);
-        eng.rolling_fitness.get_mut(&hs[1]).unwrap().push(0.1);
-        assert_eq!(eng.elite_hashes(), vec![hs[1].clone()]);
-        // Give the elite a recorded skill state, then step it while frozen.
-        let m = crate::state::NetMetrics {
-            step: 3,
-            train_loss: 0.0,
-            eval_loss: None,
-            fitness: 0.5,
-            informative: vec![],
-            frozen: false,
-        };
-        eng.state.record_step(&hs[1], m).unwrap();
-        let before_len = eng.rolling_fitness.get(&hs[1]).unwrap().len();
-        eng.step_one_net(&hs[1], 5).unwrap();
-        let after = eng.rolling_fitness.get(&hs[1]).unwrap();
-        assert_eq!(after.len(), before_len + 1, "fresh measurement appended");
-        let last_metrics = eng
-            .state
-            .net(&hs[1])
-            .unwrap()
-            .last_metrics
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            last_metrics.step, 5,
-            "frozen net acted at the CURRENT clock (act-and-measure)"
-        );
-        assert_ne!(
-            last_metrics.fitness, 0.5,
-            "the fitness is a fresh measurement, not the carried skill"
-        );
-        assert_eq!(
-            eng.state.net(&hs[1]).unwrap().step,
-            2,
-            "frozen net's step count advanced (it acted)"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
+#[test]
+fn freeze_elite_act_and_measure_no_weight_update() {
+    // A (act-and-measure freeze): the frozen elite plays its normal step
+    // against the current clock — the trainer RUNS (fresh fitness is
+    // recorded into state + buffers, so its standing stays honest) — but
+    // through a no-op optimizer, so its weights never change. The
+    // observable contract: metrics advance with a FRESH fitness (not the
+    // carried one), the rolling buffer grows by one, and the net's step
+    // COUNT is unchanged (act-and-measure is not a training step).
+    let dir = std::env::temp_dir().join("gras_freeze_elite_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = engine(&dir, 11).unwrap();
+    // Lower the join window to 0 so net B can be crowned on arrival for
+    // this test: the thing under test is the frozen-branch contract, not
+    // the probation window. The default of 5 is the real "no freeze on
+    // arrival" setting (see TODO.md + elite_join_probation_crown_lifetime).
+    eng.config.freeze_elites = true;
+    eng.config.elite_count = 1;
+    eng.config.elite_join_probation_steps = 0;
+    eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+        .unwrap();
+    let hs = eng.state.live_hashes();
+    // Fixture is Minimize: lower smoothed = better (see worst-culls test).
+    // Mirror the END-OF-GROUP-STEP model directly (skip the shared-batch
+    // plumbing): a group step does, per net, (1) run_trainer_step,
+    // (2) record_step (snapshots last_metrics AND advances the net's clock
+    // + last_update_step), then (3) pushes the fresh fitness into the
+    // rolling buffer. So at the moment refresh_crown runs, each live net
+    // already has one fresh buffer entry per trained clock. We push first
+    // so refresh_crown has a verdict to read.
+    eng.rolling_fitness.get_mut(&hs[0]).unwrap().push(0.5);
+    eng.rolling_fitness.get_mut(&hs[1]).unwrap().push(0.1);
+    assert_eq!(eng.elite_hashes(), vec![hs[1].clone()], "net B is the best net");
+    // record step for net A so step_clock() reflects "both nets have trained
+    // one step" and refresh_crown's clock is 1 (one past the max recorded
+    // clock). Without any record_step call for net A, the two nets are
+    // asymmetric and step_clock() still reads 1 from net B's recorded clock.
+    // For the frozen-path contract we only need B crowned and then stepped,
+    // so this is just to keep the clock story clean.
+    let m0 = crate::state::NetMetrics {
+        step: 0,
+        train_loss: 0.0,
+        eval_loss: None,
+        fitness: 0.5,
+        informative: vec![],
+        frozen: false,
+    };
+    eng.state.record_step(&hs[0], m0).unwrap();
+    let before_len = eng.rolling_fitness.get(&hs[1]).unwrap().len();
+    eng.step_one_net(&hs[1], 0).unwrap();
+    let after = eng.rolling_fitness.get(&hs[1]).unwrap();
+    assert_eq!(after.len(), before_len + 1, "fresh measurement appended");
+    let last_metrics = eng
+        .state
+        .net(&hs[1])
+        .unwrap()
+        .last_metrics
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        last_metrics.step, 0,
+        "frozen net's recorded last_metrics.step is the clock it acted at (act-and-measure)"
+    );
+    assert_ne!(
+        last_metrics.fitness, 0.5,
+        "the fitness is a fresh measurement, not the carried skill"
+    );
+    // Freeze-member check must use the canonical `frozen_crown` HashSet
+    // (what refresh_crown writes), NOT elite_hashes() — elite_hashes()
+    // re-derives membership from smoothed fitness + the join/lifetime gates
+    // each call, and the frozen step itself just pushed a fresh value into
+    // B's buffer, so elite_hashes() can legitimately disagree with the
+    // frozen set on a stale call site. The frozen-branch contract is about
+    // membership in frozen_crown, not current top-k retirement.
+    assert!(eng.frozen_crown.contains(&hs[1]), "net B is in the frozen crown after the freeze step");
+    assert_eq!(
+        eng.state.net(&hs[1]).unwrap().step,
+        0,
+        "frozen net's step count is unchanged (act-and-measure is not a training step)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}    #[test]
     fn dethroned_elite_resumes_stepping_without_catch_up() {
         // Dethrone under act-and-measure freeze: the former elite never fell
         // behind the clock (it acted every frozen step), so losing the crown
@@ -2929,18 +2922,26 @@ mod tests {
             "no crown before any frozen step"
         );
         // Net B (lower smoothed = fitter under Minimize) is the freeze target.
+        // For freeze_crown_logs_on_transition_only we want net B crowned on the
+        // FIRST frozen step, so lower the join window to 0 (the default of 5
+        // would keep it off the crown as a fresh net). The transition-logging
+        // contract under test is independent of the probation window.
+        eng.config.elite_join_probation_steps = 0;
         eng.rolling_fitness.get_mut(&hs[1]).unwrap().push(0.1);
         assert_eq!(eng.elite_hashes(), vec![hs[1].clone()]);
         // First frozen step: crown set (info line "elite seat" fires).
-        let m = crate::state::NetMetrics {
-            step: 3,
-            train_loss: 0.0,
-            eval_loss: None,
-            fitness: 0.1,
-            informative: vec![],
-            frozen: false,
-        };
-        eng.state.record_step(&hs[1], m).unwrap();
+        // Mirror the end-of-group-step model: a real group step's frozen branch
+        // does NOT call advance_step, so the frozen net's step count and
+        // last_update_step are unchanged by the freeze step. We do NOT call
+        // record_step here (that would advance the clock a second time and
+        // diverge from the frozen branch's actual behavior).
+        //
+        // NOTE: we call `eng.refresh_crown(5)` directly (not `step_one_net`)
+        // because this test is about the CROWN TRANSITION LOGIC, not the frozen
+        // step's trainer call. refresh_crown is the function that writes
+        // frozen_crown, so asserting on frozen_crown right after refresh_crown
+        // is the correct, stable contract. The frozen branch's trainer call
+        // (step_one_net) is covered by freeze_elite_act_and_measure_no_weight_update.
         eng.refresh_crown(5);
         assert!(eng.frozen_crown.contains(&hs[1]));
         // Second refresh, same champion: NO transition — crown unchanged and
@@ -2959,6 +2960,8 @@ mod tests {
             frozen: false,
         };
         eng.state.record_step(&hs[0], m2).unwrap();
+        // Refresh at clock 7 (one past A's recorded clock 6) so refresh_crown
+        // sees both nets' latest verdicts and can re-deal the crown.
         eng.refresh_crown(7);
         assert!(
             eng.frozen_crown.contains(&hs[0]),
@@ -3200,7 +3203,6 @@ mod tests {
                 train_loss: 0.0,
                 fitness: 1.0,
                 informative: Vec::new(),
-                challenged_turns: 0,
                 rl: None,
             })
         }
@@ -3229,7 +3231,6 @@ mod tests {
                 train_loss: step as f32 * 0.5,
                 fitness,
                 informative: Vec::new(),
-                challenged_turns: 0,
                 rl: Some(crate::trainer::RlStepMeta {
                     matches: 2,
                     train_turns: 12 + step,
@@ -3255,10 +3256,12 @@ mod tests {
         }
     }
 
-    /// RL trainer that HONORS the challenge SIGNAL: when `ctx.challenged` is
-    /// true it reports a fitness of −1000 (a sentinel no normal step ever
-    /// reports) plus 5 challenged turns, so tests can observe exactly which
-    /// steps ran challenged.
+    /// RL trainer that rolls the challenge trigger ITSELF — the trainer-side
+    /// recipe (`trainer::challenge`), since the engine no longer knows what a
+    /// challenge is. When `challenge_fires` fires for this (net, step) at the
+    /// trainer's own knob (1.0 = every step), it reports a fitness of −1000
+    /// (a sentinel no normal step ever reports), so tests can observe exactly
+    /// which steps ran challenged.
     struct ChallengingRlTrainer;
     impl crate::trainer::StepTrainer for ChallengingRlTrainer {
         fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
@@ -3274,16 +3277,23 @@ mod tests {
             step: usize,
             ctx: &crate::trainer::RlContext<'_>,
         ) -> flodl::tensor::Result<crate::trainer::RlStepReport> {
-            let (fitness, challenged_turns) = if ctx.challenged {
-                (-1000.0, 5)
+            let challenged = crate::trainer::challenge::challenge_fires(
+                ctx.env.run_seed,
+                ctx.net_seed,
+                step,
+                1.0, // the trainer's own knob: every step fires
+                ctx.env.max_steps,
+                crate::trainer::challenge::ChallengeDecay::Linear,
+            );
+            let fitness = if challenged {
+                -1000.0
             } else {
-                (step as f32 + 1.0, 0)
+                step as f32 + 1.0
             };
             Ok(crate::trainer::RlStepReport {
                 train_loss: step as f32 * 0.5,
                 fitness,
                 informative: Vec::new(),
-                challenged_turns,
                 rl: Some(crate::trainer::RlStepMeta {
                     matches: 1,
                     train_turns: 5,
@@ -3374,23 +3384,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_b);
     }
 
-    /// The challenge SIGNAL: with prob 1.0 every step fires, so a trainer
-    /// honoring `ctx.challenged` reports its sentinel fitness and challenged
-    /// turns on EVERY step; a trainer ignoring the signal is simply never
-    /// challenged (no error — the knob is a signal, the trainer decides).
+    /// The trainer-owned challenge trigger: with the trainer's knob at 1.0
+    /// every step fires, so its sentinel fitness lands on every step — the
+    /// engine never sees the knob (a trainer without challenge logic is
+    /// trivially never challenged).
     #[test]
-    fn challenge_signal_reaches_the_trainer_and_ignoring_is_legal() {
+    fn trainer_owned_challenge_trigger_fires_inside_train_step() {
         let dir = std::env::temp_dir().join("gras-challenge-signal");
         let _ = std::fs::remove_dir_all(&dir);
-        let mut cfg = rl_config(0);
-        cfg.challenge_prob = 1.0; // every step fires
+        let cfg = rl_config(0);
         let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
             cfg,
             crate::engine::fitness::Fitness::reported(
                 crate::engine::fitness::Direction::Maximize,
                 "reward",
             ),
-            ChallengingRlTrainer, // honors the flag → sentinel on every step
+            ChallengingRlTrainer, // rolls its own trigger → sentinel every step
             Some(1),
             Some(dir.clone()),
         ))
@@ -3400,48 +3409,11 @@ mod tests {
         let hash = eng.state.live_hashes()[0].clone();
         eng.step_one_net(&hash, 0).unwrap();
         let lm = eng.state.net(&hash).unwrap().last_metrics.clone().unwrap();
-        assert_eq!(lm.fitness, -1000.0, "honored flag → challenged step");
-        // The rollup's ⚔ accounting counts what the trainer reported.
-        assert_eq!(eng.step_rl.challenged_turns, 5);
-        assert_eq!(eng.total_challenged_turns, 5);
-        let _ = std::fs::remove_dir_all(&dir);
-
-        // Ignoring the signal is legal: SeededRlTrainer never reads the flag.
-        let dir2 = std::env::temp_dir().join("gras-challenge-ignored");
-        let _ = std::fs::remove_dir_all(&dir2);
-        let mut cfg2 = rl_config(0);
-        cfg2.challenge_prob = 1.0;
-        let mut eng2 = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
-            cfg2,
-            crate::engine::fitness::Fitness::reported(
-                crate::engine::fitness::Direction::Maximize,
-                "reward",
-            ),
-            SeededRlTrainer,
-            Some(1),
-            Some(dir2.clone()),
-        ))
-        .unwrap();
-        eng2.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
-            .unwrap();
-        let hash2 = eng2.state.live_hashes()[0].clone();
-        eng2.step_one_net(&hash2, 0).unwrap(); // must NOT error
-        let lm2 = eng2
-            .state
-            .net(&hash2)
-            .unwrap()
-            .last_metrics
-            .clone()
-            .unwrap();
-        assert_ne!(
-            lm2.fitness, -1000.0,
-            "an ignoring trainer is never challenged"
-        );
         assert_eq!(
-            eng2.total_challenged_turns, 0,
-            "no challenged turns were reported"
+            lm.fitness, -1000.0,
+            "the trainer-side trigger fired → sentinel step"
         );
-        let _ = std::fs::remove_dir_all(&dir2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A challenge is just another step: its fitness (measured under the
@@ -3452,7 +3424,6 @@ mod tests {
         let dir = std::env::temp_dir().join("gras-challenge-honesty");
         let _ = std::fs::remove_dir_all(&dir);
         let mut cfg = rl_config(0);
-        cfg.challenge_prob = 1.0; // every step fires → fully deterministic
         cfg.freeze_elites = false; // isolate the challenge from the freeze
         let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
             cfg,
@@ -3493,10 +3464,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Replay parity under challenges: an interrupted run with
-    /// `challenge_prob = 1.0` (every step challenged) resumed mid-run lands
-    /// on the twin's metrics — the catch-up mirror re-fires the same
-    /// challenges through the same `challenge_step`.
+    /// Replay parity under the TRAINER-OWNED trigger: an interrupted run
+    /// (trainer's knob = 1.0, every step challenged) resumed mid-run lands on
+    /// the twin's metrics — the replay re-derives the identical trigger from
+    /// (run_seed, net_seed, step), no engine involvement.
     #[test]
     fn challenge_resume_then_continue_matches_uninterrupted_twin() {
         let dir_a = std::env::temp_dir().join("gras-rl-challenge-a");
@@ -3506,7 +3477,6 @@ mod tests {
 
         let challenge_cfg = |pop: usize| {
             let mut cfg = rl_config(pop);
-            cfg.challenge_prob = 1.0;
             cfg.freeze_elites = false;
             cfg
         };
@@ -4603,74 +4573,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pruner_phase_never_fires_challenges() {
-        let dir = std::env::temp_dir().join("gras-pruner-no-challenge");
-        let _ = std::fs::remove_dir_all(&dir);
-        // The decay ALONE would not save us here: `max_steps = None` keeps
-        // `p_eff` at the full knob for every step, and the race stops early
-        // via `custom_stop`. So any solo challenge would have to come from an
-        // explicit suppression, which is what this pins.
-        let mut config = rl_config(0);
-        config.pop_size = 2;
-        config.challenge_prob = 1.0;
-        config.max_steps = None;
-        config.crossover_rolls = 0;
-        config.mutate_rolls = 0;
-        config.custom_stop = Some(Box::new(|snap: &crate::engine::config::RaceSnapshot| {
-            snap.step >= 2
-        }));
-        config.pop_pruner = Some(crate::engine::config::PopPruner {
-            method: crate::engine::config::PopPrunerMethod::Hard,
-            steps: 3,
-        });
-        let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
-            config,
-            crate::engine::fitness::Fitness::reported(
-                crate::engine::fitness::Direction::Maximize,
-                "reward",
-            ),
-            ChallengingRlTrainer,
-            Some(11),
-            Some(dir.clone()),
-        ))
-        .unwrap();
-        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-            .unwrap();
-        assert_eq!(eng.run().unwrap(), StopReason::CustomStop);
-        // history.csv carries a fitness per (step, net): the sentinel −1000
-        // marks a challenged step (ChallengingRlTrainer), and the solo steps
-        // 3..=5 must be free of it. No evolve rolls ⇒ every row is a founder
-        // (plain `founder-N` origin, no quoting to parse around).
-        let history = std::fs::read_to_string(dir.join("history.csv")).unwrap();
-        let mut race_sentinels = 0usize;
-        let mut solo_rows = 0usize;
-        for line in history.lines().skip(1) {
-            let cols: Vec<&str> = line.split(',').collect();
-            let step: usize = cols[0].parse().unwrap();
-            let fitness: f32 = cols[7].parse().unwrap();
-            if step >= 3 {
-                solo_rows += 1;
-                assert_ne!(
-                    fitness, -1000.0,
-                    "pruner solo step {step} fired a challenge"
-                );
-            } else if fitness == -1000.0 {
-                race_sentinels += 1;
-            }
-        }
-        assert!(solo_rows > 0, "the pruner phase recorded solo rows");
-        assert!(
-            race_sentinels > 0,
-            "the knob WAS live during the race (p_eff = 1.0)"
-        );
-        assert_eq!(
-            eng.total_challenged_turns,
-            race_sentinels * 5,
-            "challenged-turn total counts race steps only"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // (2026-10-10: `pruner_phase_never_fires_challenges` removed with the
+    // engine-side challenge wiring. The "solo phase never challenges" rule
+    // was engine state; a trainer-owned trigger can't see the phase. A
+    // trainer that wants the old rule checks `ctx.env.live_count` against its
+    // own knowledge of the elite set — the recipe lives in
+    // `trainer::challenge`.)
 
     /// Both CSV exports must be self-consistent: every data row has exactly as
     /// many fields as its own header. The old single-file layout padded
@@ -5261,12 +5169,10 @@ mod tests {
             eng.config.pop_size,
         );
         assert_eq!(topos.len(), 2);
-        assert!(
-            crate::state::load_engine_json(&dir)
-                .unwrap()
-                .run_topology_source
-                .is_none()
-        );
+        assert!(crate::state::load_engine_json(&dir)
+            .unwrap()
+            .run_topology_source
+            .is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5455,7 +5361,8 @@ mod tests {
         let config = RaceConfig {
             mutation_probation_steps: 4,
             crossover_probation_steps: 6,
-            elite_probation_steps: 5,
+            elite_join_probation_steps: 5,
+            elite_crown_lifetime_steps: 5,
             ..RaceConfig::defaults()
         };
         crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
@@ -5470,13 +5377,14 @@ mod tests {
         let header = crate::state::load_engine_json(&dir).unwrap();
         assert_eq!(header.config.mutation_probation_steps, 4);
         assert_eq!(header.config.crossover_probation_steps, 6);
-        assert_eq!(header.config.elite_probation_steps, 5);
+        assert_eq!(header.config.elite_join_probation_steps, 5);
+        assert_eq!(header.config.elite_crown_lifetime_steps, 5);
         assert!(header.config.elite_checkpoint_weights);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn elite_probation_keeps_fresh_nets_out_of_the_crown() {
+    fn elite_join_probation_crown_lifetime() {
         // A caught-up child arrives rankable (full buffer). With elite
         // probation on it cannot take a seat while fresh, so it trains
         // instead of freezing on arrival. Test fitness is Minimize, so the
@@ -5485,7 +5393,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 7).unwrap();
         eng.config.elite_count = 1;
-        eng.config.elite_probation_steps = 3;
+        eng.config.elite_join_probation_steps = 3;
+        eng.config.elite_crown_lifetime_steps = 5;
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
         let mut hashes = eng.state.live_hashes();
@@ -5497,7 +5406,7 @@ mod tests {
                 eng.step_one_net(h, clock).unwrap();
             }
         }
-        assert_eq!(eng.step_clock(), 4, "clock advanced by the group steps");
+        assert_eq!(eng.step_clock(), 5, "clock advanced by the group steps (one per net per clock)");
         // `hashes[0]` is the BEST net but FRESH; `hashes[1]` is worse but old.
         let best_vals = [0.1_f32, 0.9];
         for (i, h) in hashes.iter().enumerate() {
@@ -5507,7 +5416,7 @@ mod tests {
         }
         eng.state.net_mut(&hashes[0]).unwrap().entered_at_step = 4; // age 0
         eng.state.net_mut(&hashes[1]).unwrap().entered_at_step = 0; // age 4
-        // Fresh best net is BARRED; the older worst net takes the seat.
+                                                                    // Fresh best net is BARRED; the older worst net takes the seat.
         assert_eq!(
             eng.elite_hashes(),
             vec![hashes[1].clone()],

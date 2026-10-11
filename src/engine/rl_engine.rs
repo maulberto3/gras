@@ -7,7 +7,7 @@
 //! shared with the tabular engine.
 
 use super::config::RaceConfig;
-use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
+use super::core::{assert_trainer_blob_matches, CoreEngine, RlVolume, StepEvolve};
 use crate::engine::fitness::Fitness;
 use crate::state::{RaceState, RunHeader};
 use flodl::tensor::Result;
@@ -173,12 +173,7 @@ impl RlEngine {
             children_born_at_clock: HashMap::new(),
             step_evolve: StepEvolve::default(),
             step_rl: RlVolume::default(),
-            total_challenged_turns: 0,
             total_train_turns: 0,
-            expected_challenged_turns: 0.0,
-            step_challenged_inputs: 0,
-            total_challenged_inputs: 0,
-            expected_challenged_inputs: 0.0,
             champions: Vec::new(),
             checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),

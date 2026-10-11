@@ -22,7 +22,7 @@ pub(crate) const MAX_PARENT_PAIRINGS: usize = 3;
 use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
 use crate::graph::topology::Topology;
-use crate::state::{NetMetrics, NetState, write_net_state};
+use crate::state::{write_net_state, NetMetrics, NetState};
 use crate::utils::seed::derive_seed;
 
 use super::core::CoreEngine;
@@ -455,38 +455,16 @@ impl CoreEngine {
         // step (act-and-measure) is re-run through a no-op optimizer so the
         // weights stay put and the metrics reproduce bit-exactly.
         let frozen_step = child.state.is_frozen_step(step);
-        // Challenges mirror the same way: the trigger is a pure function of
-        // (run_seed, net_seed, step, challenge_prob), so the replay re-fires
-        // exactly what the original run fired and routes it through
-        // `challenge_step` — otherwise a challenged weight update would
-        // silently diverge from the recording.
-        let challenged = crate::engine::config::challenge_fires(
-            self.header.run_seed,
-            child.state.net_seed as u64,
-            step,
-            self.config.challenge_prob,
-            self.config.max_steps,
-            self.config.challenge_decay,
-        );
-        // The effective (decay-adjusted) probability for this step — the
-        // same value the live path handed the trainer, so an element-level
-        // tabular response replays identically.
-        let challenge_prob = crate::engine::config::effective_challenge_prob(
-            self.config.challenge_prob,
-            step,
-            self.config.max_steps,
-            self.config.challenge_decay,
-        );
         let mut noop = crate::engine::core::NoopOptimizer;
         let optimizer: &mut dyn flodl::nn::optim::Optimizer = if frozen_step {
             &mut noop
         } else {
             &mut *child.optimizer
         };
-        // A challenge is just another step in replay too: the re-fired
-        // trigger is passed as the SIGNAL (`challenged`) and the trainer
-        // branches inside `train_step` — identical to the live path, so the
-        // replay reproduces the original step bit-exactly.
+        // Challenges replay for free: the trainer rolls its own trigger from
+        // (run_seed, net_seed, step) — pure function, `trainer::challenge` —
+        // so this replay re-fires exactly what the original run fired without
+        // the engine knowing challenges exist.
         let report = self.trainer.train_step(
             &mut child.net,
             optimizer,
@@ -497,8 +475,6 @@ impl CoreEngine {
             env,
             &child.state.hash,
             child.state.net_seed as u64,
-            challenged,
-            challenge_prob,
         )?;
         let metrics = NetMetrics {
             step,
@@ -511,8 +487,7 @@ impl CoreEngine {
         child.state.record_metrics(metrics.clone());
         child.state.advance_step();
         // Keep the rolling buffer in sync (catch-up steps count toward the
-        // child's smoothed fitness once it rejoins) — every step, challenged
-        // or not (a challenge ranks like any other step).
+        // child's smoothed fitness once it rejoins).
         if let Some(buf) = self.rolling_fitness.get_mut(&child.state.hash) {
             buf.push(metrics.fitness);
         }

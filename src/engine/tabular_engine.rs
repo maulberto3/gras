@@ -8,7 +8,7 @@
 //! engine.
 
 use super::config::RaceConfig;
-use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
+use super::core::{assert_trainer_blob_matches, CoreEngine, RlVolume, StepEvolve};
 use crate::engine::fitness::Fitness;
 use crate::state::{RaceState, RunHeader};
 use crate::trainer::stream::{BatchStream, PoolSplit};
@@ -195,8 +195,8 @@ impl TabularEngine {
         // On resume, stream shape comes from the run header (data integrity),
         // but the trainer's stream_shape() can still override batch sizes.
         let header_stream_ratio = header.train_eval_split_ratio.unwrap_or(0.2); // legacy default if header missing it
-        // Held-out eval rows are data geometry — restored from the header,
-        // not re-decided by the resume config (mirrors the split ratio rule).
+                                                                                // Held-out eval rows are data geometry — restored from the header,
+                                                                                // not re-decided by the resume config (mirrors the split ratio rule).
         let header_held_out = header.held_out_eval_rows.unwrap_or(256); // legacy default if header missing it
 
         // Same rule on resume: the trainer's stream shape (same trainer the
@@ -269,12 +269,7 @@ impl TabularEngine {
             children_born_at_clock: HashMap::new(),
             step_evolve: StepEvolve::default(),
             step_rl: RlVolume::default(),
-            total_challenged_turns: 0,
             total_train_turns: 0,
-            expected_challenged_turns: 0.0,
-            step_challenged_inputs: 0,
-            total_challenged_inputs: 0,
-            expected_challenged_inputs: 0.0,
             champions: Vec::new(),
             checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),

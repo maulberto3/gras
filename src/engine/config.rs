@@ -439,33 +439,27 @@ pub struct RaceConfig {
     /// empty-buffer step-0 immunity. Same slot-guarantee and state-free
     /// resume contract as the mutation window.
     pub crossover_probation_steps: usize,
-    /// Elite probation: a net cannot join the ELITE set (the frozen crown AND
-    /// the cull guard) until it has aged `elite_probation_steps` clocks since
-    /// arrival (`clock − entered_at_step ≥ window`). Why: a caught-up crossover
-    /// child arrives with a FULL rolling buffer, so without this it can rank
-    /// straight into the top-`elite_count` and be FROZEN — act-and-measure,
-    /// zero training — on its first live step, benching fresh genetic material
-    /// at birth. `0` (default) = today's behavior. If EVERY rankable net is on
-    /// elite probation (tiny pop, all fresh), the crown is simply EMPTY — no
-    /// fallback, so nothing is crowned/frozen until a net has aged `k` clocks.
-    /// Fresh nets stay cull-safe via the channel-probation windows. Same
-    /// state-free, resume-safe contract as the cull-probation windows.
-    pub elite_probation_steps: usize,
-    /// Anti-plateau challenge probability (`set_run_challenge_prob`):
-    /// per-step, per-net chance the engine hands the trainer a challenged
-    /// step, decayed linearly to 0 by the end of the step budget
-    /// (`effective_challenge_prob`). 0.0 (default) = the mechanism is OFF.
-    /// A RACE device: the post-race pruner's solo phase never fires it, and
-    /// neither does a frozen (act-and-measure) elite step. A single knob by
-    /// design — the trainer owns the action draw itself.
-    pub challenge_prob: f32,
-    /// Decay SHAPE of the challenge knob (`set_run_challenge_decay`): how
-    /// `effective_challenge_prob` maps run progress onto the knob. `Linear`
-    /// (default, k=1 — the historical behavior), `Exponential` (k=2 — holds
-    /// higher longer, falls off a cliff at the end), `Custom { exponent }`
-    /// (any k > 0). Persisted + resume-guarded: the trigger re-fires from
-    /// (run_seed, net_seed, step, prob, shape), so the shape is replay state.
-    pub challenge_decay: ChallengeDecay,
+    /// Elite join probation: a net cannot join the ELITE set (the frozen
+    /// crown AND the cull guard) until it has aged `elite_join_probation_steps`
+    /// clocks since arrival (`clock − entered_at_step ≥ k`). Why: a
+    /// caught-up crossover child arrives with a FULL rolling buffer, so
+    /// without this it can rank straight into the top-`elite_count` and be
+    /// FROZEN — act-and-measure, zero training — on its first live step.
+    /// `5` (default) is the same value as the channel probation windows.
+    /// If EVERY rankable net is on join probation (tiny pop, all fresh), the
+    /// crown is simply EMPTY — no fallback, so nothing is crowned or frozen
+    /// until a net has aged `k` clocks. Fresh nets stay cull-safe via the
+    /// channel-probation windows. Same state-free, resume-safe contract as
+    /// the cull-probation windows.
+    pub elite_join_probation_steps: usize,
+    /// Elite crown lifetime: a net that has been on the frozen crown for
+    /// `elite_crown_lifetime_steps` clocks is culled OUT of the crown (age-
+    /// eliminated at peak) even if it still holds the best smoothed
+    /// fitness. Default `5`. Set to zero for the old "permanent crown until
+    /// rank changes" behavior. This is the second half of the same running
+    /// test the user asked for: a net can be elite after the join window,
+    /// but then must be dethroned after another equal window.
+    pub elite_crown_lifetime_steps: usize,
     /// Fresh holdout games the post-race guardrail plays
     /// (`set_elite_guardrail_matches`): the sample size of the honesty
     /// check. Field/key name stays `guardrail_matches` (wire-compatible).
@@ -479,10 +473,11 @@ pub struct RaceConfig {
 /// degenerate (`0`).
 ///
 /// THE one definition of "how far along are we": trainers reach it through
-/// [`crate::trainer::StepEnv::progress`] and the engine's challenge decay is
-/// built on it, so every schedule in the crate agrees on what "halfway"
-/// means. Pure arithmetic on persisted values — nothing is stored, so replay,
-/// catch-up and resume re-derive the identical number.
+/// [`crate::trainer::StepEnv::progress`] and the trainer-side challenge decay
+/// ([`crate::trainer::challenge::effective_challenge_prob`]) is built on it,
+/// so every schedule in the crate agrees on what "halfway" means. Pure
+/// arithmetic on persisted values — nothing is stored, so replay, catch-up
+/// and resume re-derive the identical number.
 pub fn run_progress(step: usize, max_steps: Option<usize>) -> Option<f32> {
     let max = max_steps?;
     if max == 0 {
@@ -491,142 +486,6 @@ pub fn run_progress(step: usize, max_steps: Option<usize>) -> Option<f32> {
     Some((step as f32 / max as f32).min(1.0))
 }
 
-/// The decay shape of the challenge knob: `eff = prob × (1 − progress^k)`.
-///
-/// All three arms share ONE closed form, so the schedule is a pure function of
-/// persisted values — replay, catch-up and resume re-derive the identical
-/// probability (an arbitrary closure could not be persisted, and would break
-/// the bit-exact challenge replay contract). `Linear` = k 1 (default — the
-/// straight-line historical schedule); `Exponential` = k 2 (holds the knob
-/// HIGHER through mid-run — at progress 0.5 the factor is 0.75 vs 0.5 — then
-/// falls off a cliff approaching the budget's end); `Custom { exponent }` =
-/// any k. The string form ("linear", "exponential", "custom:1.5") round-trips
-/// through `engine.json` and the CLI.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ChallengeDecay {
-    /// k = 1 — the knob falls in a straight line to 0 (historical default).
-    #[default]
-    Linear,
-    /// k = 2 — holds the knob higher through mid-run, cliffs at the end.
-    Exponential,
-    /// k = any positive exponent. `Custom { exponent: 1.0 }` ≡ `Linear`.
-    Custom { exponent: f32 },
-}
-
-impl ChallengeDecay {
-    /// The exponent `k` this shape applies as `1 − progress^k`, clamped to a
-    /// sane domain: k ≤ 0 would send `progress^k` to inf/NaN at progress 0
-    /// (a hand-built `Custom { exponent: -1.0 }`, or a hand-edited
-    /// `engine.json`), exploding the knob to >1 so every challenge fires.
-    /// Non-finite k (NaN from a corrupt file) clamps the same way. The knob
-    /// is a probability, so 1 − progress^k stays in [0, 1] for any k ≥ 0.
-    /// Validation at the string-parse boundary keeps honest users out of
-    /// trouble; THIS clamp is the safety net for the paths that bypass it.
-    pub(crate) fn exponent(self) -> f32 {
-        const MIN_EXPONENT: f32 = 0.0;
-        const MAX_EXPONENT: f32 = 100.0;
-        let k = match self {
-            ChallengeDecay::Linear => 1.0,
-            ChallengeDecay::Exponential => 2.0,
-            ChallengeDecay::Custom { exponent } => exponent,
-        };
-        // max/min, NOT clamp: `clamp` propagates NaN (returns NaN for a NaN
-        // receiver), while `f32::max(NaN, min)` / `min(NaN, max)` fall to the
-        // finite operand — exactly the degenerate-value fallback we want.
-        k.max(MIN_EXPONENT).min(MAX_EXPONENT)
-    }
-}
-
-// TryFrom<&str> — Tier 2 didactic (see AGENTS.md "Efficiency notes"): parse
-// lives with the enum (reusable by CLI/config tooling), returns a Result
-// instead of panicking on bad input, and keeps the parse-and-error string in
-// one place instead of duplicated match arms at every call site.
-impl TryFrom<&str> for ChallengeDecay {
-    type Error = String;
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s.trim() {
-            "linear" => Ok(ChallengeDecay::Linear),
-            "exponential" => Ok(ChallengeDecay::Exponential),
-            other => {
-                if let Some(k) = other.strip_prefix("custom:") {
-                    let exponent: f32 = k.trim().parse().map_err(|_| {
-                        format!("invalid challenge decay '{other}' (custom exponent must be a number, e.g. \"custom:1.5\")")
-                    })?;
-                    if !(exponent > 0.0) {
-                        return Err(format!(
-                            "invalid challenge decay '{other}' (exponent must be > 0)"
-                        ));
-                    }
-                    Ok(ChallengeDecay::Custom { exponent })
-                } else {
-                    Err(format!(
-                        "unknown challenge decay '{other}' (use \"linear\", \"exponential\" or \"custom:<exponent>\")"
-                    ))
-                }
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for ChallengeDecay {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ChallengeDecay::Linear => write!(f, "linear"),
-            ChallengeDecay::Exponential => write!(f, "exponential"),
-            ChallengeDecay::Custom { exponent } => write!(f, "custom:{exponent}"),
-        }
-    }
-}
-
-/// The effective (decayed) challenge probability at `step`: the knob scaled
-/// to 0 by the end of the step budget following `shape`, flat when the run is
-/// unbounded (same convention as [`run_progress`]).
-///
-/// Why the decay: challenges fight plateaus, and late-run steps are exactly
-/// where the final polish happens — the run ends with a fully challenge-free
-/// stretch so the last checkpoints measure the policy clean.
-///
-/// [`challenge_fires`] DECIDES with this value and
-/// `CoreEngine::effective_challenge_prob` LOGS it — one function, so the number
-/// shown can never drift from the number used.
-pub fn effective_challenge_prob(
-    prob: f32,
-    step: usize,
-    max_steps: Option<usize>,
-    shape: ChallengeDecay,
-) -> f32 {
-    match run_progress(step, max_steps) {
-        None => prob,
-        Some(progress) => prob * (1.0 - progress.powf(shape.exponent())),
-    }
-}
-
-/// The challenge trigger: never fires in the pruner solo phase (see
-/// `CoreEngine::effective_challenge_prob`) — that call site guards it.
-/// A pure function of `(run_seed, net_seed, step,
-/// challenge_prob, max_steps)` — deterministic, so replay/catch-up re-fires
-/// the exact same challenges the original run saw (no persisted flag needed).
-/// `prob <= 0` never fires. It decides with [`effective_challenge_prob`] (the
-/// decayed knob) and rolls ONE flip per (net, step): the trainer is handed a
-/// bool and owns what "challenged" means (see `RlContext.challenged`).
-pub(crate) fn challenge_fires(
-    run_seed: u64,
-    net_seed: u64,
-    step: usize,
-    prob: f32,
-    max_steps: Option<usize>,
-    shape: ChallengeDecay,
-) -> bool {
-    let eff = effective_challenge_prob(prob, step, max_steps, shape);
-    if eff <= 0.0 {
-        return false;
-    }
-    // Domain-separated seed: independent of every other per-step roll.
-    let mut rng =
-        fastrand::Rng::with_seed(run_seed ^ net_seed.rotate_left(17) ^ ((step as u64) << 32));
-    rng.f32() < eff
-}
 
 /// Mode-specific knob set — the arm is carried in the TYPE (same split
 /// logic as the `RunSpec` variants). Constructed via
@@ -907,6 +766,8 @@ impl RaceConfig {
             mutation_cull_policy: MutationCullPolicy::Worst,
             elite_count: 1,
             freeze_elites: true,
+            elite_join_probation_steps: 5,
+            elite_crown_lifetime_steps: 5,
             smoothing_window: SMOOTHING_WINDOW,
             mode_specific: ModeConfig::Tabular(TabularConfig::default()),
             crossover_ops_pool: Vec::new(),
@@ -939,12 +800,6 @@ impl RaceConfig {
             elite_checkpoint_weights: true,
             mutation_probation_steps: 5,
             crossover_probation_steps: 5,
-            // Empirically HARMFUL on cartpole: it benched the pre-trained
-            // crossover child that became the 500-turn champion (7be54180,
-            // born@23, trained 1 step, frozen). Opt-in only.
-            elite_probation_steps: 0,
-            challenge_prob: 0.0,
-            challenge_decay: ChallengeDecay::Linear,
             guardrail_matches: DEFAULT_GUARDRAIL_MATCHES,
         }
     }
@@ -1488,53 +1343,25 @@ impl RaceConfigBuilder {
         self.cfg.crossover_probation_steps = k;
         self
     }
-    /// Elite probation steps: a net cannot become an ELITE (frozen crown or
-    /// cull guard) until it has aged `k` clocks since arrival (see
-    /// [`RaceConfig::elite_probation_steps`]). Default 0.
-    pub fn set_elite_probation_steps(mut self, k: usize) -> Self {
-        self.cfg.elite_probation_steps = k;
+    /// Elite join probation steps: a net cannot become an ELITE (frozen
+    /// crown or cull guard) until it has aged `k` clocks since arrival.
+    /// Default `5` — the same value as the channel probation windows.
+    pub fn set_elite_join_probation_steps(mut self, k: usize) -> Self {
+        self.cfg.elite_join_probation_steps = k;
         self
     }
-    /// Per-step, per-net chance an anti-plateau challenge fires. `0.0`
-    /// (default) = challenges OFF. On a fired step the trainer is handed
-    /// `ctx.challenged = true` and owns what that means: RL forces a drawn
-    /// action on the trajectory, tabular jitters its batch — whatever the
-    /// scheme decides (a trainer that ignores the flag keeps the knob at 0).
-    /// The challenged step's fitness ranks like any other. Replay re-derives
-    /// the same trigger from (run_seed, net_seed, step), so resume stays
-    /// bit-exact. A future ramp (min_prob → max_prob approaching max_steps)
-    /// is tracked in TODO.md.
-    pub fn set_run_challenge_prob(mut self, p: f32) -> Self {
-        assert!((0.0..=1.0).contains(&p), "challenge_prob must be in [0, 1]");
-        self.cfg.challenge_prob = p;
+    /// Elite crown lifetime: how long a net may stay at peak on the frozen
+    /// crown before it is culled out of the crown (age-eliminated even if
+    /// it still holds the best smoothed fitness). Default `5`.
+    pub fn set_elite_crown_lifetime_steps(mut self, k: usize) -> Self {
+        self.cfg.elite_crown_lifetime_steps = k;
         self
     }
-    /// Decay SHAPE of the anti-plateau challenge knob — how the effective
-    /// probability falls to 0 across the step budget: `eff = prob × (1 −
-    /// progress^k)`. Accepts `ChallengeDecay::Linear` (k=1, default — the
-    /// straight-line historical schedule), `ChallengeDecay::Exponential`
-    /// (k=2 — holds higher through mid-run, cliffs at the end) or
-    /// `ChallengeDecay::Custom { exponent }` (any k > 0). Persisted in
-    /// `engine.json` and resume-guarded alongside `challenge_prob`: the
-    /// challenged-step replay re-derives the trigger from the shape, so a
-    /// resumed run with a different shape would break bit-exact parity.
-    /// Also accepts the string forms "linear", "exponential",
-    /// "custom:<exponent>" via [`ChallengeDecay::try_from`].
-    pub fn set_run_challenge_decay(mut self, shape: ChallengeDecay) -> Self {
-        // Loud validation here (unlike the clamp inside `exponent`, which is
-        // a silent safety net): a caller handing us k ≤ 0 or NaN almost
-        // certainly made a mistake, and an assert surfaces it at the config
-        // site instead of as a mysteriously challenge-free (or
-        // challenge-flooded) run three hours later.
-        if let ChallengeDecay::Custom { exponent } = shape {
-            assert!(
-                exponent.is_finite() && exponent > 0.0,
-                "challenge decay exponent must be finite and > 0 (got {exponent})"
-            );
-        }
-        self.cfg.challenge_decay = shape;
-        self
-    }
+    /// Per-step, per-net chance an anti-plateau challenge fires moved to the
+    /// TRAINER side (2026-10-10): keep the knob on your trainer and roll
+    /// [`crate::trainer::challenge_fires`] inside `train_step`. The engine no
+    /// longer knows about challenges; `set_run_challenge_prob` /
+    /// `set_run_challenge_decay` are gone with the engine wiring.
     /// Fresh holdout games the post-race guardrail plays on the exported
     /// ELITE ([`DEFAULT_GUARDRAIL_MATCHES`] = 16): the tighter the verdict has
     /// to be, the more games — the mean's standard error falls as √N, and each
@@ -1693,19 +1520,14 @@ impl RaceConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ChallengeDecay, LogLevel, RaceConfig, challenge_fires, effective_challenge_prob,
-        run_progress,
-    };
-    use crate::utils::seed::derive_seed;
+    use super::{run_progress, LogLevel, RaceConfig};
 
-    /// One decay convention for the whole crate: linear to 0 at the budget,
-    /// clamped, and flat when the run is unbounded. The SAME function feeds the
-    /// trigger (`challenge_fires`) and the log
-    /// (`CoreEngine::effective_challenge_prob`) — a schedule that shows one
-    /// number and decides with another is worse than no schedule at all.
+    /// One progress convention for the whole crate: linear to 1.0 at the
+    /// budget, clamped, and flat when the run is unbounded. (The challenge
+    /// decay built on it moved to `crate::trainer::challenge` with its own
+    /// tests — 2026-10-10.)
     #[test]
-    fn run_progress_and_challenge_decay_share_one_convention() {
+    fn run_progress_clamps_and_is_flat_unbounded() {
         assert_eq!(run_progress(0, Some(10)), Some(0.0));
         assert_eq!(run_progress(5, Some(10)), Some(0.5));
         assert_eq!(run_progress(10, Some(10)), Some(1.0));
@@ -1714,101 +1536,6 @@ mod tests {
         // No budget (or a degenerate one) = no schedule at all.
         assert_eq!(run_progress(3, None), None);
         assert_eq!(run_progress(3, Some(0)), None);
-
-        // Halfway through the budget the knob is halved; unbounded is flat.
-        assert!(
-            (effective_challenge_prob(0.2, 5, Some(10), ChallengeDecay::Linear) - 0.1).abs() < 1e-6
-        );
-        assert_eq!(
-            effective_challenge_prob(0.2, 5, None, ChallengeDecay::Linear),
-            0.2
-        );
-        // The run ends challenge-free by construction.
-        assert_eq!(
-            effective_challenge_prob(0.2, 10, Some(10), ChallengeDecay::Linear),
-            0.0
-        );
-        // Decay SHAPES: exponential (k=2) holds the knob HIGHER through the
-        // first half (progress 0.5 → factor 0.25² vs 0.25) and both reach 0
-        // at the end. Custom k=1 ≡ Linear.
-        let p = 0.2_f32;
-        let lin = effective_challenge_prob(p, 5, Some(10), ChallengeDecay::Linear);
-        let exp2 = effective_challenge_prob(p, 5, Some(10), ChallengeDecay::Exponential);
-        let cust =
-            effective_challenge_prob(p, 5, Some(10), ChallengeDecay::Custom { exponent: 2.0 });
-        assert!(exp2 > lin, "k=2 holds the knob higher at progress 0.5");
-        assert!((exp2 - cust).abs() < 1e-6, "Custom(k=2) ≡ Exponential");
-        assert_eq!(
-            effective_challenge_prob(p, 10, Some(10), ChallengeDecay::Exponential),
-            0.0
-        );
-        // String round-trip: TryFrom parses all three forms, Display prints
-        // them back, bad input is an error (not a panic).
-        assert_eq!(
-            ChallengeDecay::try_from("linear"),
-            Ok(ChallengeDecay::Linear)
-        );
-        assert_eq!(
-            ChallengeDecay::try_from("exponential"),
-            Ok(ChallengeDecay::Exponential)
-        );
-        assert_eq!(
-            ChallengeDecay::try_from("custom:1.5"),
-            Ok(ChallengeDecay::Custom { exponent: 1.5 })
-        );
-        assert!(ChallengeDecay::try_from("custom:0").is_err());
-        assert!(ChallengeDecay::try_from("wobbly").is_err());
-        assert_eq!(ChallengeDecay::Exponential.to_string(), "exponential");
-        // Fractional exponents are legal (front-loaded decay): 0.5 ≡ sqrt.
-        assert_eq!(
-            ChallengeDecay::try_from("custom:0.5"),
-            Ok(ChallengeDecay::Custom { exponent: 0.5 })
-        );
-        // Safety net: a hand-built Custom (bypassing the setter assert) or a
-        // hand-edited engine.json cannot explode the knob — k ≤ 0 and NaN
-        // clamp inside `exponent` so 1 − progress^k stays in [0, 1].
-        assert_eq!(ChallengeDecay::Custom { exponent: -1.0 }.exponent(), 0.0);
-        assert_eq!(
-            ChallengeDecay::Custom { exponent: f32::NAN }.exponent(),
-            0.0
-        );
-        let kn =
-            effective_challenge_prob(1.0, 0, Some(10), ChallengeDecay::Custom { exponent: -1.0 });
-        assert!((0.0..=1.0).contains(&kn), "knob stays a probability");
-        // The trigger's boundary agrees with the logged knob: past the budget the
-        // knob is exactly 0 and the roll can never fire, whatever the seed.
-        for step in 10..14 {
-            for net_seed in 0..50u64 {
-                assert!(
-                    !challenge_fires(1, net_seed, step, 1.0, Some(10), ChallengeDecay::Linear),
-                    "step {step} is past the budget — the knob is 0"
-                );
-            }
-        }
-        // prob = 1.0 at step 0 (eff exactly 1.0) → the roll always fires.
-        for net_seed in 0..50u64 {
-            assert!(challenge_fires(
-                1,
-                net_seed,
-                0,
-                1.0,
-                Some(10),
-                ChallengeDecay::Linear
-            ));
-        }
-        // While the knob is alive the trigger is PROBABILISTIC — one flip per
-        // (net, step), not per population-step. At step 5 (eff 0.5) a 200-net
-        // sample must contain both outcomes; a constant here would mean the roll
-        // had stopped depending on the seed.
-        let fired = (0..200u64)
-            .filter(|net_seed| {
-                challenge_fires(1, *net_seed, 5, 1.0, Some(10), ChallengeDecay::Linear)
-            })
-            .count();
-        assert!(
-            fired > 0 && fired < 200,
-            "eff 0.5 over 200 independent net-steps should mix, got {fired}"
-        );
     }
 
     /// The examples' `--log-level` vocabulary must parse: handed to env_logger
@@ -1841,29 +1568,5 @@ mod tests {
         // feature's deletion — only the step budget remains)
         let cfg = RaceConfig::builder().set_stop_max_steps(15).build();
         assert_eq!(cfg.max_steps, Some(15));
-    }
-
-    /// The trigger is per-NET, not per-step: at one step with `p = 0.5` a
-    /// population of distinct seeds must split roughly in half. A single
-    /// shared seed (the founder-seed bug) made it all-or-nothing, so `⚔`
-    /// only ever appeared on the steps where that one seed happened to fire.
-    #[test]
-    fn challenge_trigger_is_per_net_not_per_step() {
-        let fired = (0..64usize)
-            .filter(|i| {
-                challenge_fires(
-                    42,
-                    derive_seed(42, *i),
-                    3,
-                    0.5,
-                    None,
-                    ChallengeDecay::Linear,
-                )
-            })
-            .count();
-        assert!(
-            (16..=48).contains(&fired),
-            "trigger must track prob across nets, fired {fired}/64"
-        );
     }
 }

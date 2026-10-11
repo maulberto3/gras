@@ -5,9 +5,8 @@
 //! ```text
 //! step_one_net(hash, clock)
 //!   ├─ elite freeze check (ANTI-DEVOLUTION A) → act-and-measure pass (NoopOptimizer)
-//!   ├─ challenge_fires(run_seed, net_seed, clock)   ← anti-plateau trigger
-//!   └─ run_trainer_step_with_real_optimizer(hash, clock, challenged)
-//!        └─ run_trainer_step(hash, clock, optimizer, challenged)
+//!   └─ run_trainer_step_with_real_optimizer(hash, clock)
+//!        └─ run_trainer_step(hash, clock, optimizer)
 //!             ├─ seed_step_randomness(net_seed, clock)   (fastrand + libtorch)
 //!             ├─ trainer.train_step(...)                 (the caller's scheme)
 //!             └─ debug contract probe (re-scores the reported eval loss)
@@ -21,7 +20,7 @@
 use flodl::tensor::Result;
 
 use super::core::{CoreEngine, NoopOptimizer};
-use super::format::{fmt_opt2, fmt2};
+use super::format::{fmt2, fmt_opt2};
 use crate::state::NetMetrics;
 #[cfg(debug_assertions)]
 use crate::utils::race_steps::eval_one_step;
@@ -58,9 +57,7 @@ impl CoreEngine {
             // through a no-op optimizer, leaving the frozen weights and the
             // real optimizer's moments untouched.
             let mut noop = NoopOptimizer;
-            // `challenged: false` — the freeze never co-fires with a challenge
-            // (act-and-measure is already the deviation from the normal step).
-            let report = self.run_trainer_step(hash, clock, &mut noop, false)?;
+            let report = self.run_trainer_step(hash, clock, &mut noop)?;
             let metrics = NetMetrics {
                 step: clock,
                 train_loss: report.train_loss,
@@ -81,6 +78,10 @@ impl CoreEngine {
                 }
             }
             self.state.record_step(hash, metrics.clone())?;
+            // A frozen net never trains, so its weight-latest clock stays at
+            // its birth clock — do NOT call advance_step here (that would
+            // rotate last_update_step and break the crown-lifetime running
+            // test's "trained k clocks since last update" check).
             // Persist the act-and-measure marker: replay must re-run this
             // clock through the no-op optimizer (see catch_up_step).
             if let Some(s) = self.state.net_mut(hash) {
@@ -96,7 +97,9 @@ impl CoreEngine {
             return Ok(());
         }
         // One step = whatever the caller's training scheme does for one step
-        // clock. The engine only consumes the returned report.
+        // clock. The engine only consumes the returned report. (Anti-plateau
+        // challenges are the TRAINER's business — `trainer::challenge` — the
+        // engine neither rolls nor accounts for them.)
         let optimizer_ok = self.optimizers.contains_key(hash);
         if !optimizer_ok {
             return Err(crate::utils::error::EngineError::InvalidOptions(format!(
@@ -104,49 +107,9 @@ impl CoreEngine {
             ))
             .into());
         }
-        // Challenge trigger (anti-plateau): a per-step chance the net's step
-        // runs with the trainer forcing a drawn action. `prob = 0` (default)
-        // never fires. The roll is a pure function of (run, net, step) — see
-        // `challenge_fires` — so replay/catch-up re-fires identical triggers.
-        // NEVER in the pruner solo phase: that phase is the final polish, and
-        // the decay alone would not suffice (an early `custom_stop`, or
-        // `max_steps = None`, leaves `p_eff > 0` past the stop).
-        let net_seed = self.state.net(hash).map(|s| s.net_seed as u64).unwrap_or(0);
-        let challenged = !self.pruner_solo_active
-            && crate::engine::config::challenge_fires(
-                self.header.run_seed,
-                net_seed,
-                clock,
-                self.config.challenge_prob,
-                self.config.max_steps,
-                self.config.challenge_decay,
-            );
-        let report = self.run_trainer_step_with_real_optimizer(hash, clock, challenged)?;
-        // Tabular challenge accounting: the trainer reports how many INPUT
-        // VALUES it jittered (an element-level draw), and its expectation is
-        // `p_eff × rows × features` per net-step. RL reports turns instead
-        // (the block below).
-        if !self.trainer.is_rl() {
-            self.step_challenged_inputs += report.challenged_inputs;
-            self.total_challenged_inputs += report.challenged_inputs;
-            let rows = self.stream.as_ref().map(|s| s.batch_size()).unwrap_or(0);
-            self.expected_challenged_inputs +=
-                self.effective_challenge_prob(clock) * (rows * self.header.input_dim) as f32;
-        }
-        // Turn-based challenge accounting: what the trainer REPORTS as forced
-        // turns is what the log counts (the trainer owns challenge semantics;
-        // the engine only keeps the books).
-        if report.challenged_turns > 0 {
-            self.step_rl.add_challenged(report.challenged_turns);
-            self.total_challenged_turns += report.challenged_turns;
-        }
+        let report = self.run_trainer_step_with_real_optimizer(hash, clock)?;
         if let Some(rl) = &report.rl {
-            // Run-total expectation, decay-aware: the knob at THIS step's
-            // decay times the turns a challenge could have forced (train
-            // only — eval turns are never challengeable).
             self.total_train_turns += rl.train_turns;
-            self.expected_challenged_turns +=
-                self.effective_challenge_prob(clock) * rl.train_turns as f32;
         }
         let metrics = NetMetrics {
             step: clock,
@@ -156,6 +119,11 @@ impl CoreEngine {
             informative: report.informative,
             frozen: false,
         };
+        // record_step owns the clock bookkeeping end-to-end: it snapshots the
+        // metrics AND advances the net's local step clock (including
+        // `last_update_step`, the weight-latest clock the freeze branch reads
+        // to decide "trained k clocks since last update"). A second
+        // `advance_step` here would double-advance the clock per live step.
         self.state.record_step(hash, metrics.clone())?;
         // A challenge is just another step: its fitness (measured under the
         // forced action) ranks like any other — the user's semantics. The
@@ -171,15 +139,6 @@ impl CoreEngine {
             if let Some(e) = metrics.eval_loss {
                 buf.push(e);
             }
-        }
-        if challenged {
-            tracing::debug!(
-                "step {} │ net {} │ CHALLENGED — fitness{} {} (trainer-applied response)",
-                clock,
-                &hash[..8.min(hash.len())],
-                self.fitness.direction().arrow(),
-                fmt2(metrics.fitness),
-            );
         }
         // Per-net detail is debug-only (Plan A: the user log shows one rollup
         // line per step — see `run`). All values remain in nets/<hash>.json.
@@ -197,20 +156,18 @@ impl CoreEngine {
     }
 
     /// The normal group step: drive one trainer step through the net's REAL
-    /// optimizer (weights update, momentum carries forward). Returns the
-    /// report plus whether a challenge actually EXECUTED (the trigger fired
+    /// optimizer (weights update, momentum carries forward).
     fn run_trainer_step_with_real_optimizer(
         &mut self,
         hash: &str,
         clock: usize,
-        challenged: bool,
     ) -> Result<crate::trainer::StepReport> {
         let mut optimizer = self.optimizers.remove(hash).ok_or_else(|| {
             crate::utils::error::EngineError::InvalidOptions(format!(
                 "race: net {hash} not live (no Optimizer in memory)"
             ))
         })?;
-        let report = self.run_trainer_step(hash, clock, optimizer.as_mut(), challenged)?;
+        let report = self.run_trainer_step(hash, clock, optimizer.as_mut())?;
         self.optimizers.insert(hash.to_string(), optimizer);
         Ok(report)
     }
@@ -219,22 +176,15 @@ impl CoreEngine {
     /// given optimizer — the shared body of the normal group step and the
     /// act-and-measure freeze pass (which passes a [`NoopOptimizer`]). Seeds
     /// the step RNGs, runs the trainer, runs the debug contract probe, and
-    /// accumulates RL volume and the challenge counters; recording metrics
-    /// and ranking buffers is the CALLER's job (the freeze pass records
-    /// before returning early). A challenged step goes through the same
-    /// return as any other — its fitness ranks like any other.
+    /// accumulates RL volume; recording metrics and ranking buffers is the
+    /// CALLER's job (the freeze pass records before returning early).
     fn run_trainer_step(
         &mut self,
         hash: &str,
         clock: usize,
         optimizer: &mut dyn flodl::nn::optim::Optimizer,
-        challenged: bool,
     ) -> Result<crate::trainer::StepReport> {
         let net_seed = self.state.net(hash).map(|s| s.net_seed as u64).unwrap_or(0);
-        // The EFFECTIVE (decay-adjusted) challenge probability for this step —
-        // the per-(input, feature) rate an element-level tabular response
-        // should roll against. Same number the trigger used (one function).
-        let challenge_prob = self.effective_challenge_prob(clock);
         // The mode decides the context: Tabular receives the run's data
         // handle (guaranteed present by construction), RL receives none.
         let run_data = self
@@ -262,12 +212,6 @@ impl CoreEngine {
         // on replay and breaks resume parity. The engine owns this because
         // the trainer — any trainer — may draw masks inside `train_step`.
         crate::utils::race_steps::seed_step_randomness(net_seed, clock as u64, 0);
-        // The challenge SIGNAL: the engine pre-rolled the trigger and hands
-        // the flag to the trainer — the TRAINER decides what a challenge means
-        // (force a drawn action, perturb the env, whatever its env needs).
-        // A trainer that ignores the flag simply never challenges (keep the
-        // knob at 0); the engine does not verify the flag was honored. What
-        // the trainer reports in `challenged_turns` is what the log shows.
         let report = self.trainer.train_step(
             net,
             optimizer,
@@ -278,8 +222,6 @@ impl CoreEngine {
             env,
             hash,
             net_seed,
-            challenged,
-            challenge_prob,
         )?;
         // Debug-only contract probe: the Trainer's per-step clause says the
         // report describes the net AFTER this step's training. Re-score the

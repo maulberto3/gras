@@ -66,13 +66,9 @@ impl CoreEngine {
         // The mode's middle column: tabular reports the held-out eval loss,
         // RL reports the environment volume it actually played.
         let mid = if !self.trainer.is_rl() {
-            format!(
-                "eval_loss↓ {}{}",
-                stats(&evals),
-                self.tabular_challenge_cell(clock)
-            )
+            format!("eval_loss↓ {}", stats(&evals))
         } else {
-            self.step_rl.label(self.effective_challenge_prob(clock))
+            self.step_rl.label()
         };
         // Per-step rollup: Summ = compact one-liner; Minimal = framed table
         // (from step 2 — deltas need a prior step). The ★ badge names the
@@ -94,7 +90,7 @@ impl CoreEngine {
             }
         };
         if self.log_level == crate::engine::config::LogLevel::Minimal {
-            self.log_minimal_table(&trains, &evals, &fits, step_secs, clock);
+            self.log_minimal_table(&trains, &evals, &fits, step_secs);
         } else {
             info!(
                 "step {} │ pop {} │ train_loss↓ {} │ {} │ fitness{} {} │ took {:.1}s{}",
@@ -108,28 +104,6 @@ impl CoreEngine {
                 freeze_badge,
             );
         }
-    }
-
-    /// The tabular challenge cell: how many individual INPUT VALUES the
-    /// trainers jittered this clock vs the expectation `p_eff × rows ×
-    /// features × live` (the same shape as RL's `⚔ <observed> (exp <m>)`, but
-    /// counted in input values rather than environment turns). Hidden when
-    /// the knob is off; shows the live `p_chall` while nothing has fired yet.
-    fn tabular_challenge_cell(&self, clock: usize) -> String {
-        if self.config.challenge_prob <= 0.0 {
-            return String::new();
-        }
-        let p = self.effective_challenge_prob(clock);
-        if self.step_challenged_inputs == 0 {
-            return if p > 0.0 {
-                format!(" │ p_chall {p:.3}")
-            } else {
-                String::new()
-            };
-        }
-        let rows = self.stream.as_ref().map(|s| s.batch_size()).unwrap_or(0);
-        let exp = p * (rows * self.header.input_dim) as f32 * self.state.live_count() as f32;
-        format!(" │ ⚔ {} (exp {exp:.0})", self.step_challenged_inputs)
     }
 
     /// `Minimal` mode: one boxed vitals table per step (starting at step 2 —
@@ -151,7 +125,6 @@ impl CoreEngine {
         evals: &[f32],
         fits: &[f32],
         step_secs: f32,
-        clock: usize,
     ) {
         let mean = |v: &[f32]| {
             if v.is_empty() {
@@ -179,15 +152,13 @@ impl CoreEngine {
         // not bytes — ↓/↑/∆ are 3 bytes each but one column wide.
         let mut rows: Vec<String> = vec![
             if !self.trainer.is_rl() {
-                let ch = self.tabular_challenge_cell(clock);
                 format!(
-                    "pop {:>3} │ train_loss↓ {:.2}{} │ eval_loss↓ {:.2}{}{}",
+                    "pop {:>3} │ train_loss↓ {:.2}{} │ eval_loss↓ {:.2}{}",
                     pop,
                     train_m,
                     delta(train_m, Some(pt)),
                     eval_m,
                     delta(eval_m, Some(pe)),
-                    ch,
                 )
             } else {
                 format!(
@@ -195,7 +166,7 @@ impl CoreEngine {
                     pop,
                     train_m,
                     delta(train_m, Some(pt)),
-                    self.step_rl.label(self.effective_challenge_prob(clock)),
+                    self.step_rl.label(),
                 )
             },
             // `smt` tag: this rollup cell is the population MEAN of smoothed
@@ -273,27 +244,6 @@ impl CoreEngine {
             "  wrote {} frontier snapshot(s) → nets/<hash>.json (one per live net)",
             live.len(),
         );
-        // Run-total challenge accounting — how much of the race was spent
-        // under forced-action challenges. Always shown when the knob is on
-        // (the user should see the mechanism's footprint); silent when off.
-        if self.config.challenge_prob > 0.0 {
-            if self.trainer.is_rl() {
-                info!(
-                    "  total challenged turns: {} of ~{:.0} expected │ {} train turns │ knob {} per step, decaying to 0 at the last checkpoint",
-                    self.total_challenged_turns,
-                    self.expected_challenged_turns,
-                    self.total_train_turns,
-                    self.config.challenge_prob,
-                );
-            } else {
-                info!(
-                    "  total challenged inputs: {} of ~{:.0} expected │ knob {} per input-feature, decaying to 0 at the last checkpoint",
-                    self.total_challenged_inputs,
-                    self.expected_challenged_inputs,
-                    self.config.challenge_prob,
-                );
-            }
-        }
         // The population size is part of the resume call (the engine refuses a
         // mismatch instead of silently patching it), so print the number the
         // caller must pass — not just the directory. Phrased in ENGINE terms,
@@ -311,7 +261,7 @@ impl CoreEngine {
         // metadata — the run's champions at stop time. Elite = rank, not
         // identity, so this is "who holds the top-k right now".
         let k = self.config.elite_count.max(1); // report at least the champion
-        // (hash, smoothed, step, eval_loss)
+                                                // (hash, smoothed, step, eval_loss)
         let ranked: Vec<(String, f32, usize, Option<f32>)> = self
             .ranked_live()
             .into_iter()
