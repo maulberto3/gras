@@ -75,9 +75,9 @@ struct WarmupSgdTrainer {
 impl WarmupSgdTrainer {
     fn new(
         loss_fn: impl Fn(&Variable, &Variable) -> gras::flodl::tensor::Result<Variable>
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
         peak_lr: f32,
         momentum: f32,
     ) -> Self {
@@ -98,7 +98,7 @@ impl WarmupSgdTrainer {
     }
 }
 
-impl StepTrainer for WarmupSgdTrainer {
+impl TabularStep for WarmupSgdTrainer {
     // Called by the engine at every net birth (initial population, crossover
     // child, random immigrant) and on resume rebuilds. The lr baked in here
     // is the *warmup-schedule* lr for the net's birth step — the momentum
@@ -130,9 +130,7 @@ impl StepTrainer for WarmupSgdTrainer {
             "eval_every": self.eval_every,
         }))
     }
-}
 
-impl TabularStep for WarmupSgdTrainer {
     // REQUIRED: the (pred, target) loss — a supervised scheme's defining
     // choice. (RL schemes implement RlStep instead and have no loss method.)
     fn loss(&self) -> gras::trainer::LossFn<'_> {
@@ -221,7 +219,10 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-    cli::init_logger(gras::engine::config::LogLevel::Summ);
+    cli::init_logger(
+        gras::engine::config::LogLevel::Summ,
+        cli.smoke.log_level.as_deref(),
+    );
 
     // Data — XOR: 4 rows, 2 features, 2 one-hot classes. Persisted so the
     // engine's deterministic-split contract holds even for tiny data.

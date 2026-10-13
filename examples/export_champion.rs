@@ -144,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stream = gras::trainer::stream::BatchStream::new(header.run_seed, batch_size, split);
     let loss_fn = loss_by_name(&loss_name).expect("resolved above");
     let trainer = TabularTrainer::new(loss_fn).with_loss_label(loss_name.clone());
-    use gras::trainer::{StepTrainer, TabularStep};
+    use gras::trainer::TabularStep;
     let mut optimizer = trainer.make_optimizer(&net);
 
     let plan = replay_plan(net_state.step, net_state.entered_at_step);

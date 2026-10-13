@@ -88,7 +88,7 @@ fn main() {
     // Create the batch stream config
     let split = gras::trainer::stream::PoolSplit::of(&dataset, 0.2, header.run_seed);
     let stream = gras::trainer::stream::BatchStream::new(header.run_seed, 16, split);
-    use gras::trainer::StepTrainer;
+    use gras::trainer::TabularStep;
     let mut optimizer = trainer.make_optimizer(&net);
 
     println!("--------------------------------------------------------------------------------");

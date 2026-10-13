@@ -90,7 +90,7 @@ impl MountainCar {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// SECTION 2 — THE TRAINER (the gras contract: StepTrainer + RlStep)
+// SECTION 2 — THE TRAINER (the gras contract: RlStep — one trait, one block)
 // ═══════════════════════════════════════════════════════════════════════
 const RUN_SEED: u64 = 42;
 const HOLDOUT_SEED: u64 = 2;
@@ -175,7 +175,7 @@ fn random_baseline(matches: usize) -> f64 {
 /// normalized to O(1). Same skeleton as the CartPole trainer — see
 /// cartpole.rs for the annotated version; comments here only cover the
 /// MountainCar-specific deltas. Guardrail story identical: the measurement
-/// half (`holdout_score`) lives on THIS type via `StepTrainer`.
+/// half (`holdout_score`) lives on THIS type via `RlStep`.
 struct MountainCarTrainer {
     device: Device,
     matches_per_step: usize,
@@ -408,7 +408,7 @@ impl MountainCarTrainer {
     }
 }
 
-impl StepTrainer for MountainCarTrainer {
+impl RlStep for MountainCarTrainer {
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
         Box::new(gras::flodl::nn::Adam::new(
             &net.parameters(),
@@ -426,6 +426,13 @@ impl StepTrainer for MountainCarTrainer {
             "learning_rate": LEARNING_RATE,
             "grad_clip": GRAD_CLIP,
             "dropout_prob": DROPOUT_PROB,
+            // The anti-plateau trigger is TRAINER-owned (the engine no longer
+            // knows challenges exist) — `describe()` is the only place these
+            // knobs are visible to a reader of the run's record.
+            "challenge_prob": self.challenge_prob,
+            "challenge_decay": format!(
+                "custom:{CHALLENGE_DECAY_EXPONENT}" // eff = p × (1 − progress^k)
+            ),
         }))
     }
 
@@ -448,9 +455,7 @@ impl StepTrainer for MountainCarTrainer {
             0.0
         })
     }
-}
 
-impl RlStep for MountainCarTrainer {
     fn train_step(
         &mut self,
         net: &mut Network,
@@ -547,7 +552,7 @@ impl RlStep for MountainCarTrainer {
 
 // ═══════════════════════════════════════════════════════════════════════
 // SECTION 3 — THE GUARDRAIL (fresh unseen matches, engine-driven)
-// The measurement half (`holdout_score`) lives in the StepTrainer impl
+// The measurement half (`holdout_score`) lives in the RlStep impl
 // above — the engine calls the run's OWN trainer, so there is no second
 // scorer object to build.
 // ═══════════════════════════════════════════════════════════════════════
@@ -580,18 +585,35 @@ struct Cli {
     /// Stop after this many steps (default: the `RACE_STEPS` const).
     #[arg(long, value_name = "N")]
     max_steps: Option<usize>,
+    /// Log level (default: the `LOG_LEVEL` const). `none` / `summ` / `minimal`
+    /// pick the reporting shape; `debug` / `trace` keep `summ` and additionally
+    /// print the engine's per-roll detail (rolls that did not fire,
+    /// shield-blocked rolls) that the default view hides.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        value_parser = ["none", "summ", "minimal", "debug", "trace"]
+    )]
+    log_level: Option<String>,
 }
 
 fn main() {
     let cli = <Cli as clap::Parser>::parse();
     let pop = cli.pop.unwrap_or(POP);
     let race_steps = cli.max_steps.unwrap_or(RACE_STEPS);
+    // The CLI level wins over the const when passed; `debug`/`trace` add the
+    // engine's per-roll detail on top of the same reporting shape.
+    let (log_level, log_verbosity) = cli
+        .log_level
+        .as_deref()
+        .and_then(LogLevel::parse_verbose)
+        .unwrap_or((LOG_LEVEL, None));
 
-    // Install the run's log sinks: the console lines at `LOG_LEVEL` and the
+    // Install the run's log sinks: the console lines at `log_level` and the
     // `Minimal` frame. Without this the console stays silent and the run
     // LOOKS hung while the race grinds. `set_run_trace_file(true)` on the
     // config below adds `<run_dir>/telemetry.jsonl`.
-    gras::engine::logging::init(LOG_LEVEL, None);
+    gras::engine::logging::init(log_level, log_verbosity);
 
     let device = gras::auto_device();
 

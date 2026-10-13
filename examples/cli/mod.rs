@@ -2,11 +2,13 @@
 //!
 //! Two surfaces live here:
 //!
-//! - [`SmokeArgs`] — the TWO-FLAG surface the examples flatten (`--pop`,
-//!   `--max-steps`): enough for a quick smoke test, nothing to read past.
-//!   Every other knob is a `const` at the top of the example, visible in the
-//!   source rather than behind a flag. Used by cartpole, categorical,
-//!   continuous, custom_trainer and mnist (which adds its own `--data-dir`).
+//! - [`SmokeArgs`] — the smoke surface the examples flatten (`--pop`,
+//!   `--max-steps`, and `--log-level` for the one axis a reader of a log
+//!   actually needs to change mid-investigation). Every other knob is a
+//!   `const` at the top of the example, visible in the source rather than
+//!   behind a flag. Used by categorical, continuous, custom_trainer and mnist
+//!   (which adds its own `--data-dir`); cartpole and mountaincar declare the
+//!   same flags on their own `Cli` structs.
 //! - [`EngineArgs`] / [`RlEngineArgs`] — the fuller engine surface
 //!   (`--log-level`, `--seed`, `--resume`, the evolution knobs, …), kept for
 //!   the one example whose runs are long enough to need it:
@@ -48,14 +50,30 @@ pub struct SmokeArgs {
     /// Stop after this many engine steps (default: the example's own const).
     #[arg(long = "max-steps", value_name = "N")]
     pub max_steps: Option<usize>,
+    /// Log level (default: the example's own `LOG_LEVEL` const). `none` /
+    /// `summ` / `minimal` pick the reporting SHAPE; `debug` / `trace` keep
+    /// `summ` and additionally let the engine's per-roll detail through (rolls
+    /// that did not fire, shield-blocked rolls), which the default view hides.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        value_parser = ["none", "summ", "minimal", "debug", "trace"]
+    )]
+    pub log_level: Option<String>,
 }
 
-/// Turn on the engine logger at `level`.
+/// Turn on the engine logger: `raw` is the `--log-level` flag when the user
+/// passed one, `default` the example's own const.
 ///
-/// The smoke surface deliberately has no `--log-level` — pass the example's own
-/// const, exactly as a reader of the source would expect.
-pub fn init_logger(level: LogLevel) -> bool {
-    gras::engine::logging::init(level, None)
+/// The two axes stay separate because they mean different things: the engine
+/// level is the reporting SHAPE (and is recorded in `engine.json`), the
+/// verbosity is how much detail reaches this console. A run that needs the
+/// per-roll trail does not have to change what it reports.
+pub fn init_logger(default: LogLevel, raw: Option<&str>) -> bool {
+    let (level, verbosity) = raw
+        .and_then(LogLevel::parse_verbose)
+        .unwrap_or((default, None));
+    gras::engine::logging::init(level, verbosity)
 }
 
 /// Parse an engine log level (`none` | `summ` | `minimal`) on the CLI.

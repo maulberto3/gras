@@ -37,7 +37,10 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-    cli::init_logger(gras::engine::config::LogLevel::Summ);
+    cli::init_logger(
+        gras::engine::config::LogLevel::Summ,
+        cli.smoke.log_level.as_deref(),
+    );
 
     // 1. Data — synthetic classification, persisted so the engine's
     //    reproducibility contract (deterministic split from run_seed) holds.

@@ -78,7 +78,7 @@ impl CartPole {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// SECTION 2 — THE TRAINER (the gras contract: StepTrainer + RlStep)
+// SECTION 2 — THE TRAINER (the gras contract: RlStep — one trait, one block)
 // ═══════════════════════════════════════════════════════════════════════
 
 /// The guardrail's holdout games stay on a FIXED seed forever: verdicts have
@@ -87,14 +87,7 @@ const HOLDOUT_SEED: u64 = 2;
 const LEARNING_RATE: f32 = 1e-3;
 const DROPOUT_PROB: f32 = 0.25;
 const GRAD_CLIP: f32 = 2.0;
-/// Anti-plateau challenge: per-step, per-net chance the TRAINER forces a
-/// drawn action on the train matches. Trainer-owned since 2026-10-10 — the
-/// engine no longer knows challenges exist; the trigger rolls inside
-/// `train_step` via `gras::trainer::challenge_fires` (replay-safe: pure
-/// function of run/net/step). 0.0 = off.
-const CHALLENGE_PROB: f32 = 0.2; // softmax already does some exploration
-/// Decay shape of the challenge knob above: `eff = p × (1 − progress^k)`.
-/// k = 0.5 front-loads the decay (the knob falls faster than linearly).
+const CHALLENGE_PROB: f32 = 0.1;
 const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 
 /// The action head used for **TRAIN matches only** (eval and holdout are
@@ -112,7 +105,7 @@ const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 /// The REINFORCE update is unaffected either way — it still scores
 /// `log_softmax(pred)` for whichever action was taken; this knob only decides
 /// how that action was chosen.
-const LOG_SOFTMAX_HEAD: bool = false;
+const LOG_SOFTMAX_HEAD: bool = true;
 
 /// Pure function of (net_seed, step, match_i) — the replay-determinism
 /// contract for RL resume. The run seed is blended into the net seed by the
@@ -161,7 +154,7 @@ fn random_baseline(matches: usize) -> f64 {
 /// REINFORCE with per-turn credit (G_t = turns − t), batch-mean baseline,
 /// advantages normalized to O(1).
 /// Guardrail story: the measurement half (`holdout_score`) lives on THIS
-/// type via `StepTrainer` — the engine calls the run's own trainer, so
+/// type via `RlStep` — the engine calls the run's own trainer, so
 /// there is no second scorer object anywhere.
 struct CartPoleTrainer {
     device: Device,
@@ -336,7 +329,7 @@ impl CartPoleTrainer {
     }
 }
 
-impl StepTrainer for CartPoleTrainer {
+impl RlStep for CartPoleTrainer {
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
         Box::new(gras::flodl::nn::Adam::new(
             &net.parameters(),
@@ -361,6 +354,14 @@ impl StepTrainer for CartPoleTrainer {
             "learning_rate": LEARNING_RATE,
             "grad_clip": GRAD_CLIP,
             "dropout_prob": DROPOUT_PROB,
+            // The anti-plateau trigger is TRAINER-owned (the engine no longer
+            // knows challenges exist), so `describe()` is the only place these
+            // knobs are visible — a reader of the log cannot otherwise tell
+            // whether a run ran with challenges at all.
+            "challenge_prob": self.challenge_prob,
+            "challenge_decay": format!(
+                "custom:{CHALLENGE_DECAY_EXPONENT}" // eff = p × (1 − progress^k)
+            ),
         }))
     }
 
@@ -377,9 +378,7 @@ impl StepTrainer for CartPoleTrainer {
         let (_, survival) = self.play_episode(net, seed, false, None)?;
         Ok(survival as f32)
     }
-}
 
-impl RlStep for CartPoleTrainer {
     fn train_step(
         &mut self,
         net: &mut Network,
@@ -423,7 +422,7 @@ impl RlStep for CartPoleTrainer {
         let traj_seed_base = ctx.net_seed ^ ctx.env.run_seed;
         for match_i in 0..self.matches_per_step {
             let seed = episode_start_seed(traj_seed_base, step, match_i as u64);
-            let (traj, survival) = self.play_episode(net, seed, LOG_SOFTMAX_HEAD, forced)?;
+            let (traj, survival) = self.play_episode(net, seed, false, forced)?; // if false, then challenge_prob can enter
             let offset = all_transitions.len();
             all_transitions.extend(traj);
             matches.push((offset, survival));
@@ -480,9 +479,10 @@ impl RlStep for CartPoleTrainer {
 // ═══════════════════════════════════════════════════════════════════════
 // SECTION 3 — THE GUARDRAIL (fresh unseen games, engine-driven)
 // The measurement half (`holdout_score`) lives in the
-// StepTrainer impl above — the engine calls the run's OWN trainer, so there
+// RlStep impl above — the engine calls the run's OWN trainer, so there
 // is no second scorer object to build.
 // ═══════════════════════════════════════════════════════════════════════
+const HOLDOUT_MATCHES: usize = 100;
 
 // ═══════════════════════════════════════════════════════════════════════
 // SECTION 4 — main(): config → spec → run → guardrail
@@ -496,14 +496,14 @@ impl RlStep for CartPoleTrainer {
 const POP: usize = 100;
 const RACE_STEPS: usize = 20;
 const MATCHES_PER_STEP: usize = 1;
-const EVAL_MATCHES_PER_STEP: usize = 2;
+const EVAL_MATCHES_PER_STEP: usize = 10;
 
 /// The smoke-test CLI: deliberately just two flags. Everything else is a
 /// const above — clap rejects any other flag at the usage line.
 #[derive(clap::Parser, Debug)]
 #[command(
     name = "cartpole",
-    about = "CartPole RL race. Smoke flags: --pop, --max-steps, --seed (all else is a const)."
+    about = "CartPole RL race. Smoke flags: --pop, --max-steps, --seed, --log-level (all else is a const)."
 )]
 struct Cli {
     /// Live networks in the race (default: the `POP` const).
@@ -519,11 +519,20 @@ struct Cli {
     /// so any run is replayable after the fact.
     #[arg(long, value_name = "U64")]
     seed: Option<u64>,
+    /// Log level (default: the `LOG_LEVEL` const). `none` / `summ` / `minimal`
+    /// pick the reporting shape; `debug` / `trace` keep `summ` and additionally
+    /// print the engine's per-roll detail (rolls that did not fire,
+    /// shield-blocked rolls) that the default view hides.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        value_parser = ["none", "summ", "minimal", "debug", "trace"]
+    )]
+    log_level: Option<String>,
 }
 
 fn main() {
     const LOG_LEVEL: LogLevel = LogLevel::Summ;
-    const HOLDOUT_MATCHES: usize = 100;
 
     let cli = <Cli as clap::Parser>::parse();
     let pop = cli.pop.unwrap_or(POP);
@@ -532,11 +541,18 @@ fn main() {
     // is a property of a fixed seed, not of the example's default).
     let run_seed = cli.seed.unwrap_or_else(|| fastrand::u64(..));
 
-    // Install the run's log sinks: the console lines at `LOG_LEVEL` and the
+    // The CLI level wins over the const when passed; `debug`/`trace` add the
+    // engine's per-roll detail on top of the same reporting shape.
+    let (log_level, log_verbosity) = cli
+        .log_level
+        .as_deref()
+        .and_then(LogLevel::parse_verbose)
+        .unwrap_or((LOG_LEVEL, None));
+    // Install the run's log sinks: the console lines at `log_level` and the
     // `Minimal` frame. Without this the console stays silent and the run LOOKS
     // hung while the race grinds. `set_run_trace_file(true)` on the config
     // below adds `<run_dir>/telemetry.jsonl` — the engine aims that one.
-    gras::engine::logging::init(LOG_LEVEL, None);
+    gras::engine::logging::init(log_level, log_verbosity);
 
     let device = gras::auto_device();
 
@@ -546,7 +562,7 @@ fn main() {
     let config = rl_race_config_builder()
         .set_run_name("cartpole")
         .set_run_csv_export(true)
-        .set_run_log_level(LOG_LEVEL)
+        .set_run_log_level(log_level)
         // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
         .set_run_pop_size(pop)
         .set_run_smoothing_window(5)
@@ -574,14 +590,14 @@ fn main() {
         .set_crossover_prob(0.5)
         .set_crossover_rolls(pop / 10)
         .set_crossover_retries(5)
-        .set_crossover_ops_pool(["one_point", "uniform"])
+        // .set_crossover_ops_pool(["uniform"]) // ["one_point", "uniform"]
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
         .set_crossover_catch_up(false)
         // .set_crossover_gate(CrossoverGate::Off)
         // .set_crossover_gate_window(5)
         .set_crossover_probation_steps(5)
         .set_mutate_prob(0.5)
-        .set_mutate_rolls(pop / 10)
+        .set_mutate_rolls(pop / 20)
         .set_mutation_catch_up(false)
         .set_mutation_cull_policy(MutationCullPolicy::Worst)
         .set_mutation_probation_steps(5)
@@ -596,9 +612,9 @@ fn main() {
         .set_topology_output_dim(2)
         .set_topology_hidden_dim_range(16, 64)
         .set_topology_hidden_dim_stride(16)
-        // .set_topology_combine_op_pool([
-        //     "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
-        // ])
+        .set_topology_combine_op_pool([
+            "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
+        ])
         // .set_topology_activation_pool([
         //     "Identity",
         //     "ReLU",
@@ -621,7 +637,7 @@ fn main() {
         //     ])
         // .set_topology_standardize_op_pool(["Identity", "LayerNorm", "RmsNorm", "InstanceNorm"])
         .set_elite_freeze(true)
-        .set_elite_count(pop / 10)
+        .set_elite_count(pop / 20)
         .set_elite_join_probation_steps(5)
         .set_elite_crown_lifetime_steps(5)
         .set_elite_save_topology(true)
@@ -634,21 +650,7 @@ fn main() {
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(false)
         .set_elite_guardrail_matches(HOLDOUT_MATCHES)
-        // The knobs not used by cartpole today, declared for the record:
-        // .set_crossover_gate(CrossoverGate::Off)
-        // .set_crossover_gate_window(5)
-        // .set_run_metrics(vec![Metric::custom("eval_survival_min", |survivals, _| {
-        //     let v = survivals.data().to_f32_vec()?;
-        //     Ok(if v.is_empty() {
-        //         0.0
-        //     } else {
-        //         v.iter().copied().fold(f32::INFINITY, f32::min)
-        //     })
-        // })])
-        // .set_run_topologies(vec![]) // founder blueprints filling slots first
-        // .set_checkpoint_elite_weights(true) // per-checkpoint elite weight snapshot
-        // .set_topology_activation_pool(["Identity", "ReLU", "GeLU", "SiLU", "Tanh", "Sigmoid", "Mish"])
-        // .set_topology_standardize_op_pool(["Identity", "LayerNorm", "RmsNorm", "InstanceNorm"])
+        // .set_checkpoint_elite_weights(true) // per-checkpoint elite weight snapshot ???
         .build();
 
     let fitness = Fitness::reported(Direction::Maximize, "match_survival");
@@ -736,10 +738,22 @@ fn main() {
     match engine.guardrail(device) {
         Some(v) => {
             let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
-            let smoothed_note = v
-                .race_smoothed
-                .map(|s| format!(" (race smoothed {s:.1})"))
-                .unwrap_or_default();
+            // The race side carries its own error bar (and how many step
+            // readings are behind it) — printed next to the holdout's because
+            // the two decide together whether a gap is a collapse or noise: a
+            // 5-step window whose readings swing 40..500 cannot resolve better
+            // than ±80, so a holdout well below its mean is expected, not
+            // damning. The engine's own info line states the verdict in words.
+            let smoothed_note = match v.race_smoothed {
+                Some(s) => match v.race_se {
+                    Some(se) if v.race_samples > 0 => format!(
+                        " (race smoothed {s:.1} ±{se:.1} SE over {} step reading(s))",
+                        v.race_samples
+                    ),
+                    _ => format!(" (race smoothed {s:.1}, no window spread recorded)"),
+                },
+                None => String::new(),
+            };
             let verdict = if holdout >= MAX_TURNS_PER_MATCH as f32 {
                 "SOLVED ✅"
             } else if holdout > 4.0 * baseline as f32 {

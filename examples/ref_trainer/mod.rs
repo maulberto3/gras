@@ -113,7 +113,7 @@ impl Default for TabularTrainer {
     }
 }
 
-impl StepTrainer for TabularTrainer {
+impl TabularStep for TabularTrainer {
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
         use gras::flodl::nn::Module;
         Box::new(gras::flodl::nn::Adam::new(
@@ -139,12 +139,14 @@ impl StepTrainer for TabularTrainer {
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> Result<f32> {
         match &self.holdout {
             Some(scorer) => scorer(net, game_i),
-            None => gras::trainer::StepTrainer::holdout_score(self, net, game_i),
+            None => unimplemented!(
+                "holdout_score is not implemented for this trainer — install a scorer via \
+                 with_holdout_scorer (one fresh game, same units as the reported fitness) to \
+                 use engine.guardrail()"
+            ),
         }
     }
-}
 
-impl TabularStep for TabularTrainer {
     fn loss(&self) -> gras::trainer::LossFn<'_> {
         &*self.loss_fn
     }

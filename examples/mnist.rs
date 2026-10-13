@@ -3,7 +3,7 @@
 //! The library ships CONTRACTS, not recipes. This file supplies everything
 //! concrete, in four sections:
 //!   1 DATA      — a gras-format dataset (generated if absent).
-//!   2 TRAINER   — a hand-rolled `StepTrainer` + `TabularStep` impl.
+//!   2 TRAINER   — a hand-rolled `TabularStep` impl (one trait, one block).
 //!   3 GUARDRAIL — the optional holdout scorer on that same trainer.
 //!   4 RUN       — consts → config → spec → run → guardrail.
 //!
@@ -42,8 +42,10 @@ const HOLDOUT_DIR: &str = "data/mnist/test";
 
 // ═══ 2. TRAINER ═════════════════════════════════════════════════════════
 //
-// The contract is two traits; the library provides no scheme, so this is the
-// real code a user writes. Compare `examples/cartpole.rs` (same shape, `RlStep`).
+// ONE trait (`TabularStep`), ONE impl block — the library provides no scheme,
+// so this is the real code a user writes. REQUIRED: `make_optimizer`, `loss`,
+// `train_step`. OPTIONAL: `describe`, `holdout_score`, `stream_shape`.
+// Compare `examples/cartpole.rs` (same shape, `RlStep`).
 
 const LEARNING_RATE: f32 = 1e-3;
 const GRAD_CLIP: f32 = 1.0;
@@ -106,7 +108,9 @@ impl MnistTrainer {
     }
 }
 
-impl StepTrainer for MnistTrainer {
+impl TabularStep for MnistTrainer {
+    // REQUIRED: the optimizer built for every net at birth (and on resume
+    // rebuilds); its state (Adam moments) carries across steps.
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
         Box::new(gras::flodl::nn::Adam::new(
             &net.parameters(),
@@ -114,7 +118,7 @@ impl StepTrainer for MnistTrainer {
         ))
     }
 
-    /// Recorded in `engine.json` under `"trainer"`, verbatim.
+    /// OPTIONAL: recorded in `engine.json` under `"trainer"`, verbatim.
     fn describe(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({
             "trainer": "mnist-handrolled",
@@ -124,11 +128,17 @@ impl StepTrainer for MnistTrainer {
             "grad_clip": self.grad_clip,
             "batch_size": self.train_batch,
             "eval_batch_size": self.eval_batch,
+            // The tabular arm's anti-plateau response is element-level jitter
+            // rolled inside `train_step` against the decayed rate — TRAINER
+            // owned, so this blob is the only record of it (the engine has no
+            // challenge surface left).
+            "challenge_prob": self.challenge_prob,
+            "challenge_decay": "linear",
             "jitter_scale": JITTER_SCALE,
         }))
     }
 
-    /// Score ONE holdout draw — `game_i` seeds which rows.
+    /// OPTIONAL (guardrail): score ONE holdout draw — `game_i` seeds which rows.
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> TensorResult<f32> {
         let (dataset, stream) = self
             .holdout
@@ -140,13 +150,14 @@ impl StepTrainer for MnistTrainer {
         net.train();
         score::accuracy_score(&pred, &Variable::new(y, false))
     }
-}
 
-impl TabularStep for MnistTrainer {
+    // REQUIRED: the (pred, target) loss — a supervised scheme's defining choice.
     fn loss(&self) -> gras::trainer::LossFn<'_> {
         &*self.loss_fn
     }
 
+    // OPTIONAL: batch sizes requested from the engine's shared stream (the
+    // train/eval split RATIO is engine bookkeeping, not overridable).
     fn stream_shape(&self) -> Option<StreamShape> {
         Some(StreamShape {
             batch_size: self.train_batch,
@@ -154,6 +165,8 @@ impl TabularStep for MnistTrainer {
         })
     }
 
+    // REQUIRED: one clock-step of training + this step's report (`fitness` is
+    // the ranking input; `ctx.data` is always present in tabular mode).
     fn train_step(
         &mut self,
         net: &mut Network,
@@ -275,7 +288,7 @@ struct Cli {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    cli::init_logger(LOG_LEVEL);
+    cli::init_logger(LOG_LEVEL, cli.smoke.log_level.as_deref());
 
     // ── STEP A — data: generate if missing so the example runs out of the box.
     let data_dir_arg = cli
