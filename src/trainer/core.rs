@@ -1,27 +1,30 @@
-//! The trainer contracts, split per run mode.
+//! The trainer contracts — ONE trait per run mode.
 //!
 //! The engine runs either **Tabular** (dataset-driven, supervised) or **RL**
 //! (environment-driven, trainer-reported fitness) — see
-//! [`crate::engine::RunSpec`]. The trainer surface is split the same way:
+//! [`crate::engine::RunSpec`]. A scheme implements exactly ONE of:
 //!
-//! - [`StepTrainer`] — the mode-agnostic core every scheme implements
-//!   (optimizer creation, self-description).
 //! - [`TabularStep`] — the dataset-driven contract: a **required**
 //!   `(pred, target)` loss, access to the shared batch stream, per-step eval.
 //! - [`RlStep`] — the environment-driven contract: **no loss method at all**
 //!   (the training signal lives inside `train_step`), no data in the context,
-//!   the fitness is whatever the trainer reports in `RlStepReport.fitness`.
+//!   the fitness is whatever the trainer reports in [`RlStepReport::fitness`].
+//!
+//! Each trait is self-sufficient: it carries the shared lifecycle
+//! (`make_optimizer`, optional `describe`, optional `holdout_score`) next to
+//! its mode-specific step, so a trainer is ONE `impl` block. Wrong flavor
+//! combinations stay a **compile error**: `RunSpec::tabular` demands
+//! `T: TabularStep` and `RunSpec::rl` demands `T: RlStep`, and the two traits
+//! expose disjoint step methods.
 //!
 //! Reports are mode-split too: [`TabularStep`] returns [`TabularStepReport`],
 //! [`RlStep`] returns [`RlStepReport`] — no always-`None` fields. Both
 //! normalize into the engine-internal [`StepReport`] union (the persisted
 //! `NetMetrics` stays one type: wire format, history.csv, replay parity).
 //!
-//! The split makes wrong flavor combinations a **compile error**: an RL
-//! scheme cannot return a `(pred, target)` loss, and a tabular scheme cannot
-//! be built without one. `RaceEngine::new` enforces the mode pairing via
-//! trait bounds (`RunSpec::tabular` demands `T: TabularStep`,
-//! `RunSpec::RL` demands `T: RlStep`).
+//! The engine stores either mode behind one [`AnyTrainer`] enum. There is no
+//! adapter trait and no hand-written `Box<dyn _>` forwarding impls: an
+//! exhaustive `match` cannot silently fall back to a trait default.
 
 use crate::graph::network::Network;
 use crate::utils::tabular_data::Dataset;
@@ -277,17 +280,13 @@ impl StreamShape {
 
 // ── The traits ───────────────────────────────────────────────────────────────
 
-/// The mode-agnostic core every trainer implements: build an optimizer for a
-/// net and describe the recipe. The mode-specific contracts
-/// ([`TabularStep`], [`RlStep`]) require this as a supertrait.
+/// The dataset-driven (supervised) training contract — the ONE trait a
+/// tabular scheme implements.
 ///
-/// # Contract: BOTH traits, always
-/// Implementing a mode contract means complying with BOTH halves — the
-/// supertrait [`StepTrainer`] (shared lifecycle: `make_optimizer`, optional
-/// `describe`) AND the mode trait itself (the step: [`RlStep::train_step`] or
-/// [`TabularStep::train_step`]). Rust requires two `impl` blocks; that is the
-/// contract, not boilerplate. `RlStep` alone does not compile as a trainer.
-pub trait StepTrainer: Send {
+/// Owns the loss — it is REQUIRED here, not an `Option` — and optionally
+/// shapes the shared batch stream. Data arrives via [`TabularContext::data`],
+/// always present.
+pub trait TabularStep: Send {
     /// Make the optimizer for a newly built or reloaded network.
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
 
@@ -305,33 +304,21 @@ pub trait StepTrainer: Send {
 
     /// The guardrail's measurement half: score ONE fresh holdout game with
     /// the given (champion-reloaded) net, in the SAME units and estimator
-    /// as the fitness reported in the step report. Implement it to make the
-    /// trainer guardrail-capable — the engine's `guardrail()` then needs no
-    /// second scorer object: `engine.guardrail()` is the whole call.
-    ///
-    /// How MANY games are played is the run's business, not the trainer's:
-    /// the config's `set_elite_guardrail_matches` (default 16). The contract is
+    /// as the fitness reported in the step report. How MANY games are played
+    /// is the run's business, not the trainer's: the config's
+    /// `set_elite_guardrail_matches` (default 16). The contract is
     /// index-based (`game_i`), so any count works — seed the draw from
     /// `game_i` and the games stay independent.
     ///
-    /// Default: unimplemented (calling `guardrail()` without a scorer
-    /// panics with this contract text — loud, not silent).
+    /// Default: unimplemented (calling `guardrail()` without overriding this
+    /// panics with the contract text — loud, not silent).
     fn holdout_score(&mut self, _net: &mut Network, _game_i: usize) -> flodl::tensor::Result<f32> {
         unimplemented!(
             "holdout_score is not implemented for this trainer — implement it (one fresh \
              game, same units as the reported fitness) to use engine.guardrail()"
         )
     }
-}
 
-/// The dataset-driven (supervised) training contract. A trainer complies
-/// with BOTH [`StepTrainer`] and this trait — two `impl` blocks, both
-/// required (see [`StepTrainer`]).
-///
-/// Owns the loss — it is REQUIRED here, not an `Option` — and optionally
-/// shapes the shared batch stream. Data arrives via [`TabularContext::data`],
-/// always present.
-pub trait TabularStep: StepTrainer {
     /// The loss this scheme trains against: `(pred, target) -> loss`.
     fn loss(&self) -> crate::trainer::LossFn<'_>;
 
@@ -363,12 +350,8 @@ pub trait TabularStep: StepTrainer {
     ) -> flodl::tensor::Result<TabularStepReport>;
 }
 
-/// The environment-driven (RL) training contract.
-///
-/// # Contract: BOTH traits, always
-/// A trainer complies with BOTH [`StepTrainer`] (supertrait: optimizer +
-/// recipe) and `RlStep` (this step contract) — two `impl` blocks, both
-/// required. See [`StepTrainer`] for the full statement.
+/// The environment-driven (RL) training contract — the ONE trait an RL
+/// scheme implements.
 ///
 /// There is deliberately NO `loss()` method and no data in [`RlContext`]:
 /// the training signal (rewards, trajectories, advantages) is the trainer's
@@ -378,7 +361,31 @@ pub trait TabularStep: StepTrainer {
 /// [`crate::engine::fitness::Fitness::reported`].
 ///
 /// See `examples/cartpole.rs` for the canonical implementation.
-pub trait RlStep: StepTrainer {
+pub trait RlStep: Send {
+    /// Make the optimizer for a newly built or reloaded network.
+    fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
+
+    /// Optional self-description of this scheme's hyperparameters, recorded in
+    /// `engine.json` under `"trainer"`. `None` (the default) = "no description".
+    fn describe(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// The guardrail's measurement half: score ONE fresh holdout game with the
+    /// given (champion-reloaded) net, in the SAME units and estimator as the
+    /// fitness reported in the step report. How MANY games are played is the
+    /// run's business (`set_elite_guardrail_matches`, default 16); `game_i` is
+    /// the deterministic index, so seed your draw from it.
+    ///
+    /// Default: unimplemented (calling `guardrail()` without overriding this
+    /// panics with the contract text — loud, not silent).
+    fn holdout_score(&mut self, _net: &mut Network, _game_i: usize) -> flodl::tensor::Result<f32> {
+        unimplemented!(
+            "holdout_score is not implemented for this trainer — implement it (one fresh \
+             game, same units as the reported fitness) to use engine.guardrail()"
+        )
+    }
+
     /// Train the network for one clock-step in place: run the environment,
     /// apply the update, and report the reward-derived fitness.
     fn train_step(
@@ -403,79 +410,58 @@ pub trait RlStep: StepTrainer {
     fn pop_phase(&mut self, _nets: &mut [(String, &mut Network)], _step: usize) {}
 }
 
-// ── Trait-object plumbing ────────────────────────────────────────────────────
+// ── The engine's trainer seam ────────────────────────────────────────────────────
 
-/// The ENGINE's view of any trainer — the seam the split rests on
-/// (TODO.md step 8). The engine core never knows which mode it serves; it
-/// talks to this trait. Implemented by [`ModeAdapter`], the per-mode
-/// adapter whose type carries the mode tag. Sealed: only this module can
-/// add implementations.
-pub trait EngineTrainer: Send {
-    fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
-    fn describe(&self) -> Option<serde_json::Value>;
-    /// RL pop-wide phase (no-op for tabular): see [`RlStep::pop_phase`].
-    fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize);
-    /// One training step — the mode decides which context type to build.
-    #[allow(clippy::too_many_arguments)]
-    fn train_step(
-        &mut self,
-        net: &mut Network,
-        optimizer: &mut dyn flodl::nn::optim::Optimizer,
-        step: usize,
-        data: Option<&RunData<'_>>,
-        fitness: &crate::engine::fitness::Fitness,
-        metrics: &[crate::engine::fitness::Metric],
-        env: StepEnv,
-        net_hash: &str,
-        net_seed: u64,
-    ) -> flodl::tensor::Result<StepReport>;
-    /// Guardrail dispatch — forwards to the inner trainer's
-    /// `StepTrainer::holdout_score` (see the adapters).
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
-        let _ = (net, game_i);
-        unimplemented!(
-            "holdout_score is not implemented for this trainer — implement it (one fresh \
-             game, same units as the reported fitness) to use engine.guardrail()"
-        )
+/// The ENGINE's view of any trainer — one value, two modes. The engine core
+/// never knows which mode it serves; it talks to this enum. Every method is
+/// an exhaustive `match`, so adding one cannot silently fall through to a
+/// trait default the way hand-written `Box<dyn _>` forwarding impls could.
+pub enum AnyTrainer {
+    Tabular(Box<dyn TabularStep>),
+    Rl(Box<dyn RlStep>),
+}
+
+impl AnyTrainer {
+    /// Build the tabular arm, boxing the concrete trainer.
+    pub fn tabular(trainer: impl TabularStep + 'static) -> Self {
+        Self::Tabular(Box::new(trainer))
     }
+
+    /// Build the RL arm, boxing the concrete trainer.
+    pub fn rl(trainer: impl RlStep + 'static) -> Self {
+        Self::Rl(Box::new(trainer))
+    }
+
     /// Mode tag (drives the engine's log columns and RL-only phases).
-    fn is_rl(&self) -> bool;
-    /// The tabular loss, when this is a tabular trainer (checkpoint exam).
-    fn tabular_loss(&self) -> Option<super::LossFn<'_>>;
-    /// Requested batch geometry (tabular only; `None` for RL).
-    fn stream_shape(&self) -> Option<StreamShape> {
-        None
+    pub fn is_rl(&self) -> bool {
+        matches!(self, Self::Rl(_))
     }
-}
 
-/// Per-mode engine adapter: statically knows its mode, wraps the boxed
-/// user trainer. The mode tag lives in the TYPE, not a runtime enum arm
-/// (TODO.md step 8/9 — replaces the deleted ModeTrainer enum).
-pub struct ModeAdapter<T: Send + 'static> {
-    inner: T,
-}
+    pub fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
+        match self {
+            Self::Tabular(t) => t.make_optimizer(net),
+            Self::Rl(t) => t.make_optimizer(net),
+        }
+    }
 
-impl ModeAdapter<Box<dyn TabularStep>> {
-    pub fn tabular(inner: Box<dyn TabularStep>) -> Self {
-        Self { inner }
+    pub fn describe(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Tabular(t) => t.describe(),
+            Self::Rl(t) => t.describe(),
+        }
     }
-}
 
-impl ModeAdapter<Box<dyn RlStep>> {
-    pub fn rl(inner: Box<dyn RlStep>) -> Self {
-        Self { inner }
+    /// RL pop-wide phase (a no-op for the tabular arm): see [`RlStep::pop_phase`].
+    pub fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize) {
+        match self {
+            Self::Tabular(_) => {}
+            Self::Rl(t) => t.pop_phase(nets, step),
+        }
     }
-}
 
-impl EngineTrainer for ModeAdapter<Box<dyn TabularStep>> {
-    fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
-        self.inner.make_optimizer(net)
-    }
-    fn describe(&self) -> Option<serde_json::Value> {
-        self.inner.describe()
-    }
-    fn pop_phase(&mut self, _nets: &mut [(String, &mut Network)], _step: usize) {}
-    fn train_step(
+    /// One training step — the arm decides which context type to build.
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_step(
         &mut self,
         net: &mut Network,
         optimizer: &mut dyn flodl::nn::optim::Optimizer,
@@ -487,172 +473,58 @@ impl EngineTrainer for ModeAdapter<Box<dyn TabularStep>> {
         net_hash: &str,
         net_seed: u64,
     ) -> flodl::tensor::Result<StepReport> {
-        let data =
-            data.expect("Tabular step without data — engine construction invariant violated");
-        let ctx = TabularContext {
-            data: RunData {
-                dataset: data.dataset,
-                stream: data.stream,
-            },
-            fitness,
-            metrics,
-            env,
-            net_hash,
-            net_seed,
-        };
-        Ok(self.inner.train_step(net, optimizer, step, &ctx)?.into())
+        match self {
+            Self::Tabular(t) => {
+                let data = data
+                    .expect("Tabular step without data — engine construction invariant violated");
+                let ctx = TabularContext {
+                    data: RunData {
+                        dataset: data.dataset,
+                        stream: data.stream,
+                    },
+                    fitness,
+                    metrics,
+                    env,
+                    net_hash,
+                    net_seed,
+                };
+                Ok(t.train_step(net, optimizer, step, &ctx)?.into())
+            }
+            Self::Rl(t) => {
+                let ctx = RlContext {
+                    fitness,
+                    metrics,
+                    env,
+                    net_hash,
+                    net_seed,
+                };
+                Ok(t.train_step(net, optimizer, step, &ctx)?.into())
+            }
+        }
     }
-    /// Guardrail dispatch — WITHOUT this the `EngineTrainer` default runs
-    /// (`unimplemented!()`), so `engine.guardrail()` panicked even for a
-    /// library trainer that HAD a scorer installed
-    /// (`TabularTrainer::with_holdout_scorer`). The RL adapter below always
-    /// forwarded these; this one was missing them.
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
-        self.inner.holdout_score(net, game_i)
-    }
-    fn is_rl(&self) -> bool {
-        false
-    }
-    fn tabular_loss(&self) -> Option<super::LossFn<'_>> {
-        Some(self.inner.loss())
-    }
-    fn stream_shape(&self) -> Option<StreamShape> {
-        self.inner.stream_shape()
-    }
-}
 
-impl EngineTrainer for ModeAdapter<Box<dyn RlStep>> {
-    fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
-        self.inner.make_optimizer(net)
+    /// Guardrail dispatch — forwards to the trainer's own `holdout_score`.
+    pub fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
+        match self {
+            Self::Tabular(t) => t.holdout_score(net, game_i),
+            Self::Rl(t) => t.holdout_score(net, game_i),
+        }
     }
-    fn describe(&self) -> Option<serde_json::Value> {
-        self.inner.describe()
-    }
-    fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize) {
-        self.inner.pop_phase(nets, step)
-    }
-    fn train_step(
-        &mut self,
-        net: &mut Network,
-        optimizer: &mut dyn flodl::nn::optim::Optimizer,
-        step: usize,
-        _data: Option<&RunData<'_>>,
-        fitness: &crate::engine::fitness::Fitness,
-        metrics: &[crate::engine::fitness::Metric],
-        env: StepEnv,
-        net_hash: &str,
-        net_seed: u64,
-    ) -> flodl::tensor::Result<StepReport> {
-        let ctx = RlContext {
-            fitness,
-            metrics,
-            env,
-            net_hash,
-            net_seed,
-        };
-        Ok(self.inner.train_step(net, optimizer, step, &ctx)?.into())
-    }
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
-        self.inner.holdout_score(net, game_i)
-    }
-    fn is_rl(&self) -> bool {
-        true
-    }
-    fn tabular_loss(&self) -> Option<super::LossFn<'_>> {
-        None
-    }
-}
-impl StepTrainer for Box<dyn StepTrainer> {
-    fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
-        self.as_ref().make_optimizer(net)
-    }
-    fn describe(&self) -> Option<serde_json::Value> {
-        self.as_ref().describe()
-    }
-    /// Guardrail: forward through the box. Omitting this is a silent trap —
-    /// `self.inner.holdout_score(..)` on a `Box<dyn _>` resolves to the BOX's
-    /// impl (found before the autoderef to `dyn _`), whose default is
-    /// `unimplemented!()`. Every boxed impl below must forward it.
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
-        self.as_mut().holdout_score(net, game_i)
-    }
-}
 
-// Boxed trait objects satisfy the mode traits too, so the default spec
-// generics (`Box<dyn TabularStep>` / `Box<dyn RlStep>`) resolve.
-impl TabularStep for Box<dyn TabularStep> {
-    fn loss(&self) -> crate::trainer::LossFn<'_> {
-        self.as_ref().loss()
+    /// The tabular loss, when this is a tabular trainer (checkpoint exam).
+    pub fn tabular_loss(&self) -> Option<super::LossFn<'_>> {
+        match self {
+            Self::Tabular(t) => Some(t.loss()),
+            Self::Rl(_) => None,
+        }
     }
-    fn scheduled_lr(&self, step: usize) -> Option<f64> {
-        self.as_ref().scheduled_lr(step)
-    }
-    fn stream_shape(&self) -> Option<StreamShape> {
-        self.as_ref().stream_shape()
-    }
-    fn train_step(
-        &mut self,
-        net: &mut Network,
-        optimizer: &mut dyn flodl::nn::optim::Optimizer,
-        step: usize,
-        ctx: &TabularContext<'_>,
-    ) -> flodl::tensor::Result<TabularStepReport> {
-        self.as_mut().train_step(net, optimizer, step, ctx)
-    }
-}
 
-impl RlStep for Box<dyn RlStep> {
-    fn train_step(
-        &mut self,
-        net: &mut Network,
-        optimizer: &mut dyn flodl::nn::optim::Optimizer,
-        step: usize,
-        ctx: &RlContext<'_>,
-    ) -> flodl::tensor::Result<RlStepReport> {
-        self.as_mut().train_step(net, optimizer, step, ctx)
-    }
-    fn pop_phase(&mut self, nets: &mut [(String, &mut Network)], step: usize) {
-        self.as_mut().pop_phase(nets, step)
-    }
-}
-
-impl StepTrainer for Box<dyn TabularStep> {
-    fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
-        self.as_ref().make_optimizer(net)
-    }
-    fn describe(&self) -> Option<serde_json::Value> {
-        self.as_ref().describe()
-    }
-    /// Guardrail forwarding — see the `Box<dyn StepTrainer>` impl above.
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
-        self.as_mut().holdout_score(net, game_i)
-    }
-}
-
-impl StepTrainer for Box<dyn RlStep> {
-    fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
-        self.as_ref().make_optimizer(net)
-    }
-    fn describe(&self) -> Option<serde_json::Value> {
-        self.as_ref().describe()
-    }
-    /// Guardrail forwarding — see the `Box<dyn StepTrainer>` impl above. This
-    /// was the hole that made `examples/cartpole` panic AFTER its run:
-    /// `ModeAdapter<Box<dyn RlStep>>::holdout_score` forwards to here, and an
-    /// absent override here means the trait default `unimplemented!()` runs.
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
-        self.as_mut().holdout_score(net, game_i)
-    }
-}
-
-/// Helper for trait object boxing.
-pub trait IntoBoxedTrainer {
-    fn into_boxed(self) -> Box<dyn StepTrainer>;
-}
-
-impl<T: StepTrainer + 'static> IntoBoxedTrainer for T {
-    fn into_boxed(self) -> Box<dyn StepTrainer> {
-        Box::new(self)
+    /// Requested batch geometry (tabular only; `None` for RL).
+    pub fn stream_shape(&self) -> Option<StreamShape> {
+        match self {
+            Self::Tabular(t) => t.stream_shape(),
+            Self::Rl(_) => None,
+        }
     }
 }
 
@@ -669,7 +541,7 @@ mod tests {
     /// "the override ran" from "the trait default panicked".
     struct SentinelRl;
 
-    impl StepTrainer for SentinelRl {
+    impl RlStep for SentinelRl {
         fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
             Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
         }
@@ -680,9 +552,6 @@ mod tests {
         ) -> flodl::tensor::Result<f32> {
             Ok(100.0 + game_i as f32)
         }
-    }
-
-    impl RlStep for SentinelRl {
         fn train_step(
             &mut self,
             _net: &mut Network,
@@ -697,7 +566,7 @@ mod tests {
     /// The ctx carries the run clock (`step` + `max_steps`), so a trainer can
     /// derive progress and anneal its own schedules without a private counter —
     /// and `None` means "unbounded: no schedule", the same convention the
-    /// engine's challenge decay uses.
+    /// trainer-side challenge decay ([`crate::trainer::challenge`]) uses.
     #[test]
     fn step_env_progress_reads_the_run_clock() {
         let env = StepEnv {
@@ -736,29 +605,28 @@ mod tests {
     }
 
     /// REGRESSION (cartpole's post-run abort): `engine.guardrail()` must reach
-    /// the trainer's OWN `holdout_score` through every box in the chain. It did
-    /// not — `Box<dyn RlStep>` resolves `holdout_score` to its own
-    /// `StepTrainer` impl (found before the autoderef to `dyn RlStep`), and that
-    /// impl forwarded only `make_optimizer`/`describe`, so the trait DEFAULT
-    /// ran and `unimplemented!()` killed a race that had already finished.
+    /// the trainer's OWN `holdout_score`. It once did not — a hand-written
+    /// `Box<dyn RlStep>` forwarding impl omitted the method, so the trait
+    /// DEFAULT ran and `unimplemented!()` killed a race that had already
+    /// finished. `AnyTrainer`'s exhaustive `match` makes that hole
+    /// unrepresentable; this test pins the dispatch anyway.
     #[test]
-    fn guardrail_forwarding_survives_boxing_rl() {
+    fn enum_dispatch_reaches_the_rl_override() {
         let mut net = tiny_net();
-        // ModeAdapter<Box<dyn RlStep>> -> Box<dyn RlStep> -> SentinelRl.
-        let mut adapter = ModeAdapter::rl(Box::new(SentinelRl));
+        // AnyTrainer::Rl -> Box<dyn RlStep> -> SentinelRl.
+        let mut trainer = AnyTrainer::rl(SentinelRl);
         assert_eq!(
-            EngineTrainer::holdout_score(&mut adapter, &mut net, 1).unwrap(),
+            trainer.holdout_score(&mut net, 1).unwrap(),
             101.0,
             "the boxed trainer's override must run, not the trait default"
         );
     }
 
-    /// The tabular half of the same bug: `ModeAdapter<Box<dyn TabularStep>>`
-    /// omitted the holdout forward entirely, so even a library trainer WITH a
-    /// scorer installed (`TabularTrainer::with_holdout_scorer` — the MNIST
-    /// path) hit the `EngineTrainer` default panic.
+    /// The tabular half of the same bug: a library trainer WITH a scorer
+    /// installed (`TabularTrainer::with_holdout_scorer` — the MNIST path) must
+    /// reach it through enum dispatch, not a default panic.
     #[test]
-    fn guardrail_forwarding_survives_boxing_tabular() {
+    fn enum_dispatch_reaches_the_tabular_scorer() {
         let trainer = crate::trainer::TabularTrainer::new(
             |_pred, _y| -> flodl::tensor::Result<flodl::Variable> {
                 unimplemented!("the guardrail dispatch test never trains")
@@ -767,12 +635,12 @@ mod tests {
         .with_holdout_scorer(|_net, game_i| -> flodl::tensor::Result<f32> {
             Ok(7.0 + game_i as f32)
         });
-        let mut adapter = ModeAdapter::tabular(Box::new(trainer));
+        let mut any = AnyTrainer::tabular(trainer);
         let mut net = tiny_net();
         assert_eq!(
-            EngineTrainer::holdout_score(&mut adapter, &mut net, 2).unwrap(),
+            any.holdout_score(&mut net, 2).unwrap(),
             9.0,
-            "the installed scorer must run through the tabular adapter"
+            "the installed scorer must run through enum dispatch"
         );
     }
 }

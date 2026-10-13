@@ -10,7 +10,7 @@
 //! [`RlStep`] implementation; kagiculture shows the bridge-flavored one).
 
 use crate::graph::network::Network;
-use crate::trainer::{StepTrainer, TabularContext, TabularStep};
+use crate::trainer::{TabularContext, TabularStep};
 use crate::utils::race_steps::{deterministic_train_step, eval_one_step};
 use flodl::nn::optim::Optimizer;
 use flodl::tensor::Result;
@@ -157,7 +157,7 @@ impl Default for TabularTrainer {
     }
 }
 
-impl StepTrainer for TabularTrainer {
+impl TabularStep for TabularTrainer {
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
         use flodl::nn::Module;
         Box::new(flodl::nn::Adam::new(
@@ -167,7 +167,7 @@ impl StepTrainer for TabularTrainer {
     }
 
     /// Record this scheme's training recipe in `engine.json` (see
-    /// [`StepTrainer::describe`]).
+    /// [`TabularStep::describe`]).
     fn describe(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({
             "trainer": "tabular",
@@ -183,16 +183,18 @@ impl StepTrainer for TabularTrainer {
 
     /// Guardrail measurement half: run the trainer's holdout scorer when one
     /// was installed via `with_holdout_scorer`; without one, fail with the
-    /// trait's contract panic.
+    /// contract panic (loud, not silent).
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> Result<f32> {
         match &self.holdout {
             Some(scorer) => scorer(net, game_i),
-            None => crate::trainer::StepTrainer::holdout_score(self, net, game_i),
+            None => unimplemented!(
+                "holdout_score is not implemented for this trainer — install a scorer via \
+                 with_holdout_scorer (one fresh game, same units as the reported fitness) to \
+                 use engine.guardrail()"
+            ),
         }
     }
-}
 
-impl TabularStep for TabularTrainer {
     fn loss(&self) -> crate::trainer::LossFn<'_> {
         &*self.loss_fn
     }

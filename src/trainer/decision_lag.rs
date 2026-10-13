@@ -43,7 +43,7 @@
 //! which is the only weights that ever decide or rank.
 
 use crate::graph::network::Network;
-use crate::trainer::core::{RlContext, RlStep, RlStepReport, StepEnv, StepTrainer};
+use crate::trainer::core::{RlContext, RlStep, RlStepReport, StepEnv};
 
 /// The decision-lag relay around any [`RlStep`] trainer. See the module docs.
 ///
@@ -153,7 +153,7 @@ impl<T: RlStep> DecisionLagTrainer<T> {
     }
 }
 
-impl<T: RlStep> StepTrainer for DecisionLagTrainer<T> {
+impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
         self.inner.make_optimizer(net)
     }
@@ -182,9 +182,13 @@ impl<T: RlStep> StepTrainer for DecisionLagTrainer<T> {
             }),
         })
     }
-}
 
-impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
+    /// Guardrail forwarding: the inner trainer owns the environment, so the
+    /// relay must not swallow the measurement half.
+    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
+        self.inner.holdout_score(net, game_i)
+    }
+
     fn train_step(
         &mut self,
         net: &mut Network,
@@ -383,14 +387,12 @@ mod tests {
         lr: f64,
     }
 
-    impl StepTrainer for ProbeTrainer {
+    impl RlStep for ProbeTrainer {
         fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
             use flodl::nn::Module;
             Box::new(flodl::nn::Adam::new(&net.parameters(), self.lr))
         }
-    }
 
-    impl RlStep for ProbeTrainer {
         fn train_step(
             &mut self,
             net: &mut Network,
