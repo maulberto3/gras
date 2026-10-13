@@ -163,4 +163,3 @@ pub fn cross_entropy_onehot_loss(pred: &Variable, y: &Variable) -> Result<Variab
     let n = flodl::Tensor::from_f32(&[y.data().shape()[0] as f32], &[1], y.data().device())?;
     Ok(Variable::new(masked.sum()?.mul(&neg)?.div(&n)?, false))
 }
-

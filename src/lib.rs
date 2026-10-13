@@ -56,8 +56,8 @@ pub use trainer::stream::{BatchStream, PoolSplit};
 // contract only. Bring your own (or copy the reference recipes under
 // `examples/`: `mnist.rs` hand-rolled, `ref_trainer/` shared).
 pub use trainer::{
-    IntoBoxedTrainer, LossFn, ModeAdapter, RlContext, RlStep, RlStepMeta, RunData, StepEnv,
-    StepReport, StepTrainer, StreamShape, TabularContext, TabularStep,
+    AnyTrainer, LossFn, RlContext, RlStep, RlStepMeta, RunData, StepEnv, StepReport, StreamShape,
+    TabularContext, TabularStep,
 };
 
 // ── data ─────────────────────────────────────────────────────────────
@@ -103,10 +103,9 @@ pub use flodl;
 pub mod prelude {
     // Engine config + entry points.
     pub use crate::engine::config::{
-        ChallengeDecay, CrossCullPolicy, CrossoverGate, LogLevel, MutationCullPolicy, PopPruner,
-        PopPrunerMethod, RaceConfig, RaceConfigBuilder, RaceSnapshot, RlConfig, RlRaceConfig,
-        RunMode, StopReason, TabularConfig, TabularRaceConfig, rl_race_config_builder,
-        tabular_race_config_builder,
+        CrossCullPolicy, CrossoverGate, LogLevel, MutationCullPolicy, PopPruner, PopPrunerMethod,
+        RaceConfig, RaceConfigBuilder, RaceSnapshot, RlConfig, RlRaceConfig, RunMode, StopReason,
+        TabularConfig, TabularRaceConfig, rl_race_config_builder, tabular_race_config_builder,
     };
     pub use crate::engine::fitness::Metric;
     pub use crate::engine::guardrail::{ChampionScorer, GuardrailVerdict, check_champion};
@@ -116,9 +115,9 @@ pub mod prelude {
 
     // Trainer contracts + report types.
     pub use crate::trainer::{
-        BoxedLossFn, EngineTrainer, IntoBoxedTrainer, LossFn, ModeAdapter, RlContext, RlStep,
-        RlStepMeta, RlStepReport, RunData, StepEnv, StepReport, StepTrainer, StreamShape,
-        TabularContext, TabularStep, TabularStepReport,
+        AnyTrainer, BoxedLossFn, ChallengeDecay, LossFn, RlContext, RlStep, RlStepMeta,
+        RlStepReport, RunData, StepEnv, StepReport, StreamShape, TabularContext, TabularStep,
+        TabularStepReport, challenge_fires, effective_challenge_prob,
     };
 
     // Shared deterministic batching.

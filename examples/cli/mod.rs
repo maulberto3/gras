@@ -156,8 +156,7 @@ pub struct EngineArgs {
 
     /// Who an admitted crossover child evicts: `worst` (default, merit-based)
     /// or `random` (keeps slots turning over). Mutation victims are always
-    /// fitness-inverse and ignore this. (Crossover gate semantics: §2 of
-    /// OPTIONS.md.)
+    /// fitness-inverse and ignore this.
     #[arg(long, value_name = "POLICY")]
     pub crossover_cull_policy: Option<String>,
 
@@ -170,7 +169,7 @@ pub struct EngineArgs {
 
     /// Warm-up before the decision-lag relay engages (RL only): for the
     /// first N engine steps every net just trains — no relay cycles. 0
-    /// (default) = relay from step 0. See OPTIONS.md §8 for the relay
+    /// (default) = relay from step 0. See `DecisionLagTrainer` for the relay
     /// itself, and how to run without it entirely.
     #[arg(long, value_name = "N")]
     pub grace_periods: Option<usize>,
