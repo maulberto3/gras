@@ -5,8 +5,8 @@
 //! - [`Spec`] — a plain, fully-serializable mirror of [`Topology`](crate::graph::topology::Topology)
 //! - [`NetworkFacts`] — materialized-network diagnostics ("nutrition label")
 
-mod network_facts;
 mod blueprint;
+mod network_facts;
 
-pub use network_facts::NetworkFacts;
 pub use blueprint::Spec;
+pub use network_facts::NetworkFacts;
