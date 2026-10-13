@@ -273,10 +273,7 @@ impl StandardizeOp {
                 let pad = (group - feats % group) % group;
                 let padded: flodl::Tensor = if pad > 0 {
                     // Zero-pad the feature axis so it divides evenly.
-                    let flat = x.data().reshape(&[
-                        -1i64,
-                        feats as i64,
-                    ])?; // [batch, feats]
+                    let flat = x.data().reshape(&[-1i64, feats as i64])?; // [batch, feats]
                     let rows = flat.shape()[0];
                     let zeros = flodl::Tensor::from_f32(
                         &vec![0.0_f32; (rows as usize) * pad],
@@ -288,8 +285,7 @@ impl StandardizeOp {
                     x.data().reshape(&[-1i64, feats as i64])?
                 };
                 let padded_feats = (feats + pad) as i64;
-                let g = padded
-                    .reshape(&[-1i64, group as i64, padded_feats / group as i64])?;
+                let g = padded.reshape(&[-1i64, group as i64, padded_feats / group as i64])?;
                 let mean = g.mean_dim(-1, true)?; // [batch, group, 1]
                 let centered = g.sub(&mean)?;
                 let var = centered.mul(&centered)?.mean_dim(-1, true)?;
@@ -603,8 +599,8 @@ mod tests {
         // z-score would be [-1.59, -1.31, …, 1.59], a ramp, not a sawtooth).
         let x12 = flodl::Tensor::from_f32(
             &[
-                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
-                -1.0, 0.0, 1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0,
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, -1.0, 0.0, 1.0,
+                -1.0, 0.0, 1.0, -1.0, 0.0, 1.0, -1.0, 0.0, 1.0,
             ],
             &[2, 12],
             flodl::Device::CPU,
@@ -622,10 +618,16 @@ mod tests {
                 "groupnorm row-0 group-{gi} mean ≈ 0 (got {mean})"
             );
             let var: f32 = chunk.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / 3.0;
-            assert!((var.sqrt() - 1.0).abs() < 1e-3, "groupnorm group-{gi} std ≈ 1");
+            assert!(
+                (var.sqrt() - 1.0).abs() < 1e-3,
+                "groupnorm group-{gi} std ≈ 1"
+            );
         }
         // Sawtooth, not ramp — group boundaries reset to ±√(3/2) ≈ ±1.2247:
-        assert!((r0[0] - r0[3]).abs() < 1e-4, "group 0 and 1 start identically");
+        assert!(
+            (r0[0] - r0[3]).abs() < 1e-4,
+            "group 0 and 1 start identically"
+        );
         assert!(
             (r0[2] - 1.2247).abs() < 1e-3,
             "3-element z-score ends at √(3/2) ≈ 1.2247"
@@ -642,15 +644,19 @@ mod tests {
         let gd4 = g4.data().to_f32_vec().unwrap();
         let i4 = StandardizeOp::InstanceNorm.apply(&x).unwrap();
         let id4 = i4.data().to_f32_vec().unwrap();
-        assert_eq!(gd4.to_vec(), id4.to_vec(), "feats=4 ⇒ InstanceNorm fallback");
+        assert_eq!(
+            gd4.to_vec(),
+            id4.to_vec(),
+            "feats=4 ⇒ InstanceNorm fallback"
+        );
 
         // NON-divisible feature count: 10 feats → groups {3,3,3,1+pad}; the
         // zero-pad lands only in the LAST group, so groups 0-2 stay exact
         // z-scores of their true members and the shape comes back unchanged.
         let x10 = flodl::Tensor::from_f32(
             &[
-                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
-                2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0,
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0,
+                14.0, 16.0, 18.0, 20.0,
             ],
             &[2, 10],
             flodl::Device::CPU,
@@ -658,7 +664,11 @@ mod tests {
         .unwrap();
         let x10 = flodl::Variable::new(x10, false);
         let g10 = StandardizeOp::GroupNorm.apply(&x10).unwrap();
-        assert_eq!(g10.data().shape(), x10.data().shape(), "uneven feature count");
+        assert_eq!(
+            g10.data().shape(),
+            x10.data().shape(),
+            "uneven feature count"
+        );
         let g10d = g10.data().to_f32_vec().unwrap();
         let r10 = &g10d[0..10]; // row 0: [1..=10]
         // Group 0 = {1, 2, 3} → z-score [-1.22, 0, 1.22].
@@ -681,40 +691,75 @@ mod tests {
         let x = flodl::Variable::new(x, false);
 
         // log1p: clamped domain, ln(1+x) for the safe parts.
-        let l = Transform::Log1p.apply(&x).unwrap().data().to_f32_vec().unwrap();
+        let l = Transform::Log1p
+            .apply(&x)
+            .unwrap()
+            .data()
+            .to_f32_vec()
+            .unwrap();
         assert!((l[0] - 0.0).abs() < 1e-6); // ln(1)
         assert!((l[1] - 2.0_f32.ln()).abs() < 1e-5); // ln(3)?? no — row flat
         assert!(!l.iter().any(|v| v.is_nan()), "log1p must never NaN");
 
         // Sign: exactly {-1, 0, 1}.
-        let s = Transform::Sign.apply(&x).unwrap().data().to_f32_vec().unwrap();
+        let s = Transform::Sign
+            .apply(&x)
+            .unwrap()
+            .data()
+            .to_f32_vec()
+            .unwrap();
         assert_eq!(s, vec![0.0, 1.0, -1.0, 1.0, -1.0, 1.0]);
 
         // Clamp: rails at ±1.
-        let c = Transform::Clamp.apply(&x).unwrap().data().to_f32_vec().unwrap();
+        let c = Transform::Clamp
+            .apply(&x)
+            .unwrap()
+            .data()
+            .to_f32_vec()
+            .unwrap();
         assert_eq!(c, vec![0.0, 1.0, -1.0, 1.0, -1.0, 1.0]);
 
         // Sqrt: signed root of |x|.
-        let sq = Transform::Sqrt.apply(&x).unwrap().data().to_f32_vec().unwrap();
+        let sq = Transform::Sqrt
+            .apply(&x)
+            .unwrap()
+            .data()
+            .to_f32_vec()
+            .unwrap();
         assert!((sq[0] - 0.0).abs() < 1e-6);
         assert!((sq[1] - 1.0).abs() < 1e-6);
         assert!((sq[2] + 2.0_f32.sqrt()).abs() < 1e-6);
         assert!((sq[3] - 10.0).abs() < 1e-5);
 
         // Reciprocal: never overflows even at x→0 (guard clamps |x| ≥ 1e-6).
-        let r = Transform::Reciprocal.apply(&x).unwrap().data().to_f32_vec().unwrap();
-        assert!(r[0].abs() <= 1e6 + 1.0, "guarded 1/0 must be finite (got {})", r[0]);
+        let r = Transform::Reciprocal
+            .apply(&x)
+            .unwrap()
+            .data()
+            .to_f32_vec()
+            .unwrap();
+        assert!(
+            r[0].abs() <= 1e6 + 1.0,
+            "guarded 1/0 must be finite (got {})",
+            r[0]
+        );
         assert!((r[1] - 1.0).abs() < 1e-5);
         assert!((r[2] + 0.5).abs() < 1e-6);
 
         // Exp: input railed at ±10, output always finite.
-        let e = Transform::Exp.apply(&x).unwrap().data().to_f32_vec().unwrap();
+        let e = Transform::Exp
+            .apply(&x)
+            .unwrap()
+            .data()
+            .to_f32_vec()
+            .unwrap();
         assert!(!e.iter().any(|v| v.is_infinite() || v.is_nan()));
         assert!((e[0] - 1.0).abs() < 1e-6); // e^0
         assert!((e[4] - (-100.0_f32).exp().min(10.0_f32.exp())).abs() < 1e-3);
 
         // Purity: applying twice gives identical values (replay contract).
-        let twice = Transform::Sign.apply(&Transform::Sign.apply(&x).unwrap())
+        let twice = Transform::Sign
+            .apply(&Transform::Sign.apply(&x).unwrap())
             .unwrap()
             .data()
             .to_f32_vec()

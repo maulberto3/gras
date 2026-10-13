@@ -171,10 +171,7 @@ impl Network {
     }
 
     /// Step 1: Seed RNG, compute wiring table + per-node dims.
-    fn prepare_build(
-        graph: &Topology,
-        opts: &NetworkOptions,
-    ) -> BuildPlan {
+    fn prepare_build(graph: &Topology, opts: &NetworkOptions) -> BuildPlan {
         let node_inputs: Vec<usize> = graph.nodes.iter().map(|n| n.num_inputs).collect();
         let node_sources = build_node_sources(&graph.connections, &node_inputs);
         let node_dims = graph.node_dims();
