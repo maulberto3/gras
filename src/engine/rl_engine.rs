@@ -7,7 +7,7 @@
 //! shared with the tabular engine.
 
 use super::config::RaceConfig;
-use super::core::{assert_trainer_blob_matches, CoreEngine, RlVolume, StepEvolve};
+use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
 use crate::engine::fitness::Fitness;
 use crate::state::{RaceState, RunHeader};
 use flodl::tensor::Result;
@@ -33,12 +33,7 @@ impl std::ops::DerefMut for RlEngine {
 impl RlEngine {
     /// Build an RL run from its spec (the `RunSpec::rl` variant IS the mode —
     /// no config declaration needed or possible).
-    pub fn from_spec(
-        spec: crate::engine::run_spec::RunSpec<
-            Box<dyn crate::trainer::TabularStep>,
-            Box<dyn crate::trainer::RlStep>,
-        >,
-    ) -> Result<Self> {
+    pub fn from_spec(spec: crate::engine::run_spec::RunSpec) -> Result<Self> {
         Ok(Self(CoreEngine::from_spec(spec)?))
     }
 
@@ -103,8 +98,7 @@ impl RlEngine {
             run_dir,
             config,
             fitness,
-            Box::new(crate::trainer::ModeAdapter::rl(Box::new(trainer)))
-                as Box<dyn crate::trainer::EngineTrainer>,
+            crate::trainer::AnyTrainer::rl(trainer),
         )
     }
 
@@ -112,7 +106,7 @@ impl RlEngine {
         run_dir: std::path::PathBuf,
         config: RaceConfig,
         fitness: Fitness,
-        trainer: Box<dyn crate::trainer::EngineTrainer>,
+        trainer: crate::trainer::AnyTrainer,
     ) -> Result<Self> {
         let header = crate::state::load_engine_json(&run_dir)?;
         // Counter snapshot before `header` moves (see the tabular flavor).
@@ -122,7 +116,7 @@ impl RlEngine {
             children_born_at_clock: header.children_born_at_clock.clone(),
             ..header.clone()
         };
-        assert_trainer_blob_matches(&header.trainer, trainer.as_ref(), "resume_rl")?;
+        assert_trainer_blob_matches(&header.trainer, &trainer, "resume_rl")?;
         // The persisted run must itself be RL: its frontier was trained with
         // no dataset, so replaying it as tabular (or vice versa) is a bug.
         // `engine_mode` is the root discriminator; legacy headers derive it
@@ -170,6 +164,8 @@ impl RlEngine {
             elapsed_base_secs: 0,
             step_started_at_wall: std::time::Instant::now(),
             culls: 0,
+            accounting: crate::state::RunAccounting::default(),
+            initial_population_counted: false,
             children_born_at_clock: HashMap::new(),
             step_evolve: StepEvolve::default(),
             step_rl: RlVolume::default(),

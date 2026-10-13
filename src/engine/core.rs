@@ -57,53 +57,19 @@
 use flodl::nn::Optimizer;
 use flodl::tensor::Result;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::engine::fitness::{Fitness, FitnessLabel, Metric};
 use crate::graph::network::Network;
 use crate::state::{
-    write_engine_json, write_net_state, ConfigSnapshot, NetState, RaceState, RunConfig, RunHeader,
+    ConfigSnapshot, NetState, RaceState, RunConfig, RunHeader, write_engine_json, write_net_state,
 };
+use crate::engine::evolve::RollKind;
 use crate::trainer::stream::{BatchStream, PoolSplit};
 
-/// Placeholder swapped into `self.trainer` for the duration of the pop-wide
-/// phase, so the real trainer can be taken out of `self` without aliasing
-/// the `&mut Network` borrows. Its `pop_phase` is the trait's no-op default
-/// and its other methods are never called (it lives inside `run` for a few
-/// lines only).
-struct NoopPopTrainer;
-impl crate::trainer::EngineTrainer for NoopPopTrainer {
-    fn make_optimizer(&self, _net: &Network) -> Box<dyn Optimizer> {
-        unreachable!("NoopPopTrainer never builds optimizers")
-    }
-    fn describe(&self) -> Option<serde_json::Value> {
-        None
-    }
-    fn pop_phase(&mut self, _nets: &mut [(String, &mut Network)], _step: usize) {}
-    fn train_step(
-        &mut self,
-        _net: &mut Network,
-        _optimizer: &mut dyn Optimizer,
-        _step: usize,
-        _data: Option<&crate::trainer::RunData<'_>>,
-        _fitness: &Fitness,
-        _metrics: &[Metric],
-        _env: crate::trainer::StepEnv,
-        _net_hash: &str,
-        _net_seed: u64,
-    ) -> flodl::tensor::Result<crate::trainer::StepReport> {
-        unreachable!("NoopPopTrainer is a placeholder only for the pop-wide phase")
-    }
-    fn is_rl(&self) -> bool {
-        true
-    }
-    fn tabular_loss(&self) -> Option<crate::trainer::LossFn<'_>> {
-        None
-    }
-}
 use super::config::{RaceConfig, StopReason};
 use super::format::{build_stamp, csv_field};
-use super::smoothing::{rolling_mean, RollingBuffer};
+use super::smoothing::{RollingBuffer, WindowStats, rolling_mean, rolling_stats};
 
 /// One entry in the checkpoint ledger: the population-mean smoothed fitness
 /// recorded at a checkpoint step. A crossover child must BEAT this value at
@@ -158,11 +124,9 @@ pub struct CoreEngine {
     /// RlStep}`). The mode arm decides which context (data or no data) the
     /// step receives.
     ///
-    /// Engine-split note (TODO.md step 5): `TabularEngine`/`RlEngine` wrap
-    /// this core and are the public types; this field stays the internal
-    /// dispatch enum until step 8/9 deletes it in favor of per-mode concrete
-    /// trainers.
-    pub(crate) trainer: Box<dyn crate::trainer::EngineTrainer>,
+    /// The mode tag lives in the enum arm, so the engine never needs a
+    /// separate `is_rl` field or adapter type.
+    pub(crate) trainer: crate::trainer::AnyTrainer,
     /// Per-step log verbosity for the engine.
     pub(crate) log_level: crate::engine::config::LogLevel,
     /// Graceful Ctrl+C flag (set by `run`'s signal handler, consumed by
@@ -219,6 +183,14 @@ pub struct CoreEngine {
     pub(crate) step_started_at_wall: std::time::Instant,
     /// Cumulative culls so far (for max_culls stop).
     pub(crate) culls: usize,
+    /// The run's tally of evolution events (see [`crate::state::RunAccounting`]):
+    /// printed as one block at stop and persisted under `accounting` in
+    /// `engine.json`, so "what actually happened under the hood" does not have
+    /// to be counted by hand from the log. Counters of THIS process.
+    pub(crate) accounting: crate::state::RunAccounting,
+    /// Set once, at the first evolve clock, when the initial population is
+    /// counted into `accounting` (see the evolve phase).
+    pub(crate) initial_population_counted: bool,
     /// Children born per step clock. Disambiguates same-clock siblings across
     /// all evolution rounds at one step (crossover rolls + immigrant rolls),
     /// so same-clock children derive distinct seeds.
@@ -229,12 +201,14 @@ pub struct CoreEngine {
     /// discarded. Persisted to `checkpoints.json` so resume reconstructs
     /// identical gates.
     pub(crate) checkpoints: Vec<Checkpoint>,
-    /// Anti-devolution A: the nets currently holding the freeze crown (the
-    /// top-`elite_count` when `freeze_elites` is on — named by the ★ badge on
-    /// the rollup line). Empty until the first frozen step. Tracked so the
-    /// "crowned / crown moved" lines fire on TRANSITIONS only, not every
-    /// step, and so the badge can name every champion (with `elite_count > 1`
-    /// there is more than one).
+    /// Anti-devolution A: the nets currently holding the freeze crown — the
+    /// seats actually dealt by the elite gate, which is a SUBSET of the
+    /// `elite_count` top-ranked nets (a seat goes only to a net that has
+    /// served the join window, and a seated net can sit outside the top-k).
+    /// Empty until the first frozen step. Tracked so the "crowned / crown
+    /// moved" lines fire on TRANSITIONS only, not every step. NOTE: the ★
+    /// badge on the rollup line names the elite RANKING (with each net's own
+    /// seat state), not this set — the two disagree on purpose.
     pub(crate) frozen_crown: std::collections::HashSet<String>,
     /// Set TRUE only inside the post-race pruner phase: the solo steps are
     /// the finishing workout, so elite freeze is BYPASSED — survivors train
@@ -396,19 +370,13 @@ impl CoreEngine {
     ///
     /// After construction, `engine.run_dir()` and `engine.run_seed()` expose
     /// what the engine chose.
-    pub fn from_spec(
-        spec: crate::engine::run_spec::RunSpec<
-            Box<dyn crate::trainer::TabularStep>,
-            Box<dyn crate::trainer::RlStep>,
-        >,
-    ) -> Result<Self> {
+    pub fn from_spec(spec: crate::engine::run_spec::RunSpec) -> Result<Self> {
         use crate::engine::run_spec::RunSpec as RS;
         let (config, fitness, trainer, seed, run_dir, tabular_data_dir) = match spec {
             RS::Tabular(s) => (
                 s.config,
                 s.fitness,
-                Box::new(crate::trainer::ModeAdapter::tabular(s.trainer))
-                    as Box<dyn crate::trainer::EngineTrainer>,
+                crate::trainer::AnyTrainer::Tabular(s.trainer),
                 s.seed,
                 s.run_dir,
                 Some(s.data_dir),
@@ -416,8 +384,7 @@ impl CoreEngine {
             RS::RL(s) => (
                 s.config,
                 s.fitness,
-                Box::new(crate::trainer::ModeAdapter::rl(s.trainer))
-                    as Box<dyn crate::trainer::EngineTrainer>,
+                crate::trainer::AnyTrainer::Rl(s.trainer),
                 s.seed,
                 s.run_dir,
                 None,
@@ -664,10 +631,15 @@ impl CoreEngine {
                         "seed_previous_run: ranks 1..{n} of run {} ({}{}) → founder slot(s) {}{}",
                         plan.source_run_id,
                         plan.source_dir.display(),
-                        champ.guardrail_mean
+                        champ
+                            .guardrail_mean
                             .map(|m| format!(", holdout {m:.4}"))
                             .unwrap_or_default(),
-                        if n == 1 { "0".to_string() } else { format!("0-{}", n - 1) },
+                        if n == 1 {
+                            "0".to_string()
+                        } else {
+                            format!("0-{}", n - 1)
+                        },
                         if n == 1 {
                             format!(", champion {short} certified by the guardrail")
                         } else {
@@ -713,11 +685,7 @@ impl CoreEngine {
                 .map(|(ordinal, topo)| {
                     let label = seed_source.as_ref().and_then(|rec| {
                         rec.elite_hashes.get(ordinal).map(|hash| {
-                            format!(
-                                "seed:{}:{}",
-                                rec.source_run_id,
-                                &hash[..8.min(hash.len())]
-                            )
+                            format!("seed:{}:{}", rec.source_run_id, &hash[..8.min(hash.len())])
                         })
                     });
                     (topo, label)
@@ -793,6 +761,8 @@ impl CoreEngine {
             elapsed_base_secs: 0,
             step_started_at_wall: std::time::Instant::now(),
             culls: 0,
+            accounting: crate::state::RunAccounting::default(),
+            initial_population_counted: false,
             children_born_at_clock: HashMap::new(),
             step_evolve: StepEvolve::default(),
             step_rl: RlVolume::default(),
@@ -1213,6 +1183,26 @@ impl CoreEngine {
                 self.config.elite_join_probation_steps,
                 self.config.elite_crown_lifetime_steps,
             );
+            // What the numbers above/below MEAN, stated once. Without it a
+            // reader cannot tell a 4-match fitness sample from a 200-match one,
+            // nor what `smt`/`★` refer to — the log was self-describing per
+            // line but never as a whole.
+            info!(
+                "  log legend: smt = rolling mean of the last K={} clocks │ fitness per clock = mean over the `matches` played that clock │ ★ = elite rank (each with its seat tenure) │ trained n/m = optimizer updates over clocks lived",
+                self.config.smoothing_window,
+            );
+            // The trainer's own self-description, when it declares one. The
+            // engine never interprets it — but it is the ONLY visible record of
+            // trainer-side knobs (anti-plateau challenge trigger, schedules,
+            // clipping), because those left the engine with the trainer-side
+            // move. `engine.json` records it too; printing it keeps a pasted
+            // log self-contained.
+            if let Some(trainer) = self.header.trainer.as_ref() {
+                let flat = crate::engine::reporting::summarize_json(trainer);
+                if !flat.is_empty() {
+                    info!("  trainer: {flat}");
+                }
+            }
             info!("  {}", build_stamp());
         }
 
@@ -1268,12 +1258,58 @@ impl CoreEngine {
                 let mut cross_fired = 0usize;
                 let mut cross_survived = 0usize;
                 let mut cross_discarded = 0usize;
+                let mut cross_attempts = 0usize;
                 let mut mutate_fired = 0usize;
                 let culls_before = self.culls;
                 let cross_total = self.config.crossover_rolls;
                 let mutate_total = self.config.mutate_rolls;
+                // The cull shield is a POPULATION-level fact, not a per-roll
+                // one: when no live net is cull-eligible, EVERY roll this clock
+                // would be spent with nothing culled and nothing inserted (and
+                // each one re-derived the same ranking + printed the same
+                // line). Check it once, say it once, skip the batch — the
+                // draws are derived per (clock, roll), so skipping shifts no
+                // later roll's number.
+                let evolve_allowed = self.has_cull_eligible();
+                if !evolve_allowed {
+                    self.accounting.deferred_clocks += 1;
+                    info!(
+                        "step {} │ evolution deferred: no cull-eligible net — every non-elite net is inside its probation window or elite ({} crossover + {} mutation roll(s) forgone; nothing culled/inserted)",
+                        clock,
+                        cross_total,
+                        mutate_total,
+                    );
+                }
+                // The initial batch is whatever is alive at the FIRST evolve
+                // clock: nothing has been inserted yet (clock 0 never evolves)
+                // and the culls of this clock happen below, so this is exactly
+                // the founder batch the run started from. Splitting it by
+                // lineage is what tells a reader how much of the run's start
+                // came from a previous experiment's `elites.json` vs fresh
+                // random draws.
+                if !self.initial_population_counted {
+                    self.initial_population_counted = true;
+                    let initial: Vec<String> = self.state.live_hashes();
+                    let inherited = initial
+                        .iter()
+                        .filter(|h| {
+                            self.state
+                                .net(h)
+                                .and_then(|s| s.created_from.as_deref())
+                                .is_some_and(|c| c.starts_with("seed:"))
+                        })
+                        .count();
+                    self.accounting.founders = initial.len() - inherited;
+                    self.accounting.inherited_founders = inherited;
+                    self.accounting.born = initial.len();
+                }
+                self.accounting.crossover_rolls += cross_total;
+                self.accounting.mutation_rolls += mutate_total;
                 // 3a. crossover rolls: checkpoint-gated children.
                 for roll in 0..cross_total {
+                    if !evolve_allowed {
+                        break; // nobody to cull: the whole batch is forgone
+                    }
                     if self.state.live_count() < 2 {
                         info!(
                             "step {} │ crossover {}/{} skipped (pop < 2)",
@@ -1283,8 +1319,14 @@ impl CoreEngine {
                         );
                         break; // not enough population to evolve
                     }
-                    if fastrand::f32() >= self.config.crossover_prob {
-                        info!(
+                    if self.roll_fires(RollKind::Crossover, clock, roll) {
+                        // roll fired — fall through to the attempt loop
+                    } else {
+                        // debug: a roll that did not fire is the NORMAL case
+                        // (p < 1), so it is per-roll detail, not a per-clock
+                        // event. The clock's counts are summarized at info by
+                        // the rollup line; `--log-level debug` shows them all.
+                        debug!(
                             "step {} │ crossover {}/{} did not fire (p={:.2})",
                             clock,
                             roll + 1,
@@ -1321,17 +1363,37 @@ impl CoreEngine {
                         // retry — the prior attempt's detail is superseded
                         let _ = &out;
                     };
-                    info!(
-                        "step {} │ crossover {}/{} ({} attempt(s)): {}",
-                        clock,
-                        roll + 1,
-                        cross_total,
-                        attempt,
-                        outcome.detail,
-                    );
+                    // Attempts are the roll cost, so they count whichever way
+                    // the roll ended (a spent roll paid for its tries too).
+                    cross_attempts += attempt;
+                    // A roll that BUILD a child is a real event (info); a roll
+                    // that paid its attempts and produced nothing is per-roll
+                    // detail — and its detail already carries the pairing /
+                    // attempt counts, so the header stays `{group} n/N`.
+                    if outcome.survived {
+                        info!(
+                            "step {} │ crossover {}/{} ({} attempt(s)): {}",
+                            clock,
+                            roll + 1,
+                            cross_total,
+                            attempt,
+                            outcome.detail,
+                        );
+                    } else {
+                        debug!(
+                            "step {} │ crossover {}/{}: {}",
+                            clock,
+                            roll + 1,
+                            cross_total,
+                            outcome.detail,
+                        );
+                    }
                 }
                 // 3b. mutation rolls: random immigrants (no gate).
                 for roll in 0..mutate_total {
+                    if !evolve_allowed {
+                        break; // nobody to cull: the whole batch is forgone
+                    }
                     if self.state.live_count() == 0 {
                         info!(
                             "step {} │ mutation {}/{} skipped (pop empty)",
@@ -1341,8 +1403,9 @@ impl CoreEngine {
                         );
                         break;
                     }
-                    if fastrand::f32() >= self.config.mutate_prob {
-                        info!(
+                    if !self.roll_fires(RollKind::Mutation, clock, roll) {
+                        // Same as the crossover no-fire line: per-roll detail.
+                        debug!(
                             "step {} │ mutation {}/{} did not fire (p={:.2})",
                             clock,
                             roll + 1,
@@ -1364,15 +1427,32 @@ impl CoreEngine {
                         }
                         // Hard shield: the roll is spent with nothing culled and no
                         // immigrant built — a fresh net is never evicted for a slot.
-                        None => info!(
-                            "step {} │ mutation {}/{} skipped: {}",
-                            clock,
-                            roll + 1,
-                            mutate_total,
-                            self.no_cull_slot_detail("mutation"),
-                        ),
+                        // Per-roll detail (the clock-level verdict is the rollup
+                        // line's job): a shield that blocks every roll is one fact,
+                        // not one fact per roll.
+                        None => {
+                            self.accounting.mutation_blocked += 1;
+                            // Same shape as the crossover shield's line — one
+                            // fact, one spelling (`{group} n/N: detail`).
+                            debug!(
+                                "step {} │ mutation {}/{}: {}",
+                                clock,
+                                roll + 1,
+                                mutate_total,
+                                self.no_cull_slot_detail("mutation"),
+                            )
+                        }
                     }
                 }
+                // The run's accounting rides the same counters the step
+                // summary uses — one place to update, no second bookkeeping.
+                self.accounting.crossover_fired += cross_fired;
+                self.accounting.crossover_attempts += cross_attempts;
+                self.accounting.crossover_discarded += cross_discarded;
+                self.accounting.crossover_children += cross_survived;
+                self.accounting.mutation_fired += mutate_fired;
+                self.accounting.immigrants += mutate_fired;
+                self.accounting.born += cross_survived + mutate_fired;
                 // Evolve-phase summary for the `Minimal` table (rendered as part
                 // of the NEXT step's frame, so the reader sees "what happened last
                 // step" in the same table that shows the new stats). Reuses the
@@ -1423,10 +1503,10 @@ impl CoreEngine {
             // schemes (pop-mean action anchors, distillation) build their
             // shared state here; the default is a no-op. Tabular never calls
             // it — its group sharing is the batch stream itself.
-            if self.trainer.is_rl() {
-                // Take the trainer OUT of self so the &mut Network borrows
-                // (self.networks) and the &mut trainer call don't alias.
-                let mut trainer = std::mem::replace(&mut self.trainer, Box::new(NoopPopTrainer));
+            // The `if let` IS the mode check — no placeholder trainer is
+            // needed because it borrows only `self.trainer`, leaving
+            // `self.networks` free for the `&mut Network` pass below.
+            if let crate::trainer::AnyTrainer::Rl(trainer) = &mut self.trainer {
                 // One pass over the map — multiple get_mut borrows stored at
                 // once don't compile (NLL), but iter_mut does.
                 let live: std::collections::HashSet<&String> = hashes.iter().collect();
@@ -1437,7 +1517,6 @@ impl CoreEngine {
                     .map(|(h, net)| (h.clone(), net))
                     .collect();
                 trainer.pop_phase(&mut nets, clock);
-                self.trainer = trainer;
             }
             for hash in &hashes {
                 // Mid-step Ctrl+C: abandon the step immediately (user choice:
@@ -1709,6 +1788,13 @@ impl CoreEngine {
         header.culls = self.culls;
         header.run_elapsed_secs = self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs();
         header.children_born_at_clock = self.children_born_at_clock.clone();
+        // The run's tally of evolution events: part of "what happened", like
+        // the guardrail verdict, and not re-derivable from the launch config.
+        // Stamped HERE because this is the last write of the run — the
+        // in-memory `self.header` never carried it, so an earlier writer
+        // would only be overwritten at the next stop. It is the
+        // run-accounting record, not run state: resume ignores it.
+        header.accounting = Some(self.accounting.clone());
         if let Err(e) = crate::state::write_engine_json(&self.run_dir, &header) {
             tracing::warn!("engine.json counter persistence failed: {e}");
         }
@@ -1749,6 +1835,21 @@ impl CoreEngine {
         self.rolling_fitness.get(hash).map(rolling_mean)
     }
 
+    /// The net's RACE READING with its own error bar: the smoothed mean plus how
+    /// many step readings are behind it and how far apart they were
+    /// ([`WindowStats`]).
+    ///
+    /// This is what makes the guardrail verdict honest. The race reading is a
+    /// mean over `smoothing_window` step readings, each of which is itself a mean
+    /// over the trainer's eval batch (the cartpole reference trainer evaluates 2
+    /// games per step — 10 games behind a 5-step window), while the champion is
+    /// the ARGMAX of that noisy statistic over the whole population. Quoting its
+    /// spread is the difference between "the run collapsed" and "a 10-game
+    /// mean cannot resolve better than ±40".
+    pub(crate) fn race_reading_of(&self, hash: &str) -> Option<WindowStats> {
+        self.rolling_fitness.get(hash).and_then(rolling_stats)
+    }
+
     /// The post-race holdout guardrail: score the champion on fresh unseen
     /// games through the run's OWN trainer (`holdout_score` — one game per
     /// call, same units as the reported fitness). No scorer object to wire: the
@@ -1778,8 +1879,13 @@ impl CoreEngine {
         }
         let champion = self.champion_for_guardrail()?;
         let matches = self.config.guardrail_matches;
+        // The race reading AND its error bar, read from the LIVE rolling buffer
+        // before scoring: the spread of the champion's own window is what
+        // separates "the run collapsed" from "a short, noisy mean cannot resolve
+        // better than this".
+        let race = self.race_reading_of(&champion);
         let race_smoothed = self.smoothed_fitness_of(&champion);
-        let verdict = match self.networks.get_mut(&champion) {
+        let mut verdict = match self.networks.get_mut(&champion) {
             Some(net) => {
                 // `eval()` first: the resting state a fresh disk rebuild gets
                 // for free, and the state the holdout MUST be measured in —
@@ -1792,9 +1898,7 @@ impl CoreEngine {
                     race_smoothed,
                     matches,
                     &mut self.trainer,
-                    |t, net, game_i| {
-                        crate::trainer::EngineTrainer::holdout_score(&mut **t, net, game_i)
-                    },
+                    |t, net, game_i| t.holdout_score(net, game_i),
                 )
             }
             None => crate::engine::guardrail::score_with(
@@ -1804,11 +1908,55 @@ impl CoreEngine {
                 matches,
                 device,
                 &mut self.trainer,
-                |t, net, game_i| {
-                    crate::trainer::EngineTrainer::holdout_score(&mut **t, net, game_i)
-                },
+                |t, net, game_i| t.holdout_score(net, game_i),
             ),
         }?;
+        // Carry the race side's noise onto the verdict, so the example's print
+        // and this module's own line quote the same error bar.
+        verdict.race_se = race.and_then(|r| r.se());
+        verdict.race_samples = race.map(|r| r.n).unwrap_or(0);
+        verdict.race_latest = race.map(|r| r.latest);
+        // ELI5, line 1: WHAT was compared (both readings, both error bars).
+        // The window's min/max matter as much as its mean: a champion reading
+        // 191.7 out of a window of [41.5 .. 500.0] is a fluke-of-one-solve, not
+        // a policy that averages 191.7 turns.
+        let exam_se = verdict
+            .se()
+            .map(|se| format!(" (SE {se:.1})"))
+            .unwrap_or_default();
+        let race_note = match race {
+            Some(r) => format!(
+                "race reading {:.1} over {} step reading(s) (SE {:.1}, window min {:.1} / max {:.1}, latest {:.1})",
+                r.mean,
+                r.n,
+                r.se().unwrap_or(0.0),
+                r.min,
+                r.max,
+                r.latest
+            ),
+            None => "race reading unavailable (no rolling window recorded)".to_string(),
+        };
+        tracing::info!(
+            "guardrail: champion {} — {race_note}, the best of {} live net(s) on that reading │ exam {:.1} over {} unseen game(s){exam_se}",
+            &verdict.hash[..8.min(verdict.hash.len())],
+            self.state.live_count(),
+            verdict.mean().unwrap_or(0.0),
+            verdict.scores.len(),
+        );
+        let verdict_line = crate::engine::guardrail::agreement_verdict_noisy(
+            verdict.race_smoothed,
+            verdict.race_se,
+            Some(verdict.race_samples).filter(|n| *n > 0),
+            verdict.race_latest,
+            verdict.mean(),
+            verdict.se(),
+            verdict.scores.len(),
+            self.fitness.direction(),
+        );
+        // ELI5, line 2: WHAT IT MEANS — the verdict sentence carries the
+        // mechanism (short window mean + best-of-population selection) whenever
+        // the error bars allow that statement to be made.
+        tracing::info!("guardrail: {verdict_line}");
         // Record it: the guardrail is a run OUTPUT (the only reading taken on
         // games no net trained on), so it lives in engine.json — and the next
         // experiment's `seed_previous_run` reads exactly this block to inherit
@@ -1818,14 +1966,13 @@ impl CoreEngine {
             champion_hash: verdict.hash.clone(),
             champion_params: self.net_params(&verdict.hash),
             race_smoothed: verdict.race_smoothed,
+            race_se: verdict.race_se,
+            race_samples: verdict.race_samples,
+            race_latest: verdict.race_latest,
             holdout_mean: verdict.mean(),
             holdout_std: verdict.std(),
             matches_scored: verdict.scores.len(),
-            verdict: crate::engine::guardrail::agreement_verdict(
-                verdict.race_smoothed,
-                verdict.mean(),
-                self.fitness.direction(),
-            ),
+            verdict: verdict_line,
         };
         self.header.set_guardrail(Some(record.clone()));
         if let Err(e) = crate::state::write_guardrail_record(&self.run_dir, &record) {
@@ -1991,10 +2138,29 @@ impl CoreEngine {
                 .cmp(&self.rank_position(b).unwrap_or(usize::MAX))
         });
         leaving.sort();
-        // 3. Seat exits: ANY exit restarts probation (age-out AND rank
-        //    dethrone) — the ex-elite goes back to probation 0 and must train
-        //    k clocks before it can sit again. The seat age dies with the
-        //    seat.
+        // 3. Seat exits: record WHY each net left, then restart its probation
+        //    (ANY exit does — age-out and rank dethrone alike; the seat age
+        //    dies with the seat). The reason must be captured BEFORE the reset
+        //    below, because that reset is what erases the evidence: the exit
+        //    line used to infer the cause from the CURRENT rank and printed
+        //    the self-contradictory "fell out of top-5 (now rank 1)" for a net
+        //    that was aged out at peak while still ranked #1.
+        let lifetime = self.config.elite_crown_lifetime_steps;
+        let mut exit_reason: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for h in &leaving {
+            if let Some(s) = self.state.net(h) {
+                let reason = if lifetime > 0 && s.elite_seat_age >= lifetime {
+                    format!(
+                        "seat lifetime reached at peak ({}/{})",
+                        s.elite_seat_age, lifetime
+                    )
+                } else {
+                    "outranked among the eligible nets".to_string()
+                };
+                exit_reason.insert(h.clone(), reason);
+            }
+        }
         for h in &leaving {
             if let Some(s) = self.state.net_mut(h) {
                 s.elite_probation_age = 0;
@@ -2041,40 +2207,41 @@ impl CoreEngine {
                 .get(idx)
                 .and_then(|d| {
                     self.smoothed_fitness_of(d).map(|f| {
+                        // WHY the displaced net lost the seat travels with it:
+                        // `displaced e0e08870 smt500 — outranked` used to read
+                        // as a broken ranking (a smt132 taker beating smt500),
+                        // when the truth is that the stronger net was barred
+                        // this clock (see `exit_reason`).
+                        let why = exit_reason
+                            .get(d)
+                            .map(|r| format!(" — {r}"))
+                            .unwrap_or_default();
                         format!(
-                            ", displaced {} {}",
+                            ", displaced {} {}{why}",
                             &d[..8.min(d.len())],
                             crate::engine::format::fmt2_smt(f)
                         )
                     })
                 })
                 .unwrap_or_default();
-            let last_update = self
-                .state
-                .net(h)
-                .map(|s| s.last_update_step)
-                .unwrap_or(0);
-            let trained_here = clock.saturating_sub(last_update);
-            // The gate in numbers: probation served / k (elite join window),
-            // and the seat age the net starts its tenure from / j (crown
-            // lifetime, 0 = no lifetime). Enter = `seat_age 0/<j>` and it
-            // ticks up one each kept clock, so `seat 0/5 → 1/5 → … → 5/5`
-            // is the countdown to the age-out at peak.
+            // Trainings vs clocks LIVED, and the gate in words. The old pair
+            // (`clock − last_update_step` / clock, printed `{}/{}t`) looked
+            // like a training count but was the age of the WEIGHTS — and
+            // crossover children inherit the parent's `last_update_step`.
+            let trainings = self.state.net(h).map(|s| s.step).unwrap_or(0);
+            let age_now = age.unwrap_or(0);
             let gate = match self.state.net(h) {
-                Some(s) => format!(
-                    ", probation {}/{}, seat {}/{}",
+                Some(s) => crate::engine::reporting::elite_gate_note(
                     s.elite_probation_age,
-                    self.config.elite_join_probation_steps,
                     s.elite_seat_age,
+                    self.config.elite_join_probation_steps,
                     self.config.elite_crown_lifetime_steps,
                 ),
                 None => String::new(),
             };
             let extras = format!(
-                "age {}, {}/{}t, {}p{}{}",
-                age.map(|a| a.to_string()).unwrap_or_else(|| "—".into()),
-                trained_here,
-                clock,
+                "age {age_now}, {}, {} params{}{}",
+                crate::engine::reporting::trained_note(trainings, age_now),
                 params.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
                 gate,
                 displaced,
@@ -2137,38 +2304,85 @@ impl CoreEngine {
                     )
                 }
             } else {
-                // The net's CURRENT rank (it already fell) — the honest
-                // "now" side of the exit; its previous rank was ≤ seat.
-                let rank = self
-                    .rank_position(h)
-                    .map(|r| format!(" (now rank {r})"))
-                    .unwrap_or_default();
-                format!(" — fell out of top-{seat}{rank}")
+                // Multi-seat crowns add nothing here: the REASON (see
+                // `exit_reason`) and the net's own current rank are printed by
+                // the caller, and guessing a cause here is what produced lines
+                // that contradicted themselves.
+                String::new()
             };
-            let net_state = self.state.net(h);
-            let (trained_here, total_here) = match net_state {
-                Some(s) => {
-                    let clock_now = self.step_clock();
-                    let trained_here = clock_now.saturating_sub(s.last_update_step);
-                    let total_here = clock_now; // clocks lived so far (approx — clock-based)
-                    (trained_here, total_here)
-                }
+            // Trainings vs clocks LIVED for this net — the same pairing the
+            // seat line prints (see `trained_note`). The old pair here was
+            // `clock − last_update_step` over the absolute clock, labelled
+            // "trained X of Y clocks": it was the weights' staleness, not a
+            // training count.
+            let (trainings, age) = match self.state.net(h) {
+                Some(s) => (s.step, clock.saturating_sub(s.entered_at_step)),
                 None => (0, 0),
+            };
+            let reason = exit_reason
+                .get(h)
+                .cloned()
+                .unwrap_or_else(|| "seat not re-dealt".to_string());
+            // Where the net stands as it leaves. This is the number that
+            // resolves the old contradiction: a net aged out at peak can still
+            // rank #1 overall, so its rank was never the reason it lost the
+            // seat.
+            let rank_note = match self.rank_position(h) {
+                Some(r) => format!(" (still rank {r} of {} overall)", self.state.live_count()),
+                None => String::new(),
             };
             // The ex-elite was just re-probated: it trains like any
             // non-elite until it has re-served the k-clock window.
             info!(
-                "step {} │ freeze │ {} dethroned{} — resumes w updates, opt-state intact (no catch-up needed) [trained {}/{} clocks, probation reset 0/{} → trains, crown {}/{}]",
+                "step {} │ freeze │ {} dethroned: {}{}{} — resumes with updates (optimizer state intact) [{}; probation restarts at 0, serves {} to sit again; crown {}/{}]",
                 clock,
                 &h[..8.min(h.len())],
+                reason,
+                rank_note,
                 detail,
-                trained_here,
-                total_here,
+                crate::engine::reporting::trained_note(trainings, age),
                 self.config.elite_join_probation_steps,
                 self.frozen_crown.len(),
                 capacity,
             );
         }
+        // 5b. Why the elite RANKING and the crown disagree, said where it
+        //     matters: on the clocks that changed the deal. A ranked top net
+        //     can hold no seat (the gate barred it) and a seated net can sit
+        //     outside the top-k — the ★ badge shows the STATE, this line shows
+        //     the REASON, which is otherwise left to the reader to infer from
+        //     counters (and was, in practice, read as a broken ranking).
+        if enabled && !(entering.is_empty() && leaving.is_empty()) {
+            let crown = &self.frozen_crown;
+            let ranked = self.ranked_live();
+            let unseated_total = ranked.iter().filter(|(h, _)| !crown.contains(h)).count();
+            let shown: Vec<String> = ranked
+                .iter()
+                .filter(|(h, _)| !crown.contains(h))
+                .take(3)
+                .map(|(h, _)| {
+                    format!(
+                        "{} ({})",
+                        &h[..8.min(h.len())],
+                        self.unseated_reason(h, clock)
+                    )
+                })
+                .collect();
+            if !shown.is_empty() {
+                let more = unseated_total.saturating_sub(shown.len());
+                let tail = if more > 0 {
+                    format!(" … +{more} more")
+                } else {
+                    String::new()
+                };
+                info!(
+                    "step {} │ freeze │ ranked without a seat: {}{tail}",
+                    clock,
+                    shown.join(" │ ")
+                );
+            }
+        }
+
         // 6. TICK both counters for the clock that is about to run: probation
         //    ages every live net; the seat age only whoever holds a seat (a
         //    net that just took one starts at 0 and gets its first tick here).
@@ -2178,6 +2392,32 @@ impl CoreEngine {
             if crown.contains(h) {
                 s.elite_seat_age += 1;
             }
+        }
+    }
+
+    /// Why `hash` — a net in the elite RANKING — holds no seat right now.
+    ///
+    /// The gate has exactly two bars before a seat is dealt, and they are
+    /// different windows, which is why this says which one bit:
+    ///
+    /// - `join window a/k` — the elite-join probation (`elite_probation_age`),
+    ///   restarted by ANY seat exit. A fresh net sits here until it has trained
+    ///   `k` clocks.
+    /// - `cull shield` — the channel probation (`mutation`/`crossover` window)
+    ///   that `on_probation` measures from `entered_at_step`; a net inside it
+    ///   is not cull-ELIGIBLE, and the elite set is drawn from the nets that
+    ///   are.
+    /// - `outranked` — eligible and served, just below the seat cut. Nothing
+    ///   barred it; the seats simply ran out.
+    fn unseated_reason(&self, hash: &str, clock: usize) -> String {
+        let k = self.config.elite_join_probation_steps;
+        match self.state.net(hash) {
+            Some(s) if s.elite_probation_age < k => {
+                format!("join window {}/{k}", s.elite_probation_age)
+            }
+            Some(_) if self.on_probation(hash, clock) => "cull shield".to_string(),
+            Some(_) => "outranked".to_string(),
+            None => "no state".to_string(),
         }
     }
 
@@ -2203,7 +2443,9 @@ impl CoreEngine {
         let j = self.config.elite_crown_lifetime_steps;
         let (mut eligible, mut probation, mut age_blocked) = (0, 0, 0);
         for h in self.state.live_hashes() {
-            let Some(s) = self.state.net(&h) else { continue };
+            let Some(s) = self.state.net(&h) else {
+                continue;
+            };
             if self.on_probation(&h, clock) || s.elite_probation_age < k {
                 probation += 1;
             } else if j > 0 && s.elite_seat_age >= j {
@@ -2519,7 +2761,11 @@ fn step_rollup_line(
         ));
     }
     if !sat_out.is_empty() {
-        parts.push(format!("{} sat out: {}", frozen + newborn, sat_out.join(" + ")));
+        parts.push(format!(
+            "{} sat out: {}",
+            frozen + newborn,
+            sat_out.join(" + ")
+        ));
     }
     parts.push(format!(
         "crown {seats_held}/{seats_capacity} seats — {eligible} eligible, {probation} on probation (k={join_k}), {age_blocked} age-blocked (j={lifetime_j})"
@@ -2550,7 +2796,7 @@ fn step_rollup_line(
 /// *declared* drift early. The parity assert remains the hard gate.
 pub(crate) fn assert_trainer_blob_matches(
     recorded: &Option<serde_json::Value>,
-    incoming_trainer: &dyn crate::trainer::EngineTrainer,
+    incoming_trainer: &crate::trainer::AnyTrainer,
     caller: &str,
 ) -> Result<()> {
     let Some(recorded) = recorded else {
@@ -2932,7 +3178,7 @@ mod tests {
         }
         // Mutation roulette also skips the elite: worst-net weight is largest,
         // elite is excluded entirely.
-        if let Some(victim) = engine.select_inverse_proportional().unwrap() {
+        if let Some(victim) = engine.select_inverse_proportional_at(0, 0).unwrap() {
             assert_ne!(victim, elite[0], "elite must never be a mutation victim");
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -2976,8 +3222,11 @@ mod tests {
         }
         let mut worst_picks = 0usize;
         let mut best_picks = 0usize;
-        for _ in 0..200 {
-            if let Some(v) = engine.select_inverse_proportional().unwrap() {
+        // 200 distinct `(clock, roll)` coordinates: the roulette draw is DERIVED
+        // from them (was the process-global stream), so this distribution is
+        // now reproducible rather than depending on an entropy-seeded generator.
+        for i in 0..200usize {
+            if let Some(v) = engine.select_inverse_proportional_at(i / 8, i % 8).unwrap() {
                 if v == worst {
                     worst_picks += 1;
                 }
@@ -3049,87 +3298,95 @@ mod tests {
 
     // ── Anti-devolution guards ──────────────────────────────────────────────
 
-#[test]
-fn freeze_elite_act_and_measure_no_weight_update() {
-    // A (act-and-measure freeze): the frozen elite plays its normal step
-    // against the current clock — the trainer RUNS (fresh fitness is
-    // recorded into state + buffers, so its standing stays honest) — but
-    // through a no-op optimizer, so its weights never change. The
-    // observable contract: metrics advance with a FRESH fitness (not the
-    // carried one), the rolling buffer grows by one, and the net's step
-    // COUNT is unchanged (act-and-measure is not a training step).
-    let dir = std::env::temp_dir().join("gras_freeze_elite_test");
-    let _ = std::fs::remove_dir_all(&dir);
-    let mut eng = engine(&dir, 11).unwrap();
-    // Lower the join window to 0 so net B can be crowned on arrival for
-    // this test: the thing under test is the frozen-branch contract, not
-    // the probation window. The default of 5 is the real "no freeze on
-    // arrival" setting (see TODO.md + elite_join_probation_crown_lifetime).
-    open_crown(&mut eng);
-    eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-        .unwrap();
-    let hs = eng.state.live_hashes();
-    // Fixture is Minimize: lower smoothed = better (see worst-culls test).
-    // Mirror the END-OF-GROUP-STEP model directly (skip the shared-batch
-    // plumbing): a group step does, per net, (1) run_trainer_step,
-    // (2) record_step (snapshots last_metrics AND advances the net's clock
-    // + last_update_step), then (3) pushes the fresh fitness into the
-    // rolling buffer. So at the moment refresh_crown runs, each live net
-    // already has one fresh buffer entry per trained clock. We push first
-    // so refresh_crown has a verdict to read.
-    eng.rolling_fitness.get_mut(&hs[0]).unwrap().push(0.5);
-    eng.rolling_fitness.get_mut(&hs[1]).unwrap().push(0.1);
-    assert_eq!(eng.elite_hashes(), vec![hs[1].clone()], "net B is the best net");
-    // Let net A carry a verdict too, so the population is symmetric (the
-    // gate reads the two counters now, but a clean record keeps ranking
-    // honest).
-    let m0 = crate::state::NetMetrics {
-        step: 0,
-        train_loss: 0.0,
-        eval_loss: None,
-        fitness: 0.5,
-        informative: vec![],
-        frozen: false,
-    };
-    eng.state.record_step(&hs[0], m0).unwrap();
-    // KISS: the crown is DEALT by refresh_crown (once per clock at group-step
-    // start) — `step_one_net` only OBEYS the settled membership. Join
-    // probation is 0 in this fixture, so the best net (B) takes the seat here.
-    eng.refresh_crown(0);
-    let before_len = eng.rolling_fitness.get(&hs[1]).unwrap().len();
-    eng.step_one_net(&hs[1], 0).unwrap();
-    let after = eng.rolling_fitness.get(&hs[1]).unwrap();
-    assert_eq!(after.len(), before_len + 1, "fresh measurement appended");
-    let last_metrics = eng
-        .state
-        .net(&hs[1])
-        .unwrap()
-        .last_metrics
-        .as_ref()
-        .unwrap();
-    assert_eq!(
-        last_metrics.step, 0,
-        "frozen net's recorded last_metrics.step is the clock it acted at (act-and-measure)"
-    );
-    assert_ne!(
-        last_metrics.fitness, 0.5,
-        "the fitness is a fresh measurement, not the carried skill"
-    );
-    // Freeze-member check must use the canonical `frozen_crown` HashSet
-    // (what refresh_crown writes), NOT elite_hashes() — elite_hashes()
-    // re-derives membership from smoothed fitness + the join/lifetime gates
-    // each call, and the frozen step itself just pushed a fresh value into
-    // B's buffer, so elite_hashes() can legitimately disagree with the
-    // frozen set on a stale call site. The frozen-branch contract is about
-    // membership in frozen_crown, not current top-k retirement.
-    assert!(eng.frozen_crown.contains(&hs[1]), "net B is in the frozen crown after the freeze step");
-    assert_eq!(
-        eng.state.net(&hs[1]).unwrap().step,
-        0,
-        "frozen net's step count is unchanged (act-and-measure is not a training step)"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}    #[test]
+    #[test]
+    fn freeze_elite_act_and_measure_no_weight_update() {
+        // A (act-and-measure freeze): the frozen elite plays its normal step
+        // against the current clock — the trainer RUNS (fresh fitness is
+        // recorded into state + buffers, so its standing stays honest) — but
+        // through a no-op optimizer, so its weights never change. The
+        // observable contract: metrics advance with a FRESH fitness (not the
+        // carried one), the rolling buffer grows by one, and the net's step
+        // COUNT is unchanged (act-and-measure is not a training step).
+        let dir = std::env::temp_dir().join("gras_freeze_elite_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 11).unwrap();
+        // Lower the join window to 0 so net B can be crowned on arrival for
+        // this test: the thing under test is the frozen-branch contract, not
+        // the probation window. The default of 5 is the real "no freeze on
+        // arrival" setting (see TODO.md + elite_join_probation_crown_lifetime).
+        open_crown(&mut eng);
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        let hs = eng.state.live_hashes();
+        // Fixture is Minimize: lower smoothed = better (see worst-culls test).
+        // Mirror the END-OF-GROUP-STEP model directly (skip the shared-batch
+        // plumbing): a group step does, per net, (1) run_trainer_step,
+        // (2) record_step (snapshots last_metrics AND advances the net's clock
+        // + last_update_step), then (3) pushes the fresh fitness into the
+        // rolling buffer. So at the moment refresh_crown runs, each live net
+        // already has one fresh buffer entry per trained clock. We push first
+        // so refresh_crown has a verdict to read.
+        eng.rolling_fitness.get_mut(&hs[0]).unwrap().push(0.5);
+        eng.rolling_fitness.get_mut(&hs[1]).unwrap().push(0.1);
+        assert_eq!(
+            eng.elite_hashes(),
+            vec![hs[1].clone()],
+            "net B is the best net"
+        );
+        // Let net A carry a verdict too, so the population is symmetric (the
+        // gate reads the two counters now, but a clean record keeps ranking
+        // honest).
+        let m0 = crate::state::NetMetrics {
+            step: 0,
+            train_loss: 0.0,
+            eval_loss: None,
+            fitness: 0.5,
+            informative: vec![],
+            frozen: false,
+        };
+        eng.state.record_step(&hs[0], m0).unwrap();
+        // KISS: the crown is DEALT by refresh_crown (once per clock at group-step
+        // start) — `step_one_net` only OBEYS the settled membership. Join
+        // probation is 0 in this fixture, so the best net (B) takes the seat here.
+        eng.refresh_crown(0);
+        let before_len = eng.rolling_fitness.get(&hs[1]).unwrap().len();
+        eng.step_one_net(&hs[1], 0).unwrap();
+        let after = eng.rolling_fitness.get(&hs[1]).unwrap();
+        assert_eq!(after.len(), before_len + 1, "fresh measurement appended");
+        let last_metrics = eng
+            .state
+            .net(&hs[1])
+            .unwrap()
+            .last_metrics
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            last_metrics.step, 0,
+            "frozen net's recorded last_metrics.step is the clock it acted at (act-and-measure)"
+        );
+        assert_ne!(
+            last_metrics.fitness, 0.5,
+            "the fitness is a fresh measurement, not the carried skill"
+        );
+        // Freeze-member check must use the canonical `frozen_crown` HashSet
+        // (what refresh_crown writes), NOT elite_hashes() — elite_hashes()
+        // re-derives membership from smoothed fitness + the join/lifetime gates
+        // each call, and the frozen step itself just pushed a fresh value into
+        // B's buffer, so elite_hashes() can legitimately disagree with the
+        // frozen set on a stale call site. The frozen-branch contract is about
+        // membership in frozen_crown, not current top-k retirement.
+        assert!(
+            eng.frozen_crown.contains(&hs[1]),
+            "net B is in the frozen crown after the freeze step"
+        );
+        assert_eq!(
+            eng.state.net(&hs[1]).unwrap().step,
+            0,
+            "frozen net's step count is unchanged (act-and-measure is not a training step)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
     fn dethroned_elite_resumes_stepping_without_catch_up() {
         // Dethrone under act-and-measure freeze: the former elite never fell
         // behind the clock (it acted every frozen step), so losing the crown
@@ -3492,13 +3749,12 @@ fn freeze_elite_act_and_measure_no_weight_update() {
     /// Minimal RlStep for construction-validation tests: reports a constant
     /// fitness, touches nothing else.
     struct TestRlTrainer;
-    impl crate::trainer::StepTrainer for TestRlTrainer {
+    impl crate::trainer::RlStep for TestRlTrainer {
         fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
             use flodl::nn::Module;
             Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
         }
-    }
-    impl crate::trainer::RlStep for TestRlTrainer {
+
         fn train_step(
             &mut self,
             _net: &mut Network,
@@ -3519,13 +3775,12 @@ fn freeze_elite_act_and_measure_no_weight_update() {
     /// "a deterministic env": replay can only reproduce the recorded metrics
     /// if the engine feeds the trainer the same clock + seed it did live.
     struct SeededRlTrainer;
-    impl crate::trainer::StepTrainer for SeededRlTrainer {
+    impl crate::trainer::RlStep for SeededRlTrainer {
         fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
             use flodl::nn::Module;
             Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
         }
-    }
-    impl crate::trainer::RlStep for SeededRlTrainer {
+
         fn train_step(
             &mut self,
             _net: &mut Network,
@@ -3570,13 +3825,12 @@ fn freeze_elite_act_and_measure_no_weight_update() {
     /// (a sentinel no normal step ever reports), so tests can observe exactly
     /// which steps ran challenged.
     struct ChallengingRlTrainer;
-    impl crate::trainer::StepTrainer for ChallengingRlTrainer {
+    impl crate::trainer::RlStep for ChallengingRlTrainer {
         fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
             use flodl::nn::Module;
             Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
         }
-    }
-    impl crate::trainer::RlStep for ChallengingRlTrainer {
+
         fn train_step(
             &mut self,
             _net: &mut Network,
@@ -4628,8 +4882,8 @@ fn freeze_elite_act_and_measure_no_weight_update() {
         // A legacy run (or hook-less trainer) records no blob: the check
         // must stay silent, not hard-fail every old run_dir.
         let recorded = None;
-        let trainer = crate::trainer::ModeAdapter::tabular(Box::new(
-            crate::trainer::TabularTrainer::new(loss_fn()),
+        let trainer = crate::trainer::AnyTrainer::tabular(crate::trainer::TabularTrainer::new(
+            loss_fn(),
         ));
         assert!(
             super::assert_trainer_blob_matches(&recorded, &trainer, "resume").is_ok(),
@@ -5493,10 +5747,12 @@ fn freeze_elite_act_and_measure_no_weight_update() {
             eng.config.pop_size,
         );
         assert_eq!(topos.len(), 2);
-        assert!(crate::state::load_engine_json(&dir)
-            .unwrap()
-            .run_topology_source
-            .is_none());
+        assert!(
+            crate::state::load_engine_json(&dir)
+                .unwrap()
+                .run_topology_source
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5539,6 +5795,9 @@ fn freeze_elite_act_and_measure_no_weight_update() {
             champion_hash: "abcdefghabcdefgh".into(),
             champion_params: Some(77),
             race_smoothed: Some(0.5),
+            race_se: Some(0.02),
+            race_samples: 5,
+            race_latest: Some(0.52),
             holdout_mean: Some(0.55),
             holdout_std: Some(0.01),
             matches_scored: 16,
@@ -6079,7 +6338,8 @@ fn freeze_elite_act_and_measure_no_weight_update() {
         // Frozen only: likewise.
         let frozen_only = step_rollup_line(5, 6, 1, 0, 3, 3, 0, 1, 1, 5, 5);
         assert!(
-            frozen_only.contains("stepped 5/6 live nets (weights updated) │ 1 sat out: 1 elite frozen"),
+            frozen_only
+                .contains("stepped 5/6 live nets (weights updated) │ 1 sat out: 1 elite frozen"),
             "{frozen_only}"
         );
         assert!(!frozen_only.contains("newborn"), "{frozen_only}");

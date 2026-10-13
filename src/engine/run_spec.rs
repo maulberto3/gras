@@ -34,7 +34,7 @@ use crate::trainer::{RlStep, TabularStep};
 /// - `run_dir` — `None` = `results/<run_id>` with a timestamp id; give a
 ///   path to place the run anywhere. The chosen dir is readable via
 ///   `RaceEngine::run_dir()` after construction.
-pub struct TabularSpec<T: TabularStep + 'static = Box<dyn TabularStep>> {
+pub struct TabularSpec<T = Box<dyn TabularStep>> {
     pub data_dir: std::path::PathBuf,
     pub config: RaceConfig,
     pub fitness: Fitness,
@@ -49,7 +49,7 @@ pub struct TabularSpec<T: TabularStep + 'static = Box<dyn TabularStep>> {
 /// each step (require `Fitness::reported`). Everything evolution-side
 /// (population, rolls, culls, gates, smoothing, exports) is identical to
 /// Tabular mode.
-pub struct RLSpec<T: RlStep + 'static = Box<dyn RlStep>> {
+pub struct RLSpec<T = Box<dyn RlStep>> {
     pub config: RaceConfig,
     /// MUST be `Fitness::reported(..)` — validated at engine construction.
     pub fitness: Fitness,
@@ -67,10 +67,7 @@ pub struct RLSpec<T: RlStep + 'static = Box<dyn RlStep>> {
 /// - **[`RunSpec::RL`]** — environment/RL style: no dataset at all, a
 ///   [`Fitness::reported`] ranking signal, and a trainer that drives the
 ///   environment and reports the reward. `RunSpec::rl` builds it.
-pub enum RunSpec<
-    TT: TabularStep + 'static = Box<dyn TabularStep>,
-    TR: RlStep + 'static = Box<dyn RlStep>,
-> {
+pub enum RunSpec<TT = Box<dyn TabularStep>, TR = Box<dyn RlStep>> {
     Tabular(TabularSpec<TT>),
     RL(RLSpec<TR>),
 }

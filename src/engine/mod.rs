@@ -37,28 +37,28 @@ pub mod core;
 pub mod evolve;
 pub mod fitness;
 pub mod format;
+pub mod guardrail;
 pub mod logging;
 pub mod population;
-pub mod guardrail;
 pub mod pruner;
 pub mod reporting;
-pub mod step;
-pub mod stop;
 pub mod rl_engine;
 pub mod run_spec;
 pub mod seed;
 pub mod smoothing;
+pub mod step;
+pub mod stop;
 pub mod tabular_engine;
 
 pub use config::{
-    rl_race_config_builder, tabular_race_config_builder, CrossCullPolicy, ModeConfig,
-    MutationCullPolicy, RaceConfig, RaceSnapshot, RlConfig, RlRaceConfig, RunMode, StopReason,
-    TabularConfig, TabularRaceConfig,
+    CrossCullPolicy, ModeConfig, MutationCullPolicy, RaceConfig, RaceSnapshot, RlConfig,
+    RlRaceConfig, RunMode, StopReason, TabularConfig, TabularRaceConfig, rl_race_config_builder,
+    tabular_race_config_builder,
 };
-pub use guardrail::{check_champion, ChampionScorer, GuardrailVerdict};
 pub use core::CoreEngine;
 pub use fitness::{Direction, Fitness, FitnessLabel};
+pub use guardrail::{ChampionScorer, GuardrailVerdict, check_champion};
 pub use rl_engine::RlEngine;
 pub use run_spec::{RLSpec, RunSpec, StreamShape, TabularSpec};
-pub use seed::{resolve as resolve_seed_source, SeedOutcome, SeedPick};
+pub use seed::{SeedOutcome, SeedPick, resolve as resolve_seed_source};
 pub use tabular_engine::TabularEngine;

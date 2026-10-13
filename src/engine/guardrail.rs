@@ -42,12 +42,12 @@ pub trait ChampionScorer: Send {
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32>;
 }
 
-/// The engine's own trainer is a scorer: implementing
-/// `StepTrainer::holdout_score` on the trainer type IS the guardrail
-/// capability, so `engine.guardrail(device, None)` needs no second object.
-impl ChampionScorer for dyn crate::trainer::EngineTrainer {
+/// The engine's own trainer is a scorer: implementing `holdout_score` on the
+/// trainer type IS the guardrail capability, so `engine.guardrail(device)`
+/// needs no second object.
+impl ChampionScorer for crate::trainer::AnyTrainer {
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
-        crate::trainer::EngineTrainer::holdout_score(self, net, game_i)
+        crate::trainer::AnyTrainer::holdout_score(self, net, game_i)
     }
 }
 
@@ -62,6 +62,18 @@ pub struct GuardrailVerdict {
     /// The champion's final smoothed fitness as the race recorded it
     /// (None if no verdict was ever recorded).
     pub race_smoothed: Option<f32>,
+    /// Standard error of `race_smoothed` (`window std / √n`), when the engine
+    /// could still see the champion's rolling window. `None` on the saved-run
+    /// path (`score_saved`) — a reloaded net has no window to read, so the
+    /// verdict falls back to the flat rule rather than inventing an error bar.
+    pub race_se: Option<f32>,
+    /// Step readings behind `race_smoothed` (the smoothing window's length).
+    /// `0` = unknown; a one-reading window is a `race_se` of 0.0, which is
+    /// "unobservable spread", NOT "precise".
+    pub race_samples: usize,
+    /// The champion's most recent step reading — the smoothed mean LAGS it by up
+    /// to the window length. `None` on the saved-run path (no live buffer).
+    pub race_latest: Option<f32>,
     /// One score per successfully played game, in report units.
     pub scores: Vec<f32>,
 }
@@ -73,6 +85,35 @@ impl GuardrailVerdict {
             return None;
         }
         Some(self.scores.iter().sum::<f32>() / self.scores.len() as f32)
+    }
+
+    /// Standard ERROR of the holdout mean (`std / sqrt(n)`): how well the
+    /// exam's own games pin the champion down. This is the number that decides
+    /// whether a gap against the race reading means anything — a ±21 over 100
+    /// games is a ±2.1 estimate, while the race's number is typically built on
+    /// a handful of games.
+    pub fn se(&self) -> Option<f32> {
+        let std = self.std()?;
+        let n = self.scores.len() as f32;
+        (n > 0.0).then(|| std / n.sqrt())
+    }
+
+    /// `(min, p25, median, p75, max)` of the per-game scores, nearest-rank.
+    ///
+    /// The mean ± std hides the SHAPE, and the shape is the diagnosis: a
+    /// champion whose exam is `[9, 9, 500, 500, 9]`-ish survives by luck on
+    /// some start states and dies on others, while one that is genuinely
+    /// learned has a tight batch. Nearest-rank (not interpolated) because these
+    /// are counts of games — a fraction of a game reads as precision the sample
+    /// does not have.
+    pub fn percentiles(&self) -> Option<(f32, f32, f32, f32, f32)> {
+        if self.scores.is_empty() {
+            return None;
+        }
+        let mut s = self.scores.clone();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let at = |q: f32| s[((q * (s.len() as f32 - 1.0)).round() as usize).min(s.len() - 1)];
+        Some((s[0], at(0.25), at(0.5), at(0.75), s[s.len() - 1]))
     }
 
     /// Population std of the per-game scores (a wide ± hides a mix of
@@ -154,15 +195,119 @@ pub fn agreement_verdict(
     holdout_mean: Option<f32>,
     direction: Direction,
 ) -> String {
+    // No noise information: the flat relative rule. Kept as the fallback so
+    // every call site that cannot supply sampling error (saved-run scoring, a
+    // resumed run with no live rolling buffer) behaves exactly as before.
+    agreement_verdict_noisy(
+        race_smoothed, None, None, None, holdout_mean, None, 0, direction,
+    )
+}
+
+/// [`agreement_verdict`] WITH the sampling error of both readings.
+///
+/// Why the noise matters: the race reading is a mean over the smoothing
+/// window's step readings (`SMOOTHING_WINDOW` = 5 by default), and each of
+/// those is itself a mean over the trainer's eval batch (2 games each for the
+/// cartpole reference trainer → 10 games total). The champion is the ARGMAX of
+/// that noisy statistic over the whole population, so its reading carries a
+/// built-in upward bias (the winner's curse). The exam is a mean over
+/// `matches_scored` unseen games, usually 10× more. So a gap that looks like a
+/// collapse is frequently just the race's own error bar, and the honest verdict
+/// has to say which of the two it is instead of quoting a flat percentage.
+///
+/// `race_se` / `race_samples`: the race reading's own standard error and the
+/// number of step readings behind it. When the error bar is unusable — no
+/// reading, a single reading (spread unobservable), or no exam games — this
+/// degrades to the flat rule, byte-for-byte.
+///
+/// The gap is judged against the COMBINED band `2·√(race_se² + exam_se²)` (both
+/// readings are estimates), and graded in three steps so a borderline case is
+/// not reported as a collapse:
+///
+/// | gap vs the band | verdict |
+/// |---|---|
+/// | ≤ 0 | consistent — the champion held up |
+/// | ≤ 1× | consistent within noise ✅ |
+/// | ≤ 1.5× | borderline ⚠️ — quote the exam, widen the window |
+/// | > 1.5× | weak — the race OVER-REPORTED ❌ |
+pub fn agreement_verdict_noisy(
+    race_smoothed: Option<f32>,
+    race_se: Option<f32>,
+    race_samples: Option<usize>,
+    race_latest: Option<f32>,
+    holdout_mean: Option<f32>,
+    exam_se: Option<f32>,
+    matches_scored: usize,
+    direction: Direction,
+) -> String {
     let (Some(race), Some(hold)) = (race_smoothed, holdout_mean) else {
         return "unscored (no race reference or no holdout games)".to_string();
     };
-    // Direction-aware shortfall of the holdout vs the race reading.
+    // Direction-aware shortfall of the EXAM vs the race reading: positive means
+    // the exam landed BELOW what the race promised (worse), in either direction.
     let shortfall = match direction {
         Direction::Maximize => race - hold,
         Direction::Minimize => hold - race,
     };
     let rel = shortfall / race.abs().max(1e-6);
+    // The noise-aware branch. `se > 0` is the load-bearing condition: a single
+    // step reading has an unobservable spread (SE 0.0) and a mean of one sample
+    // supports no inference at all, so it must fall through to the flat rule
+    // rather than be called "perfectly consistent".
+    if let (Some(se), true) = (race_se.filter(|se| *se > 0.0), matches_scored > 0) {
+        let race_n = race_samples
+            .filter(|n| *n > 0)
+            .map(|n| format!("{n} step reading(s)"))
+            .unwrap_or_else(|| "an undeclared number of readings".to_string());
+        let exam = format!("{matches_scored} unseen game(s)");
+        let exam_note = exam_se
+            .map(|e| format!(", ±{:.1} of its own", 2.0 * e))
+            .unwrap_or_default();
+        // Freshness clause, added only when it is a fact worth stating: the
+        // window mean reaches back through older steps, and the champion's
+        // weights keep moving, so a LATEST reading far from the mean is the
+        // single most useful disambiguation of a "collapsed" verdict (it is the
+        // reading that describes the weights the exam actually played).
+        // Phrased NEUTRALLY on purpose: the latest reading is not automatically
+        // the better one (a decaying net's last reading is worse, an improving
+        // net's is better), and this clause also rides the "consistent" branch
+        // where the window mean was vindicated. It hands the reader both numbers
+        // and the reason they differ — nothing more.
+        let latest_note = match race_latest {
+            Some(l) if (l - race).abs() > 0.25 * race.abs().max(1.0) => format!(
+                " (the champion's latest reading was {l:.1}, against the {race:.1} window mean — the window also averages older steps, so it need not describe the weights the exam just played)"
+            ),
+            _ => String::new(),
+        };
+        // The gap is judged against the COMBINED error bar: both readings are
+        // estimates, so the honest band is 2×√(race_se² + exam_se²) (a plain 2σ
+        // difference test). When the exam's own SE is tiny — the usual case, 100
+        // unseen games against a window of 5 — this is the race band, as before.
+        let se_diff = (se * se + exam_se.unwrap_or(0.0).powi(2)).sqrt();
+        let band = 2.0 * se_diff;
+        let ratio = shortfall / band;
+        if shortfall <= 0.0 {
+            return format!("consistent — the exam ({exam}{exam_note}) is at or above the race reading, so the champion held up ✅");
+        }
+        if shortfall <= band {
+            return format!(
+                "consistent within noise — the exam ({exam}{exam_note}) sits {shortfall:.1} under the race reading, inside the {band:.1} band of combined sampling error (race SE {se:.1} over {race_n}, {ratio:.1}× that band). The race mean is a short-window average and the champion is that average's BEST of the whole population, so a gap this size is expected even from an unchanged net — NOT evidence of a collapse ✅{latest_note}"
+            );
+        }
+        if ratio <= 1.5 {
+            return format!(
+                "borderline ⚠️ — the exam ({exam}{exam_note}) is {shortfall:.1} under the race reading ({:.0}% of it), just outside the {band:.1} band of combined sampling error ({ratio:.1}×, race SE {se:.1} over {race_n}). The two readings disagree but barely: quote the exam (it is the tighter estimate — {race_n} cannot resolve better than ±{:.1}) and re-run with a longer smoothing window before calling it a collapse. The forecast from a short window is what is failing here, not necessarily the policy.{latest_note}",
+                rel * 100.0,
+                2.0 * se
+            );
+        }
+        return format!(
+            "weak — the race OVER-REPORTED: the exam ({exam}{exam_note}) is {shortfall:.1} under the race reading ({:.0}% of it), i.e. {ratio:.1}× the {band:.1} band of combined sampling error (race SE {se:.1} over {race_n}). Expected when the champion won on a lucky draw — the exam is the better estimate ❌{latest_note}",
+            rel * 100.0
+        );
+    }
+    // Flat fallback: no usable error bar (saved-run scoring, a one-reading
+    // window, or no live buffer).
     if rel <= 0.0 {
         "consistent with the race signal ✅".to_string()
     } else if rel <= 0.10 {
@@ -215,10 +360,24 @@ fn record_guardrail(run_dir: &std::path::Path, champion_hash: &str, verdict: &Gu
         champion_hash: champion_hash.to_string(),
         champion_params: params,
         race_smoothed,
+        // The live engine fills these in; a reloaded saved run has no window,
+        // so they stay `None`/0 and the verdict falls back to the flat rule.
+        race_se: verdict.race_se,
+        race_samples: verdict.race_samples,
+        race_latest: verdict.race_latest,
         holdout_mean: verdict.mean(),
         holdout_std: verdict.std(),
         matches_scored: verdict.scores.len(),
-        verdict: agreement_verdict(race_smoothed, verdict.mean(), direction),
+        verdict: agreement_verdict_noisy(
+            race_smoothed,
+            verdict.race_se,
+            Some(verdict.race_samples).filter(|n| *n > 0),
+            verdict.race_latest,
+            verdict.mean(),
+            verdict.se(),
+            verdict.scores.len(),
+            direction,
+        ),
     };
     if let Err(e) = crate::state::write_guardrail_record(run_dir, &record) {
         tracing::warn!("engine.json guardrail record failed: {e}");
@@ -271,12 +430,17 @@ fn verdict_from(
     Some(GuardrailVerdict {
         hash: champion_hash.to_string(),
         race_smoothed,
+        // Unknown to this path: only the live engine can read the window's
+        // spread. Callers that have it (CoreEngine::guardrail) fill it in.
+        race_se: None,
+        race_samples: 0,
+        race_latest: None,
         scores,
     })
 }
 
 /// The engine's DISK seam: reload + play + aggregate, where the scorer IS the
-/// run's own trainer (reached through the [`EngineTrainer`] dispatch). Used by
+/// run's own trainer (reached through the [`crate::trainer::AnyTrainer`] dispatch). Used by
 /// embedders that hold a trainer and a run dir but no live engine, and as the
 /// engine's fallback when the champion is no longer in memory.
 pub fn score_with<T, F>(
@@ -340,6 +504,9 @@ mod tests {
         let v = GuardrailVerdict {
             hash: "abc".into(),
             race_smoothed: Some(10.0),
+            race_se: Some(4.0),
+            race_samples: 5,
+            race_latest: Some(12.0),
             scores: vec![10.0, 500.0, 42.0],
         };
         let m = v.mean().unwrap();
@@ -349,6 +516,9 @@ mod tests {
         let empty = GuardrailVerdict {
             hash: "abc".into(),
             race_smoothed: None,
+            race_se: None,
+            race_samples: 0,
+            race_latest: None,
             scores: vec![],
         };
         assert!(empty.mean().is_none() && empty.std().is_none());
@@ -376,6 +546,152 @@ mod tests {
         assert!(v.contains("consistent"), "{v}");
         // No reference → honest "unscored", never a fake pass.
         assert!(agreement_verdict(None, Some(1.0), Maximize).contains("unscored"));
+    }
+
+    /// The noisy verdict, on the numbers a REAL cartpole run produced
+    /// (`results/1791824617260`): the champion's smoothed race reading was
+    /// 191.7 — a mean of window `[289.5, 500.0, 75.0, 52.5, 41.5]`, i.e. one
+    /// solved game among four fizzles, SE ≈ 80 — while the 100-game exam landed
+    /// at 53.5. The flat rule called this "weak … 72% below" ❌; the honest
+    /// reading is that the exam sits INSIDE the race's own noise band, so this
+    /// is a false collapse alarm.
+    #[test]
+    fn noisy_verdict_absolves_a_fluke_window() {
+        let v = agreement_verdict_noisy(
+            Some(191.7),
+            Some(80.0),
+            Some(5),
+            // The real window was [289.5, 500.0, 75.0, 52.5, 41.5]: the LATEST
+            // reading is a fizzle, and it is the one the exam agrees with.
+            Some(41.5),
+            Some(53.5),
+            Some(2.1),
+            100,
+            Direction::Maximize,
+        );
+        assert!(v.contains("consistent within noise"), "{v}");
+        assert!(v.contains("NOT evidence of a collapse"), "{v}");
+        assert!(v.contains("5 step reading(s)"), "{v}");
+        // The freshness clause hands over the latest reading (41.5 here, the one
+        // the exam's 53.5 agrees with) without claiming it is the better number.
+        assert!(v.contains("latest reading was 41.5"), "{v}");
+        assert!(v.contains("against the 191.7 window mean"), "{v}");
+        // The message must actually explain the two mechanisms, not just assert.
+        assert!(v.contains("BEST of the whole population"), "{v}");
+        assert!(!v.contains('\n'), "log lines stay single-line: {v}");
+    }
+
+    /// …and the same gap with a TIGHT race window is a real finding: when the
+    /// champion's readings barely move, the exam's landing far below is the race
+    /// over-reporting, and the verdict says so.
+    #[test]
+    fn noisy_verdict_flags_a_real_over_report() {
+        let v = agreement_verdict_noisy(
+            Some(191.7),
+            Some(5.0),
+            Some(5),
+            None,
+            Some(53.5),
+            Some(2.1),
+            100,
+            Direction::Maximize,
+        );
+        assert!(v.contains("weak") && v.contains("OVER-REPORTED"), "{v}");
+        assert!(!v.contains('\n'), "log lines stay single-line: {v}");
+        // Exam at or above the race reading is consistency in both directions.
+        let up = agreement_verdict_noisy(
+            Some(53.5),
+            Some(5.0),
+            Some(5),
+            None,
+            Some(191.7),
+            Some(2.1),
+            100,
+            Direction::Maximize,
+        );
+        assert!(up.contains("at or above"), "{up}");
+        let min = agreement_verdict_noisy(
+            Some(0.1),
+            Some(0.005),
+            Some(5),
+            None,
+            Some(0.5),
+            Some(0.01),
+            100,
+            Direction::Minimize,
+        );
+        assert!(min.contains("weak") && min.contains("OVER-REPORTED"), "{min}");
+    }
+
+    /// Severity is graded, not binary: a gap barely outside the combined band is
+    /// NOT the same finding as one 12× outside it, and calling the first a
+    /// collapse is exactly the false alarm this verdict exists to stop.
+    #[test]
+    fn noisy_verdict_grades_severity() {
+        // race 100 ±10, exam 74 (SE 1): gap 26 vs band 2·√(10²+1²) ≈ 20.1 →
+        // 1.3× → borderline, with the advice instead of a verdict.
+        let v = agreement_verdict_noisy(
+            Some(100.0),
+            Some(10.0),
+            Some(5),
+            None,
+            Some(74.0),
+            Some(1.0),
+            100,
+            Direction::Maximize,
+        );
+        assert!(v.contains("borderline"), "{v}");
+        assert!(v.contains("quote the exam"), "{v}");
+        assert!(!v.contains("collapse ❌") && !v.contains("OVER-REPORTED"), "{v}");
+        assert!(!v.contains('\n'), "log lines stay single-line: {v}");
+        // The combined band uses BOTH error bars, not just the race's.
+        let v = agreement_verdict_noisy(
+            Some(100.0),
+            Some(1.0),
+            Some(5),
+            None,
+            Some(74.0),
+            Some(10.0),
+            100,
+            Direction::Maximize,
+        );
+        assert!(v.contains("borderline"), "a wide EXAM bar must widen the band too: {v}");
+        // No latest reading supplied → no freshness clause (never a blank claim).
+        assert!(!v.contains("latest reading"), "{v}");
+        assert!(!v.contains("window mean"), "{v}");
+    }
+
+    /// The noisy branch must only fire when the race error bar is USABLE: no
+    /// spread (a single reading) or no exam games has to degrade to the flat
+    /// rule, byte-for-byte, instead of calling a one-sample mean consistent.
+    #[test]
+    fn noisy_verdict_degrades_to_the_flat_rule() {
+        let flat = agreement_verdict(Some(500.0), Some(100.0), Direction::Maximize);
+        for se in [None, Some(0.0)] {
+            let v = agreement_verdict_noisy(
+                Some(500.0),
+                se,
+                Some(1),
+                None,
+                Some(100.0),
+                None,
+                100,
+                Direction::Maximize,
+            );
+            assert_eq!(v, flat, "SE {se:?} must fall back to the flat rule");
+        }
+        // Same when the exam produced no game at all.
+        let v = agreement_verdict_noisy(
+            Some(500.0),
+            Some(5.0),
+            Some(5),
+            None,
+            Some(100.0),
+            None,
+            0,
+            Direction::Maximize,
+        );
+        assert_eq!(v, flat);
     }
 
     /// Scoring a net the caller already holds needs no run dir and no weight

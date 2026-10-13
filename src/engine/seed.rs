@@ -266,9 +266,10 @@ pub fn resolve_plan(
     if picks.is_empty() {
         // Nothing loadable. The champion's own failure keeps the old message
         // shape (and the old "nothing here was proven" contract).
-        return SeedOutcome::Skipped(first_failure.unwrap_or_else(|| {
-            format!("run {source_run_id} has no loadable elite blueprint")
-        }));
+        return SeedOutcome::Skipped(
+            first_failure
+                .unwrap_or_else(|| format!("run {source_run_id} has no loadable elite blueprint")),
+        );
     }
     SeedOutcome::Seeded(Box::new(SeedPlan {
         source_run_id,
@@ -499,22 +500,30 @@ mod tests {
         let root = tmp("incompat");
         write_run(&root.join("1000"), "1000", "tabular", "toy", true);
         // mode
-        assert!(resolve(Some(&root), None, "rl", 2, 2, Some("toy"))
-            .seeded()
-            .is_none());
+        assert!(
+            resolve(Some(&root), None, "rl", 2, 2, Some("toy"))
+                .seeded()
+                .is_none()
+        );
         // dims
-        assert!(resolve(Some(&root), None, "tabular", 4, 2, Some("toy"))
-            .seeded()
-            .is_none());
+        assert!(
+            resolve(Some(&root), None, "tabular", 4, 2, Some("toy"))
+                .seeded()
+                .is_none()
+        );
         // trainer name (two environments can share dims)
-        assert!(resolve(Some(&root), None, "tabular", 2, 2, Some("other"))
-            .seeded()
-            .is_none());
+        assert!(
+            resolve(Some(&root), None, "tabular", 2, 2, Some("other"))
+                .seeded()
+                .is_none()
+        );
         // …and the compatible call still works, proving the gate isn't just
         // refusing everything.
-        assert!(resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
-            .seeded()
-            .is_some());
+        assert!(
+            resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
+                .seeded()
+                .is_some()
+        );
     }
 
     #[test]
@@ -523,9 +532,11 @@ mod tests {
         write_run(&root.join("1000"), "1000", "tabular", "toy", true);
         // This run declares no trainer name → the check cannot be applied, so
         // it must not reject the candidate.
-        assert!(resolve(Some(&root), None, "tabular", 2, 2, None)
-            .seeded()
-            .is_some());
+        assert!(
+            resolve(Some(&root), None, "tabular", 2, 2, None)
+                .seeded()
+                .is_some()
+        );
     }
 
     #[test]
@@ -557,13 +568,17 @@ mod tests {
     #[test]
     fn empty_root_and_missing_root_are_skipped_not_panicked() {
         let root = tmp("empty");
-        assert!(resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
-            .seeded()
-            .is_none());
+        assert!(
+            resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
+                .seeded()
+                .is_none()
+        );
         let missing = root.join("does-not-exist");
-        assert!(resolve(Some(&missing), None, "tabular", 2, 2, Some("toy"))
-            .seeded()
-            .is_none());
+        assert!(
+            resolve(Some(&missing), None, "tabular", 2, 2, Some("toy"))
+                .seeded()
+                .is_none()
+        );
     }
 
     /// The run's OWN directory is written before the lookup, so it is the
@@ -589,16 +604,18 @@ mod tests {
         // Pointed straight at itself ⇒ nothing to inherit.
         let self_only = tmp("self-only");
         write_run(&self_only, "3000", "tabular", "toy", true);
-        assert!(resolve(
-            Some(&self_only),
-            Some(&self_only),
-            "tabular",
-            2,
-            2,
-            Some("toy")
-        )
-        .seeded()
-        .is_none());
+        assert!(
+            resolve(
+                Some(&self_only),
+                Some(&self_only),
+                "tabular",
+                2,
+                2,
+                Some("toy")
+            )
+            .seeded()
+            .is_none()
+        );
     }
 
     #[test]
@@ -628,7 +645,10 @@ mod tests {
         // Three elites: the certified champion (abcd…) plus two more
         // blueprints, written in the index with their ranks.
         let mut extra = Vec::new();
-        for (rank, hash, seed) in [(2usize, "beef0001beef0001", 11u64), (3, "beef0002beef0002", 12)] {
+        for (rank, hash, seed) in [
+            (2usize, "beef0001beef0001", 11u64),
+            (3, "beef0002beef0002", 12),
+        ] {
             let mut topo = toy_topology();
             topo.options.topology_seed = seed as usize;
             let state = serde_json::json!({ "topology": topo.to_json().unwrap() });
@@ -656,10 +676,16 @@ mod tests {
         );
         assert_eq!(plan.champion().champion_hash, "abcd1234abcd1234");
         assert_eq!(
-            plan.picks.iter().map(|p| p.champion_hash.as_str()).collect::<Vec<_>>(),
+            plan.picks
+                .iter()
+                .map(|p| p.champion_hash.as_str())
+                .collect::<Vec<_>>(),
             vec!["abcd1234abcd1234", extra[0].1, extra[1].1]
         );
-        assert!(plan.picks[1].guardrail_mean.is_none(), "only rank 1 is certified");
+        assert!(
+            plan.picks[1].guardrail_mean.is_none(),
+            "only rank 1 is certified"
+        );
         assert_eq!(
             plan.picks[1].topology.options.topology_seed, 11,
             "each rank brings its own blueprint"

@@ -42,8 +42,7 @@ impl CoreEngine {
             })
             .collect();
         let path = self.run_dir.join("elites.json");
-        let body = serde_json::to_string_pretty(&entries)
-            .unwrap_or_else(|_| "[]".to_string());
+        let body = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
         if let Err(source) = std::fs::write(&path, body) {
             tracing::warn!(
                 "elite index write failed: {}",

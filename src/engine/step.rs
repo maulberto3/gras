@@ -20,7 +20,7 @@
 use flodl::tensor::Result;
 
 use super::core::{CoreEngine, NoopOptimizer};
-use super::format::{fmt2, fmt_opt2};
+use super::format::{fmt_opt2, fmt2};
 use crate::state::NetMetrics;
 #[cfg(debug_assertions)]
 use crate::utils::race_steps::eval_one_step;

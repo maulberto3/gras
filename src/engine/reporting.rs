@@ -71,41 +71,35 @@ impl CoreEngine {
             self.step_rl.label()
         };
         // Per-step rollup: Summ = compact one-liner; Minimal = framed table
-        // (from step 2 — deltas need a prior step). The ★ badge names the
-        // CURRENT elite set (top-`elite_count` by smoothed fitness this
-        // step) — it explains who is immune to culls right now. With
-        // `freeze_elites` on, every elite seat is frozen each step, so the
-        // set needs no per-net marker: the badge lists the names, each with
-        // its SEAT AGE — `hash(seat/j)` — because the freeze lines only ever
-        // show an entrant's own age (always 0 at entry, printed before the
-        // tick), so without this the reader can never see how long a seated
-        // net has been sitting, i.e. how close it is to the lifetime age-out.
+        // (from step 2 — deltas need a prior step).
+        //
+        // The ★ badge names the CURRENT ELITE SET — the top-`elite_count`
+        // nets by smoothed fitness, IN RANK ORDER — and each entry says
+        // whether that net actually holds a seat. Elite and seated are NOT
+        // the same set: a seat is dealt only to nets that have served the
+        // join window (an elite net can be barred) and a seated net can sit
+        // outside the top-k, so a bare `hash(0/5)` could mean "just seated"
+        // or "no seat at all" — the reader could not tell, and the summary
+        // table disagreed with the badge on both membership and tenure. The
+        // freeze lines only ever show an ENTRANT's tenure (0 at entry, printed
+        // before the tick), so this badge is also the only place a reader sees
+        // how long a seated net has been sitting, i.e. how close its
+        // age-out at `j` is.
         let freeze_badge = {
             let elites = self.elite_hashes();
             if elites.is_empty() {
                 String::new()
             } else {
                 let j = self.config.elite_crown_lifetime_steps;
-                let seat_age = |h: &String| {
-                    self.state
-                        .net(h)
-                        .map(|s| s.elite_seat_age)
-                        .unwrap_or(0)
-                };
-                // `(seat/j)` only when the lifetime is armed (`j > 0`) — with
-                // j = 0 there is no age-out, so the number would mean nothing.
-                let mut names: Vec<String> = elites
+                let names: Vec<String> = elites
                     .iter()
                     .map(|h| {
                         let short = &h[..8.min(h.len())];
-                        if j == 0 {
-                            short.to_string()
-                        } else {
-                            format!("{short}({}/{j})", seat_age(h))
-                        }
+                        let seat_age =
+                            self.state.net(h).map(|s| s.elite_seat_age).unwrap_or(0);
+                        elite_badge_entry(short, seat_age, j)
                     })
                     .collect();
-                names.sort();
                 format!(" │ ★ {}", names.join(" "))
             }
         };
@@ -276,12 +270,31 @@ impl CoreEngine {
             self.run_dir.display(),
             live.len(),
         );
+        // Parity is a property of the CONFIG, not just the directory: the
+        // engine re-reads the replay-relevant knobs from `engine.json` and
+        // REFUSES a mismatch instead of silently patching it, so the resume
+        // call has to agree with the recorded run. Naming them here saves the
+        // reader from learning that by failing.
+        info!(
+            "  resume parity: replay-relevant knobs come from engine.json (K={}, checkpoint_every={}, gates, probation windows) — a mismatch is refused, not patched",
+            self.config.smoothing_window,
+            self.config.checkpoint_every,
+        );
+
+        // What the run DID comes before what it produced: births, deaths, and
+        // what the roll budget bought (including the rolls that bought
+        // nothing). Read from the engine's own counters — not counted by hand
+        // from the log — and persisted in `engine.json` under `accounting`.
+        info!("  ── run accounting ──");
+        for line in accounting_lines(&self.accounting, live.len()) {
+            info!("{line}");
+        }
 
         // Final elite report: the top-k nets by smoothed fitness, with their
         // metadata — the run's champions at stop time. Elite = rank, not
         // identity, so this is "who holds the top-k right now".
         let k = self.config.elite_count.max(1); // report at least the champion
-                                                // (hash, smoothed, step, eval_loss)
+        // (hash, smoothed, step, eval_loss)
         let ranked: Vec<(String, f32, usize, Option<f32>)> = self
             .ranked_live()
             .into_iter()
@@ -319,7 +332,7 @@ impl CoreEngine {
         // net, and an all-`—` column is noise. Show it when at least one of the
         // reported nets actually carries one (the tabular arm).
         let has_eval = ranked.iter().take(k).any(|(_, _, _, e)| e.is_some());
-        let mut header = vec!["#", "hash", "smt", "step", "seat age", "born", "params", "origin"];
+        let mut header = vec!["#", "hash", "smt", "step", "seat age", "params", "origin"];
         if has_eval {
             header.push("eval");
         }
@@ -346,10 +359,11 @@ impl CoreEngine {
             } else {
                 "—".to_string()
             };
-            let born = state
-                .map(|ns| ns.entered_at_step.to_string())
-                .unwrap_or_else(|| "?".to_string());
-            let origin_label = origin_cell(state.as_ref().and_then(|s| s.created_from.as_deref()));
+            let born_num = state.map(|ns| ns.entered_at_step).unwrap_or(0);
+            let origin_label = origin_cell(
+                state.as_ref().and_then(|s| s.created_from.as_deref()),
+                born_num,
+            );
             let params_label = state
                 .and_then(|s| s.meta.params)
                 .map(|p| p.to_string())
@@ -360,7 +374,6 @@ impl CoreEngine {
                 smt,
                 step.to_string(),
                 seat,
-                born,
                 params_label,
                 origin_label,
             ];
@@ -394,31 +407,35 @@ impl CoreEngine {
     }
 }
 
-/// One net's origin cell for the final elite table — the FULL lineage, only
-/// the hash-widths compacted. `created_from` carries shapes like
-/// `founder-2`, `seed:<run_id>:<champion_hash>`, `random`,
-/// `crossover:parents=<h1>,<h2>[+mut]`; the earlier `chars().take(8)` chop
-/// turned every one of those into an uninformative prefix (`crossove`,
-/// `founder-`). comfy-table sizes the column to the widest cell, so nothing
-/// needs truncation — but the 64-char hashes inside the lineage DO get
-/// shortened to 8, the same width the logs use everywhere else.
-fn origin_cell(created_from: Option<&str>) -> String {
+/// One net's origin cell for the final elite table: WHO made it, WITHOUT the
+/// parent-hash ids, and WITH the birth clock in the cases where it is not
+/// trivially zero — so a bare `random` says when it entered, and a crossover
+/// says which op made it and when. Founders are born at step 0 by definition,
+/// so `founder-N` stands alone.
+/// `created_from` carries shapes like `random`, `founder-2`,
+/// `seed:<run_id>:<champion_hash>`, `crossover-<op>:parents=<h1>,<h2>[+mut]`
+/// and `clone:parents=<h1>`; the stored lineage is NOT changed — only this
+/// display cell drops the ids (`crossover-one-point:parents=h1,h2` →
+/// `cx one-point@14`).
+fn origin_cell(created_from: Option<&str>, born: usize) -> String {
     let Some(raw) = created_from else {
-        return "unknown".to_string();
+        return format!("unknown@{born}");
     };
     let short8 = |hash: &str| hash[..8.min(hash.len())].to_string();
-    if let Some(rest) = raw.strip_prefix("crossover:parents=") {
-        // `crossover:parents=<h1>,<h2>[+mut]` → `cx parents=abc,def[+mut]`
-        let (parents, mutated) = rest
+    // `crossover-one-point:parents=h1,h2[+mut]` → `cx one-point@<born>[+mut]`
+    // — the crossover TYPE is the useful part; the parent ids are not, and
+    // two full hashes made this the widest column by far.
+    if let Some(rest) = raw.strip_prefix("crossover-") {
+        let (head, mutated) = rest
             .strip_suffix("+mut")
             .map(|p| (p, true))
             .unwrap_or((rest, false));
-        let list = parents
-            .split(',')
-            .map(short8)
-            .collect::<Vec<_>>()
-            .join(",");
-        return format!("cx parents={list}{}", if mutated { "+mut" } else { "" });
+        let kind = head.split(':').next().unwrap_or("one-point");
+        return format!("cx {kind}@{born}{}", if mutated { "+mut" } else { "" });
+    }
+    // `clone:parents=h1` — asexual single-parent child: type + step, no id.
+    if raw == "clone" || raw.starts_with("clone:") {
+        return format!("clone@{born}");
     }
     if let Some(rest) = raw.strip_prefix("seed:") {
         // `seed:<run_id>:<champion_hash>` → `seed:<run_id>:<hash8>` — the
@@ -430,39 +447,333 @@ fn origin_cell(created_from: Option<&str>) -> String {
             None => format!("seed:{run_id}"),
         };
     }
-    // `founder-N`, `random`, and anything else: verbatim.
+    if raw == "random" {
+        // A bare `random` tells nothing about WHEN — tag the birth clock.
+        return format!("random@{born}");
+    }
+    // `founder-N` and anything else: verbatim — a founder's birth clock is 0
+    // by definition, so a `@0` suffix would be pure noise.
     raw.to_string()
+}
+
+/// The run-accounting block for the stop summary: what the evolution actually
+/// did, one labeled line per fact, in the order a reader asks the questions
+/// (who was born → who died → what the rolls bought → what they did not).
+///
+/// The per-clock log carries the same events one line at a time (and the
+/// routine no-op rolls only at `debug`); this is the tally that was previously
+/// only obtainable by counting log lines or `nets/*.json` by hand.
+///
+/// `alive` is passed in rather than stored: it is a property of the population
+/// at stop, not an accumulated counter (so it starts from the current live
+/// count on resume).
+pub(crate) fn accounting_lines(a: &crate::state::RunAccounting, alive: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "  born {} = {} founders ({} random + {} inherited) + {} immigrants + {} crossover children",
+        a.born,
+        a.founders + a.inherited_founders,
+        a.founders,
+        a.inherited_founders,
+        a.immigrants,
+        a.crossover_children
+    ));
+    lines.push(format!(
+        "  culled {} ({} crossover slot(s), {} immigrant slot(s)) │ {} alive at stop",
+        a.culls, a.culls_crossover, a.culls_immigrant, alive
+    ));
+    lines.push(format!(
+        "  crossover rolls {}: {} fired → {} attempt(s), {} child(ren) built, {} discarded at the gate",
+        a.crossover_rolls, a.crossover_fired, a.crossover_attempts, a.crossover_children,
+        a.crossover_discarded
+    ));
+    lines.push(format!(
+        "  mutation rolls {}: {} fired → {} immigrant(s), {} blocked by the cull shield",
+        a.mutation_rolls, a.mutation_fired, a.immigrants, a.mutation_blocked
+    ));
+    if a.deferred_clocks > 0 {
+        lines.push(format!(
+            "  evolution deferred on {} clock(s): no cull-eligible net (every non-elite net was fresh or elite)",
+            a.deferred_clocks
+        ));
+    }
+    lines
+}
+
+/// Flatten a trainer's `describe()` blob into one readable line:
+/// `key=value │ nested.key=value │ …`.
+///
+/// The engine never interprets the blob (it persists it verbatim in
+/// `engine.json`), but the trainer-side knobs — the anti-plateau challenge
+/// trigger, learning-rate schedules, clipping — exist ONLY here now that they
+/// left the engine, so a pasted log that shows them is self-contained.
+///
+/// Bounded on purpose: a `describe()` that dumps tens of fields would turn one
+/// log line into a screenful, so the caller gets at most `MAX_FIELDS` facts and
+/// an explicit `… +n more` marker rather than an unbounded dump.
+pub(crate) fn summarize_json(v: &serde_json::Value) -> String {
+    const MAX_FIELDS: usize = 12;
+
+    fn flat(out: &mut Vec<String>, prefix: &str, v: &serde_json::Value) {
+        let key = |k: &str| {
+            if prefix.is_empty() {
+                k.to_string()
+            } else {
+                format!("{prefix}.{k}")
+            }
+        };
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, val) in map {
+                    flat(out, &key(k), val);
+                }
+            }
+            serde_json::Value::String(s) => out.push(format!("{}={s}", prefix)),
+            serde_json::Value::Number(n) => out.push(format!("{}={n}", prefix)),
+            serde_json::Value::Bool(b) => out.push(format!("{}={b}", prefix)),
+            // Arrays: the elements are already short scalars in practice
+            // (`["linear", "relu"]`), so one comma-joined cell beats N lines.
+            serde_json::Value::Array(items) => {
+                let cells: Vec<String> = items.iter().map(|x| x.to_string()).collect();
+                out.push(format!("{}=[{}]", prefix, cells.join(",")));
+            }
+            // Null carries no information; `{}` (an empty object) flattens to
+            // nothing, which is how an empty `describe()` reads as "no line".
+            serde_json::Value::Null => {}
+        }
+    }
+
+    let mut parts = Vec::new();
+    flat(&mut parts, "", v);
+    if parts.len() > MAX_FIELDS {
+        let extra = parts.len() - MAX_FIELDS;
+        parts.truncate(MAX_FIELDS);
+        parts.push(format!("… +{extra} more"));
+    }
+    parts.join(" │ ")
+}
+
+/// One ★-badge entry: the elite net's short hash plus its seat state, plainly
+/// spelled out.
+///
+/// Seated ⇒ its tenure (clocks held) out of the crown lifetime `j`; `j = 0`
+/// disarms the lifetime, so no denominator is invented. Not seated ⇒ `no seat`,
+/// which is the honest reading of what used to print as `(0/5)`: seat age 0
+/// means "holds no seat", but it looked identical to a net seated this same
+/// clock (the badge is printed after the deal's tick, so a seated net is
+/// always at ≥ 1).
+pub(crate) fn elite_badge_entry(short: &str, seat_age: usize, j: usize) -> String {
+    if seat_age == 0 {
+        format!("{short}(no seat)")
+    } else if j == 0 {
+        format!("{short}(tenure {seat_age})")
+    } else {
+        format!("{short}(tenure {seat_age}/{j})")
+    }
+}
+
+/// `trained n/m` for the freeze lines: real optimizer updates over the clocks
+/// the net has LIVED (`entered_at_step` → now).
+///
+/// `NetState::step` counts trainings — a frozen act-and-measure clock does not
+/// advance it — so this pairing is the honest one. What it replaced was
+/// `clock − last_update_step` over the ABSOLUTE clock: it read as a training
+/// count but meant "clocks since the last weight write", and crossover
+/// children inherit the parent's `last_update_step`, so a net born at step 7
+/// printed `8/12t` — more trainings than clocks lived, which is exactly the
+/// kind of line that teaches a reader to distrust the log.
+pub(crate) fn trained_note(trainings: usize, age: usize) -> String {
+    format!("trained {trainings}/{age} clocks")
+}
+
+/// The elite gate in words, for the freeze lines: the join window and the seat
+/// tenure.
+///
+/// - `probation` is the window a fresh (or just-dethroned) net must serve
+///   before it may hold a seat. The counter keeps TICKING past `k`, so raw
+///   `probation 16/5` read as a bar that had been overshot; once served it is
+///   reported as served, with the real number kept for the reader who wants
+///   to know how long it has been sitting.
+/// - `tenure` is the seat-age countdown against the crown lifetime `j`:
+///   `0/5` on the deal that seats it, `5/5` = age-out at the next deal. With
+///   `j = 0` the lifetime is disarmed and no denominator is invented.
+pub(crate) fn elite_gate_note(probation_age: usize, seat_age: usize, k: usize, j: usize) -> String {
+    let probation = if probation_age >= k {
+        format!("probation served ({probation_age}≥{k})")
+    } else {
+        format!("probation {probation_age}/{k}")
+    };
+    let tenure = if j == 0 {
+        format!("tenure {seat_age}")
+    } else {
+        format!("tenure {seat_age}/{j}")
+    };
+    format!(", {probation}, {tenure}")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::origin_cell;
+    use super::{elite_badge_entry, elite_gate_note, origin_cell, trained_note};
 
-    /// The origin cell keeps the WHOLE lineage (the info the reader needs):
-    /// run id for seeds, both parents for crossovers, the mutation flag.
-    /// Only hash widths are compacted.
     #[test]
-    fn origin_cell_keeps_the_lineage_info() {
-        assert_eq!(origin_cell(None), "unknown");
-        assert_eq!(origin_cell(Some("random")), "random");
-        assert_eq!(origin_cell(Some("founder-2")), "founder-2");
-        // Seeds keep the source run id + the champion hash (short8).
+    fn elite_badge_entry_says_whether_the_net_holds_a_seat() {
+        // Seated: tenure out of the armed lifetime.
+        assert_eq!(elite_badge_entry("abc12345", 3, 5), "abc12345(tenure 3/5)");
+        // Elite but NOT seated (barred by the gate, or aged out) — the case
+        // that used to print `(0/5)`, indistinguishable from a fresh seat.
+        assert_eq!(elite_badge_entry("abc12345", 0, 5), "abc12345(no seat)");
+        // Lifetime disarmed: no denominator invented.
+        assert_eq!(elite_badge_entry("abc12345", 4, 0), "abc12345(tenure 4)");
+    }
+    #[test]
+    fn trained_note_is_trainings_over_clocks_lived() {
+        // A net born at step 7 that trained 5 of its 12 lived clocks.
+        assert_eq!(trained_note(5, 12), "trained 5/12 clocks");
+        // The two counters can only ever agree when nothing was frozen —
+        // and `trainings ≤ age` always holds (a net cannot train before it
+        // exists), which the old weights-age number did not guarantee.
+        assert_eq!(trained_note(0, 0), "trained 0/0 clocks");
+    }
+
+    #[test]
+    fn elite_gate_note_never_prints_a_bar_that_was_overshot() {
+        // Still serving: numerator < k, plain fraction.
+        assert_eq!(elite_gate_note(3, 0, 5, 5), ", probation 3/5, tenure 0/5");
+        // Served and ticking on: reported as served, never `16/5`.
         assert_eq!(
-            origin_cell(Some("seed:1791759444988:257486c8abcdef")),
+            elite_gate_note(16, 2, 5, 5),
+            ", probation served (16≥5), tenure 2/5"
+        );
+        // Exactly at the bar is served, not "5/5 of the window remaining".
+        assert_eq!(
+            elite_gate_note(5, 5, 5, 5),
+            ", probation served (5≥5), tenure 5/5"
+        );
+        // k = 0: every net is served at once (the shield is off).
+        assert_eq!(elite_gate_note(0, 0, 0, 5), ", probation served (0≥0), tenure 0/5");
+        // j = 0: no lifetime armed, so no denominator is invented.
+        assert_eq!(elite_gate_note(7, 0, 5, 0), ", probation served (7≥5), tenure 0");
+    }
+
+    use super::{accounting_lines, summarize_json};
+    use crate::state::RunAccounting;
+
+    #[test]
+    fn summarize_json_flattens_a_trainer_description() {
+        let blob = serde_json::json!({
+            "trainer": "cartpole",
+            "lr": 0.01,
+            "challenge_prob": 0.25,
+            "optimizer": { "kind": "Adam", "weight_decay": 0.0 },
+            "activations": ["relu", "tanh"],
+            "schedules": null
+        });
+        let line = summarize_json(&blob);
+        assert!(line.contains("trainer=cartpole"), "{line}");
+        assert!(line.contains("lr=0.01"), "{line}");
+        assert!(line.contains("challenge_prob=0.25"), "{line}");
+        assert!(line.contains("optimizer.kind=Adam"), "nested keys flatten: {line}");
+        assert!(line.contains("activations=[\"relu\",\"tanh\"]"), "{line}");
+        // Nulls carry nothing and empty objects produce no line at all.
+        assert!(!line.contains("schedules"), "{line}");
+        assert_eq!(summarize_json(&serde_json::json!({})), "");
+        assert_eq!(summarize_json(&serde_json::json!(null)), "");
+        // Bounded: a dump-heavy describe() gets an explicit marker, not a
+        // screenful.
+        let big: serde_json::Map<String, serde_json::Value> = (0..30)
+            .map(|i| (format!("k{i}"), serde_json::json!(i)))
+            .collect();
+        let line = summarize_json(&serde_json::Value::Object(big));
+        assert!(line.contains("… +18 more"), "{line}");
+    }
+
+    #[test]
+    fn accounting_lines_report_births_deaths_and_wasted_rolls() {
+        let a = RunAccounting {
+            born: 214,
+            founders: 45,
+            inherited_founders: 5,
+            crossover_children: 65,
+            immigrants: 99,
+            culls: 164,
+            culls_crossover: 65,
+            culls_immigrant: 99,
+            crossover_rolls: 250,
+            crossover_fired: 62,
+            crossover_attempts: 171,
+            crossover_discarded: 7,
+            mutation_rolls: 250,
+            mutation_fired: 49,
+            mutation_blocked: 0,
+            deferred_clocks: 12,
+        };
+        let lines = accounting_lines(&a, 50);
+        assert_eq!(
+            lines[0],
+            "  born 214 = 50 founders (45 random + 5 inherited) + 99 immigrants + 65 crossover children"
+        );
+        assert_eq!(
+            lines[1],
+            "  culled 164 (65 crossover slot(s), 99 immigrant slot(s)) │ 50 alive at stop"
+        );
+        // A roll that bought nothing is reported, not hidden: the gate
+        // discards and the shield blocks are part of what the roll budget did.
+        assert_eq!(
+            lines[2],
+            "  crossover rolls 250: 62 fired → 171 attempt(s), 65 child(ren) built, 7 discarded at the gate"
+        );
+        assert_eq!(
+            lines[3],
+            "  mutation rolls 250: 49 fired → 99 immigrant(s), 0 blocked by the cull shield"
+        );
+        assert_eq!(
+            lines[4],
+            "  evolution deferred on 12 clock(s): no cull-eligible net (every non-elite net was fresh or elite)"
+        );
+        // Nothing deferred (the usual steady-state run): that line is omitted
+        // rather than printed as a zero.
+        let mut b = a;
+        b.deferred_clocks = 0;
+        assert_eq!(accounting_lines(&b, 50).len(), 4);
+    }
+
+    /// The origin cell: crossover → TYPE + birth clock (no parent ids),
+    /// random → birth clock, seeds keep the source run id + champion hash.
+    #[test]
+    fn origin_cell_names_type_and_birth_without_parent_ids() {
+        assert_eq!(origin_cell(None, 7), "unknown@7");
+        // A bare `random` says WHEN it entered.
+        assert_eq!(origin_cell(Some("random"), 14), "random@14");
+        // A founder's birth clock is 0 by definition; the label stands.
+        assert_eq!(origin_cell(Some("founder-2"), 0), "founder-2");
+        // Seeds keep the source run id + the champion hash (short8) — that
+        // is the inheritance provenance, not a parent id.
+        assert_eq!(
+            origin_cell(Some("seed:1791759444988:257486c8abcdef"), 0),
             "seed:1791759444988:257486c8"
         );
-        // Crossovers name BOTH parents; the `+mut` flag survives.
+        // Crossovers: the OP (not the parents) + the birth clock; the
+        // `+mut` flag survives.
         assert_eq!(
-            origin_cell(Some("crossover:parents=aaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbb")),
-            "cx parents=aaaaaaaa,bbbbbbbb"
+            origin_cell(
+                Some("crossover-one-point:parents=aaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbb"),
+                14
+            ),
+            "cx one-point@14"
         );
         assert_eq!(
-            origin_cell(Some(
-                "crossover:parents=aaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbb+mut"
-            )),
-            "cx parents=aaaaaaaa,bbbbbbbb+mut"
+            origin_cell(
+                Some("crossover-uniform:parents=aaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbb+mut"),
+                9
+            ),
+            "cx uniform@9+mut"
+        );
+        // Single-parent asexual child: same treatment.
+        assert_eq!(
+            origin_cell(Some("clone:parents=aaaaaaaaaaaaaaaa"), 5),
+            "clone@5"
         );
         // Short hashes are not chopped further.
-        assert_eq!(origin_cell(Some("seed:42:abc")), "seed:42:abc");
+        assert_eq!(origin_cell(Some("seed:42:abc"), 0), "seed:42:abc");
     }
 }

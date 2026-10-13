@@ -72,6 +72,24 @@ impl LogLevel {
         }
     }
 
+    /// Parse a CLI log level into the pair [`crate::engine::logging::init`]
+    /// takes: the engine's reporting style plus an optional tracing verbosity.
+    ///
+    /// Two orthogonal axes meet on the examples' single flag. The ENGINE level
+    /// picks the reporting SHAPE (`none` / `summ` / `minimal`); the verbosity
+    /// decides whether the engine's per-roll detail (a roll that did not fire,
+    /// a shield that spent a roll for nothing) is printed at all — those lines
+    /// are `tracing::debug!`, so the default view stays readable and nothing
+    /// needs re-running to see them: `--log-level debug` (or `trace`) keeps the
+    /// `Summ` reporting AND lets the detail through.
+    pub fn parse_verbose(raw: &str) -> Option<(Self, Option<&'static str>)> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "debug" => Some((LogLevel::Summ, Some("debug"))),
+            "trace" => Some((LogLevel::Summ, Some("trace"))),
+            other => LogLevel::parse(other).map(|level| (level, None)),
+        }
+    }
+
     /// The `env_logger` verbosity under which this level's lines are visible.
     /// `Summ` prints through `tracing::info!`, so it needs `info`; `Minimal` and
     /// `None` print their own lines through `println!` and only need the
@@ -485,7 +503,6 @@ pub fn run_progress(step: usize, max_steps: Option<usize>) -> Option<f32> {
     }
     Some((step as f32 / max as f32).min(1.0))
 }
-
 
 /// Mode-specific knob set — the arm is carried in the TYPE (same split
 /// logic as the `RunSpec` variants). Constructed via
@@ -1520,7 +1537,7 @@ impl RaceConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_progress, LogLevel, RaceConfig};
+    use super::{LogLevel, RaceConfig, run_progress};
 
     /// One progress convention for the whole crate: linear to 1.0 at the
     /// budget, clamped, and flat when the run is unbounded. (The challenge

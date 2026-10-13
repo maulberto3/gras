@@ -28,6 +28,37 @@ fn is_crossover_origin(created_from: Option<&str>) -> bool {
     created_from.is_some_and(|s| s.starts_with("crossover"))
 }
 
+/// Which roll group a roll belongs to. Kept apart so a crossover roll and a
+/// mutation roll at the same `(clock, roll)` never draw the same number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RollKind {
+    Crossover,
+    Mutation,
+}
+
+/// Stream tags folded into the run seed before `derive_seed`: each roll group
+/// gets its own lane, and neither can collide with the child-seed lane
+/// (`derive_seed(run_seed, clock * 1024 + child_idx)`), because different bases
+/// never agree at the same index.
+const ROLL_STREAM_CROSSOVER: u64 = 0x5A5A_0000_0000_00C1;
+const ROLL_STREAM_MUTATION: u64 = 0x5A5A_0000_0000_003D;
+
+impl RollKind {
+    /// The seed a fire check (or a victim draw) for this roll derives from.
+    ///
+    /// `clock * 1024 + roll` is the same index shape the child seeds use, in a
+    /// different lane (see the tags). Deriving instead of drawing from the
+    /// process-global `fastrand` stream is what makes the roll batch skippable
+    /// without shifting every later draw in the run.
+    fn seed(self, run_seed: u64, clock: usize, roll: usize) -> u64 {
+        let tag = match self {
+            RollKind::Crossover => ROLL_STREAM_CROSSOVER,
+            RollKind::Mutation => ROLL_STREAM_MUTATION,
+        };
+        crate::utils::seed::derive_seed(run_seed ^ tag, clock * 1024 + roll)
+    }
+}
+
 impl CoreEngine {
     /// Fresh empty rolling buffer for a net about to be caught up, so
     /// catch-up's per-step pushes land somewhere — a live net must never be
@@ -211,7 +242,7 @@ impl CoreEngine {
             }
             self.insert_child(child, clock, "crossover");
             return Ok(RollOutcome::survived(format!(
-                "child {} ({}) inserted, gate n/a (crossover_catch_up=off), caught up 0, victim {} culled ({})",
+                "child {} ({}) inserted (no gate, no catch-up: crossover_catch_up=off), victim {} culled ({})",
                 inserted_hash,
                 lineage,
                 victim_for_log
@@ -378,9 +409,7 @@ impl CoreEngine {
             crate::engine::config::CrossCullPolicy::Worst => {
                 self.select_crossover_worst_victim(clock)?
             }
-            crate::engine::config::CrossCullPolicy::Random => {
-                self.select_random_victim(clock)?
-            }
+            crate::engine::config::CrossCullPolicy::Random => self.select_random_victim(clock)?,
         };
         // Defensive: see the catch-up-off path — a `None` here discards the
         // (replayed) child and spends the roll rather than breaking probation.
@@ -480,7 +509,7 @@ impl CoreEngine {
         } else {
             // No checkpoints yet — the gate was NOT supposed to apply. Stated
             // so "no gate" never reads as "passed a gate".
-            " | gate n/a (no checkpoints yet)".to_string()
+            " | no gate (no checkpoints yet)".to_string()
         };
         let inserted_hash = child.state.hash[..8.min(child.state.hash.len())].to_string();
         let lineage = child
@@ -642,7 +671,7 @@ impl CoreEngine {
         use crate::engine::config::MutationCullPolicy;
         let picked = match self.config.mutation_cull_policy {
             MutationCullPolicy::InverseFitness => self
-                .select_inverse_proportional()?
+                .select_inverse_proportional_at(clock, roll)?
                 .or_else(|| self.mutation_victim_fallback()),
             MutationCullPolicy::Worst => self.mutation_victim_fallback(),
             // Salt `roll + 1`: the crossover path draws with salt 0, so a
@@ -727,7 +756,7 @@ impl CoreEngine {
         }
         let detail = if fresh_start {
             format!(
-                "victim {} culled (immigrant-slot), immigrant {} inserted (no gate, NO catch-up — trains from step {clock})",
+                "victim {} culled (immigrant-slot), immigrant {} inserted (no gate, no catch-up — trains from step {clock})",
                 &victim[..8.min(victim.len())],
                 &child.state.hash[..8.min(child.state.hash.len())],
             )
@@ -773,6 +802,15 @@ impl CoreEngine {
             .get(hash)
             .map(rolling_mean)
             .unwrap_or(f32::NAN);
+        // The run's accounting tallies culls by the slot they freed — the one
+        // funnel every cull passes through (log-free, like the rest of this
+        // path: the calling roll line reports the event).
+        self.accounting.culls += 1;
+        match reason {
+            "crossover" => self.accounting.culls_crossover += 1,
+            "immigrant-slot" => self.accounting.culls_immigrant += 1,
+            _ => {}
+        }
         if let Some(mut state) = self.state.net(hash).cloned() {
             state.is_alive = false;
             // Cull metadata turns the tombstone into a complete record of
@@ -803,7 +841,19 @@ impl CoreEngine {
     /// be mutation victims; nets on mutation probation are excluded too (the
     /// clock is the CURRENT race clock). Returns `None` when no cullable
     /// candidate remains (empty/single-net pop, or all elite/on-probation).
-    pub(crate) fn select_inverse_proportional(&self) -> Result<Option<String>> {
+    pub(crate) fn select_inverse_proportional_at(
+        &self,
+        clock: usize,
+        roll: usize,
+    ) -> Result<Option<String>> {
+        // The roulette draw comes from the MUTATION roll lane, like the fire
+        // check: same (clock, roll), same lane, no shift when the batch is
+        // skipped. (`Rng::with_seed` here rather than `fastrand::f32()`: the
+        // process-global stream is entropy-seeded, so this pick used to differ
+        // between two runs that recorded the same run seed.)
+        let mut rng = fastrand::Rng::with_seed(
+            RollKind::Mutation.seed(self.header.run_seed, clock, roll),
+        );
         let hashes = self.state.live_hashes();
         if hashes.len() < 2 {
             return Ok(None);
@@ -850,10 +900,10 @@ impl CoreEngine {
         let total: f32 = weights.iter().map(|(_, w)| w).sum();
         if total <= 0.0 {
             // All-equal (non-elite) population: uniform draw.
-            let i = fastrand::usize(0..weights.len());
+            let i = rng.usize(0..weights.len());
             return Ok(weights.into_iter().nth(i).map(|(h, _)| h));
         }
-        let mut pick = fastrand::f32() * total;
+        let mut pick = rng.f32() * total;
         for (h, w) in &weights {
             pick -= w;
             if pick <= 0.0 {
@@ -872,6 +922,29 @@ impl CoreEngine {
     /// empty-buffer step-0 immunity (the default). Probation is a STATUS, not a
     /// queue: the net still trains, measures, and can rank — it just cannot be
     /// a cull VICTIM while fresh.
+    /// Whether a roll of `kind` in this `clock` FIRES, drawn from a seed
+    /// derived from `(run_seed, clock, roll)` rather than from the
+    /// process-global `fastrand` stream.
+    ///
+    /// Why derived: the fire pattern decides who gets a child and who gets
+    /// culled, so it is part of what a run MEANS. The global generator is
+    /// entropy-seeded and nothing in the crate ever calls `fastrand::seed`, so
+    /// two runs that recorded the same run seed could still diverge here — the
+    /// header claims one seed, and every other stream in the crate (founders,
+    /// children, batches, challenges) already derives from it. A derived draw
+    /// is also what lets the caller SKIP a whole clock's roll batch (see
+    /// `has_cull_eligible`) without shifting the draws of later rolls.
+    pub(crate) fn roll_fires(&self, kind: RollKind, clock: usize, roll: usize) -> bool {
+        let p = match kind {
+            RollKind::Crossover => self.config.crossover_prob,
+            RollKind::Mutation => self.config.mutate_prob,
+        };
+        if p <= 0.0 {
+            return false; // p = 0 never fires, without consuming a draw
+        }
+        fastrand::Rng::with_seed(kind.seed(self.header.run_seed, clock, roll)).f32() < p
+    }
+
     pub(crate) fn on_probation(&self, hash: &str, clock: usize) -> bool {
         let Some(state) = self.state.net(hash) else {
             return false;

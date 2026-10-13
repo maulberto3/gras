@@ -31,10 +31,11 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     let mut rng = fastrand::Rng::with_seed(seed as u64);
     // Per-individual identity seed. `options.topology_seed` is the seed the
     // whole engine keys off: `Network::build` weights, `seed_step_randomness`,
-    // and the anti-plateau challenge trigger. Leaving it at the template
-    // default made every founder share ONE seed — identical initial weights,
-    // and a challenge trigger that fired for the entire population at once
-    // (or not at all) instead of ~`challenge_prob` of the nets per step.
+    // and the `net_seed` a trainer derives its own challenge trigger from.
+    // Leaving it at the template default made every founder share ONE seed —
+    // identical initial weights, and (in the engine-wired era) a challenge
+    // trigger that fired for the entire population at once or not at all,
+    // instead of for roughly `challenge_prob` of the nets per step.
     let mut opts = config.topology_options;
     opts.topology_seed = seed;
     let n_hidden = rng.usize(opts.min_hidden_num_nodes..=opts.max_hidden_num_nodes);
@@ -408,9 +409,10 @@ mod tests {
     }
 
     /// Every founder must carry its OWN `net_seed`. Sharing the template's
-    /// seed gave the whole population identical initial weights and one
-    /// challenge trigger — so `⚔` fired for every net at once (or none) on a
-    /// given step instead of ~`challenge_prob` of them.
+    /// seed gave the whole population identical initial weights — and, while
+    /// the engine still rolled challenges, one trigger for the whole
+    /// population: every net was challenged at once (or none was), instead of
+    /// roughly `challenge_prob` of them per step.
     #[test]
     fn founders_get_distinct_net_seeds() {
         let cfg = tiny_config(8);

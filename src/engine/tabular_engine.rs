@@ -8,7 +8,7 @@
 //! engine.
 
 use super::config::RaceConfig;
-use super::core::{assert_trainer_blob_matches, CoreEngine, RlVolume, StepEvolve};
+use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
 use crate::engine::fitness::Fitness;
 use crate::state::{RaceState, RunHeader};
 use crate::trainer::stream::{BatchStream, PoolSplit};
@@ -35,12 +35,7 @@ impl std::ops::DerefMut for TabularEngine {
 impl TabularEngine {
     /// Build a tabular run from its spec (mode-validated: the spec variant
     /// must be `RunSpec::tabular`).
-    pub fn from_spec(
-        spec: crate::engine::run_spec::RunSpec<
-            Box<dyn crate::trainer::TabularStep>,
-            Box<dyn crate::trainer::RlStep>,
-        >,
-    ) -> Result<Self> {
+    pub fn from_spec(spec: crate::engine::run_spec::RunSpec) -> Result<Self> {
         Ok(Self(CoreEngine::from_spec(spec)?))
     }
 
@@ -151,8 +146,7 @@ impl TabularEngine {
         fitness: Fitness,
         trainer: impl crate::trainer::TabularStep + 'static,
     ) -> Result<Self> {
-        let trainer = Box::new(crate::trainer::ModeAdapter::tabular(Box::new(trainer)))
-            as Box<dyn crate::trainer::EngineTrainer>;
+        let trainer = crate::trainer::AnyTrainer::tabular(trainer);
         let header = crate::state::load_engine_json(&run_dir)?;
         // Pluck the run-level counters out BEFORE `header` moves into the
         // engine struct (resume restores them after the frontier loads).
@@ -175,7 +169,7 @@ impl TabularEngine {
                 .into())
             }
         }
-        assert_trainer_blob_matches(&header.trainer, trainer.as_ref(), "resume")?;
+        assert_trainer_blob_matches(&header.trainer, &trainer, "resume")?;
         // Data layout comes from the HEADER (explicit_test_rows), not from
         // re-detecting the directory: a run started on the explicit
         // `{train, test}` layout replays against the SAME pools even if the
@@ -195,8 +189,8 @@ impl TabularEngine {
         // On resume, stream shape comes from the run header (data integrity),
         // but the trainer's stream_shape() can still override batch sizes.
         let header_stream_ratio = header.train_eval_split_ratio.unwrap_or(0.2); // legacy default if header missing it
-                                                                                // Held-out eval rows are data geometry — restored from the header,
-                                                                                // not re-decided by the resume config (mirrors the split ratio rule).
+        // Held-out eval rows are data geometry — restored from the header,
+        // not re-decided by the resume config (mirrors the split ratio rule).
         let header_held_out = header.held_out_eval_rows.unwrap_or(256); // legacy default if header missing it
 
         // Same rule on resume: the trainer's stream shape (same trainer the
@@ -266,6 +260,8 @@ impl TabularEngine {
             elapsed_base_secs: 0,
             step_started_at_wall: std::time::Instant::now(),
             culls: 0,
+            accounting: crate::state::RunAccounting::default(),
+            initial_population_counted: false,
             children_born_at_clock: HashMap::new(),
             step_evolve: StepEvolve::default(),
             step_rl: RlVolume::default(),

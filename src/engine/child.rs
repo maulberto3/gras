@@ -22,7 +22,7 @@ pub(crate) const MAX_PARENT_PAIRINGS: usize = 3;
 use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
 use crate::graph::topology::Topology;
-use crate::state::{write_net_state, NetMetrics, NetState};
+use crate::state::{NetMetrics, NetState, write_net_state};
 use crate::utils::seed::derive_seed;
 
 use super::core::CoreEngine;
