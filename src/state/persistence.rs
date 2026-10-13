@@ -255,6 +255,25 @@ pub struct GuardrailRecord {
     /// reading is compared against. `None` if the run recorded no verdict.
     #[serde(default)]
     pub race_smoothed: Option<f32>,
+    /// Standard error of `race_smoothed` (`window std / √n`) — the race
+    /// reading's own error bar, recorded because it is the number that decides
+    /// whether a gap against the holdout means anything. `None` when the scoring
+    /// path could not see the champion's rolling window (saved-run scoring),
+    /// which is exactly what makes the recorded verdict fall back to the flat
+    /// rule.
+    #[serde(default)]
+    pub race_se: Option<f32>,
+    /// Step readings behind `race_smoothed` (the smoothing window's length).
+    /// `0` = unknown; `1` means the spread could not be observed at all.
+    #[serde(default)]
+    pub race_samples: usize,
+    /// The champion's MOST RECENT step reading. The smoothed reference LAGS it
+    /// by up to the window length, and across 85 recorded runs this single value
+    /// predicted the holdout mean better than the window mean did (mean absolute
+    /// error 34.6 vs 44.7 turns) — which is why the verdict quotes both when
+    /// they disagree.
+    #[serde(default)]
+    pub race_latest: Option<f32>,
     /// Mean holdout score over the games that actually produced one.
     #[serde(default)]
     pub holdout_mean: Option<f32>,
@@ -266,8 +285,9 @@ pub struct GuardrailRecord {
     #[serde(default)]
     pub matches_scored: usize,
     /// Unit-free agreement between the race reading and the holdout
-    /// ([`crate::engine::guardrail::agreement_verdict`]). Informational — the
-    /// task-specific wording stays in the example's own print.
+    /// ([`crate::engine::guardrail::agreement_verdict_noisy`]): which reading to
+    /// trust and why, in plain words. Informational — the task-specific wording
+    /// stays in the example's own print.
     #[serde(default)]
     pub verdict: String,
 }
@@ -393,6 +413,57 @@ pub struct RunHeader {
     /// [`SeedSourceRecord`]). `None` = an all-random + user-blueprint batch.
     #[serde(default)]
     pub run_topology_source: Option<SeedSourceRecord>,
+    /// What the run DID to its population (see [`RunAccounting`]). Written at
+    /// stop; absent on a running or legacy run.
+    #[serde(default)]
+    pub accounting: Option<RunAccounting>,
+}
+
+/// The run's tally of what its evolution actually did.
+///
+/// The per-clock log tells this story one line at a time (and hides the routine
+/// no-op rolls behind `debug`); this is the summary a reader wants without
+/// grepping the log or counting `nets/*.json` by hand: how many nets were ever
+/// born and from where, how many left and why, and what the roll batches bought
+/// — including the rolls that bought nothing (shield-blocked, gate-discarded,
+/// and whole clocks deferred because no net was cull-eligible).
+///
+/// **Scope**: these are the counters of the process that WROTE the file. A
+/// resumed run restarts them (like the roll counters themselves); the
+/// run-lifetime record across sessions is the `nets/*.json` frontier — every
+/// tombstone carries `created_from`, `culled_at_step` and `cull_reason`, which
+/// is exactly what this struct summarizes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunAccounting {
+    /// Every net this process created: the initial batch plus each insert.
+    pub born: usize,
+    /// Initial-batch split: random founders vs nets inherited from a previous
+    /// run's `elites.json` (`created_from = seed:<run>:<hash>`).
+    pub founders: usize,
+    pub inherited_founders: usize,
+    /// Nets born from an evolution roll, by channel.
+    pub crossover_children: usize,
+    pub immigrants: usize,
+    /// Culls by the slot they freed (`crossover` / `immigrant-slot`).
+    pub culls: usize,
+    pub culls_crossover: usize,
+    pub culls_immigrant: usize,
+    /// Crossover roll batch: rolls offered, rolls that fired, generate+gate
+    /// attempts made, and children discarded by the gate (a spent roll, no
+    /// cull, no insert).
+    pub crossover_rolls: usize,
+    pub crossover_fired: usize,
+    pub crossover_attempts: usize,
+    pub crossover_discarded: usize,
+    /// Mutation roll batch: rolls offered, rolls that fired and built an
+    /// immigrant, and rolls the hard shield refused (no cull-eligible victim).
+    pub mutation_rolls: usize,
+    pub mutation_fired: usize,
+    pub mutation_blocked: usize,
+    /// Clocks whose whole roll batch was forgone because no live net was
+    /// cull-eligible — the population-level fact that used to be printed once
+    /// per roll and is now printed once per clock.
+    pub deferred_clocks: usize,
 }
 
 /// Everything that defines a step-race run's reproducible configuration —
@@ -489,6 +560,7 @@ impl RunHeader {
             // population is resolved (`CoreEngine::from_spec`).
             guardrail: None,
             run_topology_source: None,
+            accounting: None,
         }
     }
 
@@ -674,6 +746,10 @@ impl RunHeader {
             trainer,
             guardrail,
             run_topology_source,
+            accounting: v
+                .get("accounting")
+                .cloned()
+                .and_then(|x| serde_json::from_value(x).ok()),
         })
     }
 }
@@ -1575,15 +1651,17 @@ mod tests {
         let topo = tiny_topology();
         let state = NetState::new(&topo, 0, None).unwrap();
         write_net_state(&dir, &state).unwrap();
-        assert!(dir
-            .join("nets")
-            .join(format!("{}.json", state.hash))
-            .exists());
+        assert!(
+            dir.join("nets")
+                .join(format!("{}.json", state.hash))
+                .exists()
+        );
         remove_net_state(&dir, &state.hash).unwrap();
-        assert!(!dir
-            .join("nets")
-            .join(format!("{}.json", state.hash))
-            .exists());
+        assert!(
+            !dir.join("nets")
+                .join(format!("{}.json", state.hash))
+                .exists()
+        );
     }
 
     #[test]
