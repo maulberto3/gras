@@ -336,8 +336,7 @@ pub struct RunHeader {
     /// Sits at the header ROOT so a reader picks the engine before touching
     /// `config`. Written by both engines at construction and at every stop;
     /// legacy shared-shape headers have it ABSENT — `from_json` then derives
-    /// it from `config.mode` (one-generation migration, documented in
-    /// OPTIONS.md §0).
+    /// it from `config.mode` (one-generation migration).
     #[serde(default)]
     pub engine_mode: Option<String>,
     /// Single deterministic root for the whole run. When the user passes
