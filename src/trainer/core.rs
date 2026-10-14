@@ -29,11 +29,8 @@
 use crate::graph::network::Network;
 use crate::utils::tabular_data::Dataset;
 
-/// The evaluation/metrics report returned by a trainer's `train_step` at the
-/// end of each clock-step.
-///
-/// `Default` is derived so a mostly-zero report stays short to spell:
-/// `StepReport { fitness, ..Default::default() }`.
+/// The evaluation/metrics report returned by a trainer's `train_step` at the end
+/// of each step. `Default` derived for `StepReport { fitness, ..Default::default() }`.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct StepReport {
     /// The training loss achieved on the train batch (for logging).
@@ -41,25 +38,19 @@ pub struct StepReport {
     /// Optional validation loss evaluated on the shared eval batch.
     /// (RL schemes always report `None` — there is no held-out batch.)
     pub eval_loss: Option<f32>,
-    /// The ranking fitness score. Higher is better if `Direction::Maximize`,
-    /// lower is better if `Direction::Minimize`. Tabular: computed by the
-    /// engine's fitness fn on the eval batch. RL: **reported** — the scalar
-    /// the trainer derived from its environment.
+        /// The ranking fitness. Tabular: computed by the engine's fitness fn; RL:
+        /// **reported** — the scalar the trainer derived from its environment.
     pub fitness: f32,
     /// Extra non-ranking/informative scores configured for the run, if any.
     pub informative: Vec<f32>,
-    /// RL-only environment volume for this step — see [`RlStepMeta`]. `None`
-    /// in Tabular (no environment) and from RL trainers that don't report it
-    /// (the log then prints `—` in the RL columns).
+        /// RL-only environment volume for this step — see [`RlStepMeta`]. `None` in
+        /// Tabular (the log prints `—`).
     #[serde(default)]
     pub rl: Option<RlStepMeta>,
 }
 
-/// The report a [`TabularStep`] trainer returns. Tabular-shaped: no RL
-/// volume field exists here (a dataset trainer has no environment to
-/// report) — that dishonesty of the old union struct is gone.
-///
-/// `Default` is derived for `..Default::default()` convenience.
+/// The report a [`TabularStep`] returns: no RL volume field (a dataset trainer
+/// has no environment). `Default` derived for `..Default::default()`.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct TabularStepReport {
     /// The training loss achieved on this step's train batch (logging only;
@@ -74,11 +65,8 @@ pub struct TabularStepReport {
     pub informative: Vec<f32>,
 }
 
-/// The report an [`RlStep`] trainer returns. RL-shaped: no `eval_loss` field
-/// exists here (there is no (pred, target) held-out batch in RL — evaluation
-/// happens inside `train_step` and its result IS `fitness`).
-///
-/// `Default` is derived for `..Default::default()` convenience.
+/// The report an [`RlStep`] returns: no `eval_loss` (evaluation happens inside
+/// `train_step`, and its result IS `fitness`).
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct RlStepReport {
     /// The training objective your update produced (REINFORCE loss, TD error,
@@ -94,9 +82,8 @@ pub struct RlStepReport {
     pub rl: Option<RlStepMeta>,
 }
 
-// ── Report normalization: the mode reports collapse into the engine-internal
-// union the persisted `NetMetrics` consumes. This is the ONLY place the two
-// report types meet.
+    // ── Report normalization: the two mode reports collapse into the engine-internal
+    // union `NetMetrics` consumes — the only place the two types meet. ──
 
 impl From<TabularStepReport> for StepReport {
     fn from(r: TabularStepReport) -> Self {
@@ -122,24 +109,8 @@ impl From<RlStepReport> for StepReport {
     }
 }
 
-/// How much environment this step actually played — the RL counterpart of
-/// tabular's eval-loss column, which has nothing to report in a mode with no
-/// held-out batch.
-///
-/// Vocabulary (used by the engine log and every RL example): **match** = one
-/// episode (one full game, one bandit pull), **turn** = one environment step
-/// inside a match. CartPole calls them episodes/timesteps; the engine log says
-/// match/turn throughout.
-///
-/// Train and eval turns are reported SEPARATELY — a trainer that forces
-/// actions (its own challenge recipe) only ever forces TRAIN turns, so the
-/// split keeps the rollup's `turns/match` denominator honest.
-///
-/// The engine sums these over the live population per clock-step and prints
-/// `matches <total> │ train <total> │ eval <total> │ turns/match <mean>` in
-/// the per-step rollup — so a long RL step shows *why* it took long, and a
-/// changing match length (e.g. `MatchLength::RandomNumTurns`) is visible as it
-/// happens.
+/// How much environment this step played — the RL counterpart of tabular's
+/// eval-loss column. **match** = one episode, **turn** = one env step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RlStepMeta {
     /// Matches (episodes) this net's trainer played this step (train + eval).
@@ -154,8 +125,8 @@ pub struct RlStepMeta {
 }
 
 impl RlStepMeta {
-    /// Total environment turns this step (train + eval) — what the rollup's
-    /// `turns/match` mean averages over.
+        /// Total environment turns this step (train + eval) — the rollup's
+        /// `turns/match` denominator and `ms/turn` cost cell.
     pub fn turns(&self) -> usize {
         self.train_turns + self.eval_turns
     }
@@ -177,22 +148,14 @@ pub struct StepEnv {
     pub checkpoint_every: usize,
     /// The per-net fitness smoothing window, in steps (K).
     pub smoothing_window: usize,
-    /// The run's step budget as configured (`None` = unbounded). Carried so a
-    /// trainer can derive its own progress and anneal schedule-shaped things
-    /// (learning rate, entropy bonus, epsilon, exploration temperature)
-    /// WITHOUT a new config knob and without inventing a private counter.
+        /// The run's step budget (`None` = unbounded), carried so a trainer can anneal
+        /// schedules without a new config knob or a private counter.
     pub max_steps: Option<usize>,
 }
 
 impl StepEnv {
-    /// Fraction of the run's step budget consumed (`0.0` → `1.0`), or `None`
-    /// when the run is unbounded — see
-    /// [`crate::engine::config::run_progress`], the single definition both the
-    /// engine and trainers share.
-    ///
-    /// Pure arithmetic on the clock: no stored state, so a replayed step,
-    /// a catch-up step and a resumed step all compute the identical value —
-    /// which is what keeps an annealed schedule replay-safe.
+        /// Fraction of the step budget consumed (`0.0` → `1.0`), or `None` when
+        /// unbounded — pure arithmetic on the clock, so replays match.
     pub fn progress(&self) -> Option<f32> {
         crate::engine::config::run_progress(self.step, self.max_steps)
     }
@@ -236,9 +199,8 @@ pub struct TabularContext<'a> {
     pub net_seed: u64,
 }
 
-/// The context handed to an [`RlStep`] on every step. There is **no** data
-/// field: the trainer owns its environment. The fitness direction/label is
-/// still exposed (for logging the reported score in the trainer's own style).
+/// The context handed to an [`RlStep`] each step. No data field: the trainer owns
+/// its environment. Fitness direction/label is exposed for logging.
 pub struct RlContext<'a> {
     /// The ranking fitness metric (direction + label; the VALUE is the
     /// trainer's to produce in `RlStepReport.fitness`).
@@ -256,7 +218,9 @@ pub struct RlContext<'a> {
 /// The batch shape requested by a tabular trainer (defaults to batch_size).
 #[derive(Clone, Copy, Debug)]
 pub struct StreamShape {
+    /// Train batch size this trainer requests from the shared stream.
     pub batch_size: usize,
+    /// Eval batch size this trainer requests from the shared stream.
     pub eval_batch_size: usize,
 }
 
@@ -280,38 +244,20 @@ impl StreamShape {
 
 // ── The traits ───────────────────────────────────────────────────────────────
 
-/// The dataset-driven (supervised) training contract — the ONE trait a
-/// tabular scheme implements.
-///
-/// Owns the loss — it is REQUIRED here, not an `Option` — and optionally
-/// shapes the shared batch stream. Data arrives via [`TabularContext::data`],
-/// always present.
+/// The dataset-driven training contract — the ONE trait a tabular scheme
+/// implements. Owns the loss (required, not `Option`) and shapes the stream.
 pub trait TabularStep: Send {
     /// Make the optimizer for a newly built or reloaded network.
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
 
-    /// Optional self-description of this scheme's hyperparameters, recorded in
-    /// `engine.json` under `"trainer"`.
-    ///
-    /// Return a JSON object so a run stays reproducible without reading the
-    /// caller's source — e.g.
-    /// `{"trainer":"tabular","learning_rate":0.001,"grad_clip":1.0}`.
-    /// The engine never interprets the contents; it only persists them.
-    /// `None` (the default) means "no description available".
+        /// Optional self-description of this scheme's hyperparameters, recorded in
+        /// `engine.json` under `"trainer"`. The engine never interprets the contents.
     fn describe(&self) -> Option<serde_json::Value> {
         None
     }
 
-    /// The guardrail's measurement half: score ONE fresh holdout game with
-    /// the given (champion-reloaded) net, in the SAME units and estimator
-    /// as the fitness reported in the step report. How MANY games are played
-    /// is the run's business, not the trainer's: the config's
-    /// `set_elite_guardrail_matches` (default 16). The contract is
-    /// index-based (`game_i`), so any count works — seed the draw from
-    /// `game_i` and the games stay independent.
-    ///
-    /// Default: unimplemented (calling `guardrail()` without overriding this
-    /// panics with the contract text — loud, not silent).
+        /// Guardrail measurement half: score ONE fresh holdout game with the given net,
+        /// in the run's fitness units. `game_i` seeds your draw. Default: unimplemented.
     fn holdout_score(&mut self, _net: &mut Network, _game_i: usize) -> flodl::tensor::Result<f32> {
         unimplemented!(
             "holdout_score is not implemented for this trainer — implement it (one fresh \
@@ -322,15 +268,8 @@ pub trait TabularStep: Send {
     /// The loss this scheme trains against: `(pred, target) -> loss`.
     fn loss(&self) -> crate::trainer::LossFn<'_>;
 
-    /// Optional LR schedule: the learning rate to use at `step`, or `None`
-    /// for the optimizer's own (fixed) LR. Applied by the trainer itself at
-    /// the top of `train_step` via `optimizer.set_lr(lr)`.
-    ///
-    /// **Replay contract:** the schedule MUST be a pure function of `step`.
-    /// Catch-up children replay past steps through `train_step`, so a pure
-    /// schedule hands them the exact LR the population saw. A stateful
-    /// schedule would advance its state on every replay and silently break
-    /// determinism.
+        /// Optional LR schedule for `step` (`None` = the optimizer's fixed LR), applied
+        /// by the trainer. MUST be a pure function of `step` (replay contract).
     fn scheduled_lr(&self, _step: usize) -> Option<f64> {
         None
     }
@@ -350,17 +289,8 @@ pub trait TabularStep: Send {
     ) -> flodl::tensor::Result<TabularStepReport>;
 }
 
-/// The environment-driven (RL) training contract — the ONE trait an RL
-/// scheme implements.
-///
-/// There is deliberately NO `loss()` method and no data in [`RlContext`]:
-/// the training signal (rewards, trajectories, advantages) is the trainer's
-/// internal business, produced inside `train_step`. The engine's ONLY ranking
-/// input is the fitness value the trainer puts in
-/// [`RlStepReport::fitness`] each step — which is why RL runs are built with
-/// [`crate::engine::fitness::Fitness::reported`].
-///
-/// See `examples/cartpole.rs` for the canonical implementation.
+/// The environment-driven training contract — the ONE trait an RL scheme
+/// implements. No `loss()`; the engine's only ranking input is `fitness`.
 pub trait RlStep: Send {
     /// Make the optimizer for a newly built or reloaded network.
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
@@ -371,14 +301,8 @@ pub trait RlStep: Send {
         None
     }
 
-    /// The guardrail's measurement half: score ONE fresh holdout game with the
-    /// given (champion-reloaded) net, in the SAME units and estimator as the
-    /// fitness reported in the step report. How MANY games are played is the
-    /// run's business (`set_elite_guardrail_matches`, default 16); `game_i` is
-    /// the deterministic index, so seed your draw from it.
-    ///
-    /// Default: unimplemented (calling `guardrail()` without overriding this
-    /// panics with the contract text — loud, not silent).
+        /// Guardrail measurement half: score ONE fresh holdout game with the given net,
+        /// in the run's fitness units. `game_i` seeds your draw. Default: unimplemented.
     fn holdout_score(&mut self, _net: &mut Network, _game_i: usize) -> flodl::tensor::Result<f32> {
         unimplemented!(
             "holdout_score is not implemented for this trainer — implement it (one fresh \
@@ -396,28 +320,19 @@ pub trait RlStep: Send {
         ctx: &RlContext<'_>,
     ) -> flodl::tensor::Result<RlStepReport>;
 
-    /// Pop-wide phase: called ONCE per step with ALL live nets (mutable,
-    /// read order = live order) BEFORE any per-net `train_step`. Default:
-    /// no-op (the historical per-net-isolated behavior).
-    ///
-    /// This is the engine-side vantage point for loop-breaking schemes that
-    /// need the whole population: pop-mean action anchors, distillation,
-    /// shared-referee matches. The trainer may READ every net here and
-    /// cache whatever its `train_step` needs (e.g. the pop's mean action
-    /// distribution per observation); per-net learning stays in
-    /// `train_step`. Implementations must not rely on the order or on
-    /// Optimizer state — only on the forward pass.
+        /// Pop-wide phase: called ONCE per step with ALL live nets, BEFORE any per-net
+        /// `train_step`. Default: no-op; for loop-breaking schemes needing the population.
     fn pop_phase(&mut self, _nets: &mut [(String, &mut Network)], _step: usize) {}
 }
 
 // ── The engine's trainer seam ────────────────────────────────────────────────────
 
-/// The ENGINE's view of any trainer — one value, two modes. The engine core
-/// never knows which mode it serves; it talks to this enum. Every method is
-/// an exhaustive `match`, so adding one cannot silently fall through to a
-/// trait default the way hand-written `Box<dyn _>` forwarding impls could.
+/// The ENGINE's view of any trainer — one value, two modes. Every method is an
+/// exhaustive `match`, so adding one cannot fall through to a trait default.
 pub enum AnyTrainer {
+    /// A tabular (dataset-driven) trainer.
     Tabular(Box<dyn TabularStep>),
+    /// An RL (environment-driven) trainer.
     Rl(Box<dyn RlStep>),
 }
 
@@ -437,6 +352,7 @@ impl AnyTrainer {
         matches!(self, Self::Rl(_))
     }
 
+    /// Build the optimizer this scheme trains with.
     pub fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
         match self {
             Self::Tabular(t) => t.make_optimizer(net),
@@ -444,6 +360,7 @@ impl AnyTrainer {
         }
     }
 
+    /// This scheme's hyperparameter blob for `engine.json` (`None` = none).
     pub fn describe(&self) -> Option<serde_json::Value> {
         match self {
             Self::Tabular(t) => t.describe(),
@@ -563,10 +480,8 @@ mod tests {
         }
     }
 
-    /// The ctx carries the run clock (`step` + `max_steps`), so a trainer can
-    /// derive progress and anneal its own schedules without a private counter —
-    /// and `None` means "unbounded: no schedule", the same convention the
-    /// trainer-side challenge decay ([`crate::trainer::challenge`]) uses.
+        /// The ctx carries the run clock (`step` + `max_steps`), so a trainer can anneal
+        /// its own schedule; `None` = unbounded, the same convention as challenge decay.
     #[test]
     fn step_env_progress_reads_the_run_clock() {
         let env = StepEnv {
@@ -604,12 +519,8 @@ mod tests {
         Network::build(&graph, Device::CPU).unwrap()
     }
 
-    /// REGRESSION (cartpole's post-run abort): `engine.guardrail()` must reach
-    /// the trainer's OWN `holdout_score`. It once did not — a hand-written
-    /// `Box<dyn RlStep>` forwarding impl omitted the method, so the trait
-    /// DEFAULT ran and `unimplemented!()` killed a race that had already
-    /// finished. `AnyTrainer`'s exhaustive `match` makes that hole
-    /// unrepresentable; this test pins the dispatch anyway.
+        /// REGRESSION: `engine.guardrail()` must reach the trainer's OWN
+        /// `holdout_score` through enum dispatch, not the trait DEFAULT (`unimplemented!()`).
     #[test]
     fn enum_dispatch_reaches_the_rl_override() {
         let mut net = tiny_net();
@@ -622,9 +533,8 @@ mod tests {
         );
     }
 
-    /// The tabular half of the same bug: a library trainer WITH a scorer
-    /// installed (`TabularTrainer::with_holdout_scorer` — the MNIST path) must
-    /// reach it through enum dispatch, not a default panic.
+        /// The tabular half of the same bug: a trainer WITH a scorer installed must
+        /// reach it through enum dispatch, not a default panic.
     #[test]
     fn enum_dispatch_reaches_the_tabular_scorer() {
         let trainer = crate::trainer::TabularTrainer::new(

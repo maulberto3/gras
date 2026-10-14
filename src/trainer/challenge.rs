@@ -41,17 +41,8 @@
 
 use crate::engine::config::run_progress;
 
-/// The decay shape of the challenge knob: `eff = prob × (1 − progress^k)`.
-///
-/// All three arms share ONE closed form, so the schedule is a pure function of
-/// persisted values — replay, catch-up and resume re-derive the identical
-/// probability (an arbitrary closure could not be persisted, and would break
-/// the bit-exact challenge replay contract). `Linear` = k 1 (default — the
-/// straight-line historical schedule); `Exponential` = k 2 (holds the knob
-/// HIGHER through mid-run — at progress 0.5 the factor is 0.75 vs 0.5 — then
-/// falls off a cliff approaching the budget's end); `Custom { exponent }` = any
-/// k. The string form ("linear", "exponential", "custom:1.5") round-trips
-/// through `engine.json` and the CLI.
+/// The decay shape of the challenge knob: `eff = prob × (1 − progress^k)` — one
+/// closed form so replay/resume re-derive the identical probability.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ChallengeDecay {
@@ -65,32 +56,26 @@ pub enum ChallengeDecay {
 }
 
 impl ChallengeDecay {
-    /// The exponent `k` this shape applies as `1 − progress^k`, clamped to a
-    /// sane domain: k ≤ 0 would send `progress^k` to inf/NaN at progress 0
-    /// (a hand-built `Custom { exponent: -1.0 }`), exploding the knob to >1
-    /// so every challenge fires. Non-finite k (NaN) clamps the same way. The
-    /// knob is a probability, so 1 − progress^k stays in [0, 1] for any k ≥ 0.
-    /// Validation at the string-parse boundary keeps honest users out of
-    /// trouble; THIS clamp is the safety net for the paths that bypass it.
+        /// The exponent `k` as `1 − progress^k`, clamped to [0, 100]: non-finite or
+        /// negative k would explode the knob; the knob stays a probability.
     pub(crate) fn exponent(self) -> f32 {
+        /// Lower clamp bound for the challenge exponent.
         const MIN_EXPONENT: f32 = 0.0;
+        /// Upper clamp bound for the challenge exponent.
         const MAX_EXPONENT: f32 = 100.0;
         let k = match self {
             ChallengeDecay::Linear => 1.0,
             ChallengeDecay::Exponential => 2.0,
             ChallengeDecay::Custom { exponent } => exponent,
         };
-        // max/min, NOT clamp: `clamp` propagates NaN (returns NaN for a NaN
-        // receiver), while `f32::max(NaN, min)` / `min(NaN, max)` fall to the
-        // finite operand — exactly the degenerate-value fallback we want.
+            // max/min, NOT clamp: `clamp` propagates NaN, while `f32::max/min` fall
+            // to the finite operand — the degenerate-value fallback we want.
         k.max(MIN_EXPONENT).min(MAX_EXPONENT)
     }
 }
 
-// TryFrom<&str> — Tier 2 didactic (see AGENTS.md "Efficiency notes"): parse
-// lives with the enum (reusable by CLI/config tooling), returns a Result
-// instead of panicking on bad input, and keeps the parse-and-error string in
-// one place instead of duplicated match arms at every call site.
+// `TryFrom<&str>` lives with the enum (reusable by CLI/config tooling), returns a
+// Result instead of panicking, and keeps the parse-and-error string in one place.
 impl TryFrom<&str> for ChallengeDecay {
     type Error = String;
     fn try_from(s: &str) -> Result<Self, Self::Error> {
@@ -128,17 +113,8 @@ impl std::fmt::Display for ChallengeDecay {
     }
 }
 
-/// The effective (decayed) challenge probability at `step`: the knob scaled
-/// to 0 by the end of the step budget following `shape`, flat when the run is
-/// unbounded (same convention as [`run_progress`]).
-///
-/// Why the decay: challenges fight plateaus, and late-run steps are exactly
-/// where the final polish happens — the run ends with a fully challenge-free
-/// stretch so the last checkpoints measure the policy clean.
-///
-/// [`challenge_fires`] DECIDES with this value — one function, so a tabular
-/// trainer rolling element-level jitter against this number can never drift
-/// from what the trigger used.
+/// The effective (decayed) challenge probability at `step`: the knob scaled to 0
+/// by the end of the budget (flat when unbounded). [`challenge_fires`] decides with it.
 pub fn effective_challenge_prob(
     prob: f32,
     step: usize,
@@ -151,16 +127,8 @@ pub fn effective_challenge_prob(
     }
 }
 
-/// The challenge trigger: a pure function of `(run_seed, net_seed, step,
-/// challenge_prob, max_steps, shape)` — deterministic, so replay/catch-up
-/// re-fires the exact same challenges the original run saw (no persisted flag
-/// needed). `prob <= 0` never fires. It decides with
-/// [`effective_challenge_prob`] (the decayed knob) and rolls ONE flip per
-/// (net, step); the trainer owns what "challenged" means.
-///
-/// The trainer decides when to skip the roll — e.g. a scheme that wants no
-/// challenges during a final polish stretch simply doesn't call this there
-/// (the old engine-side rule: never during the pruner's solo phase).
+/// The challenge trigger: a pure function of `(run_seed, net_seed, step, prob,
+/// max_steps, shape)`, so replay re-fires the exact same challenges.
 pub fn challenge_fires(
     run_seed: u64,
     net_seed: u64,
@@ -183,9 +151,8 @@ pub fn challenge_fires(
 mod tests {
     use super::*;
 
-    /// The decay table, pinned: at each progress the factor is exactly
-    /// `1 − progress^k` for the three published shapes (Exponential holds
-    /// 0.75 at halfway vs Linear's 0.5 — the whole point of the shape).
+        /// The decay table, pinned: at each progress the factor is exactly
+        /// `1 − progress^k` for the three published shapes.
     #[test]
     fn decay_shapes_match_their_closed_form() {
         let cases: &[(f32, ChallengeDecay, f32)] = &[
@@ -241,9 +208,8 @@ mod tests {
         assert_eq!(ChallengeDecay::Custom { exponent: 1e9 }.exponent(), 100.0);
     }
 
-    /// `prob <= 0` never fires; `prob = 1` at step 0 (factor 1) always fires.
-    /// The trigger is a pure function of its arguments — same inputs, same
-    /// answer, every call.
+        /// `prob <= 0` never fires; `prob = 1` at step 0 always fires. The trigger
+        /// is a pure function of its arguments — same inputs, same answer.
     #[test]
     fn trigger_is_pure_and_respects_the_knob() {
         assert!(!challenge_fires(
@@ -298,9 +264,8 @@ mod tests {
         assert!(ChallengeDecay::try_from("custom:-1").is_err());
     }
 
-    /// The trigger is per-NET, not per-step: at one step with `p = 0.5` a
-    /// population of distinct seeds must split roughly in half. A single
-    /// shared seed (the old founder-seed bug) made it all-or-nothing.
+        /// The trigger is per-NET, not per-step: at one step with `p = 0.5` a
+        /// population of distinct seeds must split roughly in half.
     #[test]
     fn trigger_is_per_net_not_per_step() {
         use crate::utils::seed::derive_seed;

@@ -16,16 +16,8 @@ use flodl::nn::optim::Optimizer;
 use flodl::tensor::Result;
 use flodl::{Tensor, Variable};
 
-/// Classic tabular scheme: one `train_one_step` on the step's shared train
-/// batch, then one `eval_one_step` on the step's shared eval batch. Seeding
-/// matches the engine's historical behavior exactly (`seed_step_randomness`
-/// with call_index 0 before training, batch drawn from the shared stream) so
-/// runs stay deterministic and catch-up replay parity holds.
-///
-/// Also owns everything about how a net learns: the loss function (a
-/// supervised scheme's defining choice), the Adam learning rate (via
-/// `make_optimizer`), and the gradient-norm clip. The engine carries none of
-/// them — `RaceConfig` has no training knobs.
+/// Classic tabular scheme: one train step + one eval step on the step's shared
+/// batches. Also owns the loss, LR (via `make_optimizer`), and grad clip.
 pub struct TabularTrainer {
     /// The loss this scheme trains against (supervised paradigm).
     pub loss_fn: crate::trainer::BoxedLossFn,
@@ -37,19 +29,11 @@ pub struct TabularTrainer {
     pub batch_size: usize,
     /// Custom evaluation batch size requested from the engine stream.
     pub eval_batch_size: usize,
-    /// Optional LR schedule: pure function of the step clock. `None` = fixed
-    /// LR. Wrapped as a closure so any flodl scheduler (or hand math) fits:
-    /// `.with_lr_schedule(move |s| CosineScheduler::new(base, min, total).lr(s))`.
-    /// MUST be a pure function of `step` — see `TabularStep::scheduled_lr`.
+        /// Optional LR schedule: pure function of the step clock (`None` = fixed LR);
+        /// MUST be deterministic in `step` alone — see `TabularStep::scheduled_lr`.
     pub lr_schedule: Option<Box<dyn Fn(usize) -> f64 + Send + Sync>>,
-    /// What objective `loss_fn` actually optimizes, for the run record.
-    ///
-    /// The engine cannot see inside the closure, so this label is the only
-    /// machine-readable statement of the loss. Offline replay tools
-    /// (`examples/export_champion.rs`) need it to rebuild a net's weights: a
-    /// replay under a *different* objective retrains different weights and
-    /// still looks plausible, so those tools refuse an unlabeled scheme rather
-    /// than guess.
+        /// What objective `loss_fn` optimizes, for the run record. The engine can't
+        /// see inside the closure, so replay tools refuse an unlabeled scheme.
     pub loss_label: Option<String>,
     pub(crate) holdout: Option<HoldoutScorer>,
 }
@@ -68,11 +52,8 @@ impl TabularTrainer {
         }
     }
 
-    /// Name the loss this scheme trains against, for `engine.json`. Use a
-    /// plain name for a plain loss (`"mse"`, `"cross_entropy"`) so replay
-    /// tools can rebuild it; a custom objective should carry a descriptive
-    /// label (`"cross_entropy_label_smoothing_0.1"`) — that records the truth
-    /// and tells the tool it cannot replay this run.
+        /// Name the loss this scheme trains against, for `engine.json` — a plain
+        /// name lets replay tools rebuild it; a custom one records the truth.
     pub fn with_loss_label(mut self, label: impl Into<String>) -> Self {
         self.loss_label = Some(label.into());
         self
@@ -102,16 +83,8 @@ impl TabularTrainer {
         self
     }
 
-    /// Set an LR schedule: a pure function of the step clock returning the
-    /// learning rate for that step. Wrap any flodl scheduler:
-    ///
-    /// ```ignore
-    /// .with_lr_schedule(move |s| CosineScheduler::new(1e-3, 1e-6, total).lr(s))
-    /// ```
-    ///
-    /// The closure must be deterministic in `step` alone (replay/catch-up
-    /// contract — see `TabularStep::scheduled_lr`). `None` (default) keeps
-    /// the optimizer's fixed LR.
+        /// Set an LR schedule: a pure function of the step clock returning the rate
+        /// for that step; the closure must be deterministic in `step` alone.
     pub fn with_lr_schedule(
         mut self,
         schedule: impl Fn(usize) -> f64 + Send + Sync + 'static,
@@ -120,15 +93,8 @@ impl TabularTrainer {
         self
     }
 
-    /// Make this trainer guardrail-capable: the scorer draws ONE fresh
-    /// holdout batch (rows no training/eval/gating step ever touches — keep
-    /// them OUT of `data_dir`'s pools; a separate file or synthetic slice)
-    /// and scores the net in the SAME units as the run's fitness. The
-    /// engine's `guardrail()` then needs no second object. `game_i` is the
-    /// deterministic game index — seed your draw from it.
-    ///
-    /// How many games get played is the RUN's business, not this
-    /// constructor's: `set_elite_guardrail_matches` (default 16).
+        /// Make this trainer guardrail-capable: the scorer draws ONE fresh holdout
+        /// batch and scores in the run's fitness units. Games played = the run's.
     pub fn with_holdout_scorer(
         mut self,
         scorer: impl Fn(&mut Network, usize) -> Result<f32> + Send + 'static,
@@ -181,9 +147,8 @@ impl TabularStep for TabularTrainer {
         }))
     }
 
-    /// Guardrail measurement half: run the trainer's holdout scorer when one
-    /// was installed via `with_holdout_scorer`; without one, fail with the
-    /// contract panic (loud, not silent).
+        /// Guardrail measurement half: run the holdout scorer when installed;
+        /// without one, fail with the contract panic (loud, not silent).
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> Result<f32> {
         match &self.holdout {
             Some(scorer) => scorer(net, game_i),
@@ -217,10 +182,8 @@ impl TabularStep for TabularTrainer {
         step: usize,
         ctx: &TabularContext<'_>,
     ) -> Result<crate::trainer::TabularStepReport> {
-        // The tabular recipe uses every engine-provided handle: shared
-        // stream for the step's batches, loss + fitness + metrics for
-        // scoring. A scheme that doesn't fit that mold implements
-        // `TabularStep` differently — nothing here is engine-hidden.
+            // The tabular recipe uses every engine handle: shared stream for the
+            // step's batches, loss + fitness + metrics for scoring.
         let fitness = ctx.fitness;
         let loss_fn: crate::trainer::LossFn<'_> = &*self.loss_fn; // our own loss
 

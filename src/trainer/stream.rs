@@ -28,9 +28,8 @@ use flodl::tensor::Result;
 use crate::utils::seed::derive_seed;
 use crate::utils::tabular_data::Dataset;
 
-/// Per-step eval batches are derived from `run_seed + EVAL_STREAM_OFFSET`,
-/// never `run_seed` itself — same contract shape as the legacy
-/// `EVAL_SEED_OFFSET` (train and eval randomness must not share a seed).
+/// Per-step eval batches derive from `run_seed + EVAL_STREAM_OFFSET`, never
+/// `run_seed` itself — train and eval randomness must not share a seed.
 pub const EVAL_STREAM_OFFSET: u64 = 0xFFFF;
 
 /// Checkpoint exam randomness is derived from `run_seed + EXAM_STREAM_OFFSET`
@@ -39,26 +38,22 @@ pub const EXAM_STREAM_OFFSET: u64 = 0xFFFF_FFFF;
 
 // ── PoolSplit (D12) ─────────────────────────────────────────────────────────
 
-/// The static train/eval pool split, fixed once at run start. Every net in
-/// the race trains on the train pool and is evaluated on the eval pool —
-/// identical conditions by construction.
+/// The static train/eval pool split, fixed once at run start: every net trains on
+/// the train pool and is evaluated on the eval pool — identical conditions.
 #[derive(Clone, Debug)]
 pub struct PoolSplit {
     /// Row indices nets train on (the stream draws from here).
     pub train: Vec<i64>,
     /// Row indices nets are evaluated on (eval batches draw from here).
     pub eval: Vec<i64>,
-    /// Row indices reserved for checkpoint "surprise exams" — never used for
-    /// training or per-step eval, so a checkpoint score on these rows can only
-    /// reflect generalization, not memorization. Kept disjoint from `train`
-    /// and `eval` by construction.
+        /// Row indices reserved for checkpoint "surprise exams" — never used for
+        /// training or per-step eval, so an exam score reflects generalization.
     pub gating: Vec<i64>,
 }
 
 impl PoolSplit {
-    /// Split `dataset.len()` rows into train/eval/gating pools with a seeded,
-    /// deterministic shuffle. The eval ratio is divided into two halves: the
-    /// per-step eval pool and the gating (surprise-exam) pool.
+        /// Split `dataset.len()` rows into train/eval/gating pools with a seeded,
+        /// deterministic shuffle; the eval ratio halves into eval and gating.
     pub fn new(len: usize, train_eval_split_ratio: f32, seed: u64) -> Self {
         let (train, rest) = crate::utils::tabular_data::split_indices(
             len,
@@ -66,9 +61,8 @@ impl PoolSplit {
             train_eval_split_ratio,
             seed,
         );
-        // Half the held-out rows are the per-step eval pool, half the gating
-        // pool — a deterministic, seed-derived split of `rest` (already
-        // shuffled by split_indices).
+            // Half the held-out rows are the per-step eval pool, half the gating pool
+            // (a deterministic, seed-derived split of `rest`).
         let half = rest.len() / 2;
         let (eval, gating) = if half == 0 && rest.len() > 1 {
             (
@@ -93,29 +87,14 @@ impl PoolSplit {
         Self::new(dataset.len(), train_eval_split_ratio, seed)
     }
 
-    /// Split from an EXPLICIT train/test layout — the engine's
-    /// `{train, test}` two-dataset mode (`resolve_train_test_datasets`).
-    ///
-    /// The combined dataset is `train rows [0..train_len)` followed by
-    /// `test rows [train_len..total)`. Instead of shuffling one pool, the
-    /// pools are built BY CONSTRUCTION:
-    /// - `train` = ALL train-dataset rows (the engine trains on exactly
-    ///   what the user's train/ directory holds — no silent reshuffle),
-    /// - `eval` + `gating` = a seeded split of ALL test-dataset rows,
-    ///   same 50/50 division of the held-out side as [`PoolSplit::new`].
-    ///
-    /// Row DISJOINTNESS between train and eval is now guaranteed by the
-    /// directory layout (the test rows were never in the training pool at
-    /// all), not by the shuffle — and the replay contract is untouched:
-    /// the pools are still a pure function of `(train_len, test_len,
-    /// run_seed)`, both of which the run header records.
+        /// Split from an EXPLICIT train/test layout: `train` = all train rows;
+        /// `eval` + `gating` = a seeded 50/50 split of all test rows.
     pub fn explicit(train_len: usize, test_len: usize, seed: u64) -> Self {
         assert!(test_len > 0, "explicit split needs a non-empty test pool");
         let train: Vec<i64> = (0..train_len as i64).collect();
         let test_rows: Vec<i64> = (train_len as i64..(train_len + test_len) as i64).collect();
-        // Seeded shuffle of the TEST rows only, then the same half/half
-        // division `PoolSplit::new` uses: half per-step eval pool, half
-        // checkpoint surprise-exam pool.
+            // Seeded shuffle of the TEST rows only, then the same half/half division
+            // `PoolSplit::new` uses: eval pool + surprise-exam pool.
         let mut rest = test_rows;
         let mut rng = fastrand::Rng::with_seed(seed);
         for i in (1..rest.len()).rev() {
@@ -139,11 +118,8 @@ impl PoolSplit {
 
 // ── BatchStream ─────────────────────────────────────────────────────────────
 
-/// The shared, deterministic, infinite batch stream.
-///
-/// Batch for step *s* = `f(run_seed, s)` — no internal cursor, no state. Any
-/// net (or tool) can materialize any step's batch independently, which is
-/// what makes catch-up and resume replays exact (the replay contract).
+/// The shared, deterministic, infinite batch stream: batch for step *s* is
+/// `f(run_seed, s)` — no cursor, no state — so catch-up/resume replays exactly.
 #[derive(Clone, Debug)]
 pub struct BatchStream {
     run_seed: u64,
@@ -157,9 +133,8 @@ pub struct BatchStream {
 }
 
 impl BatchStream {
-    /// Build a stream over a run's pools. Holds only indices — dataset rows
-    /// are gathered at materialization time, so the stream stays cheap to
-    /// clone per net.
+        /// Build a stream over a run's pools. Holds only indices — rows are gathered
+        /// at materialization time, so the stream is cheap to clone per net.
     pub fn new(run_seed: u64, batch_size: usize, split: PoolSplit) -> Self {
         BatchStream {
             run_seed,
@@ -173,10 +148,8 @@ impl BatchStream {
         }
     }
 
-    /// Override the eval batch size (trainer's `stream_shape` hook). Train
-    /// and eval walk *separate* permutations with separate offsets, so the
-    /// two sizes are independent — changing one never shifts the other's
-    /// window, and `(run_seed, step)` purity holds for both.
+        /// Override the eval batch size (trainer's `stream_shape` hook). Train and eval
+        /// walk separate permutations, so the two sizes are independent.
     pub fn with_eval_batch_size(mut self, eval_batch_size: usize) -> Self {
         self.eval_batch_size = eval_batch_size.max(1);
         self
@@ -188,21 +161,20 @@ impl BatchStream {
         self
     }
 
-    /// Set the checkpoint cadence — the eval permutation rotates per era
-    /// (era = `step / checkpoint_every`), so the engine's `checkpoint_every`
-    /// and the stream's rotation period must agree.
+        /// Set the checkpoint cadence — the eval permutation rotates per era, so it
+        /// must agree with the engine's `checkpoint_every`.
     pub fn with_checkpoint_every(mut self, n: usize) -> Self {
         self.checkpoint_every = n.max(1);
         self
     }
 
-    /// In-place variant of [`Self::with_checkpoint_every`]. The engine calls
-    /// this at run start / resume so a post-construction config edit can never
-    /// desync the eval rotation from the gate cadence.
+        /// In-place variant of [`Self::with_checkpoint_every`], called by the engine at
+        /// run start / resume so a config edit can't desync the eval rotation.
     pub fn set_run_checkpoint_every(&mut self, n: usize) {
         self.checkpoint_every = n.max(1);
     }
 
+    /// Train batch size the stream materializes.
     pub fn batch_size(&self) -> usize {
         self.batch_size
     }
@@ -213,6 +185,7 @@ impl BatchStream {
         self.checkpoint_every
     }
 
+    /// Eval batch size the stream materializes.
     pub fn eval_batch_size(&self) -> usize {
         self.eval_batch_size
     }
@@ -228,10 +201,8 @@ impl BatchStream {
         self.held_out_eval_rows
     }
 
-    /// The three pool index vectors this stream draws from (train, eval,
-    /// gating) — row indices into the run's (combined) dataset. Read-only
-    /// view for tests and tooling; the stream never mutates them after
-    /// construction.
+        /// The three pool index vectors this stream draws from (train, eval, gating) —
+        /// read-only view; never mutated after construction.
     pub fn pools(&self) -> (&[i64], &[i64], &[i64]) {
         (&self.train_pool, &self.eval_pool, &self.gating_pool)
     }
@@ -244,17 +215,15 @@ impl BatchStream {
         Ok((x, y))
     }
 
-    /// A contiguous window of `batch_size` pool rows, starting at `offset`
-    /// (wrapping around the pool). One permutation, consumed round-robin:
-    /// the "shuffle" happens once (seeded), the walk is positional.
+        /// A contiguous window of `batch_size` pool rows starting at `offset`
+        /// (wrapping): one permutation consumed round-robin.
     fn window(pool: &[i64], batch_size: usize, offset: usize) -> Vec<i64> {
         let n = pool.len();
         (0..batch_size).map(|i| pool[(offset + i) % n]).collect()
     }
 
-    /// The **train** batch for `step` — what every live net trains on at
-    /// that step. Pure function of `(run_seed, step)`; call it as many
-    /// times, from as many places, as you like.
+        /// The **train** batch for `step` — what every live net trains on. Pure
+        /// function of `(run_seed, step)`; call it anywhere, any number of times.
     pub fn train_batch(&self, dataset: &Dataset, step: u64) -> Result<(Tensor, Tensor)> {
         // One seeded permutation of the train pool, derived from the run
         // seed only — steps walk it round-robin via a step-derived offset.
@@ -269,20 +238,14 @@ impl BatchStream {
         Self::gather(dataset, &Self::window(&perm, self.batch_size, offset))
     }
 
-    /// The **eval** batch for `step` — the held-out batch every live net is
-    /// scored on at that step (eval mode; no gradients). Derived from
-    /// `run_seed + EVAL_STREAM_OFFSET` so eval randomness never shares a
-    /// seed with training.
-    /// First `n` rows of the eval permutation **at era 0** (deterministic subset of the
-    /// held-out pool — legacy stable reading; the engine uses the era-aware
-    /// `eval_pool_rows_at` instead).
+        /// The first `n` rows of the eval permutation **at era 0** (legacy stable
+        /// reading; the engine uses the era-aware `eval_pool_rows_at`).
     pub fn eval_pool_rows(&self, n: usize) -> Result<Vec<i64>> {
         self.eval_pool_rows_at(n, 0)
     }
 
-    /// First `n` rows of the eval permutation at the given era. Deterministic
-    /// in `(run_seed, era)` — the engine rotates this at each checkpoint so
-    /// the best-net reading isn't always the same fixed rows.
+        /// First `n` rows of the eval permutation at `era` — deterministic in
+        /// `(run_seed, era)`, rotated per checkpoint so the reading isn't fixed rows.
     pub fn eval_pool_rows_at(&self, n: usize, era: u64) -> Result<Vec<i64>> {
         let perm = self.eval_permutation(era);
         Ok(Self::window(&perm, n.max(1), 0))
@@ -294,9 +257,8 @@ impl BatchStream {
         Self::gather(dataset, indices)
     }
 
-    /// The eval permutation for `era` — re-shuffled per checkpoint era so no
-    /// single ordering of the eval pool dominates the ranking. Pure function
-    /// of `(run_seed, era)`; era 0 matches the legacy fixed permutation.
+        /// The eval permutation for `era` — re-shuffled per checkpoint; pure function
+        /// of `(run_seed, era)`; era 0 matches the legacy fixed permutation.
     fn eval_permutation(&self, era: u64) -> Vec<i64> {
         let perm_seed = derive_seed(self.run_seed.wrapping_add(EVAL_STREAM_OFFSET), era as usize);
         let mut perm = self.eval_pool.clone();
@@ -314,25 +276,16 @@ impl BatchStream {
         (step as usize / self.checkpoint_every) as u64
     }
 
-    /// The **eval** batch for `step` — the held-out batch every live net is
-    /// scored on at that step (eval mode; no gradients). Derived from
-    /// `run_seed + EVAL_STREAM_OFFSET` (never shares a seed with training)
-    /// and rotated **per checkpoint era**: steps in the same era walk one
-    /// permutation, the next era re-shuffles it. Smoothed eval fitness
-    /// therefore averages skill across several orderings of the pool, not
-    /// one memorizable pass. Pure function of `(run_seed, step)` — catch-up
-    /// replays see the same rotated batches the population saw.
+        /// The **eval** batch for `step` — the held-out batch every live net is scored
+        /// on. Rotated per checkpoint era; pure in `(run_seed, step)`.
     pub fn eval_batch(&self, dataset: &Dataset, step: u64) -> Result<(Tensor, Tensor)> {
         let perm = self.eval_permutation(self.era_of(step));
         let offset = (step as usize).wrapping_mul(self.eval_batch_size);
         Self::gather(dataset, &Self::window(&perm, self.eval_batch_size, offset))
     }
 
-    /// The **checkpoint exam** — a "surprise test" batch drawn from the
-    /// gating pool: rows that no training step and no per-step eval step ever
-    /// touches. Scored once per checkpoint (engine bookkeeping), so a good
-    /// exam score can only reflect generalization, not memorized rows or a
-    /// rehearsed ordering. Pure function of `(run_seed, era)`.
+        /// The **checkpoint exam** — a "surprise test" batch from the gating pool
+        /// (touched by no training/eval step). Pure function of `(run_seed, era)`.
     pub fn exam_batch(&self, dataset: &Dataset, era: u64) -> Result<(Tensor, Tensor)> {
         let exam_seed = derive_seed(self.run_seed.wrapping_add(EXAM_STREAM_OFFSET), era as usize);
         let mut perm = self.gating_pool.clone();
@@ -509,11 +462,8 @@ mod tests {
             b0_again.to_f32_vec().unwrap(),
             "pure function of (run_seed, step)"
         );
-        // Era 0's first batch must differ from era 1's first batch (rotation).
-        // Compare row *sets* — with a small eval pool both eras' batch-0
-        // windows can coincide by chance; rotation means the permutation
-        // differs, which shows up as a different row multiset across a full
-        // lap. Sample several windows to make the flake probability ~0.
+            // Era 0's first batch must differ from era 1's: compare row *sets* across
+            // several windows so the flake probability is ~0.
         let era0_rows = (0..4usize)
             .map(|i| s.eval_batch(&ds, i as u64).unwrap().0.to_f32_vec().unwrap())
             .collect::<Vec<_>>()

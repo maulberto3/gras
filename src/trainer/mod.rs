@@ -8,12 +8,8 @@ pub mod core;
 pub mod decision_lag;
 pub mod stream;
 
-// The reference tabular scheme is NOT part of the shipped library surface:
-// the engine only knows the `TabularStep` contract, and a concrete recipe is
-// the caller's to own (see `examples/mnist.rs` for the hand-rolled one and
-// `examples/ref_trainer/mod.rs` for the shared example copy). The original
-// library copy is kept here as test scaffolding so the engine's own tests have
-// a trainer to drive; it compiles only under `cfg(test)`.
+// Test scaffolding, not shipped surface: the engine knows only the `TabularStep`
+// contract, so this compiles under `cfg(test)` to give its tests a trainer.
 #[cfg(test)]
 pub mod supervised;
 #[cfg(test)]
