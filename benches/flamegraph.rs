@@ -7,8 +7,8 @@
 //!   backward + eval. This is the profile that decides the batch-stream
 //!   question (cache the permutation? materialize once per step? stateless
 //!   index derivation?).
-//! - **`--evolve`** — rolls on, which adds checkpoint catch-up replay
-//!   (O(clock) per child) to the mix. Use this to profile the evolution path.
+//! - **`--evolve`** — rolls on, which adds the crossover/mutation cull+insert
+//!   path to the mix. Use this to profile the evolution path.
 //!
 //! For *numbers* rather than a profile (and for machines where perf can't
 //! sample, e.g. WSL2 without a PMU), use `cargo bench --bench stream` — that is
@@ -74,8 +74,8 @@ fn main() {
         .set_topology_input_dim(d_in)
         .set_topology_output_dim(d_out)
         .set_run_log_level(LogLevel::None)
-        // No checkpoint inside the run ⇒ no nets/*.json or checkpoints.json
-        // writes, and no history.csv flush, to pollute the profile.
+        // No checkpoint inside the run ⇒ no nets/*.json or checkpoint-elite-*
+        // snapshot writes, and no history.csv flush, to pollute the profile.
         .set_run_checkpoint_every(steps + 1);
 
     if evolve {
