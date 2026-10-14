@@ -53,8 +53,7 @@ pub use evolution::selection::SelectionMethod;
 // ── trainer — shared deterministic batching ──────────────────────────
 pub use trainer::stream::{BatchStream, PoolSplit};
 // NOTE: no concrete tabular scheme is re-exported — the library ships the
-// contract only. Bring your own (or copy the reference recipes under
-// `examples/`: `mnist.rs` hand-rolled, `ref_trainer/` shared).
+// contract; copy a reference recipe from `examples/` if you want one.
 pub use trainer::{
     AnyTrainer, LossFn, RlContext, RlStep, RlStepMeta, RunData, StepEnv, StepReport, StreamShape,
     TabularContext, TabularStep,
@@ -77,7 +76,7 @@ pub use utils::score::{
 // ── step primitives ──────────────────────────────────────────────────
 pub use utils::race_steps::{
     deterministic_train_step, deterministic_train_step_fn, eval_one_step, eval_one_step_fn,
-    seed_step_randomness, train_one_step, train_one_step_fn, train_one_step_pred_only,
+    seed_step_randomness, train_one_step, train_one_step_fn,
 };
 
 // ── flodl — the tensor backend ───────────────────────────────────────
@@ -89,18 +88,16 @@ pub use flodl;
 // ── prelude — one import for the common surface ──────────────────────
 
 /// One import for the common surface: `use gras::prelude::*;`.
-///
-/// Covers the engine entry points, the fitness/direction types, the trainer
-/// contracts and their reports, the shared batch stream, the graph types, the
-/// config enums an example actually touches, and the tensor/device
-/// re-exports. Everything else stays reachable through its module path —
-/// `gras::engine::config::*` for the full knob surface, `gras::utils::*` for
-/// data/score/step helpers — so a glob import here stays legible.
-///
-/// Deliberately NOT re-exported: `flodl::tensor::Result` (glob-importing
-/// `Result` would collide with `std::result::Result`), the `Metric`-adjacent
-/// low-level scoring helpers, and the `DataFormat`/loader family.
 pub mod prelude {
+    //! The common surface: engine entry points, fitness/direction types, trainer
+    //! contracts + reports, the batch stream, graph types, config enums, and the
+    //! tensor/device re-exports.
+    //!
+    //! Everything else stays reachable by module path (`gras::engine::config::*`,
+    //! `gras::utils::*`), so a glob import here stays legible. Deliberately NOT
+    //! re-exported: `flodl::tensor::Result` (a glob-imported `Result` would
+    //! collide with `std::result::Result`), the low-level scoring helpers, and
+    //! the `DataFormat`/loader family.
     // Engine config + entry points.
     pub use crate::engine::config::{
         CrossCullPolicy, CrossoverGate, LogLevel, MutationCullPolicy, PopPruner, PopPrunerMethod,
@@ -135,6 +132,7 @@ pub mod prelude {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────
+/// CUDA device 0 with the `cuda` feature, otherwise CPU.
 pub fn auto_device() -> flodl::Device {
     #[cfg(feature = "cuda")]
     {
