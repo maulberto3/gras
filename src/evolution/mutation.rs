@@ -2,10 +2,8 @@
 
 use serde::Serialize;
 
-/// Mutation strategy for perturbing a single topology.
-/// Each variant carries its own probability. The mutation pool (which
-/// activations, combine ops, or standardize ops to pick from) is always
-/// taken from the engine-level pools — not per-variant.
+/// Mutation strategy for perturbing a single topology. Each variant carries its
+/// own probability; the op pools come from the engine, never per-variant.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum MutationMethod {
     /// Swap a random hidden node's activation.
@@ -17,19 +15,17 @@ pub enum MutationMethod {
     CombineOp { prob: f32 },
     /// Swap a random hidden node's standardize op.
     Standardize { prob: f32 },
-    /// Redraw a random hidden node's elementwise feature transform from the
-    /// run's transform pool (opt-in; a run with no transform pool configured
-    /// never draws this — the engine skips the variant).
+    /// Redraw a hidden node's feature transform from the run's pool. Opt-in: a
+    /// run with no transform pool never draws this.
     Transform { prob: f32 },
-    /// Redraw one non-primary output port's activation (port >= 1) of a
-    /// random hidden node from the run's activation pool. Ports >= 1 only:
-    /// port 0 mirrors the node-level activation (the node's main signal).
+    /// Redraw one non-primary output port's activation (port >= 1) of a random
+    /// hidden node; port 0 mirrors the node-level activation by convention.
     PortActivation { prob: f32 },
 }
 
 impl Default for MutationMethod {
+    /// Disabled by default — the user opts in via `set_mutation()`.
     fn default() -> Self {
-        // Disabled by default — user must call set_mutation() explicitly.
         MutationMethod::Activation { prob: 0.0 }
     }
 }

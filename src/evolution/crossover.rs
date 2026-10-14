@@ -13,6 +13,7 @@ pub enum CrossoverMethod {
 }
 
 impl Default for CrossoverMethod {
+    /// Uniform at 0.7 action / 0.5 swap — the engine's default.
     fn default() -> Self {
         CrossoverMethod::Uniform {
             action_prob: 0.7,
@@ -22,6 +23,7 @@ impl Default for CrossoverMethod {
 }
 
 impl CrossoverMethod {
+    /// The per-roll probability this strategy acts (its own knob).
     pub fn action_prob(&self) -> f32 {
         match self {
             CrossoverMethod::OnePoint { action_prob, .. }

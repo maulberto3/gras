@@ -36,9 +36,8 @@ pub fn all_combine_ops() -> Vec<CombineOp> {
         CombineOp::Mean,
         CombineOp::Max,
         CombineOp::Min,
-        // CombineOp::Multiply, Subtract, Divide excluded by default —
-        // numerically unstable with random weights (overflow, large losses).
-        // Add explicitly: .set_combine_op_pool(vec![..., CombineOp::Multiply])
+        // Multiply/Subtract/Divide stay out by default: numerically unstable with
+        // random weights. Add them back via `.set_combine_op_pool(vec![..])`.
     ]
 }
 
@@ -53,10 +52,8 @@ pub fn all_standardize_ops() -> Vec<StandardizeOp> {
     ]
 }
 
-/// All built-in elementwise feature transforms. Deliberately EXCLUDED from
-/// the empty-pool default of any other op: the transform slot is opt-in per
-/// run (`set_topology_transform_pool`) — a run that never configures it
-/// draws `None` (identity), keeping old search spaces intact.
+/// All built-in elementwise feature transforms. Opt-in, unlike the other pools:
+/// an unconfigured run draws `None` (identity), keeping old search spaces intact.
 pub fn all_transforms() -> Vec<Transform> {
     vec![
         Transform::Log1p,

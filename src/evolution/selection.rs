@@ -15,11 +15,8 @@ use serde::Serialize;
 /// Selection strategy used by the engine to pick parents for the next
 /// generation. Each variant wraps its own tuning knobs.
 #[derive(Clone, Debug, PartialEq, Serialize)]
-pub enum SelectionMethod {
-    /// Tournament selection with elitism — the best individual always
-    /// survives, every other slot is filled by a `tournament_size`-way
-    /// random draw. Higher `tournament_size` pressures selection more
-    /// toward the fittest.
+pub enum SelectionMethod {        /// Tournament selection with elitism — the best individual always
+        /// survives; higher `tournament_size` pressures toward the fittest.
     Tournament { tournament_size: usize },
     /// Fitness-proportionate (roulette wheel) selection: one draw returns
     /// one index, weighted by the (direction-adjusted, non-negative) scores.
@@ -59,12 +56,8 @@ impl SelectionMethod {
             Self::Roulette => "roulette".to_string(),
         }
     }
-}
-
-/// One roulette-wheel draw: returns a single index into `scores`, chosen with
-/// probability proportional to its direction-adjusted weight. Negative scores
-/// are clamped to 0; if the total weight is 0 (or the slice is empty), returns
-/// an empty vec (no pick possible).
+}    /// One roulette-wheel draw: returns an index into `scores`, probability
+    /// proportional to direction-adjusted weight (negatives clamped to 0).
 fn roulette_select(scores: &[f32], direction: Direction, rng: &mut fastrand::Rng) -> Vec<usize> {
     if scores.is_empty() {
         return Vec::new();
@@ -92,13 +85,8 @@ fn roulette_select(scores: &[f32], direction: Direction, rng: &mut fastrand::Rng
         }
     }
     vec![weights.len() - 1]
-}
-
-/// Tournament selection with elitism.
-///
-/// Returns `scores.len()` indices. The top `elite_count` individuals are
-/// always kept; every other slot is a `tournament`-way random draw.
-/// Tournament size is clamped to at least 1.
+}    /// Tournament selection with elitism: returns `scores.len()` indices, top
+    /// `elite_count` always kept, the rest a `tournament`-way draw.
 fn tournament_select(
     scores: &[f32],
     direction: Direction,
@@ -221,11 +209,8 @@ mod tests {
     fn test_label() {
         let m = SelectionMethod::Tournament { tournament_size: 5 };
         assert_eq!(m.label(), "tournament(k=5)");
-    }
-
-    // Iter-5: roulette distribution sanity — the wheel must be biased
-    // toward higher-ranked nets in expectation (3:1 for weights 3,1) and
-    // deterministic under a fixed seed.
+    }        // Roulette sanity: the wheel must be biased toward higher-ranked nets
+        // in expectation (3:1 for weights 3,1) and deterministic under a seed.
     #[test]
     fn test_roulette_biased_toward_higher_score() {
         let scores = [3.0, 1.0];
