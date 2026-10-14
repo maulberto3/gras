@@ -1,11 +1,25 @@
-//! Fitness smoothing: the rolling buffer, its mean, and the window it uses.
+//! Fitness smoothing: the rolling buffer, its mean, its spread, and the window
+//! it uses.
 //!
 //! Every ranking decision in the engine reads *smoothed* fitness, not the raw
 //! per-step value — raw values bounce with batch difficulty, the trend is what
-//! matters. The consumers are the current best/worst net (cull victim
-//! selection), the roulette parent ranking, the
-//! checkpoint ledger's `pop_mean_fitness`, and the `RaceSnapshot` handed to a
-//! custom stop closure.
+//! matters. Since FIT the ranking value is not the mean but the **risk-adjusted
+//! score**: the window mean shifted by `λ` window standard deviations toward the
+//! bad side (see [`Direction::risk_adjusted`]), so a steady net outranks a
+//! volatile one with the same mean. The readable mean and its spread travel
+//! alongside it (logs, `history.csv`, `engine.json`). The consumers are the
+//! current best/worst net (cull victim selection), the roulette parent ranking,
+//! the elite/champion set, and the `RaceSnapshot` handed to a custom stop
+//! closure.
+//!
+//! Only the arithmetic mean is kept here: the geometric / harmonic family was
+//! removed with FIT. Both punish the LOW tail, which is the risk-averse choice
+//! for a Maximize fitness but the risk-SEEKING one for a Minimize fitness (its
+//! low readings are the lucky ones), so neither is a direction-symmetric
+//! objective. The spread term is symmetric, which is why one λ covers both
+//! directions.
+
+use crate::engine::fitness::Direction;
 
 /// A small fixed-capacity rolling buffer — the in-memory equivalent of reading
 /// back the last K `NetMetrics` snapshots from a net's state file.
@@ -23,7 +37,7 @@ impl RollingBuffer {
             cap,
         }
     }
-        /// A buffer pre-filled with `values` (capped at `cap`); test convenience.
+    /// Push one reading, dropping the oldest past `cap`.
     pub fn push(&mut self, v: f32) {
         self.inner.push_back(v);
         if self.inner.len() > self.cap {
@@ -62,6 +76,10 @@ impl RollingBuffer {
 }
 
 /// Rolling mean of a buffer's values. Returns 0.0 for an empty buffer.
+///
+/// This is the READABLE window value ("the turns it survives"), reported as `μ`
+/// in the logs and JSON. It is also the center the risk-adjusted score starts
+/// from — ranking itself reads [`WindowStats::risk_adjusted`], not this.
 pub fn rolling_mean(buf: &RollingBuffer) -> f32 {
     if buf.is_empty() {
         return 0.0;
@@ -70,38 +88,16 @@ pub fn rolling_mean(buf: &RollingBuffer) -> f32 {
     sum / buf.len() as f32
 }
 
-/// Geometric mean of a buffer's values. For a maximizer's readings this is the
-/// "count the low readings" mean: it shrinks the influence of lucky high spikes.
-pub fn rolling_geometric_mean(buf: &RollingBuffer, floor: f32) -> f32 {
-    if buf.is_empty() {
-        return 0.0;
-    }
-    let n = buf.len() as f32;
-    let sum_log: f32 = buf.iter().map(|v| v.max(floor).ln()).sum();
-    (sum_log / n).exp()
-}
-
-/// Harmonic mean of a buffer's values. For a minimizer's readings this is the
-/// "count the high readings" mean: it shrinks the influence of lucky low spikes.
-pub fn rolling_harmonic_mean(buf: &RollingBuffer, floor: f32) -> f32 {
-    if buf.is_empty() {
-        return 0.0;
-    }
-    let n = buf.len() as f32;
-    let v = floor.max(f32::EPSILON);
-    let sum_recip: f32 = buf.iter().map(|x| 1.0 / x.max(v)).sum();
-    n / sum_recip
-}
-
 /// A smoothed reading WITH its own error bar: how many readings it averages and
 /// how much they spread — the race's number is a mean of K small samples.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowStats {
     /// Readings behind `mean` (buffer length, ≤ the smoothing window).
     pub n: usize,
-    /// Their mean — the smoothed reading every ranking decision uses.
+        /// Their mean — the readable smoothed level, and the center the ranking score is
+        /// computed from. Use [`WindowStats::risk_adjusted`] for the value ranking uses.
     pub mean: f32,
-    /// Population std of the readings: their step-to-step spread.
+    /// Population std of the readings: their step-to-step spread (`σ` in the logs).
     pub std: f32,
         /// Extreme readings in the window — the readable form of `std` (e.g. one
         /// 500 among fizzles).
@@ -118,6 +114,18 @@ impl WindowStats {
         /// `Some(0.0)` for one reading (unobservable spread, not precision).
     pub fn se(&self) -> Option<f32> {
         (self.n > 0).then(|| self.std / (self.n as f32).sqrt())
+    }
+
+        /// The RISK-ADJUSTED score (FIT) this window ranks by: the mean shifted `lambda`
+        /// window-stds toward the bad side for `direction`. Thin wrapper over
+        /// [`Direction::risk_adjusted`] so the fitness units, the direction rule and the
+        /// spread all stay in ONE place; `lambda = 0.0` returns `mean` exactly.
+        ///
+        /// A single-reading window has `std = 0`, so it scores as its own reading — a lucky
+        /// first step looks perfectly safe. The guard against that is an eligibility rule
+        /// (minimum readings before ranking), not this formula.
+    pub fn risk_adjusted(&self, direction: Direction, lambda: f32) -> f32 {
+        direction.risk_adjusted(self.mean, self.std, lambda)
     }
 }
 
@@ -171,67 +179,47 @@ mod tests {
     }
 
     #[test]
-    fn geometric_mean_weights_the_low_readings() {
-            // The cartpole champion's window: one lucky 500 among four fizzles;
-            // the geometric mean pulls toward the fizzles.
+    fn window_stats_risk_adjusted_reads_the_window() {
+        // The bimodal champion: one lucky 500 among four fizzles. The mean is a
+        // readable 132, the spread is 184 — the score must charge for it.
         let buf = RollingBuffer::from_values(5, &[40.0, 500.0, 40.0, 40.0, 40.0]);
-        // exp(mean(ln(40), ln(500), ln(40), ln(40), ln(40)))
-        let geo = rolling_geometric_mean(&buf, f32::EPSILON);
-        // independent check: product^(1/5)
-        let product: f32 = buf.iter().product::<f32>();
-        // Tolerance, not identity: the two paths (log-sum vs product-root)
-        // round differently in f32.
+        let s = rolling_stats(&buf).unwrap();
+        assert_eq!(s.mean, 132.0);
+        assert!((s.risk_adjusted(Direction::Maximize, 0.0) - 132.0).abs() < 1e-4);
+        let scored = s.risk_adjusted(Direction::Maximize, 1.0);
         assert!(
-            (product.powf(0.2) - geo).abs() < 1e-4,
-            "geo mismatch: product-root {} vs geo {}",
-            product.powf(0.2),
-            geo
+            scored < s.mean,
+            "a maximizer pays for its spread: {scored} must be under {}",
+            s.mean
         );
-        assert!(geo < 500.0, "must shrink the 500");
-        assert!(geo > 40.0, "must stay above the floor");
-    }
-
-    #[test]
-    fn harmonic_mean_weights_the_high_readings() {
-        // For a minimizer the worst step is the one you most want to count.
-        let buf = RollingBuffer::from_values(5, &[40.0, 500.0, 40.0, 40.0, 40.0]);
-        let hm = rolling_harmonic_mean(&buf, f32::EPSILON);
-        // n / sum(1/x) with one 500 and four 40s.
-        let expected = 5.0 / (4.0 / 40.0 + 1.0 / 500.0);
-        assert_eq!(hm, expected, "harmonic mismatch {}", hm);
-        // For a maximizer this is the wrong choice: it counts the high 500 more.
-        assert!(hm > 40.0);
-    }
-
-    #[test]
-    fn geometric_and_harmonic_handle_zeros_via_the_floor() {
-        // A window with a true 0 — a net that died immediately — must not
-        // crash (ln(0)) or dominate (1/0).
-        let buf = RollingBuffer::from_values(3, &[0.0, 0.0, 50.0]);
-        // With floor 1.0, the two 0.0s count as 1.0 each.
-        let geo = rolling_geometric_mean(&buf, 1.0);
-        let expected_geo = (1.0_f32 * 1.0 * 50.0).powf(1.0 / 3.0);
+        // Minimize: the same spread is added, never subtracted.
+        let scored_min = s.risk_adjusted(Direction::Minimize, 1.0);
+        assert!(scored_min > s.mean);
+        // Both arms pay the SAME λσ; they differ only in which side of the mean
+        // they are on.
+        let (paid_hi, paid_lo) = (s.mean - scored, scored_min - s.mean);
         assert!(
-            (geo - expected_geo).abs() < 1e-5,
-            "geo mismatch: {} vs {}",
-            geo,
-            expected_geo
+            (paid_hi - paid_lo).abs() < 1e-4,
+            "one λ covers both directions: paid {paid_hi} vs {paid_lo}"
         );
-        let hm = rolling_harmonic_mean(&buf, 1.0);
-        assert_eq!(hm, 3.0 / (2.0 / 1.0 + 1.0 / 50.0));
-        // Floor 0.0 would crash: ln(0) or 1/0. Provide a positive floor at the
-        // call site (see WindowStats::smoothed_mean for the default).
-        let geo_floor = rolling_geometric_mean(&buf, f32::EPSILON);
-        assert!(geo_floor > 0.0);
-        assert!(geo_floor < 50.0);
     }
 
     #[test]
-    fn geometric_mean_is_strictly_between_arithmetic_and_floor_under_spread() {
-        let buf = RollingBuffer::from_values(5, &[40.0, 500.0, 40.0, 40.0, 40.0]);
-        let arith = rolling_mean(&buf);
-        let geo = rolling_geometric_mean(&buf, f32::EPSILON);
-        assert!(geo < arith, "geometric < arithmetic when readings spread");
+    fn window_stats_risk_adjusted_keeps_a_steady_window_on_top() {
+        // Same mean, different spread: the steady window must score better in BOTH
+        // directions — the whole point of FIT.
+        let steady = rolling_stats(&RollingBuffer::from_values(4, &[300.0; 4])).unwrap();
+        let volatile =
+            rolling_stats(&RollingBuffer::from_values(4, &[250.0, 350.0, 250.0, 350.0])).unwrap();
+        assert_eq!(steady.mean, volatile.mean);
+        for dir in [Direction::Maximize, Direction::Minimize] {
+            let a = steady.risk_adjusted(dir, 1.0);
+            let b = volatile.risk_adjusted(dir, 1.0);
+            assert!(
+                dir.is_better(a, b),
+                "{dir:?}: steady {a} must beat volatile {b}"
+            );
+        }
     }
 
     #[test]

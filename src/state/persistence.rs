@@ -73,6 +73,12 @@ pub struct ConfigSnapshot {
     pub eval_batch_size: Option<usize>,
     /// Per-net fitness smoothing window (K).
     pub smoothing_window: usize,
+        /// Risk aversion λ (FIT) the run ranked with — window stds charged against a net's
+        /// smoothed mean. `#[serde(default)]` (⇒ `0.0`) because every run recorded before
+        /// FIT ranked on the PLAIN MEAN: resuming one must reproduce that exact ranking, so
+        /// the legacy default is the pre-FIT behavior, not the new default.
+    #[serde(default)]
+    pub risk_aversion: f32,
     /// Device the run executed on (`"cpu"` | `"cuda:0"`).
     pub device: String,
     /// Whether the lossless per-step `metrics.csv` was written.
@@ -156,6 +162,7 @@ impl ConfigSnapshot {
             batch_size,
             eval_batch_size,
             smoothing_window: cfg.smoothing_window,
+            risk_aversion: cfg.risk_aversion,
             device: if cfg!(feature = "cuda") {
                 "cuda:0"
             } else {
@@ -195,10 +202,20 @@ pub struct GuardrailRecord {
         /// fitness the SMALLEST champion is scored and recorded.
     #[serde(default)]
     pub champion_params: Option<i64>,
-    /// The champion's smoothed race fitness — the reference the holdout
-    /// reading is compared against. `None` if the run recorded no verdict.
+        /// The champion's smoothed race fitness — the READABLE window mean, kept in the
+        /// fitness's own units so it stays directly comparable with `holdout_mean`. `None` if
+        /// the run recorded no verdict.
     #[serde(default)]
     pub race_smoothed: Option<f32>,
+        /// Spread of the champion's race window (σ). The holdout's own `holdout_std` is the
+        /// same quantity measured on fresh games, so the two spreads are comparable.
+    #[serde(default)]
+    pub race_std: Option<f32>,
+        /// The RISK-ADJUSTED score (FIT) that ranked the champion first — `race_smoothed`
+        /// penalized by `λ · race_std` in the run's direction. Recorded so a reader can see
+        /// how much of the champion's rank came from steadiness rather than raw level.
+    #[serde(default)]
+    pub race_score: Option<f32>,
         /// Standard error of `race_smoothed`; `None` when the scoring path could not see the
         /// champion's rolling window (saved-run scoring).
     #[serde(default)]
@@ -709,9 +726,21 @@ pub struct NetState {
     /// Why it left (`"crossover"` | `"immigrant-slot"`).
     #[serde(default)]
     pub cull_reason: Option<String>,
-    /// Its smoothed fitness at the moment of culling.
+        /// Its smoothed fitness at the moment of culling — the READABLE window mean (e.g. the
+        /// turns it survived), NOT the risk-adjusted score that ranked it.
     #[serde(default)]
     pub final_smoothed_fitness: Option<f32>,
+        /// Spread of that window (population std of the step readings). With the mean it tells
+        /// "always that good" from "one lucky step" at a glance; `None` on legacy tombstones.
+    #[serde(default)]
+    pub final_fitness_std: Option<f32>,
+        /// The RISK-ADJUSTED score (FIT: `mean ∓ λσ`) the net was actually ranked by at the
+        /// moment of culling. Equals `final_smoothed_fitness` when λ = 0.
+    #[serde(default)]
+    pub final_risk_score: Option<f32>,
+        /// Step readings behind the three values above. `0` on legacy tombstones.
+    #[serde(default)]
+    pub final_fitness_samples: usize,
     /// When this individual entered the live population. For lifetime tracking
     /// and the robustness-equivalent (appearances / span / final score).
     pub entered_at_step: usize,
@@ -845,6 +874,9 @@ impl NetState {
             culled_at_step: None,
             cull_reason: None,
             final_smoothed_fitness: None,
+            final_fitness_std: None,
+            final_risk_score: None,
+            final_fitness_samples: 0,
             entered_at_step: step,
             created_from,
             last_metrics: None,
@@ -1311,6 +1343,31 @@ mod tests {
         write_engine_json(&dir, &updated).unwrap();
         let again = load_engine_json(&dir).unwrap();
         assert_eq!(again.run_id, "run-2");
+    }
+
+        /// FIT legacy contract: a run recorded BEFORE the λ knob carries no
+        /// `risk_aversion` in its `engine.json` — and it ranked on the PLAIN MEAN, so the
+        /// serde default must be `0.0`, NOT the new default `1.0`. Anything else would
+        /// silently re-rank a resumed legacy run against its recorded history.
+    #[test]
+    fn legacy_config_snapshot_defaults_risk_aversion_to_the_plain_mean() {
+        let snapshot = ConfigSnapshot::from_config(&crate::engine::config::RaceConfig::defaults(), None, None);
+        assert_eq!(snapshot.risk_aversion, crate::engine::config::RISK_AVERSION);
+        // Round-trips at the new default…
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let back: ConfigSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.risk_aversion, crate::engine::config::RISK_AVERSION);
+        // …and a value JSON with the key REMOVED (exactly a pre-FIT engine.json) loads
+        // as λ = 0.0 while every other knob still comes through.
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy.as_object_mut().unwrap().remove("risk_aversion");
+        let loaded: ConfigSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            loaded.risk_aversion, 0.0,
+            "a pre-FIT run ranked on the plain mean"
+        );
+        assert_eq!(loaded.smoothing_window, snapshot.smoothing_window);
+        assert_eq!(loaded.pop_size, snapshot.pop_size);
     }
 
     #[test]

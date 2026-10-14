@@ -68,7 +68,7 @@ use crate::trainer::stream::{BatchStream, PoolSplit};
 
 use super::config::{RaceConfig, StopReason};
 use super::format::{build_stamp, csv_field};
-use super::smoothing::{RollingBuffer, WindowStats, rolling_mean, rolling_stats};
+use super::smoothing::{RollingBuffer, WindowStats, rolling_stats};
 
 // ── CoreEngine ───────────────────────────────────────────────────────────────
 
@@ -729,6 +729,20 @@ impl CoreEngine {
                 self.header.config.smoothing_window
             )).into());
         }
+        // λ is replay-relevant for the same reason: it decides how much of a net's
+        // spread is charged before it ranks. A run recorded BEFORE FIT stored no λ
+        // (⇒ 0.0) because it ranked on the plain mean, so resuming it needs
+        // `set_run_risk_aversion(0.0)` — the refusal names that value.
+        if (self.config.risk_aversion - self.header.config.risk_aversion).abs() > 1e-6 {
+            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                "resume: risk_aversion mismatch — run recorded λ={:.2} but the resume config sets λ={:.2} — \
+                 ranking semantics would change; set set_run_risk_aversion({:.2}) (or omit) to resume \
+                 (a run that predates FIT recorded 0.00: it ranked on the plain mean)",
+                self.header.config.risk_aversion,
+                self.config.risk_aversion,
+                self.header.config.risk_aversion
+            )).into());
+        }
         let run_dir = self.run_dir.clone();
         let nets_dir = run_dir.join("nets");
         let mut loaded = 0usize;
@@ -981,7 +995,7 @@ impl CoreEngine {
             // The knobs that silently change what a run MEANS, printed up front so a resumed
             // command is reconstructible from the log alone.
             info!(
-                "race knobs: cull_policy={:?} dropout={} freeze_elites={} elite_save={} worst_save={} probation_steps={} crossover_probation_steps={} elite_join_probation_steps={} elite_crown_lifetime_steps={}",
+                "race knobs: cull_policy={:?} dropout={} freeze_elites={} elite_save={} worst_save={} probation_steps={} crossover_probation_steps={} elite_join_probation_steps={} elite_crown_lifetime_steps={} risk_aversion={:.2}",
                 self.config.crossover_cull_policy,
                 self.header.topology_options.dropout_prob,
                 self.config.freeze_elites,
@@ -991,12 +1005,15 @@ impl CoreEngine {
                 self.config.crossover_probation_steps,
                 self.config.elite_join_probation_steps,
                 self.config.elite_crown_lifetime_steps,
+                self.config.risk_aversion,
             );
             // What the numbers above/below MEAN, stated once — without it a reader cannot
-            // tell a 4-match fitness sample from a 200-match one, nor what `smt`/`★` mean.
+            // tell a 4-match fitness sample from a 200-match one, nor what `smt`/`μ`/`σ`/`★`
+            // mean. `smt` is no longer the mean: it is the risk-adjusted score.
             info!(
-                "  log legend: smt = rolling mean of the last K={} clocks │ fitness per clock = mean over the `matches` played that clock │ ★ = elite rank (each with its seat tenure) │ trained n/m = optimizer updates over clocks lived",
+                "  log legend: fitness = mean over the `matches` played that clock │ μ = rolling mean of the last K={} clock fitnesses (the readable level) │ σ = their spread │ smt = the risk-adjusted score rankings use (μ paid λ={:.2}σ in the run's own direction; λ=0 ⇒ smt = μ) │ ★ = elite rank (each with its seat tenure) │ trained n/m = optimizer updates over clocks lived",
                 self.config.smoothing_window,
+                self.config.risk_aversion,
             );
             // The trainer's own self-description: the only visible record of trainer-side
             // knobs (challenge trigger, schedules, clipping), which left with the trainer.
@@ -1401,28 +1418,31 @@ impl CoreEngine {
 
     // ── Smoothed fitness ────────────────────────────────────────────────────
 
-    /// Per-net rolling-mean fitness over the live population, in `live_hashes()`
-    /// order — the shared input for the ledger, ranking and `RaceSnapshot`.
+    /// Per-net RISK-ADJUSTED fitness over the live population, in `live_hashes()`
+    /// order — the shared input for ranking and `RaceSnapshot` (FIT: the window
+    /// mean charged `λ` window-stds for its own spread).
     pub(crate) fn smoothed_fitness_values(&self) -> Vec<f32> {
-        // Only nets with a non-empty rolling buffer get a smoothed value — a caught-up
-        // child qualifies at once, and phantom 0.0 values never drag the mean down.
+        // Only nets with a non-empty rolling buffer get a value — a caught-up child
+        // qualifies at once, and phantom 0.0 values never drag the mean down.
+        let direction = self.fitness.direction();
+        let lambda = self.config.risk_aversion;
         self.state
             .live_hashes()
-            .iter()
-            .filter(|h| {
-                self.rolling_fitness
-                    .get(*h)
-                    .map(|b| b.iter().count() > 0)
-                    .unwrap_or(false)
-            })
-            .map(|h| rolling_mean(self.rolling_fitness.get(h).unwrap()))
+            .into_iter()
+            .filter_map(|h| self.race_reading_of(&h))
+            .map(|s| s.risk_adjusted(direction, lambda))
             .collect()
     }
 
-    /// The net's smoothed fitness (rolling mean over `smoothing_window` step
-    /// fitnesses — what every ranking decision reads). `None` = no fitness yet.
+        /// The net's ranking value (FIT): the risk-adjusted window score, `mean ∓ λ·σ`
+        /// over `smoothing_window` step fitnesses — what every ranking decision reads.
+        /// `None` = no fitness yet. The READABLE level behind it is
+        /// [`CoreEngine::race_reading_of`]'s `mean`; at `λ = 0` the two are identical.
     pub fn smoothed_fitness_of(&self, hash: &str) -> Option<f32> {
-        self.rolling_fitness.get(hash).map(rolling_mean)
+        let direction = self.fitness.direction();
+        let lambda = self.config.risk_aversion;
+        self.race_reading_of(hash)
+            .map(|s| s.risk_adjusted(direction, lambda))
     }
 
     /// The net's RACE READING with its own error bar: the smoothed mean plus how many
@@ -1447,7 +1467,12 @@ impl CoreEngine {
         // The race reading AND its error bar, read from the LIVE rolling buffer before
         // scoring: the spread is what separates "collapsed" from "an unresolvable mean".
         let race = self.race_reading_of(&champion);
-        let race_smoothed = self.smoothed_fitness_of(&champion);
+        // The race REFERENCE stays the readable window mean: it is the number the
+        // holdout mean is directly comparable with (same units, same quantity). The
+        // risk-adjusted score that actually ranked the champion rides alongside it,
+        // so a reader can see how much of the rank came from steadiness.
+        let race_smoothed = race.map(|r| r.mean);
+        let race_score = self.smoothed_fitness_of(&champion);
         let mut verdict = match self.networks.get_mut(&champion) {
             Some(net) => {
                 // `eval()` first: the resting state a fresh disk rebuild gets for free, and the
@@ -1485,13 +1510,16 @@ impl CoreEngine {
             .unwrap_or_default();
         let race_note = match race {
             Some(r) => format!(
-                "race reading {:.1} over {} step reading(s) (SE {:.1}, window min {:.1} / max {:.1}, latest {:.1})",
+                "race reading μ{:.1} over {} step reading(s) (±σ{:.1}, SE {:.1}, window min {:.1} / max {:.1}, latest {:.1} │ risk-adj {:.1} at λ={:.2})",
                 r.mean,
                 r.n,
+                r.std,
                 r.se().unwrap_or(0.0),
                 r.min,
                 r.max,
-                r.latest
+                r.latest,
+                race_score.unwrap_or(r.mean),
+                self.config.risk_aversion,
             ),
             None => "race reading unavailable (no rolling window recorded)".to_string(),
         };
@@ -1521,6 +1549,8 @@ impl CoreEngine {
             champion_hash: verdict.hash.clone(),
             champion_params: self.net_params(&verdict.hash),
             race_smoothed: verdict.race_smoothed,
+            race_std: race.map(|r| r.std),
+            race_score,
             race_se: verdict.race_se,
             race_samples: verdict.race_samples,
             race_latest: verdict.race_latest,
@@ -1557,13 +1587,20 @@ impl CoreEngine {
     /// best-first. `require_measured` is the eligibility contract (true = ranked_live).
     fn ranked_live_impl(&self, require_measured: bool) -> Vec<(String, f32)> {
         let direction = self.fitness.direction();
+        let lambda = self.config.risk_aversion;
         let mut ranked: Vec<(String, f32)> = self
             .state
             .live_hashes()
             .into_iter()
-            .filter_map(|h| match self.rolling_fitness.get(&h) {
-                Some(b) if !require_measured || !b.is_empty() => Some((h, rolling_mean(b))),
+            .filter_map(|h| match self.rolling_fitness.get(&h).and_then(rolling_stats) {
+                // FIT: the ranking value is the risk-adjusted score, so a net with a
+                // wild window pays for its spread before it is ever crowned, culled
+                // or drawn as a parent.
+                Some(s) if !require_measured || s.n > 0 => {
+                    Some((h, s.risk_adjusted(direction, lambda)))
+                }
                 Some(_) => None,
+                // Never measured: the parent-selection contract counts it as 0.0.
                 None if !require_measured => Some((h, 0.0)),
                 None => None,
             })
@@ -1709,8 +1746,18 @@ impl CoreEngine {
                 ),
                 None => String::new(),
             };
+                // The reading behind the rank, in three legs: `smt` on the line is the
+                // risk-adjusted score (FIT), `μ` the window level it was charged from, `σ`
+                // the spread it paid. `—` for a window too short to observe a spread.
+            let reading = self.race_reading_of(h);
             let details = format!(
-                "age {age_now} · {} · {} params{gate}",
+                "μ{} σ{} · age {age_now} · {} · {} params{gate}",
+                reading
+                    .map(|r| format!("{:.1}", r.mean))
+                    .unwrap_or_else(|| "—".into()),
+                reading
+                    .and_then(|r| (r.n > 1).then(|| format!("{:.1}", r.std)))
+                    .unwrap_or_else(|| "—".into()),
                 crate::engine::reporting::trained_note(trainings, age_now),
                 params.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
             );
@@ -1994,6 +2041,24 @@ impl CoreEngine {
                         row.push(',');
                         row.push_str(&val.to_string());
                     }
+                        // FIT columns, appended LAST so every existing column keeps its
+                        // position (positional readers stay valid): the risk-adjusted
+                        // score this net ranked by and the window spread it paid for.
+                        // `nan` = no reading yet, the same convention as `eval_loss`.
+                    let reading = self.race_reading_of(hash);
+                    let score = self.smoothed_fitness_of(hash);
+                    row.push(',');
+                    row.push_str(
+                        &score
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "nan".to_string()),
+                    );
+                    row.push(',');
+                    row.push_str(
+                        &reading
+                            .map(|r| r.std.to_string())
+                            .unwrap_or_else(|| "nan".to_string()),
+                    );
                     row.push('\n');
                     self.history_csv_buffer.push_str(&row);
                 }
@@ -2016,6 +2081,9 @@ impl CoreEngine {
             history_header.push(',');
             history_header.push_str(m.label());
         }
+        // The window's other two legs (`fitness` above stays the RAW per-step value):
+        // the risk-adjusted score the net ranked by, and its spread `σ`.
+        history_header.push_str(",fitness_smooth,fitness_smooth_std");
         let attempts_header = "step,branch,attempt,outcome,child_hash,child_net_seed,child_origin,child_fitness,victim,victim_net_seed,pop_size";
         let history_body = std::mem::take(&mut self.history_csv_buffer);
         let attempts_body = std::mem::take(&mut self.attempts_csv_buffer);
@@ -2421,6 +2489,103 @@ mod tests {
             Some(seed),
             Some(run_dir.to_path_buf()),
         ))
+    }
+
+    /// FIT: the ranking value is the risk-adjusted score, so a steady net outranks a
+    /// volatile one with the SAME window mean — and `λ = 0` puts them back on the mean.
+    /// The test fitness is Minimize (lower is better), i.e. the direction where the
+    /// penalty is ADDED, which is the half a naive implementation gets wrong.
+    #[test]
+    fn risk_aversion_ranks_the_steadier_net_first() {
+        let dir = std::env::temp_dir().join("gras-fit-ranking");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        let mut hashes = eng.state.live_hashes();
+        hashes.sort();
+        assert_eq!(hashes.len(), 2);
+        // Equal window means (0.50) so ONLY the spread can separate them: `hashes[0]`
+        // never moves, `hashes[1]` swings ±0.30 (population σ = 0.30).
+        for (h, values) in [
+            (&hashes[0], [0.50_f32, 0.50, 0.50, 0.50]),
+            (&hashes[1], [0.20_f32, 0.80, 0.20, 0.80]),
+        ] {
+            let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+            for v in values {
+                buf.push(v);
+            }
+            *eng.rolling_fitness.get_mut(h).unwrap() = buf;
+        }
+
+        // λ = 0 (the pre-FIT ranking): equal means ⇒ equal scores. The ORDER is then the
+        // sort's own tie-break, so pin the values, not the order.
+        eng.config.risk_aversion = 0.0;
+        let flat = eng.ranked_live();
+        assert_eq!(flat.len(), 2);
+        assert_eq!(flat[0].1, flat[1].1, "λ=0 must rank on the plain mean");
+        assert!((flat[0].1 - 0.50).abs() < 1e-6);
+
+        // λ = 1: Minimize pays `mean + σ`, so the steady net scores 0.50 and the
+        // volatile one 0.80 — the steady net ranks first and is strictly better.
+        eng.config.risk_aversion = 1.0;
+        let ranked = eng.ranked_live();
+        assert_eq!(ranked[0].0, hashes[0], "the steady net must rank first");
+        assert!((ranked[0].1 - 0.50).abs() < 1e-6, "steady score was {}", ranked[0].1);
+        assert!(
+            (ranked[1].1 - 0.80).abs() < 1e-6,
+            "volatile score was {}",
+            ranked[1].1
+        );
+        // The readable window mean is untouched by λ — the score is derived from it.
+        let reading = eng.race_reading_of(&hashes[1]).unwrap();
+        assert_eq!((reading.mean, reading.std), (0.50, 0.30));
+
+        // The ELITE take-k reads the same ranking: the steadier net holds the seat.
+        eng.config.elite_count = 1;
+        eng.config.elite_join_probation_steps = 0;
+        eng.config.elite_crown_lifetime_steps = 0;
+        eng.config.mutation_probation_steps = 0;
+        eng.config.crossover_probation_steps = 0;
+        assert_eq!(
+            eng.elite_hashes(),
+            vec![hashes[0].clone()],
+            "the elite must be the steadier net"
+        );
+        // …and so does cull-victim selection: the volatile net is the one dropped.
+        assert_eq!(
+            eng.worst_nets_by_smoothed_fitness(1).unwrap(),
+            vec![hashes[1].clone()],
+            "the cull victim must be the volatile net"
+        );
+    }
+
+    /// The tombstone a cull writes records all three legs of the reading the net died
+    /// with: the readable mean, its spread, and the score it was ranked by.
+    #[test]
+    fn cull_tombstone_records_mean_spread_and_risk_score() {
+        let dir = std::env::temp_dir().join("gras-fit-tombstone");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 11).unwrap();
+        eng.config.risk_aversion = 2.0;
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        let hashes = eng.state.live_hashes();
+        let victim = hashes[1].clone();
+        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        for v in [0.20_f32, 0.80, 0.20, 0.80] {
+            buf.push(v);
+        }
+        *eng.rolling_fitness.get_mut(&victim).unwrap() = buf;
+        eng.cull_net(&victim, 3, "crossover").unwrap();
+        let state = crate::state::load_net_state(&dir, &victim).unwrap();
+        assert_eq!(state.final_smoothed_fitness, Some(0.50), "the mean is readable");
+        assert_eq!(state.final_fitness_std, Some(0.30), "the spread is kept");
+        // Minimize at λ=2: 0.50 + 2(0.30) = 1.10 — the value that actually ranked it.
+        let score = state.final_risk_score.unwrap();
+        assert!((score - 1.10).abs() < 1e-6, "risk score was {score}");
+        assert_eq!(state.final_fitness_samples, 4);
+        assert_eq!(state.cull_reason.as_deref(), Some("crossover"));
     }
 
     #[test]
@@ -4040,6 +4205,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+        /// λ is replay-relevant like K: a run that recorded one λ cannot be resumed at
+        /// another, and a run from BEFORE FIT (no λ in `engine.json` ⇒ 0.0, i.e. it ranked
+        /// on the plain mean) is refused BY NAME until the caller passes 0.0 back.
+    #[test]
+    fn resume_refuses_a_risk_aversion_mismatch_and_names_the_recorded_value() {
+        let dir = std::env::temp_dir().join("race_resume_risk_aversion");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut engine = engine(&dir, 99).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        for h in engine.state.live_hashes() {
+            let state = engine.state.net(&h).cloned().unwrap();
+            crate::state::write_net_state(&dir, &state).unwrap();
+        }
+        drop(engine);
+
+        // Strip the field: exactly what an `engine.json` written before FIT looks like.
+        let raw = std::fs::read_to_string(dir.join("engine.json")).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        json["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("risk_aversion");
+        std::fs::write(dir.join("engine.json"), json.to_string()).unwrap();
+
+        let resume = |config: RaceConfig| {
+            crate::engine::TabularEngine::resume(
+                dir.clone(),
+                tiny_dataset_dir("risk_aversion"),
+                config,
+                fitness(),
+                crate::trainer::TabularTrainer::new(loss_fn()),
+            )
+        };
+        // The NEW default (λ = 1.0) against a run that recorded none is refused, and the
+        // message names the value that reproduces the recorded ranking.
+        let mut current = RaceConfig::defaults();
+        current.pop_size = 2;
+        let err = resume(current)
+            .err()
+            .expect("a λ mismatch must be refused, not patched")
+            .to_string();
+        assert!(err.contains("risk_aversion mismatch"), "{err}");
+        assert!(
+            err.contains("set_run_risk_aversion(0.00)"),
+            "the refusal must name the recorded λ: {err}"
+        );
+        // …and passing the recorded λ back resumes the run.
+        let mut legacy = RaceConfig::defaults();
+        legacy.pop_size = 2;
+        legacy.risk_aversion = 0.0;
+        assert!(
+            resume(legacy).is_ok(),
+            "a pre-FIT run must resume at the λ it actually ranked with"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Trainer-blob validation on resume ───────────────────────────────
 
     #[test]
@@ -5019,6 +5244,8 @@ mod tests {
             champion_hash: "abcdefghabcdefgh".into(),
             champion_params: Some(77),
             race_smoothed: Some(0.5),
+            race_std: Some(0.08),
+            race_score: Some(0.42),
             race_se: Some(0.02),
             race_samples: 5,
             race_latest: Some(0.52),

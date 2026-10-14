@@ -23,6 +23,12 @@ pub enum StopReason {
 /// decision averages over.
 pub const SMOOTHING_WINDOW: usize = 10;
 
+/// Default risk aversion (λ, FIT): how many window standard deviations a net is
+/// charged for its own spread. `1.0` = "credit the net only with the value it is
+/// still expected to beat after one window of bad luck"; `0.0` = rank on the
+/// plain window mean (the pre-FIT behavior).
+pub const RISK_AVERSION: f32 = 1.0;
+
 /// Steps between population checkpoints — the cadence the stream's era rotation
 /// and the CSV flush key off.
 pub const DEFAULT_CHECKPOINT_EVERY: usize = 10;
@@ -191,6 +197,10 @@ pub struct RaceConfig {
         /// Per-net smoothed-fitness rolling window (K) — how many recent step fitnesses every
         /// ranking decision averages over. Defaults to [`SMOOTHING_WINDOW`].
     pub smoothing_window: usize,
+        /// Risk aversion λ (FIT): window standard deviations subtracted from (Maximize) or
+        /// added to (Minimize) a net's smoothed mean before ranking. Defaults to
+        /// [`RISK_AVERSION`]; `0.0` ranks on the plain mean.
+    pub risk_aversion: f32,
         /// Mode-specific knobs (tabular vs RL) — the arm is carried in the type. The engine
         /// core reads only the shared fields; mode branches match on this arm.
     pub mode_specific: ModeConfig,
@@ -438,11 +448,13 @@ pub struct RaceSnapshot {
     pub live_count: usize,
     /// Current step.
     pub step: usize,
-    /// Best smoothed fitness.
+        /// Best smoothed fitness — the RISK-ADJUSTED window score (FIT: `mean ∓ λσ`), which is
+        /// what the race actually ranks on. At λ = 0 this is the plain window mean again.
     pub best_smoothed_fitness: f32,
-    /// Worst smoothed fitness.
+    /// Worst smoothed fitness — the same risk-adjusted score, at the other end.
     pub worst_smoothed_fitness: f32,
-    /// Mean smoothed fitness.
+        /// Mean of the live risk-adjusted scores (a plain arithmetic mean OF the scores, not a
+        /// second smoothing pass).
     pub mean_smoothed_fitness: f32,
     /// Cumulative culls.
     pub culls: usize,
@@ -482,6 +494,7 @@ impl RaceConfig {
             elite_join_probation_steps: 5,
             elite_crown_lifetime_steps: 5,
             smoothing_window: SMOOTHING_WINDOW,
+            risk_aversion: RISK_AVERSION,
             mode_specific: ModeConfig::Tabular(TabularConfig::default()),
             crossover_ops_pool: Vec::new(),
             max_steps: None,
@@ -620,6 +633,20 @@ impl RaceConfigBuilder {
         /// Replay-relevant: a resumed run must use the same value or construction fails parity.
     pub fn set_run_smoothing_window(mut self, k: usize) -> Self {
         self.cfg.smoothing_window = k.max(1);
+        self
+    }
+        /// Risk aversion λ (FIT) — how many window standard deviations a net pays for its own
+        /// spread, so a steady net outranks a volatile one with the same window mean.
+        /// Default [`RISK_AVERSION`] = 1.0; `0.0` restores the plain-mean ranking exactly.
+        /// Negative values clamp to 0.0 (a risk-SEEKING ranking is not offered) and a
+        /// non-finite λ falls back to the default. Replay-relevant: a resumed run must use
+        /// the same value or construction fails parity.
+    pub fn set_run_risk_aversion(mut self, lambda: f32) -> Self {
+        self.cfg.risk_aversion = if lambda.is_finite() {
+            lambda.max(0.0)
+        } else {
+            RISK_AVERSION
+        };
         self
     }
         /// A user-supplied stop predicate, consulted every step alongside `max_steps`;

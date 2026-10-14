@@ -10,7 +10,8 @@
 //!   closure types, `RaceSnapshot`, `RunMetaCtx`
 //! - [`population`] — initial population generation from the config's pools
 //! - [`child`] — child generation (roulette → crossover → mutate) + resume replay
-//! - [`smoothing`] — the rolling fitness buffer + its mean (ranking inputs)
+//! - [`smoothing`] — the rolling fitness buffer + the window's mean/spread and the
+//!   risk-adjusted score the rankings read
 //! - [`core`] — the `CoreEngine` itself: construction, the run loop,
 //!   per-net stepping, culling, persistence hooks
 //! - [`logging`] — the `tracing` subscriber + its three sinks (console,

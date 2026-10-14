@@ -270,11 +270,14 @@ fn record_guardrail(run_dir: &std::path::Path, champion_hash: &str, verdict: &Gu
         .as_ref()
         .map(|h| h.fitness_direction)
         .unwrap_or(Direction::Maximize);
-    // The race reference, when the run already recorded one.
-    let race_smoothed = header
-        .as_ref()
-        .and_then(|h| h.guardrail.as_ref())
-        .and_then(|g| g.race_smoothed);
+    // The race reference, when the run already recorded one. This path has no live
+    // rolling window (the population is gone), so the race side is CARRIED from the
+    // existing record rather than recomputed — `race_std`/`race_score` included, or
+    // a rescore would silently drop how the champion was ranked.
+    let race = header.as_ref().and_then(|h| h.guardrail.as_ref());
+    let race_smoothed = race.and_then(|g| g.race_smoothed);
+    let race_std = race.and_then(|g| g.race_std);
+    let race_score = race.and_then(|g| g.race_score);
     let params = crate::state::load_net_state(run_dir, champion_hash)
         .ok()
         .and_then(|s| s.meta.params);
@@ -282,6 +285,8 @@ fn record_guardrail(run_dir: &std::path::Path, champion_hash: &str, verdict: &Gu
         champion_hash: champion_hash.to_string(),
         champion_params: params,
         race_smoothed,
+        race_std,
+        race_score,
         // The live engine fills these in; a reloaded saved run has no window,
         // so they stay `None`/0 and the verdict falls back to the flat rule.
         race_se: verdict.race_se,

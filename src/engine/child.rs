@@ -457,6 +457,9 @@ impl CoreEngine {
             culled_at_step: None,
             cull_reason: None,
             final_smoothed_fitness: None,
+            final_fitness_std: None,
+            final_risk_score: None,
+            final_fitness_samples: 0,
                 // frozen_spans are KEPT: replay needs to know which clocks were act-and-measure.
                 // Keep the rest (hash, topology, net_seed, lineage, entry step, meta).
             ..state

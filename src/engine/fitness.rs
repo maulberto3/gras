@@ -47,6 +47,28 @@ impl Direction {
             Direction::Maximize => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
         }
     }
+
+    /// The RISK-ADJUSTED ranking value: the window `mean` shifted by `lambda`
+    /// window standard deviations TOWARD THE BAD SIDE, in the fitness's own
+    /// units. This is the single place the smoothing window's spread becomes a
+    /// ranking decision (FIT).
+    ///
+    /// - `Maximize` — a weak window drags the net DOWN (`mean − λσ`): the net is
+    ///   credited only with the value it is still expected to beat after one
+    ///   window of bad luck.
+    /// - `Minimize` — a costly window drags the net UP (`mean + λσ`).
+    ///
+    /// `std` is direction-INVARIANT (spread is spread), which is why ONE lambda
+    /// covers both directions — no per-direction knob exists or is needed. The
+    /// shift is expressed in fitness units, so [`Direction::cmp`] and every
+    /// call site that sorts with it keep working unchanged: `lambda = 0.0`
+    /// returns the plain mean exactly (the pre-FIT ranking).
+    pub fn risk_adjusted(&self, mean: f32, std: f32, lambda: f32) -> f32 {
+        match self {
+            Direction::Maximize => mean - lambda * std,
+            Direction::Minimize => mean + lambda * std,
+        }
+    }
 }
 
 // ── Fitness — computed or reported ───────────────────────────────────────
@@ -246,6 +268,82 @@ mod tests {
         assert!(!Direction::Minimize.is_better(1.0, 0.5));
         assert!(Direction::Maximize.is_better(1.0, 0.5));
         assert!(!Direction::Maximize.is_better(0.5, 1.0));
+    }
+
+    #[test]
+    fn risk_adjusted_at_zero_lambda_is_the_plain_mean() {
+        // The pre-FIT ranking, exactly — for BOTH directions and both signs of
+        // value (a negative-mean fitness must not drift either).
+        for (mean, std) in [(320.4, 41.0), (-0.75, 0.25), (0.0, 3.0)] {
+            assert_eq!(Direction::Maximize.risk_adjusted(mean, std, 0.0), mean);
+            assert_eq!(Direction::Minimize.risk_adjusted(mean, std, 0.0), mean);
+        }
+    }
+
+    #[test]
+    fn risk_adjusted_shifts_toward_the_bad_side() {
+        let (mean, std) = (320.0, 40.0);
+        let lambda = 1.0;
+        // Maximize: the penalty is SUBTRACTED (a weak window is less attractive).
+        let hi = Direction::Maximize.risk_adjusted(mean, std, lambda);
+        assert_eq!(hi, 280.0);
+        // Minimize: the same spread is ADDED (a costly window is less attractive).
+        let lo = Direction::Minimize.risk_adjusted(mean, std, lambda);
+        assert_eq!(lo, 360.0);
+        // The two directions move in OPPOSITE absolute directions but the SAME
+        // relative one: each is worse than its own mean.
+        assert!(hi < mean, "a maximizer must lose value from spread");
+        assert!(lo > mean, "a minimizer must lose value from spread");
+        // Wider lambda penalizes monotonically, and never better than λ=0.
+        for lambda in [0.5, 1.0, 2.0] {
+            assert!(Direction::Maximize.risk_adjusted(mean, std, lambda) <= mean);
+            assert!(Direction::Minimize.risk_adjusted(mean, std, lambda) >= mean);
+        }
+        // λ = 2 = two window-stds, not a clamp or a re-scale.
+        assert_eq!(Direction::Maximize.risk_adjusted(mean, std, 2.0), 240.0);
+    }
+
+    #[test]
+    fn risk_adjusted_is_mirrored_between_directions() {
+        // Negating the readings and flipping the direction must give the negated
+        // score: the two arms are one rule, not two rules that happen to agree.
+        for (mean, std) in [(320.0_f32, 40.0_f32), (1e-4, 2e-5), (-12.5, 3.5)] {
+            let up = Direction::Maximize.risk_adjusted(mean, std, 1.5);
+            let down = Direction::Minimize.risk_adjusted(-mean, std, 1.5);
+            assert!(
+                (up + down).abs() < 1e-5,
+                "Maximize({mean},{std}) = {up} must mirror Minimize({},{std}) = {down}",
+                -mean
+            );
+        }
+    }
+
+    #[test]
+    fn risk_adjustment_breaks_a_mean_tie_toward_the_steadier_net() {
+        // THE FIT CONTRACT: two nets with the SAME window mean, one steady one
+        // volatile. Under Maximize the steady net must rank better; the volatile
+        // one still wins on the plain mean (a tie, decided by the tie-break).
+        let steady = (300.0_f32, 5.0_f32); // always ~300
+        let volatile = (300.0_f32, 120.0_f32); // 40s and 500s
+        let dir = Direction::Maximize;
+        assert_eq!(dir.cmp(steady.0, volatile.0), std::cmp::Ordering::Equal);
+        let s = dir.risk_adjusted(steady.0, steady.1, 1.0);
+        let v = dir.risk_adjusted(volatile.0, volatile.1, 1.0);
+        assert!(
+            dir.is_better(s, v),
+            "the steady net ({s}) must outrank the volatile one ({v})"
+        );
+        // And λ = 0 removes the preference entirely (back to the mean).
+        assert_eq!(
+            dir.risk_adjusted(steady.0, steady.1, 0.0),
+            dir.risk_adjusted(volatile.0, volatile.1, 0.0)
+        );
+        // A minimizer: same numbers, spread is now the cost — the steady net wins
+        // on the SAME sort (`is_better` reads the smaller value as better).
+        let dir = Direction::Minimize;
+        let s = dir.risk_adjusted(steady.0, steady.1, 1.0);
+        let v = dir.risk_adjusted(volatile.0, volatile.1, 1.0);
+        assert!(dir.is_better(s, v), "minimizer: steady {s} beats volatile {v}");
     }
 
     #[test]

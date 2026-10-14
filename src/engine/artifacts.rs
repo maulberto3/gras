@@ -16,15 +16,23 @@ impl CoreEngine {
     /// k = `elite_count`. UNCONDITIONAL: an inheritance receipt, not a log line.
     pub(crate) fn write_elite_index(&mut self) -> Result<()> {
         self.record_champions();
+            // `fitness` stays the RANKING value (the key the next run and this file's
+            // readers already agree on); the reading behind it is written out in full so
+            // "ranked 1st because it is steady, not because it is high" is visible.
         let entries: Vec<serde_json::Value> = self
             .champion_ranked()
             .enumerate()
             .map(|(rank, (hash, fitness))| {
                 let state = self.state.net(&hash);
+                let reading = self.race_reading_of(&hash);
                 serde_json::json!({
                     "rank": rank + 1,
                     "hash": hash,
                     "fitness": fitness,
+                    "fitness_mean": reading.map(|r| r.mean),
+                    "fitness_std": reading.map(|r| r.std),
+                    "fitness_samples": reading.map(|r| r.n),
+                    "risk_aversion": self.config.risk_aversion,
                     "params": state.and_then(|s| s.meta.params),
                     "born": state.map(|s| s.entered_at_step),
                 })
@@ -74,10 +82,21 @@ impl CoreEngine {
             } else {
                 format!("Elite #{}", rank + 1)
             };
+                // The header names all three legs: the score it ranked by, and the window
+                // level `μ` / spread `σ` that produced it.
+            let reading = self.race_reading_of(&hash);
+            let (mu, sigma) = match reading {
+                Some(r) => (format!("{:.2}", r.mean), format!("{:.2}", r.std)),
+                None => ("—".to_string(), "—".to_string()),
+            };
             let md = format!(
-                "**{label} · fitness {} (smoothed) = {:.4}**\n\n{}",
+                "**{label} · fitness {} (risk-adjusted) = {:.4} · window μ{} σ{} over {} reading(s) · λ={:.2}**\n\n{}",
                 self.fitness.direction().arrow(),
                 fitness,
+                mu,
+                sigma,
+                reading.map(|r| r.n).unwrap_or(0),
+                self.config.risk_aversion,
                 crate::utils::markdown::topology_markdown(&topo, None),
             );
             match std::fs::write(&path, &md) {
@@ -185,10 +204,18 @@ impl CoreEngine {
             if let Some(state) = self.state.net(&worst) {
                 if let Ok(topo) = state.topology() {
                     let path = self.run_dir.join(format!("worst-{short}.md"));
+                    let reading = self.race_reading_of(&worst);
                     let md = format!(
-                        "**Worst · fitness {} (smoothed) = {:.4}**\n\n{}",
+                        "**Worst · fitness {} (risk-adjusted) = {:.4} · window μ{} σ{} over {} reading(s)**\n\n{}",
                         self.fitness.direction().arrow(),
                         worst_fitness,
+                        reading
+                            .map(|r| format!("{:.2}", r.mean))
+                            .unwrap_or_else(|| "—".into()),
+                        reading
+                            .map(|r| format!("{:.2}", r.std))
+                            .unwrap_or_else(|| "—".into()),
+                        reading.map(|r| r.n).unwrap_or(0),
                         crate::utils::markdown::topology_markdown(&topo, None),
                     );
                     if let Err(source) = std::fs::write(&path, &md) {

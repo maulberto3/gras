@@ -44,19 +44,34 @@ impl CoreEngine {
         // Per-step wall time: the step's own cost (train + evolve), not time
         // since run start. Matters most in RL (one step = many full matches).
         let step_secs = self.step_started_at_wall.elapsed().as_secs_f32();
-        // Fitness column: same mean ± std shape so all three read alike.
-        let fits: Vec<f32> = self
+            // Fitness column: same mean ± std shape so all three read alike. Since FIT the
+            // value is the per-net RISK-ADJUSTED score (what the race decides on), with the
+            // readable window level and spread printed right beside it: `μ` is "how much does
+            // the population's net actually score", `σ` the spread it is charged for.
+        let readings: Vec<_> = self
             .state
             .live_hashes()
             .iter()
-            .filter_map(|h| {
-                self.rolling_fitness
-                    .get(h.as_str())
-                    .filter(|b| !b.is_empty())
-            })
-            .map(rolling_mean)
+            .filter_map(|h| self.race_reading_of(h))
+            .collect();
+        let direction = self.fitness.direction();
+        let lambda = self.config.risk_aversion;
+        let fits: Vec<f32> = readings
+            .iter()
+            .map(|r| r.risk_adjusted(direction, lambda))
             .collect();
         let fit_stats = stats(&fits);
+        let windows: Vec<f32> = readings.iter().map(|r| r.mean).collect();
+        let spreads: Vec<f32> = readings.iter().map(|r| r.std).collect();
+        // A plain average (not `stats`): these are single population aggregates, not a
+        // distribution being described.
+        let avg = |v: &[f32]| {
+            if v.is_empty() {
+                f32::NAN
+            } else {
+                v.iter().sum::<f32>() / v.len() as f32
+            }
+        };
         // The mode's middle column: tabular reports the held-out eval loss,
         // RL reports the environment volume it actually played.
         let mid = if !self.trainer.is_rl() {
@@ -85,16 +100,18 @@ impl CoreEngine {
             }
         };
         if self.log_level == crate::engine::config::LogLevel::Minimal {
-            self.log_minimal_table(&trains, &evals, &fits, step_secs);
+            self.log_minimal_table(&trains, &evals, &fits, avg(&windows), avg(&spreads), step_secs);
         } else {
             info!(
-                "step {} │ pop {} │ train_loss↓ {} │ {} │ fitness{} {} │ took {:.1}s{}",
+                "step {} │ pop {} │ train_loss↓ {} │ {} │ fitness{} {} │ μ{:.1} σ{:.1} │ took {:.1}s{}",
                 clock,
                 self.state.live_count(),
                 stats(&trains),
                 mid,
                 self.fitness.direction().arrow(),
                 fit_stats,
+                avg(&windows),
+                avg(&spreads),
                 step_secs,
                 freeze_badge,
             );
@@ -108,6 +125,8 @@ impl CoreEngine {
         trains: &[f32],
         evals: &[f32],
         fits: &[f32],
+        window_mean: f32,
+        window_std: f32,
         step_secs: f32,
     ) {
         let mean = |v: &[f32]| {
@@ -152,11 +171,15 @@ impl CoreEngine {
             },
                 // `smt` tag: this cell is the population MEAN of smoothed per-net fitness,
                 // never confused with the per-net raw values.
+                // `smt` is the risk-adjusted score (FIT); `μ`/`σ` are the window level and
+                // spread behind it, so the readable value is never lost.
             format!(
-                "fitness{} smt{:.2}{} │ culls {} │ inserts {}",
+                "fitness{} smt{:.2}{} │ μ{:.2} σ{:.2} │ culls {} │ inserts {}",
                 self.fitness.direction().arrow(),
                 fit_m,
                 delta(fit_m, Some(pf)),
+                window_mean,
+                window_std,
                 e.culls,
                 e.inserts,
             ),
@@ -246,15 +269,27 @@ impl CoreEngine {
             // Final elite report: the top-k nets by smoothed fitness — the run's
             // champions. Elite = rank, not identity.
         let k = self.config.elite_count.max(1); // report at least the champion
-        // (hash, smoothed, step, eval_loss)
-        let ranked: Vec<(String, f32, usize, Option<f32>)> = self
+            // (hash, risk-adjusted score, window mean, window σ, step, eval_loss). The score
+            // is the ranking value (FIT); the mean is the readable level that used to BE the
+            // `smt` cell, kept next to it so "how many turns does it survive" stays readable.
+        let ranked: Vec<(String, f32, Option<f32>, Option<f32>, usize, Option<f32>)> = self
             .ranked_live()
             .into_iter()
             .map(|(h, fit)| {
+                let reading = self.race_reading_of(&h);
                 let metrics = self.state.net(&h).and_then(|s| s.last_metrics.as_ref());
                 let step = metrics.map(|m| m.step).unwrap_or(0);
                 let eval_loss = metrics.and_then(|m| m.eval_loss);
-                (h, fit, step, eval_loss)
+                (
+                    h,
+                    fit,
+                    reading.map(|r| r.mean),
+                    // A single-reading window has no observable spread — `—`, not 0.0,
+                    // which would read as "perfectly steady".
+                    reading.and_then(|r| (r.n > 1).then_some(r.std)),
+                    step,
+                    eval_loss,
+                )
             })
             .collect();
         let direction = self.fitness.direction();
@@ -269,12 +304,12 @@ impl CoreEngine {
         table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
             // RL trainers report fitness only — show the `eval_loss` column only when at
             // least one reported net carries one.
-        let has_eval = ranked.iter().take(k).any(|(_, _, _, e)| e.is_some());
+        let has_eval = ranked.iter().take(k).any(|(_, _, _, _, _, e)| e.is_some());
             // Every column recycles state the engine already carries (`spread`, `trained`,
             // `frozen`, each informative metric labeled as in `history.csv`).
         let mut header = vec![
-            "#", "hash", "smt", "spread", "step", "seat age", "trained", "frozen", "params",
-            "origin",
+            "#", "hash", "smt", "mean", "spread", "step", "seat age", "trained", "frozen",
+            "params", "origin",
         ];
         if has_eval {
             header.push("eval");
@@ -283,10 +318,14 @@ impl CoreEngine {
             header.push(m.label());
         }
         table.set_header(header);
-        for (rank, (h, fit, step, eval_loss)) in ranked.iter().take(k).enumerate() {
-                // ± std over the smoothing window (same framing as the guardrail): a wide ±
-                // means the ordering is luck-sensitive. eval_loss `—` when not applicable.
+        for (rank, (h, fit, mean, std, step, eval_loss)) in ranked.iter().take(k).enumerate() {
+                // Three legs of ONE reading: `smt` = the risk-adjusted score the rank was
+                // decided on (FIT), `mean` = the readable window level, `spread` = its σ. A
+                // wide σ means the ordering is luck-sensitive; eval_loss `—` when N/A.
             let smt = crate::engine::format::fmt2_smt(*fit);
+            let mean_cell = mean
+                .map(|m| format!("{m:.2}"))
+                .unwrap_or_else(|| "—".to_string());
             let short = &h[..8.min(h.len())];
             let state = self.state.net(h);
             let on_crown = self.config.freeze_elites && self.frozen_crown.contains(h);
@@ -306,18 +345,10 @@ impl CoreEngine {
                 .and_then(|s| s.meta.params)
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
-                // The raw spread behind `smt`: two nets at the same smoothed value can be
-                // "always that good" or "one lucky step".
-            let spread = self
-                .rolling_fitness
-                .get(h.as_str())
-                .filter(|b| b.len() > 1)
-                .map(|b| {
-                    let n = b.len() as f32;
-                    let mean = b.iter().sum::<f32>() / n;
-                    let sd = (b.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).sqrt();
-                    format!("{sd:.1}")
-                })
+                // The spread behind `smt`: two nets at the same score can be "always that
+                // good" or "one lucky step".
+            let spread = std
+                .map(|s| format!("{s:.1}"))
                 .unwrap_or_else(|| "—".to_string());
                 // Clocks lived INCLUSIVE of the birth clock and the last run — same
                 // convention the freeze lines use (`clock − entered_at_step`).
@@ -333,6 +364,7 @@ impl CoreEngine {
                 (rank + 1).to_string(),
                 short.to_string(),
                 smt,
+                mean_cell,
                 spread,
                 step.to_string(),
                 seat,
@@ -369,7 +401,7 @@ impl CoreEngine {
             // One line: the header names the list, then the gate tally follows inline,
             // separated by ` · ` (it was the longest of the twelve fields).
         info!(
-            "  ── final elites (top-{k}, fitness{arrow} smoothed) ──{}",
+            "  ── final elites (top-{k}, ranked by fitness{arrow} smt = risk-adjusted score; mean = window level, spread = σ) ──{}",
             detail_inline(&format!(
                 "crown {}/{} seats · {} eligible · {} on probation (k={}) · {} age-blocked (j={})",
                 self.frozen_crown.len(),

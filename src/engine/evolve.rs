@@ -18,7 +18,6 @@ use super::child::RaceChild;
 use super::core::{CoreEngine, RollOutcome};
 use super::format::csv_field;
 use super::smoothing::RollingBuffer;
-use crate::engine::smoothing::rolling_mean;
 use crate::state::write_net_state;
 
 /// Whether a lineage string names a crossover-born net (`crossover-one-point`,
@@ -417,11 +416,14 @@ impl CoreEngine {
     pub(crate) fn cull_net(&mut self, hash: &str, clock: usize, reason: &str) -> Result<()> {
         // NO per-event log here: culls are reported on the calling roll's
         // single line (crossover/mutation/pruned) — one roll, one line.
-        let smoothed = self
-            .rolling_fitness
-            .get(hash)
-            .map(rolling_mean)
-            .unwrap_or(f32::NAN);
+        // The tombstone records all three legs of the reading it died with: the
+        // readable window mean, its spread, and the risk-adjusted score it was
+        // actually ranked by (FIT). An unmeasured net records NaN throughout.
+        let reading = self.race_reading_of(hash);
+        let smoothed = reading.map(|r| r.mean).unwrap_or(f32::NAN);
+        let smoothed_std = reading.map(|r| r.std);
+        let risk_score = self.smoothed_fitness_of(hash);
+        let samples = reading.map(|r| r.n).unwrap_or(0);
             // The run's accounting tallies culls by the slot freed — the one funnel
             // every cull passes through.
         self.accounting.culls += 1;
@@ -437,6 +439,9 @@ impl CoreEngine {
             state.culled_at_step = Some(clock);
             state.cull_reason = Some(reason.to_string());
             state.final_smoothed_fitness = Some(smoothed);
+            state.final_fitness_std = smoothed_std;
+            state.final_risk_score = risk_score;
+            state.final_fitness_samples = samples;
             write_net_state(&self.run_dir, &state)?;
         }
         self.state.remove(hash);
@@ -473,22 +478,14 @@ impl CoreEngine {
         let clock = self.step_clock();
             // Inverse fitness: weight = (adjusted best) − (adjusted value) ≥ 0 — the
             // worst net gets the largest weight, the best gets zero.
+            // The weights read the SAME ranking value as every other site (FIT: the
+            // risk-adjusted score), so "who is worst" cannot disagree between the
+            // inverse-roulette draw and the cull itself.
         let scored: Vec<(String, f32)> = hashes
             .iter()
             .filter(|h| !elite.contains(h))
             .filter(|h| !self.on_probation(h, clock))
-            .filter(|h| {
-                self.rolling_fitness
-                    .get(*h)
-                    .map(|b| b.iter().count() > 0)
-                    .unwrap_or(false)
-            })
-            .map(|h| {
-                (
-                    h.clone(),
-                    rolling_mean(self.rolling_fitness.get(h).unwrap()),
-                )
-            })
+            .filter_map(|h| self.smoothed_fitness_of(h).map(|s| (h.clone(), s)))
             .collect();
         if scored.len() < 2 {
             return Ok(None);
