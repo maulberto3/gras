@@ -5,6 +5,23 @@
 //! constructor (`resume_rl`). Everything else — the struct, the step loop,
 //! evolution, artifacts — lives in [`crate::engine::core::CoreEngine`] and is
 //! shared with the tabular engine.
+//!
+//! ## Typed-spec construction
+//! ```ignore
+//! let spec = RLSpec { config: builder, seed: Some(42), run_dir: None,
+//!                     fitness: Fitness::reported(Direction::Maximize, "turns"), trainer };
+//! RlEngine::from_rl_spec(spec)?.run()?;
+//! ```
+//!
+//! ## Resuming an RL run
+//! Same contract as [`crate::engine::TabularEngine::resume`]: seed, frontier and
+//! checkpoint ledger come from disk, and the trainer must be the same scheme.
+//! Each live net is rebuilt from blueprint + weight seed and replayed through
+//! `0..recorded_step` with metric-parity asserts. Replay requires the trainer's
+//! step to be deterministic from `(run_seed, net_seed, step)` — true for a
+//! pure-Rust env (CartPole), not for a scripted subprocess whose world draws its
+//! own randomness (kagiculture): there the parity assert fails loudly by design,
+//! because a run that cannot be replayed cannot be resumed.
 
 use super::config::RaceConfig;
 use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
@@ -13,9 +30,8 @@ use crate::state::{RaceState, RunHeader};
 use flodl::tensor::Result;
 use std::collections::HashMap;
 
-/// The environment-driven (RL) engine — the public handle for
-/// `RunSpec::rl` runs. Wraps [`CoreEngine`]; derefs to it, so every shared
-/// method is reachable directly.
+    /// The environment-driven (RL) engine — the public handle for `RunSpec::rl`
+    /// runs. Wraps [`CoreEngine`] and derefs to it.
 pub struct RlEngine(pub(crate) CoreEngine);
 
 impl std::ops::Deref for RlEngine {
@@ -37,25 +53,8 @@ impl RlEngine {
         Ok(Self(CoreEngine::from_spec(spec)?))
     }
 
-    /// Build an RL run from an [`RLSpec`] DIRECTLY — no enum wrapping.
-    ///
-    /// The typed-spec path: keep your spec in a variable (or a const panel /
-    /// config file), tweak it, feed it here. Equivalent to
-    /// `RlEngine::from_spec(RunSpec::rl(..))` minus the enum round-trip; the
-    /// trainer is auto-boxed, so a concrete `CartPoleTrainer` goes straight
-    /// in.
-    ///
-    /// ```ignore
-    /// let spec = RLSpec {
-    ///     config: builder,
-    ///     fitness: Fitness::reported(Direction::Maximize, "turns"),
-    ///     trainer,                       // impl RlStep + 'static
-    ///     seed: Some(42),
-    ///     run_dir: None,
-    /// };
-    /// let mut engine = RlEngine::from_rl_spec(spec)?;
-    /// engine.run()?;
-    /// ```
+        /// Build an RL run from an [`RLSpec`] directly — the typed-spec path (no
+        /// enum round-trip); the trainer is auto-boxed. Example in the module docs.
     pub fn from_rl_spec<T: crate::trainer::RlStep + 'static>(
         spec: crate::engine::run_spec::RLSpec<T>,
     ) -> Result<Self> {
@@ -70,24 +69,8 @@ impl RlEngine {
             crate::engine::run_spec::RunSpec::rl(config, fitness, trainer, seed, run_dir),
         )?))
     }
-    /// Resume an **RL** run (no dataset) from its run directory, reusing the
-    /// persisted identity — the environment-driven sibling of [`crate::engine::TabularEngine::resume`].
-    ///
-    /// Same contract as the tabular flavor: the seed, the net frontier and the
-    /// checkpoint ledger come from disk; the trainer must be the same scheme
-    /// the run started with; the stop criteria are **config, not state**, so
-    /// this is how you keep training a stopped race under a new bar
-    /// (`--max-target-fitness 250` on a run that stopped at `MaxSteps`).
-    ///
-    /// Each live net is rebuilt from its blueprint + weight seed and replayed
-    /// through `0..recorded_step` with metric-parity asserts. That replay is
-    /// only possible when the trainer's own step is deterministic from
-    /// `(run_seed, net_seed, step)` — true for a pure-Rust env like CartPole
-    /// (match starts are seeded per net/step/match), NOT true for a scripted
-    /// subprocess whose world draws its own randomness (kagiculture): there the
-    /// parity assert fails loudly, which is the correct outcome — an RL run
-    /// that cannot be replayed cannot be resumed, and silently continuing with
-    /// wrong weights would be worse.
+        /// Resume an **RL** run (no dataset) from its run directory. See the
+        /// module docs for the replay contract and the tabular sibling.
     pub fn resume(
         run_dir: std::path::PathBuf,
         config: RaceConfig,
@@ -102,6 +85,7 @@ impl RlEngine {
         )
     }
 
+    /// Shared resume internals: validate the run's mode, then replay each net.
     fn resume_with(
         run_dir: std::path::PathBuf,
         config: RaceConfig,
@@ -117,10 +101,8 @@ impl RlEngine {
             ..header.clone()
         };
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume_rl")?;
-        // The persisted run must itself be RL: its frontier was trained with
-        // no dataset, so replaying it as tabular (or vice versa) is a bug.
-        // `engine_mode` is the root discriminator; legacy headers derive it
-        // from `config.mode` on load (same vocabulary).
+        // The persisted run must itself be RL: replaying an RL frontier as
+        // tabular (or vice versa) is a bug. `engine_mode` is the discriminator.
         if header.engine_mode.as_deref() != Some("rl") {
             return Err(crate::utils::error::EngineError::InvalidOptions(format!(
                 "resume_rl: {} was recorded as mode \"{}\", not \"rl\" — use RaceEngine::resume with its data_dir",

@@ -12,19 +12,8 @@ use flodl::tensor::Result;
 use tracing::info;
 
 impl CoreEngine {
-    /// Write the MACHINE-READABLE elite ranking — `elites.json` in the run
-    /// dir: `[{rank, hash, fitness, params, born}]`, best first, k =
-    /// `elite_count` (min 1). The next experiment's `set_run_seed_previous`
-    /// reads THIS to reinstate every elite by rank; the `elite-<hash>.md`
-    /// dumps are the human view of the same ranking (their header even
-    /// carries the rank), but inheritance must never have to parse markdown.
-    ///
-    /// UNCONDITIONAL at stop — same artifact discipline as the guardrail
-    /// record: it is an inheritance receipt, not a log line, so it lands even
-    /// with every `elite_save_*` dump switched off (a run stays inheritable
-    /// whatever the user asked to see). Empty population ⇒ `[]`, which the
-    /// reader treats as "no elite ranking here" and falls back to the
-    /// certified champion.
+    /// Write the MACHINE-READABLE elite ranking — `elites.json`, best first,
+    /// k = `elite_count`. UNCONDITIONAL: an inheritance receipt, not a log line.
     pub(crate) fn write_elite_index(&mut self) -> Result<()> {
         self.record_champions();
         let entries: Vec<serde_json::Value> = self
@@ -61,12 +50,8 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Write the top-k elites' topology markdown to the run dir, one file
-    /// per elite (`elite-<hash>.md`), k = `elite_count` (min 1). The user
-    /// configured more than one elite — they get more than one artifact.
-    /// UNCONDITIONAL — called at stop regardless of log level: the `.md` file
-    /// is a run artifact (like `nets/<hash>.json` and `history.csv`), not a
-    /// log line. Prints a confirmation only when per-step detail is on.
+    /// Write the top-k elites' topology markdown, one file per elite
+    /// (`elite-<hash>.md`). UNCONDITIONAL at every log level.
     pub(crate) fn write_champion_markdown(&mut self) -> Result<()> {
         if !self.config.elite_save_topology {
             return Ok(());
@@ -116,12 +101,8 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Write the top-k elites' weights as `.safetensors`, one file per elite
-    /// (`elite-<hash>.safetensors`), k = `elite_count` (min 1). UNCONDITIONAL
-    /// — same artifact discipline as [`Self::write_champion_markdown`]: lands
-    /// on disk at every log level. Exports each elite's live in-memory
-    /// `Network` — byte-faithful coefficients, exactly what the race left
-    /// them with.
+    /// Write the top-k elites' weights as `elite-<hash>.safetensors`.
+    /// UNCONDITIONAL; exports each elite's live `Network` byte-faithfully.
     pub(crate) fn write_champion_safetensors(&mut self) -> Result<()> {
         if !self.config.elite_save_safetensors {
             return Ok(());
@@ -130,9 +111,8 @@ impl CoreEngine {
         for (hash, _) in self.champion_ranked() {
             let short = &hash[..8.min(hash.len())];
             let path = self.run_dir.join(format!("elite-{short}.safetensors"));
-            // The elite's live Network is still in memory at stop — export
-            // it directly, no rebuild/replay needed. Its coefficients are the
-            // exact ones the race left it with (byte-faithful by construction).
+            // The elite's live Network is still in memory at stop — export it
+            // directly; its coefficients are exactly what the race left.
             match self.networks.get(hash.as_str()) {
                 Some(net) => {
                     if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
@@ -147,13 +127,8 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Per-checkpoint elite weight snapshot (hard-kill durability). Writes
-    /// each top-`elite_count` net's weights as
-    /// `checkpoint-elite-<hash>.safetensors`, OVERWRITTEN every checkpoint —
-    /// latest wins, so the run dir never accumulates one file per era. The
-    /// stop-time `elite-<hash>.safetensors` artifacts stay separate (they are
-    /// the run's headline output; a mid-run snapshot must never shadow them).
-    /// Fires every checkpoint behind `elite_checkpoint_weights`.
+    /// Per-checkpoint elite weight snapshot (hard-kill durability):
+    /// `checkpoint-elite-<hash>.safetensors`, OVERWRITTEN every checkpoint.
     pub(crate) fn write_checkpoint_elite_safetensors(&mut self) -> Result<()> {
         self.record_champions();
         for (hash, _) in self.champion_ranked() {
@@ -176,47 +151,26 @@ impl CoreEngine {
     }
 
     /// Full hashes of the elite set exported at stop — the single source of
-    /// truth for "which nets are the champions". Read this (not file mtimes,
-    /// not glob order) when post-race tooling needs the champion: the frontier
-    /// snapshot writes all live nets in HashMap order, so "latest file" is
-    /// arbitrary. Empty until the first champion dump.
+    /// truth for "which nets are the champions" (never file mtimes/glob order).
     pub fn champion_hashes(&self) -> &[String] {
         &self.champions
     }
 
-    /// The champion set: top-`elite_count` live hashes by smoothed fitness.
-    /// The ONE ranking both elite writers consume, so `elite-<hash>.md`,
-    /// `elite-<hash>.safetensors` and `champion_hashes()` can never disagree.
-    ///
-    /// EFFICIENCY NOTE (Tier 2 — `impl Iterator` from ranking helpers): the
-    /// ranking is lazily returned as an iterator so each caller takes only
-    /// what it needs (`take(k)`, `.last()`, `map + collect`) without ever
-    /// materializing the full ranked population in a `Vec` first. Perk: for
-    /// pop-500 runs the champion writers allocate 5 entries instead of 500.
-    /// Cost: the sort inside still allocates once (unavoidable — the ranking
-    /// needs total order), but the full-`Vec` handoff to every consumer is
-    /// gone.
+    /// The champion set: top-`elite_count` live hashes by smoothed fitness. The
+    /// ONE ranking all elite writers consume, so they can never disagree.
     fn champion_ranked(&self) -> impl Iterator<Item = (String, f32)> {
         let k = self.config.elite_count.max(1);
         self.ranked_live().into_iter().take(k)
     }
 
-    /// Snapshot the current champion set into `self.champions` before any
-    /// artifact writing, so `champion_hashes()` reflects exactly the set the
-    /// writers iterate — even if an individual file write fails.
+    /// Snapshot the champion set into `self.champions` before any writing, so
+    /// `champion_hashes()` reflects exactly what the writers iterate.
     pub(crate) fn record_champions(&mut self) {
         self.champions = self.champion_ranked().map(|(h, _)| h).collect();
     }
 
-    /// When any `worst_save_*` flag is set: save the WORST live net's
-    /// artifacts — `worst-<hash>.md` (topology markdown) and/or
-    /// `worst-<hash>.safetensors` (weights), each behind its own flag. The
-    /// anti-champion is the net the search avoided — its topology is often
-    /// the cheapest way to see what the fitness signal rejected.
-    ///
-    /// MUST be called BEFORE any cull shrinks the population: the worst is
-    /// ranked over the full pre-cull field (e.g. the pop_pruner culls to
-    /// elites, so a post-cull call would find no worst to dump).
+    /// When any `worst_save_*` flag is set: save the WORST live net's artifacts
+    /// (`worst-<hash>.md` / `.safetensors`). MUST run BEFORE any cull shrinking.
     pub(crate) fn write_worst_artifacts(&self) -> Result<()> {
         if !self.config.worst_save_topology && !self.config.worst_save_safetensors {
             return Ok(());

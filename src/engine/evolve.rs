@@ -22,8 +22,7 @@ use crate::engine::smoothing::rolling_mean;
 use crate::state::write_net_state;
 
 /// Whether a lineage string names a crossover-born net (`crossover-one-point`,
-/// `crossover-uniform`, …). Founders and random immigrants are not crossover —
-/// they carry the mutation probation window, not the crossover one.
+/// `crossover-uniform`, …). Founders/immigrants use the mutation probation.
 fn is_crossover_origin(created_from: Option<&str>) -> bool {
     created_from.is_some_and(|s| s.starts_with("crossover"))
 }
@@ -32,24 +31,21 @@ fn is_crossover_origin(created_from: Option<&str>) -> bool {
 /// mutation roll at the same `(clock, roll)` never draw the same number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RollKind {
+    /// A crossover roll (checkpoint-gated child).
     Crossover,
+    /// A mutation roll (random immigrant).
     Mutation,
 }
 
 /// Stream tags folded into the run seed before `derive_seed`: each roll group
-/// gets its own lane, and neither can collide with the child-seed lane
-/// (`derive_seed(run_seed, clock * 1024 + child_idx)`), because different bases
-/// never agree at the same index.
+/// gets its own lane, and none can collide with the child-seed lane.
 const ROLL_STREAM_CROSSOVER: u64 = 0x5A5A_0000_0000_00C1;
+/// Stream tag for the mutation roll lane.
 const ROLL_STREAM_MUTATION: u64 = 0x5A5A_0000_0000_003D;
 
 impl RollKind {
-    /// The seed a fire check (or a victim draw) for this roll derives from.
-    ///
-    /// `clock * 1024 + roll` is the same index shape the child seeds use, in a
-    /// different lane (see the tags). Deriving instead of drawing from the
-    /// process-global `fastrand` stream is what makes the roll batch skippable
-    /// without shifting every later draw in the run.
+        /// The seed a fire check (or victim draw) for this roll derives from —
+        /// `clock * 1024 + roll` in this roll group's lane, so skips don't shift.
     fn seed(self, run_seed: u64, clock: usize, roll: usize) -> u64 {
         let tag = match self {
             RollKind::Crossover => ROLL_STREAM_CROSSOVER,
@@ -60,9 +56,8 @@ impl RollKind {
 }
 
 impl CoreEngine {
-    /// Fresh empty rolling buffer for a net about to be caught up, so
-    /// catch-up's per-step pushes land somewhere — a live net must never be
-    /// without a buffer entry.
+        /// Fresh empty rolling buffer for a net about to be caught up, so catch-up's
+        /// per-step pushes land somewhere.
     fn pre_insert_buffer(&mut self, hash: &str) {
         self.rolling_fitness.insert(
             hash.to_string(),
@@ -78,9 +73,8 @@ impl CoreEngine {
         );
     }
 
-    /// A guaranteed-fresh random child (mutation path): roll `random_child`
-    /// directly (bypassing the crossover/mutation dispatch, which the caller
-    /// has already resolved), re-rolling on duplicate hashes (bounded).
+        /// A guaranteed-fresh random child (mutation path): roll `random_child`
+        /// directly (the caller already resolved the branch), re-rolling on duplicates.
     fn generate_random_at(&mut self, clock: usize, start_idx: usize) -> Result<RaceChild> {
         for attempt in 0..8 {
             let child = self.random_child(clock, start_idx + attempt)?;
@@ -114,23 +108,16 @@ impl CoreEngine {
             .insert(child.state.hash.clone(), child.optimizer);
     }
 
-    /// One evolution roll of the crossover branch: generate a child, run the
-    /// checkpoint-gated catch-up (early-out discard on the first failed
-    /// gate), and on success cull one slot per the cull policy + insert the
-    /// child. A failed child culls nothing — the gate IS the cull, and a
-    /// failed attempt is a SPENT ROLL: no random fallback (random whole nets
-    /// enter exclusively via the mutation rolls).
-    /// Returns the roll outcome (survived + log detail); `attempt` is the
-    /// 1-based retry ordinal (for history.csv).
+        /// One crossover roll: generate a child, run the checkpoint-gated catch-up
+        /// (discard on the first failed gate), and on success cull + insert the child.
     pub(crate) fn evolve_crossover_child(
         &mut self,
         clock: usize,
         _roll: usize,
         attempt: usize,
     ) -> Result<RollOutcome> {
-        // HARD SHIELD before any work: with no cull-eligible slot the child
-        // would have nowhere to go (and generating it would burn the parent
-        // pairing + a full replay), so the roll is spent up front.
+            // HARD SHIELD before any work: with no cull-eligible slot the child would
+            // have nowhere to go, so the roll is spent up front.
         if !self.has_cull_eligible() {
             return Ok(RollOutcome::no_slot(self.no_cull_slot_detail("crossover")));
         }
@@ -141,16 +128,15 @@ impl CoreEngine {
             Some(c) => c,
             None => {
                 return Ok(RollOutcome::spent(format!(
-                    "no child: {} parent-pairing draw(s) × {} gate attempt(s) all incompatible (no compatible pivot/dims)",
+                    "no child: {} parent-pairing draw(s) × {} attempt(s) all incompatible (no compatible pivot/dims)",
                     crate::engine::child::MAX_PARENT_PAIRINGS,
                     attempt,
                 )));
             }
         };
         if self.state.net(&child.state.hash).is_some() {
-            // Duplicate of a live topology (crossover recreated an existing
-            // net) → the roll is spent: discard, no replacement. Random
-            // whole nets enter only via the mutation path.
+                // Duplicate of a live topology → the roll is spent: discard, no
+                // replacement. Random whole nets enter only via mutation.
             self.record_attempt(
                 clock,
                 "crossover",
@@ -171,17 +157,8 @@ impl CoreEngine {
             )));
         }
 
-        // Checkpoint-gated catch-up: the child must beat the recorded
-        // population mean at the checkpoints between its birth and now
-        // (Hard: every gate; Soft: the aggregate mean of the gate means).
-        // Children born before any checkpoint exists skip the gate entirely.
-        // With `crossover_catch_up` OFF (RL only), the child skips catch-up
-        // AND the gate: a net with no replayed history has nothing to compare
-        // against the historical bars — gating off is the only sound reading.
-        // It trains from the current clock like a mutation immigrant.
-        // With `crossover_gate = Off` (catch-up still ON), the child replays
-        // the full stream but is never rejected: the gate is isolated from
-        // catch-up so the two effects can be told apart.
+            // Gated catch-up: the child must beat the checkpoint bars; `crossover_catch_up`
+            // OFF skips it entirely, and gate `Off` replays but never rejects.
         self.pre_insert_buffer(&child.state.hash);
         if !self.config.mode_specific.crossover_catch_up() {
             child.state.step = 0;
@@ -200,10 +177,8 @@ impl CoreEngine {
                     self.select_random_victim(clock)?
                 }
             };
-            // Defensive: the top-of-roll check saw an eligible slot, so a
-            // `None` here means the selection filter disagreed. Discard the
-            // child (and its provisional buffers) and spend the roll —
-            // probation is never broken to manufacture a victim.
+                // Defensive: a `None` victim means the selection filter disagreed —
+                // discard the child and spend the roll (probation is never broken).
             if victim_for_log.is_none() {
                 self.rolling_fitness.remove(&child.state.hash);
                 self.rolling_train.remove(&child.state.hash);
@@ -258,12 +233,8 @@ impl CoreEngine {
         let mut replayed_to = 0usize;
         let mut last_checkpoint_step = 0usize;
         let mut child_fit_at_gate = f32::NAN;
-        // Gate window: both gates read only the last `crossover_gate_window`
-        // RECORDED checkpoints (0 = all — the unbounded legacy behavior).
-        // Bars are historical; the window keeps them local to the population's
-        // current era instead of averaging the run's whole life. Indices are
-        // preserved (`relevant` keeps its ledger position) so Hard's
-        // per-checkpoint replay sites stay exact.
+            // Gate window: both gates read only the last `crossover_gate_window` recorded
+            // checkpoints (0 = all); indices are preserved so Hard replay sites stay exact.
         let relevant_all: Vec<(usize, Checkpoint)> = self
             .checkpoints
             .iter()
@@ -281,9 +252,8 @@ impl CoreEngine {
         let mut failed_gate: Option<(usize, usize, f32, f32)> = None; // (i+1, chk.step, child, mean)
         match self.config.crossover_gate {
             crate::engine::config::CrossoverGate::Hard => {
-                // Evaluate gate-by-gate: replay to each checkpoint, compare.
-                // PROVISIONAL replay: a rejected candidate must leave no
-                // state file behind (the ghost-file resume bug).
+                    // Evaluate gate-by-gate: replay to each checkpoint, compare.
+                    // PROVISIONAL replay: a rejected candidate leaves no state file behind.
                 for (i, chk) in &relevant {
                     self.catch_up_range_provisional(&mut child, replayed_to, chk.step)?;
                     replayed_to = chk.step;
@@ -334,9 +304,8 @@ impl CoreEngine {
             }
         }
         if let Some((gate_i, gate_step, child_fit, bar)) = failed_gate {
-            // "discarded" = the child was rejected by the checkpoint gate and
-            // never joined the population; the pop did NOT shrink.
-            // Record the rejected attempt (cx_retry_full measurement).
+                // "discarded" = rejected by the checkpoint gate and never joined the
+                // population (the pop did not shrink); record the attempt.
             self.record_attempt(
                 clock,
                 "crossover",
@@ -355,14 +324,8 @@ impl CoreEngine {
             self.rolling_fitness.remove(&child.state.hash);
             self.rolling_train.remove(&child.state.hash);
             self.rolling_eval.remove(&child.state.hash);
-            // k/N uses the SAME convention as the success line: Soft has ONE
-            // aggregate bar (the mean of the window's checkpoint means), so a
-            // soft rejection reads `1/1` — the 5 checkpoints that FORMED the
-            // bar are named separately by `(window 5)`. Hard is gate-by-gate,
-            // so its k/N is the real per-bar count (`3/5` = failed on the 3rd
-            // of 5). (Previously the rejection line printed
-            // `checkpoint_count` for Soft — `rejected by soft gate 5/5` —
-            // contradicting the success line's `gate soft 1/1 bars`.)
+                // k/N follows the success-line convention: Soft has ONE aggregate bar
+                // (`1/1`), Hard is gate-by-gate (`3/5`).
             let (k, n) = match self.config.crossover_gate {
                 crate::engine::config::CrossoverGate::Hard => (gate_i, checkpoint_count),
                 crate::engine::config::CrossoverGate::Soft => (1, 1),
@@ -399,12 +362,8 @@ impl CoreEngine {
                 .map(rolling_mean)
                 .unwrap_or(f32::NAN);
         }
-        // Slot eviction per CrossCullPolicy (crossover-only — the immigrant
-        // channel has its own fitness-inverse victim selection): Worst =
-        // merit-based (default); Random = uniform (diversity-first). In both
-        // cases the elite guard excludes the top-k nets from victim status.
-        // The victim is resolved BEFORE recording, so the attempt row can
-        // carry its identity (fills the previously-empty `victim` column).
+            // Slot eviction per CrossCullPolicy (crossover-only): Worst = merit-based,
+            // Random = uniform. Elite guard excludes the top-k from victim status.
         let victim_for_log: Option<String> = match self.config.crossover_cull_policy {
             crate::engine::config::CrossCullPolicy::Worst => {
                 self.select_crossover_worst_victim(clock)?
@@ -451,9 +410,8 @@ impl CoreEngine {
                 }
             }
         }
-        // The gate verdict belongs on the SUCCESS line too: what the child
-        // scored vs the bar it beat, WHICH gate, and how many bars — the
-        // whole admission story, correlated to the `set_crossover_*` knobs.
+            // The gate verdict belongs on the SUCCESS line too: the child's score vs
+            // the bar, which gate, and how many bars.
         let gate_note = if matches!(
             self.config.crossover_gate,
             crate::engine::config::CrossoverGate::Off
@@ -491,10 +449,8 @@ impl CoreEngine {
                 crate::engine::config::CrossoverGate::Soft => 1,
                 crate::engine::config::CrossoverGate::Off => 0,
             };
-            // The bar's value is TAGGED `avg` (mean of checkpoint means for
-            // Soft, the newest recorded mean for Hard — both historical
-            // aggregates); the child's figure is its post-catch-up smoothed
-            // fitness, tagged `smt`. Same units on both sides of the `vs`.
+                // The bar is tagged `avg` (historical aggregate) and the child's figure
+                // `smt` (post-catch-up smoothed fitness) — same units on both sides.
             format!(
                 " | gate {} {bars}/{bars} bars: smt{:.4} vs avg{:.4}{}",
                 gate_name,
@@ -539,12 +495,8 @@ impl CoreEngine {
         )))
     }
 
-    /// Append one evolution-event row to the `attempts.csv` buffer
-    /// (cx_retry_full measurement). Every crossover/mutation attempt is
-    /// recorded — inserted or rejected — so gate-failure rate, operator yield,
-    /// and retry economics are queryable after the run. Own file, own header:
-    /// an attempt has none of a metric row's columns, so there is nothing to
-    /// pad — a shared schema was exactly what let the two shapes drift.
+        /// Append one evolution-event row to the `attempts.csv` buffer: every attempt
+        /// is recorded (inserted or rejected), so gate-failure rate stays queryable.
     #[allow(clippy::too_many_arguments)] // one row of the attempt ledger — fields, not logic
     pub(crate) fn record_attempt(
         &mut self,
@@ -564,13 +516,8 @@ impl CoreEngine {
         if !self.config.csv_export {
             return;
         }
-        // `attempts.csv` columns, in header order (see `flush_csv_exports`):
-        // step,branch,attempt,outcome,child_hash,child_net_seed,child_origin,
-        // gate_index,child_fitness,bar,victim,victim_net_seed,pop_size.
-        // FULL hashes + net_seed here (no truncation): (hash, net_seed) is the
-        // unique individual key — the same topology hash can legitimately
-        // appear in multiple attempt rows (regenerated children) and across
-        // eras, so the log must not manufacture collisions.
+            // `attempts.csv` columns (see `flush_csv_exports`) with FULL hashes +
+            // net_seed — (hash, net_seed) is the unique individual key.
         let row = format!(
             "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             step,
@@ -590,18 +537,8 @@ impl CoreEngine {
         self.attempts_csv_buffer.push_str(&row);
     }
 
-    /// Uniformly random **cullable** live net — the `Random` arm of BOTH cull
-    /// policies (crossover children and mutation immigrants). Deterministic:
-    /// derived from `(run_seed, clock, salt)` so replays and resume pick the
-    /// same victim. Elite nets are excluded from the draw (no child —
-    /// crossover or immigrant — can evict an elite), and so is every net still
-    /// inside its CHANNEL probation window: the shield is HARD — a roll with no
-    /// eligible victim is skipped by the caller, never satisfied by culling a
-    /// fresh net (a just-born net has no verdict to be judged on, and one
-    /// trained clock can turn it into the best candidate).
-    ///
-    /// `salt` separates the several rolls that fire within one clock: without
-    /// it every roll of the same step would draw the same index.
+        /// Uniformly random **cullable** live net (the `Random` arm of both policies):
+        /// deterministic in `(run_seed, clock, salt)`; elites/probation excluded.
     fn select_random_victim_at(&self, clock: usize, salt: usize) -> Result<Option<String>> {
         let elite = self.elite_hashes();
         // The param `clock` is the SALTED seed input; the probation check needs
@@ -624,18 +561,14 @@ impl CoreEngine {
         Ok(Some(hashes[idx].clone()))
     }
 
-    /// [`Self::select_random_victim_at`] with salt 0 — the crossover path's
-    /// original derivation, kept verbatim so its victim draws (and the tests
-    /// pinning them) are unchanged.
+        /// [`Self::select_random_victim_at`] with salt 0 — the crossover path's original
+        /// derivation, kept verbatim so its victim draws are unchanged.
     pub(crate) fn select_random_victim(&self, clock: usize) -> Result<Option<String>> {
         self.select_random_victim_at(clock, 0)
     }
 
-    /// Whether ANY live net is cull-eligible right now: non-elite AND past its
-    /// channel probation window. The evolution branches consult this BEFORE
-    /// building a child — a child with no slot would be thrown away anyway, so
-    /// the check saves the generate/replay work. It applies exactly the victim
-    /// selectors' own filter, so the two can never disagree.
+        /// Whether ANY live net is cull-eligible right now (non-elite AND past
+        /// probation). Consulted before building a child, so the check saves work.
     pub(crate) fn has_cull_eligible(&self) -> bool {
         let elite = self.elite_hashes();
         let now = self.step_clock();
@@ -658,11 +591,8 @@ impl CoreEngine {
         )
     }
 
-    /// The mutation channel's victim, per [`crate::engine::config::MutationCullPolicy`].
-    /// Every arm is probation-aware and the shield is HARD: `None` means no
-    /// cull-eligible net exists and the caller must SKIP the roll (nothing is
-    /// culled, no immigrant is built). `roll` salts the `Random` arm so the
-    /// rolls of one step don't all draw the same net.
+        /// The mutation channel's victim, per `MutationCullPolicy`. Every arm is
+        /// probation-aware and the shield is HARD: `None` = skip the roll.
     pub(crate) fn select_mutation_victim(
         &self,
         clock: usize,
@@ -674,9 +604,8 @@ impl CoreEngine {
                 .select_inverse_proportional_at(clock, roll)?
                 .or_else(|| self.mutation_victim_fallback()),
             MutationCullPolicy::Worst => self.mutation_victim_fallback(),
-            // Salt `roll + 1`: the crossover path draws with salt 0, so a
-            // mutation roll never silently mirrors a crossover victim. A `None`
-            // draw (everyone shielded) falls through to the same last resort.
+                    // Salt `roll + 1`: the crossover path draws with salt 0, so a mutation
+                    // roll never mirrors a crossover victim.
             MutationCullPolicy::Random => self
                 .select_random_victim_at(clock, roll + 1)?
                 .or_else(|| self.mutation_victim_fallback()),
@@ -684,42 +613,26 @@ impl CoreEngine {
         Ok(picked)
     }
 
-    /// Mutation victim last resorts: the worst net by smoothed fitness, else
-    /// the first live hash. `None` only when the population is empty (a firing
-    /// roll cannot happen then). Probation-aware: off-probation victims are
-    /// preferred, but a firing roll ALWAYS finds a slot — if every
-    /// non-elite net is on probation (window ≥ pop − elite, an unusual
-    /// config), the protection is broken for this pick.
+        /// Mutation victim last resorts: worst by smoothed fitness, else first live
+        /// hash. `None` only when the population is empty.
     fn mutation_victim_fallback(&self) -> Option<String> {
         let clock = self.step_clock();
         let elite = self.elite_hashes();
-        // EFFICIENCY NOTE (Tier 1 — `&str` over `&String`): the closures only
-        // look up / re-borrow the hash; `&str` derefs from `&String` for free
-        // (auto-coercion at the call site). `elite` is a tiny Vec (elite_count
-        // entries), so a linear `iter().any` on `&str` beats forcing the
-        // closure to take `&String` just to satisfy `Vec::contains`.
+            // `&str` over `&String`: the closures only look up the hash, and `elite` is
+            // a tiny Vec — a linear `iter().any` beats forcing `Vec::contains`.
         let eligible = |h: &str| !elite.iter().any(|e| e == h);
         let off_probation = |h: &str| !self.on_probation(h, clock);
         let live = self.state.live_hashes();
-        // The worst non-elite net that has ALSO served its channel probation.
-        // No "first live" fallback: the shield is HARD, so when nobody
-        // qualifies the caller SKIPS the roll instead of destroying a fresh
-        // net that has not had a chance to prove itself yet.
+            // The worst non-elite net that has ALSO served its channel probation; no
+            // "first live" fallback — when nobody qualifies the caller SKIPS the roll.
         self.worst_nets_by_smoothed_fitness(live.len())
             .ok()?
             .into_iter()
             .find(|h| eligible(h) && off_probation(h))
     }
 
-    /// One evolution roll of the mutation branch: cull a net selected
-    /// inversely-proportionate to fitness and insert a fully-random
-    /// immigrant (no checkpoint gate — a random topology could never clear
-    /// historical means; its job is diversity).
-    ///
-    /// HARD SHIELD: `Ok(None)` means the roll was SKIPPED — there is no
-    /// cull-eligible victim (every non-elite net is inside its channel
-    /// probation window, or the whole population is elite), so nothing is
-    /// culled and no immigrant is built.
+        /// One mutation roll: cull a net inversely-proportionate to fitness and insert
+        /// a fully-random immigrant (no gate — a random topology could never clear it).
     pub(crate) fn evolve_random_immigrant(
         &mut self,
         clock: usize,
@@ -729,10 +642,8 @@ impl CoreEngine {
         if !self.has_cull_eligible() {
             return Ok(None);
         }
-        // Pick a victim per the mutation cull policy (`InverseFitness` by
-        // default — the historical fitness-inverse roulette; `Worst` for a
-        // deterministic merit cull; `Random` for uniform turnover). The elite
-        // guard AND the probation shield apply in every arm.
+            // Pick a victim per the mutation cull policy (InverseFitness default, `Worst`,
+            // `Random`); the elite guard and probation shield apply in every arm.
         let Some(victim) = self.select_mutation_victim(clock, roll)? else {
             return Ok(None);
         };
@@ -740,13 +651,8 @@ impl CoreEngine {
         let idx = self.next_child_ordinal(clock);
         let mut child = self.generate_random_at(clock, idx)?;
         self.pre_insert_buffer(&child.state.hash);
-        // Catch-up toggle (`mutation_catch_up`, default FALSE — no
-        // handicap): with it off the immigrant keeps its fresh-init weights
-        // and trains from the current clock on. Sound in RL (no shared data
-        // stream to have missed — see the knob's docs); tabular always
-        // catches up regardless of the flag. Its empty rolling buffers
-        // already mean "no verdict yet", so it cannot be culled or crowned
-        // before its first step.
+            // Catch-up toggle (`mutation_catch_up`, default FALSE): off keeps fresh-init
+            // weights; tabular always catches up. Empty buffers mean "no verdict yet".
         let fresh_start = !self.config.mode_specific.mutation_catch_up();
         if fresh_start {
             child.state.step = 0;
@@ -802,9 +708,8 @@ impl CoreEngine {
             .get(hash)
             .map(rolling_mean)
             .unwrap_or(f32::NAN);
-        // The run's accounting tallies culls by the slot they freed — the one
-        // funnel every cull passes through (log-free, like the rest of this
-        // path: the calling roll line reports the event).
+            // The run's accounting tallies culls by the slot freed — the one funnel
+            // every cull passes through.
         self.accounting.culls += 1;
         match reason {
             "crossover" => self.accounting.culls_crossover += 1,
@@ -826,31 +731,22 @@ impl CoreEngine {
         self.rolling_fitness.remove(hash);
         self.rolling_train.remove(hash);
         self.rolling_eval.remove(hash);
-        // Decision-lag bookkeeping dies with the net: the shadow and its
-        // promotion clock are per-individual state.
-        // A culled frozen elite leaves the crown (the `stepped X/N` log line
-        // counts crown members as skipped — a stale entry would corrupt it).
+            // Decision-lag state dies with the net (shadow + promotion clock are
+            // per-individual); a culled frozen elite leaves the crown.
         self.frozen_crown.remove(hash);
         self.culls += 1;
         Ok(())
     }
 
-    /// Select a live net inversely-proportionate to smoothed fitness (worst
-    /// nets most likely) — the `MutationCullPolicy::InverseFitness` arm. Elite
-    /// nets (top-`config.elite_count`) are excluded entirely — they can never
-    /// be mutation victims; nets on mutation probation are excluded too (the
-    /// clock is the CURRENT race clock). Returns `None` when no cullable
-    /// candidate remains (empty/single-net pop, or all elite/on-probation).
+        /// Select a live net inversely-proportionate to smoothed fitness — the
+        /// `InverseFitness` arm. Elites and probation nets are excluded; `None` = none.
     pub(crate) fn select_inverse_proportional_at(
         &self,
         clock: usize,
         roll: usize,
     ) -> Result<Option<String>> {
-        // The roulette draw comes from the MUTATION roll lane, like the fire
-        // check: same (clock, roll), same lane, no shift when the batch is
-        // skipped. (`Rng::with_seed` here rather than `fastrand::f32()`: the
-        // process-global stream is entropy-seeded, so this pick used to differ
-        // between two runs that recorded the same run seed.)
+            // The roulette draw comes from the MUTATION roll lane, like the fire check:
+            // same (clock, roll), same lane, no shift when the batch is skipped.
         let mut rng = fastrand::Rng::with_seed(
             RollKind::Mutation.seed(self.header.run_seed, clock, roll),
         );
@@ -861,10 +757,8 @@ impl CoreEngine {
         let direction = self.fitness.direction();
         let elite = self.elite_hashes();
         let clock = self.step_clock();
-        // Inverse fitness: weight = (adjusted best) − (adjusted value) ≥ 0 —
-        // the worst net gets the largest weight, the best gets zero. (The
-        // previous `value − worst` weighting was inverted: it targeted the
-        // FITTEST net — fixed; the confused "wait, inverted" comment is gone.)
+            // Inverse fitness: weight = (adjusted best) − (adjusted value) ≥ 0 — the
+            // worst net gets the largest weight, the best gets zero.
         let scored: Vec<(String, f32)> = hashes
             .iter()
             .filter(|h| !elite.contains(h))
@@ -913,27 +807,8 @@ impl CoreEngine {
         Ok(weights.last().map(|(h, _)| h.clone()))
     }
 
-    /// Whether `hash` is on probation at `clock`: cull-IMMUNE for its first
-    /// few clocks (measured from `entered_at_step`, which is already persisted
-    /// — no new state, resume-safe). The window depends on HOW the net was
-    /// born: a crossover child uses `crossover_probation_steps`, everything
-    /// else (random immigrants) uses `mutation_probation_steps`. Either window
-    /// at 0 means that channel's fresh nets carry only the built-in
-    /// empty-buffer step-0 immunity (the default). Probation is a STATUS, not a
-    /// queue: the net still trains, measures, and can rank — it just cannot be
-    /// a cull VICTIM while fresh.
-    /// Whether a roll of `kind` in this `clock` FIRES, drawn from a seed
-    /// derived from `(run_seed, clock, roll)` rather than from the
-    /// process-global `fastrand` stream.
-    ///
-    /// Why derived: the fire pattern decides who gets a child and who gets
-    /// culled, so it is part of what a run MEANS. The global generator is
-    /// entropy-seeded and nothing in the crate ever calls `fastrand::seed`, so
-    /// two runs that recorded the same run seed could still diverge here — the
-    /// header claims one seed, and every other stream in the crate (founders,
-    /// children, batches, challenges) already derives from it. A derived draw
-    /// is also what lets the caller SKIP a whole clock's roll batch (see
-    /// `has_cull_eligible`) without shifting the draws of later rolls.
+    /// Whether a roll of `kind` in this `clock` FIRES, derived from
+    /// `(run_seed, clock, roll)` rather than the process-global `fastrand` stream.
     pub(crate) fn roll_fires(&self, kind: RollKind, clock: usize, roll: usize) -> bool {
         let p = match kind {
             RollKind::Crossover => self.config.crossover_prob,
@@ -945,6 +820,8 @@ impl CoreEngine {
         fastrand::Rng::with_seed(kind.seed(self.header.run_seed, clock, roll)).f32() < p
     }
 
+    /// Whether `hash` is on probation at `clock`: cull-IMMUNE for its first few
+    /// clocks (from the persisted `entered_at_step`); a status, not a queue.
     pub(crate) fn on_probation(&self, hash: &str, clock: usize) -> bool {
         let Some(state) = self.state.net(hash) else {
             return false;
@@ -957,10 +834,8 @@ impl CoreEngine {
         window > 0 && clock.saturating_sub(state.entered_at_step) < window
     }
 
-    /// The crossover Worst-policy victim: the worst non-elite net that has
-    /// served its crossover probation. `None` when nobody is cullable — the
-    /// shield is HARD (no plain-worst fallback), so the roll is skipped rather
-    /// than paid for with a fresh net.
+        /// The crossover Worst-policy victim: the worst non-elite net that has served
+        /// its crossover probation. `None` when nobody is cullable (shield is HARD).
     fn select_crossover_worst_victim(&self, clock: usize) -> Result<Option<String>> {
         Ok(self
             .worst_nets_by_smoothed_fitness(self.state.live_count())?

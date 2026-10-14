@@ -77,10 +77,7 @@ pub struct SeedPick {
 }
 
 /// A resolved PLAN: the source run plus its elites in rank order, best first.
-///
-/// Always at least one pick when it is `Seeded` — a plan with no blueprints to
-/// load is a [`SeedOutcome::Skipped`], so the caller never has to handle "an
-/// inheritance that inherited nothing".
+/// Always at least one pick when `Seeded` — an empty plan is `Skipped`.
 #[derive(Clone, Debug)]
 pub struct SeedPlan {
     /// The source run's id (its `results/<id>` directory name).
@@ -119,10 +116,8 @@ impl SeedOutcome {
     }
 }
 
-/// One entry of a source run's `elites.json` — the machine-readable ranking
-/// `CoreEngine::write_elite_index` (`src/engine/artifacts.rs`) leaves behind
-/// for the next experiment. `fitness`, `params` and `born` are in the file for
-/// a human reader; this module only needs the rank and the hash.
+/// One entry of a source run's `elites.json` — the machine-readable ranking the
+/// next experiment reads; only the rank and hash matter here.
 #[derive(Clone, Debug, serde::Deserialize)]
 struct EliteIndexEntry {
     /// 1-based rank in the source run's stop-time elite ranking.
@@ -132,9 +127,7 @@ struct EliteIndexEntry {
 }
 
 /// Resolve the previous experiment's CERTIFIED CHAMPION (rank 1 only) — the
-/// single-slot inheritance. Kept as the narrow entry point (`resolve_plan` with
-/// `max_seeds = 1`); the engine uses [`resolve_plan`] so a whole elite list can
-/// come over.
+/// narrow entry point; the engine uses [`resolve_plan`] for the whole list.
 pub fn resolve(
     root: Option<&Path>,
     exclude: Option<&Path>,
@@ -146,21 +139,8 @@ pub fn resolve(
     resolve_plan(root, exclude, mode, input_dim, output_dim, trainer_name, 1)
 }
 
-/// Resolve the previous experiment to inherit from, and load its elites.
-///
-/// `mode` is the NEW run's `engine_mode` (`"tabular"` | `"rl"`), `trainer_name`
-/// its `Trainer::describe()` name (`engine.json` → `trainer.trainer`), and the
-/// dims come from the new run's header — the candidate must match all of them.
-/// `exclude` is the new run's OWN directory (see the module doc: it exists on
-/// disk by the time this runs, and must never be treated as "a previous run").
-/// `max_seeds` caps how many elites come over — the new run's `pop_size`, so a
-/// small population takes the TOP `max_seeds` ranks instead of overflowing.
-///
-/// Partial failures are survivable per elite: a rank whose `nets/<hash>.json`
-/// is missing (or whose blueprint declares the wrong dims) is dropped and the
-/// next rank is tried, because losing one blueprint must not sink an
-/// inheritance of ten. Rank 1 is the exception that keeps the old contract: if
-/// the CERTIFIED champion cannot be loaded, nothing is inherited at all.
+/// Resolve the previous experiment and load its elites (`mode`, `trainer_name`
+/// and dims must all match; per-elite failures drop that rank, rank 1 is fatal).
 pub fn resolve_plan(
     root: Option<&Path>,
     exclude: Option<&Path>,
@@ -213,9 +193,8 @@ pub fn resolve_plan(
             "run {source_run_id} recorded an empty guardrail champion hash"
         ));
     }
-    // ── 4. the ranked list: `elites.json`, else the champion alone ─────────
-    // The champion stays rank 1 either way, so an old source (no index) and a
-    // new one agree on which net is first.
+        // ── 4. the ranked list: `elites.json`, else the champion alone ─────────
+        // The champion stays rank 1 either way, so old and new sources agree.
     let ranked: Vec<(usize, String)> = match read_elite_index(dir) {
         Some(entries) if !entries.is_empty() => entries,
         _ => vec![(1, record.champion_hash.clone())],
@@ -238,9 +217,8 @@ pub fn resolve_plan(
                 continue;
             }
         };
-        // The header gate above proves the RUN matched; this proves the
-        // BLUEPRINT did too (a legacy one may carry explicit dims that
-        // disagree). A mismatched rank is dropped like a missing file.
+            // The header gate proved the RUN matched; this proves the BLUEPRINT did
+            // (a legacy one may carry disagreeing dims). A mismatch is dropped.
         let opts = &topology.options;
         if opts.input_dim.is_some()
             && (opts.input_dim != Some(input_dim) || opts.output_dim != Some(output_dim))
@@ -278,12 +256,8 @@ pub fn resolve_plan(
     }))
 }
 
-/// Read a source run's `elites.json` as `(rank, hash)` pairs, best first.
-///
-/// `None` when the file is absent, unreadable, unparsable, or empty — every one
-/// of those means "this source predates the index", and the caller falls back
-/// to the guardrail champion. Duplicate hashes (which would seed the same
-/// blueprint twice) are collapsed, keeping the better rank.
+/// Read a source run's `elites.json` as `(rank, hash)` pairs, best first. `None`
+/// when absent/unparsable (the source predates the index); duplicates collapse.
 fn read_elite_index(dir: &Path) -> Option<Vec<(usize, String)>> {
     let raw = std::fs::read_to_string(dir.join("elites.json")).ok()?;
     let mut entries: Vec<EliteIndexEntry> = serde_json::from_str(&raw).ok()?;
@@ -314,13 +288,8 @@ fn read_header(dir: &Path) -> Result<RunHeader, String> {
         .map_err(|e| format!("{}: unparsable engine.json ({e})", dir.display()))
 }
 
-/// Run directories under `root`, NEWEST FIRST, minus `exclude` (this run).
-///
-/// `root` itself is a candidate when it holds an `engine.json` (so a caller
-/// can point straight at one run). Otherwise every subdirectory with an
-/// `engine.json` is a candidate, ordered by the numeric prefix of its name —
-/// the timestamped run id — descending. Directories without a numeric prefix
-/// are not run dirs and are ignored.
+/// Run directories under `root`, NEWEST FIRST, minus `exclude` (this run) —
+/// ordered by the numeric run-id prefix of the name, descending.
 fn run_dirs(root: &Path, exclude: Option<&Path>) -> Vec<PathBuf> {
     let excluded = |p: &Path| exclude.map(|e| same_dir(p, e)).unwrap_or(false);
     if root.join("engine.json").is_file() {
@@ -360,9 +329,8 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// The numeric run-id prefix of a directory name (`"1791666865613"` →
-/// `1791666865613`, `"1790205878633_cartpole"` → `1790205878633`). `None` when
-/// the name doesn't start with a digit — not a run dir.
+/// The numeric run-id prefix of a directory name (`"1790205878633_cartpole"` →
+/// `1790205878633`). `None` when the name doesn't start with a digit.
 fn run_id_key(name: &str) -> Option<u128> {
     let digits: String = name.chars().take_while(|c| c.is_ascii_digit()).collect();
     if digits.is_empty() {
@@ -417,9 +385,8 @@ mod tests {
         topo
     }
 
-    /// Write a minimal but realistic prior-run directory: an `engine.json`
-    /// header, a `nets/<hash>.json` frontier state carrying the blueprint, and
-    /// optionally the guardrail block.
+        /// Write a minimal but realistic prior-run directory: an `engine.json`
+        /// header, a `nets/<hash>.json` state carrying the blueprint.
     fn write_run(
         dir: &Path,
         run_id: &str,
@@ -581,10 +548,8 @@ mod tests {
         );
     }
 
-    /// The run's OWN directory is written before the lookup, so it is the
-    /// "newest" candidate by construction. It must be excluded (and excluded
-    /// even when it is the only run dir, which must read as "nothing to
-    /// inherit", not "inherit an empty header").
+        /// The run's OWN directory is written before the lookup, so it is the
+        /// "newest" candidate by construction and must always be excluded.
     #[test]
     fn the_current_runs_own_directory_is_never_chosen() {
         let root = tmp("self-exclude");

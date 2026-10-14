@@ -16,37 +16,38 @@ pub struct RollingBuffer {
 }
 
 impl RollingBuffer {
+    /// New buffer keeping at most `cap` readings (oldest dropped first).
     pub fn new(cap: usize) -> Self {
         RollingBuffer {
             inner: std::collections::VecDeque::with_capacity(cap),
             cap,
         }
     }
-    /// A buffer pre-filled with the given values (capped at `cap`, oldest
-    /// dropped first). Test convenience: fixtures push a whole history at
-    /// once instead of looping `push`.
+        /// A buffer pre-filled with `values` (capped at `cap`); test convenience.
     pub fn push(&mut self, v: f32) {
         self.inner.push_back(v);
         if self.inner.len() > self.cap {
             self.inner.pop_front();
         }
     }
+    /// Iterate the buffered readings, oldest first.
     pub fn iter(&self) -> std::collections::vec_deque::Iter<'_, f32> {
         self.inner.iter()
     }
+    /// True when no reading has been pushed.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
+    /// Number of buffered readings (at most `cap`).
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+    /// Drop every buffered reading.
     pub fn clear(&mut self) {
         self.inner.clear();
     }
-    /// The most recent value pushed — the net's LATEST reading. The window mean
-    /// lags it by up to `cap` steps, so the two disagree whenever a net improves
-    /// or decays near the end (or when one lucky batch entered the window); the
-    /// guardrail prints both exactly because the disagreement is diagnostic.
+        /// The most recent value pushed (the net's LATEST reading); the window
+        /// mean lags it by up to `cap` steps — the guardrail prints both.
     pub fn last(&self) -> Option<f32> {
         self.inner.back().copied()
     }
@@ -92,19 +93,8 @@ pub fn rolling_harmonic_mean(buf: &RollingBuffer, floor: f32) -> f32 {
     n / sum_recip
 }
 
-/// A smoothed reading WITH its own error bar: how many readings it averages
-/// and how much they spread.
-///
-/// Why this exists: a smoothed fitness is a mean over the smoothing window
-/// (`SMOOTHING_WINDOW` step readings — 5 by default), and each of those
-/// readings is itself a mean over the trainer's eval batch. So the number the
-/// race reports for the champion is a mean of K small samples, taken from a
-/// distribution that is often bimodal (cartpole: 500 = solved, ~40 = fell
-/// over). Comparing that against the guardrail's exam mean — usually a mean
-/// over 10× more games — without quoting the spread is how a run whose
-/// TRUE score is fine reads as a collapse: the champion is the ARGMAX of the
-/// noisy statistic over the whole population, so its recorded mean carries a
-/// built-in upward bias (the winner's curse).
+/// A smoothed reading WITH its own error bar: how many readings it averages and
+/// how much they spread — the race's number is a mean of K small samples.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowStats {
     /// Readings behind `mean` (buffer length, ≤ the smoothing window).
@@ -113,11 +103,10 @@ pub struct WindowStats {
     pub mean: f32,
     /// Population std of the readings: their step-to-step spread.
     pub std: f32,
-    /// Extreme readings in the window. Printed by the guardrail because they are
-    /// the readable form of `std`: a mean of 191.7 built from `[41.5 .. 500.0]`
-    /// is one solved game inside a window of fizzles, and no error bar states
-    /// that more directly.
+        /// Extreme readings in the window — the readable form of `std` (e.g. one
+        /// 500 among fizzles).
     pub min: f32,
+    /// Largest reading in the window.
     pub max: f32,
     /// The buffer's most recent value (see [`RollingBuffer::last`]): the reading
     /// that describes the weights the run actually ended with.
@@ -125,12 +114,8 @@ pub struct WindowStats {
 }
 
 impl WindowStats {
-    /// Standard error of `mean` (`std / √n`) — the error bar to compare against
-    /// a holdout mean. `None` for zero readings (nothing was measured);
-    /// `Some(0.0)` for a single reading (a one-sample mean has no observable
-    /// spread, which is NOT the same as being precise — see
-    /// [`crate::engine::guardrail::agreement_verdict_noisy`], which declines to
-    /// use the noisy branch when the spread is unobservable).
+        /// Standard error of `mean` (`std / √n`). `None` for zero readings;
+        /// `Some(0.0)` for one reading (unobservable spread, not precision).
     pub fn se(&self) -> Option<f32> {
         (self.n > 0).then(|| self.std / (self.n as f32).sqrt())
     }
@@ -187,9 +172,8 @@ mod tests {
 
     #[test]
     fn geometric_mean_weights_the_low_readings() {
-        // The cartpole champion's defining window: one lucky 500 among four
-        // fizzles. The geometric mean pulls hard toward the fizzles instead of
-        // averaging in the solve.
+            // The cartpole champion's window: one lucky 500 among four fizzles;
+            // the geometric mean pulls toward the fizzles.
         let buf = RollingBuffer::from_values(5, &[40.0, 500.0, 40.0, 40.0, 40.0]);
         // exp(mean(ln(40), ln(500), ln(40), ln(40), ln(40)))
         let geo = rolling_geometric_mean(&buf, f32::EPSILON);
@@ -268,9 +252,8 @@ mod tests {
         // Population std: sqrt((4·92² + 368²)/5) = 184 — the deviations are
         // −92 (×4) and +368 (×1), so one solve dominates the spread.
         assert!((s.std - 184.0).abs() < 0.1, "std was {}", s.std);
-        // SE = std/√n ≈ 82.3 — the error bar that makes this 132-mean race
-        // reading look far shakier than a 100-game exam's ±2 (and matches the
-        // ≈80 SE the real run recorded).
+            // SE = std/√n ≈ 82.3 — the error bar that makes this 132-mean race
+            // reading look far shakier than a 100-game exam's ±2.
         let se = s.se().unwrap();
         assert!((se - s.std / 5.0_f32.sqrt()).abs() < 1e-4, "se was {se}");
     }

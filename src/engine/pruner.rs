@@ -16,18 +16,8 @@ use super::config::{PopPruner, StopReason};
 use super::core::{CoreEngine, RlVolume, StepEvolve};
 
 impl CoreEngine {
-    /// Post-race pruner phase (Hard method): cull all but the top
-    /// `elite_count` live nets, then keep training the survivors for
-    /// `pruner.steps` extra steps with evolution and stop criteria off.
-    ///
-    /// The survivors continue through the SAME per-net step path (`step_one_net`)
-    /// with the SAME trainer, optimizer state, and shared stream — only the
-    /// orchestration differs: no evolve rolls fire (the race is over), and
-    /// `check_stop` is not consulted (its signals are population-level and
-    /// meaningless on 1–2 nets; std on a 1-net population is literally 0).
-    /// Every solo step is recorded exactly like a race step — history.csv
-    /// metric rows and the survivors' `nets/<hash>.json` step counters — so
-    /// the post-race extension is a visible, replayable part of the run.
+        /// Post-race pruner phase (Hard method): cull all but the top
+        /// `elite_count` nets, then keep training survivors for `pruner.steps`.
     pub(crate) fn run_pruner_phase(
         &mut self,
         reason: StopReason,
@@ -42,9 +32,8 @@ impl CoreEngine {
             .take(self.config.elite_count.max(1).min(self.state.live_count()))
             .map(|(h, _)| h)
             .collect();
-        // Worst-net dump BEFORE the cull: the anti-champion only exists
-        // while the full field is alive — after culling to elites there is
-        // no "worst" left to distinguish from the elite.
+            // Worst-net dump BEFORE the cull: the anti-champion only exists while
+            // the full field is alive.
         self.write_worst_artifacts()?;
         let victims: Vec<String> = self
             .state
@@ -100,30 +89,20 @@ impl CoreEngine {
             self.persist_run_counters();
             return Ok(reason);
         }
-        // Solo extension: the same group-step shape, minus evolution and stop
-        // checks. Optimizer state is intact (nothing rebuilt) — the elites
-        // simply keep learning at the same LR/hyperparams. Elite freeze is
-        // BYPASSED (see `pruner_solo_active`): every survivor IS an elite,
-        // so freezing here would reduce the whole post-race workout to
-        // act-and-measure steps with zero weight updates.
+            // Solo extension: the same group-step shape, minus evolution and stop
+            // checks. Elite freeze is BYPASSED — every survivor IS an elite.
         self.pruner_solo_active = true;
         for offset in 0..pruner.steps {
             let step = clock + 1 + offset;
-            // FREEZE BYPASS: refresh the crown (which CLEARS it while
-            // `pruner_solo_active`) so no stale race-phase crown membership
-            // can make a survivor act-and-measure. Every solo step is a real
-            // trained step.
+                // FREEZE BYPASS: refresh the crown (which clears it while
+                // `pruner_solo_active`) so every solo step is a real trained step.
             self.refresh_crown(step);
-            // Solo steps evolve nothing: both per-step accumulators start
-            // clean, so the rollup reports this step's own RL volume and the
-            // (already logged) pruner culls are not re-counted every step.
+                // Solo steps evolve nothing: both accumulators start clean, so the
+                // rollup reports only this step's volume.
             self.step_evolve = StepEvolve::default();
             self.step_rl = RlVolume::default();
-            // The rollup's `took` must be THIS step's cost. The race loop
-            // resets the clock at the top of every iteration; the pruner
-            // loop had no reset, so its lines reported cumulative wall time
-            // since the race started (a pop-2 solo step showing "took 52.3s"
-            // when it really took ~0.9s). Same reset, same meaning.
+                // The rollup's `took` must be THIS step's cost — reset the clock
+                // like the race loop does, or it reports cumulative wall time.
             self.step_started_at_wall = std::time::Instant::now();
             let hashes = self.state.live_hashes();
             if hashes.is_empty() {
@@ -153,9 +132,8 @@ impl CoreEngine {
         }
         self.write_live_frontier_states()?;
         self.flush_csv_exports()?;
-        // This path RETURNS from `finish_race` before its own counter stamp,
-        // so the pruner culls and the phase's wall time must be persisted
-        // here or `engine.json` undercounts both.
+            // This path RETURNS before `finish_race`'s counter stamp, so persist
+            // the culls and wall time here or `engine.json` undercounts both.
         self.persist_run_counters();
         Ok(reason)
     }

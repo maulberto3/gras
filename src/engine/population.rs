@@ -12,9 +12,8 @@ use crate::graph::node::NodeKind;
 use crate::graph::topology::Topology;
 use crate::utils::seed::{derive_seed, topo_hash};
 
-/// One deterministic topology draw from the run's config + pools, keyed by a
-/// single ordinal. Shared by the initial loop and the duplicate re-roll so a
-/// re-roll uses exactly the same pool/stride discipline as the original.
+/// One deterministic topology draw from the run's config + pools, keyed by an
+/// ordinal. Shared by the initial loop and the duplicate re-roll.
 fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology {
     // Empty config pool ⇒ all known ops (resolved_* handles the fallback).
     let activation = config
@@ -29,13 +28,8 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
 
     let seed = derive_seed(run_seed, ordinal) as usize;
     let mut rng = fastrand::Rng::with_seed(seed as u64);
-    // Per-individual identity seed. `options.topology_seed` is the seed the
-    // whole engine keys off: `Network::build` weights, `seed_step_randomness`,
-    // and the `net_seed` a trainer derives its own challenge trigger from.
-    // Leaving it at the template default made every founder share ONE seed —
-    // identical initial weights, and (in the engine-wired era) a challenge
-    // trigger that fired for the entire population at once or not at all,
-    // instead of for roughly `challenge_prob` of the nets per step.
+        // Per-individual identity seed. `options.topology_seed` keys the whole engine;
+        // sharing the template default made every founder identical.
     let mut opts = config.topology_options;
     opts.topology_seed = seed;
     let n_hidden = rng.usize(opts.min_hidden_num_nodes..=opts.max_hidden_num_nodes);
@@ -57,12 +51,8 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     graph
 }
 
-/// The initial population: `pop_size` deterministic draws, deduped by
-/// topology hash. Dedupe matters because two identical topology JSONs hash
-/// identically and `RaceState` would silently collapse them onto one key —
-/// the pop would shrink below `pop_size` from step 0 (the gap this closes
-/// was flagged as Tier-A follow-up when the duplicate gate landed for
-/// children; this is the population-side twin of that gate).
+/// The initial population: `pop_size` deterministic draws, deduped by topology
+/// hash — identical JSONs would otherwise collapse onto one `RaceState` key.
 pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
     let pop_size = config.pop_size;
     let mut topos: Vec<Topology> = (0..pop_size)
@@ -114,20 +104,7 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
 }
 
 /// Build the founder batch from explicit blueprints + random draws, deduped by
-/// topology hash and always landing on `target` nets.
-///
-/// `founders` fill the first slots IN ORDER (an imported champion first, then
-/// any user `run_topologies`), then random draws fill the rest. A draw that
-/// collides with a founder — or with an earlier draw — is RE-ROLLED at
-/// ordinals past both the initial batch and [`initial_population`]'s own
-/// re-roll window, so the two sets of re-rolls cannot collide by construction.
-///
-/// Re-rolling is what the caller used to only *promise*: the old mix was
-/// `truncate`d, so a random draw duplicating an imported blueprint silently
-/// landed the population a net short for the whole run.
-///
-/// Empty `founders` ⇒ [`initial_population`] verbatim, so the no-import path
-/// stays bit-identical to what it always was.
+/// topology hash and always landing on `target` nets (import first, then draws).
 pub fn fill_unique(
     config: &RaceConfig,
     run_seed: u64,
@@ -198,9 +175,8 @@ pub fn fill_unique(
     out
 }
 
-/// Same shape as [`initial_population`], seeded from the run header's
-/// recorded split ratio so a resumed run's new entrants see the same
-/// train/eval pools as the run that wrote the checkpoint.
+/// Same shape as [`initial_population`], seeded from the header's recorded split
+/// ratio so a resumed run's entrants see the same pools.
 pub fn initial_population_from_header(
     config: &RaceConfig,
     run_seed: u64,
@@ -213,11 +189,8 @@ pub fn initial_population_from_header(
 
 // ── Run topology (founding batch) loading ──────────────────────────────
 
-/// Load a run topology from a saved artifact: a topology JSON file
-/// (`Topology::to_json` output) or a `nets/<hash>.json` frontier state (its
-/// `topology` field is parsed). Blueprint-ONLY — the topology gets fresh
-/// weights and a fresh optimizer like every other net; weight import is a
-/// separate, not-yet-landed path.
+/// Load a run topology from a saved artifact (a topology JSON, or a
+/// `nets/<hash>.json` state's `topology` field). Blueprint-only, fresh weights.
 pub fn run_topology_from_json_file(path: &std::path::Path) -> Result<Topology, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("run-topology {}: {e}", path.display()))?;
@@ -239,12 +212,8 @@ pub fn run_topology_from_json_file(path: &std::path::Path) -> Result<Topology, S
         .map_err(|e| format!("run-topology {}: bad topology: {e}", path.display()))
 }
 
-/// Load run topologies from a PRIOR RUN's directory: every
-/// `nets/<hash>.json` frontier state, ranked by final smoothed fitness (the
-/// champion first), up to `max` topologies. Dims and ops come from the saved
-/// blueprints verbatim — the new run's topology pools don't constrain them
-/// (the run topologies are proven architectures; re-rolling their nodes would
-/// defeat the point). Fails only when NO state parses.
+/// Load topologies from a PRIOR RUN's dir: every `nets/<hash>.json`, ranked by
+/// final smoothed fitness (champion first), up to `max`. Fails only if none parse.
 pub fn run_topologies_from_run_dir(
     dir: &std::path::Path,
     max: usize,
@@ -332,11 +301,8 @@ mod tests {
         assert_eq!(hashes.len(), total, "no two topologies may share a hash");
     }
 
-    /// An import (a previous run's champion) that DUPLICATES a random draw
-    /// must not shrink the population: the colliding draw is re-rolled, so the
-    /// batch still lands on `pop_size` unique topologies with the import in
-    /// slot 0. The old `truncate` mix left the population a net short for the
-    /// whole run — the bug this closes.
+        /// An import duplicating a random draw must not shrink the population: the
+        /// colliding draw is re-rolled, so the batch lands on `pop_size` uniques.
     #[test]
     fn fill_unique_keeps_pop_size_when_a_draw_collides_with_an_import() {
         let cfg = tiny_config(6);
@@ -397,9 +363,8 @@ mod tests {
 
     #[test]
     fn forced_space_of_one_keeps_exactly_one_unique() {
-        // A 1-hidden-node, fixed-dim space with no op variety can only
-        // produce ONE distinct topology; the gate can't invent variety. It
-        // must keep pop_size entries but only 1 unique hash — the warn path.
+            // A 1-hidden-node fixed-dim space yields ONE topology; the gate must
+            // keep pop_size entries with only 1 unique hash (the warn path).
         let mut cfg = tiny_config(3);
         cfg.activation_pool = vec!["relu".into()];
         cfg.combine_op_pool = vec!["mean".into()];
@@ -408,11 +373,8 @@ mod tests {
         assert_eq!(topos.len(), 3, "pop size preserved even when trapped");
     }
 
-    /// Every founder must carry its OWN `net_seed`. Sharing the template's
-    /// seed gave the whole population identical initial weights — and, while
-    /// the engine still rolled challenges, one trigger for the whole
-    /// population: every net was challenged at once (or none was), instead of
-    /// roughly `challenge_prob` of them per step.
+        /// Every founder must carry its OWN `net_seed` — sharing the template seed
+        /// gave the whole population identical weights and one challenge trigger.
     #[test]
     fn founders_get_distinct_net_seeds() {
         let cfg = tiny_config(8);

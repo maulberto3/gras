@@ -10,15 +10,11 @@ use super::config::{RaceSnapshot, StopReason};
 use super::core::CoreEngine;
 
 impl CoreEngine {
-    /// Check stop criteria at the given step. Returns `Some(reason)` if one
-    /// fires, `None` if the run should continue.
-    ///
-    /// `custom_stop` is independent and always evaluated after the built-ins.
+    /// Check the stop criteria at this step: `Some(reason)` if one fires, `None`
+    /// to continue. `custom_stop` is independent and runs after the built-ins.
     pub(crate) fn check_stop(&mut self, step: usize) -> Option<StopReason> {
-        // 0. Ctrl+C (checked FIRST — the user's intent outranks every bar;
-        // abandoning flows through the SAME artifact path as a natural stop).
-        // The in-flight step IS completed (we are between steps here), then
-        // the whole post-race sequence runs.
+        // 0. Ctrl+C first — the user's intent outranks every bar, and abandoning
+        // flows through the same artifact path as a natural stop (step included).
         if let Some(flag) = &self.interrupt_flag {
             if flag.load(std::sync::atomic::Ordering::SeqCst) {
                 info!(
@@ -34,9 +30,8 @@ impl CoreEngine {
                 return Some(StopReason::MaxSteps);
             }
         }
-        // 2. Custom stop: joins the race **in addition** to the built-ins, so
-        // a user policy can stop the run on criteria the built-ins don't
-        // model.
+        // 2. Custom stop: joins the race IN ADDITION to the built-ins, for
+        // criteria they don't model.
         if let Some(stop) = self.config.custom_stop.as_ref() {
             if stop(&self.snapshot(step)) {
                 return Some(StopReason::CustomStop);
@@ -45,9 +40,8 @@ impl CoreEngine {
         None
     }
 
-    /// Build the read-only `RaceSnapshot` handed to a custom stop closure.
-    /// `best`/`worst` are direction-aware (the fitness direction decides which
-    /// end of the spread is "best"); `mean` is the plain arithmetic mean.
+    /// Build the read-only `RaceSnapshot` for a custom stop: `best`/`worst` are
+    /// direction-aware, `mean` is the plain arithmetic mean.
     pub(crate) fn snapshot(&self, step: usize) -> RaceSnapshot {
         let smoothed = self.smoothed_fitness_values();
         let (best, worst, mean) = if smoothed.is_empty() {

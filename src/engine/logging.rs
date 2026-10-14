@@ -49,21 +49,15 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 const MAX_STARTUP_BYTES: usize = 1 << 20;
 
 /// Install the subscriber for a run: console + frame, plus the telemetry sink
-/// (inert until [`settle_run_dir`] decides whether the run wants the file).
-///
-/// `filter_override` is a caller-supplied verbosity (the examples'
-/// `--log-level`); `RUST_LOG` beats both. Returns false when a subscriber is
-/// already installed (a second engine in one process) — the first one owns the
-/// sinks, and calling this twice is not an error.
+/// (inert until [`settle_run_dir`] decides). Returns false if already installed.
 pub fn init(level: LogLevel, filter_override: Option<&str>) -> bool {
     let base = filter_override.unwrap_or_else(|| level.env_filter());
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| base.to_string());
 
     PENDING.store(true, Ordering::Relaxed);
 
-    // `Minimal` mutes the info lines that would compete with the frame (its
-    // `env_filter` is `warn`) — the frame rides a different target, so it
-    // still gets through, which is exactly what the mode means.
+        // `Minimal` mutes info lines (its `env_filter` is `warn`); the frame rides
+        // a different target, so it still gets through.
     let console = fmt::layer()
         .with_writer(io::stderr)
         .with_ansi(false)
@@ -75,9 +69,8 @@ pub fn init(level: LogLevel, filter_override: Option<&str>) -> bool {
         );
     let frame =
         FrameLayer::new().with_filter(filter_fn(|m: &Metadata<'_>| m.target() == FRAME_TARGET));
-    // The record, not a view: every gras event lands in the file regardless of
-    // the console verbosity, and no other crate's chatter does. Gated on the
-    // settle state so an untraced run serializes nothing at all.
+        // The record, not a view: every gras event lands in the file and no other
+        // crate's chatter does. Gated on settle state so untraced runs are silent.
     let telemetry = fmt::layer()
         .with_writer(SINK.get_or_init(Sink::new).clone())
         .with_ansi(false)
@@ -107,10 +100,8 @@ pub(crate) fn frame(text: &str) {
     tracing::info!(target: FRAME_TARGET, frame = text);
 }
 
-/// Settle the telemetry sink now that the run dir exists: attach
-/// `<run_dir>/telemetry.jsonl` when the run asked for the trace file, flush the
-/// buffered start-up block into it, and otherwise close the window by dropping
-/// that buffer. Called by the engine right after it writes `engine.json`.
+/// Settle the telemetry sink once the run dir exists: attach
+/// `<run_dir>/telemetry.jsonl` when asked, else drop the buffered start-up block.
 pub fn settle_run_dir(run_dir: &Path, trace_file: bool) {
     PENDING.store(false, Ordering::Relaxed);
     let sink = SINK.get_or_init(Sink::new);
@@ -135,9 +126,8 @@ pub fn settle_run_dir(run_dir: &Path, trace_file: bool) {
         })
     };
 
-    // Reported outside the lock: the telemetry layer writes through this very
-    // sink, so emitting while holding it would deadlock. A failed open leaves
-    // the sink disarmed — no file, no half-written "telemetry" in the run dir.
+        // Reported outside the lock: the telemetry layer writes through this sink,
+        // so emitting while holding it would deadlock.
     match outcome {
         Ok(()) => ARMED.store(true, Ordering::Relaxed),
         Err(e) => tracing::warn!("telemetry {} unavailable: {e}", path.display()),
@@ -158,6 +148,7 @@ struct Telemetry {
 }
 
 impl Sink {
+    /// New empty sink: buffered until the run dir attaches a file.
     fn new() -> Self {
         Self(Arc::new(Mutex::new(Telemetry {
             buffered: String::new(),
@@ -203,15 +194,15 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
     }
 }
 
-/// Renders `Minimal` frames. On a terminal the previous frame is erased and
-/// redrawn in place, so the table holds one screen position instead of
-/// scrolling; off a terminal it prints plainly (no escape codes in a file).
+/// Renders `Minimal` frames: erased and redrawn in place on a terminal,
+/// printed plainly off one.
 struct FrameLayer {
     /// Lines the last frame occupied, for the cursor-up count.
     drawn: Mutex<usize>,
 }
 
 impl FrameLayer {
+    /// New frame layer with no frame drawn yet.
     fn new() -> Self {
         Self {
             drawn: Mutex::new(0),

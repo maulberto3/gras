@@ -51,19 +51,8 @@ impl Direction {
 
 // ── Fitness — computed or reported ───────────────────────────────────────
 
-/// Ranking signal for the race. Two flavors:
-///
-/// - **[`Fitness::Computed`]** — the engine scores `(pred, target)` itself on
-///   the step's eval batch (supervised style: accuracy, mse, …). Built with
-///   [`Fitness::new`].
-/// - **[`Fitness::Reported`]** — the trainer computes the scalar however it
-///   wants (e.g. an RL episode reward) and ships it back in
-///   [`StepReport::fitness`](crate::trainer::StepReport); the engine only
-///   ranks/culls on the reported values. Built with [`Fitness::reported`].
-///
-/// In both cases the engine's evolutionary machinery (ranking, culling,
-/// gates, smoothing) operates on the scalar — the flavors differ only in
-/// WHO computes it and whether a `(pred, target)` pair is needed.
+/// Ranking signal for the race. [`Fitness::Computed`] = the engine scores
+/// `(pred, target)`; [`Fitness::Reported`] = the trainer ships the scalar.
 pub enum Fitness {
     /// Engine-computed: a pure `(pred, target) → f32` scoring function,
     /// plus the direction and label that travel with it.
@@ -98,9 +87,8 @@ impl Fitness {
         }
     }
 
-    /// Trainer-reported fitness (RL / episode style): the trainer supplies
-    /// the scalar in `StepReport.fitness` each step; the engine ranks on it.
-    /// The engine never calls a scorer in this mode.
+        /// Trainer-reported fitness (RL style): the trainer supplies the scalar
+        /// each step and the engine ranks on it.
     pub fn reported(direction: Direction, label: &str) -> Self {
         Fitness::Reported {
             direction,
@@ -108,9 +96,8 @@ impl Fitness {
         }
     }
 
-    /// Lower-is-better scorer — shorthand for
-    /// `Fitness::new(score_fn, Direction::Minimize, label)` that reads as the
-    /// intent: `Fitness::minimize("mse", mse_loss_score)`.
+        /// Lower-is-better scorer — shorthand for
+        /// `Fitness::new(score_fn, Direction::Minimize, label)`.
     pub fn minimize<F>(label: &str, score_fn: F) -> Self
     where
         F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
@@ -118,9 +105,8 @@ impl Fitness {
         Fitness::new(score_fn, Direction::Minimize, label)
     }
 
-    /// Higher-is-better scorer — shorthand for
-    /// `Fitness::new(score_fn, Direction::Maximize, label)`:
-    /// `Fitness::maximize("f1", f1_score)`.
+        /// Higher-is-better scorer — shorthand for
+        /// `Fitness::new(score_fn, Direction::Maximize, label)`.
     pub fn maximize<F>(label: &str, score_fn: F) -> Self
     where
         F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
@@ -128,11 +114,8 @@ impl Fitness {
         Fitness::new(score_fn, Direction::Maximize, label)
     }
 
-    /// Score prediction against target — engine-computed ranking metric.
-    ///
-    /// Errors on a [`Fitness::Reported`] (the trainer owns the value there —
-    /// there is nothing to score). Callers on engine paths that may run in
-    /// reported mode branch on [`Fitness::is_reported`] first.
+        /// Score prediction against target — engine-computed ranking metric.
+        /// Errors on a [`Fitness::Reported`] (nothing to score there).
     pub fn score(&self, pred: &Variable, target: &Variable) -> Result<f32> {
         match self {
             Fitness::Computed { score_fn, .. } => score_fn(pred, target),
@@ -178,25 +161,17 @@ impl Fitness {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FitnessLabel(pub String);
 
-/// An informative (non-ranking) metric configured for a run — e.g. "accuracy",
-/// "f1". Carries only its label; the actual per-step values live in
-/// `NetMetrics::informative` (same order as the run's `Vec<Metric>`).
-///
-/// There are no built-in labels: a metric IS a closure
-/// (`Metric::custom("my_metric", |pred, y| ...)`), so what gets measured is
-/// always explicit and never a name lookup that can silently drift. The label
-/// is for history.csv/logs only — the closure is code, not data, so engine.json
-/// records just the label.
+/// An informative (non-ranking) metric for a run — a label plus its closure;
+/// values live in `NetMetrics::informative` in the run's `Vec<Metric>` order.
 #[derive(Clone)]
 pub struct Metric {
+    /// Metric label, recorded in engine.json/history.csv.
     pub label: String,
     score_fn: std::sync::Arc<ScoreFn>,
 }
 
 impl Metric {
-    /// The only way to build a metric: a label + your own scoring closure
-    /// `(pred, target) -> f32`. Recorded by label in engine.json/history.csv,
-    /// scored by the closure at eval time.
+        /// Build a metric: a label + your own `(pred, target) -> f32` closure.
     pub fn custom<F>(label: impl Into<String>, score_fn: F) -> Self
     where
         F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
@@ -342,19 +317,8 @@ mod tests {
         assert_eq!(f.label(), "mse");
     }
 
-    // TODO: uncomment when from_loss_with_other is re-enabled.
-    // #[test]
-    // fn test_fitness_from_loss_with_other() {
-    //     let f = Fitness::from_loss_with_other(
-    //         accuracy_score,
-    //         |pred, y| flodl::nn::loss::mse_loss(pred, y),
-    //         Direction::Maximize,
-    //         Direction::Minimize,
-    //         "accuracy",
-    //         "mse",
-    //     );
-    //     ...
-    // }
+    // TODO: restore `test_fitness_from_loss_with_other` when
+    // `from_loss_with_other` is re-enabled.
 
     #[test]
     fn test_scoring_helpers() {

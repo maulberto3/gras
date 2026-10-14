@@ -26,20 +26,14 @@ impl CoreEngine {
         values.iter().sum::<f32>() / values.len() as f32
     }
 
-    /// Whether this run has a surprise-exam batch at all: it needs BOTH a
-    /// dataset/stream and a tabular trainer, so RL runs (and any run without
-    /// data) do not. The ledger still stores 0.0 for those; this predicate is
-    /// what lets the log print `—` instead of a fabricated score.
+        /// Whether this run has a surprise-exam batch at all (needs a dataset +
+        /// tabular trainer); RL runs store 0.0 and the log prints `—`.
     pub(crate) fn exam_available(&self) -> bool {
         self.stream.is_some() && self.dataset.is_some() && !self.trainer.is_rl()
     }
 
-    /// The gate bar a crossover child faces at `clock` — the exact quantity
-    /// [`Self::evolve_crossover_child`] compares against (`relevant` = every
-    /// checkpoint with `step <= clock`; Hard takes the last one, Soft the mean
-    /// of them). `None` when no checkpoint exists yet. Printed on the
-    /// checkpoint line so the ledger entry and the gate lines can be read
-    /// together (a Soft bar is a historical AVERAGE, not the newest mean).
+        /// The gate bar a crossover child faces at `clock` (`None` before any
+        /// checkpoint): Hard = last relevant bar, Soft = their mean.
     pub(crate) fn current_gate_bar(&self, clock: usize) -> Option<f32> {
         let relevant: Vec<&Checkpoint> = self
             .checkpoints
@@ -64,20 +58,11 @@ impl CoreEngine {
         }
     }
 
-    /// Run the checkpoint "surprise exam": score every live net on the given
-    /// era's gating-pool batch (rows never used for training or per-step
-    /// eval). Returns the population's mean exam fitness — a generalization
-    /// diagnostic recorded in the checkpoint ledger, never used for ranking,
-    /// culling, or gating (so the replay contract is untouched). Nets are
-    /// scored in eval mode (no gradients); a net whose eval-mode forward has
-    /// side effects would violate the Trainer contract anyway.
-    ///
-    /// Returns `0.0` when [`Self::exam_available`] is false (RL): the ledger
-    /// field is unconditional, but the log omits it rather than showing it.
+        /// Run the checkpoint "surprise exam": score every live net in eval mode
+        /// on the era's held-out batch — a diagnostic, never ranking input.
     pub(crate) fn run_checkpoint_exam(&mut self, era: u64) -> Result<f32> {
-        // RL mode has no dataset to examine — the exam is a generalization
-        // diagnostic over held-out DATA rows, meaningless without data. Also
-        // requires a Tabular trainer (the loss to score with).
+            // RL mode has no dataset to examine; the exam also needs a Tabular
+            // trainer (the loss to score with).
         let (stream, dataset, loss) = match (
             self.stream.as_ref(),
             self.dataset.as_ref(),
@@ -108,9 +93,8 @@ impl CoreEngine {
         Ok(scores.iter().sum::<f32>() / scores.len() as f32)
     }
 
-    /// Persist the checkpoint ledger to `checkpoints.json` (sidecar next to
-    /// `engine.json`). Overwritten on every record — small file, atomic
-    /// enough for analysis purposes.
+        /// Persist the checkpoint ledger to `checkpoints.json`, overwritten on
+        /// every record.
     pub(crate) fn write_checkpoints(&self) -> Result<()> {
         let path = self.run_dir.join("checkpoints.json");
         let v: Vec<serde_json::Value> = self

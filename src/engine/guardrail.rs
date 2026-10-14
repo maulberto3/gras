@@ -28,33 +28,24 @@
 use crate::engine::fitness::Direction;
 use crate::graph::network::Network;
 
-/// The user-owned half of the guardrail: score ONE fresh holdout game.
-///
-/// Implement on the same type as your `RlStep`/`TabularStep` trainer (a
-/// fresh instance — this is measurement, never learning). The engine has
-/// already loaded the champion's TRAINED weights into `net`; play exactly
-/// one game and return its score in the same units/estimator as the
-/// reported fitness.
+/// The user-owned half of the guardrail: score ONE fresh holdout game. The engine
+/// has loaded the champion's TRAINED weights; play one game, measure only.
 pub trait ChampionScorer: Send {
-    /// Score one holdout game. `game_i` is the deterministic game index
-    /// (0..matches) — seed your env from it so the batch is reproducible
-    /// and disjoint from race games.
+        /// Score one holdout game. `game_i` is the deterministic game index — seed
+        /// your env from it so the batch is reproducible and disjoint from race games.
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32>;
 }
 
-/// The engine's own trainer is a scorer: implementing `holdout_score` on the
-/// trainer type IS the guardrail capability, so `engine.guardrail(device)`
-/// needs no second object.
+/// The engine's own trainer is a scorer: implementing `holdout_score` on the trainer
+/// type IS the guardrail capability, so `engine.guardrail(device)` needs no second object.
 impl ChampionScorer for crate::trainer::AnyTrainer {
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
         crate::trainer::AnyTrainer::holdout_score(self, net, game_i)
     }
 }
 
-/// The guardrail's verdict: per-game scores plus the two readings users
-/// compare. `scores` is empty only when scoring failed entirely (see
-/// [`check_champion`] — it returns `None` then, so a `Some` verdict always
-/// carries at least one score).
+/// The guardrail's verdict: per-game scores plus the two readings users compare.
+/// `scores` is empty only when scoring failed entirely.
 #[derive(Clone, Debug)]
 pub struct GuardrailVerdict {
     /// Full hash of the champion scored.
@@ -62,14 +53,11 @@ pub struct GuardrailVerdict {
     /// The champion's final smoothed fitness as the race recorded it
     /// (None if no verdict was ever recorded).
     pub race_smoothed: Option<f32>,
-    /// Standard error of `race_smoothed` (`window std / √n`), when the engine
-    /// could still see the champion's rolling window. `None` on the saved-run
-    /// path (`score_saved`) — a reloaded net has no window to read, so the
-    /// verdict falls back to the flat rule rather than inventing an error bar.
+        /// Standard error of `race_smoothed` (`window std / √n`); `None` on the
+        /// saved-run path (a reloaded net has no window), falling back to the flat rule.
     pub race_se: Option<f32>,
-    /// Step readings behind `race_smoothed` (the smoothing window's length).
-    /// `0` = unknown; a one-reading window is a `race_se` of 0.0, which is
-    /// "unobservable spread", NOT "precise".
+        /// Step readings behind `race_smoothed` (`0` = unknown); a one-reading window
+        /// is unobservable spread, NOT precision.
     pub race_samples: usize,
     /// The champion's most recent step reading — the smoothed mean LAGS it by up
     /// to the window length. `None` on the saved-run path (no live buffer).
@@ -87,25 +75,16 @@ impl GuardrailVerdict {
         Some(self.scores.iter().sum::<f32>() / self.scores.len() as f32)
     }
 
-    /// Standard ERROR of the holdout mean (`std / sqrt(n)`): how well the
-    /// exam's own games pin the champion down. This is the number that decides
-    /// whether a gap against the race reading means anything — a ±21 over 100
-    /// games is a ±2.1 estimate, while the race's number is typically built on
-    /// a handful of games.
+        /// Standard ERROR of the holdout mean (`std / sqrt(n)`) — the number that decides
+        /// whether a gap against the race reading means anything.
     pub fn se(&self) -> Option<f32> {
         let std = self.std()?;
         let n = self.scores.len() as f32;
         (n > 0.0).then(|| std / n.sqrt())
     }
 
-    /// `(min, p25, median, p75, max)` of the per-game scores, nearest-rank.
-    ///
-    /// The mean ± std hides the SHAPE, and the shape is the diagnosis: a
-    /// champion whose exam is `[9, 9, 500, 500, 9]`-ish survives by luck on
-    /// some start states and dies on others, while one that is genuinely
-    /// learned has a tight batch. Nearest-rank (not interpolated) because these
-    /// are counts of games — a fraction of a game reads as precision the sample
-    /// does not have.
+        /// `(min, p25, median, p75, max)` of the per-game scores, nearest-rank — the
+        /// SHAPE is the diagnosis (luck on some starts vs a tight, learned batch).
     pub fn percentiles(&self) -> Option<(f32, f32, f32, f32, f32)> {
         if self.scores.is_empty() {
             return None;
@@ -136,16 +115,8 @@ impl GuardrailVerdict {
     }
 }
 
-/// Rebuild the champion net from its saved state and load its TRAINED
-/// weights. Prefers the stop-time `elite-<short>.safetensors`; falls back to
-/// the per-checkpoint `checkpoint-elite-<short>.safetensors` when the run
-/// was hard-killed before stop. Refuses (None) rather than silently scoring
-/// a newborn brain when no weights exist or a load fails.
-///
-/// NOTE: no `Topology::finalize()` here — the saved topology is already
-/// finalized and `finalize()` REGENERATES the wiring (same nodes/dims,
-/// different graph). Calling it measured a stranger; this is the regression
-/// the reload path exists to prevent.
+/// Rebuild the champion from its saved state and load its TRAINED weights (stop-time
+/// `elite-*.safetensors`, else `checkpoint-elite-*`); refuses rather than scoring a newborn.
 pub fn reload_champion(
     run_dir: &std::path::Path,
     hash: &str,
@@ -183,53 +154,22 @@ pub fn reload_champion(
     Some(net)
 }
 
-/// Unit-free agreement between the race reading and the holdout mean.
-///
-/// The engine cannot know what the numbers MEAN (survival turns, accuracy,
-/// loss), so this is the honest generic statement: how far the holdout landed
-/// below what the race claimed, relative to the race reading's own magnitude.
-/// Task-specific wording ("SOLVED ✅") stays in the example's print; this is
-/// what gets recorded in `engine.json`.
+/// Unit-free agreement between the race reading and the holdout mean: how far the
+/// holdout landed below the claim, relative to the claim's magnitude.
 pub fn agreement_verdict(
     race_smoothed: Option<f32>,
     holdout_mean: Option<f32>,
     direction: Direction,
 ) -> String {
-    // No noise information: the flat relative rule. Kept as the fallback so
-    // every call site that cannot supply sampling error (saved-run scoring, a
-    // resumed run with no live rolling buffer) behaves exactly as before.
+            // No noise information: the flat relative rule, the fallback for call sites
+            // that cannot supply sampling error.
     agreement_verdict_noisy(
         race_smoothed, None, None, None, holdout_mean, None, 0, direction,
     )
 }
 
-/// [`agreement_verdict`] WITH the sampling error of both readings.
-///
-/// Why the noise matters: the race reading is a mean over the smoothing
-/// window's step readings (`SMOOTHING_WINDOW` = 5 by default), and each of
-/// those is itself a mean over the trainer's eval batch (2 games each for the
-/// cartpole reference trainer → 10 games total). The champion is the ARGMAX of
-/// that noisy statistic over the whole population, so its reading carries a
-/// built-in upward bias (the winner's curse). The exam is a mean over
-/// `matches_scored` unseen games, usually 10× more. So a gap that looks like a
-/// collapse is frequently just the race's own error bar, and the honest verdict
-/// has to say which of the two it is instead of quoting a flat percentage.
-///
-/// `race_se` / `race_samples`: the race reading's own standard error and the
-/// number of step readings behind it. When the error bar is unusable — no
-/// reading, a single reading (spread unobservable), or no exam games — this
-/// degrades to the flat rule, byte-for-byte.
-///
-/// The gap is judged against the COMBINED band `2·√(race_se² + exam_se²)` (both
-/// readings are estimates), and graded in three steps so a borderline case is
-/// not reported as a collapse:
-///
-/// | gap vs the band | verdict |
-/// |---|---|
-/// | ≤ 0 | consistent — the champion held up |
-/// | ≤ 1× | consistent within noise ✅ |
-/// | ≤ 1.5× | borderline ⚠️ — quote the exam, widen the window |
-/// | > 1.5× | weak — the race OVER-REPORTED ❌ |
+/// [`agreement_verdict`] WITH the sampling error of both readings. The race reading
+/// is a noisy ARGMAX (winner's curse), so the gap is judged against the combined band.
 pub fn agreement_verdict_noisy(
     race_smoothed: Option<f32>,
     race_se: Option<f32>,
@@ -250,10 +190,8 @@ pub fn agreement_verdict_noisy(
         Direction::Minimize => hold - race,
     };
     let rel = shortfall / race.abs().max(1e-6);
-    // The noise-aware branch. `se > 0` is the load-bearing condition: a single
-    // step reading has an unobservable spread (SE 0.0) and a mean of one sample
-    // supports no inference at all, so it must fall through to the flat rule
-    // rather than be called "perfectly consistent".
+            // The noise-aware branch. `se > 0` is load-bearing: a single reading has
+            // unobservable spread and must fall through to the flat rule.
     if let (Some(se), true) = (race_se.filter(|se| *se > 0.0), matches_scored > 0) {
         let race_n = race_samples
             .filter(|n| *n > 0)
@@ -263,26 +201,16 @@ pub fn agreement_verdict_noisy(
         let exam_note = exam_se
             .map(|e| format!(", ±{:.1} of its own", 2.0 * e))
             .unwrap_or_default();
-        // Freshness clause, added only when it is a fact worth stating: the
-        // window mean reaches back through older steps, and the champion's
-        // weights keep moving, so a LATEST reading far from the mean is the
-        // single most useful disambiguation of a "collapsed" verdict (it is the
-        // reading that describes the weights the exam actually played).
-        // Phrased NEUTRALLY on purpose: the latest reading is not automatically
-        // the better one (a decaying net's last reading is worse, an improving
-        // net's is better), and this clause also rides the "consistent" branch
-        // where the window mean was vindicated. It hands the reader both numbers
-        // and the reason they differ — nothing more.
+                // Freshness clause (only when worth stating): a LATEST reading far from the
+                // window mean disambiguates a "collapsed" verdict. Phrased neutrally.
         let latest_note = match race_latest {
             Some(l) if (l - race).abs() > 0.25 * race.abs().max(1.0) => format!(
                 " (the champion's latest reading was {l:.1}, against the {race:.1} window mean — the window also averages older steps, so it need not describe the weights the exam just played)"
             ),
             _ => String::new(),
         };
-        // The gap is judged against the COMBINED error bar: both readings are
-        // estimates, so the honest band is 2×√(race_se² + exam_se²) (a plain 2σ
-        // difference test). When the exam's own SE is tiny — the usual case, 100
-        // unseen games against a window of 5 — this is the race band, as before.
+                // Judged against the COMBINED error bar: 2×√(race_se² + exam_se²) — a plain
+                // 2σ difference test; with a tiny exam SE this is the race band, as before.
         let se_diff = (se * se + exam_se.unwrap_or(0.0).powi(2)).sqrt();
         let band = 2.0 * se_diff;
         let ratio = shortfall / band;
@@ -320,11 +248,8 @@ pub fn agreement_verdict_noisy(
     }
 }
 
-/// Score a SAVED champion without an engine (the `--score-only` path):
-/// reload from `run_dir`, play `matches` fresh games, aggregate, and stamp the
-/// result into `engine.json` (best-effort — the verdict is returned either
-/// way). Same semantics as [`check_champion`] but you name the hash yourself
-/// and the race-smoothed reference comes from the run's own record, if any.
+/// Score a SAVED champion without an engine (the `--score-only` path): reload from
+/// `run_dir`, play `matches` fresh games, aggregate, stamp into `engine.json`.
 pub fn score_saved(
     run_dir: &std::path::Path,
     champion_hash: &str,
@@ -337,11 +262,8 @@ pub fn score_saved(
     Some(verdict)
 }
 
-/// Stamp a scored saved-run champion into the run's `engine.json`.
-///
-/// Best-effort by design: a run dir whose `engine.json` is unreadable should
-/// still hand back the verdict (the scoring already happened) — the recording
-/// failure is a warning, not a silent downgrade of the answer.
+/// Stamp a scored saved-run champion into the run's `engine.json`. Best-effort: an
+/// unreadable header still hands back the verdict — recording failure is a warning.
 fn record_guardrail(run_dir: &std::path::Path, champion_hash: &str, verdict: &GuardrailVerdict) {
     let header = crate::state::load_engine_json(run_dir).ok();
     let direction = header
@@ -384,18 +306,8 @@ fn record_guardrail(run_dir: &std::path::Path, champion_hash: &str, verdict: &Gu
     }
 }
 
-/// Play the `matches` holdout games on a net the CALLER already holds and
-/// aggregate the verdict.
-///
-/// This is the engine's path: at stop time the trained champion is still a live
-/// population member, so certification needs no `elite-*.safetensors` on disk.
-/// The caller owns the net's state — put it in the resting (eval) state first,
-/// exactly as a fresh [`reload_champion`] build would be: with dropout on, the
-/// 100 games stop being a measurement of the deterministic policy and become a
-/// sample of a random one.
-///
-/// `None` when every game failed; per-game failures are skipped and reflected
-/// in `verdict.scores.len() < matches`.
+/// Play the `matches` holdout games on a net the CALLER already holds and aggregate —
+/// the engine's stop-time path (no `elite-*.safetensors` needed). Put it in eval mode first.
 pub fn score_net<T, F>(
     net: &mut Network,
     champion_hash: &str,
@@ -439,10 +351,8 @@ fn verdict_from(
     })
 }
 
-/// The engine's DISK seam: reload + play + aggregate, where the scorer IS the
-/// run's own trainer (reached through the [`crate::trainer::AnyTrainer`] dispatch). Used by
-/// embedders that hold a trainer and a run dir but no live engine, and as the
-/// engine's fallback when the champion is no longer in memory.
+/// The engine's DISK seam: reload + play + aggregate, where the scorer IS the run's
+/// own trainer (via `AnyTrainer` dispatch). For embedders with no live engine.
 pub fn score_with<T, F>(
     run_dir: &std::path::Path,
     champion_hash: &str,
@@ -466,14 +376,8 @@ where
     )
 }
 
-/// Run the guardrail: reload the champion's TRAINED weights, play `matches`
-/// fresh games through the user's [`ChampionScorer`], and aggregate.
-///
-/// `champion_hash` comes from `engine.champion_hashes()` (first = best).
-/// Returns `None` when the champion could not be reloaded (missing or
-/// unloadable weights — the verdict would be about a stranger) or when
-/// every game failed; per-game failures are skipped and reflected in
-/// `verdict.scores.len() < matches`.
+/// Run the guardrail: reload the champion's TRAINED weights, play `matches` fresh games
+/// through the user's [`ChampionScorer`], aggregate. `None` if reload or all games fail.
 pub fn check_champion(
     run_dir: &std::path::Path,
     champion_hash: &str,
@@ -524,10 +428,8 @@ mod tests {
         assert!(empty.mean().is_none() && empty.std().is_none());
     }
 
-    /// The generic verdict is direction-aware and unit-free: a holdout at or
-    /// above the race reading is consistent, a large relative shortfall is
-    /// weak — in BOTH directions (maximize and minimize runs read correctly
-    /// from the same formula).
+        /// The generic verdict is direction-aware and unit-free: a holdout at or above
+        /// the race reading is consistent; a large relative shortfall is weak (both directions).
     #[test]
     fn agreement_verdict_is_direction_aware() {
         use Direction::{Maximize, Minimize};
@@ -548,13 +450,8 @@ mod tests {
         assert!(agreement_verdict(None, Some(1.0), Maximize).contains("unscored"));
     }
 
-    /// The noisy verdict, on the numbers a REAL cartpole run produced
-    /// (`results/1791824617260`): the champion's smoothed race reading was
-    /// 191.7 — a mean of window `[289.5, 500.0, 75.0, 52.5, 41.5]`, i.e. one
-    /// solved game among four fizzles, SE ≈ 80 — while the 100-game exam landed
-    /// at 53.5. The flat rule called this "weak … 72% below" ❌; the honest
-    /// reading is that the exam sits INSIDE the race's own noise band, so this
-    /// is a false collapse alarm.
+        /// The noisy verdict on numbers a REAL cartpole run produced
+        /// (`results/1791824617260`): the flat rule called it a collapse; it is inside the noise band.
     #[test]
     fn noisy_verdict_absolves_a_fluke_window() {
         let v = agreement_verdict_noisy(
@@ -581,9 +478,8 @@ mod tests {
         assert!(!v.contains('\n'), "log lines stay single-line: {v}");
     }
 
-    /// …and the same gap with a TIGHT race window is a real finding: when the
-    /// champion's readings barely move, the exam's landing far below is the race
-    /// over-reporting, and the verdict says so.
+        /// …and the same gap with a TIGHT race window is a real finding: the race
+        /// over-reported, and the verdict says so.
     #[test]
     fn noisy_verdict_flags_a_real_over_report() {
         let v = agreement_verdict_noisy(
@@ -623,9 +519,8 @@ mod tests {
         assert!(min.contains("weak") && min.contains("OVER-REPORTED"), "{min}");
     }
 
-    /// Severity is graded, not binary: a gap barely outside the combined band is
-    /// NOT the same finding as one 12× outside it, and calling the first a
-    /// collapse is exactly the false alarm this verdict exists to stop.
+        /// Severity is graded, not binary: barely outside the band is not the same as
+        /// 12× outside it.
     #[test]
     fn noisy_verdict_grades_severity() {
         // race 100 ±10, exam 74 (SE 1): gap 26 vs band 2·√(10²+1²) ≈ 20.1 →
@@ -661,9 +556,8 @@ mod tests {
         assert!(!v.contains("window mean"), "{v}");
     }
 
-    /// The noisy branch must only fire when the race error bar is USABLE: no
-    /// spread (a single reading) or no exam games has to degrade to the flat
-    /// rule, byte-for-byte, instead of calling a one-sample mean consistent.
+        /// The noisy branch must only fire when the race error bar is USABLE: no spread
+        /// (single reading) or no exam games degrades to the flat rule.
     #[test]
     fn noisy_verdict_degrades_to_the_flat_rule() {
         let flat = agreement_verdict(Some(500.0), Some(100.0), Direction::Maximize);
@@ -694,10 +588,8 @@ mod tests {
         assert_eq!(v, flat);
     }
 
-    /// Scoring a net the caller already holds needs no run dir and no weight
-    /// file — the engine's path, and the reason `elite_save_safetensors(false)`
-    /// no longer costs a run its guardrail verdict. Also pins the failure rule:
-    /// a batch where every game errors is `None`, not a zero verdict.
+        /// Scoring a net the caller holds needs no run dir or weight file — the engine's
+        /// path. Also pins the failure rule: every game erroring is `None`, not zero.
     #[test]
     fn score_net_needs_no_files_and_reports_failed_batches_as_none() {
         /// A minimal wired 2→2 net (a bare `Topology::new` has no nodes).
@@ -761,9 +653,8 @@ mod tests {
         assert!(failed.is_none(), "an all-failed batch is not a verdict");
     }
 
-    /// The reload path must refuse when no weights exist — a fresh-init net
-    /// measures like noise and the verdict would be about a stranger (the
-    /// original guardrail bug).
+        /// The reload path must refuse when no weights exist — a fresh-init net measures
+        /// like noise and the verdict would be about a stranger.
     #[test]
     fn reload_refuses_without_weights() {
         let dir = std::env::temp_dir().join("gras-guardrail-no-weights");

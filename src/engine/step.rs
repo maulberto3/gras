@@ -26,36 +26,15 @@ use crate::state::NetMetrics;
 use crate::utils::race_steps::eval_one_step;
 
 impl CoreEngine {
-    /// Step one live net at the given step_clock: train on the shared train
-    /// batch, eval on the shared eval batch, record metrics into `RaceState`,
-    /// push fitness into the rolling buffer, overwrite `nets/<hash>.json`,
-    /// log one per-net line.
-    ///
-    /// The net's `Network` + `Optimizer` live in the engine's maps and are
-    /// mutated in place — coefficients evolve across steps, optimizer state
-    /// carries forward. **Not rebuilt each step** (that would lose optimizer
-    /// state and forget prior training).
+        /// Step one live net at the given clock: train + eval on the shared batches,
+        /// record metrics, push fitness, log one line. Nets mutate in place.
     pub(crate) fn step_one_net(&mut self, hash: &str, clock: usize) -> Result<()> {
-        // ANTI-DEVOLUTION A — elite freeze: the crown (the take-k elite set,
-        // recomputed at group-step start in core.rs — see the "KISS crown"
-        // block there) holds the nets that skip the trainer update this
-        // step. Membership and its freeze/dethrone LINES were settled before
-        // the loop; this function only obeys the membership. Their skill is
-        // the frozen state, so the "report" is the last recorded metrics —
-        // re-measuring would require re-running the trainer, which is
-        // exactly what we're skipping. Scoring, ranking, parent selection
-        // all proceed as normal off the carried metrics.
-        // The pruner phase bypasses freeze entirely: it keeps ONLY elites,
-        // so with freeze active every solo step would be a no-op-optimizer
-        // act-and-measure and the post-race workout would train nothing.
+            // ANTI-DEVOLUTION A — elite freeze: the crown holds the nets that skip
+            // the trainer update this step; scoring proceeds off carried metrics.
         let frozen = self.frozen_crown.contains(hash);
         if frozen {
-            // ACT-AND-MEASURE freeze: the elite plays its normal step against
-            // the current clock (fresh batch / fresh env matches — the fitness
-            // input is real, so its standing stays honest and the pack can
-            // pass it) but the weight update is DISCARDED: the step runs
-            // through a no-op optimizer, leaving the frozen weights and the
-            // real optimizer's moments untouched.
+                // ACT-AND-MEASURE freeze: the elite plays a real step (fresh batch,
+                // honest standing) but its weight update is DISCARDED (no-op optimizer).
             let mut noop = NoopOptimizer;
             let report = self.run_trainer_step(hash, clock, &mut noop)?;
             let metrics = NetMetrics {
@@ -77,11 +56,8 @@ impl CoreEngine {
                     buf.push(e);
                 }
             }
-            // Act-and-measure records WITHOUT advancing the clock: `state.step`
-            // counts TRAININGS (resume replay derives its clock set from that
-            // count), and `last_update_step` must not rotate — an act is not a
-            // weight update. The method also stamps the frozen span, which is
-            // how catch_up_step re-runs this clock through the no-op optimizer.
+                // Act-and-measure records WITHOUT advancing the clock: `state.step`
+                // counts trainings, and `last_update_step` must not rotate.
             self.state.record_frozen_act(hash, metrics.clone())?;
             tracing::debug!(
                 "step {} │ net {} │ FROZEN (elite) — acted+measured fitness{} {} (no weight update)",
@@ -92,10 +68,8 @@ impl CoreEngine {
             );
             return Ok(());
         }
-        // One step = whatever the caller's training scheme does for one step
-        // clock. The engine only consumes the returned report. (Anti-plateau
-        // challenges are the TRAINER's business — `trainer::challenge` — the
-        // engine neither rolls nor accounts for them.)
+            // One step = whatever the caller's training scheme does; the engine only
+            // consumes the report. Challenges are the trainer's business.
         let optimizer_ok = self.optimizers.contains_key(hash);
         if !optimizer_ok {
             return Err(crate::utils::error::EngineError::InvalidOptions(format!(
@@ -115,16 +89,11 @@ impl CoreEngine {
             informative: report.informative,
             frozen: false,
         };
-        // record_step owns the clock bookkeeping end-to-end: it snapshots the
-        // metrics AND advances the net's local step clock (including
-        // `last_update_step`, the weight-latest clock the freeze branch reads
-        // to decide "trained k clocks since last update"). A second
-        // `advance_step` here would double-advance the clock per live step.
+            // record_step owns the clock bookkeeping end-to-end (metrics snapshot +
+            // local step advance); a second advance would double-count.
         self.state.record_step(hash, metrics.clone())?;
-        // A challenge is just another step: its fitness (measured under the
-        // forced action) ranks like any other — the user's semantics. The
-        // forced trajectory is part of what the net had to survive, so the
-        // ranking sees it.
+            // A challenge is just another step: its forced-action fitness ranks like
+            // any other — the user's semantics.
         if let Some(buf) = self.rolling_fitness.get_mut(hash) {
             buf.push(metrics.fitness);
         }
@@ -168,12 +137,8 @@ impl CoreEngine {
         Ok(report)
     }
 
-    /// Drive one trainer step for the live net `hash` at `clock` through the
-    /// given optimizer — the shared body of the normal group step and the
-    /// act-and-measure freeze pass (which passes a [`NoopOptimizer`]). Seeds
-    /// the step RNGs, runs the trainer, runs the debug contract probe, and
-    /// accumulates RL volume; recording metrics and ranking buffers is the
-    /// CALLER's job (the freeze pass records before returning early).
+        /// Drive one trainer step for net `hash` at `clock` through the given
+        /// optimizer — shared by the group step and the act-and-measure freeze pass.
     fn run_trainer_step(
         &mut self,
         hash: &str,
@@ -202,11 +167,8 @@ impl CoreEngine {
                 "race: net {hash} not live (no Network in memory)"
             ))
         })?;
-        // Seed BOTH RNGs for this (net, step) before the trainer runs: gras's
-        // fastrand stream and libtorch's global RNG (dropout masks). Without
-        // the libtorch seed a `dropout_prob > 0` net redraws different masks
-        // on replay and breaks resume parity. The engine owns this because
-        // the trainer — any trainer — may draw masks inside `train_step`.
+            // Seed BOTH RNGs for this (net, step) before the trainer runs (fastrand +
+            // libtorch), or dropout masks differ on replay and resume parity breaks.
         crate::utils::race_steps::seed_step_randomness(net_seed, clock as u64, 0);
         let report = self.trainer.train_step(
             net,
@@ -219,11 +181,8 @@ impl CoreEngine {
             hash,
             net_seed,
         )?;
-        // Debug-only contract probe: the Trainer's per-step clause says the
-        // report describes the net AFTER this step's training. Re-score the
-        // net on the step's eval batch and check the reported eval loss is
-        // what this net actually scores — catches a stale/fabricated report
-        // at development time. Zero cost in release.
+            // Debug-only probe: re-score the net on the eval batch and check the
+            // report's loss — catches a stale/fabricated report. Free in release.
         #[cfg(debug_assertions)]
         // Tabular-only: the probe needs an eval batch + a computed fitness
         // scorer. RL mode has neither (reported fitness, no dataset).
@@ -249,9 +208,8 @@ impl CoreEngine {
                 }
             }
         }
-        // RL volume: the trainer's reported environment work for this step
-        // accumulates across the group so the rollup can show the step's real
-        // workload (matches + turns). Tabular trainers report `None`.
+            // RL volume: the trainer's reported env work accumulates across the group
+            // so the rollup shows the step's real workload.
         if let Some(rl) = report.rl {
             self.step_rl.nets += 1;
             self.step_rl.matches += rl.matches;

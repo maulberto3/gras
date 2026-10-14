@@ -13,10 +13,8 @@ use flodl::nn::Optimizer;
 use flodl::tensor::Result;
 use tracing::debug;
 
-/// Parent-pairing attempts before the crossover roll is spent as a no-op.
-/// Distinct from `crossover_rolls` (rolls per step) and `crossover_retries`
-/// (gate-rejection retries) — this bounds only the draw of fresh parent
-/// PAIRS when no compatible pairing is found.
+/// Parent-pairing attempts before the crossover roll is spent as a no-op — bounds
+/// the draw of fresh parent PAIRS (distinct from rolls/retries).
 pub(crate) const MAX_PARENT_PAIRINGS: usize = 3;
 
 use crate::graph::network::Network;
@@ -28,62 +26,39 @@ use crate::utils::seed::derive_seed;
 use super::core::CoreEngine;
 
 /// A freshly-built child net being caught up solo before it rejoins the group.
-///
-/// Holds the child's state (written to `nets/<hash>.json`), its live `Network`
-/// (coefficients live here, mutate in place during catch-up), and its
-/// `Optimizer` (Adam state carries forward across catch-up steps).
+/// Holds its state, live `Network`, and `Optimizer` (Adam state carries forward).
 pub struct RaceChild {
+    /// The child's persisted state (also written to `nets/<hash>.json`).
     pub state: NetState,
+    /// Live network; coefficients mutate in place during catch-up.
     pub net: Network,
+    /// Optimizer whose Adam state carries forward across catch-up steps.
     pub optimizer: Box<dyn Optimizer>,
 }
 
 impl CoreEngine {
     // ── Child generation (Iter 5: roulette → crossover → mutate?) ───────────
 
-    /// Generate exactly one child for a culled slot (Iter 5 contract).
-    ///
-    /// The decision is deterministic: the evolve/random switch is rolled from
-    /// `derive_seed(run_seed, clock)`, so two identical-seed runs make the
-    /// same call at the same step.
-    ///
-    /// - `crossover_prob` fires → roulette-select 1–2 parents from the live
-    ///   ranking (by smoothed fitness), crossover them (up to 3 attempts,
-    ///   then fall back to the fittest parent's clone; if even that is
-    ///   impossible, a fresh random topology), then mutate with the configured
-    ///   per-type probability.
-    /// - otherwise → a fresh random child from the run's resolved pools.
-    ///
-    /// The child always gets its own weight seed `derive_seed(run_seed, clock)`
-    /// and `created_from` lineage recording what actually happened.
-    /// Returns `Ok(None)` when the roll was spent without a child (crossover
-    /// fired but produced nothing viable) — NOT an error, just nothing to
-    /// insert. `Ok(Some(child))` is a ready child (evolved or random).
+        /// Generate exactly one child for a culled slot: deterministic from
+        /// `derive_seed(run_seed, clock)` — crossover (roulette parents) or a fresh random draw.
     pub(crate) fn generate_child(
         &mut self,
         clock: usize,
         child_idx: usize,
     ) -> Result<Option<RaceChild>> {
-        // Same-clock siblings must differ: mix the child ordinal into the
-        // derivation so two culled slots at one step make distinct children
-        // (the pop-shrink bug: identical roll seeds ⇒ identical children ⇒
-        // dedupe collapsed the pop).
+            // Same-clock siblings must differ: mix the child ordinal into the derivation,
+            // or identical children collapse the pop at dedupe.
         let roll_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx);
         let mut rng = fastrand::Rng::with_seed(roll_seed);
 
-        // Every roll is a CROSSOVER roll now: when `crossover_prob` does not
-        // fire, or the attempt fails, the roll is simply spent (no child).
-        // Random whole nets enter exclusively via the mutation rolls — the
-        // old not-fired → random fallback is gone.
+            // Every roll is a CROSSOVER roll now: a not-fired or failed roll is simply
+            // spent. Random whole nets enter only via mutation.
         let try_crossover = rng.f32() < self.config.crossover_prob;
 
         if try_crossover {
             match self.evolved_child(clock, child_idx, &mut rng) {
-                // Crossover produced nothing viable: the roll does NOTHING.
-                // No random fallback — random whole nets enter the population
-                // exclusively via the mutation path.
-                // NO log here: the caller logs one line per roll, including
-                // the no-child outcome (this None is returned as detail).
+                    // Crossover produced nothing viable: the roll does NOTHING (no random
+                    // fallback). NO log here — the caller logs one line per roll.
                 Ok(None) => Ok(None),
                 other => other,
             }
@@ -92,22 +67,16 @@ impl CoreEngine {
         }
     }
 
-    /// The evolved branch: roulette parents → crossover → mutate.
-    /// The evolved branch: roulette parents → crossover → maybe mutate.
-    /// Called only when ``crossover_prob`` fires; returns an error when there
-    /// are no live parents to select from (which is treated as "no crossover
-    /// this step" by ``generate_child`` — a spent roll, NO random fallback: a
-    /// not-fired or failed crossover roll inserts nothing; random whole nets
-    /// enter exclusively via the mutation rolls.
+        /// The evolved branch: roulette parents → crossover → maybe mutate. Called only
+        /// when `crossover_prob` fires; a failed pairing is a spent roll (no fallback).
     fn evolved_child(
         &mut self,
         clock: usize,
         child_idx: usize,
         rng: &mut fastrand::Rng,
     ) -> Result<Option<RaceChild>> {
-        // Ok(None) = the roll produced no child (no compatible pairing); the
-        // caller treats it as a spent roll, not an error path.
-        // 1. Ranking: live nets ordered best-first by smoothed fitness.
+            // Ok(None) = the roll produced no child (no compatible pairing); the caller
+            // treats it as a spent roll, not an error. 1. Ranking: best-first by smoothed fitness.
         if self.state.live_hashes().is_empty() {
             return Err(flodl::tensor::TensorError::new(
                 "race: no live nets to select parents from",
@@ -119,42 +88,26 @@ impl CoreEngine {
         let ranked = self.ranked_live_all();
         let scores: Vec<f32> = ranked.iter().map(|(_, s)| *s).collect();
 
-        // 3. Crossover: up to 3 attempts; a no-op (incompatible dims) retries
-        //    with FRESH roulette-drawn parents (the draw lives inside the
-        //    attempt loop — see below).
+            // 3. Crossover: up to 3 attempts; a no-op (incompatible dims) retries with
+            // FRESH roulette-drawn parents.
         let mut child_topo = None;
         let mut cx_note = String::new();
-        // Operator pool: resolved once per child (not per attempt) so a
-        // single child's retries vary the PARENTS, not the op. Draw is
-        // uniform over the pool; empty config pool ⇒ both ops (engine
-        // convention). Uniform uses its own swap_prob — no more magic 0.5.
+            // Operator pool resolved once per child (not per attempt) so retries vary the
+            // PARENTS, not the op. Uniform uses its own swap_prob — no magic 0.5.
         let ops = self
             .config
             .resolved_crossover_ops()
             .map_err(|e| flodl::tensor::TensorError::new(&e))?;
         let op = ops[rng.usize(..ops.len())];
-        // Parent count is a property of the OPERATOR, not a config knob:
-        // every CrossoverOp is binary today ⇒ n_parents = op.required_parents().
-        // The old set_crossover_parents knob is gone — redundant surface.
+            // Parent count is a property of the OPERATOR, not a config knob: every
+            // CrossoverOp is binary (`op.required_parents()`).
         let n_parents = op.required_parents();
-        // Up to 3 attempts. The FULL attempt is retried — new roulette parent
-        // draws each pass, not the same pair with new op randomness. A pair
-        // with no compatible pivot (one_point) or mismatched hidden counts
-        // (uniform) can never succeed, so retrying only the operator would
-        // burn all 3 attempts on a doomed pairing. Parents persist past the
-        // loop only if the LAST attempt used them (for lineage metadata).
+            // Up to 3 attempts, each with fresh roulette parent draws — retrying only the
+            // operator would burn all attempts on a doomed pairing.
         let mut parent_hashes: Vec<String> = Vec::new();
         for _ in 0..MAX_PARENT_PAIRINGS {
-            // 2. Roulette-select parents — INSIDE the attempt loop: a failed
-            //    pairing gets fresh parents, per the design contract.
-            //
-            //    Self-pairing guard: each parent is an INDEPENDENT roulette
-            //    draw, so the same net can come up twice. Crossing a net with
-            //    itself is a no-op (identical topologies swap nothing) — the
-            //    roll would burn on a clone. If B duplicated A, redraw B
-            //    uniformly from the OTHER positions (roulette weighting is
-            //    only lost in this rare case; a redraw loop cannot beat a
-            //    dominant wheel). pop==1 keeps the self-pair: an honest clone.
+                // 2. Roulette-select parents INSIDE the attempt loop. Self-pairing guard:
+                // if B duplicated A, redraw B uniformly from the OTHER positions.
             let mut parent_positions: Vec<usize> = (0..n_parents)
                 .filter_map(|_| {
                     crate::evolution::selection::SelectionMethod::Roulette
@@ -186,6 +139,7 @@ impl CoreEngine {
                         Topology::cx_one_point(&mut pa, &mut pb, rng)
                     }
                     crate::engine::config::CrossoverOp::Uniform => {
+                        // Per-swap probability for the uniform operator.
                         const UNIFORM_SWAP_PROB: f32 = 0.5;
                         Topology::cx_uniform(&mut pa, &mut pb, UNIFORM_SWAP_PROB, rng)
                     }
@@ -213,18 +167,14 @@ impl CoreEngine {
         let mut child_topo = match child_topo {
             Some(t) => t,
             None => {
-                // MAX_PARENT_PAIRINGS exhausted → NO child this roll. No
-                // random fallback: random whole nets enter only via the
-                // mutation path. The roll is simply spent (the population
-                // stays untouched — no cull happens for a child that was
-                // never born). NO log — the caller's roll line carries it.
+                    // MAX_PARENT_PAIRINGS exhausted → NO child this roll (no random fallback;
+                    // the population stays untouched). NO log — the caller's roll line carries it.
                 return Ok(None);
             }
         };
 
-        // NO part-mutation anywhere: crossover exploits (pure recombination),
-        // mutation explores (fresh random immigrants). `mutate_prob` gates the
-        // immigrant rolls in the race loop, not topology tweaks on children.
+            // NO part-mutation anywhere: crossover exploits, mutation explores.
+            // `mutate_prob` gates the immigrant rolls in the race loop.
 
         // Crossover children get per-port activations — the port pool
         // is part of the search space, not just the immigrant path.
@@ -255,23 +205,20 @@ impl CoreEngine {
         }
     }
 
-    /// A fresh random child from the run's resolved pools (the crossover_prob
-    /// "random" branch, and the last-resort fallback for a failed evolved
-    /// path). Mirrors the generational `create_individual` shape.
+        /// A fresh random child from the run's resolved pools (the `random` branch and
+        /// the last-resort fallback). Mirrors the generational `create_individual` shape.
     pub(crate) fn random_child(&mut self, clock: usize, child_idx: usize) -> Result<RaceChild> {
         let roll_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx);
         let mut rng = fastrand::Rng::with_seed(roll_seed);
         let topo_opts = self.config.topology_options;
         let n_hidden = rng.usize(topo_opts.min_hidden_num_nodes..=topo_opts.max_hidden_num_nodes);
-        // Stamp the run's dataset dims + hidden-dim pool so the child trains on
-        // the same shared stream the rest of the population uses.
-        // match the actual data).
+            // Stamp the run's dataset dims + hidden-dim pool so the child trains on the
+            // same shared stream the rest of the population uses.
         let mut opts = topo_opts;
         opts.input_dim = Some(self.header.input_dim);
         opts.output_dim = Some(self.header.output_dim);
-        // The topology's internal rng must also derive from the run seed —
-        // seeding it with the template's default would make every random
-        // child with the same n_hidden structurally identical.
+            // The topology's internal rng must also derive from the run seed, or every
+            // random child with the same n_hidden is structurally identical.
         let topo_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx) as usize;
         let mut graph = Topology::new(topo_seed, Some(opts));
         graph.create_random_hidden_nodes(n_hidden);
@@ -289,9 +236,8 @@ impl CoreEngine {
             .config
             .resolved_standardize_pool()
             .unwrap_or_else(|_| crate::evolution::pools::all_standardize_ops());
-        // Transform pool is OPT-IN: empty ⇒ no node carries a transform
-        // (identity). Non-empty ⇒ each hidden node draws from it (with the
-        // empty string never appearing — the pool holds only real transforms).
+            // Transform pool is OPT-IN: empty ⇒ identity; non-empty ⇒ each hidden node
+            // draws from it (the empty string never appears).
         let transforms = self.config.resolved_transform_pool().unwrap_or_default();
         let hidden_dim_pool = self.config.hidden_dim_pool.clone().unwrap_or(4..=8);
         let stride = self.config.hidden_dim_stride.max(1);
@@ -311,24 +257,20 @@ impl CoreEngine {
         }
         graph.refresh_labels();
         graph.finalize();
-        // Per-port activations AFTER finalize: num_outputs is final only
-        // once trim_orphaned_ports compacted the ports. Pool = the run's
-        // resolved activation pool (same knob as node-level activations).
+            // Per-port activations AFTER finalize: `num_outputs` is final only once
+            // `trim_orphaned_ports` compacted the ports.
         let act_pool = self
             .config
             .resolved_activation_pool()
             .unwrap_or_else(|_| crate::evolution::pools::all_activations());
         graph.assign_port_activations(&act_pool);
-        // NO mutation roll on the immigrant path. Crossover exploits, mutation
-        // explores: a brand-new random topology is already maximal exploration
-        // — a second random op tweak on top is redundant noise. The mutation
-        // roll belongs to the crossover branch only.
+            // NO mutation roll on the immigrant path: a brand-new random topology is
+            // already maximal exploration; the mutation roll belongs to crossover only.
         self.finalize_child(graph, clock, child_idx, "random", &[], false)
     }
 
-    /// Shared child finalization: fresh weight seed from `run_seed + clock`,
-    /// lineage string, `NetState` starting at step 0, built `Network` +
-    /// `Optimizer` ready for catch-up.
+        /// Shared child finalization: fresh weight seed from `run_seed + clock`, lineage
+        /// string, `NetState` at step 0, and built `Network` + `Optimizer` ready for catch-up.
     fn finalize_child(
         &self,
         mut topo: Topology,
@@ -350,9 +292,8 @@ impl CoreEngine {
         } else {
             lineage
         };
-        // The child's step counter starts at **0** (it has trained zero steps
-        // so far); `entered_at_step` is patched to the run clock right after,
-        // so catch-up advances it 0 → clock and it rejoins in lockstep.
+            // The child's step counter starts at 0; `entered_at_step` is patched to the run
+            // clock right after, so catch-up advances it 0 → clock and it rejoins in lockstep.
         let mut state = NetState::new(&topo, 0, Some(lineage))?;
         state.entered_at_step = clock;
         let _net_device = self.config.device();
@@ -368,38 +309,14 @@ impl CoreEngine {
 
     // ── Catch-up ────────────────────────────────────────────────────────────
 
-    /// Catch-up a newcomer by replaying the shared stream solo for steps
-    /// `0..clock`. Each step calls the same `train_one_step` and
-    /// `eval_one_step` plus `seed_step_randomness` as the group loop, so the
-    /// child reproduces exactly what a group net would have seen at each
-    /// step — that's the replay contract.
-    ///
-    /// The child's network is rebuilt from its topology + seed at insertion
-    /// time (in `clone_fittest_parent`), so catch-up starts from fresh weights
-    /// (the same starting point the group nets had at step 0). This is correct:
-    /// a group net also started fresh at step 0 and saw the same batch sequence.
-    ///
-    /// Writes the child's state file **once at the end** (with the final step
-    /// and last metrics). During catch-up the child is not live in the population,
-    /// so no one reads its file per-step; for Item-6 resume, the recorded
-    /// `step` field is what matters, not intermediate writes. The asymmetry
-    /// with the group loop (which writes every step) is noted — Item 6 may
-    /// make catch-up write per-step too for full parity, but it's not required
-    /// for Item 4's determinism exit criterion.
+        /// Catch-up a newcomer by replaying the shared stream solo for steps `0..clock`,
+        /// using the same primitives as the group loop (the replay contract).
     pub(crate) fn catch_up(&mut self, child: &mut RaceChild, clock: usize) -> Result<()> {
         self.catch_up_range(child, 0, clock)
     }
 
-    /// Incremental catch-up: replay steps `from..to` (half-open). Used by the
-    /// checkpoint-gated evolution path to evaluate the child at each gate
-    /// without replaying the whole history — `from` is where the child's
-    /// replay currently stands, `to` the next gate (or the clock).
-    /// Catch-up variant for PROVISIONAL children (crossover gate
-    /// candidates): identical replay, but no state file is written. A
-    /// gate-rejected child must leave NOTHING behind — writing its state
-    /// mid-replay left "ghost" `nets/<hash>.json` files (`is_alive: true`,
-    /// counters from the replay window) that resume then tried to resurrect
-    /// as real members (parity failure + pop corruption).
+        /// Incremental catch-up: replay steps `from..to` (half-open), used by the gated
+        /// evolution path. No state file is written for PROVISIONAL children.
     pub(crate) fn catch_up_range_provisional(
         &mut self,
         child: &mut RaceChild,
@@ -412,6 +329,7 @@ impl CoreEngine {
         Ok(())
     }
 
+    /// Replay steps `from..to` (half-open) into an owned child.
     pub(crate) fn catch_up_range(
         &mut self,
         child: &mut RaceChild,
@@ -446,14 +364,11 @@ impl CoreEngine {
             smoothing_window: self.config.smoothing_window,
             max_steps: self.config.max_steps,
         };
-        // Same (net, step) seed discipline the group step uses, so a
-        // catch-up replay and a resume replay draw the SAME dropout masks
-        // (fastrand + libtorch). This is what keeps stochastic nets
-        // bit-exact across replays.
+            // Same (net, step) seed discipline the group step uses, so a catch-up replay
+            // and a resume replay draw the SAME dropout masks (fastrand + libtorch).
         crate::utils::race_steps::seed_step_randomness(child.state.net_seed as u64, step as u64, 0);
-        // Replay must mirror the step's ORIGINAL execution: a recorded frozen
-        // step (act-and-measure) is re-run through a no-op optimizer so the
-        // weights stay put and the metrics reproduce bit-exactly.
+            // Replay must mirror the original execution: a recorded frozen step is re-run
+            // through a no-op optimizer so the weights stay put and metrics reproduce.
         let frozen_step = child.state.is_frozen_step(step);
         let mut noop = crate::engine::core::NoopOptimizer;
         let optimizer: &mut dyn flodl::nn::optim::Optimizer = if frozen_step {
@@ -461,10 +376,8 @@ impl CoreEngine {
         } else {
             &mut *child.optimizer
         };
-        // Challenges replay for free: the trainer rolls its own trigger from
-        // (run_seed, net_seed, step) — pure function, `trainer::challenge` —
-        // so this replay re-fires exactly what the original run fired without
-        // the engine knowing challenges exist.
+            // Challenges replay for free: the trainer rolls its own trigger from
+            // (run_seed, net_seed, step), a pure function — no engine knowledge needed.
         let report = self.trainer.train_step(
             &mut child.net,
             optimizer,
@@ -485,10 +398,8 @@ impl CoreEngine {
             frozen: frozen_step,
         };
         child.state.record_metrics(metrics.clone());
-        // Mirror the live contract: an act-and-measure records metrics but
-        // never advances the clock (`state.step` counts trainings only), so
-        // the replayed step count equals the original run's — and
-        // `last_update_step` stays on the last TRAINED clock.
+            // Mirror the live contract: an act-and-measure records metrics but never advances
+            // the clock, so the replayed step count equals the original.
         if !frozen_step {
             child.state.advance_step();
         }
@@ -511,18 +422,8 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Iter-6 Tier B: rebuild a net from its persisted `NetState` and replay
-    /// steps `0..step`, asserting **metric parity** with the recorded
-    /// `last_metrics`.
-    ///
-    /// Resume = replay: coefficients are never persisted, so a reconstructed
-    /// net must re-derive its entire training history from the deterministic
-    /// stream. If the replayed metrics differ from what was recorded, the
-    /// reconstruction is broken (seed drift, primitive change, config
-    /// mismatch) — fail loudly rather than silently diverge.
-    ///
-    /// Returns a `RaceChild` ready for insertion into the live maps (same
-    /// shape `generate_child` + `catch_up` produce for newborns).
+        /// Rebuild a net from its persisted `NetState` and replay steps `0..step`, asserting
+        /// **metric parity** with the recorded `last_metrics` — resume = replay, fail loudly.
     pub(crate) fn replay_loaded_net(&mut self, state: NetState) -> Result<RaceChild> {
         let clock = state
             .last_metrics
@@ -532,13 +433,8 @@ impl CoreEngine {
         let recorded = state.last_metrics.clone();
         let segments = replay_segments(&state);
         let mut child = self.build_child_from_state(state)?;
-        // Replay the clocks this net ACTUALLY trained, not a naive `0..clock`:
-        // a net inserted mid-run never trains at its own birth clock (the group
-        // step for that clock ran before it existed — its first `history.csv`
-        // row is `entered_at_step + 1`), while a founder trained every clock.
-        // `state.step` counts trainings, so the two cases end at different
-        // clocks; walking the wrong set feeds a stale batch and drops a real
-        // one, drifting the weights by ~1e-3…1e-2.
+            // Replay the clocks this net ACTUALLY trained, not a naive `0..clock`: a mid-run
+            // joiner never trains at its birth clock, while a founder trained every clock.
         for (from, to) in segments {
             self.catch_up_range(&mut child, from, to)?;
         }
@@ -568,10 +464,8 @@ impl CoreEngine {
         Ok(child)
     }
 
-    /// Rebuild a `RaceChild` from a persisted `NetState`: same topology, same
-    /// recorded weight seed and lineage — but step reset to 0 so `catch_up`
-    /// can replay the full history. Unlike `finalize_child`, the seed is
-    /// **preserved**, never re-derived.
+        /// Rebuild a `RaceChild` from a persisted `NetState`: same topology, recorded weight
+        /// seed and lineage — but step reset to 0 so `catch_up` can replay. Seed preserved.
     fn build_child_from_state(&self, state: NetState) -> Result<RaceChild> {
         let topo = state.topology()?;
         let net = Network::build(&topo, self.config.device())?;
@@ -584,9 +478,8 @@ impl CoreEngine {
             culled_at_step: None,
             cull_reason: None,
             final_smoothed_fitness: None,
-            // frozen_spans are KEPT: replay needs to know which clocks were
-            // act-and-measure so it reproduces them with the no-op optimizer.
-            // Keep the rest (hash, topology, net_seed, lineage, entry step, meta).
+                // frozen_spans are KEPT: replay needs to know which clocks were act-and-measure.
+                // Keep the rest (hash, topology, net_seed, lineage, entry step, meta).
             ..state
         };
         Ok(RaceChild {
@@ -597,30 +490,8 @@ impl CoreEngine {
     }
 }
 
-/// The clocks a reconstructed net must replay, as contiguous `(from, to)`
-/// segments consumable by [`RaceEngine::catch_up_range`].
-///
-/// A net records a clock (a training OR an act-and-measure) at every clock in
-/// its life except its birth clock: the group step for the clock it joined ran
-/// *before* it existed (a joiner's first `history.csv` row is
-/// `entered_at_step + 1`). Additionally, a fresh joiner (`mutation_catch_up`
-/// off — the default) has NO history before birth at all: it starts from its
-/// birth weights, so replaying a pre-birth clock would train on a batch the
-/// original never saw at that point and drift the weights.
-///
-/// `state.step` counts trainings and `frozen_spans` the acts, so
-/// `recorded = step + acts`, and the gap `end + 1 − recorded` says which
-/// shape the record is:
-///   - `0` → founder/seeded: every clock `0..=end` was recorded;
-///   - `1` → joiner WITH pre-birth catch-up history: only the birth clock
-///     is missing;
-///   - `birth + 1` → fresh joiner: the birth clock AND every pre-birth clock
-///     is missing (nothing before birth was ever trained);
-///   - anything else → ambiguous (partial catch-up / corrupt record): use
-///     the conservative catch-up shape and let the parity check decide.
-///
-/// Mirrored by `replay_plan` in `examples/export_champion.rs`, so resume and
-/// the export tool can never disagree about which steps a net saw.
+/// The clocks a reconstructed net must replay, as contiguous `(from, to)` segments for
+/// [`RaceEngine::catch_up_range`]: `recorded = step + acts`, and the gap tells the shape.
 fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
     // Clocks with a recorded metrics row: trainings + act-and-measure acts.
     let recorded = state.step + frozen_act_count(state);
@@ -668,9 +539,9 @@ fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
     out
 }
 
-/// How many clocks sit inside `frozen_spans` — the act-and-measure passes.
-/// Spans are disjoint run-length by construction (`record_frozen_step`).
-fn frozen_act_count(state: &NetState) -> usize {
+/// How many clocks sit inside `frozen_spans` — the act-and-measure passes. Shared with the
+/// stop-time elite table's `frozen` column, so the log and traceback cannot disagree.
+pub(crate) fn frozen_act_count(state: &NetState) -> usize {
     state
         .frozen_spans
         .iter()

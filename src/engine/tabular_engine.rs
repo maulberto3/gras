@@ -6,6 +6,37 @@
 //! core. Everything else — the struct, the step loop, evolution, artifacts —
 //! lives in [`crate::engine::core::CoreEngine`] and is shared with the RL
 //! engine.
+//!
+//! ## Resume semantics — what must match vs what's yours to change
+//! Every live net is replayed from step 0 to its recorded step (no weights are
+//! persisted — topology + weight seed + the deterministic stream reproduce them),
+//! asserting metric parity with the recorded values.
+//!
+//! **Frozen** (construction hard-errors, or the first replayed step fails parity):
+//! `pop_size` (checked against the live frontier), the trainer scheme (loss,
+//! update recipe, `stream_shape()` batch sizes), the fitness function, the dataset
+//! at `data_dir`, the metric set, dims, and `run_seed` / `train_eval_split_ratio`
+//! / eval-row counts — those come from the persisted header, not your config.
+//!
+//! **Yours to change** (budget/log surface only — never a step's dynamics): the
+//! stop criterion (the `max_steps` budget is **absolute**, not per-process:
+//! interrupt at 17 with `max_steps: 20` and the resumed run does 3 more steps),
+//! `log_level`, and `checkpoint_every`.
+//!
+//! Also: `step_clock()` reads the max step across live nets, so a trailing
+//! crossover child can never repeat an iteration; replayed nets' rolling buffers
+//! are seeded by catch-up, and the checkpoint ledger is reloaded so gates compare
+//! against the SAME historical bars. Tabular resume is bit-identical because
+//! trainer randomness is engine-seeded — in RL only the env's own internal draws
+//! (the Python-side seeding contract) can drift; engine-side rolls always replay.
+//!
+//! Recorded schema (identical for tabular and RL): run-level settings in
+//! `engine.json`'s `config`, per-net facts in `nets/<hash>.json`, and
+//! trainer-owned facts (LR, grad clip, loss/update scheme) only in `engine.json`
+//! → `"trainer"`. Mode-owned absences are recorded as absences (`batch_size: null`
+//! for RL, not a tabular `16`). `MatchLength::draw` is a pure function of
+//! `(run_seed, step, match_i)`, so no schedule cursor is stored — a stateful
+//! variant (a curriculum ladder) would need one, which is why it isn't in the enum.
 
 use super::config::RaceConfig;
 use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
@@ -15,9 +46,8 @@ use crate::trainer::stream::{BatchStream, PoolSplit};
 use flodl::tensor::Result;
 use std::collections::HashMap;
 
-/// The dataset-driven (tabular) engine — the public handle for
-/// `RunSpec::tabular` runs. Wraps [`CoreEngine`]; derefs to it, so every
-/// shared method (step loop, ranking, artifacts) is reachable directly.
+/// The dataset-driven (tabular) engine — the public handle for `RunSpec::tabular`
+/// runs. Wraps [`CoreEngine`] and derefs to it.
 pub struct TabularEngine(pub(crate) CoreEngine);
 
 impl std::ops::Deref for TabularEngine {
@@ -39,10 +69,8 @@ impl TabularEngine {
         Ok(Self(CoreEngine::from_spec(spec)?))
     }
 
-    /// Build a tabular run from a [`TabularSpec`] DIRECTLY — no enum
-    /// wrapping. The typed-spec path: keep your spec in a variable, tweak it,
-    /// feed it here. Trainer is auto-boxed. Mirrors
-    /// [`RlEngine::from_rl_spec`](crate::engine::RlEngine::from_rl_spec).
+    /// Build a tabular run from a [`TabularSpec`] directly — the typed-spec path
+    /// (no enum round-trip); the trainer is auto-boxed.
     pub fn from_tabular_spec<T: crate::trainer::TabularStep + 'static>(
         spec: crate::engine::run_spec::TabularSpec<T>,
     ) -> Result<Self> {
@@ -60,85 +88,8 @@ impl TabularEngine {
             ),
         )?))
     }
-    /// Resume a run from its run directory + the same spec shape as `new`
-    /// (minus seed/run_dir — both come from the persisted `engine.json` and
-    /// the directory itself). The trainer must be the same scheme the run
-    /// started with; split ratio / eval rows also come from the header.
-    ///
-    /// The **tabular** flavor: the run's dataset is re-resolved from
-    /// `data_dir` and the batch stream is rebuilt from the header's split.
-    /// For an environment-driven run use [`Self::resume_rl`].
-    ///
-    /// # Resume semantics — what must match vs what's yours to change
-    ///
-    /// Every live net is replayed from step 0 to its recorded step (no
-    /// weights are persisted — topology + weight seed + the deterministic
-    /// stream reproduce them), asserting metric parity with the recorded
-    /// values.
-    ///
-    /// **Frozen** (changing these hard-errors at construction, or fails the
-    /// parity assert on the first replayed step):
-    ///
-    /// - `pop_size` — validated against the live frontier on disk
-    /// - the **trainer scheme** (loss, update recipe, `stream_shape()` batch
-    ///   sizes)
-    /// - the **fitness function** — replayed and compared
-    /// - the dataset at `data_dir` (shape errors at build; content drift
-    ///   fails parity)
-    /// - `metrics` / informative metric set; `input_dim` / `output_dim`
-    /// - `run_seed`, `train_eval_split_ratio`, eval-row counts — **read from
-    ///   the persisted `engine.json` header, not your config** (you can't
-    ///   get them wrong)
-    ///
-    /// **Yours to change** between runs (budget/log surface only — never
-    /// touches a step's dynamics):
-    ///
-    /// - stop criterion: keep or raise `max_steps` (`max_target_fitness` was
-    ///   deleted — use `custom_stop` for a target-like policy). The step budget
-    ///   is **absolute**, not per-process: interrupt at 17 with
-    ///   `max_steps: 20` and the resumed run goes 3 more steps, not 20.
-    /// - `log_level`, `checkpoint_every`
-    ///
-    /// Also worth knowing: `step_clock()` reads the **max step across live
-    /// nets**, so a caught-up crossover child (trailing the originals by one
-    /// step mid-evolution) can never repeat an iteration; replayed nets'
-    /// rolling buffers are seeded by the catch-up, so ranking/gates are warm
-    /// immediately; and the checkpoint ledger is reloaded so crossover gates
-    /// compare against the SAME historical bars.
-    ///
-    /// **RL caveat:** tabular resume is bit-identical because trainer
-    /// randomness is engine-seeded. In RL the randomness splits in two:
-    /// anything the TRAINER derives from its step context replays exactly —
-    /// batches, and the `RandomNumTurns` match-length schedule, a pure
-    /// function of `(run_seed, step, match_i)` shared by the whole
-    /// population — while only the env's own internal draws (market,
-    /// opponent, weed rolls: the Python side's seeding contract) can drift.
-    /// Engine-side rolls always replay.
-    ///
-    /// **What the engine records** — tabular and RL persist the SAME schema,
-    /// nothing mode-specific: `engine.json` (`RunHeader`) carries `run_seed`,
-    /// fitness label/direction, dims, topology options + pools, informative
-    /// metrics, stop criteria, split ratio / eval rows, the full
-    /// `ConfigSnapshot`, and `trainer`: the trainer's own `describe()` blob
-    /// (free-form JSON persisted verbatim, never interpreted). Per-net facts
-    /// live in `nets/<hash>.json` (`NetState`): topology, `net_seed`, step,
-    /// aliveness/tombstone fields, lineage, `last_metrics`, `meta`. Schema
-    /// rule: run-level settings in the header's `config`, per-net facts in
-    /// the net JSON, **trainer-owned facts** (learning rate, grad clip, loss/
-    /// update scheme) only in `engine.json` → `"trainer"` — never duplicated
-    /// into per-net meta. Mode-owned absences are recorded as absences (an RL
-    /// header has `batch_size: null`, not a tabular `16` that reads as a
-    /// fact).
-    ///
-    /// Why no match-length schedule field is needed: `MatchLength::draw` is
-    /// a pure function of `(run_seed, step, match_i)`, so the entire length
-    /// sequence re-derives from the header — no RNG cursor, no rung to
-    /// store. The exception is a *stateful* variant (a curriculum ladder):
-    /// its current rung WOULD have to be persisted, which is exactly why it
-    /// isn't in the enum yet. The `trainer` blob is validated on resume by
-    /// [`Self::assert_trainer_blob_matches`] — editing trainer consts
-    /// between runs is now caught immediately, naming the changed key, not
-    /// indirectly by a generic parity failure.
+    /// Resume a run from its run directory, replaying every live net to its
+    /// recorded step. See the module docs for what must match vs. what may change.
     pub fn resume(
         run_dir: std::path::PathBuf,
         data_dir: std::path::PathBuf,
@@ -156,9 +107,8 @@ impl TabularEngine {
             children_born_at_clock: header.children_born_at_clock.clone(),
             ..header.clone()
         };
-        // Mode guard (engine split, TODO.md step 6): a run dir written by
-        // the RL engine cannot be resumed as tabular (no dataset geometry).
-        // Legacy headers derive `engine_mode` from `config.mode` on load.
+        // Mode guard: a run dir written by the RL engine cannot be resumed as
+        // tabular (no dataset geometry); `engine_mode` is the discriminator.
         match header.engine_mode.as_deref() {
             Some("tabular") | None => {}
             Some(other) => {
@@ -170,13 +120,8 @@ impl TabularEngine {
             }
         }
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume")?;
-        // Data layout comes from the HEADER (explicit_test_rows), not from
-        // re-detecting the directory: a run started on the explicit
-        // `{train, test}` layout replays against the SAME pools even if the
-        // dirs were renamed/moved afterward. `Some(n)` = the combined dataset
-        // is `train rows [0..len-n)` + `test rows [len-n..len)` (same
-        // resolution order as construction, so row order — and thus the
-        // pools — is identical).
+        // Data layout comes from the HEADER (`explicit_test_rows`), not from
+        // re-detecting the directory — the same pools replay after a rename.
         let explicit_test_rows = header.explicit_test_rows;
         let dataset = if explicit_test_rows.is_some() {
             let (train, test) = crate::utils::tabular_data::resolve_train_test_datasets(&data_dir)?;
@@ -193,9 +138,8 @@ impl TabularEngine {
         // not re-decided by the resume config (mirrors the split ratio rule).
         let header_held_out = header.held_out_eval_rows.unwrap_or(256); // legacy default if header missing it
 
-        // Same rule on resume: the trainer's stream shape (same trainer the
-        // run started with) overrides batch sizes; the split ratio comes from
-        // the run header — data integrity is not re-decided on resume.
+        // Same rule on resume: the trainer's stream shape overrides batch sizes
+        // and the split ratio comes from the header — data integrity is fixed.
         let (batch_size, eval_batch_size) = match trainer.stream_shape() {
             Some(shape) => (shape.batch_size, shape.eval_batch_size),
             None => (16, 16), // conservative default when no stream_shape override
@@ -277,10 +221,8 @@ impl TabularEngine {
         };
 
         engine.load_live_frontier()?;
-        // Counters continue from the recorded values (cull budget, wall-clock
-        // age, child-seed ordinals) — a resumed run is the same race, not a
-        // fresh one with reset budgets. Legacy headers (missing fields) read
-        // as fresh, which is the only sane fallback.
+        // Counters continue from the recorded values (cull budget, wall-clock age,
+        // child-seed ordinals) — a resumed run is the same race. Legacy: fresh.
         engine.culls = persisted_counters.culls;
         engine.children_born_at_clock = persisted_counters.children_born_at_clock;
         engine.elapsed_base_secs = persisted_counters.run_elapsed_secs;

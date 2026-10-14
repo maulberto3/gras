@@ -16,74 +16,50 @@ use crate::engine::config::RaceConfig;
 use crate::engine::fitness::Fitness;
 use crate::trainer::{RlStep, TabularStep};
 
-/// Start-a-race spec: the entire `RaceEngine::new` argument surface.
-///
-/// - `data_dir` — the engine loads the dataset itself (already-resolved
-///   on-disk format; generate it beforehand if you need synthetic data).
-/// - `config` — the ONE config (population, evolution, budgets,
-///   topology, log level, divergence). No training knobs — those live on
-///   the trainer you supply.
-/// - `fitness` — ranking is engine business (drives cull/insert), so it
-///   stays explicit. The *loss* is training business and lives inside the
-///   trainer.
-/// - `trainer` — your training scheme, self-contained: it owns its loss, its
-///   optimizer recipe, its LR / grad-clip / schedule, and (optionally) the
-///   shape of the shared batch stream it wants. Accepts any `T: TabularStep`
-///   (auto-boxed), or a ready `Box<dyn TabularStep>`.
-/// - `seed` — `None` = random (recorded in `engine.json` for repro).
-/// - `run_dir` — `None` = `results/<run_id>` with a timestamp id; give a
-///   path to place the run anywhere. The chosen dir is readable via
-///   `RaceEngine::run_dir()` after construction.
+/// Start-a-race spec: the entire `new` argument surface. `fitness` is the
+/// ranking signal; the loss lives on your `trainer`.
 pub struct TabularSpec<T = Box<dyn TabularStep>> {
+    /// Dataset directory the engine loads.
     pub data_dir: std::path::PathBuf,
+    /// The one `RaceConfig` (no training knobs — those live on the trainer).
     pub config: RaceConfig,
+    /// Ranking signal (engine-computed for tabular runs).
     pub fitness: Fitness,
+    /// Your training scheme, self-contained and auto-boxed.
     pub trainer: T,
+    /// `None` = random seed (recorded in `engine.json`).
     pub seed: Option<u64>,
+    /// `None` = `results/<run_id>` with a timestamp id.
     pub run_dir: Option<std::path::PathBuf>,
 }
 
-/// RL spec: the run learns from an ENVIRONMENT the trainer drives, not from a
-/// dataset. No `data_dir`, no split/stream/eval — the engine's only ranking
-/// input is the fitness value the trainer reports in `StepReport.fitness`
-/// each step (require `Fitness::reported`). Everything evolution-side
-/// (population, rolls, culls, gates, smoothing, exports) is identical to
-/// Tabular mode.
+/// RL spec: the run learns from an ENVIRONMENT the trainer drives, not a dataset;
+/// the only ranking input is the `StepReport.fitness` the trainer reports.
 pub struct RLSpec<T = Box<dyn RlStep>> {
+    /// The one `RaceConfig`.
     pub config: RaceConfig,
     /// MUST be `Fitness::reported(..)` — validated at engine construction.
     pub fitness: Fitness,
+    /// Your environment-driving training scheme, auto-boxed.
     pub trainer: T,
+    /// `None` = random seed (recorded in `engine.json`).
     pub seed: Option<u64>,
+    /// `None` = `results/<run_id>` with a timestamp id.
     pub run_dir: Option<std::path::PathBuf>,
 }
 
-/// Start-a-race spec — one variant per run mode, each self-contained. The
-/// compiler enforces that each mode supplies exactly its own requirement set:
-///
-/// - **[`RunSpec::tabular`]** — supervised tabular style: `data_dir` + engine-
-///   computed fitness (see [`Fitness::new`]). This is the historical behavior;
-///   `RunSpec::tabular` builds it.
-/// - **[`RunSpec::RL`]** — environment/RL style: no dataset at all, a
-///   [`Fitness::reported`] ranking signal, and a trainer that drives the
-///   environment and reports the reward. `RunSpec::rl` builds it.
+/// Start-a-race spec — one variant per run mode, each self-contained, so the
+/// compiler enforces exactly each mode's requirement set.
 pub enum RunSpec<TT = Box<dyn TabularStep>, TR = Box<dyn RlStep>> {
+    /// Supervised tabular run: `data_dir` + engine-computed fitness.
     Tabular(TabularSpec<TT>),
+    /// Environment/RL run: no dataset, `Fitness::reported`, env-driving trainer.
     RL(RLSpec<TR>),
 }
 
 impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
-    /// Convenience constructor for the (default) Tabular variant — every
-    /// path field coerces via `Into<PathBuf>`, so callers can pass `&str`,
-    /// `String`, `&Path`, or `PathBuf` directly — no `.to_path_buf()` /
-    /// `.clone()` noise:
-    ///
-    /// ```ignore
-    /// RunSpec::tabular("data/mnist/train", config, fitness, trainer, Some(42), run_dir)
-    /// ```
-    ///
-    /// `run_dir` takes `Option<P>` where `P: Into<PathBuf>`; pass
-    /// `None::<&str>` for the default `results/<timestamp>` location.
+        /// Convenience constructor for the Tabular variant — path fields coerce via
+        /// `Into<PathBuf>`; `run_dir: None` uses `results/<timestamp>`.
     pub fn tabular<P: Into<std::path::PathBuf>>(
         data_dir: impl Into<std::path::PathBuf>,
         mut config: RaceConfig,
@@ -92,10 +68,8 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
         seed: Option<u64>,
         run_dir: Option<P>,
     ) -> Self {
-        // The spec variant DECIDES the mode arm: stamp the Tabular arm,
-        // replacing whatever placeholder the builder carried. A caller who
-        // tuned RL-only knobs on the builder would panic in the setters
-        // before ever reaching here (they match on the arm).
+            // The spec variant DECIDES the mode arm: stamp the Tabular arm, replacing
+            // whatever placeholder the builder carried.
         config.mode_specific = crate::engine::config::ModeConfig::Tabular(
             crate::engine::config::TabularConfig::default(),
         );
@@ -109,11 +83,8 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
         })
     }
 
-    /// Convenience constructor for the RL variant: NO data_dir (the trainer
-    /// learns from an environment), and `fitness` MUST be
-    /// [`Fitness::reported`] — the engine validates and refuses
-    /// `Fitness::Computed` here (a (pred, target) scorer has nothing to score
-    /// without a dataset).
+        /// Convenience constructor for the RL variant: no `data_dir`, and `fitness`
+        /// MUST be [`Fitness::reported`] (a `Computed` scorer has nothing to score).
     pub fn rl(
         mut config: RaceConfig,
         fitness: Fitness,
@@ -137,10 +108,8 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
             run_dir,
         })
     }
-    /// Convenience: build a spec with the trainer auto-boxed. Accepts any
-    /// `U: TabularStep + 'static` so callers can write
-    /// `.with_trainer(TabularTrainer::new(loss).with_learning_rate(1e-3))`
-    /// instead of `trainer: Box::new(...)`.
+        /// Build a spec with the trainer auto-boxed: accepts any
+        /// `U: TabularStep + 'static` instead of `trainer: Box::new(...)`.
     pub fn with_trainer<U: TabularStep + 'static>(
         self,
         trainer: U,
@@ -165,23 +134,11 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
     }
 }
 
-// NOTE: there is deliberately no engine-side "default trainer" builder. The
-// engine never constructs a concrete recipe — a run without a trainer is a
-// type error, and the reference recipes live in `examples/` (the caller's
-// copy to own and edit). See `examples/mnist.rs` and `examples/ref_trainer/`.
+// Deliberately no engine-side "default trainer": a run without a trainer is a type
+// error, and reference recipes live in `examples/` for the caller to own.
 
-/// Stream shape request — what the trainer wants the shared batch stream to
-/// look like. Returned from [`crate::trainer::TabularStep::stream_shape`]; the
-/// engine uses it to build the `BatchStream` at construction.
-///
-/// The trainer owns this request; the engine applies it (or the default if
-/// the trainer returns `None`). The **split ratio** is NOT in this struct:
-/// `train_eval_split_ratio` is engine bookkeeping (which rows are held out
-/// protects fitness comparability across all nets, whatever the recipe), and
-/// the engine always derives it from the dataset via the seeded split.
-///
-/// A trainer that doesn't want the engine stream returns `None` from
-/// `stream_shape()` and brings its own dataloader — it ignores `ctx.data`.
+/// Stream shape request — what the trainer wants the shared batch stream to look
+/// like (returned from `TabularStep::stream_shape`); the engine applies it.
 #[derive(Clone, Copy, Debug)]
 pub struct StreamShape {
     /// Rows per shared train batch.
@@ -200,11 +157,13 @@ impl StreamShape {
         }
     }
 
+    /// Override the train batch size for the shared stream.
     pub fn with_batch_size(mut self, n: usize) -> Self {
         self.batch_size = n;
         self
     }
 
+    /// Override the eval batch size for the shared stream.
     pub fn with_eval_batch_size(mut self, n: usize) -> Self {
         self.eval_batch_size = n;
         self

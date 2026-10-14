@@ -9,18 +9,12 @@
 use tracing::info;
 
 use super::core::CoreEngine;
+use crate::engine::child::frozen_act_count;
 use crate::engine::smoothing::rolling_mean;
 
 impl CoreEngine {
-    /// One rollup line per step: pop size, the train-loss mean ± std, the
-    /// mode's middle column, and the fitness column in the same shape. Two
-    /// decimals throughout — the spread is the signal worth reading, the
-    /// extremes are noise. Printed LAST for the step (see the run loop), so
-    /// it lands at the bottom of the terminal.
-    ///
-    /// Middle column by mode: Tabular = held-out `eval_loss`; RL = the step's
-    /// environment volume (`matches`/`turns`, from [`RlVolume`]) — an RL net
-    /// has no held-out batch, and the volume is what explains the wall time.
+        /// One rollup line per step: pop size, train-loss mean ± std, the mode's middle
+        /// column, and the fitness column. Printed LAST, so it lands at the terminal bottom.
     pub(crate) fn log_step_rollup(&mut self, clock: usize) {
         // Smoothed (K-step rolling mean) population stats — raw per-step
         // values bounce with batch difficulty; the trend is what matters.
@@ -68,23 +62,10 @@ impl CoreEngine {
         let mid = if !self.trainer.is_rl() {
             format!("eval_loss↓ {}", stats(&evals))
         } else {
-            self.step_rl.label()
+            self.step_rl.label(step_secs)
         };
-        // Per-step rollup: Summ = compact one-liner; Minimal = framed table
-        // (from step 2 — deltas need a prior step).
-        //
-        // The ★ badge names the CURRENT ELITE SET — the top-`elite_count`
-        // nets by smoothed fitness, IN RANK ORDER — and each entry says
-        // whether that net actually holds a seat. Elite and seated are NOT
-        // the same set: a seat is dealt only to nets that have served the
-        // join window (an elite net can be barred) and a seated net can sit
-        // outside the top-k, so a bare `hash(0/5)` could mean "just seated"
-        // or "no seat at all" — the reader could not tell, and the summary
-        // table disagreed with the badge on both membership and tenure. The
-        // freeze lines only ever show an ENTRANT's tenure (0 at entry, printed
-        // before the tick), so this badge is also the only place a reader sees
-        // how long a seated net has been sitting, i.e. how close its
-        // age-out at `j` is.
+            // Per-step rollup: Summ = compact one-liner; Minimal = framed table (step 2+).
+            // The ★ badge names the current elite set in rank order, each with its seat state.
         let freeze_badge = {
             let elites = self.elite_hashes();
             if elites.is_empty() {
@@ -120,19 +101,8 @@ impl CoreEngine {
         }
     }
 
-    /// `Minimal` mode: one boxed vitals table per step (starting at step 2 —
-    /// step 1 has no prior step to diff against). The frame sink redraws the
-    /// block in place on a terminal, so only the numbers move; off a terminal
-    /// it prints plainly, with no escape codes in the file. Deltas reuse
-    /// what the engine already reports (population-mean smoothed values vs the
-    /// last step); a zero delta drops the parenthetical. The evolve counters
-    /// and the best-net footer are plain current values — no delta on the
-    /// footer. Nothing else is printed per step in this mode.
-    ///
-    /// Row 1's tail is mode-dependent, exactly like the `Summ` line: tabular
-    /// shows the held-out `eval_loss`, RL shows the step's environment volume
-    /// (`matches`/`turns`). Rendered at the END of the step, so the evolve
-    /// counters in the frame are this step's own.
+        /// `Minimal` mode: one boxed vitals table per step (step 2+), redrawn in place on a
+        /// terminal. Row 1's tail is mode-dependent (eval_loss / env volume).
     pub(crate) fn log_minimal_table(
         &mut self,
         trains: &[f32],
@@ -148,10 +118,8 @@ impl CoreEngine {
             }
         };
         let (train_m, eval_m, fit_m) = (mean(trains), mean(evals), mean(fits));
-        // Delta vs the previous step's mean; omitted entirely when 0. The
-        // first table render (step 2) sets the baseline without deltas.
-        // Only surface a delta that survives 2-decimal rounding, so the table
-        // never shows a meaningless `(∆+0.00)`.
+            // Delta vs the previous step's mean; omitted when 0 or when it dies at
+            // 2-decimal rounding (the first render sets the baseline).
         let delta = |cur: f32, prev: Option<f32>| match prev {
             Some(p) if (cur - p).abs() >= 5e-3 => format!(" (∆{:+.2})", cur - p),
             _ => String::new(),
@@ -161,9 +129,8 @@ impl CoreEngine {
             .unwrap_or((f32::NAN, f32::NAN, f32::NAN));
         let pop = self.state.live_count();
         let e = self.step_evolve;
-        // Rows first, THEN size the box: a fixed width overflowed on long
-        // delta lines and swallowed the right border. Padding counts chars,
-        // not bytes — ↓/↑/∆ are 3 bytes each but one column wide.
+            // Rows first, THEN size the box; padding counts chars, not bytes (↓/↑/∆
+            // are 3 bytes but one column wide).
         let mut rows: Vec<String> = vec![
             if !self.trainer.is_rl() {
                 format!(
@@ -180,12 +147,11 @@ impl CoreEngine {
                     pop,
                     train_m,
                     delta(train_m, Some(pt)),
-                    self.step_rl.label(),
+                    self.step_rl.label(step_secs),
                 )
             },
-            // `smt` tag: this rollup cell is the population MEAN of smoothed
-            // per-net fitness — tagged so the rollup and the per-net raw
-            // values on other lines are never confused.
+                // `smt` tag: this cell is the population MEAN of smoothed per-net fitness,
+                // never confused with the per-net raw values.
             format!(
                 "fitness{} smt{:.2}{} │ culls {} │ inserts {}",
                 self.fitness.direction().arrow(),
@@ -200,9 +166,8 @@ impl CoreEngine {
             ),
             format!("step took {:.1}s", step_secs),
         ];
-        // Anti-devolution row — only when a knob is on (zero noise by
-        // default): the elite set and/or the current demotion count. Same
-        // annotation style as the Summ line's badge.
+            // Anti-devolution row — only when a knob is on (zero noise by default): the
+            // elite set and/or the current demotion count.
         let mut guard_cells: Vec<String> = Vec::new();
         if self.config.freeze_elites || self.config.elite_count > 0 {
             let elites = self.elite_hashes();
@@ -223,20 +188,16 @@ impl CoreEngine {
             .max()
             .unwrap_or(0)
             .max(20);
-        // EFFICIENCY NOTE (Tier 1 — `&str` over `&String`): a `&String` is a
-        // double pointer (ptr + len + capacity); the closure only READS the
-        // text, so `&str` suffices and accepts string literals too. Perk:
-        // one deref less and the borrower's `String` needn't exist — borrow
-        // the `&str` view directly.
+            // `&str` over `&String`: the closure only READS the text, so `&str` suffices
+            // and accepts literals too — one deref less.
         let pad = |s: &str| {
             let visible = s.chars().count();
             format!("│ {}{} │", s, " ".repeat(inner.saturating_sub(visible)))
         };
         let rule = |left: char, right: char| format!("{left}{}{right}", "─".repeat(inner + 2));
 
-        // One boxed block, handed to the frame sink as a whole so it can be
-        // redrawn in place: the divider splits what the population IS (state
-        // rows) from what the engine DID to it (rolls, timing, elite seats).
+            // One boxed block handed to the frame sink whole, so it can be redrawn in
+            // place: the divider splits population state from engine activity.
         let mut frame: Vec<String> = vec![rule('┌', '┐')];
         for (i, row) in rows.iter().enumerate() {
             if i == 2 {
@@ -258,11 +219,8 @@ impl CoreEngine {
             "  wrote {} frontier snapshot(s) → nets/<hash>.json (one per live net)",
             live.len(),
         );
-        // The population size is part of the resume call (the engine refuses a
-        // mismatch instead of silently patching it), so print the number the
-        // caller must pass — not just the directory. Phrased in ENGINE terms,
-        // not CLI flags: only the long-run example keeps a `--resume` flag, so
-        // a flag spelling here would be wrong for most runs.
+            // Print the pop size the caller must pass (the engine refuses a mismatch) —
+            // phrased in ENGINE terms, not CLI flags.
         info!(
             "  {} live net(s) at step {} → resume from {} with pop_size {}",
             live.len(),
@@ -270,29 +228,23 @@ impl CoreEngine {
             self.run_dir.display(),
             live.len(),
         );
-        // Parity is a property of the CONFIG, not just the directory: the
-        // engine re-reads the replay-relevant knobs from `engine.json` and
-        // REFUSES a mismatch instead of silently patching it, so the resume
-        // call has to agree with the recorded run. Naming them here saves the
-        // reader from learning that by failing.
+            // Parity is a property of the CONFIG: the engine re-reads the replay-relevant
+            // knobs and REFUSES a mismatch, so the resume call has to agree.
         info!(
             "  resume parity: replay-relevant knobs come from engine.json (K={}, checkpoint_every={}, gates, probation windows) — a mismatch is refused, not patched",
             self.config.smoothing_window,
             self.config.checkpoint_every,
         );
 
-        // What the run DID comes before what it produced: births, deaths, and
-        // what the roll budget bought (including the rolls that bought
-        // nothing). Read from the engine's own counters — not counted by hand
-        // from the log — and persisted in `engine.json` under `accounting`.
+            // What the run DID comes before what it produced: births, deaths, and what
+            // the roll budget bought. Read from the engine's own persisted counters.
         info!("  ── run accounting ──");
         for line in accounting_lines(&self.accounting, live.len()) {
             info!("{line}");
         }
 
-        // Final elite report: the top-k nets by smoothed fitness, with their
-        // metadata — the run's champions at stop time. Elite = rank, not
-        // identity, so this is "who holds the top-k right now".
+            // Final elite report: the top-k nets by smoothed fitness — the run's
+            // champions. Elite = rank, not identity.
         let k = self.config.elite_count.max(1); // report at least the champion
         // (hash, smoothed, step, eval_loss)
         let ranked: Vec<(String, f32, usize, Option<f32>)> = self
@@ -307,47 +259,33 @@ impl CoreEngine {
             .collect();
         let direction = self.fitness.direction();
         let arrow = direction.arrow();
-        // The list below is RANK-top-k, not the crown: a net can rank top-k
-        // while still barred by the elite gate (it never held a seat). The
-        // gate numbers here say how the population actually split, and each
-        // line names that net's own seat state.
-        //
-        // Counted at the LAST DEALT clock — the report runs after the final
-        // group step, so `step_clock()` is one past it and would grade every
-        // net's born-window `k` clocks late (see `elite_gate_counts`).
-        let (eligible, probation, age_blocked) =
-            self.elite_gate_counts(self.step_clock().saturating_sub(1));
-        // Compact one-line-per-elite table, built with `comfy-table` so the
-        // column widths are computed from the actual cell content. The old
-        // hand-padded `format!` table had three defects: the separator's
-        // `┬` characters landed in the wrong columns, the footer header row
-        // was printed twice (once above the bottom border, once below it),
-        // and the `step` column actually printed `entered_at_step` (the net's
-        // birth clock) while the real last-metric step was never shown. The
-        // table below prints the true recorded step, the seat age only for
-        // nets that actually hold a seat, and one header row at the top.
+            // The list is RANK-top-k, not the crown: a net can rank top-k while barred by
+            // the elite gate. Counted at the LAST DEALT clock (not `step_clock()`).
+        let dealt_clock = self.step_clock().saturating_sub(1);
+        let (eligible, probation, age_blocked) = self.elite_gate_counts(dealt_clock);
+            // Compact one-line-per-elite table via `comfy-table`, so column widths come
+            // from cell content; prints the true recorded step and one header row.
         let mut table = comfy_table::Table::new();
         table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
-        // RL trainers report fitness only — `eval_loss` is `None` for every
-        // net, and an all-`—` column is noise. Show it when at least one of the
-        // reported nets actually carries one (the tabular arm).
+            // RL trainers report fitness only — show the `eval_loss` column only when at
+            // least one reported net carries one.
         let has_eval = ranked.iter().take(k).any(|(_, _, _, e)| e.is_some());
-        let mut header = vec!["#", "hash", "smt", "step", "seat age", "params", "origin"];
+            // Every column recycles state the engine already carries (`spread`, `trained`,
+            // `frozen`, each informative metric labeled as in `history.csv`).
+        let mut header = vec![
+            "#", "hash", "smt", "spread", "step", "seat age", "trained", "frozen", "params",
+            "origin",
+        ];
         if has_eval {
             header.push("eval");
         }
+        for m in &self.metrics {
+            header.push(m.label());
+        }
         table.set_header(header);
         for (rank, (h, fit, step, eval_loss)) in ranked.iter().take(k).enumerate() {
-            // ± std over the smoothing window, same framing as the holdout
-            // guardrail: the mean alone hides the mix of raw values behind it
-            // (two elites at 500 can be 500-always vs 500-by-luck). A wide ±
-            // means the smoothed value rests on noisy raw steps — and at race
-            // end, that the ORDERING of this list itself is luck-sensitive.
-            // eval_loss: `—` when the mode doesn't produce one (RL trainers
-            // report fitness only). `None` is Rust-speak; a dash reads as
-            // "not applicable", which is the truth.
-            // `smt` tag: the ranked figure is the smoothed fitness (decided on
-            // it); the ± note is the spread of RAW steps behind it.
+                // ± std over the smoothing window (same framing as the guardrail): a wide ±
+                // means the ordering is luck-sensitive. eval_loss `—` when not applicable.
             let smt = crate::engine::format::fmt2_smt(*fit);
             let short = &h[..8.min(h.len())];
             let state = self.state.net(h);
@@ -368,12 +306,38 @@ impl CoreEngine {
                 .and_then(|s| s.meta.params)
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
+                // The raw spread behind `smt`: two nets at the same smoothed value can be
+                // "always that good" or "one lucky step".
+            let spread = self
+                .rolling_fitness
+                .get(h.as_str())
+                .filter(|b| b.len() > 1)
+                .map(|b| {
+                    let n = b.len() as f32;
+                    let mean = b.iter().sum::<f32>() / n;
+                    let sd = (b.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n).sqrt();
+                    format!("{sd:.1}")
+                })
+                .unwrap_or_else(|| "—".to_string());
+                // Clocks lived INCLUSIVE of the birth clock and the last run — same
+                // convention the freeze lines use (`clock − entered_at_step`).
+            let age = dealt_clock.saturating_sub(born_num) + 1;
+            // `trained n/m` as two cells: optimizer updates over clocks lived.
+            let trained = state
+                .map(|ns| format!("{}/{age}", ns.step))
+                .unwrap_or_else(|| "—".to_string());
+            let frozen = state
+                .map(|ns| frozen_act_count(ns).to_string())
+                .unwrap_or_else(|| "—".to_string());
             let mut row = vec![
                 (rank + 1).to_string(),
                 short.to_string(),
                 smt,
+                spread,
                 step.to_string(),
                 seat,
+                trained,
+                frozen,
                 params_label,
                 origin_label,
             ];
@@ -384,6 +348,17 @@ impl CoreEngine {
                         .unwrap_or_else(|| "—".to_string()),
                 );
             }
+            // One cell per configured informative metric, in config order —
+            // the same order `history.csv` writes its columns in.
+            let metrics = state.and_then(|ns| ns.last_metrics.as_ref());
+            for i in 0..self.metrics.len() {
+                row.push(
+                    metrics
+                        .and_then(|m| m.informative.get(i).copied())
+                        .map(|v| format!("{v:.2}"))
+                        .unwrap_or_else(|| "—".to_string()),
+                );
+            }
             table.add_row(row);
         }
         // comfy-table computes the widths; indent each line so the block
@@ -391,40 +366,36 @@ impl CoreEngine {
         for line in table.to_string().lines() {
             info!("  {line}");
         }
+            // Two lines: the header names the list, the gate tally rides an indented
+            // continuation (it was the longest of the twelve fields).
         info!(
-            "  ── final elites (top-{k}, fitness{arrow} smoothed) ── [crown {}/{} seats: {} eligible, {} on probation (k={}), {} age-blocked (j={})]",
-            self.frozen_crown.len(),
-            self.config
-                .elite_count
-                .min(self.state.live_count().saturating_sub(1)),
-            eligible,
-            probation,
-            self.config.elite_join_probation_steps,
-            age_blocked,
-            self.config.elite_crown_lifetime_steps,
+            "  ── final elites (top-{k}, fitness{arrow} smoothed) ──{}",
+            detail_line(&format!(
+                "crown {}/{} seats · {} eligible · {} on probation (k={}) · {} age-blocked (j={})",
+                self.frozen_crown.len(),
+                self.config
+                    .elite_count
+                    .min(self.state.live_count().saturating_sub(1)),
+                eligible,
+                probation,
+                self.config.elite_join_probation_steps,
+                age_blocked,
+                self.config.elite_crown_lifetime_steps,
+            )),
         );
         Ok(())
     }
 }
 
-/// One net's origin cell for the final elite table: WHO made it, WITHOUT the
-/// parent-hash ids, and WITH the birth clock in the cases where it is not
-/// trivially zero — so a bare `random` says when it entered, and a crossover
-/// says which op made it and when. Founders are born at step 0 by definition,
-/// so `founder-N` stands alone.
-/// `created_from` carries shapes like `random`, `founder-2`,
-/// `seed:<run_id>:<champion_hash>`, `crossover-<op>:parents=<h1>,<h2>[+mut]`
-/// and `clone:parents=<h1>`; the stored lineage is NOT changed — only this
-/// display cell drops the ids (`crossover-one-point:parents=h1,h2` →
-/// `cx one-point@14`).
+/// One net's origin cell for the final elite table: WHO made it, without parent-hash
+/// ids, with the birth clock when non-zero. Stored lineage is unchanged.
 fn origin_cell(created_from: Option<&str>, born: usize) -> String {
     let Some(raw) = created_from else {
         return format!("unknown@{born}");
     };
     let short8 = |hash: &str| hash[..8.min(hash.len())].to_string();
-    // `crossover-one-point:parents=h1,h2[+mut]` → `cx one-point@<born>[+mut]`
-    // — the crossover TYPE is the useful part; the parent ids are not, and
-    // two full hashes made this the widest column by far.
+        // `crossover-one-point:parents=h1,h2[+mut]` → `cx one-point@<born>[+mut]` — the
+        // crossover TYPE is useful; the parent ids are not (widest column by far).
     if let Some(rest) = raw.strip_prefix("crossover-") {
         let (head, mutated) = rest
             .strip_suffix("+mut")
@@ -456,17 +427,8 @@ fn origin_cell(created_from: Option<&str>, born: usize) -> String {
     raw.to_string()
 }
 
-/// The run-accounting block for the stop summary: what the evolution actually
-/// did, one labeled line per fact, in the order a reader asks the questions
-/// (who was born → who died → what the rolls bought → what they did not).
-///
-/// The per-clock log carries the same events one line at a time (and the
-/// routine no-op rolls only at `debug`); this is the tally that was previously
-/// only obtainable by counting log lines or `nets/*.json` by hand.
-///
-/// `alive` is passed in rather than stored: it is a property of the population
-/// at stop, not an accumulated counter (so it starts from the current live
-/// count on resume).
+/// The run-accounting block for the stop summary: what the evolution did, one labeled
+/// line per fact (born → died → what the rolls bought). `alive` is passed in at stop.
 pub(crate) fn accounting_lines(a: &crate::state::RunAccounting, alive: usize) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(format!(
@@ -483,7 +445,7 @@ pub(crate) fn accounting_lines(a: &crate::state::RunAccounting, alive: usize) ->
         a.culls, a.culls_crossover, a.culls_immigrant, alive
     ));
     lines.push(format!(
-        "  crossover rolls {}: {} fired → {} attempt(s), {} child(ren) built, {} discarded at the gate",
+        "  crossover rolls {}: {} fired → {} attempt(s), {} child(ren) built, {} discarded (no viable child)",
         a.crossover_rolls, a.crossover_fired, a.crossover_attempts, a.crossover_children,
         a.crossover_discarded
     ));
@@ -500,20 +462,13 @@ pub(crate) fn accounting_lines(a: &crate::state::RunAccounting, alive: usize) ->
     lines
 }
 
-/// Flatten a trainer's `describe()` blob into one readable line:
-/// `key=value │ nested.key=value │ …`.
-///
-/// The engine never interprets the blob (it persists it verbatim in
-/// `engine.json`), but the trainer-side knobs — the anti-plateau challenge
-/// trigger, learning-rate schedules, clipping — exist ONLY here now that they
-/// left the engine, so a pasted log that shows them is self-contained.
-///
-/// Bounded on purpose: a `describe()` that dumps tens of fields would turn one
-/// log line into a screenful, so the caller gets at most `MAX_FIELDS` facts and
-/// an explicit `… +n more` marker rather than an unbounded dump.
+/// Flatten a trainer's `describe()` blob into one readable line
+/// (`key=value │ nested.key=value`). Bounded at `MAX_FIELDS` with an explicit `… +n more`.
 pub(crate) fn summarize_json(v: &serde_json::Value) -> String {
+    /// Max facts rendered before an explicit `… +n more` marker.
     const MAX_FIELDS: usize = 12;
 
+    /// Flatten a nested JSON object into `key=value` fragments.
     fn flat(out: &mut Vec<String>, prefix: &str, v: &serde_json::Value) {
         let key = |k: &str| {
             if prefix.is_empty() {
@@ -553,15 +508,8 @@ pub(crate) fn summarize_json(v: &serde_json::Value) -> String {
     parts.join(" │ ")
 }
 
-/// One ★-badge entry: the elite net's short hash plus its seat state, plainly
-/// spelled out.
-///
-/// Seated ⇒ its tenure (clocks held) out of the crown lifetime `j`; `j = 0`
-/// disarms the lifetime, so no denominator is invented. Not seated ⇒ `no seat`,
-/// which is the honest reading of what used to print as `(0/5)`: seat age 0
-/// means "holds no seat", but it looked identical to a net seated this same
-/// clock (the badge is printed after the deal's tick, so a seated net is
-/// always at ≥ 1).
+/// One ★-badge entry: the elite net's short hash plus its seat state. Seated ⇒ tenure
+/// over the crown lifetime `j` (`j = 0` disarms); not seated ⇒ `no seat`.
 pub(crate) fn elite_badge_entry(short: &str, seat_age: usize, j: usize) -> String {
     if seat_age == 0 {
         format!("{short}(no seat)")
@@ -572,31 +520,28 @@ pub(crate) fn elite_badge_entry(short: &str, seat_age: usize, j: usize) -> Strin
     }
 }
 
-/// `trained n/m` for the freeze lines: real optimizer updates over the clocks
-/// the net has LIVED (`entered_at_step` → now).
-///
-/// `NetState::step` counts trainings — a frozen act-and-measure clock does not
-/// advance it — so this pairing is the honest one. What it replaced was
-/// `clock − last_update_step` over the ABSOLUTE clock: it read as a training
-/// count but meant "clocks since the last weight write", and crossover
-/// children inherit the parent's `last_update_step`, so a net born at step 7
-/// printed `8/12t` — more trainings than clocks lived, which is exactly the
-/// kind of line that teaches a reader to distrust the log.
+/// `trained n/m` for the freeze lines: real optimizer updates over the clocks the net
+/// has LIVED (`entered_at_step` → now) — not the old absolute-clock delta.
 pub(crate) fn trained_note(trainings: usize, age: usize) -> String {
     format!("trained {trainings}/{age} clocks")
 }
 
-/// The elite gate in words, for the freeze lines: the join window and the seat
-/// tenure.
-///
-/// - `probation` is the window a fresh (or just-dethroned) net must serve
-///   before it may hold a seat. The counter keeps TICKING past `k`, so raw
-///   `probation 16/5` read as a bar that had been overshot; once served it is
-///   reported as served, with the real number kept for the reader who wants
-///   to know how long it has been sitting.
-/// - `tenure` is the seat-age countdown against the crown lifetime `j`:
-///   `0/5` on the deal that seats it, `5/5` = age-out at the next deal. With
-///   `j = 0` the lifetime is disarmed and no denominator is invented.
+/// Indent for a wrapped event's continuation line — a fixed four spaces, deliberately
+/// not a column tracking the head line's clock-carrying prefix.
+pub(crate) const DETAIL_INDENT: &str = "    ";
+
+/// Wrap an event's detail onto its own indented line so the head line stays scannable.
+/// Empty detail returns "" (no dangling blank line).
+pub(crate) fn detail_line(detail: &str) -> String {
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!("\n{DETAIL_INDENT}{detail}")
+    }
+}
+
+/// The elite gate in words for the freeze lines: `probation` is the window a fresh net
+/// must serve before a seat; `tenure` is the seat-age countdown against `j`.
 pub(crate) fn elite_gate_note(probation_age: usize, seat_age: usize, k: usize, j: usize) -> String {
     let probation = if probation_age >= k {
         format!("probation served ({probation_age}≥{k})")
@@ -629,9 +574,8 @@ mod tests {
     fn trained_note_is_trainings_over_clocks_lived() {
         // A net born at step 7 that trained 5 of its 12 lived clocks.
         assert_eq!(trained_note(5, 12), "trained 5/12 clocks");
-        // The two counters can only ever agree when nothing was frozen —
-        // and `trainings ≤ age` always holds (a net cannot train before it
-        // exists), which the old weights-age number did not guarantee.
+            // The two counters can only agree when nothing was frozen, and
+            // `trainings ≤ age` always holds.
         assert_eq!(trained_note(0, 0), "trained 0/0 clocks");
     }
 
@@ -716,11 +660,11 @@ mod tests {
             lines[1],
             "  culled 164 (65 crossover slot(s), 99 immigrant slot(s)) │ 50 alive at stop"
         );
-        // A roll that bought nothing is reported, not hidden: the gate
-        // discards and the shield blocks are part of what the roll budget did.
+            // A roll that bought nothing is reported, not hidden. "no viable child", not
+            // "at the gate": with `crossover_catch_up=off` the gate is never consulted.
         assert_eq!(
             lines[2],
-            "  crossover rolls 250: 62 fired → 171 attempt(s), 65 child(ren) built, 7 discarded at the gate"
+            "  crossover rolls 250: 62 fired → 171 attempt(s), 65 child(ren) built, 7 discarded (no viable child)"
         );
         assert_eq!(
             lines[3],
