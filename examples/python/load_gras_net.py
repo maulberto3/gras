@@ -28,6 +28,27 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file
 
+
+def apply_transform(name: str | None, t: torch.Tensor) -> torch.Tensor:
+    """Per-node elementwise transform after standardize, before activation
+    (mirrors node.rs::Transform::apply — every branch stateless)."""
+    if name in (None, "Identity"):
+        return t
+    if name == "Log1p":
+        return t.clamp(-0.999999, 1e9).log1p()
+    if name == "Sqrt":
+        return t.sign() * t.abs().sqrt()
+    if name == "Clamp":
+        return t.clamp(-1.0, 1.0)
+    if name == "Sign":
+        return torch.sign(t)
+    if name == "Reciprocal":
+        return t.sign() * t.abs().clamp(min=1e-6).reciprocal()
+    if name == "Exp":
+        return t.clamp(-10.0, 10.0).exp()
+    raise ValueError(f"unknown transform op {name!r}")
+
+
 # ── Topology model (mirrors gras's JSON) ────────────────────────────────────
 
 
@@ -42,6 +63,7 @@ class Node:
     port_activations: list | None = None
     combine_op: str = "Add"
     standardize: str | None = None
+    transform: str | None = None
 
 
 @dataclass
@@ -223,6 +245,7 @@ class GrasNet:
 
             base = self.layers[f"node{n.id}"](z)
             base = standardize(n.standardize, base)
+            base = apply_transform(n.transform, base)
             for p in range(n.num_outputs or 1):
                 a = (
                     n.port_activations[p]

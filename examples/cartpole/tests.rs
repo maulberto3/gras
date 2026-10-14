@@ -123,6 +123,7 @@ mod tests {
             matches_per_step: 1,
             eval_matches_per_step: 1,
             challenge_prob: CHALLENGE_PROB,
+            challenge_policy: CHALLENGE_POLICY,
         };
         let metrics = vec![Metric::custom("mean", |survivals, _| {
             let v = survivals.data().to_f32_vec()?;
@@ -226,8 +227,8 @@ mod tests {
         Ok(())
     }
 
-    /// One head: `argmax(logits)`, deterministic and replay-safe. `forced` (the
-    /// challenge) overrides it on every turn, and that trajectory replays too.
+    /// One head: `argmax(logits)`, deterministic and replay-safe. The challenge
+    /// overrides it per turn (`Exact` holds one action, `Least` the argmin).
     #[test]
     fn argmax_head_plays_greedy_actions() -> gras::flodl::tensor::Result<()> {
         let device = gras::auto_device();
@@ -236,6 +237,7 @@ mod tests {
             matches_per_step: 1,
             eval_matches_per_step: 1,
             challenge_prob: CHALLENGE_PROB,
+            challenge_policy: CHALLENGE_POLICY,
         };
         let topo = gras::TopologyOptions {
             input_dim: Some(4),
@@ -266,19 +268,45 @@ mod tests {
             "greedy replay must be exact"
         );
 
-        // The challenge path: `forced` overrides the head on EVERY turn, and it
-        // replays exactly under its seed.
+        // The `Random` challenge path: one drawn index, held on EVERY turn — and
+        // it replays exactly under its seed.
         let forced = 1 - greedy_traj[0].1;
-        let (forced_traj, _) = trainer.play_episode(&mut net, seed, Some(forced))?;
+        let exact = Some(ForcedAction::Exact(forced));
+        let (forced_traj, _) = trainer.play_episode(&mut net, seed, exact)?;
         assert!(
             forced_traj.iter().all(|(_, a)| *a == forced),
             "a challenge must force its action on every turn"
         );
-        let (forced_again, _) = trainer.play_episode(&mut net, seed, Some(forced))?;
+        let (forced_again, _) = trainer.play_episode(&mut net, seed, exact)?;
         assert_eq!(
             seq(&forced_traj),
             seq(&forced_again),
             "a forced trajectory must replay exactly"
+        );
+
+        // The `LeastAction` path: no drawn action — each turn takes the argmin of
+        // its OWN logits (with 2 actions, the exact opposite of the greedy head).
+        let (least_traj, _) = trainer.play_episode(&mut net, seed, Some(ForcedAction::Least))?;
+        for (obs, action) in &least_traj {
+            let x = Tensor::from_f32(obs, &[1, 4], device)?;
+            let pred = net.forward(&Variable::new(x, false))?;
+            let logits = pred.data().to_f32_vec()?;
+            assert_eq!(
+                *action,
+                gras::trainer::least_action(&logits),
+                "LeastAction must play that turn's argmin"
+            );
+            assert_ne!(
+                *action,
+                if logits[1] > logits[0] { 1 } else { 0 },
+                "with 2 actions the argmin is the opposite of the greedy head"
+            );
+        }
+        let (least_again, _) = trainer.play_episode(&mut net, seed, Some(ForcedAction::Least))?;
+        assert_eq!(
+            seq(&least_traj),
+            seq(&least_again),
+            "a LeastAction trajectory must replay exactly"
         );
         Ok(())
     }

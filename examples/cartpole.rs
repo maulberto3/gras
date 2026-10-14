@@ -131,8 +131,13 @@ const LEARNING_RATE: f32 = 1e-3;
 const DROPOUT_PROB: f32 = 0.25;
 /// Gradient-norm clip before the optimizer step; 0 disables it.
 const GRAD_CLIP: f32 = 2.0;
+/// Actions the env accepts: 0 = push left, 1 = push right.
+const ACTIONS: usize = 2;
 /// Peak probability that a step fires a challenge (forced action).
 const CHALLENGE_PROB: f32 = 0.1;
+/// What a fired challenge forces: `Random` holds one drawn action for the whole
+/// episode, `LeastAction` re-picks the policy's least-preferred action per turn.
+const CHALLENGE_POLICY: ChallengePolicy = ChallengePolicy::LeastAction;
 /// Challenge decay shape: eff = p × (1 − progress^k).
 const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 
@@ -189,16 +194,18 @@ struct CartPoleTrainer {
     /// The trainer's own anti-plateau knob (see `CHALLENGE_PROB`). Rolled
     /// inside `train_step` — the engine never sees it.
     challenge_prob: f32,
+    /// Which policy a fired challenge applies (see `CHALLENGE_POLICY`).
+    challenge_policy: ChallengePolicy,
 }
 
 impl CartPoleTrainer {
-    /// Play one match with the greedy head. `forced` plays THAT action on every
-    /// turn — the challenge path, and the example's only exploration.
+    /// Play one match with the greedy head; `forced` is the challenge override —
+    /// `Exact(a)` holds one action on every turn, `Least` re-picks the argmin.
     fn play_episode(
         &self,
         net: &mut Network,
         start_seed: u64,
-        forced: Option<usize>,
+        forced: Option<ForcedAction>,
     ) -> gras::flodl::tensor::Result<(Vec<Transition>, usize)> {
         let mut rng = Rng::with_seed(start_seed);
         let mut env = CartPole::new(rng.f32() * 0.1 - 0.05, rng.f32() * 0.1 - 0.05);
@@ -210,7 +217,7 @@ impl CartPoleTrainer {
             let pred = net.forward(&Variable::new(t, false))?;
             let logits = pred.data().to_f32_vec()?;
             let action = match forced {
-                Some(a) => a,
+                Some(f) => f.resolve(&logits),
                 None => {
                     if logits[1] > logits[0] {
                         1
@@ -345,6 +352,7 @@ impl RlStep for CartPoleTrainer {
             // The challenge trigger is TRAINER-owned, so `describe()` is the
             // only place a reader of the log can see it at all.
             "challenge_prob": self.challenge_prob,
+            "challenge_policy": self.challenge_policy.to_string(),
             "challenge_decay": format!(
                 "custom:{CHALLENGE_DECAY_EXPONENT}" // eff = p × (1 − progress^k)
             ),
@@ -372,7 +380,7 @@ impl RlStep for CartPoleTrainer {
         step: usize,
         ctx: &RlContext<'_>,
     ) -> gras::flodl::tensor::Result<RlStepReport> {
-        // Anti-plateau challenge: on a fired step, force ONE random action on
+        // Anti-plateau challenge: on a fired step the policy forces an action on
         // every TRAIN turn — a pure fn of (run_seed, net_seed, step).
         let challenged = gras::trainer::challenge_fires(
             ctx.env.run_seed,
@@ -384,13 +392,8 @@ impl RlStep for CartPoleTrainer {
                 exponent: CHALLENGE_DECAY_EXPONENT,
             },
         );
-        let forced = if challenged {
-            let mut rng =
-                Rng::with_seed(ctx.net_seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            Some(rng.usize(..2))
-        } else {
-            None
-        };
+        let forced =
+            challenged.then(|| forced_action(self.challenge_policy, ctx.net_seed, step, ACTIONS));
 
         // 1. Train batch: per-net seeds, run seed blended in so an inherited
         //    champion doesn't replay its source run's exact trajectories.
@@ -532,7 +535,7 @@ fn main() {
         .set_run_pop_size(pop)
         .set_run_smoothing_window(5)
         .set_run_pop_catch_up(false)
-        .set_run_checkpoint_every(5)
+        // .set_run_checkpoint_every(5)
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra
         // history.csv column; `f` gets the eval survivals as a 1-D tensor.
         .set_stop_max_steps(Some(race_steps))
@@ -592,6 +595,7 @@ fn main() {
         matches_per_step: MATCHES_PER_STEP,
         eval_matches_per_step: EVAL_MATCHES_PER_STEP,
         challenge_prob: CHALLENGE_PROB,
+        challenge_policy: CHALLENGE_POLICY,
     };
 
     let mut engine = RlEngine::from_spec(RunSpec::rl(

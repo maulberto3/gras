@@ -80,6 +80,8 @@ const MAX_SPEED: f32 = 0.07;
 const GRAVITY: f32 = 0.0025;
 const PUSH: f32 = 0.001;
 const MAX_TURNS_PER_MATCH: usize = 200;
+/// Actions the env accepts: 0 = push left, 1 = no push, 2 = push right.
+const ACTIONS: usize = 3;
 
 impl MountainCar {
     fn new(position: f32, velocity: f32) -> Self {
@@ -213,6 +215,8 @@ struct MountainCarTrainer {
     /// inside `train_step` via `gras::trainer::challenge_fires` — the
     /// engine never sees it (trainer-side since 2026-10-10).
     challenge_prob: f32,
+    /// Which policy a fired challenge applies (see `CHALLENGE_POLICY`).
+    challenge_policy: ChallengePolicy,
 }
 
 impl MountainCarTrainer {
@@ -244,8 +248,8 @@ impl MountainCarTrainer {
     /// `sample = false` (eval/holdout) stays argmax: fitness must measure
     /// the deterministic policy, not a lucky draw.
     ///
-    /// `forced = Some(action)` plays THAT action on every turn of every
-    /// match (challenge: train matches of a fired step only). In a momentum
+    /// `forced = Some(Exact(action))` plays THAT action on every turn of every
+    /// match; `Some(Least)` re-picks the argmin each turn. In a momentum
     /// problem a constant push is not a handicap — "hold right until the
     /// wall, then hold left" is a real (bad but informative) momentum
     /// strategy, and forced trajectories widen the sampled batch in
@@ -256,7 +260,7 @@ impl MountainCarTrainer {
         start_seed_base: u64,
         count: usize,
         sample: bool,
-        forced: Option<usize>,
+        forced: Option<ForcedAction>,
     ) -> gras::flodl::tensor::Result<Vec<(Vec<Transition>, bool, usize)>> {
         // One seeded env per match — the SAME per-match seeds the sequential
         // version used, so a batched run replays a sequential one exactly.
@@ -294,10 +298,11 @@ impl MountainCarTrainer {
             // re-introduce the argmax freeze as T → 0.
             const SOFTMAX_T: f32 = 1.0;
             for (row, &i) in live.iter().enumerate() {
+                let row_logits = &logits[row * ACTIONS..row * ACTIONS + ACTIONS];
                 let action = match forced {
-                    Some(a) => a,
+                    Some(f) => f.resolve(row_logits),
                     None if sample => {
-                        let lg = &logits[row * 3..row * 3 + 3];
+                        let lg = row_logits;
                         // softmax over THIS match's logits, drawn from THIS
                         // match's rng — the E rows never share randomness.
                         let max = lg.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -316,7 +321,7 @@ impl MountainCarTrainer {
                         picked
                     }
                     None => {
-                        let lg = &logits[row * 3..row * 3 + 3];
+                        let lg = row_logits;
                         lg.iter()
                             .enumerate()
                             .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
@@ -459,6 +464,7 @@ impl RlStep for MountainCarTrainer {
             // knows challenges exist) — `describe()` is the only place these
             // knobs are visible to a reader of the run's record.
             "challenge_prob": self.challenge_prob,
+            "challenge_policy": self.challenge_policy.to_string(),
             "challenge_decay": format!(
                 "custom:{CHALLENGE_DECAY_EXPONENT}" // eff = p × (1 − progress^k)
             ),
@@ -492,11 +498,11 @@ impl RlStep for MountainCarTrainer {
         step: usize,
         ctx: &RlContext<'_>,
     ) -> gras::flodl::tensor::Result<RlStepReport> {
-        // Challenge (anti-plateau, TRAINER-side): on a fired (net, step),
-        // force ONE drawn action for the whole episode. The trigger is a
-        // pure function of (run_seed, net_seed, step), and the forced draw
-        // is seeded from (net_seed, step) — replay re-fires and re-forces
-        // identically. Knob at 0 = never fires.
+        // Challenge (anti-plateau, TRAINER-side): on a fired (net, step) the
+        // policy forces an action on the train episodes. The trigger is a pure
+        // function of (run_seed, net_seed, step) and the forced action of
+        // (net_seed, step) — replay re-fires and re-forces identically. Knob at
+        // 0 = never fires.
         let challenged = gras::trainer::challenge_fires(
             ctx.env.run_seed,
             ctx.net_seed,
@@ -507,13 +513,8 @@ impl RlStep for MountainCarTrainer {
                 exponent: CHALLENGE_DECAY_EXPONENT,
             },
         );
-        let forced = if challenged {
-            let mut rng =
-                Rng::with_seed(ctx.net_seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            Some(rng.usize(..3))
-        } else {
-            None
-        };
+        let forced =
+            challenged.then(|| forced_action(self.challenge_policy, ctx.net_seed, step, ACTIONS));
 
         // 1. Train batch: play ALL matches in LOCKSTEP (see the efficiency
         // note on `play_episodes`) — per-net seeds blended with the run seed
@@ -596,6 +597,9 @@ const HOLDOUT_MATCHES: usize = 16;
 const LOG_LEVEL: LogLevel = LogLevel::Summ;
 const CHALLENGE_PROB: f32 = 0.35;
 const CHALLENGE_DECAY_EXPONENT: f32 = 2.0;
+/// What a fired challenge forces: `Random` holds one drawn action per episode,
+/// `LeastAction` re-picks the policy's least-preferred action every turn.
+const CHALLENGE_POLICY: ChallengePolicy = ChallengePolicy::LeastAction;
 const RACE_STEPS: usize = 40;
 const MATCHES_PER_STEP: usize = 2;
 const EVAL_MATCHES_PER_STEP: usize = 2;
@@ -748,6 +752,7 @@ fn main() {
         matches_per_step: MATCHES_PER_STEP,
         eval_matches_per_step: EVAL_MATCHES_PER_STEP,
         challenge_prob: CHALLENGE_PROB,
+        challenge_policy: CHALLENGE_POLICY,
     };
 
     let mut engine = RlEngine::from_spec(RunSpec::rl(

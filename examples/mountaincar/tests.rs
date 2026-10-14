@@ -104,6 +104,7 @@ fn trainer() -> MountainCarTrainer {
         matches_per_step: 2,
         eval_matches_per_step: 2,
         challenge_prob: CHALLENGE_PROB,
+        challenge_policy: CHALLENGE_POLICY,
     }
 }
 
@@ -134,10 +135,35 @@ fn episode_respects_cap_and_reports_shape() {
         );
     }
     // A forced-action batch also terminates cleanly (challenge path).
-    let forced = t.play_episodes(&mut net, 11, 2, true, Some(2)).unwrap();
+    let forced = t
+        .play_episodes(&mut net, 11, 2, true, Some(ForcedAction::Exact(2)))
+        .unwrap();
     for (_, _, turns) in &forced {
         assert!(*turns >= 1 && *turns <= MAX_TURNS_PER_MATCH);
     }
+    // `LeastAction` needs no draw: each turn plays the argmin of its own logits,
+    // so the batch is deterministic and still terminates cleanly.
+    let least = t
+        .play_episodes(&mut net, 11, 2, true, Some(ForcedAction::Least))
+        .unwrap();
+    assert_eq!(least.len(), 2);
+    for (traj, _, turns) in &least {
+        assert!(*turns >= 1 && *turns <= MAX_TURNS_PER_MATCH);
+        assert!(!traj.is_empty(), "a LeastAction episode must play turns");
+    }
+    let least_again = t
+        .play_episodes(&mut net, 11, 2, true, Some(ForcedAction::Least))
+        .unwrap();
+    let acts = |eps: &Vec<(Vec<Transition>, bool, usize)>| {
+        eps.iter()
+            .map(|(traj, _, _)| traj.iter().map(|(_, a)| *a).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        acts(&least),
+        acts(&least_again),
+        "a LeastAction batch must replay exactly"
+    );
     // Seeded replay: the same base seed reproduces identical episodes.
     let again = t.play_episodes(&mut net, 11, 2, true, None).unwrap();
     for ((_, s1, t1), (_, s2, t2)) in eps.iter().zip(again.iter()) {
