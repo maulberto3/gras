@@ -1778,8 +1778,9 @@ impl CoreEngine {
                 crate::engine::reporting::trained_note(trainings, age_now),
                 params.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
             );
-            // Two lines: the seat verdict on top, the bookkeeping indented underneath. The
-            // old `displaced <hash>` tail said it twice and made the widest line in the log.
+            // One line: the verdict, then the bookkeeping joined by ` · `. A seat event is
+            // never split across two log lines (the old form wrapped it onto an indent).
+            let tail = crate::engine::reporting::detail_inline(&details);
             info!(
                 "step {} │ freeze │ elite seat {}/{seat}: {} seated{} — fitness{} {}{}",
                 clock,
@@ -1789,7 +1790,7 @@ impl CoreEngine {
                 self.fitness.direction().arrow(),
                 fit.map(crate::engine::format::fmt2_smt)
                     .unwrap_or_else(|| "—".into()),
-                crate::engine::reporting::detail_line(&details),
+                tail,
             );
         }
         for h in &leaving {
@@ -1863,7 +1864,7 @@ impl CoreEngine {
                 reason,
                 rank_note,
                 detail,
-                crate::engine::reporting::detail_line(&format!(
+                crate::engine::reporting::detail_inline(&format!(
                     "{} · probation restarts at 0 (serves {} to sit again) · crown {}/{}",
                     crate::engine::reporting::trained_note(trainings, age),
                     self.config.elite_join_probation_steps,
@@ -2271,13 +2272,13 @@ fn step_rollup_line(v: &StepVitals) -> String {
             sat_out.join(" + ")
         ));
     }
-    // The gate tally rides its own indented line: the seat count is the event, the
-    // split is the detail, and joined on one line it ran wider than the terminal.
+    // The gate tally rides the same line as the seat count — a step rollup is never
+    // split across lines, so the split detail follows the count after ` · `.
     parts.push(format!(
         "crown {}/{} seats{}",
         v.seats_held,
         v.seats_capacity,
-        crate::engine::reporting::detail_line(&format!(
+        crate::engine::reporting::detail_inline(&format!(
             "{} eligible · {} on probation (k={}) · {} age-blocked (j={})",
             v.eligible, v.probation, v.join_k, v.age_blocked, v.lifetime_j
         ))
@@ -5678,8 +5679,10 @@ mod tests {
         let line = rollup([74, 100, 10, 16, 74, 26, 0, 10, 10, 5, 5]);
         assert_eq!(
             line,
-            "stepped 74/100 live nets (weights updated) │ 26 sat out: 10 elite frozen (act+measure, no update) + 16 newborn (born this clock, first step next clock) │ crown 10/10 seats\n    74 eligible · 26 on probation (k=5) · 0 age-blocked (j=5)"
+            "stepped 74/100 live nets (weights updated) │ 26 sat out: 10 elite frozen (act+measure, no update) + 16 newborn (born this clock, first step next clock) │ crown 10/10 seats · 74 eligible · 26 on probation (k=5) · 0 age-blocked (j=5)"
         );
+        // The rollup is ONE log line: the crown tally rides inline, never an indent.
+        assert!(!line.contains('\n'), "rollup stays one line: {line}");
         // `stepped + sat out = live` — the invariant the format upholds.
         assert!(74 + 10 + 16 == 100);
 
@@ -5705,7 +5708,7 @@ mod tests {
         let clean = rollup([4, 4, 0, 0, 0, 4, 0, 0, 1, 5, 5]);
         assert_eq!(
             clean,
-            "stepped 4/4 live nets (weights updated) │ crown 0/1 seats\n    0 eligible · 4 on probation (k=5) · 0 age-blocked (j=5)"
+            "stepped 4/4 live nets (weights updated) │ crown 0/1 seats · 0 eligible · 4 on probation (k=5) · 0 age-blocked (j=5)"
         );
     }
 }

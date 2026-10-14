@@ -24,11 +24,18 @@
 //! );
 //! ```
 //!
-//! On a fired step the trainer owns the response: RL forces a drawn action on
-//! the TRAIN matches (seed the draw from `(net_seed, step)` so catch-up and
-//! resume replay the identical force); tabular jitters its batch at the
-//! element level against [`effective_challenge_prob`] (the decayed per-value
-//! rate). Ignoring the flag is legal — keep the knob at 0.
+//! On a fired step the trainer owns the response: RL forces an action on the
+//! TRAIN matches through [`ChallengePolicy`] + [`forced_action`] (pure, so
+//! catch-up and resume replay the identical force); tabular jitters its batch
+//! at the element level against [`effective_challenge_prob`] (the decayed
+//! per-value rate). Ignoring the flag is legal — keep the knob at 0.
+//!
+//! # Challenge policies (CHA)
+//!
+//! [`ChallengePolicy::Random`] draws ONE action index and holds it for the whole
+//! episode. [`ChallengePolicy::LeastAction`] forces, per turn, the action the
+//! policy wants least (`argmin`) — no draw, state-dependent, and the sharpest
+//! push away from what the net already does.
 //!
 //! # Replay contract
 //!
@@ -110,6 +117,96 @@ impl std::fmt::Display for ChallengeDecay {
             ChallengeDecay::Exponential => write!(f, "exponential"),
             ChallengeDecay::Custom { exponent } => write!(f, "custom:{exponent}"),
         }
+    }
+}
+
+/// What a fired challenge forces on the TRAIN matches. `Random` is the historical
+/// behaviour; `LeastAction` aims at the policy's own blind spot instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChallengePolicy {
+    /// One uniformly drawn action index, forced on every train turn of the step.
+    #[default]
+    Random,
+    /// Per turn, the argmin over that turn's action values — the action the policy
+    /// least wants. No draw, so it is replay-exact by construction.
+    LeastAction,
+}
+
+impl TryFrom<&str> for ChallengePolicy {
+    type Error = String;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s.trim() {
+            "random" => Ok(ChallengePolicy::Random),
+            "least_action" | "least-action" => Ok(ChallengePolicy::LeastAction),
+            other => Err(format!(
+                "unknown challenge policy '{other}' (use \"random\" or \"least_action\")"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for ChallengePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChallengePolicy::Random => write!(f, "random"),
+            ChallengePolicy::LeastAction => write!(f, "least_action"),
+        }
+    }
+}
+
+/// The action a fired challenge forces, resolved per turn by the trainer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForcedAction {
+    /// One drawn index (the `Random` policy) — every turn of the step plays it.
+    Exact(usize),
+    /// The least-preferred action of the CURRENT turn (the `LeastAction` policy).
+    Least,
+}
+
+impl ForcedAction {
+    /// The action this turn plays: the drawn index, or the argmin of `values`.
+    pub fn resolve(self, values: &[f32]) -> usize {
+        match self {
+            ForcedAction::Exact(a) => a,
+            ForcedAction::Least => least_action(values),
+        }
+    }
+}
+
+/// The least-preferred action: argmin over `values`, ties to the lowest index.
+/// NaN ranks as least-preferred, and it never panics (a challenge must not kill a run).
+pub fn least_action(values: &[f32]) -> usize {
+    let mut best = 0usize;
+    for (i, v) in values.iter().enumerate() {
+        let better = match (v.partial_cmp(&values[best]), v.is_nan()) {
+            (None, true) => !values[best].is_nan(),
+            (Some(std::cmp::Ordering::Less), _) => true,
+            _ => false,
+        };
+        if better {
+            best = i;
+        }
+    }
+    best
+}
+
+/// What a fired challenge forces — pure, like the trigger itself. `Random`
+/// reproduces the historical draw; `actions` is the env's count (the trainer's).
+pub fn forced_action(
+    policy: ChallengePolicy,
+    net_seed: u64,
+    step: usize,
+    actions: usize,
+) -> ForcedAction {
+    match policy {
+        ChallengePolicy::Random => {
+            let mut rng = fastrand::Rng::with_seed(
+                net_seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
+            ForcedAction::Exact(rng.usize(..actions))
+        }
+        ChallengePolicy::LeastAction => ForcedAction::Least,
     }
 }
 
@@ -284,6 +381,82 @@ mod tests {
         assert!(
             (16..=48).contains(&fired),
             "trigger must track prob across nets, fired {fired}/64"
+        );
+    }
+
+    /// `LeastAction` resolves per turn from the values it is handed — the same
+    /// `ForcedAction` yields a different action as the policy's preference flips.
+    #[test]
+    fn least_action_resolves_per_turn_from_the_values() {
+        let forced = forced_action(ChallengePolicy::LeastAction, 42, 7, 2);
+        assert_eq!(forced, ForcedAction::Least);
+        // The policy prefers action 0 here, so the challenge takes 1 — and vice versa.
+        assert_eq!(forced.resolve(&[5.0, 1.0]), 1);
+        assert_eq!(forced.resolve(&[1.0, 5.0]), 0);
+        // Three actions: the argmin of the row, not a fixed column.
+        assert_eq!(forced.resolve(&[0.5, -2.0, 0.9]), 1);
+    }
+
+    /// The argmin: ties go to the lowest index, a single action is always 0, an
+    /// empty slice is 0, and NaN ranks as least-preferred without ever panicking.
+    #[test]
+    fn least_action_picks_the_argmin_and_never_panics() {
+        assert_eq!(least_action(&[0.5, -1.0, 2.0]), 1);
+        assert_eq!(least_action(&[1.0, 1.0]), 0);
+        assert_eq!(least_action(&[-0.0, 0.0]), 0);
+        assert_eq!(least_action(&[3.0]), 0);
+        assert_eq!(least_action(&[]), 0);
+        assert_eq!(least_action(&[0.0, f32::NAN]), 1);
+        assert_eq!(least_action(&[f32::NAN, 0.0]), 0);
+        assert_eq!(least_action(&[f32::NAN, f32::NAN]), 0);
+        assert_eq!(least_action(&[f32::INFINITY, f32::NEG_INFINITY]), 1);
+    }
+
+    /// The policy string round-trips through the CLI/`describe()` vocabulary, and
+    /// bad input errors instead of panicking.
+    #[test]
+    fn policy_string_round_trip_and_parse_errors() {
+        for (raw, want) in [
+            ("random", ChallengePolicy::Random),
+            ("least_action", ChallengePolicy::LeastAction),
+        ] {
+            assert_eq!(ChallengePolicy::try_from(raw).unwrap(), want);
+            assert_eq!(want.to_string(), raw);
+        }
+        assert_eq!(
+            ChallengePolicy::try_from("least-action").unwrap(),
+            ChallengePolicy::LeastAction
+        );
+        assert!(ChallengePolicy::try_from("argmin").is_err());
+        assert_eq!(ChallengePolicy::default(), ChallengePolicy::Random);
+    }
+
+    /// `Random` must stay bit-identical to the historical inline draw — the policy
+    /// refactor may not silently change what a recorded run would do.
+    #[test]
+    fn random_policy_reproduces_the_historical_draw() {
+        /// The draw the examples used before the policy existed (verbatim).
+        fn legacy(net_seed: u64, step: usize) -> usize {
+            let mut rng =
+                fastrand::Rng::with_seed(net_seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            rng.usize(..2)
+        }
+        for net_seed in [1u64, 42, 999] {
+            for step in 0..8usize {
+                assert_eq!(
+                    forced_action(ChallengePolicy::Random, net_seed, step, 2),
+                    ForcedAction::Exact(legacy(net_seed, step))
+                );
+            }
+        }
+        // Golden values, pinned: a changed seed derivation fails here, not in a run.
+        assert_eq!(
+            forced_action(ChallengePolicy::Random, 42, 3, 2),
+            ForcedAction::Exact(1)
+        );
+        assert_eq!(
+            forced_action(ChallengePolicy::Random, 7, 0, 3),
+            ForcedAction::Exact(2)
         );
     }
 

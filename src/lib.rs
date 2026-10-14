@@ -112,9 +112,10 @@ pub mod prelude {
 
     // Trainer contracts + report types.
     pub use crate::trainer::{
-        AnyTrainer, BoxedLossFn, ChallengeDecay, LossFn, RlContext, RlStep, RlStepMeta,
-        RlStepReport, RunData, StepEnv, StepReport, StreamShape, TabularContext, TabularStep,
-        TabularStepReport, challenge_fires, effective_challenge_prob,
+        AnyTrainer, BoxedLossFn, ChallengeDecay, ChallengePolicy, ForcedAction, LossFn, RlContext,
+        RlStep, RlStepMeta, RlStepReport, RunData, StepEnv, StepReport, StreamShape,
+        TabularContext, TabularStep, TabularStepReport, challenge_fires,
+        effective_challenge_prob, forced_action, least_action,
     };
 
     // Shared deterministic batching.

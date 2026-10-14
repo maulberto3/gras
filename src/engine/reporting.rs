@@ -366,11 +366,11 @@ impl CoreEngine {
         for line in table.to_string().lines() {
             info!("  {line}");
         }
-            // Two lines: the header names the list, the gate tally rides an indented
-            // continuation (it was the longest of the twelve fields).
+            // One line: the header names the list, then the gate tally follows inline,
+            // separated by ` · ` (it was the longest of the twelve fields).
         info!(
             "  ── final elites (top-{k}, fitness{arrow} smoothed) ──{}",
-            detail_line(&format!(
+            detail_inline(&format!(
                 "crown {}/{} seats · {} eligible · {} on probation (k={}) · {} age-blocked (j={})",
                 self.frozen_crown.len(),
                 self.config
@@ -526,17 +526,13 @@ pub(crate) fn trained_note(trainings: usize, age: usize) -> String {
     format!("trained {trainings}/{age} clocks")
 }
 
-/// Indent for a wrapped event's continuation line — a fixed four spaces, deliberately
-/// not a column tracking the head line's clock-carrying prefix.
-pub(crate) const DETAIL_INDENT: &str = "    ";
-
-/// Wrap an event's detail onto its own indented line so the head line stays scannable.
-/// Empty detail returns "" (no dangling blank line).
-pub(crate) fn detail_line(detail: &str) -> String {
+/// Append an event's detail on the SAME line, separated by ` · ` so an event is always
+/// one log line. Empty detail returns "" (no dangling separator).
+pub(crate) fn detail_inline(detail: &str) -> String {
     if detail.is_empty() {
         String::new()
     } else {
-        format!("\n{DETAIL_INDENT}{detail}")
+        format!(" · {detail}")
     }
 }
 
@@ -558,7 +554,7 @@ pub(crate) fn elite_gate_note(probation_age: usize, seat_age: usize, k: usize, j
 
 #[cfg(test)]
 mod tests {
-    use super::{elite_badge_entry, elite_gate_note, origin_cell, trained_note};
+    use super::{detail_inline, elite_badge_entry, elite_gate_note, origin_cell, trained_note};
 
     #[test]
     fn elite_badge_entry_says_whether_the_net_holds_a_seat() {
@@ -577,6 +573,21 @@ mod tests {
             // The two counters can only agree when nothing was frozen, and
             // `trainings ≤ age` always holds.
         assert_eq!(trained_note(0, 0), "trained 0/0 clocks");
+    }
+
+    #[test]
+    fn detail_inline_keeps_an_event_on_one_line() {
+        // The seat line's bookkeeping: inline joins mid-line, never a wrap.
+        let tail = detail_inline(
+            "age 5 · trained 5/5 clocks · 10850 params, probation served (5≥5), tenure 0/5",
+        );
+        assert_eq!(
+            tail,
+            " · age 5 · trained 5/5 clocks · 10850 params, probation served (5≥5), tenure 0/5"
+        );
+        assert!(!tail.contains('\n'), "the seat line stays one log line: {tail}");
+        // Empty detail adds nothing — no dangling separator.
+        assert_eq!(detail_inline(""), "");
     }
 
     #[test]

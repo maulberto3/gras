@@ -15,7 +15,10 @@ pub mod supervised;
 #[cfg(test)]
 pub use supervised::TabularTrainer;
 
-pub use challenge::{ChallengeDecay, challenge_fires, effective_challenge_prob};
+pub use challenge::{
+    ChallengeDecay, ChallengePolicy, ForcedAction, challenge_fires, effective_challenge_prob,
+    forced_action, least_action,
+};
 pub use core::{
     AnyTrainer, RlContext, RlStep, RlStepMeta, RlStepReport, RunData, StepEnv, StepReport,
     StreamShape, TabularContext, TabularStep, TabularStepReport,
