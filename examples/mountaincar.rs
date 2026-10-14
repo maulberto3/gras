@@ -25,9 +25,38 @@ mod mountaincar_tests;
 
 use fastrand::Rng;
 use gras::prelude::*;
-use gras::utils::race_steps::train_one_step_pred_only;
-
 type Transition = ([f32; 2], usize);
+
+/// One RL train step: forward + `pred`-only loss + backward + optimizer step.
+///
+/// No target tensor: the training signal is built inside the loss closure from
+/// the trajectory this net itself played. Same backward/clip/step skeleton as
+/// the tabular `train_one_step`; seeding stays the caller's job under the
+/// engine's replay contract.
+///
+/// Local to the example on purpose — `pred`-only training is an RL recipe, not
+/// a tabular primitive, and the crate ships contracts rather than recipes (see
+/// AGENTS.md §7). It used to live at `gras::utils::race_steps::…`.
+fn train_one_step_pred_only(
+    net: &mut Network,
+    optimizer: &mut dyn Optimizer,
+    loss_fn: &dyn Fn(&Variable) -> gras::flodl::tensor::Result<Variable>,
+    inputs: &Tensor,
+    grad_clip: f32,
+) -> gras::flodl::tensor::Result<f32> {
+    let x = Variable::new(inputs.clone(), true);
+    let pred = net.forward(&x)?;
+    let loss = loss_fn(&pred)?;
+    let loss_val = loss.item().unwrap_or(0.0) as f32;
+    loss.set_requires_grad(true)?;
+    optimizer.zero_grad();
+    loss.backward()?;
+    if grad_clip > 0.0 {
+        gras::flodl::clip_grad_norm(&net.parameters(), grad_clip as f64)?;
+    }
+    optimizer.step()?;
+    Ok(loss_val)
+}
 
 // ═══════════════════════════════════════════════════════════════════════
 // SECTION 1 — THE ENVIRONMENT (plain Rust; gras never sees it)

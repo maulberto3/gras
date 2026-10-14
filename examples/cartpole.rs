@@ -1,49 +1,79 @@
 //! CartPole — the RL example: pure-Rust env, REINFORCE policy, reported
-//! fitness, post-race guardrail.
-//!
-//! Every knob is a const (Sections 1–2) or a builder line (STEP A). The ONLY
-//! CLI flags are `--pop` and `--max-steps` — they exist for quick smoke runs
-//! (`cargo run --example cartpole -- --pop 4 --max-steps 2`); everything else
-//! is still a const to edit. Add a flag here if a smoke test ever needs one.
-//!
-//! Vocabulary: **match** = one episode, **turn** = one env step.
+//! fitness, post-race guardrail. Vocabulary: match = one episode, turn = one env step.
 
+/// The example's tests, kept in a sibling file so the example reads cleanly.
 #[cfg(test)]
 #[path = "cartpole/tests.rs"]
 mod cartpole_tests;
 
 use fastrand::Rng;
 use gras::prelude::*;
-use gras::utils::race_steps::train_one_step_pred_only;
-
+/// One played turn: the observation, and the action taken from it.
 type Transition = ([f32; 4], usize);
 
-// ═══════════════════════════════════════════════════════════════════════
-// SECTION 1 — THE ENVIRONMENT (plain Rust; gras never sees it)
-// ═══════════════════════════════════════════════════════════════════════
+/// One RL train step: forward + `pred`-only loss + backward + optimizer step.
+/// Local to the example — a recipe, not a crate primitive (AGENTS.md §7).
+fn train_one_step_pred_only(
+    net: &mut Network,
+    optimizer: &mut dyn Optimizer,
+    loss_fn: &dyn Fn(&Variable) -> gras::flodl::tensor::Result<Variable>,
+    inputs: &Tensor,
+    grad_clip: f32,
+) -> gras::flodl::tensor::Result<f32> {
+    let x = Variable::new(inputs.clone(), true);
+    let pred = net.forward(&x)?;
+    let loss = loss_fn(&pred)?;
+    let loss_val = loss.item().unwrap_or(0.0) as f32;
+    loss.set_requires_grad(true)?;
+    optimizer.zero_grad();
+    loss.backward()?;
+    if grad_clip > 0.0 {
+        gras::flodl::clip_grad_norm(&net.parameters(), grad_clip as f64)?;
+    }
+    optimizer.step()?;
+    Ok(loss_val)
+}
+
+// ═══ SECTION 1 — THE ENVIRONMENT (plain Rust) ══════════════════════════
 
 /// CartPole state: [cart_x, cart_v, pole_angle, pole_ang_vel].
 #[derive(Clone, Copy)]
 struct CartPole {
+    /// Cart position (m).
     x: f32,
+    /// Cart velocity (m/s).
     x_dot: f32,
+    /// Pole angle off vertical (rad).
     theta: f32,
+    /// Pole angular velocity (rad/s).
     theta_dot: f32,
 }
 
+/// Gravity (m/s²).
 const GRAVITY: f32 = 9.8;
+/// Cart mass (kg).
 const CART_MASS: f32 = 1.0;
+/// Pole mass (kg).
 const POLE_MASS: f32 = 0.1;
+/// Cart + pole — the denominator in both accelerations.
 const TOTAL_MASS: f32 = CART_MASS + POLE_MASS;
+/// Half the pole's length (m).
 const POLE_HALF_LEN: f32 = 0.5;
+/// Distance from the pivot to the pole's centre of gravity (m).
 const POLEMASS_COG: f32 = POLE_HALF_LEN;
+/// Magnitude of the push the agent applies left or right (N).
 const FORCE_MAG: f32 = 10.0;
+/// Physics timestep (s) — one env step per turn.
 const TAU: f32 = 0.02;
+/// Cart position beyond which the episode fails (±m).
 const X_LIMIT: f32 = 2.4;
+/// Pole angle beyond which the episode fails (±rad, 12°).
 const THETA_LIMIT: f32 = 12.0_f32.to_radians();
+/// Episode cap in turns — also the fitness ceiling (500 = solved).
 const MAX_TURNS_PER_MATCH: usize = 500;
 
 impl CartPole {
+    /// A fresh episode at (x, theta) at rest — the only randomized start.
     fn new(x: f32, theta: f32) -> Self {
         CartPole {
             x,
@@ -53,10 +83,12 @@ impl CartPole {
         }
     }
 
+    /// The agent's input: `[cart_x, cart_v, pole_angle, pole_ang_vel]`.
     fn obs(&self) -> [f32; 4] {
         [self.x, self.x_dot, self.theta, self.theta_dot]
     }
 
+    /// Episode over: the cart left the track or the pole fell past 12°.
     fn failed(&self) -> bool {
         self.x.abs() > X_LIMIT || self.theta.abs() > THETA_LIMIT
     }
@@ -77,50 +109,32 @@ impl CartPole {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// SECTION 2 — THE TRAINER (the gras contract: RlStep — one trait, one block)
-// ═══════════════════════════════════════════════════════════════════════
+// ═══ SECTION 2 — THE TRAINER (the RlStep contract) ═════════════════════
 
-/// The guardrail's holdout games stay on a FIXED seed forever: verdicts have
-/// to be comparable across runs even though each run draws its own race seed.
-const HOLDOUT_SEED: u64 = 2;
+/// The guardrail's games stay on a FIXED seed forever: verdicts have to be
+/// comparable across runs even though each run draws its own race seed.
+const GUARDRAIL_SEED: u64 = 2;
+/// Adam step size for the REINFORCE update.
 const LEARNING_RATE: f32 = 1e-3;
+/// Dropout applied during the training forward pass only.
 const DROPOUT_PROB: f32 = 0.25;
+/// Gradient-norm clip before the optimizer step; 0 disables it.
 const GRAD_CLIP: f32 = 2.0;
+/// Peak probability that a step fires a challenge (forced action).
 const CHALLENGE_PROB: f32 = 0.1;
+/// Challenge decay shape: eff = p × (1 − progress^k).
 const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 
-/// The action head used for **TRAIN matches only** (eval and holdout are
-/// always argmax — fitness must measure the deterministic policy):
-///
-/// * `true` — draw `a_t ~ softmax(logits)` from the match's own rng. This is
-///   the on-policy sampling REINFORCE requires, and the behavior since
-///   commit 500f9ca ("softmax on-policy sampling for RL trainers").
-/// * `false` — `a_t = argmax(logits)`, a deterministic greedy policy. This is
-///   the pre-500f9ca behavior, kept reachable as a toggle because a greedy
-///   policy replays the same trajectory for every match: identical outcomes,
-///   near-zero advantage variance, weights that may never move (the
-///   zero-gradient trap the sampling change fixed).
-///
-/// The REINFORCE update is unaffected either way — it still scores
-/// `log_softmax(pred)` for whichever action was taken; this knob only decides
-/// how that action was chosen.
-const LOG_SOFTMAX_HEAD: bool = true;
-
-/// Pure function of (net_seed, step, match_i) — the replay-determinism
-/// contract for RL resume. The run seed is blended into the net seed by the
-/// caller (`ctx.net_seed ^ ctx.env.run_seed`): net_seed alone would replay
-/// the SAME trajectories in every experiment, which especially matters for
-/// an inherited champion (its blueprint carries the source run's net_seed).
+/// Pure fn of (net_seed, step, match_i) — the replay-determinism contract for
+/// RL resume; the caller blends the run seed in (`ctx.net_seed ^ run_seed`).
 fn episode_start_seed(net_seed: u64, step: usize, match_i: u64) -> u64 {
     net_seed
         ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ match_i.wrapping_mul(0xBF58_476D_1CE4_E5B9)
 }
 
-/// Eval games use run_seed + 1000 (shared across nets, never trained on);
-/// holdout games use HOLDOUT_SEED (fixed forever — guardrail verdicts stay
-/// comparable across experiments).
+/// Eval games use run_seed + 1000 (shared, never trained on); guardrail games
+/// use GUARDRAIL_SEED — fixed forever, so verdicts stay comparable.
 fn shared_start_seed(seed_base: u64, step: usize, match_i: u64) -> u64 {
     episode_start_seed(seed_base, step, match_i)
 }
@@ -133,6 +147,7 @@ fn fitness_from_survivals(survivals: &[usize]) -> f32 {
     survivals.iter().copied().sum::<usize>() as f32 / survivals.len() as f32
 }
 
+/// Mean survival of a random policy — the bar a race has to beat.
 fn random_baseline(matches: usize) -> f64 {
     let mut total = 0.0f64;
     let mut rng = Rng::with_seed(3);
@@ -152,13 +167,13 @@ fn random_baseline(matches: usize) -> f64 {
 }
 
 /// REINFORCE with per-turn credit (G_t = turns − t), batch-mean baseline,
-/// advantages normalized to O(1).
-/// Guardrail story: the measurement half (`holdout_score`) lives on THIS
-/// type via `RlStep` — the engine calls the run's own trainer, so
-/// there is no second scorer object anywhere.
+/// O(1) advantages — and the guardrail scorer, same type (one `RlStep` block).
 struct CartPoleTrainer {
+    /// Device every tensor and match in this trainer runs on.
     device: Device,
+    /// Train matches per step — the learning signal (`MATCHES_PER_STEP`).
     matches_per_step: usize,
+    /// Eval matches per step — the ranking signal (`EVAL_MATCHES_PER_STEP`).
     eval_matches_per_step: usize,
     /// The trainer's own anti-plateau knob (see `CHALLENGE_PROB`). Rolled
     /// inside `train_step` — the engine never sees it.
@@ -166,24 +181,12 @@ struct CartPoleTrainer {
 }
 
 impl CartPoleTrainer {
-    /// `sample = true` draws the action from softmax(logits) using the
-    /// match's OWN rng — the on-policy requirement of REINFORCE. With argmax,
-    /// a deterministic policy replays THE SAME trajectory every match:
-    /// identical outcomes, zero advantage variance, weights that never move
-    /// (the zero-gradient trap — sampling is what gives the update something
-    /// to learn from). Train matches pass `LOG_SOFTMAX_HEAD` (true by default,
-    /// so sampled); `sample = false` is argmax — the eval/holdout setting, and
-    /// the opt-in greedy training mode when `LOG_SOFTMAX_HEAD` is off.
-    /// Fitness must measure the deterministic policy, not a lucky draw, so
-    /// eval/holdout never sample regardless of the toggle.
-    ///
-    /// `forced = Some(action)` plays THAT action on every turn (challenge:
-    /// train matches of a fired step only); overrides sampling entirely.
+    /// Play one match with the greedy head. `forced` plays THAT action on every
+    /// turn — the challenge path, and the example's only exploration.
     fn play_episode(
         &self,
         net: &mut Network,
         start_seed: u64,
-        sample: bool,
         forced: Option<usize>,
     ) -> gras::flodl::tensor::Result<(Vec<Transition>, usize)> {
         let mut rng = Rng::with_seed(start_seed);
@@ -197,24 +200,6 @@ impl CartPoleTrainer {
             let logits = pred.data().to_f32_vec()?;
             let action = match forced {
                 Some(a) => a,
-                None if sample => {
-                    // softmax(logits), drawn from this match's rng. No
-                    // temperature: T = 1 keeps the policy distribution
-                    // honest (T → 0 would re-freeze into argmax).
-                    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
-                    let sum: f32 = exps.iter().sum();
-                    let mut draw = rng.f32() * sum;
-                    let mut picked = exps.len() - 1;
-                    for (j, e) in exps.iter().enumerate() {
-                        draw -= e;
-                        if draw <= 0.0 {
-                            picked = j;
-                            break;
-                        }
-                    }
-                    picked
-                }
                 None => {
                     if logits[1] > logits[0] {
                         1
@@ -271,8 +256,8 @@ impl CartPoleTrainer {
         );
         // x shape: [total, 4], pred shape: [total, 2]
         let pred = net.forward(&x)?;
-        // Compute the log probabilities of the actions.
-        // shape: [total, 2] — log probabilities for each action (0 or 1) for each transition.
+        // The score function ∇log π(a|s) REQUIRES a normalized log-prob: raw logits
+        // (or an argmax indicator) are not a gradient — keep the log_softmax.
         let logp = pred.data().log_softmax(1)?;
         // Mask out the log probabilities of the actions not taken.
         // shape: [total, 2] — mask for the actions taken (1 for taken, 0 for not taken).
@@ -309,11 +294,8 @@ impl CartPoleTrainer {
         )
     }
 
-    /// Score the run's informative metrics on this step's eval survivals.
-    /// RL has no `(pred, target)` batch for the engine to score against, so
-    /// the TRAINER owns the call: the engine only names the history.csv
-    /// column (`set_run_metrics`), exactly like the tabular side where
-    /// `eval_one_step` does this in the trainer.
+    /// Score the run's informative metrics on this step's eval survivals — RL
+    /// has no batch to score against, so the TRAINER owns the call.
     fn score_metrics(
         &self,
         metrics: &[Metric],
@@ -330,6 +312,7 @@ impl CartPoleTrainer {
 }
 
 impl RlStep for CartPoleTrainer {
+    /// Adam over the net's parameters — one optimizer per net, kept across steps.
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
         Box::new(gras::flodl::nn::Adam::new(
             &net.parameters(),
@@ -337,27 +320,19 @@ impl RlStep for CartPoleTrainer {
         ))
     }
 
+    /// The recorded trainer blob — resume diffs it, so a knob change is named.
     fn describe(&self) -> Option<serde_json::Value> {
         Some(serde_json::json!({
             "trainer": "cartpole",
             "env": "CartPole-v1 physics (pure Rust), 500-turn cap",
             "update": "REINFORCE (log_softmax autodiff), baseline + per-turn returns + adv normalization",
-            // Which action head the TRAIN matches ran — a run is only
-            // reproducible if this is recorded alongside the seeds.
-            "action_head": if LOG_SOFTMAX_HEAD {
-                "log_softmax_sample"
-            } else {
-                "argmax"
-            },
             "matches_per_step": self.matches_per_step,
             "eval_matches_per_step": self.eval_matches_per_step,
             "learning_rate": LEARNING_RATE,
             "grad_clip": GRAD_CLIP,
             "dropout_prob": DROPOUT_PROB,
-            // The anti-plateau trigger is TRAINER-owned (the engine no longer
-            // knows challenges exist), so `describe()` is the only place these
-            // knobs are visible — a reader of the log cannot otherwise tell
-            // whether a run ran with challenges at all.
+            // The challenge trigger is TRAINER-owned, so `describe()` is the
+            // only place a reader of the log can see it at all.
             "challenge_prob": self.challenge_prob,
             "challenge_decay": format!(
                 "custom:{CHALLENGE_DECAY_EXPONENT}" // eff = p × (1 − progress^k)
@@ -365,20 +340,20 @@ impl RlStep for CartPoleTrainer {
         }))
     }
 
-    /// Guardrail measurement half (SECTION 3): play ONE fresh holdout game.
-    /// Same units as the reported fitness (survival turns) — ranking and
-    /// holdout agree by construction. The engine calls this through the run's
-    /// own trainer, so `engine.guardrail(device)` is the whole call.
+    /// Guardrail measurement half: play ONE fresh guardrail game, in the same
+    /// units as the reported fitness so ranking and the guardrail agree.
     fn holdout_score(
         &mut self,
         net: &mut Network,
         game_i: usize,
     ) -> gras::flodl::tensor::Result<f32> {
-        let seed = shared_start_seed(HOLDOUT_SEED, 0, game_i as u64);
-        let (_, survival) = self.play_episode(net, seed, false, None)?;
+        let seed = shared_start_seed(GUARDRAIL_SEED, 0, game_i as u64);
+        let (_, survival) = self.play_episode(net, seed, None)?;
         Ok(survival as f32)
     }
 
+    /// One step: play train matches (challenge-aware), REINFORCE-update, then
+    /// measure on shared eval games — the fitness that ranks.
     fn train_step(
         &mut self,
         net: &mut Network,
@@ -386,14 +361,8 @@ impl RlStep for CartPoleTrainer {
         step: usize,
         ctx: &RlContext<'_>,
     ) -> gras::flodl::tensor::Result<RlStepReport> {
-        // Challenge (anti-plateau, TRAINER-side): roll the trigger for this
-        // (net, step) — pure function of (run_seed, net_seed, step), so
-        // catch-up and resume re-fire the identical forces. On a fired step,
-        // draw ONE random action (seeded from (net_seed, step) so replay
-        // re-forces it) and force it on every turn of the TRAIN matches —
-        // the widened trajectory is what the net learns from. A challenge is
-        // just another action the net had to survive; its fitness ranks like
-        // any other. Knob at 0 = never fires.
+        // Anti-plateau challenge: on a fired step, force ONE random action on
+        // every TRAIN turn — a pure fn of (run_seed, net_seed, step).
         let challenged = gras::trainer::challenge_fires(
             ctx.env.run_seed,
             ctx.net_seed,
@@ -412,17 +381,15 @@ impl RlStep for CartPoleTrainer {
             None
         };
 
-        // 1. Train batch: play matches, per-net seeds (exploration diversity).
-        //    The run seed is blended in: an inherited champion keeps its
-        //    source run's net_seed, so without this it would replay the
-        //    source's exact trajectories in every new experiment.
+        // 1. Train batch: per-net seeds, run seed blended in so an inherited
+        //    champion doesn't replay its source run's exact trajectories.
         let mut all_transitions: Vec<Transition> = Vec::new();
         let mut matches: Vec<(usize, usize)> = Vec::with_capacity(self.matches_per_step);
         let mut survivals: Vec<usize> = Vec::with_capacity(self.matches_per_step);
         let traj_seed_base = ctx.net_seed ^ ctx.env.run_seed;
         for match_i in 0..self.matches_per_step {
             let seed = episode_start_seed(traj_seed_base, step, match_i as u64);
-            let (traj, survival) = self.play_episode(net, seed, false, forced)?; // if false, then challenge_prob can enter
+            let (traj, survival) = self.play_episode(net, seed, forced)?;
             let offset = all_transitions.len();
             all_transitions.extend(traj);
             matches.push((offset, survival));
@@ -442,20 +409,15 @@ impl RlStep for CartPoleTrainer {
         }
 
         // 2. REINFORCE update: −Σ adv_t · log P(a_t|s_t), G_t = survival − t,
-        //    batch-mean baseline, adv normalized to O(1) so grad_clip stays
-        //    meaningful. The challenged trajectory feeds the SAME update —
-        //    that widened data is the whole point of the challenge.
+        //    O(1) advantages so grad_clip stays meaningful; challenge data too.
         let train_loss = self.reinforce_update(net, optimizer, &all_transitions, &matches)?;
 
-        // 3. Eval batch: AFTER the update, shared seeds, argmax policy —
-        //    fitness measures what THIS net does on games it didn't train on.
-        //    (Runs on challenged steps too — a challenge is just another
-        //    step, and the eval fitness is what ranks.) The run seed (not a
-        //    hard const) so a new `--seed` re-rolls the eval games too.
+        // 3. Eval batch: AFTER the update, shared seeds, argmax — fitness is
+        //    what THIS net does on games it didn't train on (run-seed-derived).
         let mut eval_survivals: Vec<usize> = Vec::with_capacity(self.eval_matches_per_step);
         for match_i in 0..self.eval_matches_per_step {
             let seed = shared_start_seed(ctx.env.run_seed + 1000, step, match_i as u64);
-            let (_, survival) = self.play_episode(net, seed, false, None)?;
+            let (_, survival) = self.play_episode(net, seed, None)?;
             eval_survivals.push(survival);
         }
 
@@ -476,30 +438,27 @@ impl RlStep for CartPoleTrainer {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// SECTION 3 — THE GUARDRAIL (fresh unseen games, engine-driven)
-// The measurement half (`holdout_score`) lives in the
-// RlStep impl above — the engine calls the run's OWN trainer, so there
-// is no second scorer object to build.
-// ═══════════════════════════════════════════════════════════════════════
-const HOLDOUT_MATCHES: usize = 100;
+// ═══ SECTION 3 — THE GUARDRAIL (fresh unseen games) ════════════════════
+/// Fresh unseen games the champion is re-scored on at stop.
+const GUARDRAIL_MATCHES: usize = 100;
 
-// ═══════════════════════════════════════════════════════════════════════
-// SECTION 4 — main(): config → spec → run → guardrail
-// ═══════════════════════════════════════════════════════════════════════
-// Engine = when/who of racing (STEP A); you = what of learning (Sections
-// 1–2). RunSpec::rl IS the mode declaration; Fitness::reported says "the
-// fitness value comes from my RlStepReport" (computed fitness is rejected
-// at construction: no dataset to score against). rl_race_config_builder()
-// is the RL front door — RlRaceConfig::builder() silently resolves to the
-// shared (Tabular-arm) builder and RL-only setters would panic at build.
+// ═══ SECTION 4 — main(): config → spec → run → guardrail ═══════════════
+
+// RunSpec::rl declares the mode; Fitness::reported takes the value from the
+// report. Use rl_race_config_builder() — RlRaceConfig::builder() is the shared arm.
+
+/// Live nets in the race (default; `--pop` overrides).
 const POP: usize = 100;
+/// Step budget for a full run (default; `--max-steps` overrides).
 const RACE_STEPS: usize = 20;
+/// Train matches each net plays per step — the learning signal.
 const MATCHES_PER_STEP: usize = 1;
+/// Eval matches each net plays per step — the ranking signal. Raising it
+/// resolves fitness more finely and multiplies both turns and step time.
 const EVAL_MATCHES_PER_STEP: usize = 10;
 
-/// The smoke-test CLI: deliberately just two flags. Everything else is a
-/// const above — clap rejects any other flag at the usage line.
+/// The smoke-test CLI: `--pop`, `--max-steps`, `--seed`, `--log-level`.
+/// Everything else is a const above — clap rejects any other flag at the usage line.
 #[derive(clap::Parser, Debug)]
 #[command(
     name = "cartpole",
@@ -512,17 +471,12 @@ struct Cli {
     /// Stop after this many steps (default: the `RACE_STEPS` const).
     #[arg(long, value_name = "N")]
     max_steps: Option<usize>,
-    /// Pin the run seed. Without it the example draws a RANDOM one per launch
-    /// (the engine's reproducibility contract holds for a given seed — the
-    /// example just doesn't force the same seed on every run). Pin it to
-    /// re-run a specific race; the seed is always recorded in `engine.json`,
-    /// so any run is replayable after the fact.
+    /// Pin the run seed (otherwise a fresh random one per launch). The seed is
+    /// always recorded in `engine.json`, so any run stays replayable.
     #[arg(long, value_name = "U64")]
     seed: Option<u64>,
-    /// Log level (default: the `LOG_LEVEL` const). `none` / `summ` / `minimal`
-    /// pick the reporting shape; `debug` / `trace` keep `summ` and additionally
-    /// print the engine's per-roll detail (rolls that did not fire,
-    /// shield-blocked rolls) that the default view hides.
+    /// Log level (default: the `LOG_LEVEL` const). `none`/`summ`/`minimal` pick
+    /// the shape; `debug`/`trace` add the engine's per-roll detail.
     #[arg(
         long,
         value_name = "LEVEL",
@@ -531,7 +485,9 @@ struct Cli {
     log_level: Option<String>,
 }
 
+/// Wire the config → run the race → guardrail the champion; prints the verdict.
 fn main() {
+    // Default reporting shape when `--log-level` is not passed.
     const LOG_LEVEL: LogLevel = LogLevel::Summ;
 
     let cli = <Cli as clap::Parser>::parse();
@@ -548,10 +504,8 @@ fn main() {
         .as_deref()
         .and_then(LogLevel::parse_verbose)
         .unwrap_or((LOG_LEVEL, None));
-    // Install the run's log sinks: the console lines at `log_level` and the
-    // `Minimal` frame. Without this the console stays silent and the run LOOKS
-    // hung while the race grinds. `set_run_trace_file(true)` on the config
-    // below adds `<run_dir>/telemetry.jsonl` — the engine aims that one.
+    // Install the run's log sinks — without this the console stays silent and
+    // the run LOOKS hung while the race grinds.
     gras::engine::logging::init(log_level, log_verbosity);
 
     let device = gras::auto_device();
@@ -568,22 +522,11 @@ fn main() {
         .set_run_smoothing_window(5)
         .set_run_pop_catch_up(false)
         .set_run_checkpoint_every(5)
-        // .set_run_metrics(vec![Metric::custom("eval_survival_min", |survivals, _| {
-        //     let v = survivals.data().to_f32_vec()?;
-        //     Ok(if v.is_empty() {
-        //         0.0
-        //     } else {
-        //         v.iter().copied().fold(f32::INFINITY, f32::min)
-        //     })
-        // })])
+        // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra
+        // history.csv column; `f` gets the eval survivals as a 1-D tensor.
         .set_stop_max_steps(Some(race_steps))
-        // .set_stop_custom(|snap: &RaceSnapshot| {
-        //     snap.best_smoothed_fitness > 400.0
-        // })
-        // .set_pruner_enabled(true)          // … or post-race: cull to elites, solo-train
-        // .set_pruner_method(PopPrunerMethod::Hard)
-        // .set_pruner_steps(10)              // solo-phase length in steps
-        // .set_run_topologies(vec![])        // founder blueprints filling slots first
+        // .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
+        // .set_pruner_{enabled,method,steps}(..) · .set_run_topologies(vec![])
         .set_run_seed_previous(true)
         // .set_run_seed_previous_dir("assets/1790920031289_500")
         // .set_topology_seed(7)              // pin the topology-draw RNG (else run_seed-derived)
@@ -615,41 +558,20 @@ fn main() {
         .set_topology_combine_op_pool([
             "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
         ])
-        // .set_topology_activation_pool([
-        //     "Identity",
-        //     "ReLU",
-        //     "GeLU",
-        //     "SiLU",
-        //     "SELU",
-        //     "Tanh",
-        //     "Sigmoid",
-        //     "Mish",
-        //     "LeakyReLU",
-        //     "ELU",
-        //     "GeluTanh",
-        //     "Softplus",
-        //     "HardSwish",
-        //     "HardSigmoid",
-        //     "Sin",
-        //     "Cos",
-        //     "Softmax",
-        //     "LogSoftmax",
-        //     ])
-        // .set_topology_standardize_op_pool(["Identity", "LayerNorm", "RmsNorm", "InstanceNorm"])
+        // .set_topology_activation_pool(["ReLU", "Tanh", …]) — evolve activations
+        // .set_topology_standardize_op_pool(["LayerNorm", …]) — per-node norm ops
         .set_elite_freeze(true)
         .set_elite_count(pop / 20)
         .set_elite_join_probation_steps(5)
         .set_elite_crown_lifetime_steps(5)
         .set_elite_save_topology(true)
-        // Save the champion's weights for LATER reuse by tools (`export_champion`,
-        // a `--score-only` re-check). NOT needed to certify this run: the guardrail
-        // scores the live in-memory champion, so a run with this off still records
-        // a `guardrail` verdict and is still inheritable by `set_run_seed_previous`.
+        // Champion weights for later tools (`export_champion`); not needed to
+        // certify this run — the guardrail scores the live in-memory champion.
         .set_elite_save_safetensors(false)
         .set_elite_checkpoint_weights(false)
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(false)
-        .set_elite_guardrail_matches(HOLDOUT_MATCHES)
+        .set_elite_guardrail_matches(GUARDRAIL_MATCHES)
         // .set_checkpoint_elite_weights(true) // per-checkpoint elite weight snapshot ???
         .build();
 
@@ -680,14 +602,8 @@ fn main() {
         }
     );
 
-    // SHOWCASE — what `set_run_seed_previous(true)` above actually inherited.
-    // The receipt is `engine.json` → `run_topology_source`, written at
-    // construction: it names the source run, the certified champion that took
-    // slot 0, and every elite reinstated behind it (`elite_hashes`, ranked) —
-    // and it is exactly what the NEXT run reads when it seeds from THIS one
-    // (chains work for free). `None` = nothing was inheritable (no prior run,
-    // an incompatible one, or one with no guardrail champion recorded) — the
-    // engine printed why, and the population is all-random.
+    // SHOWCASE — the inheritance receipt (`engine.json` →
+    // `run_topology_source`); `None` means nothing was inheritable.
     match gras::state::load_engine_json(engine.run_dir())
         .ok()
         .and_then(|h| h.run_topology_source)
@@ -726,24 +642,13 @@ fn main() {
         Err(e) => eprintln!("race error: {e}"),
     }
 
-    // STEP D — guardrail: HOLDOUT_MATCHES FRESH games (HOLDOUT_SEED, seen by
-    // no step) — per-step fitness ranks nets against each other; this asks the
-    // absolute question (is the champion actually good? see
-    // CARTPOLE_EXPERIMENTS.md for the false-SOLVED verdict that motivated it).
-    // The run's OWN trainer scores the holdout (holdout_score above), and the
-    // count comes from the config's `set_elite_guardrail_matches`. The champion
-    // is scored from the LIVE population (no weight file required) and the
-    // verdict is recorded in `engine.json`; `None` means no champion was ranked
-    // at all — the honest skip, not an error.
+    // STEP D — guardrail: GUARDRAIL_MATCHES fresh games the run never trained
+    // on, scored from the LIVE champion; the verdict lands in `engine.json`.
     match engine.guardrail(device) {
         Some(v) => {
             let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
-            // The race side carries its own error bar (and how many step
-            // readings are behind it) — printed next to the holdout's because
-            // the two decide together whether a gap is a collapse or noise: a
-            // 5-step window whose readings swing 40..500 cannot resolve better
-            // than ±80, so a holdout well below its mean is expected, not
-            // damning. The engine's own info line states the verdict in words.
+            // The race side carries its own error bar — a swinging window can't
+            // resolve better than ±80, so a holdout below its mean isn't damning.
             let smoothed_note = match v.race_smoothed {
                 Some(s) => match v.race_se {
                     Some(se) if v.race_samples > 0 => format!(

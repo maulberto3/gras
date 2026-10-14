@@ -85,28 +85,46 @@ its **rebuild path**, and that path must be exercised end-to-end on a net with
 mixed dims (i.e. with bridges). Both are now covered by tests, and
 `load_safetensors` refuses partial files rather than half-applying them.
 
-## The action head — sampling vs argmax training (toggle kept)
+## The action head — greedy everywhere, the challenge is the exploration
 
-Before commit `500f9ca` ("softmax on-policy sampling for RL trainers"),
-**every** match — train included — used the greedy action `argmax(logits)`.
-That commit made train matches draw `a_t ~ softmax(logits)` and left eval /
-holdout on argmax; the reason in its message was the **zero-gradient trap**: a
-deterministic policy replays the same trajectory for every match, so the
-advantages carry ~no variance and the weights never move.
+Every match plays `argmax(logits)` — train, eval and guardrail — and the only
+exploration is the **challenge**: on a fired step one random action is forced
+down every TRAIN match (`CHALLENGE_PROB`, decaying with run progress). The head
+is no longer a knob and `describe()` no longer records one.
 
-The greedy mode is reachable again through one const — `LOG_SOFTMAX_HEAD` in
-`examples/cartpole.rs` (default `true` = sampled, the current behavior):
+Selection and scoring are separate concerns, and only the first changed. The
+loss still scores `log_softmax(pred)` of the action that was taken, because
+REINFORCE's score function `∇log π(a|s)` only exists for a *normalized*
+log-probability — a greedy rollout scored with raw logits (or an argmax
+indicator) is not a gradient at all. What was deleted is the action **draw**,
+never the softmax.
 
-| `LOG_SOFTMAX_HEAD` | train action | eval / holdout | notes |
-|---|---|---|---|
-| `true` (default) | `a_t ~ softmax(logits)` | argmax | on-policy REINFORCE; keeps trajectory variance |
-| `false` | `argmax(logits)` | argmax | the pre-500f9ca behavior; expect a frozen, low-variance batch |
+History, kept because it was measured: before commit `500f9ca` every match was
+already greedy; that commit made train matches draw `a_t ~ softmax(logits)` so
+the update saw the policy's own sampling noise; on 2026-10-13 the draw was
+deleted again — the operator's read was that the challenge already supplies the
+exploration, and the sampled path was the one that made a pop-100 run take
+substantially longer per step. That cost was never attributed and the question
+went with the code: the branch contained **no `log_softmax`** (a hand-rolled
+softmax over two `f32` logits — an `exp`, a sum, one `fastrand` draw), while the
+`log_softmax` in `reinforce_update` runs either way. Suspicion is episode
+length: a stochastic rollout survives longer, so a step plays more turns — and
+step time tracks turns played with `ms/turn` flat, exactly as the eval-side A/B
+showed (`EVAL_MATCHES_PER_STEP` 2 → 10 at fixed binary/seed/pop: matches ×3.67,
+turns ×3.6, step time ×3.35, `ms/turn` ~1.0).
 
-The toggle changes **action selection only**. `reinforce_update` still scores
-`log_softmax(pred)` of the taken action — REINFORCE needs `log P(a|s)` no
-matter how `a` was chosen. `describe()` records the choice as `action_head`, so
-a saved run says which mode produced it. Eval and holdout never sample: fitness
-must measure the deterministic policy, not a lucky draw.
+That same effect is why a cross-run baseline must pin that const first: the
+Oct-11 runs recorded `eval_matches_per_step: 2`, the tree now uses 10, so "the
+same 3 steps" was never the same amount of work.
+
+What the greedy head gives up: the net can only be reinforced for the action it
+already prefers, so it cannot discover a counter-steering move it never picks,
+and once the logits separate, the policy sits at the argmax boundary. The update
+still moves — the score function is evaluated at the chosen action and the
+advantages vary with survival — so this is a narrower signal, not a zero
+gradient. Restoring the sampled head means putting the rng draw back in
+`play_episode`; the test that pinned it (sampled ≠ greedy at a fixed seed) went
+with it.
 
 ## What survived into the codebase
 

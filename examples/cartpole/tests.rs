@@ -1,19 +1,14 @@
-//! CartPole example tests — run with `cargo test --example cartpole`.
-//!
-//! Kept out of cartpole.rs so the example itself reads as the user-facing
-//! walkthrough (sections 1–4). Pure checks of the example's own logic:
-//! reward shaping, seed namespaces, the learning loop.
+//! CartPole example tests — run with `cargo test --example cartpole`. Kept out
+//! of cartpole.rs so the example reads as the walkthrough; checks its logic.
 
 // This file is `mod cartpole_tests` INSIDE cartpole.rs — `crate::*` is the
 // example's root, so every item there is directly visible.
-
 #[cfg(test)]
 mod tests {
     use crate::*;
 
-    /// The example draws a RANDOM run seed per launch (so consecutive runs
-    /// differ); the namespace checks below only need SOME seed to compare
-    /// against, so they pin one.
+    /// The example draws a RANDOM run seed per launch; the namespace checks
+    /// below only need SOME seed to compare against, so they pin one.
     const RUN_SEED: u64 = 42;
 
     /// fitness_from_survivals is MEAN-of-batch: every match counts, one
@@ -30,9 +25,8 @@ mod tests {
         );
     }
 
-    /// Per-timestep credit sign: G_t = survival − t is strictly positive
-    /// for every action in a completed match and strictly decreasing —
-    /// early actions earn more (they enabled the rest).
+    /// Per-timestep credit: G_t = survival − t is positive for every action in
+    /// a completed match and strictly decreasing — early actions earn more.
     #[test]
     fn credit_assignment_sign() {
         let survival = 10usize;
@@ -55,11 +49,8 @@ mod tests {
         assert_ne!(a, episode_start_seed(43, 3, 1));
     }
 
-    /// Eval games must be DISJOINT from train games — the honesty
-    /// guarantee. The eval namespace starts at RUN_SEED + 1000 (see
-    /// train_step); every eval seed differs from every train seed at the
-    /// same step, and the derivation stays a pure function of seeds
-    /// (replay parity).
+    /// Eval games must be DISJOINT from train games (namespace RUN_SEED + 1000),
+    /// and the derivation stays a pure function of seeds (replay parity).
     #[test]
     fn eval_batch_disjoint_from_train_batch() {
         let (net_seed, step) = (42u64, 3usize);
@@ -72,10 +63,8 @@ mod tests {
         }
     }
 
-    /// PAIRED COMPARISON: all nets are measured on the IDENTICAL eval games
-    /// per step — the eval derivation never mixes a net_seed in. Train
-    /// batches stay per-net (exploration diversity). This is what makes
-    /// start-state luck common-mode and cancel in the ranking.
+    /// PAIRED COMPARISON: all nets are measured on the IDENTICAL eval games —
+    /// the eval derivation never takes a net_seed, so start-state luck cancels.
     #[test]
     fn eval_batch_shared_across_nets() {
         let step = 7usize;
@@ -88,13 +77,12 @@ mod tests {
         }
     }
 
-    /// The guardrail seed namespace (HOLDOUT_SEED) is disjoint from both
-    /// the train namespace (any net_seed) and the eval namespace
-    /// (RUN_SEED + 1000) — fresh games, seen by no race step.
+    /// The guardrail namespace (GUARDRAIL_SEED) is disjoint from both the train
+    /// namespace (any net_seed) and the eval one (RUN_SEED + 1000): fresh games.
     #[test]
-    fn holdout_namespace_is_fresh() {
+    fn guardrail_namespace_is_fresh() {
         for game_i in 0..8u64 {
-            let holdout = episode_start_seed(HOLDOUT_SEED, 0, game_i);
+            let holdout = episode_start_seed(GUARDRAIL_SEED, 0, game_i);
             assert_ne!(holdout, episode_start_seed(RUN_SEED + 1000, 0, game_i));
             for net_seed in [42u64, 111, 999] {
                 assert_ne!(holdout, episode_start_seed(net_seed, 0, game_i));
@@ -102,9 +90,8 @@ mod tests {
         }
     }
 
-    /// The challenge forced-action draw is a pure function of
-    /// (net_seed, step): replay re-forces the identical action, so a
-    /// challenged step is bit-exact.
+    /// The challenge forced-action draw is a pure fn of (net_seed, step): replay
+    /// re-forces the identical action, so a challenged step is bit-exact.
     #[test]
     fn challenge_action_draw_is_replay_stable() {
         let draw = |net_seed: u64, step: usize| {
@@ -123,9 +110,8 @@ mod tests {
         assert_eq!(draws.len(), 2, "draw must hit both actions over 16 steps");
     }
 
-    /// The informative metric is scored by the TRAINER (RL has no
-    /// (pred, target) batch): the closure sees the eval survivals as a 1-D
-    /// tensor, and no configured metrics means no extra columns.
+    /// The informative metric is scored by the TRAINER (RL has no (pred, target)
+    /// batch): the closure sees the eval survivals as a 1-D tensor.
     #[test]
     fn trainer_scores_informative_metrics() -> gras::flodl::tensor::Result<()> {
         let trainer = CartPoleTrainer {
@@ -236,12 +222,8 @@ mod tests {
         Ok(())
     }
 
-    /// The `LOG_SOFTMAX_HEAD` toggle is a real branch, not a dead const: with
-    /// `sample = false` the TRAIN matches play the greedy action, so every
-    /// recorded action equals `argmax(net logits)` at that observation — the
-    /// deterministic policy the pre-500f9ca trainer used. The RNG-drawn head
-    /// must NOT reduce to that: somewhere across a batch its action sequence
-    /// has to differ from the greedy one, or the toggle changes nothing.
+    /// One head: `argmax(logits)`, deterministic and replay-safe. `forced` (the
+    /// challenge) overrides it on every turn, and that trajectory replays too.
     #[test]
     fn argmax_head_plays_greedy_actions() -> gras::flodl::tensor::Result<()> {
         let device = gras::auto_device();
@@ -262,7 +244,7 @@ mod tests {
 
         // Greedy head: every action is argmax of the net's own logits.
         let seed = episode_start_seed(1234, 0, 0);
-        let (greedy_traj, _) = trainer.play_episode(&mut net, seed, false, None)?;
+        let (greedy_traj, _) = trainer.play_episode(&mut net, seed, None)?;
         assert!(!greedy_traj.is_empty(), "the greedy policy must play turns");
         for (obs, action) in &greedy_traj {
             let x = Tensor::from_f32(obs, &[1, 4], device)?;
@@ -272,7 +254,7 @@ mod tests {
             assert_eq!(*action, greedy, "argmax head played a non-greedy action");
         }
         // Same seed ⇒ same greedy trajectory (the branch is replay-safe).
-        let (again, _) = trainer.play_episode(&mut net, seed, false, None)?;
+        let (again, _) = trainer.play_episode(&mut net, seed, None)?;
         let seq = |traj: &Vec<Transition>| traj.iter().map(|(_, a)| *a).collect::<Vec<_>>();
         assert_eq!(
             seq(&greedy_traj),
@@ -280,22 +262,19 @@ mod tests {
             "greedy replay must be exact"
         );
 
-        // Sampled head: not greedy everywhere — otherwise the toggle is inert.
-        // Compare at the SAME seed, so the two branches share one start state
-        // and the only difference can be the action choice itself.
-        let mut differs = false;
-        for match_i in 0..8u64 {
-            let seed = episode_start_seed(1234, 0, match_i);
-            let (greedy, _) = trainer.play_episode(&mut net, seed, false, None)?;
-            let (sampled, _) = trainer.play_episode(&mut net, seed, true, None)?;
-            if seq(&sampled) != seq(&greedy) {
-                differs = true;
-                break;
-            }
-        }
+        // The challenge path: `forced` overrides the head on EVERY turn, and it
+        // replays exactly under its seed.
+        let forced = 1 - greedy_traj[0].1;
+        let (forced_traj, _) = trainer.play_episode(&mut net, seed, Some(forced))?;
         assert!(
-            differs,
-            "sampled head never differed from greedy — the toggle would be inert"
+            forced_traj.iter().all(|(_, a)| *a == forced),
+            "a challenge must force its action on every turn"
+        );
+        let (forced_again, _) = trainer.play_episode(&mut net, seed, Some(forced))?;
+        assert_eq!(
+            seq(&forced_traj),
+            seq(&forced_again),
+            "a forced trajectory must replay exactly"
         );
         Ok(())
     }
