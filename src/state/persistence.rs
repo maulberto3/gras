@@ -27,19 +27,17 @@ use crate::utils::seed::topo_hash;
 // ── Run header (engine.json) ───────────────────────────────────────────────
 
 /// The run's **complete** configuration, serialized into `engine.json` under
-/// `"config"`.
-///
-/// `engine.json` is the single source of truth for a run's settings: every knob
-/// that can change the trajectory is recorded here, so the file alone is enough
-/// to reproduce the run — no parallel `options.csv` is written. To add a knob,
-/// add it to this struct and to [`ConfigSnapshot::from_config`].
+/// `"config"` — the single source of truth; the file alone reproduces the run.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ConfigSnapshot {
     /// Population size the race held constant.
     pub pop_size: usize,
+    /// Steps between population checkpoints.
     pub checkpoint_every: usize,
+    /// Crossover rolls offered per step.
     pub crossover_rolls: usize,
+    /// Mutation (immigrant) rolls offered per step.
     pub mutate_rolls: usize,
     /// Checkpoint gate strictness (`"hard"` | `"soft"`).
     pub crossover_gate: String,
@@ -55,11 +53,12 @@ pub struct ConfigSnapshot {
     pub elite_count: usize,
     /// Crossover operator pool (`"one_point"`/`"uniform"`); empty ⇒ both.
     pub crossover_ops_pool: Vec<String>,
+    /// Probability a crossover roll fires.
     pub crossover_prob: f32,
+    /// Probability a mutation roll fires.
     pub mutate_prob: f32,
-    /// Stop budget as configured (`None` = no limit). Duplicated at
-    /// the header root for readers that want the stop criterion without
-    /// opening `config`; this copy is the authoritative one.
+        /// Stop budget as configured (`None` = no limit). Duplicated at the header root;
+        /// this copy is authoritative.
     #[serde(default)]
     pub max_steps: Option<usize>,
     /// Whether a pluggable `custom_stop` closure was installed. The closure is
@@ -74,13 +73,10 @@ pub struct ConfigSnapshot {
     /// Problem-space target (`"tabular"` | `"onecimage"` | `"threecimage"` |
     /// `"nlp"` | `"rl"`).
     pub mode: String,
-    /// Effective shared-stream geometry — after the trainer's `stream_shape()`
-    /// override, i.e. the shape the run actually used. `None` in modes with no
-    /// shared stream (RL): there is no stream and no eval batch to describe,
-    /// and the trainer owns the per-step volume (`matches_per_step`, …),
-    /// recorded in `engine.json` → `"trainer"`. Tabular defaults must never be
-    /// stamped into a run that never draws a batch.
+        /// Effective shared-stream geometry after the trainer's `stream_shape()` override.
+        /// `None` in modes with no shared stream (RL).
     pub batch_size: Option<usize>,
+    /// Effective eval batch size (`None` when the mode has no shared stream).
     pub eval_batch_size: Option<usize>,
     /// Per-net fitness smoothing window (K).
     pub smoothing_window: usize,
@@ -95,78 +91,55 @@ pub struct ConfigSnapshot {
     /// Human label for the experiment (`set_run_name`), verbatim. Purely
     /// informative — never affects the results folder name.
     pub run_name: Option<String>,
-    /// Anti-devolution A (`set_elite_freeze`): top-k nets skip the trainer
-    /// call. Changes WHICH nets train during a replay, so it must match on
-    /// resume — record it.
+        /// Anti-devolution A (`set_elite_freeze`): top-k nets skip the trainer call.
+        /// Replay-relevant, so it must match on resume.
     #[serde(default)]
     pub freeze_elites: bool,
-    /// Mutation catch-up toggle (`set_mutation_catch_up`, engine.json key
-    /// kept as `fresh_immigrants`): `true` = immigrants replay catch-up.
-    /// Replay-relevant — a resumed run must use the same insertion semantics
-    /// or the replayed population diverges. Reads the active mode arm
-    /// (tabular and RL each carry their own copy).
+        /// Mutation catch-up toggle (engine.json key `fresh_immigrants`): `true` = immigrants
+        /// replay catch-up. Replay-relevant.
     #[serde(default = "default_false")]
     pub fresh_immigrants: bool,
-    /// Crossover catch-up toggle (`set_crossover_catch_up`): `false` = a
-    /// crossover child skips replay AND the checkpoint gate. Replay-relevant
-    /// for the same reason as `fresh_immigrants`.
+        /// Crossover catch-up toggle: `false` = a crossover child skips replay AND the
+        /// checkpoint gate. Replay-relevant.
     #[serde(default = "default_true")]
     pub crossover_catch_up: bool,
-    /// How many of the initial population slots were user-supplied run
-    /// topologies (the founding batch) (`set_run_topologies`). Informational (lineage reads:
-    /// ordinals `< run_topology_count` are imports, the rest are random draws).
+        /// How many initial slots were user-supplied run topologies. Informational (lineage
+        /// reads: ordinals below this are imports).
     #[serde(default)]
     pub run_topology_count: usize,
-    /// Per-checkpoint elite weight snapshot flag
-    /// (`set_elite_checkpoint_weights`). Informational — describes artifact
-    /// cadence, not replay semantics.
+        /// Per-checkpoint elite weight snapshot flag. Informational — describes artifact
+        /// cadence, not replay semantics.
     #[serde(default = "default_true")]
     pub elite_checkpoint_weights: bool,
-    /// Mutation probation steps (`set_mutation_probation_steps`):
-    /// cull-immunity for a random immigrant's first k clocks. Replay-relevant
-    /// — it changes WHICH nets get culled, so a resumed run must use the same
-    /// window.
+        /// Mutation probation steps: cull-immunity for an immigrant's first k clocks.
+        /// Replay-relevant.
     #[serde(default)]
     pub mutation_probation_steps: usize,
-    /// Crossover probation steps (`set_crossover_probation_steps`):
-    /// cull-immunity for a crossover child's first k clocks. Replay-relevant —
-    /// it changes WHICH nets get culled, so a resumed run must use the same
-    /// window.
+        /// Crossover probation steps: cull-immunity for a crossover child's first k clocks.
+        /// Replay-relevant.
     #[serde(default)]
     pub crossover_probation_steps: usize,
-    /// Elite join probation steps (`set_elite_join_probation_steps`):
-    /// cull-immunity for a random immigrant's first k clocks. Replay-relevant
-    /// — it changes WHO freezes and WHO is guarded, hence who trains, so a
-    /// resumed run must use the same window.
+        /// Elite join probation steps: clocks a fresh net must train before it may hold a
+        /// seat. Replay-relevant.
     #[serde(default)]
     pub elite_join_probation_steps: usize,
-    /// Elite crown lifetime steps (`set_elite_crown_lifetime_steps`):
-    /// a net on the crown is culled out of the crown after k clocks at peak,
-    /// so a long-lived best net does not monopolize the frozen state. A net
-    /// that ages out of the crown is still a live net and still ranks
-    /// normally. Replay-relevant — it changes WHO freezes and WHO is guarded,
-    /// hence who trains, so a resumed run must use the same window.
+        /// Elite crown lifetime steps: a net on the crown is culled out of it after k clocks
+        /// at peak (`0` disables). Replay-relevant.
     #[serde(default)]
     pub elite_crown_lifetime_steps: usize,
-    /// Fresh holdout games the post-race guardrail plays
-    /// (`set_elite_guardrail_matches`). Diagnostic — it describes the verdict's
-    /// sample size, not replay semantics, so a change needs no resume guard.
+        /// Fresh holdout games the post-race guardrail plays. Diagnostic — no resume guard.
     #[serde(default = "default_guardrail_matches")]
     pub guardrail_matches: usize,
-    /// Seed the population from a PREVIOUS experiment's guardrail champion
-    /// (`set_run_seed_previous`). Recorded for the same reason
-    /// `run_topology_count` is: it decides what the founder batch IS, so a
-    /// reader can tell where slot 0 came from. Default false.
+        /// Seed the population from a previous experiment's champion. Recorded because it
+        /// decides what the founder batch IS. Default false.
     #[serde(default)]
     pub seed_previous_run: bool,
-    /// Where that previous experiment is looked up
-    /// (`set_run_seed_previous_dir`): a run dir, or a directory of run dirs
-    /// (newest run id wins). `None` ⇒ the default root `results/`.
+        /// Where that previous experiment is looked up: a run dir or a dir of run dirs
+        /// (newest wins). `None` ⇒ `results/`.
     #[serde(default)]
     pub seed_previous_run_dir: Option<String>,
-    /// One-line identity of the binary that produced the run (`gras` version,
-    /// profile, exe path, build time). Diagnostics only — lets a reader tell
-    /// a stale-process artifact from a logic bug.
+        /// One-line identity of the binary that produced the run (version, profile, exe
+        /// path, build time). Diagnostics only.
     #[serde(default)]
     pub build: String,
 }
@@ -231,47 +204,30 @@ impl ConfigSnapshot {
     }
 }
 
-/// The post-race guardrail's record of the run's certified champion.
-///
-/// This is the ONE field of `engine.json` that is **not** launch
-/// configuration: the guardrail runs after the race, and its verdict is a run
-/// OUTPUT — arguably the strongest one, since it is the only reading taken on
-/// games no net ever trained on. `CoreEngine::guardrail` stamps it back into
-/// `engine.json` (and `refresh_header`/resume preserve it).
-///
-/// It is what makes seeding possible: `RaceConfig::seed_previous_run` reads
-/// exactly this block to carry the champion's TOPOLOGY into the next
-/// experiment.
+/// The post-race guardrail's record of the run's certified champion — the one field
+/// of `engine.json` that is not launch config, and what makes seeding possible.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GuardrailRecord {
     /// Full hash of the champion that was scored.
     pub champion_hash: String,
-    /// Trainable parameter count of that net (elements). The tie-break key:
-    /// on equal smoothed race fitness the SMALLEST champion is scored and
-    /// recorded.
+        /// Trainable parameter count of that net (elements) — the tie-break key: on equal
+        /// fitness the SMALLEST champion is scored and recorded.
     #[serde(default)]
     pub champion_params: Option<i64>,
     /// The champion's smoothed race fitness — the reference the holdout
     /// reading is compared against. `None` if the run recorded no verdict.
     #[serde(default)]
     pub race_smoothed: Option<f32>,
-    /// Standard error of `race_smoothed` (`window std / √n`) — the race
-    /// reading's own error bar, recorded because it is the number that decides
-    /// whether a gap against the holdout means anything. `None` when the scoring
-    /// path could not see the champion's rolling window (saved-run scoring),
-    /// which is exactly what makes the recorded verdict fall back to the flat
-    /// rule.
+        /// Standard error of `race_smoothed`; `None` when the scoring path could not see the
+        /// champion's rolling window (saved-run scoring).
     #[serde(default)]
     pub race_se: Option<f32>,
     /// Step readings behind `race_smoothed` (the smoothing window's length).
     /// `0` = unknown; `1` means the spread could not be observed at all.
     #[serde(default)]
     pub race_samples: usize,
-    /// The champion's MOST RECENT step reading. The smoothed reference LAGS it
-    /// by up to the window length, and across 85 recorded runs this single value
-    /// predicted the holdout mean better than the window mean did (mean absolute
-    /// error 34.6 vs 44.7 turns) — which is why the verdict quotes both when
-    /// they disagree.
+        /// The champion's MOST RECENT step reading; the smoothed reference lags it by up to
+        /// the window length, so the verdict quotes both when they disagree.
     #[serde(default)]
     pub race_latest: Option<f32>,
     /// Mean holdout score over the games that actually produced one.
@@ -284,20 +240,14 @@ pub struct GuardrailRecord {
     /// be less than `config.guardrail_matches`).
     #[serde(default)]
     pub matches_scored: usize,
-    /// Unit-free agreement between the race reading and the holdout
-    /// ([`crate::engine::guardrail::agreement_verdict_noisy`]): which reading to
-    /// trust and why, in plain words. Informational — the task-specific wording
-    /// stays in the example's own print.
+        /// Unit-free agreement between the race reading and the holdout — which reading to
+        /// trust and why. Informational.
     #[serde(default)]
     pub verdict: String,
 }
 
-/// Which previous experiment this run's founder batch was seeded from
-/// (`RaceConfig::seed_previous_run`) — the run's inheritance receipt.
-///
-/// Informational (the copied topology is recorded per net like any founder);
-/// it exists so a reader can answer "where did these founders come from?"
-/// without diffing populations.
+/// Which previous experiment this run's founder batch was seeded from — the inheritance
+/// receipt (informational; the copied topology is recorded per net like any founder).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SeedSourceRecord {
     /// The source run's id (its `results/<id>` directory name).
@@ -312,36 +262,24 @@ pub struct SeedSourceRecord {
     /// Its holdout mean, carried for readability (the champion's pedigree).
     #[serde(default)]
     pub guardrail_mean: Option<f32>,
-    /// Every elite that was reinstated here, ranked (best first, `[0]` ==
-    /// `champion_hash`). A run that inherited only the certified champion —
-    /// the source predates `elites.json` — carries exactly one entry.
-    /// Empty on a run that inherited nothing.
+        /// Every elite reinstated here, ranked (best first, `[0]` == `champion_hash`);
+        /// one entry when the source predates `elites.json`, empty if nothing inherited.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub elite_hashes: Vec<String>,
 }
 
-/// The reproducible run header, serialized as `engine.json` in the run dir.
-///
-/// This is the "who are we, what rules are we running under" snapshot. It is
-/// overwritten whenever the config that affects reproducibility changes — it
-/// does **not** accumulate history. The live population lives in
-/// `nets/<hash>.json` files, not here. The one exception is the post-race
-/// [`GuardrailRecord`], stamped in after the race and preserved by every
-/// header rewrite.
+/// The reproducible run header, serialized as `engine.json`. Overwritten when the
+/// reproducibility-affecting config changes; the post-race guardrail record is preserved.
 #[derive(Clone, Debug, Serialize)]
 pub struct RunHeader {
     /// User-visible run id (directory name or CLI-chosen label).
     pub run_id: String,
-    /// Mode discriminator (engine split, TODO.md step 6): `"tabular"` | `"rl"`.
-    /// Sits at the header ROOT so a reader picks the engine before touching
-    /// `config`. Written by both engines at construction and at every stop;
-    /// legacy shared-shape headers have it ABSENT — `from_json` then derives
-    /// it from `config.mode` (one-generation migration).
+        /// Mode discriminator (`"tabular"` | `"rl"`) at the header ROOT; legacy headers
+        /// lack it and `from_json` derives it from `config.mode`.
     #[serde(default)]
     pub engine_mode: Option<String>,
-    /// Single deterministic root for the whole run. When the user passes
-    /// `--seed N` this is that N; when no seed is given the engine generates
-    /// one and records it here so an interrupted run can be resumed exactly.
+        /// Single deterministic root for the whole run; generated and recorded when no seed
+        /// is given, so an interrupted run can be resumed exactly.
     pub run_seed: u64,
     /// Fitness label used for ranking (e.g. `"f1"`, `"cross_entropy"`).
     pub fitness_label: FitnessLabel,
@@ -350,62 +288,58 @@ pub struct RunHeader {
     /// Dataset dims the run was launched with (informational; the stream
     /// derives its pool from the actual dataset on disk).
     pub input_dim: usize,
+    /// Output dimension the run was built for.
     pub output_dim: usize,
     /// Topology template + GP-pool knobs the run was launched with.
     pub topology_options: TopologyOptions,
     /// Hidden-dim sampling range.
     pub hidden_dim_pool: String,
+    /// Hidden-dim stride used when sampling.
     pub hidden_dim_stride: usize,
     /// Combine/activation/standardize pools actually used by the run.
     pub combine_op_pool: Vec<String>,
+    /// Activation pool the run drew from.
     pub activation_pool: Vec<String>,
+    /// Standardize-op pool the run drew from.
     pub standardize_op_pool: Vec<String>,
-    /// Informative (non-ranking) metrics configured for the run, if any.
-    /// Their labels determine the extra columns a reader may expect in a
-    /// per-net metrics snapshot.
+        /// Informative (non-ranking) metrics configured for the run; their labels determine
+        /// the extra per-net metric columns.
     pub informative_metrics: Vec<String>,
-    /// Stop criteria / budgets configured for the run. The scheduler honors
-    /// them at runtime and `config` carries the authoritative copy of both;
-    /// the stopped-by fact itself is in `history.csv` / the stop banner.
+        /// Stop criteria / budgets. The scheduler honors them and `config` carries the
+        /// authoritative copy; the stopped-by fact is in `history.csv` / the stop banner.
     pub max_steps: Option<usize>,
     /// When the run was started (wall clock), for human-readability.
     pub started_at: Option<String>,
+    /// Train/eval split ratio recorded for the run.
     pub train_eval_split_ratio: Option<f32>,
+    /// Explicit held-out eval row count, when configured.
     pub held_out_eval_rows: Option<usize>,
-    /// Cumulative culls recorded at the last stop. Restored on resume so a
-    /// resumed run continues the ORIGINAL cull budget instead of a fresh one.
-    /// `0` on legacy engine.json files (written before this existed).
+        /// Cumulative culls at the last stop — restored on resume so the cull budget
+        /// continues. `0` on legacy files.
     #[serde(default)]
     pub culls: usize,
-    /// Wall-clock seconds the run had accumulated at the last stop. Restored
-    /// on resume as the base offset, so `elapsed_seconds` keeps counting the
-    /// run's true age across stop/resume cycles. `0` on legacy files.
+        /// Accumulated wall-clock seconds at the last stop — restored on resume as the base
+        /// offset. `0` on legacy files.
     #[serde(default)]
     pub run_elapsed_secs: u64,
     /// Children born per step clock at the last stop (same-clock siblings get
     /// distinct child seeds). Restored on resume; empty on legacy files.
     #[serde(default)]
     pub children_born_at_clock: std::collections::HashMap<usize, usize>,
-    /// Data layout the run was built on: `None` = single-pool seeded split
-    /// (default), `Some(n)` = explicit `{train, test}` two-dataset layout
-    /// where `n` test rows were concatenated AFTER the train rows — the
-    /// stream's eval/gating pools live entirely in `[len-n..len)`. Recorded
-    /// so resume rebuilds the SAME pools without re-detecting the layout.
+        /// Data layout: `None` = single-pool seeded split; `Some(n)` = explicit `{train,test}`
+        /// with `n` test rows after the train rows. Recorded so resume rebuilds the pools.
     #[serde(default)]
     pub explicit_test_rows: Option<usize>,
     /// The run's complete configuration (see [`ConfigSnapshot`]). This is the
     /// authoritative settings record — `engine.json` alone reproduces a run.
     #[serde(default)]
     pub config: ConfigSnapshot,
-    /// The training scheme's self-description, from `Trainer::describe()`
-    /// (learning rate, grad clip, optimizer, schedule, …). Free-form JSON:
-    /// the engine persists it verbatim and never interprets it. `None` when
-    /// the trainer doesn't implement the hook (or on legacy `engine.json`).
+        /// The training scheme's self-description from `Trainer::describe()` — persisted
+        /// verbatim, never interpreted. `None` on legacy files.
     #[serde(default)]
     pub trainer: Option<serde_json::Value>,
-    /// The post-race guardrail's certified champion (see [`GuardrailRecord`]).
-    /// Written AFTER the race — absent on a running or legacy run, and
-    /// preserved by `refresh_header`/resume so a resumed run never erases it.
+        /// The post-race guardrail's certified champion. Written after the race; preserved by
+        /// `refresh_header`/resume.
     #[serde(default)]
     pub guardrail: Option<GuardrailRecord>,
     /// The previous experiment this run's founder batch was seeded from (see
@@ -418,20 +352,8 @@ pub struct RunHeader {
     pub accounting: Option<RunAccounting>,
 }
 
-/// The run's tally of what its evolution actually did.
-///
-/// The per-clock log tells this story one line at a time (and hides the routine
-/// no-op rolls behind `debug`); this is the summary a reader wants without
-/// grepping the log or counting `nets/*.json` by hand: how many nets were ever
-/// born and from where, how many left and why, and what the roll batches bought
-/// — including the rolls that bought nothing (shield-blocked, gate-discarded,
-/// and whole clocks deferred because no net was cull-eligible).
-///
-/// **Scope**: these are the counters of the process that WROTE the file. A
-/// resumed run restarts them (like the roll counters themselves); the
-/// run-lifetime record across sessions is the `nets/*.json` frontier — every
-/// tombstone carries `created_from`, `culled_at_step` and `cull_reason`, which
-/// is exactly what this struct summarizes.
+/// The run's tally of what its evolution actually did — births, deaths and what the roll
+/// batches bought. Counters of the WRITING process; the frontier is the cross-session record.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunAccounting {
     /// Every net this process created: the initial batch plus each insert.
@@ -439,29 +361,35 @@ pub struct RunAccounting {
     /// Initial-batch split: random founders vs nets inherited from a previous
     /// run's `elites.json` (`created_from = seed:<run>:<hash>`).
     pub founders: usize,
+    /// Founders that came from an inherited run.
     pub inherited_founders: usize,
     /// Nets born from an evolution roll, by channel.
     pub crossover_children: usize,
+    /// Random immigrants inserted.
     pub immigrants: usize,
     /// Culls by the slot they freed (`crossover` / `immigrant-slot`).
     pub culls: usize,
+    /// Culls that freed a slot for a crossover child.
     pub culls_crossover: usize,
+    /// Culls that freed a slot for a mutation immigrant.
     pub culls_immigrant: usize,
-    /// Crossover roll batch: rolls offered, rolls that fired, generate+gate
-    /// attempts made, and children discarded by the gate (a spent roll, no
-    /// cull, no insert).
+        /// Crossover roll batch: rolls offered/fired, attempts made, rolls discarded after the
+        /// retry budget. NOT a gate-only count (`crossover_catch_up=off` never runs the gate).
     pub crossover_rolls: usize,
+    /// Crossover rolls that fired.
     pub crossover_fired: usize,
+    /// Crossover generate(+gate) attempts made.
     pub crossover_attempts: usize,
+    /// Crossover rolls discarded after the retry budget.
     pub crossover_discarded: usize,
     /// Mutation roll batch: rolls offered, rolls that fired and built an
     /// immigrant, and rolls the hard shield refused (no cull-eligible victim).
     pub mutation_rolls: usize,
+    /// Mutation rolls that fired.
     pub mutation_fired: usize,
+    /// Mutation rolls skipped by the shield (no cullable victim).
     pub mutation_blocked: usize,
-    /// Clocks whose whole roll batch was forgone because no live net was
-    /// cull-eligible — the population-level fact that used to be printed once
-    /// per roll and is now printed once per clock.
+        /// Clocks whose whole roll batch was forgone because no live net was cull-eligible.
     pub deferred_clocks: usize,
 }
 
@@ -469,28 +397,47 @@ pub struct RunAccounting {
 /// the field-by-field input to [`RunHeader::from_race_options`].
 #[derive(Debug)]
 pub struct RunConfig {
+    /// Timestamped run id (also the run dir name).
     pub run_id: String,
     /// Mode discriminator (`"tabular"` | `"rl"`) — see [`RunHeader::engine_mode`].
     pub engine_mode: Option<String>,
+    /// Deterministic seed for the whole run.
     pub run_seed: u64,
+    /// Ranking fitness label.
     pub fitness_label: FitnessLabel,
+    /// Ranking direction (maximize/minimize).
     pub fitness_direction: Direction,
+    /// Input feature dimension.
     pub input_dim: usize,
+    /// Output dimension.
     pub output_dim: usize,
+    /// The topology template options.
     pub topology_options: TopologyOptions,
+    /// Hidden-dim pool the run sampled from.
     pub hidden_dim_pool: std::ops::RangeInclusive<usize>,
+    /// Hidden-dim stride.
     pub hidden_dim_stride: usize,
+    /// Combine-op pool.
     pub combine_op_pool: Vec<String>,
+    /// Activation pool.
     pub activation_pool: Vec<String>,
+    /// Standardize-op pool.
     pub standardize_op_pool: Vec<String>,
+    /// Informative (non-ranking) metrics.
     pub informative_metrics: Vec<Metric>,
+    /// Step budget as configured (`None` = no limit).
     pub max_steps: Option<usize>,
+    /// Train/eval split ratio.
     pub train_eval_split_ratio: Option<f32>,
+    /// Explicit held-out eval rows.
     pub held_out_eval_rows: Option<usize>,
     /// See [`RunHeader::explicit_test_rows`].
     pub explicit_test_rows: Option<usize>,
+    /// Cumulative culls at the last stop.
     pub culls: usize,
+    /// Accumulated wall-clock seconds at the last stop.
     pub run_elapsed_secs: u64,
+    /// Children born per clock (persisted counter).
     pub children_born_at_clock: std::collections::HashMap<usize, usize>,
     /// The run's complete configuration (see [`ConfigSnapshot`]).
     pub config: ConfigSnapshot,
@@ -554,18 +501,16 @@ impl RunHeader {
             children_born_at_clock,
             config,
             trainer,
-            // Both are post-construction facts: the guardrail hasn't run at
-            // launch, and the seed source is stamped in right after the
-            // population is resolved (`CoreEngine::from_spec`).
+                // Both are post-construction facts: the guardrail hasn't run at launch, and
+                // the seed source is stamped in right after the population is resolved.
             guardrail: None,
             run_topology_source: None,
             accounting: None,
         }
     }
 
-    /// Record the guardrail's certified champion (see [`GuardrailRecord`]).
-    /// Called by `CoreEngine::guardrail` so every later header rewrite keeps
-    /// it.
+        /// Record the guardrail's certified champion — called by `CoreEngine::guardrail` so
+        /// every later header rewrite keeps it.
     pub fn set_guardrail(&mut self, record: Option<GuardrailRecord>) {
         self.guardrail = record;
     }
@@ -700,10 +645,8 @@ impl RunHeader {
             .get("run_topology_source")
             .cloned()
             .and_then(|s| serde_json::from_value(s).ok());
-        // Migration (engine split, TODO.md step 6): legacy shared-shape
-        // headers have no root `engine_mode` — derive it from `config.mode`
-        // (same vocabulary, always present). New headers carry it at the
-        // root so a reader picks the engine before touching `config`.
+            // Migration: legacy headers have no root `engine_mode` — derive it from
+            // `config.mode`. New headers carry it so a reader picks the engine first.
         let engine_mode = v
             .get("engine_mode")
             .and_then(|m| m.as_str())
@@ -753,58 +696,49 @@ impl RunHeader {
     }
 }
 
+/// Serde default: a net with no `alive` field is alive.
 fn default_alive() -> bool {
     true
 }
 
+/// Serde default: `false`.
 fn default_false() -> bool {
     false
 }
 
+/// Serde default: `true`.
 fn default_true() -> bool {
     true
 }
 
-/// Pre-knob `engine.json` files carry no `guardrail_matches`; a bare
-/// `#[serde(default)]` would deserialize them as 0 games, so anchor the
-/// fallback on the config's own default.
+    /// Pre-knob headers carry no `guardrail_matches`; anchor the serde fallback on the
+    /// config's own default rather than 0.
 fn default_guardrail_matches() -> usize {
     crate::engine::config::DEFAULT_GUARDRAIL_MATCHES
 }
 
 // ── Per-net state (nets/<hash>.json) ──────────────────────────────────────
 
-/// The last-known state of one live net. Written to `nets/<hash>.json` and
-/// overwritten each step the net survives (and on cull-enter, if a tombstone
-/// path is enabled later).
-///
-/// This is the resume anchor for that net: load it, rebuild the topology +
-/// network from the embedded blueprint + weight-init seed, then replay the
-/// deterministic stream to `step`.
+/// The last-known state of one live net, written to `nets/<hash>.json` and overwritten each
+/// surviving step. The resume anchor: rebuild from the blueprint + seed, then replay.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NetState {
     /// Canonical xxh3 hash of this individual's topology (16 hex chars).
     pub hash: String,
-    /// The topology blueprint, serialized. Self-describing: `Network::build`
-    /// reads `options.topology_seed` (weight init) and `options.dropout_prob` (the
-    /// regularization the run applied) straight from here.
+        /// The topology blueprint, serialized (self-describing: `Network::build` reads the
+        /// seed and dropout from here).
     pub topology: String,
-    /// Weight-init seed embedded in the topology's `options.topology_seed`. Stored
-    /// here redundantly so a reader doesn't have to re-parse the topology to
-    /// recover the seed the run used for this individual.
+        /// Weight-init seed, stored redundantly so a reader needn't re-parse the topology.
     pub net_seed: usize,
-    /// The step this net has been trained/evaluated through. A resume replays
-    /// the stream from step 0 up to (but not including) this step, then
-    /// continues from here.
+        /// The step this net has trained/evaluated through; a resume replays up to it, then
+        /// continues.
     pub step: usize,
     /// Whether this net is currently alive in the active population. Culled nets
     /// are written as final tombstones to disk with `is_alive: false`.
     #[serde(default = "default_alive")]
     pub is_alive: bool,
-    /// Step at which this net was culled (`None` while it is alive). With
-    /// `cull_reason` and `final_smoothed_fitness` this makes a tombstone a
-    /// complete record of when and why a net left the population — not just
-    /// the surviving frontier.
+        /// Step this net was culled (`None` while alive). With `cull_reason` and
+        /// `final_smoothed_fitness` it makes a complete tombstone.
     #[serde(default)]
     pub culled_at_step: Option<usize>,
     /// Why it left (`"crossover"` | `"immigrant-slot"`).
@@ -816,58 +750,35 @@ pub struct NetState {
     /// When this individual entered the live population. For lifetime tracking
     /// and the robustness-equivalent (appearances / span / final score).
     pub entered_at_step: usize,
-    /// Optional lineage record for Iter 5: which parent(s) / mutation produced
-    /// this individual. Left as an optional string so the field exists today
-    /// without inventing the crossover/mutation schema ahead of Iter 5.
+        /// Optional lineage record: which parents/mutation produced this individual.
     pub created_from: Option<String>,
-    /// Last-seen metrics snapshot. Enough for a resume/time-travel read
-    /// without walking a separate CSV. Schema: loss + fitness + any configured
-    /// informative metrics. Empty until the first persisted step.
+        /// Last-seen metrics snapshot (loss + fitness + informative metrics) — enough for a
+        /// resume/time-travel read. Empty until the first persisted step.
     pub last_metrics: Option<NetMetrics>,
-    /// Inclusive clock ranges this net executed as FROZEN (act-and-measure:
-    /// played/measured, weight update discarded). Replay-relevant: resume
-    /// re-runs frozen clocks through a no-op optimizer to reproduce the
-    /// recorded metrics bit-exactly (a real optimizer pass would move the
-    /// frozen weights). Compact run-length form: `[(start, end), …]`,
-    /// non-overlapping, extending contiguously.
+        /// Inclusive clock ranges this net executed as FROZEN (act-and-measure). Replay-
+        /// relevant: resume re-runs them through a no-op optimizer. Run-length, disjoint.
     #[serde(default)]
     pub frozen_spans: Vec<(usize, usize)>,
-    /// Rich per-individual metadata (params, dims, training regime, run
-    /// context). Written once at construction; missing on legacy JSONs
-    /// (serde default) and backfilled on first rewrite.
+        /// Rich per-individual metadata (params, dims, regime, run context). Missing on
+        /// legacy JSONs; backfilled on first rewrite.
     #[serde(default)]
     pub meta: NetMeta,
-    /// When this net's weights were last updated (the last step it trained
-    /// with a real optimizer). New nets start at 0. Freeze-log only: an
-    /// act-and-measure step never rotates it, so the freeze/dethrone lines
-    /// can show "trained n clocks since last update" honestly. Never written
-    /// to disk; rebuilt from `last_metrics` on resume.
+        /// When this net's weights were last updated with a real optimizer. Freeze-log only,
+        /// never written to disk; rebuilt from `last_metrics` on resume.
     #[serde(skip)]
     pub last_update_step: usize,
-    /// Elite probation clock — half of the KISS elite gate. Starts at 0 on
-    /// birth (and on ANY seat exit) and is ticked +1 every clock by
-    /// `CoreEngine::refresh_crown`. A net may hold an elite seat only once
-    /// `elite_probation_age >= elite_join_probation_steps` (k): a fresh net
-    /// must train k clocks before it can be crowned, and every seat exit
-    /// (age-out or rank dethrone) restarts the window — a lucky
-    /// founder/crossover child cannot live in the crown forever.
+        /// Elite probation clock: starts at 0 on birth and any seat exit, ticked +1 per clock;
+        /// a seat needs `elite_probation_age >= elite_join_probation_steps`.
     #[serde(default)]
     pub elite_probation_age: usize,
-    /// Elite seat clock — the other half of the gate. 0 while the net holds
-    /// no seat; +1 per clock while seated. While seated the gate also
-    /// requires `elite_seat_age < elite_crown_lifetime_steps` (j): at j the
-    /// net is age-eliminated at peak even if it still ranks first
-    /// (`j = 0` disables the lifetime — crown held until rank moves). Reset
-    /// to 0 on seat exit together with `elite_probation_age`.
+        /// Elite seat clock: 0 while unseated, +1 per seated clock; at
+        /// `elite_crown_lifetime_steps` the net ages out (`0` disables).
     #[serde(default)]
     pub elite_seat_age: usize,
 }
 
-/// Rich metadata for one individual, embedded in `nets/<hash>.json` under
-/// the `meta` key. Everything a reader (human or tool) needs to understand
-/// the net *and* the conditions it trained under, without touching code.
-/// Populated once at construction; `params` is stamped right after the
-/// `Network` is built (cheap, computed once — never re-serialized per step).
+/// Rich metadata for one individual (embedded in `nets/<hash>.json` under `meta`) — enough
+/// to understand the net and its training conditions without touching code.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct NetMeta {
     /// Trainable parameter count (elements) of the built network.
@@ -880,21 +791,18 @@ pub struct NetMeta {
     #[serde(default)]
     pub input_dim: Option<usize>,
     #[serde(default)]
+    /// Output dimension (`None` in modes without a shared stream).
     pub output_dim: Option<usize>,
-    /// Shared training regime for the run. `None` in modes with no shared
-    /// stream (RL) — learning rate, grad clip and the per-step volume are all
-    /// trainer-owned and live in `engine.json` → `"trainer"`
-    /// (`Trainer::describe`), never in per-net schema.
+        /// Shared training regime. `None` in modes with no shared stream (RL) — LR, grad clip
+        /// and volume are trainer-owned (`engine.json` → `"trainer"`).
     #[serde(default)]
     pub batch_size: Option<usize>,
     /// Dropout probability stamped into the topology (also lives in the
     /// topology JSON; duplicated here for quick scanning).
     #[serde(default)]
     pub dropout_prob: Option<f32>,
-    /// Ranking fitness label for this run. There is deliberately no
-    /// `loss_label` beside it: the loss/update scheme is trainer-owned (the
-    /// engine cannot see it), so `engine.json` → `"trainer"` is the only
-    /// honest record.
+        /// Ranking fitness label. No `loss_label` beside it: the loss/update scheme is
+        /// trainer-owned, so `engine.json` → `"trainer"` is the only honest record.
     #[serde(default)]
     pub fitness_label: Option<String>,
     /// What ranking direction this run uses ("minimize"/"maximize").
@@ -908,12 +816,14 @@ pub struct NetMeta {
     #[serde(default)]
     pub pop_size: Option<usize>,
     #[serde(default)]
+    /// Run seed recorded for this net's regime (`None` if unknown).
     pub run_seed: Option<u64>,
 }
 
 /// One snapshot of metrics for a single net, at a single step.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct NetMetrics {
+    /// Step this metric snapshot was recorded at.
     pub step: usize,
     /// Training loss for this step's train batch.
     pub train_loss: f32,
@@ -923,18 +833,15 @@ pub struct NetMetrics {
     pub fitness: f32,
     /// Informative-only metric values, in the same order the run configured them.
     pub informative: Vec<f32>,
-    /// True when this step was an ACT-AND-MEASURE pass (frozen elite: the net
-    /// played/measured at this clock but the weight update was discarded).
-    /// Replay-relevant: resume replays frozen steps through a no-op optimizer
-    /// to reproduce the recorded metrics bit-exactly.
+        /// True when this step was an ACT-AND-MEASURE pass (frozen elite). Replay-relevant:
+        /// resume re-runs it through a no-op optimizer.
     #[serde(default)]
     pub frozen: bool,
 }
 
 impl NetState {
-    /// Stamp the `meta` block from the materialized network + the run context.
-    /// Called once per net right after its `Network` is built (initial seed,
-    /// child finalize, resume rebuild) — never per step.
+        /// Stamp the `meta` block from the materialized network + run context — once per net
+        /// right after its `Network` is built, never per step.
     pub fn stamp_meta(
         &mut self,
         net: &crate::graph::network::Network,
@@ -947,9 +854,8 @@ impl NetState {
         self.meta.input_dim = Some(run.input_dim);
         self.meta.output_dim = Some(run.output_dim);
         self.meta.batch_size = run.batch_size;
-        // Learning rate, grad clip and the loss scheme are trainer-owned, so
-        // the engine records none of them here; the trainer's `describe()`
-        // block in engine.json is the authoritative record.
+            // LR, grad clip and the loss scheme are trainer-owned, so the engine records none
+            // of them here; the trainer's `describe()` block is the authoritative record.
         self.meta.fitness_label = Some(run.fitness_label.clone());
         self.meta.direction = Some(run.direction.clone());
         self.meta.born_at_step = Some(self.entered_at_step);
@@ -985,10 +891,8 @@ impl NetState {
         })
     }
 
-    /// Record that clock `step` was an act-and-measure (frozen) step,
-    /// extending the last span when contiguous. A frozen step is never a
-    /// weight update, so `last_update_step` is NOT advanced by the freeze
-    /// pass (see `CoreEngine::step_one_net` — the live path records it).
+        /// Record clock `step` as an act-and-measure (frozen) step, extending the last span
+        /// when contiguous. Does NOT advance `last_update_step`.
     pub fn record_frozen_step(&mut self, step: usize) {
         match self.frozen_spans.last_mut() {
             Some((_, end)) if *end + 1 == step => *end = step,
@@ -1003,13 +907,8 @@ impl NetState {
             .any(|&(s, e)| step >= s && step <= e)
     }
 
-    /// Serialize to pretty JSON for writing `nets/<hash>.json`.
-    /// Backfill `meta` on legacy JSONs so every written record carries a
-    /// self-contained metadata block. We rebuild a throwaway `Network` from
-    /// the topology just to count params (cheap, once per write flight); the
-    /// `RunMetaCtx::default()` is fine here because we only need the network
-    /// shape, not the run regime (that comes from the callers who call
-    /// `stamp_meta` directly with the real run context).
+        /// Serialize to pretty JSON for `nets/<hash>.json`, backfilling `meta` on legacy
+        /// records with a throwaway network build (cheap, once per write flight).
     pub fn to_json(&self) -> Result<String> {
         let mut to_write = self.clone();
         if to_write.meta.params.is_none() {
@@ -1034,16 +933,8 @@ impl NetState {
         self.last_metrics = Some(metrics);
     }
 
-    /// Advance the local step clock and record it as the last weight-update
-    /// step.
-    ///
-    /// This is the LIVE-path bookkeeping hook: a training step bumps the net's
-    /// local clock *and* records `last_update_step = clock`. A frozen elite
-    /// step calls a separate freeze-only path (see `CoreEngine::step_one_net`)
-    /// that does NOT bump the clock, so resume replay reproduces the original
-    /// step counts exactly: a net frozen at step k still carries step k after
-    /// a frozen act-and-measure step, and the resumed run continues from k+1
-    /// on its next live step.
+        /// Advance the local step clock and record it as the last weight-update step — the
+        /// LIVE-path hook (a frozen step uses the separate freeze-only path).
     pub fn advance_step(&mut self) {
         self.step += 1;
         self.last_update_step = self.step;
@@ -1058,13 +949,8 @@ impl NetState {
 
 // ── Runtime population state (in memory) ──────────────────────────────────
 
-/// The in-memory view of the live population that the scheduler reads/writes.
-///
-/// Backed by a hash map from canonical topology hash to `NetState`, plus a
-/// small robustness-equivalent accumulator that tracks per-topology lifetime
-/// and final score over the run (the replacement for the old per-generation
-/// `robustness.csv` semantics — here it is one accumulator in the run, not a
-/// separate CSV written at generation boundaries).
+/// The in-memory view of the live population the scheduler reads/writes: a hash map of
+/// `NetState` plus a per-topology lifetime accumulator (the robustness-equivalent).
 pub struct RaceState {
     /// Live nets, indexed by canonical topology hash.
     nets: HashMap<String, NetState>,
@@ -1072,9 +958,7 @@ pub struct RaceState {
     topology_lifetime: HashMap<String, TopologyLifetime>,
 }
 
-/// Per-topology lifetime tracking — the robustness-equivalent for the step-race
-/// model. Tracks how many times a topology entered the live population, the
-/// step span it covered, and its final recorded fitness.
+        /// Per-topology lifetime tracking — entries, step span, and final recorded fitness.
 #[derive(Clone, Debug)]
 pub struct TopologyLifetime {
     /// Times this topology entered the live population.
@@ -1088,6 +972,7 @@ pub struct TopologyLifetime {
 }
 
 impl TopologyLifetime {
+        /// New accumulator seeded from the first entry.
     pub fn new(first_step: usize, fitness: Option<f32>) -> Self {
         TopologyLifetime {
             appearances: 1,
@@ -1097,6 +982,7 @@ impl TopologyLifetime {
         }
     }
 
+        /// Record one entry at `step` with `fitness`.
     pub fn record_entry(&mut self, step: usize, fitness: Option<f32>) {
         self.appearances = self.appearances.saturating_add(1);
         self.last_step = step;
@@ -1112,22 +998,27 @@ impl TopologyLifetime {
         }
     }
 
+        /// How many times this topology entered the population.
     pub fn appearances(&self) -> usize {
         self.appearances
     }
 
+        /// First step it was seen.
     pub fn first_step(&self) -> usize {
         self.first_step
     }
 
+        /// Last step it was seen.
     pub fn last_step(&self) -> usize {
         self.last_step
     }
 
+        /// Steps covered from first to last.
     pub fn span(&self) -> usize {
         self.last_step.saturating_sub(self.first_step)
     }
 
+        /// Final recorded fitness.
     pub fn last_fitness(&self) -> Option<f32> {
         self.last_fitness
     }
@@ -1140,6 +1031,7 @@ impl Default for RaceState {
 }
 
 impl RaceState {
+        /// New empty population state.
     pub fn new() -> Self {
         RaceState {
             nets: HashMap::new(),
@@ -1182,13 +1074,8 @@ impl RaceState {
         Ok(())
     }
 
-    /// Record an ACT-AND-MEASURE (frozen) step: metrics snapshot, lifetime
-    /// progress and the frozen span — but WITHOUT advancing the net's step
-    /// clock. An act is not a training: `state.step` keeps counting trainings
-    /// only (resume replay derives its clock set from that count), and
-    /// `last_update_step` stays put so the freeze logs report "trained n
-    /// clocks since last update" honestly. This is the freeze branch's
-    /// counterpart to [`Self::record_step`].
+        /// Record an ACT-AND-MEASURE (frozen) step: metrics, lifetime progress and the frozen
+        /// span — but WITHOUT advancing the clock. Counterpart to [`Self::record_step`].
     pub fn record_frozen_act(&mut self, hash: &str, metrics: NetMetrics) -> Result<()> {
         let state = self.nets.get_mut(hash).ok_or_else(|| {
             EngineError::InvalidOptions(format!("race state: net {hash} not live"))
@@ -1211,27 +1098,30 @@ impl RaceState {
         Ok(())
     }
 
+        /// Immutable access to a live net by hash.
     pub fn net(&self, hash: &str) -> Option<&NetState> {
         self.nets.get(hash)
     }
 
+        /// Mutable access to a live net by hash.
     pub fn net_mut(&mut self, hash: &str) -> Option<&mut NetState> {
         self.nets.get_mut(hash)
     }
 
+        /// Hashes of every live (non-tombstoned) net.
     pub fn live_hashes(&self) -> Vec<String> {
         let mut hashes: Vec<String> = self.nets.keys().cloned().collect();
         hashes.sort();
         hashes
     }
 
+        /// Number of live nets.
     pub fn live_count(&self) -> usize {
         self.nets.len()
     }
 
-    /// Mutable access to every live net, keyed by hash. Used by the per-clock
-    /// counter tick: the increments are commutative, so the map's iteration
-    /// order does not matter and no hash list/ordering has to be built.
+        /// Mutable access to every live net keyed by hash — for the commutative counter tick,
+        /// so iteration order doesn't matter.
     pub fn live_mut(&mut self) -> impl Iterator<Item = (&String, &mut NetState)> {
         self.nets.iter_mut()
     }
@@ -1277,12 +1167,8 @@ pub fn write_engine_json(dir: &Path, header: &RunHeader) -> Result<()> {
     Ok(())
 }
 
-/// Stamp the post-race guardrail record into an EXISTING `engine.json`.
-///
-/// Read-modify-write on the raw JSON, deliberately: the guardrail runs after
-/// the race, so this must not re-serialize a freshly built header (that would
-/// drop any field this version doesn't model, and hand-edited notes with
-/// them). Missing file = no-op success would hide a real bug, so it errors.
+/// Stamp the post-race guardrail record into an EXISTING `engine.json` via raw read-modify-
+/// write, so unmodeled fields and hand-edited notes survive. Missing file errors.
 pub fn write_guardrail_record(dir: &Path, record: &GuardrailRecord) -> Result<()> {
     stamp_engine_json_key(
         dir,
@@ -1496,10 +1382,8 @@ mod tests {
         assert_eq!(rebuilt_json, loaded.topology);
     }
 
-    /// Schema separation: run-level facts live in the header's `config`, per-net
-    /// facts in `nets/<hash>.json` — and neither invents a value for a mode that
-    /// has none (RL has no shared stream ⇒ no batch geometry; the loss/update
-    /// scheme is trainer-owned ⇒ no `loss_label` in the schema at all).
+        /// Schema separation: run-level facts in the header's `config`, per-net facts in
+        /// `nets/<hash>.json` — neither invents a value for a mode that has none.
     #[test]
     fn schema_records_mode_appropriate_geometry_and_no_trainer_owned_fields() {
         // RL header: no stream, so geometry is genuinely absent (`null`), and
