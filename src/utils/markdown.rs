@@ -7,14 +7,8 @@ use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
 use crate::graph::topology::Topology;
 
-/// Markdown rendering of a [`Topology`]: header, merged nodes/network table,
-/// edge list, and the visual wiring diagram in a code block.
-/// When a built [`Network`] is provided, the nodes table includes linear dims
-/// and source wiring (merged topology + network view).
-///
-/// Deliberately stamp-free: the header only identifies the topology — it does
-/// not claim a fitness or rank. Scores live in the CSV; this is a structural
-/// view you generate for any individual you choose.
+/// Markdown for a [`Topology`]: header, nodes table, edge list, wiring diagram
+/// and Mermaid. Stamp-free by design — scores live in the CSV, not here.
 pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     let mut out = String::new();
 
@@ -169,9 +163,8 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("\n## Graph\n\n");
     out.push_str(&topology_mermaid(graph));
 
-    // ── Legend — plain-words reasoning guide for every visual above ──
-    // Each visual channel (border, wire, label) encodes one structural
-    // fact; the legend says which, so a reader never has to guess.
+    // ── Legend — one entry per visual channel, so a reader never has to guess
+    // which structural fact a border, wire or label encodes. ──
     out.push_str("\n## How to read this\n\n");
     out.push_str("| Visual | Meaning |\n");
     out.push_str("|---|---|");

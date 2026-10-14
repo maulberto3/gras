@@ -44,19 +44,8 @@ struct TensorBlob {
     data: Vec<u8>,
 }
 
-/// Collect a network's parameters in safetensors naming convention.
-///
-/// **Every** parameter the net trains must be here — node layers
-/// (`node<N>.weight` / `node<N>.bias`) *and* the per-port cross-dim bridges
-/// (`proj<N>_<port>_<src>.weight` / `.bias`). The bridges were missing once,
-/// and it was a silent near-catastrophe: the champion's file carried only 10
-/// of its 16 parameter tensors, so `load_safetensors` filled the layers and
-/// left the bridges at the fresh rebuild's random init — the guardrail then
-/// measured a crippled net (500 in the race, 25/500 holdout, i.e. random)
-/// while reporting it as the champion's honest score. Bridges sit on the
-/// critical path whenever a wire crosses dims (e.g. 128→32→64→2), so a
-/// missing or stale bridge is not a small numeric error — it is a different
-/// network. Ordered by node id, then port, then source, for a stable file.
+/// Collect a network's parameters in safetensors naming convention. **Every**
+/// trained tensor must be here — missing port bridges silently cripple a net.
 fn collect_tensors(net: &Network) -> Result<Vec<TensorBlob>> {
     let mut blobs = Vec::new();
     for (idx, layer) in net.layers.iter().enumerate() {
@@ -95,6 +84,7 @@ fn push_linear(blobs: &mut Vec<TensorBlob>, prefix: &str, layer: &flodl::nn::Lin
     Ok(())
 }
 
+/// Short safetensors dtype tag (`"F32"`, `"F64"`, …).
 fn dtype_tag(dt: DType) -> &'static str {
     match dt {
         DType::Float32 => "F32",
@@ -134,9 +124,8 @@ fn serialize(blobs: &[TensorBlob]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Write a built [`Network`]'s parameters to `path` in safetensors format.
-/// Returns the path written. Works on CPU or CUDA nets (blobs are copied
-/// to host little-endian bytes by flodl's `to_blob`).
+/// Write a built [`Network`]'s parameters to `path` in safetensors; returns the
+/// path. Works on CPU/CUDA (blobs copied to host little-endian).
 pub fn export_safetensors(net: &Network, path: &Path) -> Result<PathBuf> {
     let blobs = collect_tensors(net)?;
     if blobs.is_empty() {
@@ -150,17 +139,8 @@ pub fn export_safetensors(net: &Network, path: &Path) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-/// Read a safetensors file written by [`export_safetensors`] and copy the
-/// tensors into `net`'s parameters **in place** (the network keeps its
-/// optimizer/autograd wiring; only the values change). Tensor names must
-/// match the `node<N>.*` / `proj<N>_<port>_<src>.*` convention and shapes
-/// must equal the layer's — a mismatch is an error, never a silent skip.
-///
-/// **Completeness is enforced**: the number of tensors copied must equal
-/// `net.parameters().len()`. A partial file (the bug that hid the port
-/// bridges) is rejected instead of leaving some parameters at their fresh
-/// random init — a half-loaded net measures like a different network, and
-/// silence there is how a guardrail lies about its champion.
+/// Read a safetensors file into `net`'s parameters **in place**. Completeness
+/// is enforced: a partial file is rejected, never left at random init.
 pub fn load_safetensors(net: &mut Network, path: &Path) -> Result<()> {
     let raw = std::fs::read(path)
         .map_err(|e| TensorError::new(&format!("failed to read {}: {e}", path.display())))?;
@@ -191,9 +171,8 @@ pub fn load_safetensors(net: &mut Network, path: &Path) -> Result<()> {
             }
         }
     }
-    // Same count as `Network::parameters()` (each entry is one tensor, and
-    // every weight/bias pair appears in both). Checked AFTER loading, so a
-    // mismatch is reported with both numbers and names the file.
+        // Same count as `Network::parameters()`; checked AFTER loading so a
+        // partial file cannot pass.
     use flodl::nn::Module;
     let expected = net.parameters().len();
     if copied != expected {
@@ -230,15 +209,8 @@ fn load_linear(
     Ok(copied)
 }
 
-/// Copy one header entry's blob into a parameter variable, checking shape.
-///
-/// The blob is host bytes, so the tensor is built on CPU first and then moved
-/// to **the parameter's own device** (`cur.device()`) before being installed.
-/// Without that move a CUDA net kept CPU-resident weights after a load and the
-/// very next forward died with `Expected all tensors to be on the same device,
-/// but got mat1 is on cuda:0, different from other tensors on cpu` — a load
-/// that *looked* fine (no error, right shapes) and only failed at inference.
-/// A `to_device` on CPU is a no-op, so the CPU path is unchanged.
+/// Copy one header entry's blob into a parameter variable, checking shape. The
+/// tensor is built on CPU then moved to the parameter's device (CUDA-safe).
 fn copy_entry(
     entry: &serde_json::Value,
     data: &[u8],
@@ -354,10 +326,7 @@ mod tests {
     }
 
     /// A graph with MISMATCHED node dims, so `bridge_diff_dims` creates real
-    /// port projections: input widens 4→128, then a 32-wide hidden node is
-    /// fed across dims from it. This is the shape of the champion that the
-    /// old exporter half-saved (500 in-race, 25/500 holdout — the bridges
-    /// were left at fresh init by the loader).
+    /// port projections (the shape the old exporter half-saved).
     fn bridged_topo() -> Topology {
         use crate::graph::topology::{Connection, Port};
         let mut graph = Topology::new(7, None);
@@ -426,9 +395,8 @@ mod tests {
             );
         }
 
-        // And a PARTIAL file must be rejected loudly, never silently applied
-        // (that silence is exactly how the guardrail reported 25/500 on a
-        // champion that scored 500).
+        // A PARTIAL file must be rejected loudly, never silently applied — that
+        // silence is how a guardrail reported 25/500 on a 500 champion.
         let truncated = dir.join("partial.safetensors");
         let only_header_len = 8 + hdr_len;
         std::fs::write(&truncated, &raw[..only_header_len]).unwrap();

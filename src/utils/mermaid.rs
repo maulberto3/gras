@@ -3,9 +3,8 @@
 use crate::graph::node::NodeKind;
 use crate::graph::topology::Topology;
 
-/// Mermaid flowchart of a [`Topology`].
-/// Renders natively in GitHub markdown, GitLab, Notion, etc.
-/// Can also be exported to PNG/SVG via `mmdc` (mermaid-cli).
+/// Mermaid flowchart of a [`Topology`] — renders natively in GitHub/GitLab/Notion
+/// and can be exported via `mmdc`.
 pub fn topology_mermaid(graph: &Topology) -> String {
     let mut out = String::new();
     out.push_str("```mermaid\ngraph LR\n");
@@ -18,10 +17,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
     );
     let dim_range = (max_dim.saturating_sub(min_dim)).max(1);
 
-    // Node definitions — COMPACT one-line labels. Mermaid auto-sizes each
-    // box to fit its label, so multi-line labels balloon every box; one
-    // short line keeps boxes small and roughly uniform. Full detail lives
-    // in the Nodes table above.
+        // Node definitions — COMPACT one-line labels; Mermaid auto-sizes boxes, so
+        // multi-line labels balloon every box.
     for node in &graph.nodes {
         let label = match node.kind {
             NodeKind::Input => {
@@ -33,12 +30,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
             }
             NodeKind::Hidden => {
                 let dim = node.hidden_dim.unwrap_or(8);
-                // Node-level activation moves OFF the label: with per-port
-                // activations it's no longer "the" node's activation — each
-                // outgoing wire carries its own (rendered on the edge label).
-                // Label = combine + std + dim.
-                // Kept one-line — Mermaid auto-sizes boxes, so a slightly wider
-                // label is free, but a second line would balloon every box.
+                    // Activation moves OFF the label (per-port ops belong on the
+                    // wire); label = combine + std + dim, kept one line.
                 let combine = node
                     .combine_op
                     .map(|c| c.to_string())
@@ -50,9 +43,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
                 format!("n{}[\"H{} {}·{} {}\"]", node.id, node.id, combine, std, dim)
             }
             NodeKind::Output => {
-                // Same combine·std·dim shape as hidden nodes, prefixed `out`.
-                // The activation is fixed identity (pure logits readout) so
-                // it's omitted — nothing variable to show.
+                    // Same combine·std·dim shape, prefixed `out`; activation omitted
+                    // (fixed identity readout).
                 let combine = node
                     .combine_op
                     .map(|c| c.to_string())
@@ -73,10 +65,10 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         out.push_str(&format!("    {}\n", label));
     }
 
-    // Node borders — stroke-width driven by the node's hidden_dim (per-net
-    // normalized: min dims get the thinnest border, max the thickest). One
-    // inline `style` line per node; Mermaid renders it as the box outline.
+        // Node borders — stroke-width from the node's hidden_dim (per-net
+        // normalized); one inline `style` line per node.
     const MIN_BORDER: f32 = 0.5;
+    /// Thickest border stroke (widest hidden dim in the net).
     const MAX_BORDER: f32 = 5.0;
     for node in &graph.nodes {
         let dim = node.hidden_dim.unwrap_or(min_dim);
@@ -88,12 +80,10 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         ));
     }
 
-    // Edges — stroke-width scaled by HOP DISTANCE (to.node − from.node):
-    // the farther a wire travels, the thicker it renders, so long-range
-    // skips (the interesting structural feature) are thick trunks while
-    // immediate neighbor-to-neighbor wires stay thin. Normalized per net:
-    // 1 hop = thinnest, max hop in this graph = thickest.
+        // Edges — stroke-width scaled by HOP DISTANCE, so long-range skips render
+        // as thick trunks; normalized per net.
     const MIN_WIDTH: f32 = 0.5;
+    /// Thickest edge stroke (longest hop in the net).
     const MAX_WIDTH: f32 = 5.0;
     let max_hop = graph
         .connections
@@ -103,15 +93,12 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         .unwrap_or(1)
         .max(1);
     for (idx, conn) in graph.connections.iter().enumerate() {
-        // Edge label = the SOURCE PORT's activation: with per-port
-        // activations, the wire itself carries the non-linearity, so the
-        // signal name belongs on the arrow, not the box.
+            // Edge label = the SOURCE PORT's activation: the wire carries the
+            // non-linearity, so the signal name belongs on the arrow.
         let edge_act = graph.nodes[conn.from.node].port_activation(conn.from.index);
         let act = format!("{:#?}", edge_act).to_lowercase();
-        // No port annotation: dedup guarantees at most one wire per
-        // (source → target, activation) — so parallel wires always differ
-        // by their activation label alone, and the source/target boxes are
-        // already visible in the graph.
+            // No port annotation: dedup guarantees at most one wire per
+            // (source → target, activation), so parallel wires differ by label.
         out.push_str(&format!(
             "    n{} -- {} --> n{}\n",
             conn.from.node, act, conn.to.node
@@ -125,12 +112,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         ));
     }
 
-    // Orphaned ports — the mermaid counterpart of the ASCII `*` marks.
-    // Direction mirrors the ASCII convention (inputs enter the box's left,
-    // outputs leave its right): an orphaned INPUT renders as a dashed stub
-    // flowing INTO the node (from a floating marker), an orphaned OUTPUT as
-    // a stub flowing OUT. Markers are styled invisible (no fill/stroke) —
-    // they read as bare dashed whiskers hanging off the box.
+        // Orphaned ports — the mermaid counterpart of the ASCII `*` marks;
+        // markers styled invisible (bare dashed whiskers).
     let mut orphan_idx = graph.connections.len();
     let output_id = graph
         .nodes
@@ -138,10 +121,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         .find(|n| n.kind == NodeKind::Output)
         .map(|n| n.id);
     for node in &graph.nodes {
-        // The Output node's own output port always "dangles" by design — it
-        // is the net's exit, not an unused port (ASCII renders it bare, no
-        // `*`). Skip it so mermaid doesn't invent an orphan the ASCII
-        // (correctly) doesn't show.
+            // The Output node's port always "dangles" by design (it's the exit, not
+            // an unused port) — skip it so mermaid doesn't invent an orphan.
         let is_output = Some(node.id) == output_id;
         for port in 0..node.num_inputs {
             let wired = graph

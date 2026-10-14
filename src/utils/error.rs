@@ -80,12 +80,8 @@ impl Display for TopologyError {
 
 // ── Node ─────────────────────────────────────────────────────────────────
 
-/// Per-node invariant violations.
-///
-/// Forward-looking: node constructors and builders are infallible, and
-/// `Activation::apply` delegates to flodl directly — so nothing constructs
-/// these yet. They give future node-level rules (port sanity, dim checks) a
-/// typed home in this module.
+/// Per-node invariant violations — forward-looking: nothing constructs these
+/// yet; they give future node-level rules (port sanity, dim checks) a home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum NodeError {
@@ -112,9 +108,8 @@ impl Display for NodeError {
 /// Compiling a blueprint into an executable [`Network`](crate::graph::network::Network).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkError {
-    /// The blueprint failed
-    /// [`Topology::validate`](crate::graph::topology::Topology::validate) — refused
-    /// before any tensor work is spent.
+    /// The blueprint failed [`Topology::validate`](crate::graph::topology::Topology::validate) —
+    /// refused before any tensor work is spent.
     InvalidTopology(TopologyError),
     /// A build-time inconsistency not covered by validation.
     Build(String),

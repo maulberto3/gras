@@ -18,46 +18,14 @@ use crate::graph::network::Network;
 /// generator). See [`rng_lock`].
 static RNG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Hold this guard for the duration of any region that must see a stable
-/// libtorch generator state: seed via [`seed_step_randomness`] then every
-/// stochastic draw (dropout forwards, `Tensor::randn`, weight init)
-/// belonging to that seed.
-///
-/// Why a lock exists: libtorch's CPU generator is process-global but its
-/// mutex only serializes *access*, not *meaning*. Two threads can legally
-/// interleave [seed A; draw] and [seed B; draw], leaving the generator in
-/// whichever order the OS schedules — so "seed then draw" is only a
-/// determinism contract while the whole region is exclusive. Proven by
-/// probe: 8 threads × 50 seed/forward pairs → 235/400 mask mismatches
-/// unlocked, 0/400 with every seed/draw/build region under one lock.
-///
-/// The ENGINE uses this implicitly: its group loop steps nets sequentially
-/// on one thread, so each seed→train_step region is already exclusive. The
-/// lock matters for (a) the trainer-side helpers below, which any user
-/// thread may call, and (b) tests, where 167 tests run in parallel.
-///
-/// Rule of thumb (see AGENTS.md): anything that draws from libtorch's RNG
-/// — builds, forwards in train mode, `randn` — must happen while holding a
-/// guard from this function, or inside the engine's single-threaded step.
+/// Hold this guard for any region that must see a stable libtorch generator
+/// state: seed via [`seed_step_randomness`], then every stochastic draw.
 pub fn rng_lock() -> std::sync::MutexGuard<'static, ()> {
     RNG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Seed the global RNG deterministically for one (net, step) pair. Called
-/// before each step so any stochastic op (dropout) draws the same values for
-/// the same (seed, step, call_index) — the replay/catch-up contract.
-/// Each (net_seed, step, call_index) triple produces a distinct stream, so
-/// `catch_up` and group-step nets see different dropout masks at the same
-/// step (required for the catch_up determinism test).
-///
-/// Two RNG systems are seeded:
-/// - **fastrand** — gras's own stream (population draws, cull roulette…).
-/// - **libtorch's global RNG** ([`flodl::manual_seed`]) — the one `Dropout`
-///   draws from. Before this second seed existed, a `dropout_prob > 0` run
-///   drew different masks on every replay and the exact-equality parity
-///   check refused (dropout was a one-way trip). Weight INIT is untouched:
-///   gras builds Linears from its own seeded fastrand data, never libtorch's
-///   `rand`.
+/// Seed both RNG systems (fastrand + libtorch) deterministically for one
+/// `(net, step)` pair — the replay/catch-up contract.
 pub fn seed_step_randomness(net_seed: u64, step: u64, call_index: u64) {
     let mixed = net_seed
         .wrapping_add(step.wrapping_mul(0x9E37_79B9_7F4A_7C15))
@@ -66,12 +34,8 @@ pub fn seed_step_randomness(net_seed: u64, step: u64, call_index: u64) {
     flodl::manual_seed(mixed);
 }
 
-/// Deterministic train step: seeds the per-(net, step) RNG stream, then runs
-/// [`train_one_step`]. The seeding MUST precede the forward/backward pass for
-/// the replay/catch-up contract to hold (dropout masks identical across
-/// replays) — bundling both into one call makes that ordering impossible to
-/// get wrong at the call site. Custom schemes that manage their own RNG can
-/// call [`train_one_step`] directly.
+/// Deterministic train step: seeds the per-`(net, step)` RNG stream, then runs
+/// [`train_one_step`] — the seed must precede the forward pass.
 #[allow(clippy::too_many_arguments)] // seed triple + step inputs; all required, none optional
 pub fn deterministic_train_step(
     net_seed: u64,
@@ -83,23 +47,15 @@ pub fn deterministic_train_step(
     batch: &(Tensor, Tensor),
     grad_clip: f32,
 ) -> Result<f32> {
-    // The seed→forward→backward region must be exclusive against any other
-    // thread touching the generator (see [`rng_lock`]) — otherwise another
-    // thread's draw can land between our seed and our dropout mask.
+        // The seed→forward→backward region must be exclusive against any other
+        // thread touching the generator (see [`rng_lock`]).
     let _guard = rng_lock();
     seed_step_randomness(net_seed, step, call_index);
     train_one_step(net, optimizer, loss_fn, batch, grad_clip)
 }
 
-// ── Generic (`F: Fn`) siblings ──────────────────────────────────────────────
-//
-// EFFICIENCY NOTE (Tier 2 — `F: Fn` beside `&dyn Fn`): the `&dyn Fn` forms
-// above are what the ENGINE uses (the loss arrives through a boxed trait,
-// so a generic would just re-box). These generic siblings exist for the
-// EXAMPLE/user side, where the loss is a concrete closure: monomorphization
-// gives a direct call (no vtable indirection) and the closure can inline
-// into the hot forward+backward path. Same replay contract — pick the form
-// that matches where your closure comes from.
+    // ── Generic (`F: Fn`) siblings — for the example/user side, where the loss
+    // is a concrete closure (monomorphized call, no vtable). Same contract. ──
 
 /// Generic sibling of [`deterministic_train_step`]: monomorphized loss
 /// closure (direct call, inlinable — no vtable). See the note above.
@@ -177,37 +133,14 @@ pub fn train_one_step(
     Ok(loss_val)
 }
 
-/// One RL-style train step: forward + `pred`-only loss + backward + optimizer
-/// step. No target tensor — the training signal (rewards, advantages, …) is
-/// captured inside the loss closure itself. Same backward/clip/step skeleton
-/// as [`train_one_step`]; deterministic seeding stays the caller's job via
-/// [`seed_step_randomness`]. Returns the batch's training loss.
-pub fn train_one_step_pred_only(
-    net: &mut Network,
-    optimizer: &mut dyn Optimizer,
-    loss_fn: &dyn Fn(&Variable) -> Result<Variable>,
-    inputs: &Tensor,
-    grad_clip: f32,
-) -> Result<f32> {
-    let x = Variable::new(inputs.clone(), true);
-    let pred = net.forward(&x)?;
-    let loss = loss_fn(&pred)?;
-    let loss_val = loss.item().unwrap_or(0.0) as f32;
-    loss.set_requires_grad(true)?;
-    optimizer.zero_grad();
-    loss.backward()?;
-    if grad_clip > 0.0 {
-        flodl::clip_grad_norm(&net.parameters(), grad_clip as f64)?;
-    }
-    optimizer.step()?;
-    Ok(loss_val)
-}
-
 /// What one eval step reports: loss, ranking fitness, and the informative
 /// metric values (same order as the run's `Vec<Metric>`).
 pub struct EvalReport {
+    /// Eval loss when the trainer reports one.
     pub eval_loss: Option<f32>,
+    /// Ranking fitness for this eval batch.
     pub fitness: f32,
+    /// Informative metric values, in the run's `Vec<Metric>` order.
     pub metrics: Vec<f32>,
 }
 
@@ -275,23 +208,8 @@ mod tests {
         Network::build(&topo, flodl::Device::CPU).unwrap()
     }
 
-    // NOTE: this test is #[ignore]d by default. Root cause (proven by probe):
-    // libtorch's CPU generator is a PROCESS-GLOBAL singleton whose seed and
-    // draws are mutex-protected but NOT transactional — another thread can
-    // interleave [seed; draw] pairs between ours, so "seed then draw" is only
-    // deterministic when no other thread touches the generator concurrently.
-    // The full test suite runs tests in parallel and other tests draw from
-    // the generator (proptest `randn` inputs, Network builds) without taking
-    // the engine's RNG lock — so an exact-equality assert here flakes ~40% of
-    // runs. Run it serially to verify the contract it guards:
-    //
-    //   cargo test --lib dropout_masks -- --test-threads=1 --ignored
-    //
-    // (mirrors flodl's own global-RNG test, also `#[ignore] --test-threads=1`).
-    // The ENGINE contract itself is unaffected and enforced structurally: the
-    // group loop is single-threaded and seeds immediately before every
-    // trainer step / catch-up replay, and `deterministic_train_step` takes
-    // `rng_lock()` internally.
+        // #[ignore]d by default: libtorch's CPU generator is process-global and
+        // not transactional, so exact-equality flakes under parallel tests.
     #[test]
     #[ignore = "needs --test-threads=1: libtorch's generator is process-global and other tests draw from it concurrently (see comment)"]
     fn dropout_masks_reproduce_under_seed_step_randomness() {

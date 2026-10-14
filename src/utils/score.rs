@@ -139,10 +139,8 @@ pub fn cross_entropy_onehot(pred: &Variable, y: &Variable) -> Result<f32> {
     Ok(-masked.sum()?.item()? as f32 / n)
 }
 
-/// Label-smoothed softmax cross-entropy loss (for backward): the one-hot
-/// target is softened to `1−ε` on the true class and `ε/n_classes` elsewhere
-/// before the standard CE — penalizes overconfident logits, regularizes the
-/// survivor nets. `ε = 0` reduces exactly to [`cross_entropy_onehot_loss`].
+/// Label-smoothed CE loss (for backward): the one-hot target is softened to
+/// `1−ε` on the true class and `ε/n_classes` elsewhere. `ε = 0` = plain CE.
 pub fn label_smoothing_cross_entropy_loss(
     pred: &Variable,
     y: &Variable,

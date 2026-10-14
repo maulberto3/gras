@@ -24,11 +24,12 @@ use flodl::{DType, Device};
 use crate::utils::error::DataError;
 
 /// One input/target pair, ready for the engine: `inputs [n, in_dim]`,
-/// `targets [n, out_dim]`. Tensors only — the engine never sees other data
-/// types.
+/// `targets [n, out_dim]`. Tensors only — the engine never sees other types.
 #[derive(Clone, Debug)]
 pub struct Dataset {
+    /// Input tensor `[n, in_dim]`.
     pub inputs: Tensor,
+    /// Target tensor `[n, out_dim]`.
     pub targets: Tensor,
 }
 
@@ -43,10 +44,8 @@ impl Dataset {
         self.len() == 0
     }
 
-    /// Cast both tensors to `Float32` if they aren't already — flodl's
-    /// native workhorse dtype and this crate's default precision. The
-    /// engine calls this on load, so a dataset written in another dtype
-    /// (e.g. Float64) is normalized once, up front.
+        /// Cast both tensors to `Float32` (flodl's workhorse dtype) so a dataset
+        /// written in another dtype is normalized once, up front.
     pub fn to_f32(&self) -> Result<Dataset> {
         self.to_dtype(DType::Float32)
     }
@@ -84,13 +83,8 @@ impl Dataset {
         })
     }
 
-    /// Row-concatenate two datasets into one (`train rows first, then
-    /// `other`'s`). Both must share feature and target dims (the caller —
-    /// [`resolve_train_test_datasets`] — already validated them) and sit on
-    /// the same device. Used by the engine's explicit train/test layout: the
-    /// combined dataset goes into the shared stream, and the stream's pools
-    /// are built BY CONSTRUCTION over the two row ranges instead of by a
-    /// random split of one pool (see `PoolSplit::explicit`).
+        /// Row-concatenate two datasets (`self` rows first) — shared dims/device —
+        /// used by the explicit train/test layout to build pools by construction.
     pub fn concat(&self, other: &Dataset) -> Result<Dataset> {
         Ok(Dataset {
             inputs: Tensor::cat_many(&[&self.inputs, &other.inputs], 0)?,
@@ -106,9 +100,12 @@ const MAGIC: &[u8; 4] = b"GRA1";
 
 /// Single-byte dtype tags in the header.
 const TAG_F32: u8 = 0;
+/// Binary tag byte for Float64 tensors.
 const TAG_F64: u8 = 1;
+/// Binary tag byte for Int64 tensors.
 const TAG_I64: u8 = 2;
 
+/// Map a `DType` to its binary tag byte.
 fn dtype_tag(dtype: DType) -> std::result::Result<u8, DataError> {
     match dtype {
         DType::Float32 => Ok(TAG_F32),
@@ -120,6 +117,7 @@ fn dtype_tag(dtype: DType) -> std::result::Result<u8, DataError> {
     }
 }
 
+/// Map a binary tag byte back to a `DType`.
 fn tag_dtype(tag: u8) -> std::result::Result<DType, DataError> {
     match tag {
         TAG_F32 => Ok(DType::Float32),
@@ -129,6 +127,7 @@ fn tag_dtype(tag: u8) -> std::result::Result<DType, DataError> {
     }
 }
 
+/// Byte width of one element of `dtype`.
 fn elem_size(dtype: DType) -> usize {
     match dtype {
         DType::Float32 => 4,
@@ -202,27 +201,22 @@ pub fn load_tensor(path: &Path) -> Result<Tensor> {
 /// On-disk format for [`save_dataset_as`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataFormat {
-    /// flodl-native binary tensors (`inputs.bin` + `targets.bin` + a
-    /// human-readable `meta.json`). Lossless and fast to load — the
-    /// engine's native format.
+        /// flodl-native binary tensors (`inputs.bin` + `targets.bin` + `meta.json`):
+        /// lossless and fast — the engine's native format.
     Bin,
-    /// Plain-text floats (`inputs.csv` + `targets.csv`, 6-decimal
-    /// precision). Human-inspectable and portable; lossy for full f32
-    /// precision.
+        /// Plain-text floats (`inputs.csv` + `targets.csv`, 6-decimal precision):
+        /// human-inspectable and portable, lossy for full f32 precision.
     Csv,
     /// Write **both** formats into `dir`, so the same dataset is usable
     /// by tools that only read one or the other.
     Both,
 }
 
-/// Save a dataset in the requested format — the one-stop convenience
-/// over [`save_dataset`] (`.bin`) and [`save_csv_dataset`] (`.csv`).
-/// With [`DataFormat::Both`] the directory ends up with `inputs.bin` +
-/// `targets.bin` + `inputs.csv` + `targets.csv`.
+/// Save a dataset in the requested format — one-stop over [`save_dataset`] (`.bin`)
+/// and [`save_csv_dataset`] (`.csv`); `Both` writes all four files.
 pub fn save_dataset_as(dir: impl AsRef<Path>, ds: &Dataset, format: DataFormat) -> Result<()> {
-    // `impl AsRef<Path>` is an owned generic — normalize to `&Path` ONCE, up
-    // front, then reuse the borrow (a generic moved twice would be a compile
-    // error; this is also why `&str`/`&Path` wrappers around it are free).
+        // `impl AsRef<Path>` is an owned generic — normalize to `&Path` ONCE up front
+        // and reuse the borrow.
     let dir = dir.as_ref();
     match format {
         DataFormat::Bin => save_dataset(dir, ds),
@@ -234,11 +228,8 @@ pub fn save_dataset_as(dir: impl AsRef<Path>, ds: &Dataset, format: DataFormat) 
     }
 }
 
-/// Load a dataset written in **either** format — the read-side counterpart
-/// of [`save_dataset_as`]. Looks for `inputs.bin` (native) first, then
-/// `inputs.csv`; errors if the directory holds neither. Unlike
-/// [`resolve_dataset`] it does no CSV→bin caching — pure "read what's
-/// there".
+/// Load a dataset written in **either** format — looks for `inputs.bin` first,
+/// then `inputs.csv`; no CSV→bin caching. Read-side counterpart of `save_dataset_as`.
 pub fn load_dataset_auto(dir: impl AsRef<Path>) -> Result<Dataset> {
     let dir = dir.as_ref();
     if dir.join("inputs.bin").exists() {
@@ -280,14 +271,8 @@ pub fn save_dataset(dir: impl AsRef<Path>, ds: &Dataset) -> Result<()> {
     Ok(())
 }
 
-/// Load a dataset written by [`save_dataset`].
-///
-/// EFFICIENCY NOTE (Tier 1 — `impl AsRef<Path>`): a `&Path` parameter forces
-/// callers with a `String`/`&str`/`PathBuf` to build a `Path` first
-/// (`Path::new(HOLDOUT_DIR)`). `impl AsRef<Path>` accepts ALL of them — the
-/// generic monomorphizes to a cheap `.as_ref()` at compile time (zero
-/// runtime cost, since `AsRef<Path> for &Path` is a no-op) — so the loader
-/// is callable as `load_dataset("data/mnist")` directly.
+/// Load a dataset written by [`save_dataset`]. `impl AsRef<Path>` accepts
+/// `&str`/`String`/`PathBuf` directly (`load_dataset("data/mnist")`).
 pub fn load_dataset(dir: impl AsRef<Path>) -> Result<Dataset> {
     let dir = dir.as_ref();
     let inputs = load_tensor(&dir.join("inputs.bin"))?;
@@ -295,30 +280,14 @@ pub fn load_dataset(dir: impl AsRef<Path>) -> Result<Dataset> {
     Ok(Dataset { inputs, targets })
 }
 
-/// Auto-detect data format: .bin (cached or direct) or .csv (converts to .bin).
-///
-/// Priority:
-/// 1. `{dir}/flodl_data/inputs.bin` (cached .bin)
-/// 2. `{dir}/inputs.bin` (direct .bin)
-/// 3. `{dir}/inputs.csv` → convert → cache in `{dir}/flodl_data/`
-///
-/// Single-pool contract: `inputs.csv|bin` + `targets.csv|bin` in ONE pool —
-/// the engine splits it internally (train/eval/gating). For a directory with
-/// explicit `train/` + `test/` splits, use [`resolve_train_test_datasets`].
-///
-/// Errors loudly if the directory holds no recognizable dataset — there is
-/// deliberately NO synthetic fallback: silent made-up data corrupts runs.
+/// Auto-detect the format: `flodl_data/inputs.bin`, then `inputs.bin`, then
+/// `inputs.csv` (converted + cached). Errors loudly — no synthetic fallback.
 pub fn resolve_dataset(dir: impl AsRef<Path>) -> Result<Dataset> {
     resolve_inputs_targets_datasets(dir)
 }
 
-/// Resolve a **single-pool** dataset directory: `inputs.csv|bin` +
-/// `targets.csv|bin` living side by side (the Kaggle-style layout —
-/// `data/kaggle_ev_s6e9/`). First CSV load converts to `.bin` under
-/// `<dir>/flodl_data/` and caches. The engine then splits the pool
-/// internally into train/eval/gating (90/10-style seeded split).
-///
-/// Errors loudly if nothing recognizable is present — no synthetic fallback.
+/// Resolve a **single-pool** dataset dir (`inputs.csv|bin` + `targets.csv|bin`),
+/// caching CSV→bin under `<dir>/flodl_data/`. No synthetic fallback.
 pub fn resolve_inputs_targets_datasets(dir: impl AsRef<Path>) -> Result<Dataset> {
     let dir = dir.as_ref();
     let cache_dir = dir.join("flodl_data");
@@ -355,17 +324,8 @@ pub fn resolve_inputs_targets_datasets(dir: impl AsRef<Path>) -> Result<Dataset>
     .into())
 }
 
-/// Resolve a **two-split** dataset directory: `train/` and `test/` subdirs,
-/// each holding `inputs.csv|bin` + `targets.csv|bin` (the MNIST-style layout
-/// — `data/mnist/{train,test}/` as produced by `mnist_data.rs`). CSV splits
-/// are converted to `.bin` and cached in each split's own `flodl_data/`.
-///
-/// Returns `(train, test)` as two independent datasets: the engine trains on
-/// the train pool and evaluates on the test pool — no internal reshuffle of
-/// rows between them, so eval rows are genuinely unseen by training.
-///
-/// Errors loudly if either split is missing or unreadable — no synthetic
-/// fallback, a half-present dataset must stop the run before it starts.
+/// Resolve a **two-split** dataset dir (`train/` + `test/`), each with
+/// `inputs.csv|bin` + `targets.csv|bin`; returns two independent datasets.
 pub fn resolve_train_test_datasets(dir: impl AsRef<Path>) -> Result<(Dataset, Dataset)> {
     let dir = dir.as_ref();
     let train_dir = dir.join("train");
@@ -409,12 +369,8 @@ pub fn resolve_train_test_datasets(dir: impl AsRef<Path>) -> Result<(Dataset, Da
     Ok((train, test))
 }
 
-/// Load a dataset from CSV files (`inputs.csv` + `targets.csv`).
-///
-/// CSV format: one sample per line, comma-separated floats.
-/// Headers are auto-detected (skipped if first row contains non-numeric values).
-/// Lines starting with `#` are treated as comments and skipped.
-/// All data rows must have the same number of columns.
+/// Load a dataset from CSV files (`inputs.csv` + `targets.csv`): one sample per
+/// line; headers and `#` comments are skipped.
 pub fn load_csv_dataset(dir: impl AsRef<Path>) -> Result<Dataset> {
     let dir = dir.as_ref();
     let inputs_path = dir.join("inputs.csv");
@@ -550,9 +506,8 @@ pub fn load_csv_dataset(dir: impl AsRef<Path>) -> Result<Dataset> {
     Ok(Dataset { inputs, targets })
 }
 
-/// Save tensors as CSV files (`inputs.csv` + `targets.csv`).
-///
-/// Each row is one sample, values comma-separated.
+/// Save tensors as CSV files (`inputs.csv` + `targets.csv`), one sample per line,
+/// values comma-separated.
 pub fn save_csv_dataset(dir: impl AsRef<Path>, inputs: &Tensor, targets: &Tensor) -> Result<()> {
     let dir = dir.as_ref();
     fs::create_dir_all(dir).map_err(|source| DataError::Io {
@@ -604,9 +559,8 @@ pub fn save_csv_dataset(dir: impl AsRef<Path>, inputs: &Tensor, targets: &Tensor
     Ok(())
 }
 
-/// Generate a synthetic classification dataset: random inputs `[n, in_dim]`
-/// and one-hot targets `[n, out_dim]` (each row sums to 1). Quick stand-in
-/// for MNIST or any categorical task — no download needed.
+/// Generate a synthetic classification dataset: random inputs and one-hot targets
+/// — a quick stand-in for MNIST or any categorical task, no download needed.
 pub fn synthetic_classification(
     n: usize,
     in_dim: usize,
@@ -682,6 +636,7 @@ pub fn split_indices(
     let eval: Vec<i64> = indices[split..].to_vec();
     // Silent fallback: if eval is empty, use all data for eval
     if eval.is_empty() {
+        // One-shot so the "unseedable" warning prints at most once per process.
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
             tracing::warn!(

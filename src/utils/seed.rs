@@ -13,9 +13,8 @@ pub fn derive_seed(base: u64, i: usize) -> u64 {
     base.wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
-/// xxh3 hash of a topology's canonical JSON — 16 hex chars, deterministic,
-/// near-zero collisions. The canonical identity for a topology everywhere it
-/// appears (net state files, race snapshots).
+/// xxh3 of a topology's canonical JSON — 16 hex chars, deterministic. The
+/// topology's identity everywhere it appears (net files, race snapshots).
 pub fn topo_hash(topology_json: &str) -> String {
     format!(
         "{:016x}",

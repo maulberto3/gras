@@ -3,17 +3,8 @@
 use crate::graph::node::{Activation, Node, NodeKind};
 use crate::graph::topology::{Connection, KindCounts, Port};
 
-/// Precompute wiring table: per node, per port, list of source ports.
-///
-/// **Order is deterministic**: each port's sources appear in CONNECTION
-/// order (the order wires were declared / saved to JSON), regardless of map
-/// type — the per-key Vec preserves push order. The src index derived from
-/// this Vec names the bridge Linear `proj<node>_<port>_<src>` in the
-/// safetensors exporter AND the Python loader
-/// (examples/python/load_gras_net.py), so both must count the same way.
-/// The map itself is a BTreeMap purely so any iteration over it (diagnostics,
-/// future callers) is key-ordered, never hash-seed dependent — the per-port
-/// Vec order, the load-bearing part, is connection order either way.
+/// Per node, per input port, the list of source ports in CONNECTION order —
+/// the order the safetensors exporter and the Python loader both count by.
 pub(crate) fn build_node_sources(
     connections: &[Connection],
     num_inputs: &[usize],
@@ -130,9 +121,8 @@ pub(crate) fn node_activation_counts(nodes: &[Node]) -> Vec<(Activation, usize)>
     counts
 }
 
-/// Per-port activation histogram: one entry per OUTPUT PORT of every node
-/// (what actually flows on the wires), counting each port's effective
-/// activation — per-port override when set, node-level activation otherwise.
+/// Per-port activation histogram: one entry per OUTPUT PORT (what actually
+/// flows on the wires), using each port's effective activation.
 pub(crate) fn port_activation_counts(nodes: &[Node]) -> Vec<(Activation, usize)> {
     let mut counts: Vec<(Activation, usize)> = Vec::new();
     for n in nodes {

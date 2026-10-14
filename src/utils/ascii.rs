@@ -8,9 +8,13 @@ use crate::graph::topology::{Connection, Topology};
 /// Per-node description consumed by [`render_wire_diagram`].
 #[derive(Clone, Copy)]
 pub(crate) struct AsciiNode {
+    /// Stable id (index in `Topology::nodes`).
     pub id: usize,
+    /// Input/Hidden/Output role.
     pub kind: NodeKind,
+    /// Input ports.
     pub num_inputs: usize,
+    /// Output ports.
     pub num_outputs: usize,
     /// Output dimension (from node_dims), shown in parentheses.
     pub out_dim: Option<usize>,
@@ -22,6 +26,7 @@ pub(crate) struct AsciiNode {
     pub out_wires: usize,
 }
 
+/// Render the ASCII wire diagram for `nodes` and their `connections`.
 pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection]) -> String {
     if nodes.is_empty() {
         return "(empty graph)".to_string();
@@ -37,10 +42,8 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
     let labels: Vec<String> = nodes
         .iter()
         .map(|n| {
-            // Wires vs ports, stated explicitly on both sides:
-            // `in: 2 wires → 1 port · out: 1 port → 3 wires`. A bare port
-            // count read as "one input" while 4 arrows arrived (or hid a
-            // fan-out) — the wire counts make the box match the arrows.
+                // Wires vs ports on both sides: `in: 2 wires → 1 port` — the
+                // wire counts make the box match the arrows.
             let in_part = format!("{}w→{}i", n.in_wires.max(n.num_inputs), n.num_inputs);
             let out_part = format!("{}o→{}w", n.num_outputs, n.out_wires.max(n.num_outputs));
             match n.out_dim {
@@ -65,15 +68,8 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         .map(|c| c.from.node < c.to.node && c.to.node < nodes.len() && c.to.node > 0)
         .collect();
 
-    // ── Port slots: ONE PER WIRE, so every wire is drawn one-to-one. ──
-    // A port can carry several wires (the Input node fans out; any node's
-    // fan-in is merged by the combine op). Drawing the port once made those
-    // wires share a column and split ambiguously — a `> ` with three wires
-    // leaving it read as one signal, not three. Instead each wire gets its
-    // OWN slot, labelled with its port index (a shared port's label simply
-    // repeats: `o1 o1` = two wires off output 1), so every `>`/`<` marker
-    // maps to exactly one wire and the text diagram matches the mermaid edge
-    // list visually. A port with no wires still gets one slot (an orphan `*`).
+        // ── Port slots: ONE PER WIRE, so each wire is drawn one-to-one. ──
+        // A shared port's label simply repeats (`o1 o1`); no wires → one orphan slot.
     let mut out_slots: Vec<Vec<(usize, Option<usize>)>> = Vec::with_capacity(nodes.len());
     let mut in_slots: Vec<Vec<(usize, Option<usize>)>> = Vec::with_capacity(nodes.len());
     let mut src_slot = vec![0usize; connections.len()];
@@ -112,9 +108,8 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         }
         in_slots.push(slots);
     }
-    // Slot labels: each wire is labelled with its PORT index, so a port that
-    // carries several wires shows its label repeated (`o1 o1` = two wires off
-    // output 1). One marker per wire — the repeat IS the fan-out.
+        // Each wire is labelled with its PORT index, so a port carrying several
+        // wires shows its label repeated (`o1 o1` = fan-out).
     let slot_labels = |prefix: char, ports: &[usize]| -> Vec<String> {
         ports.iter().map(|p| format!("{prefix}{p}")).collect()
     };
@@ -192,14 +187,10 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
             .count()
     };
 
-    // Per-node box height, driven by port count and normalized within the
-    // net (the same relative-sizing spirit as the wire-lane tiers below):
-    // the node with the fewest ports gets the base height, the node with the
-    // most ports gets base + MAX_EXTRA, everything in between scales
-    // linearly. Box size thus carries information — a tall box is a wide
-    // fan-in/fan-out node. Rows 0..3 are structural (label / inputs /
-    // outputs / padding) and must not move: wire drops anchor at +1 and +2.
+    // Per-node box height: fewest ports → base, most ports → base + MAX_EXTRA,
+    // scaling linearly in between. Rows 0..3 are structural and must not move.
     let base_rows = 4usize;
+    /// Extra rows the widest node may add (relative box sizing).
     const MAX_EXTRA: usize = 4;
     let ports = |n: &AsciiNode| n.num_inputs.max(n.num_outputs);
     let min_ports = nodes.iter().map(ports).min().unwrap_or(0);
@@ -394,10 +385,8 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
     out
 }
 
-/// Compact edge list with distance markers for a [`Topology`].
-///
-/// Sorts connections by source node, shows the distance (in hops) between
-/// source and target, and highlights long-range jumps with `>>>` markers.
+/// Compact edge list with distance markers for a [`Topology`] — sorted by
+/// source node, long-range jumps marked `>>>`.
 pub(crate) fn edge_list(graph: &Topology) -> String {
     let mut out = String::new();
     let n = graph.connections.len();
