@@ -26,18 +26,21 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::graph::node::Node;
-use crate::graph::topology::{Connection, Topology, TopologyOptions};
-
-/// JSON round-trip representation of a [`Topology`] — the blueprint minus the
-/// RNG. `options.topology_seed` is what makes regeneration reproducible, so the RNG is
-/// rebuilt from it on load rather than stored.
+use crate::graph::topology::{Connection, Topology, TopologyOptions};    /// JSON round-trip representation of a [`Topology`] — the blueprint minus
+    /// the RNG. `options.topology_seed` makes regeneration reproducible.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Spec {
+    /// Topology id this blueprint was captured from.
     pub id: usize,
+    /// The options the graph was built with (incl. `topology_seed`).
     pub options: TopologyOptions,
+    /// Nodes in graph order.
     pub nodes: Vec<Node>,
+    /// Names of the graph's input ports.
     pub graph_inputs: Vec<String>,
+    /// Names of the graph's output ports.
     pub graph_outputs: Vec<String>,
+    /// Finalized wiring between ports (no RNG state).
     pub connections: Vec<Connection>,
 }
 
@@ -123,10 +126,8 @@ mod tests {
     }
 
     #[test]
-    fn test_topology_json_rebuilds_same_architecture() {
-        // The blueprint is the single source of truth: saving/loading it and
-        // re-building yields the same architecture (fresh random weights —
-        // weights are never serialized).
+    fn test_topology_json_rebuilds_same_architecture() {            // The blueprint is the single source of truth: saving/loading it and
+            // re-building yields the same architecture (fresh random weights).
         use crate::graph::network::Network;
         use crate::graph::node::Activation;
         use flodl::nn::Module;
@@ -181,11 +182,8 @@ mod tests {
         fn prop_topology_json_roundtrip(graph in topology_strategy()) {
             let json = graph.to_json().unwrap();
             let loaded: Topology = Topology::from_json(&json).unwrap();
-            prop_assert_eq!(Spec::from(&loaded), Spec::from(&graph));
-
-            // Reproducibility: with both RNGs back at the seed, a reloaded
-            // graph rewires identically (same connections, same order) to a
-            // fresh graph with the same topology and options.
+            prop_assert_eq!(Spec::from(&loaded), Spec::from(&graph));                // Reproducibility: with both RNGs back at the seed, a reloaded
+                // graph rewires identically to a fresh graph with the same options.
             let mut loaded = loaded;
             let mut fresh = graph;
             loaded.rng = fastrand::Rng::with_seed(loaded.options.topology_seed as u64);

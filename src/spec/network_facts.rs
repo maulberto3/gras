@@ -7,29 +7,43 @@ use flodl::nn::Module;
 
 use crate::utils::graph_utils;
 
-/// Materialized-network diagnostics — the network's "nutrition label".
-/// Mirrors what [`Network::to_json`] used to produce; lives here alongside
-/// [`Spec`](super::Spec) so all serialization stays in one module.
+/// The network's "nutrition label": structure, parameter counts, and a census
+/// of every per-node op. Built from a live [`Network`](crate::graph::network::Network).
 pub struct NetworkFacts {
+    /// Name the network carries.
     pub name: String,
+    /// Input feature dimension.
     pub input_dim: usize,
+    /// Hidden width (0 when the net has no hidden nodes).
     pub hidden_dim: usize,
+    /// Index of the node that produces the output.
     pub output_node: usize,
+    /// Live nodes in the graph.
     pub num_nodes: usize,
+    /// Wires (connections) in the graph.
     pub num_wires: usize,
+    /// Number of trainable parameter tensors.
     pub param_tensors: usize,
+    /// Total scalar parameters across those tensors.
     pub param_elements: i64,
+    /// Projection tensors the port wiring allocated.
     pub port_projections: usize,
+    /// `(in, out)` dimension per node index.
     pub node_dims: Vec<(usize, usize)>,
+    /// `(in, out)` degree per node.
     pub degrees: Vec<(usize, usize)>,
+    /// Topological depth per node (0 = feeds straight from input).
     pub depths: Vec<usize>,
+    /// `(orphaned inputs, orphaned outputs)`.
     pub orphan_counts: (usize, usize),
+    /// `(input, hidden, output)` node counts.
     pub kind_counts: (usize, usize, usize),
+    /// Activation → how many nodes use it.
     pub activation_counts: Vec<(crate::graph::node::Activation, usize)>,
+    /// Normalization op → how many nodes use it.
     pub standardize_counts: Vec<(crate::graph::node::StandardizeOp, usize)>,
-    /// Per-port activation census: how many ports carry each activation,
-    /// across the whole graph (node-level + per-port overrides combined —
-    /// what actually flows, port by port).
+    /// Per-port activation census over the whole graph (node-level + per-port
+    /// overrides combined — what actually flows, port by port).
     pub port_activation_counts: Vec<(crate::graph::node::Activation, usize)>,
 }
 
