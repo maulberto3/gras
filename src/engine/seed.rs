@@ -1,6 +1,7 @@
 //! Seed the founder batch from a PREVIOUS experiment's elites.
 //!
-//! `RaceConfig::seed_previous_run` turns this on: the newest compatible prior
+//! The engine does this automatically (it is on by default; turn it off with
+//! `RaceConfig::set_elite_previous_load(false)`): the newest compatible prior
 //! run's ELITES are copied in as the first slots of the initial population, in
 //! rank order (best first), capped by the new run's `pop_size`; the rest stay
 //! random draws. The cap is what makes a small population work: with 10 elites
@@ -18,7 +19,7 @@
 //! guardrail-certified champion, which is exactly the old behavior.
 //!
 //! Resolution (deterministic, and every failure is survivable):
-//! 1. root = `set_run_seed_previous_dir(path)`, else [`DEFAULT_RESULTS_ROOT`].
+//! 1. root = `set_elite_previous_dir(path)`, else [`DEFAULT_RESULTS_ROOT`].
 //!    A root that IS a run dir (it holds `engine.json`) is used as-is;
 //!    otherwise the newest run dir under it wins — newest by the numeric
 //!    `run_id` prefix, so both the timestamped `results/<id>` layout and the
@@ -52,7 +53,7 @@ use std::path::{Path, PathBuf};
 use crate::graph::topology::Topology;
 use crate::state::RunHeader;
 
-/// Root searched when `set_run_seed_previous_dir` is unset — the engine's own
+/// Root searched when `set_elite_previous_dir` is unset — the engine's own
 /// output directory.
 pub const DEFAULT_RESULTS_ROOT: &str = "results";
 
@@ -150,10 +151,21 @@ pub fn resolve_plan(
     trainer_name: Option<&str>,
     max_seeds: usize,
 ) -> SeedOutcome {
+    let explicit = root.is_some();
     let root = root.unwrap_or(Path::new(DEFAULT_RESULTS_ROOT));
     let dirs = run_dirs(root, exclude);
     let Some(dir) = dirs.first() else {
-        return SeedOutcome::Skipped(format!("no run directories under {}", root.display()));
+        // The caller's one-line receipt leans on these two wordings: an explicit
+        // dir that holds no run is different from the default folder simply not
+        // existing yet (a first-ever run inherits nothing).
+        return SeedOutcome::Skipped(if explicit {
+            format!("no previous run under {}", root.display())
+        } else {
+            format!(
+                "default folder `{}/` not found — no previous run to inherit from",
+                root.display()
+            )
+        });
     };
     let header = match read_header(dir) {
         Ok(h) => h,
@@ -164,12 +176,14 @@ pub fn resolve_plan(
     let src_mode = header.engine_mode.as_deref().unwrap_or("unknown");
     if src_mode != mode {
         return SeedOutcome::Skipped(format!(
-            "newest run {source_run_id} is engine_mode {src_mode}, this run is {mode}"
+            "different experiment — newest run {source_run_id} is engine_mode {src_mode}, \
+             this run is {mode}"
         ));
     }
     if header.input_dim != input_dim || header.output_dim != output_dim {
         return SeedOutcome::Skipped(format!(
-            "newest run {source_run_id} is {}→{}, this run is {input_dim}→{output_dim}",
+            "different experiment — newest run {source_run_id} is {}→{}, this run is \
+             {input_dim}→{output_dim}",
             header.input_dim, header.output_dim
         ));
     }
@@ -177,7 +191,8 @@ pub fn resolve_plan(
     if let (Some(a), Some(b)) = (src_trainer, trainer_name) {
         if a != b {
             return SeedOutcome::Skipped(format!(
-                "newest run {source_run_id} was trained by `{a}`, this run by `{b}`"
+                "different experiment — newest run {source_run_id} was trained by `{a}`, \
+                 this run by `{b}`"
             ));
         }
     }

@@ -484,13 +484,13 @@ impl CoreEngine {
         // Manual founders WIN: `set_run_topologies` is the user naming the batch, so the
         // engine must not inject a net they did not ask for (or shift every ordinal).
         let manual_founders = !config.run_topologies.is_empty();
-        if config.seed_previous_run && manual_founders {
+        if config.elite_previous_load && manual_founders {
             println!(
-                "seed_previous_run: skipped — {} founder blueprint(s) supplied via \
+                "elite_previous_load: skipped — {} founder blueprint(s) supplied via \
                  set_run_topologies (manual founders win)",
                 config.run_topologies.len()
             );
-        } else if config.seed_previous_run {
+        } else if config.elite_previous_load {
             // The compatibility gate reads the candidate's engine.json header,
             // so this run's own header (mode, dims, trainer name) is the input.
             let trainer_name = header
@@ -501,7 +501,7 @@ impl CoreEngine {
             // `max_seeds = pop_size`: the WHOLE elite list comes over in rank order, so the
             // founders are the source's own ranking, never a reshuffle of it.
             match super::seed::resolve_plan(
-                config.seed_previous_run_dir.as_deref(),
+                config.elite_previous_dir.as_deref(),
                 // This run's own dir already exists on disk (the header is
                 // written above), so it would otherwise be "the newest run".
                 Some(run_dir.as_path()),
@@ -515,8 +515,10 @@ impl CoreEngine {
                     let champ = plan.champion();
                     let short = &champ.champion_hash[..8.min(champ.champion_hash.len())];
                     let n = plan.picks.len();
-                    info!(
-                        "seed_previous_run: ranks 1..{n} of run {} ({}{}) → founder slot(s) {}{}",
+                    // Deliberately a plain println, like the skip line below: the
+                    // inheritance receipt must be visible at any log level.
+                    println!(
+                        "elite_previous_load: inherited ranks 1..{n} of run {} ({}{}) → founder slot(s) {}{}",
                         plan.source_run_id,
                         plan.source_dir.display(),
                         champ
@@ -554,7 +556,7 @@ impl CoreEngine {
                 super::seed::SeedOutcome::Skipped(why) => {
                     // Deliberately a plain println: this is a fact about what the run INHERITED and
                     // must be visible at any log level. The run continues all-random either way.
-                    println!("seed_previous_run: {why} — starting from an all-random population");
+                    println!("elite_previous_load: {why} — starting from an all-random population");
                 }
             }
         }
@@ -4701,8 +4703,8 @@ mod tests {
         let data_dir = tiny_dataset_dir("seeded");
         let config = RaceConfig {
             pop_size: 3,
-            seed_previous_run: true,
-            seed_previous_run_dir: Some(seed_root.to_path_buf()),
+            elite_previous_load: true,
+            elite_previous_dir: Some(seed_root.to_path_buf()),
             ..RaceConfig::defaults()
         };
         crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
@@ -4718,7 +4720,7 @@ mod tests {
     /// The happy path: slot 0 carries the champion's blueprint, the population is
     /// full, lineage says where it came from, and the receipt is recorded.
     #[test]
-    fn seed_previous_run_imports_the_certified_champion() {
+    fn elite_previous_load_imports_the_certified_champion() {
         let prior = std::env::temp_dir().join("gras-seedprior-good");
         let _ = std::fs::remove_dir_all(&prior);
         std::fs::create_dir_all(&prior).unwrap();
@@ -4760,7 +4762,7 @@ mod tests {
         assert_eq!(source.champion_params, Some(4242));
         assert_eq!(source.guardrail_mean, Some(0.30));
         assert_eq!(header.config.run_topology_count, 0);
-        assert!(header.config.seed_previous_run);
+        assert!(header.config.elite_previous_load);
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&prior);
@@ -4769,7 +4771,7 @@ mod tests {
     /// Every failure mode degrades to an all-random population of the right size —
     /// no panic, no short population, no false `run_topology_source`.
     #[test]
-    fn seed_previous_run_failures_fall_back_to_random() {
+    fn elite_previous_load_failures_fall_back_to_random() {
         // A prior run with NO guardrail champion recorded.
         let prior = std::env::temp_dir().join("gras-seedprior-none");
         let _ = std::fs::remove_dir_all(&prior);
@@ -4869,8 +4871,8 @@ mod tests {
         let manual = tiny_topology(11);
         let config = RaceConfig {
             pop_size: 3,
-            seed_previous_run: true,
-            seed_previous_run_dir: Some(prior.clone()),
+            elite_previous_load: true,
+            elite_previous_dir: Some(prior.clone()),
             run_topologies: vec![manual.clone()],
             ..RaceConfig::defaults()
         };
@@ -4920,15 +4922,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&prior);
     }
 
-    /// The knob is OFF by default: an unconfigured run must behave exactly as
-    /// it always did (no lookup, no record, a full random population).
+    /// Inheritance is AUTOMATIC and ON by default: an unconfigured run looks for a
+    /// compatible previous experiment by itself, and records nothing (falls back to
+    /// an all-random batch) when there is none. `set_elite_previous_load(false)`
+    /// opts out entirely.
     #[test]
-    fn seed_previous_run_is_off_by_default() {
+    fn elite_previous_load_is_on_by_default_and_can_be_turned_off() {
         let defaults = RaceConfig::defaults();
-        assert!(!defaults.seed_previous_run);
-        assert!(defaults.seed_previous_run_dir.is_none());
+        assert!(defaults.elite_previous_load);
+        assert!(defaults.elite_previous_dir.is_none());
 
-        let dir = std::env::temp_dir().join("gras-seedprior-off");
+        // On by default: this tabular run finds no compatible tabular source (only
+        // the engine's own `results/`), so nothing is inherited and the batch is
+        // still full and all-random.
+        let dir = std::env::temp_dir().join("gras-seedprior-on");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 7).unwrap();
         eng.config.pop_size = 2;
@@ -4939,6 +4946,33 @@ mod tests {
             eng.config.pop_size,
         );
         assert_eq!(topos.len(), 2);
+        assert!(
+            crate::state::load_engine_json(&dir)
+                .unwrap()
+                .run_topology_source
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Explicit opt-out: no lookup, no receipt, still a full random population.
+        let dir = std::env::temp_dir().join("gras-seedprior-optout");
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = RaceConfig {
+            pop_size: 2,
+            elite_previous_load: false,
+            ..RaceConfig::defaults()
+        };
+        let eng =
+            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+                tiny_dataset_dir("seedprior-optout"),
+                config,
+                fitness(),
+                crate::trainer::TabularTrainer::new(loss_fn()),
+                Some(7),
+                Some(dir.clone()),
+            ))
+            .unwrap();
+        assert_eq!(eng.state.live_count(), 2, "opt-out still fills the pop");
         assert!(
             crate::state::load_engine_json(&dir)
                 .unwrap()

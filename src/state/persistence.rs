@@ -115,14 +115,15 @@ pub struct ConfigSnapshot {
         /// Fresh holdout games the post-race guardrail plays. Diagnostic — no resume guard.
     #[serde(default = "default_guardrail_matches")]
     pub guardrail_matches: usize,
-        /// Seed the population from a previous experiment's champion. Recorded because it
-        /// decides what the founder batch IS. Default false.
-    #[serde(default)]
-    pub seed_previous_run: bool,
+        /// Load the newest compatible previous experiment's elites as the first
+        /// founders. Recorded because it decides what the founder batch IS. Default
+        /// false. `alias` reads headers written before the rename.
+    #[serde(default, alias = "seed_previous_run")]
+    pub elite_previous_load: bool,
         /// Where that previous experiment is looked up: a run dir or a dir of run dirs
         /// (newest wins). `None` ⇒ `results/`.
-    #[serde(default)]
-    pub seed_previous_run_dir: Option<String>,
+    #[serde(default, alias = "seed_previous_run_dir")]
+    pub elite_previous_dir: Option<String>,
         /// One-line identity of the binary that produced the run (version, profile, exe
         /// path, build time). Diagnostics only.
     #[serde(default)]
@@ -168,9 +169,9 @@ impl ConfigSnapshot {
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
             run_topology_count: cfg.run_topologies.len(),
-            seed_previous_run: cfg.seed_previous_run,
-            seed_previous_run_dir: cfg
-                .seed_previous_run_dir
+            elite_previous_load: cfg.elite_previous_load,
+            elite_previous_dir: cfg
+                .elite_previous_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
             elite_checkpoint_weights: cfg.elite_checkpoint_weights,

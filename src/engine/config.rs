@@ -262,12 +262,15 @@ pub struct RaceConfig {
         /// User-supplied run topologies (blueprint-only, fresh weights) seeded BEFORE the
         /// random draws; duplicates are re-rolled. Recorded as `run_topology_count`.
     pub run_topologies: Vec<crate::graph::topology::Topology>,
-        /// Seed slot 0 with the guardrail-certified champion of a PREVIOUS experiment
-        /// (topology-only). "Compatible" is read from the header; any failure runs all-random.
-    pub seed_previous_run: bool,
-        /// Where `seed_previous_run` looks: a run dir or a dir of run dirs (newest run id
-        /// wins). `None` ⇒ `results/`.
-    pub seed_previous_run_dir: Option<std::path::PathBuf>,
+        /// AUTOMATIC inheritance: load the newest compatible PREVIOUS experiment's
+        /// elites into the first founder slots (topology-only). "Compatible" is read
+        /// from the header (same mode, dims and trainer); a different experiment, or
+        /// no default folder, runs all-random. Default true — turn it off to force a
+        /// fresh, all-random founder batch.
+    pub elite_previous_load: bool,
+        /// Where `elite_previous_load` looks: a run dir or a dir of run dirs (newest run id
+        /// wins). `None` ⇒ the default `results/` folder.
+    pub elite_previous_dir: Option<std::path::PathBuf>,
         /// Per-checkpoint elite weight snapshot (`checkpoint-elite-<hash>.safetensors`,
         /// overwritten each checkpoint). Default true — a hard kill loses at most one interval.
     pub elite_checkpoint_weights: bool,
@@ -505,8 +508,8 @@ impl RaceConfig {
             pop_pruner: None,
             run_name: None,
             run_topologies: Vec::new(),
-            seed_previous_run: false,
-            seed_previous_run_dir: None,
+            elite_previous_load: true,
+            elite_previous_dir: None,
             elite_checkpoint_weights: true,
             mutation_probation_steps: 5,
             crossover_probation_steps: 5,
@@ -836,16 +839,17 @@ impl RaceConfigBuilder {
         self.cfg.run_topologies = topos;
         self
     }
-        /// Seed slot 0 with the guardrail-certified champion of a previous experiment
-        /// (topology-only). Enters as an ordinary founder. Default false.
-    pub fn set_run_seed_previous(mut self, enabled: bool) -> Self {
-        self.cfg.seed_previous_run = enabled;
+        /// Opt in/out of the automatic inheritance of the newest compatible previous
+        /// experiment's elites (topology-only). ON by default; `false` forces a fresh,
+        /// all-random founder batch.
+    pub fn set_elite_previous_load(mut self, enabled: bool) -> Self {
+        self.cfg.elite_previous_load = enabled;
         self
     }
-        /// Where `set_run_seed_previous` looks: a run dir or a dir of run dirs (newest id
-        /// wins). Unset ⇒ `results/`.
-    pub fn set_run_seed_previous_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
-        self.cfg.seed_previous_run_dir = Some(dir.into());
+        /// Where the automatic inheritance looks: a run dir or a dir of run dirs
+        /// (newest id wins). Unset ⇒ the default `results/`.
+    pub fn set_elite_previous_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.cfg.elite_previous_dir = Some(dir.into());
         self
     }
         /// Per-checkpoint elite weight snapshot (overwritten each checkpoint). Default true —
