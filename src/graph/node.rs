@@ -1,4 +1,4 @@
-//! The node type  — pure metadata (ports, kind, dim, activation).
+//! The node type — pure metadata (ports, kind, dim, activation).
 //!
 //! Nodes hold no tensors; execution happens in
 //! [`Network`](crate::graph::network::Network). The NAS knobs live here:
@@ -11,10 +11,8 @@ use serde::{Deserialize, Serialize};
 /// in magnitude are treated as ±ε (bounded output, bounded gradients).
 pub const DIVIDE_EPS: f64 = 1e-3;
 
-/// `n / d` without the singularity: `n * (d / clamp(|d|, ε))`.
-/// Exact whenever `|d| ≥ ε`; below it the quotient saturates instead of
-/// blowing up. Differentiable end to end (clamp passes gradients through
-/// where |d| > ε and zeroes them below — no NaN paths in backward).
+/// `n / d` without the singularity: `n * (d / clamp(|d|, ε))`. Exact for
+/// `|d| ≥ ε`, saturating below it; differentiable with no NaN in backward.
 pub fn safe_divide(n: &Variable, d: &Variable) -> flodl::tensor::Result<Variable> {
     let d_abs = d.abs()?;
     let clamped = d_abs.clamp_min(DIVIDE_EPS)?;
@@ -71,12 +69,8 @@ impl CombineOp {
                 Ok(result)
             }
             CombineOp::Divide => {
-                // Divide-safe: n/d = n * (d / clamp(|d|, ε)). For |d| ≥ ε this
-                // is exactly n/d (the d/d cancels); below ε the multiplier
-                // saturates at ±1/ε instead of exploding — so a zeroed
-                // denominator (dropout mask, dead branch) yields a bounded
-                // value, never inf/NaN. Gradients keep the same guard shape,
-                // so backward stays finite too.
+                // Divide-safe (see `safe_divide`): a zeroed denominator (dropout
+                // mask, dead branch) yields a bounded value, never inf/NaN.
                 let mut result = tensors[0].clone();
                 for t in &tensors[1..] {
                     result = safe_divide(&result, t)?;
@@ -137,9 +131,8 @@ pub enum Activation {
     Sin,
     /// cos(x) -- periodic, bounded in (-1, 1).
     Cos,
-    /// softmax(x) over the feature dim -- outputs sum to 1 per sample.
-    /// Gating-style transform: turns a node into a competitive mixer over
-    /// its channels (winner-take-most signal reweighting).
+    /// softmax(x) over the feature dim -- rows sum to 1; a competitive mixer
+    /// over channels (winner-take-most reweighting).
     Softmax,
     /// log(softmax(x)) over the feature dim -- numerically stable log of
     /// Softmax. Pairs with NLL-style downstream losses; strictly negative.
@@ -182,31 +175,22 @@ pub enum StandardizeOp {
     Identity,
     /// Layer normalization over the feature dimension.
     LayerNorm,
-    /// RMS normalization over the feature dimension -- scales by the root
-    /// mean square (no mean subtraction, no learnable params). Cheaper than
-    /// LayerNorm, often equal quality on tabular. Stateless: replay-safe.
+    /// RMS normalization over the feature dim -- root-mean-square scaling, no
+    /// centering and no params. Cheaper than LayerNorm; stateless.
     RmsNorm,
-    /// Instance normalization over the feature dimension -- per-sample z-score
-    /// (the affine/running-stats variant is deliberately NOT used: learnable
-    /// params + stateful stats would break the replay contract). Stateless:
-    /// replay-safe.
+    /// Per-sample z-score over the feature dim. Deliberately the stateless form:
+    /// affine params or running stats would break the replay contract.
     InstanceNorm,
-    /// Group normalization over the feature dimension with a FIXED 4-group
-    /// partition (features are split into 4 contiguous chunks; each row is
-    /// z-scored within its chunk). Middle ground between LayerNorm (one
-    /// group = all features) and InstanceNorm (one group per feature):
-    /// gives the network per-chunk scale discipline without collapsing all
-    /// channels together. Stateless (no learnable affine, no running
-    /// stats): replay-safe. Feature counts not divisible by 4 are handled
-    /// by an uneven last group (the split is contiguous ranges, so every
-    /// feature belongs to exactly one group and the math stays well-
-    /// defined for any feature count ≥ 1).
+    /// z-score within a FIXED 4-group split of the feature dim -- the middle
+    /// ground between LayerNorm and InstanceNorm. Stateless; last group uneven.
     GroupNorm,
 }
 
-/// Same Tier-2 idiom as `Transform`: the label parse lives with the enum.
+/// The label parse lives with the enum (same as [`Transform`]).
 impl TryFrom<&str> for StandardizeOp {
+    /// The unknown-label message.
     type Error = String;
+    /// Case-insensitive label → variant; an unknown label errors with its name.
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         Ok(match s.to_lowercase().as_str() {
             "identity" => StandardizeOp::Identity,
@@ -241,10 +225,8 @@ impl StandardizeOp {
                 Ok(x.div(&rms)?)
             }
             StandardizeOp::InstanceNorm => {
-                // LayerNorm without the centering-vs-variance asymmetry... it
-                // IS the z-score here, per-sample over the feature dim. The
-                // flodl nn::instance_norm module carries running stats (state!) —
-                // hand-rolled instead, matching LayerNorm's pure-f(x) shape.
+                // Hand-rolled rather than flodl's nn::instance_norm, which carries
+                // running stats (state) — this stays pure f(x).
                 let mean = x.mean_dim(-1, true)?;
                 let centered = x.sub(&mean)?;
                 let var = centered.mul(&centered)?.mean_dim(-1, true)?;
@@ -252,13 +234,8 @@ impl StandardizeOp {
                 Ok(centered.div(&std)?)
             }
             StandardizeOp::GroupNorm => {
-                // GroupNorm with a fixed 4-group partition, hand-rolled to
-                // stay pure f(x) (the flodl nn module carries state).
-                // Implementation: pad the feature axis to a multiple of 4,
-                // reshape [batch, 4, feats/4], z-score per (sample, group),
-                // then undo the reshape/pad. Padding is deterministic
-                // (zeros at the END of the feature axis), so the same input
-                // always yields the same output — the replay contract holds.
+                // Hand-rolled (flodl's nn module carries state): pad the feature
+                // axis to a multiple of 4, z-score per (sample, group), unpad.
                 let shape = x.data().shape();
                 let feats = shape[shape.len() - 1] as usize;
                 let group = 4usize;
@@ -304,13 +281,8 @@ impl StandardizeOp {
     }
 }
 
-/// Per-node elementwise FEATURE transform, applied to the linear output
-/// AFTER standardize, BEFORE activation. Distinct from the activation pool in
-/// kind, not just label: these are shape-of-signal transforms a human would
-/// hand-design for a feature (log1p on income-like magnitudes, sign as a
-/// hard two-state switch) — no saturation/competition semantics. All are
-/// pure `f(x)` — stateless, no learnable params — so the replay/catch-up
-/// contract holds. `None` on the node = identity (the default).
+/// Per-node elementwise feature transform: applied to the linear output after
+/// standardize, before activation. All variants are pure `f(x)` -- replay-safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Transform {
     /// ln(1 + x) — compresses income-like heavy tails while keeping order.
@@ -330,13 +302,12 @@ pub enum Transform {
     Exp,
 }
 
-// EFFICIENCY NOTE (Tier 2 — `TryFrom<&str>` on enums): config pools store
-// labels as strings (`vec!["log1p", "sqrt"]`); the parse used to be a
-// private fn in the config. Living ON the enum, `TryFrom<&str>` is reusable
-// by any tooling, is the standard-library idiom for fallible string→enum,
-// and keeps every new arm's label in ONE place next to the variant itself.
+// The label parse lives on the enum, so every new arm's label is added in one
+// place and any tooling can reuse it. Config pools store labels as strings.
 impl TryFrom<&str> for Transform {
+    /// The unknown-label message.
     type Error = String;
+    /// Case-insensitive label → variant; an unknown label errors with its name.
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         Ok(match s.to_lowercase().as_str() {
             "log1p" => Transform::Log1p,
@@ -355,9 +326,8 @@ impl Transform {
     /// the same input always yields the same output (replay contract).
     pub fn apply(&self, x: &Variable) -> flodl::tensor::Result<Variable> {
         match self {
-            // log1p needs x > -1: clamp into the stable domain first. The
-            // upper rail (1e9) only exists to keep extreme inputs finite —
-            // ln(1+1e9) ≈ 20.7, still comfortably representable.
+            // log1p needs x > -1: clamp into the stable domain (the 1e9 rail
+            // only keeps extreme inputs finite).
             Transform::Log1p => x.clamp(-0.999_999_f64, 1.0e9_f64)?.log1p(),
             // Signed sqrt: sign(x) · √|x|.
             Transform::Sqrt => {
@@ -395,52 +365,46 @@ impl Transform {
     }
 }
 
-/// A node in the computational graph . Receives tensors, transforms,
-/// applies activation, exposes outputs. Invariants enforced by `Topology::validate`.
+/// A node in the computational graph: receives tensors, transforms them,
+/// applies an activation, exposes outputs. Invariants live in `Topology::validate`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Node {
     pub id: usize,          //  unique id; also execution order (0 runs first)
     pub num_inputs: usize,  //  how many input ports this node has
     pub num_outputs: usize, //  how many output ports this node has
     pub kind: NodeKind,     // role: Input / Hidden / Output
-    /// Per-node feature-dimension override for the layer's *output*
-    /// (`None` = inherit the graph's `hidden_dim`). The layer's *input* dim
-    /// is derived from its sources at build time. This is the knob NAS
-    /// evolution will mutate to grow/shrink the network channel-wise.
+    /// Feature-dim override for this layer's *output* (`None` = the graph's
+    /// `hidden_dim`); the layer's *input* dim comes from its sources at build time.
     pub hidden_dim: Option<usize>,
     /// Activation applied after this node's linear transform.
     pub activation: Activation,
-    /// Per-output-port activations. `None` = every port inherits
-    /// `activation` (the node-level default). When set, the vec has exactly
-    /// `num_outputs` entries and entry `i` REPLACES the node-level
-    /// activation for port `i`'s outgoing wire — so two ports of the same
-    /// node can carry genuinely different signals (the whole point: wires
-    /// from the same node stop being redundant copies of one tensor).
-    /// Port 0 conventionally mirrors the node-level activation; generation
-    /// assigns ports 1..n from the run's activation pool.
+    /// Per-output-port activations: entry `i` REPLACES the node-level activation
+    /// for port `i`'s wire, so one node's ports can carry different signals.
     #[serde(default)]
     pub port_activations: Option<Vec<Activation>>,
-    /// Per-node combine override: how this node merges its incoming tensors
-    /// (`None` = inherit the graph's `combine_op`). `#[serde(default)]` keeps
-    /// older topology JSON (no field) loadable.
+    /// Per-node combine override: how this node merges incoming tensors (`None`
+    /// = the graph's `combine_op`); serde default keeps old JSON loadable.
     #[serde(default)]
     pub combine_op: Option<CombineOp>,
     /// Per-node standardize op: normalization applied after linear, before
     /// activation (`None` = inherit the graph's `standardize_op`).
     #[serde(default)]
     pub standardize: Option<StandardizeOp>,
-    /// Per-node elementwise feature transform (see [`Transform`]), applied
-    /// after standardize, before activation. `None` = identity (default;
-    /// `#[serde(default)]` keeps older topology JSON loadable).
+    /// Per-node feature transform (see [`Transform`]) after standardize, before
+    /// activation; `None` = identity, and serde default keeps old JSON loadable.
     #[serde(default)]
     pub transform: Option<Transform>,
 }
 
+/// The role a node plays — where it sits in the forward pass, and its ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeKind {
-    Input,  //  start of the network: no inputs, feeds the rest
-    Hidden, //  middle of the network: combine -> transform -> pass on
-    Output, //  end of the network: its output becomes the network output
+    /// Start of the network: no inputs, feeds the rest.
+    Input,
+    /// Middle of the network: combine → transform → pass on.
+    Hidden,
+    /// End of the network: its output becomes the network output.
+    Output,
 }
 
 impl Node {
@@ -516,17 +480,15 @@ impl Node {
         self
     }
 
-    /// Set per-port activations (builder style). The slice must be empty or
-    /// exactly `num_outputs` long; `validate()` enforces the same invariant
-    /// on whole graphs. Empty = inherit node-level activation everywhere.
+    /// Set per-port activations (builder style). Empty = inherit everywhere;
+    /// otherwise it must be exactly `num_outputs` long — `validate()` enforces it.
     pub fn with_port_activations(mut self, ports: Vec<Activation>) -> Self {
         self.port_activations = if ports.is_empty() { None } else { Some(ports) };
         self
     }
 
-    /// The activation carried by output port `i`: the per-port override when
-    /// set, else the node-level activation. Input nodes are excluded by the
-    /// caller — their ports always run Identity (raw data fan-out).
+    /// The activation carried by output port `i`: its override when set, else the
+    /// node-level one. Input-node ports are Identity (raw data fan-out).
     pub fn port_activation(&self, i: usize) -> Activation {
         self.port_activations
             .as_ref()
@@ -589,14 +551,8 @@ mod tests {
         let m = i.data().mean().unwrap().item().unwrap() as f32;
         assert!(m.abs() < 1e-5, "instancenorm per-row mean ≈ 0 (got {m})");
 
-        // GroupNorm (fixed 4 groups) — the TRUE group regime needs feats > 4:
-        // 12 features → 4 contiguous groups of 3. Row-major [2, 12]: row 0 =
-        // [1, 2, 3,  4, 5, 6,  7, 8, 9,  10, 11, 12] → groups {1,2,3},
-        // {4,5,6}, {7,8,9}, {10,11,12}; each z-scored independently. A
-        // 3-element arithmetic sequence z-scores to [-1.22, 0, 1.22] — so
-        // EVERY group of row 0 lands on the same pattern, which is exactly
-        // what distinguishes GroupNorm from InstanceNorm (whose whole-row
-        // z-score would be [-1.59, -1.31, …, 1.59], a ramp, not a sawtooth).
+        // GroupNorm (fixed 4 groups): 12 features → 4 contiguous groups of 3, each
+        // z-scored alone → every group shows the ±1.2247 sawtooth, not a ramp.
         let x12 = flodl::Tensor::from_f32(
             &[
                 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, -1.0, 0.0, 1.0,
@@ -637,9 +593,8 @@ mod tests {
         let id = inst.data().to_f32_vec().unwrap();
         assert_ne!(r0.to_vec(), id[0..12].to_vec(), "GroupNorm ≠ InstanceNorm");
 
-        // Degenerate regime: feats ≤ 4 falls back to the InstanceNorm shape
-        // (a single-feature group would z-score to 0/0 — the guard prevents
-        // the useless all-zeros output).
+        // Degenerate feats ≤ 4: falls back to the InstanceNorm shape, avoiding a
+        // single-feature group that would z-score to 0/0.
         let g4 = StandardizeOp::GroupNorm.apply(&x).unwrap();
         let gd4 = g4.data().to_f32_vec().unwrap();
         let i4 = StandardizeOp::InstanceNorm.apply(&x).unwrap();
@@ -650,9 +605,8 @@ mod tests {
             "feats=4 ⇒ InstanceNorm fallback"
         );
 
-        // NON-divisible feature count: 10 feats → groups {3,3,3,1+pad}; the
-        // zero-pad lands only in the LAST group, so groups 0-2 stay exact
-        // z-scores of their true members and the shape comes back unchanged.
+        // Non-divisible count: 10 feats → groups {3,3,3,1+pad}; the pad lands only
+        // in the last group, so groups 0-2 stay exact and the shape is unchanged.
         let x10 = flodl::Tensor::from_f32(
             &[
                 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0,

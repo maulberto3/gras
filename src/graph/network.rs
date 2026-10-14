@@ -17,17 +17,17 @@ use crate::utils::graph_utils::build_node_sources;
 
 // ── NetworkOptions — execution knobs ──────────────────────────────────────
 
-/// Options for materializing a [`Network`] from a topology blueprint.
-///
-/// Passed to [`Network::build_with_options`]; [`Network::build`] is the CPU
-/// convenience wrapper. It holds the **execution** knobs (device, dtype,
-/// seed, dropout) — *not* the architecture values (dims, port ranges,
-/// combine op), which live in `TopologyOptions`.
+/// Options for materializing a [`Network`] from a topology blueprint: the
+/// **execution** knobs (device, dtype, seed, dropout) — not the architecture.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NetworkOptions {
+    /// Device the net is materialized on.
     pub device: Device,
+    /// DType of the net's tensors.
     pub dtype: DType,
+    /// Seed for initial weights (from `TopologyOptions`).
     pub topology_seed: usize,
+    /// Dropout probability applied to hidden nodes.
     pub dropout_prob: f32,
 }
 
@@ -37,18 +37,15 @@ impl Default for NetworkOptions {
             device: Device::CPU,
             dtype: DType::Float32,
             topology_seed: 0,
-            // 0.0 — never silently inject regularization. (`Network::build`
-            // reads dropout from the topology anyway; this default only
-            // guards direct `build_with_options` callers using
-            // `..Default::default()` from picking up an unrequested 5%.)
+        // 0.0 — never silently inject regularization for direct
+        // `build_with_options` callers using `..Default::default()`.
             dropout_prob: 0.0,
         }
     }
 }
 
-// Neither `Device` nor `DType` implement serde, so serialize the network
-// knobs by hand — device/dtype become readable strings in `engine.json`
-// ("CPU" / "Float32"), keeping the run envelope self-describing.
+// Neither `Device` nor `DType` implement serde, so serialize the network knobs
+// by hand as readable strings ("CPU" / "Float32") in `engine.json`.
 impl serde::Serialize for NetworkOptions {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -81,7 +78,9 @@ impl serde::Serialize for NetworkOptions {
 /// Executable flodl module built from a [`Topology`](crate::graph::topology::Topology).
 pub struct Network {
     pub(crate) name: String,
+    /// Input feature dimension.
     pub input_dim: usize,
+    /// Hidden width.
     pub hidden_dim: usize,
     /// One linear layer per node, indexed by node id.
     pub layers: Vec<Linear>,
@@ -109,13 +108,8 @@ struct BuildPlan {
 }
 
 impl Network {
-    /// Compile blueprint on the given device. Convenience wrapper over
-    /// `build_with_options` that derives the **architecture-affecting** knobs
-    /// from the topology itself — `seed: graph.options.topology_seed` (initial
-    /// weights) and `dropout_prob: graph.options.dropout_prob` — so replaying
-    /// a saved topology reproduces the exact net the engine built. It does
-    /// *not* fall back to `NetworkOptions::default()` for those two fields
-    /// anymore: seed 0 / dropout 0.05 silently diverged from evolved nets.
+        /// Compile blueprint on the given device, deriving the architecture-affecting
+        /// knobs from the topology (seed + dropout) so replay reproduces the exact net.
     pub fn build(graph: &Topology, device: Device) -> flodl::tensor::Result<Self> {
         Self::build_with_options(
             graph,
@@ -189,6 +183,7 @@ impl Network {
             node_dims,
         }
     }
+    /// Build the per-node `Linear` layers from the topology (seeded).
     fn build_linear_layers(
         graph: &Topology,
         node_dims: &[(usize, usize)],
@@ -310,11 +305,8 @@ impl Network {
         })
     }
 
-    /// Create a `Linear(in → out)` layer. — generated in Rust from that RNG, replicating flodl's exact
-    /// init distributions (`kaiming_uniform(a=√5)` and `uniform_bias` are both
-    /// uniform(-1/√fan_in, +1/√fan_in)) — so the same seed produces the same
-    /// layer. With `rng = None` it falls back to `Linear::on_device` (flodl's
-    /// internal RNG).
+        /// Create a `Linear(in → out)` layer from the seeded RNG (replicating flodl's
+        /// init distributions); `None` falls back to flodl's internal RNG.
     fn create_linear_with_seed(
         in_dim: i64,
         out_dim: i64,
@@ -363,12 +355,8 @@ impl Network {
 // Forward pass — gather → combine → standardize (LayerNorm) → activate → dropout ───────────────────────
 
 impl Network {
-    /// Step 1: Gather -- collect wired source tensors per port.
-    ///
-    /// Sources are looked up by exact `(node, port)` from `port_outputs`, so
-    /// each incoming wire carries its source port's OWN activated tensor —
-    /// two ports of the same node feed genuinely different signals (the
-    /// per-port-activation contract).
+        /// Step 1: Gather -- collect wired source tensors per port, looked up by exact
+        /// `(node, port)` so each wire carries its source port's OWN activated tensor.
     fn gather_inputs(
         &self,
         port_outputs: &HashMap<(usize, usize), Variable>,
@@ -452,11 +440,8 @@ impl Network {
                     result = match op {
                         CombineOp::Multiply => result.mul(&t)?,
                         CombineOp::Subtract => result.sub(&t)?,
-                        // Divide-safe: dropout zeroes elements of the
-                        // denominator tensor, and a raw div by 0.0 is inf →
-                        // NaN poison in the loss (live kagi run, net
-                        // 0ce5f88ce646d532: Divide nodes 2/6/8 + dropout
-                        // 0.25). Same guard as CombineOp::apply.
+                            // Divide-safe: dropout zeroes denominator elements and raw
+                            // div by 0.0 is inf → NaN poison. Same guard as CombineOp::apply.
                         CombineOp::Divide => crate::graph::node::safe_divide(&result, &t)?,
                         CombineOp::Max => result.maximum(&t)?,
                         CombineOp::Min => result.minimum(&t)?,
@@ -533,11 +518,8 @@ impl Network {
         }
     }
 
-    /// Step 6: Apply dropout (hidden nodes only, training mode only).
-    ///
-    /// Applied to the node's SHARED base tensor in `forward`, before the
-    /// per-port activation split — one mask draw per node regardless of
-    /// port count, so the RNG discipline (and replay determinism) holds.
+        /// Step 6: apply dropout (hidden nodes only, training mode only) to the node's
+        /// SHARED base tensor — one mask draw per node, so replay determinism holds.
     fn apply_dropout(&self, node_id: usize, x: Variable) -> flodl::tensor::Result<Variable> {
         match &self.dropout_layers[node_id] {
             Some(dropout) => dropout.forward(&x),
@@ -545,35 +527,14 @@ impl Network {
         }
     }
 
-    /// Serialize the **materialized network facts**  — the nutrition label
-    /// of the built module, no weights (a rebuilt Network has the same
-    /// architecture, fresh weights — that's by design).
-    ///
-    /// The recipe ([`Topology::to_json`](crate::graph::topology::Topology::to_json))
-    /// says *how to build it*; this JSON says *what the build produced*:
-    /// per-node dims, wiring stats, depths, orphan counts and the **real**
-    /// parameter counts (tensors + elements), read straight off the flodl
-    /// module. The derived diagnostics are computed by the **same** shared
-    /// functions the blueprint uses
-    /// ([`Topology::orphan_counts`](crate::graph::topology::Topology::orphan_counts)
-    /// etc.), so both sides always agree.
-    /// Materialized-network diagnostics as JSON — delegates to
-    /// [`NetworkFacts`](crate::spec::NetworkFacts).
+        /// Serialize the **materialized network facts** (no weights) — per-node dims,
+        /// wiring stats, depths, orphan counts, real parameter counts. Delegates to `NetworkFacts`.
     pub fn to_json(&self) -> flodl::tensor::Result<String> {
         crate::spec::NetworkFacts::from_network(self).to_json()
     }
 
-    /// Reconstruct the graph blueprint this network was built from — same
-    /// nodes, same wiring, same per-node dims. Calling
-    /// [`Network::build`] on the result reproduces an architecture-identical
-    /// module (fresh random weights — sync them with
-    /// [`Network::clone_weights_from`]).
-    ///
-    /// Options are recovered from the materialized net: `input_dim` and
-    /// `output_dim` come from the net's own fields, while `topology_seed` /
-    /// `dropout_prob` are pinned to neutral values (seed 0, dropout 0.0) —
-    /// the seed only shapes the throwaway init weights, and dropout 0 keeps
-    /// eval-time forward passes deterministic.
+        /// Reconstruct the graph blueprint this network was built from — same nodes,
+        /// wiring and dims. `topology_seed`/`dropout_prob` are pinned to neutral values.
     pub fn topology_blueprint(&self) -> crate::graph::topology::Topology {
         let mut topo = crate::graph::topology::Topology::new(
             0,
@@ -588,17 +549,8 @@ impl Network {
         topo
     }
 
-    /// Copy the weights of `other` into `self`, layer by layer.
-    ///
-    /// Both networks MUST have the same architecture (built from the same
-    /// [`Topology`]) — layer shapes are asserted, not silently mismatched.
-    /// This is the load_state_dict primitive: used by trainers that run
-    /// parallel copies of one net (each thread owns its own `Network`, synced
-    /// from the master before its batch) and by any future import path.
-    ///
-    /// Only leaf weights are copied (node layers + port projections); the
-    /// copies are detached tensors, so gradients never flow across the pair —
-    /// each net keeps its own autograd graph and optimizer state.
+        /// Copy the weights of `other` into `self`, layer by layer — architectures must
+        /// match (asserted). Leaf weights only; gradients never flow across the pair.
     pub fn clone_weights_from(&mut self, other: &Network) -> flodl::tensor::Result<()> {
         if self.layers.len() != other.layers.len() {
             return Err(flodl::tensor::TensorError::new(&format!(
@@ -668,12 +620,8 @@ impl Network {
         }
         Ok(())
     }
-    /// All learnable parameters as one flat f32 vector, in a deterministic
-    /// order (node layers by id, then port projections in build order).
-    /// The `Send`-safe weight format: `Network` itself is `!Send` (flodl's
-    /// autograd `Variable` is `Rc`-based), so moving weights to a worker
-    /// thread means moving THIS, not the net. Sizes are appended to the
-    /// front so [`Self::import_weights`] can assert a perfect match.
+        /// All learnable parameters as one flat f32 vector in a deterministic order —
+        /// the `Send`-safe weight format (`Network` itself is `!Send`).
     pub fn export_weights(&self) -> flodl::tensor::Result<Vec<f32>> {
         let mut out = Vec::new();
         let mut count = 0usize;
@@ -706,9 +654,8 @@ impl Network {
         Ok(out)
     }
 
-    /// Load weights produced by [`Self::export_weights`] (same architecture,
-    /// same tensor count/total — asserted, not assumed). Overwrites leaf
-    /// weights in place; gradients never flow across the pair.
+        /// Load weights produced by [`Self::export_weights`] (same architecture —
+        /// asserted); overwrites leaf weights in place, gradients never flow across.
     pub fn import_weights(&mut self, blob: &[f32]) -> flodl::tensor::Result<()> {
         let Some(&[count, total]) = blob.first_chunk::<2>() else {
             return Err(flodl::tensor::TensorError::new(
@@ -726,10 +673,8 @@ impl Network {
         }
         let mut cursor = 2usize;
         let mut seen = 0usize;
-        // Load one tensor's worth of f32s from the blob into `var`.
-        // Variable::set_data swaps the leaf's storage in place: the
-        // optimizer's Variable handles stay valid, gradient tracking is
-        // preserved (set_data re-enables requires_grad automatically).
+            // Load one tensor's worth of f32s into `var`; `set_data` swaps storage in
+            // place so optimizer handles stay valid (requires_grad re-enabled).
         let load = |var: &flodl::Variable,
                     blob: &[f32],
                     cursor: &mut usize,
@@ -775,67 +720,32 @@ impl Network {
 // ── Module impl — forward, parameters, name ───────────────────────────────
 
 impl Module for Network {
-    /// Execute the graph on an input tensor.
-    ///
-    /// Worked example for a tiny graph:
-    ///   nodes:       n0 (input,  0 in / 2 out), n1 (hidden, 2 in / 1 out)
-    ///   connections: n0_o0 -> n1_i0,  n0_o1 -> n1_i1
-    ///   combine_op:  Add
-    ///
-    /// ```text
-    ///   x ──▶ input_proj ──▶ n0 base ──┐ per-port act: o0 = act0(base)
-    ///                                  │              o1 = act1(base)
-    ///                            combined ──▶ layers[1] ──▶ act ──▶ n1_out = y
-    ///
-    ///   1. net_input = input_proj(x)              // [batch, hidden_dim]
-    ///   2. n0 has no input ports
-    ///      => base = layers[0](net_input)         // [batch, hidden_dim]
-    ///         o0 = act(n0, 0, base), o1 = act(n0, 1, base)
-    ///   3. n1's inputs: n1_i0 <- n0_o0, n1_i1 <- n0_o1
-    ///      combined = n0_o0 + n0_o1               // Add: a + b
-    ///      n1_out = act(layers[1](combined))      // [batch, hidden_dim]
-    ///   4. return n1_out                          //  output_node = n1
-    /// ```
-    ///
-    /// The forward pass: input → project → [gather → combine → transform →
-    /// per-port activate] × N nodes → output.
-    ///
-    /// Per-node compute: ONE shared Linear + standardize, then one cheap
-    /// elementwise activation per output port. Every port of a node sees the
-    /// same base tensor through its own non-linearity — so two wires leaving
-    /// the same node carry different signals whenever their port activations
-    /// differ.
-    ///
-    /// Note: `validate()` runs at build time ([`Network::build_with_options`]),
-    /// not per forward call — it's Step 0.
+        /// Execute the graph on an input tensor: input → project → [gather → combine →
+        /// transform → per-port activate] × N nodes → output.
     fn forward(&self, input: &Variable) -> flodl::tensor::Result<Variable> {
-        // Per-port outputs, keyed by (node_id, port_index). Nodes can emit
-        // up to num_outputs distinct tensors; consumers look up the exact
-        // port they are wired to.
+            // Per-port outputs, keyed by (node_id, port_index); consumers look up the
+            // exact port they are wired to.
         let mut port_outputs: HashMap<(usize, usize), Variable> = HashMap::new();
 
         // Pass 1: compute all node outputs normally.
         for node_id in 0..self.layers.len() {
             let base = if self.nodes[node_id].kind == crate::graph::node::NodeKind::Input {
-                // Input node: one Linear over the raw input, then the same
-                // base tensor fans out through every port (Identity — ports
-                // of Input nodes stay raw by validation rule).
+                    // Input node: one Linear over the raw input; the base tensor fans out
+                    // through every port (Identity — Input ports stay raw).
                 self.layers[node_id].forward(input)?
             } else {
                 let gathered = self.gather_inputs(&port_outputs, node_id)?;
                 let combined = self.combine_inputs(gathered, &port_outputs, node_id)?;
                 let transformed = self.layers[node_id].forward(&combined)?;
-                // Standardize + transform + dropout BEFORE the port split, so
-                // every port of the node sees the same shared tensor, and the
-                // dropout mask draw count stays one-per-node (replay-safe).
+                    // Standardize + transform + dropout BEFORE the port split, so every
+                    // port sees the same tensor and the mask draw is one-per-node.
                 let standardized = self.standardize(node_id, transformed)?;
                 let transformed = self.transform(node_id, standardized)?;
                 self.apply_dropout(node_id, transformed)?
             };
 
-            // Per-port activation: port i applies its own non-linearity to
-            // the shared base. Port 0 conventionally mirrors the node-level
-            // activation; other ports may differ (see Node::port_activation).
+                // Per-port activation: port i applies its own non-linearity to the shared
+                // base; port 0 conventionally mirrors the node-level activation.
             if self.nodes[node_id].kind == crate::graph::node::NodeKind::Input {
                 for o in 0..self.nodes[node_id].num_outputs.max(1) {
                     port_outputs.insert((node_id, o), base.clone());
@@ -878,13 +788,8 @@ impl Module for Network {
         &self.name
     }
 
-    /// Flip all dropout layers between train and eval mode. A **trainer-side**
-    /// knob: the engine never touches this. `Network::build` leaves every net
-    /// in eval mode (deterministic forwards — the replay-parity contract
-    /// depends on it), so a training scheme that wants dropout noise must
-    /// call [`Network::train`](Self::train) before its loss forwards and
-    /// [`Network::eval`](Self::eval) before rollouts/eval matches. The mode
-    /// is per-instance, not persisted — it resets to eval on rebuild.
+        /// Flip all dropout layers between train and eval mode (a trainer-side knob).
+        /// The engine never touches this; build leaves every net in eval mode.
     fn set_training(&self, training: bool) {
         for d in self.dropout_layers.iter().flatten() {
             d.set_training(training);
@@ -961,12 +866,8 @@ mod tests {
     #[test]
     fn test_divide_combine_with_dropout_stays_finite() -> flodl::tensor::Result<()> {
         use flodl::Optimizer;
-        // Regression: net 0ce5f88ce646d532 (live kagi run) went NaN at step 0.
-        // Its hidden nodes combine via Divide; with dropout active the
-        // denominator tensor can contain exact zeros, and raw `div` produced
-        // inf → NaN in the loss. The divide-safe guard must keep BOTH the
-        // forward output and one training step (forward + backward + Adam)
-        // finite.
+            // Regression: net 0ce5f88ce646d532 (kagi) went NaN — Divide nodes + dropout
+            // let the denominator hit exact 0. The guard must keep forward + one step finite.
         let mut graph = Topology::new(0, None);
         graph.options.dropout_prob = 0.25;
         graph.options.input_dim = Some(8);
@@ -1095,9 +996,8 @@ mod tests {
 
     #[test]
     fn test_network_to_json_facts() {
-        // The materialized-net nutrition label: dims, wiring stats, and real
-        // param counts — computed from the same shared diagnostics as the
-        // blueprint side, so both always agree.
+            // The materialized-net nutrition label: dims, wiring stats, real param counts
+            // — same shared diagnostics as the blueprint side.
         let mut graph = Topology::new(0, None);
         graph.nodes.push(Node::new_input(0, 1));
         let mut wide = Node::new_hidden(1, 1, 1);
@@ -1137,9 +1037,8 @@ mod tests {
 
     #[test]
     fn test_per_port_activations_give_distinct_signals() {
-        // n1 has 2 output ports: port 0 ReLU, port 1 Tanh. The consumer n2
-        // receives port 0's tensor on i0 and port 1's on i1 — the wires must
-        // carry DIFFERENT tensors even though they leave the same node.
+            // n1 has port 0 ReLU, port 1 Tanh; n2 receives those two DIFFERENT tensors on
+            // i0/i1 even though both leave the same node.
         let opts = crate::graph::topology::TopologyOptions {
             // Guarantee the hidden node keeps 2 wired output ports after trim.
             min_hidden_outputs_per_node: 2,
@@ -1157,9 +1056,8 @@ mod tests {
         // finalize trims ports BEFORE we stamp per-port activations (the
         // port count is only final after trim) — mirrors the engine flow.
         g.finalize();
-        // Force the 2-port wiring deterministically: random finalize may
-        // orphan one of n1's ports and trim it. We re-stamp both ports and
-        // wire them to n2's two inputs by hand.
+            // Force the 2-port wiring deterministically: random finalize may orphan a
+            // port and trim it, so re-stamp both ports and wire n2's inputs by hand.
         g.nodes[1].num_outputs = 2;
         g.connections
             .retain(|c| !(c.from.node == 1 && c.to.node == 2));
@@ -1191,9 +1089,8 @@ mod tests {
         // observable contract: forward succeeds and shapes are sane.
         let out = net.forward(&input).unwrap();
         assert_eq!(out.shape(), &[1, 1]);
-        // activations to the SAME base tensor. Show those two tensors differ
-        // on a negative-heavy sample — which is exactly why two wires from
-        // one node now carry different signals.
+            // Two activations on the SAME base tensor differ on a negative-heavy sample —
+            // exactly why two wires from one node carry different signals.
         let sample = Variable::new(
             Tensor::from_f32(&[-1.0, -2.0, 0.5, 3.0], &[1, 4], Device::CPU).unwrap(),
             false,
@@ -1321,11 +1218,8 @@ mod var_dim_test {
     #[test]
     fn test_variable_hidden_dim_fan_in() {
         let mut g = Topology::new(0, None);
-        // input0 (out_dim=8) ─┐
-        //                     ├→ hidden (in_dim=max(8,4)=4, out_dim=4) → output
-        // input1 (out_dim=4) ─┘
-        // Actually input0 and input1 both have out_dim = topo.hidden_dim = 8
-        // unless we override. Let's make input1 wider:
+            // input0 (out_dim=8) and input1 both default to `topo.hidden_dim`; make
+            // input1 wider to exercise the max() combine below.
         g.nodes.push(Node::new_input(0, 1));
         let mut wide = Node::new_input(1, 1);
         wide.hidden_dim = Some(16);
