@@ -18,8 +18,11 @@ a champion you can actually trust.
   batches, and history — bit for bit.
 - **Your learning loop, our search loop.** Bring your own loss, optimizer,
   environment, and fitness; the crate owns the search around them.
-- **Results you can trust.** Champions are re-tested on data they never
-  trained on before you rely on them.
+- **Results you can trust.** Champions are certified by a guardrail —
+  re-tested on data they never trained on before you rely on them.
+- **Each run builds on the last.** A new experiment automatically inherits
+  the ranked elites of the newest compatible prior run, so progress
+  accumulates instead of restarting from scratch.
 
 ## How it works
 
@@ -30,6 +33,12 @@ as they fall behind; strong ones hold their place and keep learning; new
 candidates are born continuously. Because the whole run is a pure function of
 its seed, any run replays exactly — and the surviving champion is measured
 against fresh, unseen data at the end.
+
+Two runs chain together automatically. At stop, the champion is certified by
+the guardrail and the run's ranked elites are recorded; the next compatible
+run (same mode, dimensions, and trainer) seeds its founder batch with those
+elites before evolving, so a race picks up where the last one left off. Point
+it elsewhere or opt out of the inheritance when you want a fresh batch.
 
 ## Install
 
@@ -48,8 +57,7 @@ cargo add gras --features cuda
 
 ## Get started
 
-Runnable examples, the full API, and the design notes all live in the
-repository:
+Runnable examples and the full API live in the repository:
 
 **https://github.com/maulberto3/gras** · API docs: **https://docs.rs/gras**
 
