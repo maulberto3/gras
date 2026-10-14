@@ -9,7 +9,7 @@
 //! - [`config`] — `RaceConfig` knob surface, `StopReason`, divergence/stop
 //!   closure types, `RaceSnapshot`, `RunMetaCtx`
 //! - [`population`] — initial population generation from the config's pools
-//! - [`child`] — child generation (roulette → crossover → mutate) + catch-up
+//! - [`child`] — child generation (roulette → crossover → mutate) + resume replay
 //! - [`smoothing`] — the rolling fitness buffer + its mean (ranking inputs)
 //! - [`core`] — the `CoreEngine` itself: construction, the run loop,
 //!   per-net stepping, culling, persistence hooks
@@ -19,7 +19,6 @@
 //!   frame, stop summary)
 //! - [`format`] — display/CSV formatting + the build identity stamp
 //! - [`artifacts`] — champion/worst dumps + their ranking helpers
-//! - [`checkpoint`] — the checkpoint ledger, gate bar, and surprise exam
 //! - [`evolve`] — the crossover/immigrant rolls, cull/insert, victim selection
 //! - [`pruner`] — the post-race solo-training phase
 //! - [`step`] — one net's step path (trainer dispatch, freeze pass, RNG seeding)
@@ -30,7 +29,6 @@
 //! - [`fitness`] — `Fitness`, `Direction`, `Metric`, `FitnessLabel`
 
 pub mod artifacts;
-pub mod checkpoint;
 pub mod child;
 pub mod config;
 pub mod core;

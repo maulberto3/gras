@@ -205,7 +205,7 @@ impl TryFrom<&str> for StandardizeOp {
 
 impl StandardizeOp {
     /// Apply this standardize op. All variants are pure `f(x)` — stateless,
-    /// no learnable params — so the replay/catch-up contract holds.
+    /// no learnable params — so the replay contract holds.
     pub fn apply(&self, x: &Variable) -> flodl::tensor::Result<Variable> {
         match self {
             StandardizeOp::Identity => Ok(x.clone()),

@@ -1,13 +1,12 @@
 //! Step-race scheduler for the continuous step-race engine.
 //!
-//! One global `step_clock`. Every live net — original population or
-//! caught-up newcomer — is at the **same** step at the start of every loop
-//! iteration. One iteration = one step_clock for the whole group:
+//! One global `step_clock`. Every live net steps together each loop iteration,
+//! pulling from the same shared batch stream. One iteration = one step_clock:
 //!
 //! 1. Evolve first (from clock 1 on) — two independent roll groups. Crossover
-//!    rolls: a checkpoint-gated child replaces the worst net only if it clears
-//!    every gate, otherwise the attempt is discarded and the population is
-//!    unchanged. Immigrant rolls: a random entrant replaces an inverse-fitness
+//!    rolls: a recombined child evicts a victim per `CrossCullPolicy`; a draw
+//!    that produces nothing is discarded and the population is unchanged.
+//!    Immigrant rolls: a random entrant replaces an inverse-fitness
 //!    victim (pop stays constant). Acting on the metrics the previous clock
 //!    recorded, this is what makes a clock's log read in the order the clock
 //!    happened: evolve → crown → step.
@@ -21,9 +20,9 @@
 //!    across steps), records its metrics into `nets/<hash>.json`, and logs one
 //!    per-net line. A child born at the head of this clock sits it out (see
 //!    the birth-clock invariant below).
-//! 4. After **all** nets stepped: every `checkpoint_every` steps, record the
-//!    population-mean smoothed fitness in the checkpoint ledger — the bar a
-//!    crossover child must clear.
+//! 4. After **all** nets stepped: every `checkpoint_every` steps, snapshot the
+//!    live frontier (states + elite weights) and flush the CSVs — the durability
+//!    tick, which also advances the stream's eval-permutation era.
 //! 5. One per-step rollup line (or the `Minimal` frame) describing the step
 //!    that just ended — logged LAST on purpose, so it always sits at the bottom
 //!    of the terminal.
@@ -33,9 +32,9 @@
 //!    the same step after the group steps, so reading any live net's step
 //!    gives the clock).
 //!
-//! Determinism: the children's catch-up uses the same `seed_step_randomness` +
-//! same step primitives as the group loop, so two identical-seed runs produce
-//! identical cull/insertion sequences.
+//! Determinism: resume replay uses the same `seed_step_randomness` + same step
+//! primitives as the group loop, so two identical-seed runs produce identical
+//! cull/insertion sequences.
 //!
 //! Memory model: **all live nets + their optimizers live inside the loop** for
 //! the whole run. Pop 5 → 5 networks + 5 optimizers in memory at once. On
@@ -70,18 +69,6 @@ use crate::trainer::stream::{BatchStream, PoolSplit};
 use super::config::{RaceConfig, StopReason};
 use super::format::{build_stamp, csv_field};
 use super::smoothing::{RollingBuffer, WindowStats, rolling_mean, rolling_stats};
-
-/// One entry in the checkpoint ledger: the population-mean smoothed fitness that a
-/// crossover child must BEAT at every checkpoint, plus that era's `exam_mean_fitness`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Checkpoint {
-    /// Step clock at which this checkpoint was taken.
-    pub step: usize,
-    /// Population-mean smoothed fitness — the bar a child must beat.
-    pub pop_mean_fitness: f32,
-    /// Mean exam fitness across all live nets at this checkpoint.
-    pub exam_mean_fitness: f32,
-}
 
 // ── CoreEngine ───────────────────────────────────────────────────────────────
 
@@ -127,11 +114,11 @@ pub struct CoreEngine {
     /// In-memory state of the live population (topology JSON, seed, step,
     /// last_metrics, lineage). The source of truth for resume + tooling.
     pub(crate) state: RaceState,
-    /// Per-net `Network` — built once on insert / catch-up complete, mutated
-    /// in place each step. **Coefficients live here**, not on disk.
+    /// Per-net `Network` — built once on insert, mutated in place each step.
+    /// **Coefficients live here**, not on disk.
     pub(crate) networks: HashMap<String, Network>,
-    /// Per-net `Optimizer` — created on insert / catch-up complete, mutated in place
-    /// each step; Adam momentum/variance carries forward across steps.
+    /// Per-net `Optimizer` — created on insert, mutated in place each step;
+    /// Adam momentum/variance carries forward across steps.
     pub(crate) optimizers: HashMap<String, Box<dyn Optimizer>>,
     /// Rolling fitness history per net (in-memory): every ranking decision reads the
     /// smoothed mean of this buffer, not the raw per-step value.
@@ -157,9 +144,6 @@ pub struct CoreEngine {
     /// Children born per step clock — disambiguates same-clock siblings across all
     /// evolution rounds, so same-clock children derive distinct seeds.
     pub(crate) children_born_at_clock: HashMap<usize, usize>,
-    /// The checkpoint ledger: population-mean smoothed fitness recorded every
-    /// `checkpoint_every` steps — the bar a catching-up crossover child must beat.
-    pub(crate) checkpoints: Vec<Checkpoint>,
     /// Anti-devolution A: the nets holding the freeze crown — the seats the elite gate
     /// dealt, a SUBSET of the count-top nets; tracked so crown lines fire on transitions.
     pub(crate) frozen_crown: std::collections::HashSet<String>,
@@ -180,9 +164,9 @@ pub struct CoreEngine {
 // ── Construction ─────────────────────────────────────────────────────────────
 
 /// One evolution roll's outcome, formatted for the single per-roll log line.
-/// `survived`: crossover-only — did the child clear the checkpoint gate?
+/// `survived`: crossover-only — did the child get inserted?
 pub(crate) struct RollOutcome {
-    /// Crossover-only: did the child clear the checkpoint gate?
+    /// Crossover-only: did the child get inserted?
     pub survived: bool,
     /// No cull-eligible slot existed (hard probation shield): the roll ended WITHOUT
     /// generating or inserting a child. `run` tells this apart from a spent roll.
@@ -191,7 +175,7 @@ pub(crate) struct RollOutcome {
     pub detail: String,
 }
 impl RollOutcome {
-    /// A crossover child that cleared the checkpoint gate.
+    /// A crossover child that was admitted.
     pub fn survived(detail: impl Into<String>) -> Self {
         Self {
             survived: true,
@@ -226,7 +210,7 @@ pub(crate) struct StepEvolve {
     pub inserts: usize,
     /// Crossover rolls that fired this step.
     pub cross_fired: usize,
-    /// Fired crossover rolls whose child passed the gate.
+    /// Fired crossover rolls whose child was admitted.
     pub cross_survived: usize,
     /// Fired crossover rolls whose child was discarded.
     pub cross_discarded: usize,
@@ -433,7 +417,6 @@ impl CoreEngine {
         }
         let metrics = config.metrics.clone();
         let train_eval_split_ratio = 0.2f32;
-        let held_out_eval_rows = 256usize;
         let default_batch_size = 16usize;
         // The trainer owns batch geometry (Tabular only), resolved BEFORE the header so
         // engine.json records the stream shape the run used. `None` = no stream (RL).
@@ -474,7 +457,6 @@ impl CoreEngine {
                 informative_metrics: metrics.clone(),
                 max_steps: config.max_steps,
                 train_eval_split_ratio: Some(train_eval_split_ratio),
-                held_out_eval_rows: Some(held_out_eval_rows),
                 explicit_test_rows,
                 culls: 0,
                 run_elapsed_secs: 0,
@@ -616,7 +598,6 @@ impl CoreEngine {
                 Some(
                     BatchStream::new(run_seed, batch_size.unwrap_or(default_batch_size), split)
                         .with_eval_batch_size(eval_batch_size.unwrap_or(default_batch_size))
-                        .with_held_out_eval_rows(held_out_eval_rows)
                         .with_checkpoint_every(config.checkpoint_every),
                 )
             }
@@ -664,7 +645,6 @@ impl CoreEngine {
             step_rl: RlVolume::default(),
             total_train_turns: 0,
             champions: Vec::new(),
-            checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),
             pruner_solo_active: false,
             minimal_prev_means: None,
@@ -683,7 +663,7 @@ impl CoreEngine {
     /// Runtime default for the best-net eval size, for configs that predate
     /// the field (legacy `0` sentinel ⇒ batch_size). No-op for current configs.
     fn apply_eval_defaults(&mut self) {
-        // held_out_eval_rows now lives on RunSpec::stream, not RaceConfig — the engine
+        // Batch geometry now lives on RunSpec::stream, not RaceConfig — the engine
         // stores the stream directly, so this is a no-op for current code paths.
     }
 
@@ -734,7 +714,7 @@ impl CoreEngine {
     }
 
     /// Load every live net from `nets/` and replay it to its recorded step. Also
-    /// reloads the checkpoint ledger, so gates use the SAME historical bars.
+    /// reloads the checkpoint ledger so the history is the SAME.
     pub(crate) fn load_live_frontier(&mut self) -> Result<()> {
         // Replay-relevant knob guard: the smoothing window shapes every ranking decision,
         // so a resumed run must use the SAME window the original recorded.
@@ -780,14 +760,14 @@ impl CoreEngine {
                 );
                 continue;
             }
-            // Ghost guard (defensive): a gate-rejected child once leaked as a live state; a
-            // net born at step N cannot have trained clocks < N — warn and skip, don't fail.
+            // Ghost guard (defensive): a rejected child once leaked as a live state; a net
+            // born at step N cannot have trained clocks < N — warn and skip, don't fail.
             let entered = state.entered_at_step;
             if entered > 0 {
                 if let Some(lm) = state.last_metrics.as_ref() {
                     if entered > lm.step + 1 {
                         tracing::warn!(
-                            "race resume: skipping GHOST net {} (entered_at_step {} but last trained clock {} — a gate-rejected provisional child that leaked into nets/)",
+                            "race resume: skipping GHOST net {} (entered_at_step {} but last trained clock {} — a rejected child that leaked into nets/)",
                             state.hash,
                             entered,
                             lm.step
@@ -841,7 +821,6 @@ impl CoreEngine {
             loaded,
             run_dir.display()
         );
-        self.load_checkpoints()?;
         Ok(())
     }
 
@@ -938,8 +917,8 @@ impl CoreEngine {
     /// iteration — same batch, same eval, then the evolve rolls cull and replace.
     pub fn run(&mut self) -> Result<StopReason> {
         self.apply_eval_defaults();
-        // Keep the stream's eval-rotation cadence in lockstep with the gate cadence — a
-        // post-construction config edit must not desync era numbering.
+        // Keep the stream's eval-rotation cadence in lockstep with the checkpoint cadence —
+        // a post-construction config edit must not desync era numbering.
         if let Some(stream) = self.stream.as_mut() {
             stream.set_run_checkpoint_every(self.config.checkpoint_every);
         }
@@ -1000,13 +979,10 @@ impl CoreEngine {
             // The knobs that silently change what a run MEANS, printed up front so a resumed
             // command is reconstructible from the log alone.
             info!(
-                "race knobs: gate={:?} cull_policy={:?} retries={} dropout={} freeze_elites={} fresh_immigrants={} elite_save={} worst_save={} probation_steps={} crossover_probation_steps={} elite_join_probation_steps={} elite_crown_lifetime_steps={}",
-                self.config.crossover_gate,
+                "race knobs: cull_policy={:?} dropout={} freeze_elites={} elite_save={} worst_save={} probation_steps={} crossover_probation_steps={} elite_join_probation_steps={} elite_crown_lifetime_steps={}",
                 self.config.crossover_cull_policy,
-                self.config.crossover_retries,
                 self.header.topology_options.dropout_prob,
                 self.config.freeze_elites,
-                self.config.mode_specific.mutation_catch_up(),
                 self.config.elite_save_topology,
                 self.config.worst_save_topology,
                 self.config.mutation_probation_steps,
@@ -1108,7 +1084,7 @@ impl CoreEngine {
                 }
                 self.accounting.crossover_rolls += cross_total;
                 self.accounting.mutation_rolls += mutate_total;
-                // 3a. crossover rolls: checkpoint-gated children.
+                // 3a. crossover rolls: recombined children.
                 for roll in 0..cross_total {
                     if !evolve_allowed {
                         break; // nobody to cull: the whole batch is forgone
@@ -1137,9 +1113,9 @@ impl CoreEngine {
                         continue;
                     }
                     cross_fired += 1;
-                    // cx_retry_full: on a gate rejection, retry the FULL attempt (fresh parents,
-                    // generate + gate). `crossover_retries` is the TOTAL attempts budget per roll.
-                    let max_attempts = self.config.crossover_retries.max(1);
+                    // A crossover roll retries the FULL attempt (fresh parents) up to a
+                    // fixed budget; a roll that still produces nothing is discarded.
+                    let max_attempts = CROSSOVER_ATTEMPTS;
                     let mut attempt = 0usize;
                     let outcome = loop {
                         attempt += 1;
@@ -1184,7 +1160,7 @@ impl CoreEngine {
                         );
                     }
                 }
-                // 3b. mutation rolls: random immigrants (no gate).
+                // 3b. mutation rolls: random immigrants.
                 for roll in 0..mutate_total {
                     if !evolve_allowed {
                         break; // nobody to cull: the whole batch is forgone
@@ -1338,70 +1314,28 @@ impl CoreEngine {
                 info!("step {} │ {}", clock, step_rollup_line(&vitals));
             }
 
-            // ── 2. record checkpoint (every `checkpoint_every` steps) ───────
+            // ── 2. durability tick (every `checkpoint_every` steps) ─────────
             if clock > 0 && clock % self.config.checkpoint_every == 0 {
-                let mean = self.population_mean_smoothed_fitness();
-                // Surprise exam: score every live net on this era's gating-pool batch (rows
-                // never touched by training or eval). Diagnostic only — it cannot perturb ranking.
-                let era = (clock / self.config.checkpoint_every) as u64;
-                let exam_mean = self.run_checkpoint_exam(era)?;
-                self.checkpoints.push(Checkpoint {
-                    step: clock,
-                    pop_mean_fitness: mean,
-                    exam_mean_fitness: exam_mean,
-                });
-                if let Err(e) = self.write_checkpoints() {
-                    tracing::warn!("checkpoint ledger write failed: {e}");
-                }
+                // Snapshot the live frontier so a hard kill loses at most one tick.
                 if let Err(e) = self.write_live_frontier_states() {
                     tracing::warn!("checkpoint live states write failed: {e}");
                 }
                 // Elite weight snapshot (hard-kill durability): the frontier states carry
-                // topology + counters every checkpoint; this adds the top-k WEIGHTS.
+                // topology + counters every tick; this adds the top-k WEIGHTS.
                 if self.config.elite_checkpoint_weights {
                     if let Err(e) = self.write_checkpoint_elite_safetensors() {
                         tracing::warn!("checkpoint elite snapshot failed: {e}");
                     }
                 }
-                // Flush metrics at the checkpoint too, so an interrupted run keeps per-step
-                // history up to its last checkpoint instead of the whole in-memory buffer.
+                // Flush metrics at the tick too, so an interrupted run keeps per-step
+                // history up to its last tick instead of the whole in-memory buffer.
                 if let Err(e) = self.flush_csv_exports() {
                     tracing::warn!("checkpoint CSV flush failed: {e}");
                 }
                 if self.verbose_detail() {
-                    let arrow = self.fitness.direction().arrow();
-                    // The bar the gate actually compares against: `Soft` uses the mean of ALL
-                    // checkpoint means, `Hard` the newest one — shown so they are never confused.
-                    let bar_txt = match self.current_gate_bar(clock) {
-                        Some(bar) => format!(
-                            "gate bar({}) {} avg{:.4} │ ",
-                            match self.config.crossover_gate {
-                                crate::engine::config::CrossoverGate::Hard => "hard",
-                                crate::engine::config::CrossoverGate::Soft => "soft",
-                                crate::engine::config::CrossoverGate::Off => "off",
-                            },
-                            arrow,
-                            bar,
-                        ),
-                        None => String::new(),
-                    };
-                    // RL has no exam batch — `—`, like the eval_loss column,
-                    // instead of a fake 0.0000.
-                    let exam_txt = if self.exam_available() {
-                        format!("{} {:.4}", arrow, exam_mean)
-                    } else {
-                        "—".to_string()
-                    };
-                    // `smt` tag: the population mean is a mean of SMOOTHED per-net fitnesses, so it
-                    // is never misread as a raw step value.
                     info!(
-                        "step {} │ checkpoint │ pop_mean_fitness {} smt{:.4} │ {}exam_mean_fitness {} (ledger: {} entries)",
-                        clock,
-                        arrow,
-                        mean,
-                        bar_txt,
-                        exam_txt,
-                        self.checkpoints.len(),
+                        "step {} │ checkpoint │ frontier + elite weights snapshotted, CSVs flushed",
+                        clock
                     );
                 }
             }
@@ -2080,7 +2014,7 @@ impl CoreEngine {
             history_header.push(',');
             history_header.push_str(m.label());
         }
-        let attempts_header = "step,branch,attempt,outcome,child_hash,child_net_seed,child_origin,gate_index,child_fitness,bar,victim,victim_net_seed,pop_size";
+        let attempts_header = "step,branch,attempt,outcome,child_hash,child_net_seed,child_origin,child_fitness,victim,victim_net_seed,pop_size";
         let history_body = std::mem::take(&mut self.history_csv_buffer);
         let attempts_body = std::mem::take(&mut self.attempts_csv_buffer);
         self.append_csv_file("history.csv", &history_header, &history_body)?;
@@ -2160,12 +2094,6 @@ impl CoreEngine {
                     .map(|s| s.train_eval_split_ratio())
                     .unwrap_or(0.2),
             ),
-            held_out_eval_rows: Some(
-                self.stream
-                    .as_ref()
-                    .map(|s| s.held_out_eval_rows())
-                    .unwrap_or(256),
-            ),
             explicit_test_rows: self.explicit_test_rows,
             culls: self.culls,
             run_elapsed_secs: self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs(),
@@ -2189,6 +2117,9 @@ impl CoreEngine {
 /// Smoothed-fitness tolerance for "these nets are tied" (a solved cartpole
 /// population sits at `500.0000 ± 0.0000`, so exact equality is the norm).
 const CHAMPION_TIE_EPS: f32 = 1e-6;
+
+/// Attempts a crossover roll may make (fresh parents each) before it is discarded.
+const CROSSOVER_ATTEMPTS: usize = 5;
 
 /// The champion among `candidates` as `(hash, smoothed fitness, params)`: best
 /// fitness first, ties broken by FEWEST parameters (unknown count always loses).
@@ -2534,12 +2465,6 @@ mod tests {
         assert_eq!(cfg.mutate_rolls, 1);
         // Evolution semantics default to the cartpole reference (only the
         // SIZE axis stays small/conservative).
-        assert_eq!(
-            cfg.crossover_gate,
-            crate::engine::config::CrossoverGate::Soft
-        );
-        assert_eq!(cfg.crossover_gate_window, 5);
-        assert_eq!(cfg.crossover_retries, 5);
         assert_eq!(cfg.mutate_prob, 0.5);
         assert_eq!(
             cfg.mutation_cull_policy,
@@ -2554,8 +2479,8 @@ mod tests {
             crate::engine::config::CrossCullPolicy::Worst
         );
         assert_eq!(cfg.checkpoint_every, DEFAULT_CHECKPOINT_EVERY);
-        // batch_size and held_out_eval_rows live on RunSpec::stream (engine
-        // infrastructure), not RaceConfig — verified by the stream_shape contract.
+        // batch_size lives on RunSpec::stream (engine infrastructure), not
+        // RaceConfig — verified by the stream_shape contract.
         assert_eq!(cfg.max_steps, None, "budgets inactive by default");
         assert!(cfg.hidden_dim_pool.is_some());
         assert_eq!(cfg.pop_size, 5);
@@ -2832,7 +2757,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
-    fn dethroned_elite_resumes_stepping_without_catch_up() {
+    fn dethroned_elite_resumes_stepping_without_replay() {
         // Dethrone under act-and-measure freeze: the former elite never fell behind the
         // clock, so losing the crown is simply RESUMING normal training (no gauntlet).
         let dir = std::env::temp_dir().join("gras_dethrone_resume_test");
@@ -2884,7 +2809,7 @@ mod tests {
         eng.refresh_crown(7);
         assert!(eng.frozen_crown.contains(&hs[0]), "crown moved to A");
         // B's next step is a NORMAL train step at the current clock — one
-        // clock past its last acted clock (no catch-up replay span).
+        // clock past its last acted clock (no replay span).
         eng.step_one_net(&hs[1], 8).unwrap();
         let b_last = eng
             .state
@@ -2895,7 +2820,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             b_last.step, 8,
-            "dethroned net stepped once at the current clock (no catch-up)"
+            "dethroned net stepped once at the current clock (no replay)"
         );
         // NOTE: B may legitimately re-crown if its trained fitness beats A's 0.05 —
         // correct dethrone semantics. Assert consistency with B's standing, not a set.
@@ -2962,14 +2887,14 @@ mod tests {
     }
 
     #[test]
-    fn mutation_catch_up_off_is_the_default_no_handicap() {
-        // Default (mutation_catch_up = false): a mutation immigrant keeps step 0 / no
-        // metrics and gets the NO-catch-up detail line; with the flag on it catches up.
-        let dir = std::env::temp_dir().join("gras_mutation_catch_up_toggle");
+    fn newborn_immigrant_starts_fresh_without_replay() {
+        // A mutation immigrant joins at step 0 with no recorded metrics: there is no
+        // replay, and its first optimizer update is the next group step.
+        let dir = std::env::temp_dir().join("gras_mutation_newborn_fresh");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 31).unwrap();
         eng.config.mutate_rolls = 1;
-        // Cull shield 0: this test pins the immigrant's catch-up bookkeeping,
+        // Cull shield 0: this test pins the immigrant's fresh-insert bookkeeping,
         // and with the default window nobody would be cull-eligible yet.
         eng.config.mutation_probation_steps = 0;
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
@@ -2977,8 +2902,8 @@ mod tests {
         let hs = eng.state.live_hashes();
         eng.rolling_fitness.get_mut(&hs[0]).unwrap().push(0.1);
         eng.rolling_fitness.get_mut(&hs[1]).unwrap().push(0.9);
-        // Default: no catch-up. A fresh immigrant is inserted; its step count
-        // is 0 and it has no recorded metrics (no replay happened).
+        // A fresh immigrant is inserted; its step count is 0 and it has no
+        // recorded metrics (no replay happened).
         eng.evolve_random_immigrant(5, 0).unwrap();
         assert_eq!(eng.state.live_hashes().len(), 2, "cull+insert keeps size");
         let newcomer = eng
@@ -2988,31 +2913,8 @@ mod tests {
             .find(|h| !hs.contains(h))
             .expect("a new immigrant hash exists");
         let s = eng.state.net(&newcomer).unwrap();
-        assert_eq!(
-            s.step, 0,
-            "catch-up off (default): no replayed training count"
-        );
-        assert!(
-            s.last_metrics.is_none(),
-            "catch-up off (default): no replayed metrics"
-        );
-        // Flip the flag: the next immigrant catches up to the clock.
-        eng.config.mode_specific =
-            crate::engine::config::ModeConfig::Rl(crate::engine::config::RlConfig {
-                mutation_catch_up: true,
-                ..crate::engine::config::RlConfig::default()
-            });
-        let before = eng.state.live_hashes();
-        eng.evolve_random_immigrant(7, 0).unwrap();
-        let newcomer2 = eng
-            .state
-            .live_hashes()
-            .into_iter()
-            .find(|h| !before.contains(h))
-            .expect("a second immigrant hash exists");
-        let s2 = eng.state.net(&newcomer2).unwrap();
-        assert_eq!(s2.step, 7, "catch-up on: immigrant replayed to the clock");
-        assert!(s2.last_metrics.is_some(), "catch-up on: replayed metrics");
+        assert_eq!(s.step, 0, "newborn: no replayed training count");
+        assert!(s.last_metrics.is_none(), "newborn: no replayed metrics");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3074,7 +2976,7 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_replays_steps_zero_to_clock() {
+    fn replay_range_replays_steps_zero_to_clock() {
         let dir = std::env::temp_dir().join("race_catchup_test");
         let mut engine = engine(&dir, 42).unwrap();
         engine.config.crossover_prob = 0.0;
@@ -3084,7 +2986,7 @@ mod tests {
             .unwrap();
         let clock = 5;
         // generate_child can now return Ok(None) (spent roll) — this test
-        // exercises catch-up mechanics, so build the child directly.
+        // exercises replay mechanics, so build the child directly.
         let mut child = engine.random_child(clock, 0).unwrap();
         assert!(
             !child
@@ -3093,20 +2995,20 @@ mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("crossover"),
-            "catch-up replay test should use the random branch so the child nets fit the tiny harness"
+            "the replay test should use the random branch so the child nets fit the tiny harness"
         );
         let topo = child.state.topology().unwrap();
         assert_eq!(topo.options.input_dim, Some(2));
         assert_eq!(topo.options.output_dim, Some(2));
-        // Catch-up replays steps 0..clock-1 and leaves the child at the clock.
-        engine.catch_up(&mut child, clock).unwrap();
+        // Replay runs steps 0..clock-1 and leaves the child at the clock.
+        engine.replay_range(&mut child, 0, clock).unwrap();
         assert_eq!(child.state.step, clock);
         let m = child.state.last_metrics.as_ref().unwrap();
         assert_eq!(m.step, clock - 1);
     }
 
     #[test]
-    fn catch_up_is_deterministic() {
+    fn replay_range_is_deterministic() {
         let dir_a = std::env::temp_dir().join("race_catchup_det_a");
         let dir_b = std::env::temp_dir().join("race_catchup_det_b");
         let mut engine_a = engine(&dir_a, 42).unwrap();
@@ -3124,9 +3026,9 @@ mod tests {
         let clock = 5;
         let mut child_a = engine_a.random_child(clock, 0).unwrap();
         let mut child_b = engine_b.random_child(clock, 0).unwrap();
-        engine_a.catch_up(&mut child_a, clock).unwrap();
-        engine_b.catch_up(&mut child_b, clock).unwrap();
-        // Same seed ⇒ same catch-up metrics.
+        engine_a.replay_range(&mut child_a, 0, clock).unwrap();
+        engine_b.replay_range(&mut child_b, 0, clock).unwrap();
+        // Same seed ⇒ same replayed metrics.
         let m_a = child_a.state.last_metrics.as_ref().unwrap();
         let m_b = child_b.state.last_metrics.as_ref().unwrap();
         assert_eq!(m_a.train_loss, m_b.train_loss);
@@ -3796,7 +3698,7 @@ mod tests {
     #[test]
     fn resume_restores_run_counters() {
         // Stop → resume continues the ORIGINAL cull budget, wall-clock age and child
-        // ordinals; `held_out_eval_rows` rides the header so the stream geometry holds.
+        // ordinals; the stream geometry rides the header so it holds across resume.
         let dir = std::env::temp_dir().join("race_resume_counters");
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = engine(&dir, 99).unwrap();
@@ -3859,45 +3761,6 @@ mod tests {
             snap.elapsed_seconds
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn resume_held_out_eval_rows_ride_the_header() {
-        // The header's held_out_eval_rows is data geometry: the resumed
-        // stream must use the run's recorded value, not re-decide it.
-        let dir = std::env::temp_dir().join("race_resume_held_out");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut engine = engine(&dir, 99).unwrap();
-        engine
-            .seed_population_internal(vec![tiny_topology(7)], Some(0.5))
-            .unwrap();
-        let h = engine.state.live_hashes()[0].clone();
-        engine.step_one_net(&h, 0).unwrap();
-        let state = engine.state.net(&h).cloned().unwrap();
-        crate::state::write_net_state(&dir, &state).unwrap();
-        // Stamp a distinctive value into the header (as a run with a custom
-        // stream would have recorded).
-        engine.header.held_out_eval_rows = Some(64);
-        crate::state::write_engine_json(&dir, &engine.header).unwrap();
-        drop(engine);
-
-        let resumed = crate::engine::TabularEngine::resume(
-            dir,
-            tiny_dataset_dir("resume_held_out"),
-            {
-                let mut c = RaceConfig::defaults();
-                c.pop_size = 1;
-                c
-            },
-            fitness(),
-            crate::trainer::TabularTrainer::new(loss_fn()),
-        )
-        .unwrap();
-        assert_eq!(
-            resumed.stream.as_ref().unwrap().held_out_eval_rows(),
-            64,
-            "resumed stream honors the header's held_out_eval_rows"
-        );
     }
 
     #[test]
@@ -4087,8 +3950,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The durability tick writes the live frontier states; a resume rebuilds the
+    /// SAME frontier from them (no ledger involved — the ledger was removed as a
+    /// diagnostic that nothing read).
     #[test]
-    fn resume_checkpoint_ledger_gate_parity() {
+    fn resume_rebuilds_the_frontier_from_durability_states() {
         let dir = std::env::temp_dir().join("race_checkpoint_resume_parity");
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -4105,37 +3971,18 @@ mod tests {
         engine
             .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
-
-        // Step 1 & 2 to create a checkpoint at step 2
         let hashes = engine.state.live_hashes();
         for clock in 0..3 {
             for h in &hashes {
                 engine.step_one_net(h, clock).unwrap();
             }
-            // Trigger checkpoint write in engine.run() equivalent
             if clock > 0 && clock % engine.config.checkpoint_every == 0 {
-                let era = (clock / engine.config.checkpoint_every) as u64;
-                let mean = engine.population_mean_smoothed_fitness();
-                let exam = engine.run_checkpoint_exam(era).unwrap();
-                engine.checkpoints.push(Checkpoint {
-                    step: clock,
-                    pop_mean_fitness: mean,
-                    exam_mean_fitness: exam,
-                });
-                engine.write_checkpoints().unwrap();
+                engine.write_live_frontier_states().unwrap();
             }
         }
-        assert_eq!(engine.checkpoints.len(), 1);
-        let expected_mean = engine.checkpoints[0].pop_mean_fitness;
-
-        // Persist the live states
-        for h in &hashes {
-            let state = engine.state.net(h).cloned().unwrap();
-            crate::state::write_net_state(&dir, &state).unwrap();
-        }
+        let live_before = engine.state.live_count();
         drop(engine);
 
-        // Resume engine
         let resumed = crate::engine::TabularEngine::resume(
             dir.clone(),
             tiny_dataset_dir("chk_parity"),
@@ -4149,13 +3996,10 @@ mod tests {
             crate::trainer::TabularTrainer::new(loss_fn()),
         )
         .unwrap();
-
-        assert_eq!(resumed.checkpoints.len(), 1, "ledger reloaded");
-        assert_eq!(resumed.checkpoints[0].step, 2);
-        assert_eq!(resumed.checkpoints[0].pop_mean_fitness, expected_mean);
-        assert!(
-            !resumed.checkpoints[0].exam_mean_fitness.is_nan(),
-            "exam reading persisted"
+        assert_eq!(
+            resumed.state.live_count(),
+            live_before,
+            "the tick's frontier states must rebuild the same live population"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4328,19 +4172,6 @@ mod tests {
                 )
                 .unwrap();
         }
-    }
-
-    #[test]
-    fn stop_criteria_single_each_fires() {
-        // max_steps alone: fires at its own step.
-        let run_dir = std::env::temp_dir().join("gras-race-steps");
-        let mut eng = engine(&run_dir, 5).unwrap();
-        eng.config.max_steps = Some(20);
-        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-            .unwrap();
-        seed_raw_fitness(&mut eng, 0.5);
-        assert_eq!(eng.check_stop(19), None, "not fired yet");
-        assert_eq!(eng.check_stop(20), Some(StopReason::MaxSteps));
     }
 
     #[test]
@@ -4667,7 +4498,7 @@ mod tests {
         // The stream's pools are disjoint BY CONSTRUCTION: eval pool rows all
         // sit in the test range [80..100) of the combined dataset.
         let stream = eng.stream.as_ref().unwrap();
-        let (train_pool, eval_pool, gating_pool) = stream.pools();
+        let (train_pool, eval_pool) = stream.pools();
         let test_start = split_at as i64;
         for row in eval_pool {
             assert!(
@@ -4675,12 +4506,15 @@ mod tests {
                 "eval pool row {row} leaks into the train range"
             );
         }
-        for row in gating_pool {
-            assert!(*row >= test_start, "gating row {row} leaks into train");
-        }
         for row in train_pool {
             assert!(*row < test_start, "train pool row {row} enters test range");
         }
+        // Every test row is evaluated
+        assert_eq!(
+            eval_pool.len(),
+            100 - split_at,
+            "all held-out rows are in the eval pool"
+        );
         // Resume rebuilds the SAME pools from the header (no re-detection).
         let resumed = crate::engine::TabularEngine::resume(
             run_dir.clone(),
@@ -4695,7 +4529,6 @@ mod tests {
         .unwrap();
         let rs = resumed.stream.as_ref().unwrap().pools();
         assert_eq!(eval_pool, rs.1, "resume: identical eval pool");
-        assert_eq!(gating_pool, rs.2, "resume: identical gating pool");
         assert_eq!(train_pool, rs.0);
 
         let _ = std::fs::remove_dir_all(&data_dir);
@@ -5192,6 +5025,12 @@ mod tests {
             eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
                 .unwrap();
             eng.run().unwrap();
+            // The ledger was removed: the tick writes durability snapshots, never
+            // a checkpoints.json diagnostic.
+            assert!(
+                !dir.join("checkpoints.json").exists(),
+                "the removed checkpoint ledger must not be written"
+            );
             if expect_file {
                 // Champion hash from the engine — the same source the
                 // snapshot writer used.
@@ -5531,125 +5370,6 @@ mod tests {
             !eng.on_probation(&hashes[0], 17),
             "crossover window expires after k clocks"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn crossover_gate_window_limits_bars_and_persists() {
-        // The window must (a) slice the ledger to the last k RECORDED
-        // checkpoints for both gates and (b) round-trip through engine.json.
-        let dir = std::env::temp_dir().join("gras-cx-gate-window");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut engine = engine(&dir, 7).unwrap();
-        engine.config.crossover_gate_window = 2;
-        // Seed a 5-entry ledger with distinct, ordered bars (Minimize: lower
-        // = better — so the last-2 mean differs sharply from the all-5 mean).
-        for (i, step) in [10usize, 20, 30, 40, 50].iter().enumerate() {
-            engine.checkpoints.push(Checkpoint {
-                step: *step,
-                pop_mean_fitness: 1.0 + i as f32,
-                exam_mean_fitness: 0.0,
-            });
-        }
-        let all: Vec<(usize, Checkpoint)> = engine
-            .checkpoints
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (i, *c))
-            .collect();
-        let gate_k = engine.config.crossover_gate_window;
-        let windowed = &all[all.len() - gate_k..];
-        assert_eq!(windowed.len(), 2);
-        assert_eq!(windowed.len(), 2);
-        // The all-bars mean (3.0) vs windowed mean: window actually changed
-        // the verdict input.
-        let all_mean = all.iter().map(|(_, c)| c.pop_mean_fitness).sum::<f32>() / 5.0;
-        assert!((all_mean - 3.0).abs() < 1e-6);
-        let win_mean = windowed
-            .iter()
-            .map(|(_, c)| c.pop_mean_fitness)
-            .sum::<f32>()
-            / 2.0;
-        assert!(
-            (win_mean - 4.5).abs() < 1e-6,
-            "last two bars are 4.0 and 5.0 → mean 4.5 (got {win_mean})"
-        );
-        // Persist + reload: the knob is replay-relevant.
-        let cfg = crate::engine::config::RaceConfig {
-            crossover_gate_window: 7,
-            ..crate::engine::config::RaceConfig::defaults()
-        };
-        let snap = crate::state::ConfigSnapshot::from_config(&cfg, Some(32), Some(32));
-        assert_eq!(snap.crossover_gate_window, 7);
-        assert_eq!(
-            crate::engine::config::RaceConfig::defaults().crossover_gate_window,
-            5,
-            "default gate window = 5 (cartpole reference)"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn crossover_gate_off_catches_up_without_gating() {
-        // `Off` must still CATCH UP the child (replay 0..clock) but never reject it:
-        // under an impossible Hard bar the same child is discarded — the variant's point.
-        let dir = std::env::temp_dir().join("gras-cx-gate-off");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut eng = seed_two_parents(&dir, 21);
-        eng.config.crossover_prob = 1.0;
-        // Cull shield 0 on BOTH channels: the race below is 3 clocks, so the default
-        // windows would leave no net cull-eligible and the roll would be skipped.
-        eng.config.crossover_probation_steps = 0;
-        eng.config.mutation_probation_steps = 0;
-        // The tabular arm defaults catch-up OFF, so the gate is never reached;
-        // turn catch-up ON to exercise the gated path this test is about.
-        eng.config.mode_specific =
-            crate::engine::config::ModeConfig::Tabular(crate::engine::config::TabularConfig {
-                crossover_catch_up: true,
-                ..Default::default()
-            });
-        let hashes = eng.state.live_hashes();
-        for clock in 0..3 {
-            for h in &hashes {
-                eng.step_one_net(h, clock).unwrap();
-            }
-        }
-        // An impossible bar: the test fitness is Minimize (lower = better), so
-        // a bar of −1e9 can never be beaten by a replayed child (its mse ≥ 0).
-        eng.checkpoints.push(Checkpoint {
-            step: 2,
-            pop_mean_fitness: -1.0e9,
-            exam_mean_fitness: 0.0,
-        });
-        assert!(
-            eng.current_gate_bar(3).is_some(),
-            "Hard/Soft draw a bar from the ledger"
-        );
-
-        eng.config.crossover_gate = crate::engine::config::CrossoverGate::Hard;
-        let hard = eng.evolve_crossover_child(3, 0, 1).unwrap();
-        assert!(
-            !hard.survived && hard.detail.contains("rejected by hard gate"),
-            "hard gate rejects under an impossible bar: {}",
-            hard.detail
-        );
-
-        eng.config.crossover_gate = crate::engine::config::CrossoverGate::Off;
-        assert_eq!(eng.current_gate_bar(3), None, "Off draws no bar");
-        let off = eng.evolve_crossover_child(3, 0, 1).unwrap();
-        assert!(
-            off.survived && off.detail.contains("gate off"),
-            "Off catches the child up but never rejects it: {}",
-            off.detail
-        );
-
-        // The knob is replay-relevant and round-trips as `off`.
-        let cfg = crate::engine::config::RaceConfig {
-            crossover_gate: crate::engine::config::CrossoverGate::Off,
-            ..crate::engine::config::RaceConfig::defaults()
-        };
-        let snap = crate::state::ConfigSnapshot::from_config(&cfg, Some(2), Some(2));
-        assert_eq!(snap.crossover_gate, "off");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

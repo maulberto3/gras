@@ -281,16 +281,10 @@ mod tests {
     }
 
     #[test]
-    fn population_size_is_preserved_despite_duplicates() {
+    fn dedupe_keeps_size_and_leaves_no_duplicate_hashes() {
         let cfg = tiny_config(6);
         let topos = initial_population(&cfg, 42);
         assert_eq!(topos.len(), 6, "dedupe must not shrink the population");
-    }
-
-    #[test]
-    fn population_has_no_duplicate_hashes() {
-        let cfg = tiny_config(6);
-        let topos = initial_population(&cfg, 42);
         let mut hashes: Vec<String> = topos
             .iter()
             .map(|t| topo_hash(&t.to_json().unwrap()))

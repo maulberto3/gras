@@ -3,7 +3,7 @@
 //! Every ranking decision in the engine reads *smoothed* fitness, not the raw
 //! per-step value — raw values bounce with batch difficulty, the trend is what
 //! matters. The consumers are the current best/worst net (cull victim
-//! selection, crossover gate replacement), the roulette parent ranking, the
+//! selection), the roulette parent ranking, the
 //! checkpoint ledger's `pop_mean_fitness`, and the `RaceSnapshot` handed to a
 //! custom stop closure.
 

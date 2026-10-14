@@ -211,7 +211,7 @@ impl TabularStep for TabularTrainer {
         )?;
 
         // Eval on the step's shared eval batch (held-out stream), never the
-        // train batch — this must mirror catch-up exactly.
+        // train batch — this must mirror replay exactly.
         let eval_batch: (Tensor, Tensor) = ctx.data.eval_batch(step as u64)?;
         let report = eval_one_step(net, loss_fn, fitness, ctx.metrics, &eval_batch)?;
 

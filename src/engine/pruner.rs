@@ -68,8 +68,6 @@ impl CoreEngine {
                 "pruned",
                 "pruned",
                 None,
-                None,
-                None,
                 Some(v.as_str()),
                 victim_seed,
             );

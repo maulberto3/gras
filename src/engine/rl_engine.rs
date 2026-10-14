@@ -153,7 +153,6 @@ impl RlEngine {
             step_rl: RlVolume::default(),
             total_train_turns: 0,
             champions: Vec::new(),
-            checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),
             pruner_solo_active: false,
             minimal_prev_means: None,

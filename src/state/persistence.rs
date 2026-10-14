@@ -39,13 +39,6 @@ pub struct ConfigSnapshot {
     pub crossover_rolls: usize,
     /// Mutation (immigrant) rolls offered per step.
     pub mutate_rolls: usize,
-    /// Checkpoint gate strictness (`"hard"` | `"soft"`).
-    pub crossover_gate: String,
-    /// Crossover gate window (last-k checkpoints; 0 = all). Replay-relevant.
-    #[serde(default)]
-    pub crossover_gate_window: usize,
-    /// Extra gate-aware retries per crossover roll (0 = none).
-    pub crossover_retries: usize,
     /// Crossover replacement policy (`"worst"` | `"random"`). Crossover-only:
     /// mutation immigrants always evict via fitness-inverse roulette.
     pub crossover_cull_policy: String,
@@ -95,14 +88,6 @@ pub struct ConfigSnapshot {
         /// Replay-relevant, so it must match on resume.
     #[serde(default)]
     pub freeze_elites: bool,
-        /// Mutation catch-up toggle (engine.json key `fresh_immigrants`): `true` = immigrants
-        /// replay catch-up. Replay-relevant.
-    #[serde(default = "default_false")]
-    pub fresh_immigrants: bool,
-        /// Crossover catch-up toggle: `false` = a crossover child skips replay AND the
-        /// checkpoint gate. Replay-relevant.
-    #[serde(default = "default_true")]
-    pub crossover_catch_up: bool,
         /// How many initial slots were user-supplied run topologies. Informational (lineage
         /// reads: ordinals below this are imports).
     #[serde(default)]
@@ -157,9 +142,6 @@ impl ConfigSnapshot {
             checkpoint_every: cfg.checkpoint_every,
             crossover_rolls: cfg.crossover_rolls,
             mutate_rolls: cfg.mutate_rolls,
-            crossover_gate: format!("{:?}", cfg.crossover_gate).to_lowercase(),
-            crossover_gate_window: cfg.crossover_gate_window,
-            crossover_retries: cfg.crossover_retries,
             crossover_cull_policy: format!("{:?}", cfg.crossover_cull_policy).to_lowercase(),
             elite_count: cfg.elite_count,
             crossover_ops_pool: cfg.crossover_ops_pool.clone(),
@@ -185,8 +167,6 @@ impl ConfigSnapshot {
                 .map(|p| (format!("{:?}", p.method).to_lowercase(), p.steps)),
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
-            fresh_immigrants: cfg.mode_specific.mutation_catch_up(),
-            crossover_catch_up: cfg.mode_specific.crossover_catch_up(),
             run_topology_count: cfg.run_topologies.len(),
             seed_previous_run: cfg.seed_previous_run,
             seed_previous_run_dir: cfg
@@ -312,8 +292,6 @@ pub struct RunHeader {
     pub started_at: Option<String>,
     /// Train/eval split ratio recorded for the run.
     pub train_eval_split_ratio: Option<f32>,
-    /// Explicit held-out eval row count, when configured.
-    pub held_out_eval_rows: Option<usize>,
         /// Cumulative culls at the last stop — restored on resume so the cull budget
         /// continues. `0` on legacy files.
     #[serde(default)]
@@ -374,11 +352,11 @@ pub struct RunAccounting {
     /// Culls that freed a slot for a mutation immigrant.
     pub culls_immigrant: usize,
         /// Crossover roll batch: rolls offered/fired, attempts made, rolls discarded after the
-        /// retry budget. NOT a gate-only count (`crossover_catch_up=off` never runs the gate).
+        /// retry budget.
     pub crossover_rolls: usize,
     /// Crossover rolls that fired.
     pub crossover_fired: usize,
-    /// Crossover generate(+gate) attempts made.
+    /// Crossover generate attempts made.
     pub crossover_attempts: usize,
     /// Crossover rolls discarded after the retry budget.
     pub crossover_discarded: usize,
@@ -429,8 +407,6 @@ pub struct RunConfig {
     pub max_steps: Option<usize>,
     /// Train/eval split ratio.
     pub train_eval_split_ratio: Option<f32>,
-    /// Explicit held-out eval rows.
-    pub held_out_eval_rows: Option<usize>,
     /// See [`RunHeader::explicit_test_rows`].
     pub explicit_test_rows: Option<usize>,
     /// Cumulative culls at the last stop.
@@ -465,7 +441,6 @@ impl RunHeader {
             informative_metrics,
             max_steps,
             train_eval_split_ratio,
-            held_out_eval_rows,
             explicit_test_rows,
             culls,
             run_elapsed_secs,
@@ -494,7 +469,6 @@ impl RunHeader {
             max_steps,
             started_at: None,
             train_eval_split_ratio,
-            held_out_eval_rows,
             explicit_test_rows,
             culls,
             run_elapsed_secs,
@@ -599,10 +573,6 @@ impl RunHeader {
             .get("train_eval_split_ratio")
             .and_then(|f| f.as_f64())
             .map(|n| n as f32);
-        let held_out_eval_rows = v
-            .get("held_out_eval_rows")
-            .and_then(|f| f.as_u64())
-            .map(|n| n as usize);
         let explicit_test_rows = v
             .get("explicit_test_rows")
             .and_then(|f| f.as_u64())
@@ -679,7 +649,6 @@ impl RunHeader {
             max_steps,
             started_at,
             train_eval_split_ratio,
-            held_out_eval_rows,
             explicit_test_rows,
             culls,
             run_elapsed_secs,
@@ -699,11 +668,6 @@ impl RunHeader {
 /// Serde default: a net with no `alive` field is alive.
 fn default_alive() -> bool {
     true
-}
-
-/// Serde default: `false`.
-fn default_false() -> bool {
-    false
 }
 
 /// Serde default: `true`.
@@ -1039,7 +1003,7 @@ impl RaceState {
         }
     }
 
-    /// Register a newly inserted net (after catch-up or initial insertion).
+    /// Register a newly inserted net (after initial insertion).
     pub fn insert(&mut self, state: NetState, initial_fitness: Option<f32>) {
         let key = state.hash.clone();
         if let Some(entry) = self.topology_lifetime.get_mut(&key) {
@@ -1081,7 +1045,7 @@ impl RaceState {
             EngineError::InvalidOptions(format!("race state: net {hash} not live"))
         })?;
         state.record_metrics(metrics.clone());
-        // The span is how catch_up_step re-runs this clock through the
+        // The span is how replay_step re-runs this clock through the
         // no-op optimizer on resume.
         state.record_frozen_step(metrics.step);
         let fitness = metrics.fitness;
@@ -1296,7 +1260,6 @@ mod tests {
             informative_metrics: vec![Metric::custom("dummy", |_p, _y| Ok(0.0))],
             max_steps: Some(10_000),
             train_eval_split_ratio: Some(0.2),
-            held_out_eval_rows: Some(256),
             culls: 0,
             run_elapsed_secs: 0,
             children_born_at_clock: std::collections::HashMap::new(),

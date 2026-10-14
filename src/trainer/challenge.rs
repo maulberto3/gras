@@ -25,8 +25,8 @@
 //! ```
 //!
 //! On a fired step the trainer owns the response: RL forces an action on the
-//! TRAIN matches through [`ChallengePolicy`] + [`forced_action`] (pure, so
-//! catch-up and resume replay the identical force); tabular jitters its batch
+//! TRAIN matches through [`ChallengePolicy`] + [`forced_action`] (pure, so a
+//! resume replays the identical force); tabular jitters its batch
 //! at the element level against [`effective_challenge_prob`] (the decayed
 //! per-value rate). Ignoring the flag is legal — keep the knob at 0.
 //!
@@ -40,8 +40,8 @@
 //! # Replay contract
 //!
 //! [`challenge_fires`] is a pure function of `(run_seed, net_seed, step)` —
-//! no stored state, no engine involvement — so a catch-up child, a resumed
-//! run and the original run all re-derive the identical trigger. The run seed
+//! no stored state, no engine involvement — so a resumed run and the original
+//! run both re-derive the identical trigger. The run seed
 //! is recorded in `engine.json`; the net seed rides the net's blueprint. A
 //! stateful schedule (a counter, an RNG stream) would advance on every
 //! replay and silently break determinism — don't keep one.

@@ -30,9 +30,9 @@ use super::core::CoreEngine;
 pub struct RaceChild {
     /// The child's persisted state (also written to `nets/<hash>.json`).
     pub state: NetState,
-    /// Live network; coefficients mutate in place during catch-up.
+    /// Live network; coefficients mutate in place during training.
     pub net: Network,
-    /// Optimizer whose Adam state carries forward across catch-up steps.
+    /// Optimizer whose Adam state carries forward across steps.
     pub optimizer: Box<dyn Optimizer>,
 }
 
@@ -270,7 +270,7 @@ impl CoreEngine {
     }
 
         /// Shared child finalization: fresh weight seed from `run_seed + clock`, lineage
-        /// string, `NetState` at step 0, and built `Network` + `Optimizer` ready for catch-up.
+        /// string, `NetState` at step 0, and built `Network` + `Optimizer` ready to train.
     fn finalize_child(
         &self,
         mut topo: Topology,
@@ -293,7 +293,7 @@ impl CoreEngine {
             lineage
         };
             // The child's step counter starts at 0; `entered_at_step` is patched to the run
-            // clock right after, so catch-up advances it 0 → clock and it rejoins in lockstep.
+            // clock right after. A newborn trains forward from the current clock (no replay).
         let mut state = NetState::new(&topo, 0, Some(lineage))?;
         state.entered_at_step = clock;
         let _net_device = self.config.device();
@@ -307,47 +307,26 @@ impl CoreEngine {
         })
     }
 
-    // ── Catch-up ────────────────────────────────────────────────────────────
+    // ── Resume replay ───────────────────────────────────────────────────────
 
-        /// Catch-up a newcomer by replaying the shared stream solo for steps `0..clock`,
-        /// using the same primitives as the group loop (the replay contract).
-    pub(crate) fn catch_up(&mut self, child: &mut RaceChild, clock: usize) -> Result<()> {
-        self.catch_up_range(child, 0, clock)
-    }
-
-        /// Incremental catch-up: replay steps `from..to` (half-open), used by the gated
-        /// evolution path. No state file is written for PROVISIONAL children.
-    pub(crate) fn catch_up_range_provisional(
+    /// Replay steps `from..to` (half-open) into an owned child — the resume path that
+    /// rebuilds a net's history before the race continues.
+    pub(crate) fn replay_range(
         &mut self,
         child: &mut RaceChild,
         from: usize,
         to: usize,
     ) -> Result<()> {
         for step in from..to {
-            self.catch_up_step(child, step)?;
+            self.replay_step(child, step)?;
         }
-        Ok(())
-    }
-
-    /// Replay steps `from..to` (half-open) into an owned child.
-    pub(crate) fn catch_up_range(
-        &mut self,
-        child: &mut RaceChild,
-        from: usize,
-        to: usize,
-    ) -> Result<()> {
-        for step in from..to {
-            self.catch_up_step(child, step)?;
-        }
-        // Write the child's final caught-up state once. (Per-step writes during
-        // catch-up are a later nicety — see the function doc.)
+        // Write the child's final replayed state once (per-step writes are a later nicety).
         write_net_state(&self.run_dir, &child.state)?;
         Ok(())
     }
 
-    /// One catch-up/replay training step, shared by both range flavors.
-    /// Writes nothing — the range wrapper decides persistence.
-    fn catch_up_step(&mut self, child: &mut RaceChild, step: usize) -> Result<()> {
+    /// One replay training step. Writes nothing — the range wrapper decides persistence.
+    fn replay_step(&mut self, child: &mut RaceChild, step: usize) -> Result<()> {
         // The child replays through the caller's training scheme — the
         // same contract group-step nets use, so the recipe is identical.
         let run_data = self
@@ -364,8 +343,8 @@ impl CoreEngine {
             smoothing_window: self.config.smoothing_window,
             max_steps: self.config.max_steps,
         };
-            // Same (net, step) seed discipline the group step uses, so a catch-up replay
-            // and a resume replay draw the SAME dropout masks (fastrand + libtorch).
+            // Same (net, step) seed discipline the group step uses, so a resume replay
+            // draws the SAME dropout masks (fastrand + libtorch) as the original step.
         crate::utils::race_steps::seed_step_randomness(child.state.net_seed as u64, step as u64, 0);
             // Replay must mirror the original execution: a recorded frozen step is re-run
             // through a no-op optimizer so the weights stay put and metrics reproduce.
@@ -403,15 +382,15 @@ impl CoreEngine {
         if !frozen_step {
             child.state.advance_step();
         }
-        // Keep the rolling buffer in sync (catch-up steps count toward the
+        // Keep the rolling buffer in sync (replay steps count toward the
         // child's smoothed fitness once it rejoins).
         if let Some(buf) = self.rolling_fitness.get_mut(&child.state.hash) {
             buf.push(metrics.fitness);
         }
-        // Per-step catch-up lines are debug-only — the user-facing log
-        // is one "catch-up: N steps … done" message from the caller.
+        // Per-step replay lines are debug-only — the user-facing log is the resume
+        // summary from the caller.
         tracing::debug!(
-            "catch-up step {}: net {} train_loss↓ {:.4} eval_loss↓ {:?} fitness{} {:.4}",
+            "replay step {}: net {} train_loss↓ {:.4} eval_loss↓ {:?} fitness{} {:.4}",
             step,
             child.state.hash,
             metrics.train_loss,
@@ -436,7 +415,7 @@ impl CoreEngine {
             // Replay the clocks this net ACTUALLY trained, not a naive `0..clock`: a mid-run
             // joiner never trains at its birth clock, while a founder trained every clock.
         for (from, to) in segments {
-            self.catch_up_range(&mut child, from, to)?;
+            self.replay_range(&mut child, from, to)?;
         }
 
         if let (Some(recorded), Some(replayed)) = (recorded, child.state.last_metrics.clone()) {
@@ -465,7 +444,7 @@ impl CoreEngine {
     }
 
         /// Rebuild a `RaceChild` from a persisted `NetState`: same topology, recorded weight
-        /// seed and lineage — but step reset to 0 so `catch_up` can replay. Seed preserved.
+        /// seed and lineage — but step reset to 0 so replay can rebuild it. Seed preserved.
     fn build_child_from_state(&self, state: NetState) -> Result<RaceChild> {
         let topo = state.topology()?;
         let net = Network::build(&topo, self.config.device())?;
@@ -491,7 +470,7 @@ impl CoreEngine {
 }
 
 /// The clocks a reconstructed net must replay, as contiguous `(from, to)` segments for
-/// [`RaceEngine::catch_up_range`]: `recorded = step + acts`, and the gap tells the shape.
+/// [`CoreEngine::replay_range`]: `recorded = step + acts`, and the gap tells the shape.
 fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
     // Clocks with a recorded metrics row: trainings + act-and-measure acts.
     let recorded = state.step + frozen_act_count(state);
@@ -510,7 +489,7 @@ fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
     }
     let mut out: Vec<(usize, usize)> = Vec::new();
     if unrecorded == 1 {
-        // Exactly the birth clock is missing → full pre-birth catch-up.
+        // Exactly the birth clock is missing → full pre-birth replay.
         if birth > 0 {
             out.push((0, birth.min(end + 1)));
         }
@@ -525,7 +504,7 @@ fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
         return vec![(birth + 1, end + 1)];
     }
     tracing::warn!(
-        "resume: net {} recorded {} clocks over 0..={end} (birth {birth}) — ambiguous replay shape; using the catch-up plan",
+        "resume: net {} recorded {} clocks over 0..={end} (birth {birth}) — ambiguous replay shape; using the replay plan",
         state.hash,
         recorded
     );

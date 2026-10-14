@@ -1,11 +1,11 @@
 //! Evolution: the two independent roll groups that reshape the population.
 //!
-//! - **Crossover** (`evolve_crossover_child`): a checkpoint-gated child that
-//!   must beat the recorded population mean at every bar it replays through.
-//!   A failure is a SPENT ROLL — no cull, no random fallback (random whole
-//!   nets enter only via the mutation channel).
-//! - **Mutation** (`evolve_random_immigrant`): a fresh random topology with no
-//!   gate, evicting a victim per `MutationCullPolicy`.
+//! - **Crossover** (`evolve_crossover_child`): a recombined child, inserted
+//!   fresh (no replay) and evicting a victim per `CrossCullPolicy`. A draw that
+//!   produces nothing is a SPENT ROLL — no cull, no random fallback (random
+//!   whole nets enter only via the mutation channel).
+//! - **Mutation** (`evolve_random_immigrant`): a fresh random topology, evicting
+//!   a victim per `MutationCullPolicy`.
 //!
 //! Both share the cull/insert primitives here: `pre_insert_buffer`,
 //! `insert_child`, `cull_net`, and the victim selectors (elite-guarded,
@@ -15,7 +15,7 @@ use flodl::tensor::{Result, TensorError};
 use tracing::info;
 
 use super::child::RaceChild;
-use super::core::{Checkpoint, CoreEngine, RollOutcome};
+use super::core::{CoreEngine, RollOutcome};
 use super::format::csv_field;
 use super::smoothing::RollingBuffer;
 use crate::engine::smoothing::rolling_mean;
@@ -31,7 +31,7 @@ fn is_crossover_origin(created_from: Option<&str>) -> bool {
 /// mutation roll at the same `(clock, roll)` never draw the same number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RollKind {
-    /// A crossover roll (checkpoint-gated child).
+    /// A crossover roll (recombined child).
     Crossover,
     /// A mutation roll (random immigrant).
     Mutation,
@@ -56,8 +56,8 @@ impl RollKind {
 }
 
 impl CoreEngine {
-        /// Fresh empty rolling buffer for a net about to be caught up, so catch-up's
-        /// per-step pushes land somewhere.
+        /// Fresh empty rolling buffer for a net about to be inserted, so its per-step
+        /// pushes land somewhere.
     fn pre_insert_buffer(&mut self, hash: &str) {
         self.rolling_fitness.insert(
             hash.to_string(),
@@ -96,8 +96,8 @@ impl CoreEngine {
         ))
     }
 
-    /// Insert a caught-up child into the live maps (state, network, optimizer;
-    /// its rolling buffer was pre-inserted before catch-up and is NOT reset).
+    /// Insert a newborn child into the live maps (state, network, optimizer; its rolling
+    /// buffer was pre-inserted and is NOT reset).
     fn insert_child(&mut self, child: RaceChild, _clock: usize, _group: &str) {
         // NO per-event log here: inserts are reported on the calling roll's
         // single line — one roll, one line.
@@ -108,8 +108,8 @@ impl CoreEngine {
             .insert(child.state.hash.clone(), child.optimizer);
     }
 
-        /// One crossover roll: generate a child, run the checkpoint-gated catch-up
-        /// (discard on the first failed gate), and on success cull + insert the child.
+        /// One crossover roll: generate a child, cull a victim, insert the child fresh
+        /// (no replay, no checkpoint gate).
     pub(crate) fn evolve_crossover_child(
         &mut self,
         clock: usize,
@@ -148,8 +148,6 @@ impl CoreEngine {
                 None,
                 None,
                 None,
-                None,
-                None,
             );
             return Ok(RollOutcome::spent(format!(
                 "child {} duplicates a live topology → discarded",
@@ -157,10 +155,10 @@ impl CoreEngine {
             )));
         }
 
-            // Gated catch-up: the child must beat the checkpoint bars; `crossover_catch_up`
-            // OFF skips it entirely, and gate `Off` replays but never rejects.
+        // A newborn joins fresh: step 0, no replay — its first optimizer update is the
+        // next group step.
         self.pre_insert_buffer(&child.state.hash);
-        if !self.config.mode_specific.crossover_catch_up() {
+        {
             child.state.step = 0;
             child.state.last_metrics = None;
             let inserted_hash = child.state.hash[..8.min(child.state.hash.len())].to_string();
@@ -198,8 +196,6 @@ impl CoreEngine {
                 &child.state.created_from.clone().unwrap_or_default(),
                 "inserted",
                 None,
-                None,
-                None,
                 victim_for_log.as_deref(),
                 victim_net_seed,
             );
@@ -217,7 +213,7 @@ impl CoreEngine {
             }
             self.insert_child(child, clock, "crossover");
             return Ok(RollOutcome::survived(format!(
-                "child {} ({}) inserted (no gate, no catch-up: crossover_catch_up=off), victim {} culled ({})",
+                "child {} ({}) inserted (fresh, trains from step {clock}), victim {} culled ({})",
                 inserted_hash,
                 lineage,
                 victim_for_log
@@ -230,273 +226,10 @@ impl CoreEngine {
                 },
             )));
         }
-        let mut replayed_to = 0usize;
-        let mut last_checkpoint_step = 0usize;
-        let mut child_fit_at_gate = f32::NAN;
-            // Gate window: both gates read only the last `crossover_gate_window` recorded
-            // checkpoints (0 = all); indices are preserved so Hard replay sites stay exact.
-        let relevant_all: Vec<(usize, Checkpoint)> = self
-            .checkpoints
-            .iter()
-            .enumerate()
-            .filter(|(_, chk)| chk.step <= clock)
-            .map(|(i, chk)| (i, *chk))
-            .collect();
-        let gate_k = self.config.crossover_gate_window;
-        let relevant: Vec<(usize, Checkpoint)> = if gate_k == 0 || relevant_all.len() <= gate_k {
-            relevant_all
-        } else {
-            relevant_all[relevant_all.len() - gate_k..].to_vec()
-        };
-        let checkpoint_count = relevant.len();
-        let mut failed_gate: Option<(usize, usize, f32, f32)> = None; // (i+1, chk.step, child, mean)
-        match self.config.crossover_gate {
-            crate::engine::config::CrossoverGate::Hard => {
-                    // Evaluate gate-by-gate: replay to each checkpoint, compare.
-                    // PROVISIONAL replay: a rejected candidate leaves no state file behind.
-                for (i, chk) in &relevant {
-                    self.catch_up_range_provisional(&mut child, replayed_to, chk.step)?;
-                    replayed_to = chk.step;
-                    last_checkpoint_step = chk.step;
-                    let child_fit = self
-                        .rolling_fitness
-                        .get(&child.state.hash)
-                        .map(rolling_mean)
-                        .unwrap_or(f32::NAN);
-                    child_fit_at_gate = child_fit;
-                    let beat = self
-                        .fitness
-                        .direction()
-                        .is_better(child_fit, chk.pop_mean_fitness);
-                    if !beat {
-                        failed_gate = Some((i + 1, chk.step, child_fit, chk.pop_mean_fitness));
-                        break;
-                    }
-                }
-            }
-            crate::engine::config::CrossoverGate::Soft => {
-                // One aggregate bar: beat the mean of the checkpoint means.
-                // Replay straight to the last relevant checkpoint, compare once.
-                if let Some((_, last)) = relevant.last() {
-                    self.catch_up_range_provisional(&mut child, replayed_to, last.step)?;
-                    replayed_to = last.step;
-                    last_checkpoint_step = last.step;
-                    let mean_of_means = relevant
-                        .iter()
-                        .map(|(_, c)| c.pop_mean_fitness)
-                        .sum::<f32>()
-                        / checkpoint_count as f32;
-                    let child_fit = self
-                        .rolling_fitness
-                        .get(&child.state.hash)
-                        .map(rolling_mean)
-                        .unwrap_or(f32::NAN);
-                    child_fit_at_gate = child_fit;
-                    let beat = self.fitness.direction().is_better(child_fit, mean_of_means);
-                    if !beat {
-                        failed_gate = Some((checkpoint_count, last.step, child_fit, mean_of_means));
-                    }
-                }
-            }
-            crate::engine::config::CrossoverGate::Off => {
-                // No gate: the child is always admitted. `replayed_to` stays 0
-                // so the full replay below runs; `failed_gate` stays None.
-            }
-        }
-        if let Some((gate_i, gate_step, child_fit, bar)) = failed_gate {
-                // "discarded" = rejected by the checkpoint gate and never joined the
-                // population (the pop did not shrink); record the attempt.
-            self.record_attempt(
-                clock,
-                "crossover",
-                attempt,
-                Some(&child.state.hash),
-                Some(child.state.net_seed),
-                &child.state.created_from.clone().unwrap_or_default(),
-                "rejected_gate",
-                Some(gate_i),
-                Some(child_fit),
-                Some(bar),
-                None,
-                None,
-            );
-            // Drop the child's provisional buffers — it never joined.
-            self.rolling_fitness.remove(&child.state.hash);
-            self.rolling_train.remove(&child.state.hash);
-            self.rolling_eval.remove(&child.state.hash);
-                // k/N follows the success-line convention: Soft has ONE aggregate bar
-                // (`1/1`), Hard is gate-by-gate (`3/5`).
-            let (k, n) = match self.config.crossover_gate {
-                crate::engine::config::CrossoverGate::Hard => (gate_i, checkpoint_count),
-                crate::engine::config::CrossoverGate::Soft => (1, 1),
-                // Unreachable: `Off` never sets `failed_gate`.
-                crate::engine::config::CrossoverGate::Off => (1, 1),
-            };
-            return Ok(RollOutcome::spent(format!(
-                "child {} rejected by {} gate {k}/{n} ({}{:.4} vs bar avg{:.4}, window {checkpoint_count}) → discarded at step {}",
-                &child.state.hash[..8.min(child.state.hash.len())],
-                match self.config.crossover_gate {
-                    crate::engine::config::CrossoverGate::Hard => "hard",
-                    crate::engine::config::CrossoverGate::Soft => "soft",
-                    crate::engine::config::CrossoverGate::Off => "off",
-                },
-                self.fitness.direction().arrow(),
-                child_fit,
-                bar,
-                gate_step,
-            )));
-        }
-        let _ = last_checkpoint_step;
-        // Passed every gate — finish the replay to the clock, resolve the
-        // victim, record the attempt, then cull + insert.
-        self.catch_up_range(&mut child, replayed_to, clock)?;
-        // With the gate off nothing was measured mid-replay, so read the
-        // child's post-catch-up fitness once here for the attempt row.
-        if matches!(
-            self.config.crossover_gate,
-            crate::engine::config::CrossoverGate::Off
-        ) {
-            child_fit_at_gate = self
-                .rolling_fitness
-                .get(&child.state.hash)
-                .map(rolling_mean)
-                .unwrap_or(f32::NAN);
-        }
-            // Slot eviction per CrossCullPolicy (crossover-only): Worst = merit-based,
-            // Random = uniform. Elite guard excludes the top-k from victim status.
-        let victim_for_log: Option<String> = match self.config.crossover_cull_policy {
-            crate::engine::config::CrossCullPolicy::Worst => {
-                self.select_crossover_worst_victim(clock)?
-            }
-            crate::engine::config::CrossCullPolicy::Random => self.select_random_victim(clock)?,
-        };
-        // Defensive: see the catch-up-off path — a `None` here discards the
-        // (replayed) child and spends the roll rather than breaking probation.
-        if victim_for_log.is_none() {
-            self.rolling_fitness.remove(&child.state.hash);
-            self.rolling_train.remove(&child.state.hash);
-            self.rolling_eval.remove(&child.state.hash);
-            return Ok(RollOutcome::no_slot(self.no_cull_slot_detail("crossover")));
-        }
-        // Record the admitted attempt (cx_retry_full measurement) — before
-        // the cull/insert, while both victim and child states are readable.
-        let victim_net_seed = victim_for_log
-            .as_ref()
-            .and_then(|v| self.state.net(v))
-            .map(|s| s.net_seed);
-        self.record_attempt(
-            clock,
-            "crossover",
-            attempt,
-            Some(&child.state.hash),
-            Some(child.state.net_seed),
-            &child.state.created_from.clone().unwrap_or_default(),
-            "inserted",
-            None,
-            Some(child_fit_at_gate),
-            None,
-            victim_for_log.as_deref(),
-            victim_net_seed,
-        );
-        match self.config.crossover_cull_policy {
-            crate::engine::config::CrossCullPolicy::Worst => {
-                if let Some(victim) = &victim_for_log {
-                    self.cull_net(victim, clock, "crossover")?;
-                }
-            }
-            crate::engine::config::CrossCullPolicy::Random => {
-                if let Some(victim) = &victim_for_log {
-                    self.cull_net(victim, clock, "crossover-random")?;
-                }
-            }
-        }
-            // The gate verdict belongs on the SUCCESS line too: the child's score vs
-            // the bar, which gate, and how many bars.
-        let gate_note = if matches!(
-            self.config.crossover_gate,
-            crate::engine::config::CrossoverGate::Off
-        ) {
-            // Gate off: there is no bar to beat and no verdict to report.
-            " | gate off (crossover_catch_up=on, always inserted)".to_string()
-        } else if checkpoint_count > 0 {
-            let gate_name = match self.config.crossover_gate {
-                crate::engine::config::CrossoverGate::Hard => "hard",
-                crate::engine::config::CrossoverGate::Soft => "soft",
-                crate::engine::config::CrossoverGate::Off => "off",
-            };
-            let bar = match self.config.crossover_gate {
-                crate::engine::config::CrossoverGate::Off => f32::NAN,
-                crate::engine::config::CrossoverGate::Hard => {
-                    // Hard gate: the LAST checkpoint's bar was the final one beaten.
-                    relevant
-                        .last()
-                        .map(|(_, c)| c.pop_mean_fitness)
-                        .unwrap_or(f32::NAN)
-                }
-                crate::engine::config::CrossoverGate::Soft => {
-                    // Soft gate: one aggregate bar — the mean of the checkpoint means.
-                    relevant
-                        .iter()
-                        .map(|(_, c)| c.pop_mean_fitness)
-                        .sum::<f32>()
-                        / checkpoint_count.max(1) as f32
-                }
-            };
-            // bars-beaten shown per configured gate: Hard beat ALL of the
-            // `checkpoint_count` bars; Soft beat the 1 aggregate of them.
-            let bars = match self.config.crossover_gate {
-                crate::engine::config::CrossoverGate::Hard => checkpoint_count,
-                crate::engine::config::CrossoverGate::Soft => 1,
-                crate::engine::config::CrossoverGate::Off => 0,
-            };
-                // The bar is tagged `avg` (historical aggregate) and the child's figure
-                // `smt` (post-catch-up smoothed fitness) — same units on both sides.
-            format!(
-                " | gate {} {bars}/{bars} bars: smt{:.4} vs avg{:.4}{}",
-                gate_name,
-                child_fit_at_gate,
-                bar,
-                if gate_k > 0 {
-                    format!(" (window {gate_k}, {checkpoint_count} in window)")
-                } else {
-                    String::new()
-                },
-            )
-        } else {
-            // No checkpoints yet — the gate was NOT supposed to apply. Stated
-            // so "no gate" never reads as "passed a gate".
-            " | no gate (no checkpoints yet)".to_string()
-        };
-        let inserted_hash = child.state.hash[..8.min(child.state.hash.len())].to_string();
-        let lineage = child
-            .state
-            .created_from
-            .clone()
-            .unwrap_or_else(|| "?".into());
-        // Catch-up status on the success line: a gated child has ALWAYS
-        // replayed the full history (0..clock) — that's what the gate judged.
-        let catchup_note = format!("caught up {clock} step(s)");
-        // Victim with its POLICY (which `set_crossover_cull_policy` chose it).
-        let victim_note = match victim_for_log.as_deref() {
-            Some(v) => format!(
-                "victim {} culled ({})",
-                &v[..8.min(v.len())],
-                match self.config.crossover_cull_policy {
-                    crate::engine::config::CrossCullPolicy::Worst => "worst",
-                    crate::engine::config::CrossCullPolicy::Random => "random",
-                },
-            ),
-            None => "victim none".to_string(),
-        };
-        self.insert_child(child, clock, "crossover");
-        Ok(RollOutcome::survived(format!(
-            "child {} ({}) inserted{}, {}, {}",
-            inserted_hash, lineage, gate_note, catchup_note, victim_note,
-        )))
     }
 
         /// Append one evolution-event row to the `attempts.csv` buffer: every attempt
-        /// is recorded (inserted or rejected), so gate-failure rate stays queryable.
+        /// is recorded (inserted or rejected), so the failed-draw rate stays queryable.
     #[allow(clippy::too_many_arguments)] // one row of the attempt ledger — fields, not logic
     pub(crate) fn record_attempt(
         &mut self,
@@ -507,9 +240,7 @@ impl CoreEngine {
         child_net_seed: Option<usize>,
         origin: &str,
         outcome: &str,
-        gate_index: Option<usize>,
         child_fitness: Option<f32>,
-        bar: Option<f32>,
         victim: Option<&str>,
         victim_net_seed: Option<usize>,
     ) {
@@ -519,7 +250,7 @@ impl CoreEngine {
             // `attempts.csv` columns (see `flush_csv_exports`) with FULL hashes +
             // net_seed — (hash, net_seed) is the unique individual key.
         let row = format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
             step,
             branch,
             attempt,
@@ -527,9 +258,7 @@ impl CoreEngine {
             child_hash.unwrap_or_default(),
             child_net_seed.map(|s| s.to_string()).unwrap_or_default(),
             csv_field(origin),
-            gate_index.map(|g| g.to_string()).unwrap_or_default(),
             child_fitness.map(|v| v.to_string()).unwrap_or_default(),
-            bar.map(|v| v.to_string()).unwrap_or_default(),
             victim.unwrap_or_default(),
             victim_net_seed.map(|s| s.to_string()).unwrap_or_default(),
             self.state.live_count(),
@@ -631,8 +360,8 @@ impl CoreEngine {
             .find(|h| eligible(h) && off_probation(h))
     }
 
-        /// One mutation roll: cull a net inversely-proportionate to fitness and insert
-        /// a fully-random immigrant (no gate — a random topology could never clear it).
+        /// One mutation roll: cull a net inversely-proportionate to fitness and insert a
+        /// fully-random immigrant, fresh from the current clock.
     pub(crate) fn evolve_random_immigrant(
         &mut self,
         clock: usize,
@@ -651,28 +380,15 @@ impl CoreEngine {
         let idx = self.next_child_ordinal(clock);
         let mut child = self.generate_random_at(clock, idx)?;
         self.pre_insert_buffer(&child.state.hash);
-            // Catch-up toggle (`mutation_catch_up`, default FALSE): off keeps fresh-init
-            // weights; tabular always catches up. Empty buffers mean "no verdict yet".
-        let fresh_start = !self.config.mode_specific.mutation_catch_up();
-        if fresh_start {
-            child.state.step = 0;
-            child.state.last_metrics = None;
-        } else {
-            self.catch_up(&mut child, clock)?;
-        }
-        let detail = if fresh_start {
-            format!(
-                "victim {} culled (immigrant-slot), immigrant {} inserted (no gate, no catch-up — trains from step {clock})",
-                &victim[..8.min(victim.len())],
-                &child.state.hash[..8.min(child.state.hash.len())],
-            )
-        } else {
-            format!(
-                "victim {} culled (immigrant-slot), immigrant {} inserted (no gate, caught up {clock} step(s))",
-                &victim[..8.min(victim.len())],
-                &child.state.hash[..8.min(child.state.hash.len())],
-            )
-        };
+            // A newborn immigrant joins fresh: step 0, no replay. Empty buffers mean "no
+            // verdict yet"; its first optimizer update is the next group step.
+        child.state.step = 0;
+        child.state.last_metrics = None;
+        let detail = format!(
+            "victim {} culled (immigrant-slot), immigrant {} inserted (fresh, trains from step {clock})",
+            &victim[..8.min(victim.len())],
+            &child.state.hash[..8.min(child.state.hash.len())],
+        );
         let victim_net_seed = self.state.net(&victim).map(|s| s.net_seed);
         self.record_attempt(
             clock,
@@ -682,9 +398,7 @@ impl CoreEngine {
             Some(child.state.net_seed),
             &child.state.created_from.clone().unwrap_or_default(),
             "inserted",
-            None,
             child.state.last_metrics.as_ref().map(|m| m.fitness),
-            None,
             Some(&victim),
             victim_net_seed,
         );

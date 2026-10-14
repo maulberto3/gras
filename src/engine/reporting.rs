@@ -231,7 +231,7 @@ impl CoreEngine {
             // Parity is a property of the CONFIG: the engine re-reads the replay-relevant
             // knobs and REFUSES a mismatch, so the resume call has to agree.
         info!(
-            "  resume parity: replay-relevant knobs come from engine.json (K={}, checkpoint_every={}, gates, probation windows) — a mismatch is refused, not patched",
+            "  resume parity: replay-relevant knobs come from engine.json (K={}, checkpoint_every={}, probation windows) — a mismatch is refused, not patched",
             self.config.smoothing_window,
             self.config.checkpoint_every,
         );
@@ -671,8 +671,7 @@ mod tests {
             lines[1],
             "  culled 164 (65 crossover slot(s), 99 immigrant slot(s)) │ 50 alive at stop"
         );
-            // A roll that bought nothing is reported, not hidden. "no viable child", not
-            // "at the gate": with `crossover_catch_up=off` the gate is never consulted.
+            // A roll that bought nothing is reported, not hidden: "no viable child".
         assert_eq!(
             lines[2],
             "  crossover rolls 250: 62 fired → 171 attempt(s), 65 child(ren) built, 7 discarded (no viable child)"

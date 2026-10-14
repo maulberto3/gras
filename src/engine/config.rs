@@ -23,8 +23,8 @@ pub enum StopReason {
 /// decision averages over.
 pub const SMOOTHING_WINDOW: usize = 10;
 
-/// Steps between population checkpoints — the cadence every evolution gate
-/// hangs off.
+/// Steps between population checkpoints — the cadence the stream's era rotation
+/// and the CSV flush key off.
 pub const DEFAULT_CHECKPOINT_EVERY: usize = 10;
 
 /// Learning rate default for the Adam optimizers.
@@ -81,22 +81,7 @@ impl LogLevel {
     }
 }
 
-/// How strict the checkpoint gate is for a crossover child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum CrossoverGate {
-        /// **Hard** — the child's smoothed fitness must beat the population's mean at
-        /// **every** checkpoint it passes through.
-    Hard,
-        /// **Soft** (default) — the child must beat the **mean of the checkpoint means**
-        /// (one aggregate bar over the replay window).
-    #[default]
-    Soft,
-        /// **Off** — no gate: a caught-up child still replays, but is ALWAYS inserted. No
-        /// bar is drawn (`crossover_catch_up=off` skips both).
-    Off,
-}
-
-    /// Who gets evicted when a crossover child passes the gate and takes a slot.
+    /// Who gets evicted when a crossover child takes a slot.
     /// **Crossover-only** — the mutation channel has its own policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CrossCullPolicy {
@@ -182,23 +167,15 @@ pub enum RunMode {
 pub struct RaceConfig {
     /// Number of live nets in the population.
     pub pop_size: usize,
-        /// Steps between population checkpoints. The checkpoint ledger records the
-        /// population-mean smoothed fitness a crossover child must clear.
+        /// Steps between population checkpoints (the stream's era rotation and the
+        /// CSV flush cadence key off this).
     pub checkpoint_every: usize,
         /// Independent crossover rolls per step; each fires with `crossover_prob`. A
         /// not-fired or failed roll is SPENT (no random fallback).
     pub crossover_rolls: usize,
         /// Independent mutation rolls per step; each fires with `mutate_prob` and culls one
-        /// net (by `mutation_cull_policy`), inserting a random immigrant (no gate).
+        /// net (by `mutation_cull_policy`), inserting a random immigrant.
     pub mutate_rolls: usize,
-    /// Checkpoint gate strictness for crossover children (see
-    /// [`CrossoverGate`]).
-    pub crossover_gate: CrossoverGate,
-        /// How many RECENT checkpoints the crossover gate reads. `0` = all (legacy).
-    pub crossover_gate_window: usize,
-        /// Extra retries per crossover roll after a gate rejection, each with fresh parents.
-        /// `0` (default) = one attempt per roll (legacy).
-    pub crossover_retries: usize,
         /// Who a surviving crossover child evicts (crossover-only; immigrants follow
         /// `mutation_cull_policy`).
     pub crossover_cull_policy: CrossCullPolicy,
@@ -354,47 +331,11 @@ impl ModeConfig {
         matches!(self, ModeConfig::Rl(_))
     }
 
-    /// Mutation catch-up for this arm — `false` means a mutation immigrant
-    /// keeps fresh weights and trains from the current clock.
-    pub fn mutation_catch_up(&self) -> bool {
-        match self {
-            ModeConfig::Tabular(t) => t.mutation_catch_up,
-            ModeConfig::Rl(r) => r.mutation_catch_up,
-        }
-    }
-
-    /// Crossover catch-up for this arm — `false` means a crossover child
-    /// skips replay AND the checkpoint gate.
-    pub fn crossover_catch_up(&self) -> bool {
-        match self {
-            ModeConfig::Tabular(t) => t.crossover_catch_up,
-            ModeConfig::Rl(r) => r.crossover_catch_up,
-        }
-    }
-
-    /// Population rejoin catch-up for this arm (reserved; see
-    /// [`TabularConfig::run_pop_catch_up`]).
-    pub fn run_pop_catch_up(&self) -> bool {
-        match self {
-            ModeConfig::Tabular(t) => t.run_pop_catch_up,
-            ModeConfig::Rl(r) => r.run_pop_catch_up,
-        }
-    }
 }
 
-    /// Tabular-only knobs: the catch-up family. Defaults keep historical behavior —
-    /// crossover children replay + gate, immigrants start at the current clock.
+    /// Tabular-arm knobs (reserved; the tabular mode has no mode-specific knobs today).
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct TabularConfig {
-    /// Mutation immigrants skip catch-up and start at the current clock.
-    pub mutation_catch_up: bool,
-    /// Whether a crossover child replays the training stream (and passes the
-    /// checkpoint gate on the replayed history) before insertion.
-    pub crossover_catch_up: bool,
-    /// Whether a population net rejoining the group step replays missed
-    /// training (reserved; no consumer in the default flow today).
-    pub run_pop_catch_up: bool,
-}
+pub struct TabularConfig {}
 
 impl TabularConfig {
     /// Builder for the tabular-only knob surface.
@@ -410,53 +351,15 @@ pub struct TabularConfigBuilder {
 }
 
 impl TabularConfigBuilder {
-    /// Mutation immigrants skip catch-up (see [`TabularConfig::mutation_catch_up`]).
-    pub fn set_mutation_catch_up(mut self, yes: bool) -> Self {
-        self.cfg.mutation_catch_up = yes;
-        self
-    }
-    /// Crossover children skip catch-up (see [`TabularConfig::crossover_catch_up`]).
-    pub fn set_crossover_catch_up(mut self, yes: bool) -> Self {
-        self.cfg.crossover_catch_up = yes;
-        self
-    }
-    /// Population rejoin replay toggle (see [`TabularConfig::run_pop_catch_up`]).
-    pub fn set_run_pop_catch_up(mut self, yes: bool) -> Self {
-        self.cfg.run_pop_catch_up = yes;
-        self
-    }
     /// Finalize the tabular arm.
     pub fn build(self) -> TabularConfig {
         self.cfg
     }
 }
 
-    /// RL knobs: the catch-up family. The tabular arm carries an identical copy, so both
-    /// modes expose the same toggles.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RlConfig {
-    /// Mutation/crossover immigrants skip catch-up and start at the current
-    /// clock (see [`RaceConfigBuilder::set_mutation_catch_up`]).
-    pub mutation_catch_up: bool,
-        /// Whether a crossover child replays the training stream before insertion. With it
-        /// OFF the checkpoint gate is OFF for those children too.
-    pub crossover_catch_up: bool,
-        /// Whether a population net rejoining the group step replays missed training.
-        /// (Reserved: with act-and-measure freeze, dethroned elites never fall behind.)
-    pub run_pop_catch_up: bool,
-}
-
-impl Default for RlConfig {
-    fn default() -> Self {
-        Self {
-            mutation_catch_up: false,
-                // Default OFF (the cartpole reference): a crossover child trains forward like
-                // an immigrant. With catch-up ON the gate is live.
-            crossover_catch_up: false,
-            run_pop_catch_up: false,
-        }
-    }
-}
+    /// RL-arm knobs (reserved; the RL mode has no mode-specific knobs today).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RlConfig {}
 
 impl RlConfig {
     /// Builder for the RL knob surface.
@@ -472,21 +375,6 @@ pub struct RlConfigBuilder {
 }
 
 impl RlConfigBuilder {
-    /// Mutation immigrants skip catch-up (see [`RlConfig::mutation_catch_up`]).
-    pub fn set_mutation_catch_up(mut self, yes: bool) -> Self {
-        self.cfg.mutation_catch_up = yes;
-        self
-    }
-    /// Crossover children skip catch-up (see [`RlConfig::crossover_catch_up`]).
-    pub fn set_crossover_catch_up(mut self, yes: bool) -> Self {
-        self.cfg.crossover_catch_up = yes;
-        self
-    }
-    /// Population rejoin replay toggle (see [`RlConfig::run_pop_catch_up`]).
-    pub fn set_run_pop_catch_up(mut self, yes: bool) -> Self {
-        self.cfg.run_pop_catch_up = yes;
-        self
-    }
     /// Finalize the RL arm.
     pub fn build(self) -> RlConfig {
         self.cfg
@@ -584,9 +472,6 @@ impl RaceConfig {
             checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
             crossover_rolls: 1,
             mutate_rolls: 1,
-            crossover_gate: CrossoverGate::default(),
-            crossover_gate_window: 5,
-            crossover_retries: 5,
             crossover_cull_policy: CrossCullPolicy::default(),
             mutation_cull_policy: MutationCullPolicy::Worst,
             elite_count: 1,
@@ -639,12 +524,10 @@ impl RaceConfig {
     }
 }
 
-    /// Typed front door for RL runs: `builder()` with the RL arm pre-stamped, so RL-side
-    /// catch-up copies are the ones the engine reads.
+    /// Typed front door for RL runs: `builder()` with the RL arm pre-stamped.
 pub type RlRaceConfig = RaceConfig;
 
-/// Typed front door for tabular runs (reads well at the call site; the
-/// catch-up setters write the tabular arm's own copy).
+/// Typed front door for tabular runs (reads well at the call site).
 pub type TabularRaceConfig = RaceConfig;
 
     /// `TabularRaceConfig::builder()` — the tabular front door: a free function so the type
@@ -706,23 +589,6 @@ impl RaceConfigBuilder {
         self.cfg.mutate_rolls = n;
         self
     }
-        /// Gate strictness for crossover children: `Hard` = beat every checkpoint bar in the
-        /// window; `Soft` = beat the mean; `Off` = no gate (still replays).
-    pub fn set_crossover_gate(mut self, mode: CrossoverGate) -> Self {
-        self.cfg.crossover_gate = mode;
-        self
-    }
-        /// Limit the crossover gate to the last `k` RECORDED checkpoints. `0` (default) = no
-        /// window. Replay-relevant: recorded and validated on resume.
-    pub fn set_crossover_gate_window(mut self, k: usize) -> Self {
-        self.cfg.crossover_gate_window = k;
-        self
-    }
-        /// Extra full retries a crossover roll gets after a gate rejection. `0` = no retries.
-    pub fn set_crossover_retries(mut self, n: usize) -> Self {
-        self.cfg.crossover_retries = n;
-        self
-    }
         /// Crossover replacement policy (crossover-only). `Worst` (default) or `Random`;
         /// mutation immigrants use `set_mutation_cull_policy`.
     pub fn set_crossover_cull_policy(mut self, policy: CrossCullPolicy) -> Self {
@@ -745,33 +611,6 @@ impl RaceConfigBuilder {
         /// trainer call (frozen, but still scored/ranked/parents). Default `true`.
     pub fn set_elite_freeze(mut self, yes: bool) -> Self {
         self.cfg.freeze_elites = yes;
-        self
-    }
-        /// Catch-up toggle (mutation family): whether an immigrant replays the stream before
-        /// training at the current clock. Default `false` (no handicap). Both modes.
-    pub fn set_mutation_catch_up(mut self, yes: bool) -> Self {
-        match &mut self.cfg.mode_specific {
-            ModeConfig::Rl(rl) => rl.mutation_catch_up = yes,
-            ModeConfig::Tabular(t) => t.mutation_catch_up = yes,
-        }
-        self
-    }
-        /// Catch-up toggle (crossover family): whether a child replays the stream and passes
-        /// the gate before insertion. Default `true`. With `false` both are skipped. Both modes.
-    pub fn set_crossover_catch_up(mut self, yes: bool) -> Self {
-        match &mut self.cfg.mode_specific {
-            ModeConfig::Rl(rl) => rl.crossover_catch_up = yes,
-            ModeConfig::Tabular(t) => t.crossover_catch_up = yes,
-        }
-        self
-    }
-        /// Catch-up toggle (population): whether a rejoining net replays missed training.
-        /// Default `false`; reserved for future rejoin paths. RESUME always replays regardless.
-    pub fn set_run_pop_catch_up(mut self, yes: bool) -> Self {
-        match &mut self.cfg.mode_specific {
-            ModeConfig::Rl(rl) => rl.run_pop_catch_up = yes,
-            ModeConfig::Tabular(t) => t.run_pop_catch_up = yes,
-        }
         self
     }
         /// Per-net smoothed-fitness rolling window (K). Default [`SMOOTHING_WINDOW`] = 10.
@@ -908,12 +747,6 @@ impl RaceConfigBuilder {
         /// `TopologyOptions`). TRAIN forwards only.
     pub fn set_topology_dropout_prob(mut self, p: f32) -> Self {
         self.cfg.topology_options.dropout_prob = p;
-        self
-    }
-        /// Seed for the topology's own RNG (wiring + weight init). The engine re-seeds each
-        /// child from `(run_seed, clock, child_idx)`; set only to pin the template's structure.
-    pub fn set_topology_seed(mut self, seed: usize) -> Self {
-        self.cfg.topology_options.topology_seed = seed;
         self
     }
     // ── individual topology fields (direct, no need to build a full TopologyOptions)

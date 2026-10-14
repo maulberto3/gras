@@ -100,7 +100,7 @@ pub mod prelude {
     //! the `DataFormat`/loader family.
     // Engine config + entry points.
     pub use crate::engine::config::{
-        CrossCullPolicy, CrossoverGate, LogLevel, MutationCullPolicy, PopPruner, PopPrunerMethod,
+        CrossCullPolicy, LogLevel, MutationCullPolicy, PopPruner, PopPrunerMethod,
         RaceConfig, RaceConfigBuilder, RaceSnapshot, RlConfig, RlRaceConfig, RunMode, StopReason,
         TabularConfig, TabularRaceConfig, rl_race_config_builder, tabular_race_config_builder,
     };

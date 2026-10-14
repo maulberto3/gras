@@ -144,7 +144,8 @@ pub struct StepEnv {
     pub pop_size: usize,
     /// Live nets in the population right now.
     pub live_count: usize,
-    /// Checkpoint cadence (crossover-gate bar is recorded every N steps).
+    /// Checkpoint cadence — the durability tick (frontier + elite weight
+    /// snapshots) and the stream's eval-permutation era fire every N steps.
     pub checkpoint_every: usize,
     /// The per-net fitness smoothing window, in steps (K).
     pub smoothing_window: usize,

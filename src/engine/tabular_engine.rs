@@ -25,8 +25,8 @@
 //!
 //! Also: `step_clock()` reads the max step across live nets, so a trailing
 //! crossover child can never repeat an iteration; replayed nets' rolling buffers
-//! are seeded by catch-up, and the checkpoint ledger is reloaded so gates compare
-//! against the SAME historical bars. Tabular resume is bit-identical because
+//! are seeded by replay, and the checkpoint ledger is reloaded so the history is
+//! the SAME. Tabular resume is bit-identical because
 //! trainer randomness is engine-seeded — in RL only the env's own internal draws
 //! (the Python-side seeding contract) can drift; engine-side rolls always replay.
 //!
@@ -134,9 +134,6 @@ impl TabularEngine {
         // On resume, stream shape comes from the run header (data integrity),
         // but the trainer's stream_shape() can still override batch sizes.
         let header_stream_ratio = header.train_eval_split_ratio.unwrap_or(0.2); // legacy default if header missing it
-        // Held-out eval rows are data geometry — restored from the header,
-        // not re-decided by the resume config (mirrors the split ratio rule).
-        let header_held_out = header.held_out_eval_rows.unwrap_or(256); // legacy default if header missing it
 
         // Same rule on resume: the trainer's stream shape overrides batch sizes
         // and the split ratio comes from the header — data integrity is fixed.
@@ -165,7 +162,6 @@ impl TabularEngine {
         let stream = Some(
             BatchStream::new(run_seed, batch_size, split)
                 .with_eval_batch_size(eval_batch_size)
-                .with_held_out_eval_rows(header_held_out)
                 .with_checkpoint_every(config.checkpoint_every),
         );
         let dataset = Some(dataset);
@@ -211,7 +207,6 @@ impl TabularEngine {
             step_rl: RlVolume::default(),
             total_train_turns: 0,
             champions: Vec::new(),
-            checkpoints: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),
             pruner_solo_active: false,
             minimal_prev_means: None,

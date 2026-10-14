@@ -1,23 +1,20 @@
 //! The deterministic shared batch stream for the step-race engine.
 //!
-//! Three pieces:
-//! - [`PoolSplit`]: the static, seeded train/eval/gating pool split (D12),
-//!   fixed at run start so every net is compared on identical data. The
-//!   **gating pool** is never used for training or per-step eval — it exists
-//!   only for checkpoint "surprise exam" readings (anti-memorization).
+//! Two pieces:
+//! - [`PoolSplit`]: the static, seeded train/eval pool split (D12), fixed at
+//!   run start so every net is compared on identical data. Every held-out row
+//!   is in the eval pool — there is no separate exam pool.
 //! - [`BatchStream`]: batch `step` is a **pure function of
 //!   `(run_seed, step_index)`** — any net (or tool) can materialize any step's
-//!   batch independently, which is what makes catch-up and resume replays
-//!   exact (the replay contract). The train pool is drawn round-robin from a
+//!   batch independently, which is what makes resume replays exact (the replay
+//!   contract). The train pool is drawn round-robin from a
 //!   fixed seeded permutation. The **eval permutation rotates per era** (era
 //!   = `step / checkpoint_every`), so smoothed eval fitness reflects skill
 //!   across several different data orderings instead of one memorizable pass.
-//!   The checkpoint exam is likewise a pure function of `(run_seed, era)`.
 //!
 //! Determinism note: because the eval rotation is a pure function of
-//! `(run_seed, step)`, catch-up replays for crossover children and immigrants
-//! automatically see the exact rotated eval batches the population saw at
-//! those historical steps — no extra bookkeeping needed.
+//! `(run_seed, step)`, a resume replay automatically sees the exact rotated eval
+//! batches the population saw at those historical steps — no extra bookkeeping.
 //!
 //! There is no epoch concept here (D14): the stream is infinite, and train +
 //! eval both happen per step.
@@ -32,10 +29,6 @@ use crate::utils::tabular_data::Dataset;
 /// `run_seed` itself — train and eval randomness must not share a seed.
 pub const EVAL_STREAM_OFFSET: u64 = 0xFFFF;
 
-/// Checkpoint exam randomness is derived from `run_seed + EXAM_STREAM_OFFSET`
-/// — a third seed space, disjoint from train (0) and eval (`EVAL_STREAM_OFFSET`).
-pub const EXAM_STREAM_OFFSET: u64 = 0xFFFF_FFFF;
-
 // ── PoolSplit (D12) ─────────────────────────────────────────────────────────
 
 /// The static train/eval pool split, fixed once at run start: every net trains on
@@ -44,42 +37,23 @@ pub const EXAM_STREAM_OFFSET: u64 = 0xFFFF_FFFF;
 pub struct PoolSplit {
     /// Row indices nets train on (the stream draws from here).
     pub train: Vec<i64>,
-    /// Row indices nets are evaluated on (eval batches draw from here).
+    /// Row indices nets are evaluated on (eval batches draw from here) — ALL
+    /// held-out rows, so the reading uses every test row the run was given.
     pub eval: Vec<i64>,
-        /// Row indices reserved for checkpoint "surprise exams" — never used for
-        /// training or per-step eval, so an exam score reflects generalization.
-    pub gating: Vec<i64>,
 }
 
 impl PoolSplit {
-        /// Split `dataset.len()` rows into train/eval/gating pools with a seeded,
-        /// deterministic shuffle; the eval ratio halves into eval and gating.
+        /// Split `dataset.len()` rows into train/eval pools with a seeded,
+        /// deterministic shuffle: `train_eval_split_ratio` of the rows train, the
+        /// rest are the eval pool.
     pub fn new(len: usize, train_eval_split_ratio: f32, seed: u64) -> Self {
-        let (train, rest) = crate::utils::tabular_data::split_indices(
+        let (train, eval) = crate::utils::tabular_data::split_indices(
             len,
             1.0 - train_eval_split_ratio,
             train_eval_split_ratio,
             seed,
         );
-            // Half the held-out rows are the per-step eval pool, half the gating pool
-            // (a deterministic, seed-derived split of `rest`).
-        let half = rest.len() / 2;
-        let (eval, gating) = if half == 0 && rest.len() > 1 {
-            (
-                rest[..rest.len() - 1].to_vec(),
-                rest[rest.len() - 1..].to_vec(),
-            )
-        } else if rest.len() == 1 {
-            // Degenerate: a single held-out row doubles as eval + gating.
-            (rest.clone(), rest.clone())
-        } else {
-            (rest[..half].to_vec(), rest[half..].to_vec())
-        };
-        PoolSplit {
-            train,
-            eval,
-            gating,
-        }
+        PoolSplit { train, eval }
     }
 
     /// Split from an existing dataset — convenience over [`PoolSplit::new`].
@@ -88,48 +62,34 @@ impl PoolSplit {
     }
 
         /// Split from an EXPLICIT train/test layout: `train` = all train rows;
-        /// `eval` + `gating` = a seeded 50/50 split of all test rows.
+        /// `eval` = a seeded shuffle of all test rows.
     pub fn explicit(train_len: usize, test_len: usize, seed: u64) -> Self {
         assert!(test_len > 0, "explicit split needs a non-empty test pool");
         let train: Vec<i64> = (0..train_len as i64).collect();
-        let test_rows: Vec<i64> = (train_len as i64..(train_len + test_len) as i64).collect();
-            // Seeded shuffle of the TEST rows only, then the same half/half division
-            // `PoolSplit::new` uses: eval pool + surprise-exam pool.
-        let mut rest = test_rows;
+        let mut eval: Vec<i64> = (train_len as i64..(train_len + test_len) as i64).collect();
+            // Seeded shuffle of the TEST rows only (the eval permutation re-shuffles per
+            // era anyway, but this keeps the raw pool order seed-dependent).
         let mut rng = fastrand::Rng::with_seed(seed);
-        for i in (1..rest.len()).rev() {
+        for i in (1..eval.len()).rev() {
             let j = rng.usize(0..=i);
-            rest.swap(i, j);
+            eval.swap(i, j);
         }
-        let half = rest.len() / 2;
-        let (eval, gating) = if half == 0 {
-            // Degenerate: a single test row doubles as eval + gating.
-            (rest.clone(), rest.clone())
-        } else {
-            (rest[..half].to_vec(), rest[half..].to_vec())
-        };
-        PoolSplit {
-            train,
-            eval,
-            gating,
-        }
+        PoolSplit { train, eval }
     }
 }
 
 // ── BatchStream ─────────────────────────────────────────────────────────────
 
 /// The shared, deterministic, infinite batch stream: batch for step *s* is
-/// `f(run_seed, s)` — no cursor, no state — so catch-up/resume replays exactly.
+/// `f(run_seed, s)` — no cursor, no state — so resume replays exactly.
 #[derive(Clone, Debug)]
 pub struct BatchStream {
     run_seed: u64,
     batch_size: usize,
     eval_batch_size: usize,
-    held_out_eval_rows: usize,
     checkpoint_every: usize,
     train_pool: Vec<i64>,
     eval_pool: Vec<i64>,
-    gating_pool: Vec<i64>,
 }
 
 impl BatchStream {
@@ -140,11 +100,9 @@ impl BatchStream {
             run_seed,
             batch_size,
             eval_batch_size: batch_size,
-            held_out_eval_rows: 256, // default, can be overridden via with_held_out_eval_rows
             checkpoint_every: 100,   // default, can be overridden via with_checkpoint_every
             train_pool: split.train,
             eval_pool: split.eval,
-            gating_pool: split.gating,
         }
     }
 
@@ -152,12 +110,6 @@ impl BatchStream {
         /// walk separate permutations, so the two sizes are independent.
     pub fn with_eval_batch_size(mut self, eval_batch_size: usize) -> Self {
         self.eval_batch_size = eval_batch_size.max(1);
-        self
-    }
-
-    /// Set the rows per best-net held-out reading (engine bookkeeping).
-    pub fn with_held_out_eval_rows(mut self, n: usize) -> Self {
-        self.held_out_eval_rows = n.max(1);
         self
     }
 
@@ -196,15 +148,10 @@ impl BatchStream {
         self.train_pool.len() as f32 / (self.train_pool.len() + self.eval_pool.len()) as f32
     }
 
-    /// Rows per best-net held-out reading.
-    pub fn held_out_eval_rows(&self) -> usize {
-        self.held_out_eval_rows
-    }
-
-        /// The three pool index vectors this stream draws from (train, eval, gating) —
-        /// read-only view; never mutated after construction.
-    pub fn pools(&self) -> (&[i64], &[i64], &[i64]) {
-        (&self.train_pool, &self.eval_pool, &self.gating_pool)
+        /// The pool index vectors this stream draws from (train, eval) — read-only
+        /// view; never mutated after construction.
+    pub fn pools(&self) -> (&[i64], &[i64]) {
+        (&self.train_pool, &self.eval_pool)
     }
 
     /// Gather `indices` into one `(inputs, targets)` batch tensor pair.
@@ -283,21 +230,6 @@ impl BatchStream {
         let offset = (step as usize).wrapping_mul(self.eval_batch_size);
         Self::gather(dataset, &Self::window(&perm, self.eval_batch_size, offset))
     }
-
-        /// The **checkpoint exam** — a "surprise test" batch from the gating pool
-        /// (touched by no training/eval step). Pure function of `(run_seed, era)`.
-    pub fn exam_batch(&self, dataset: &Dataset, era: u64) -> Result<(Tensor, Tensor)> {
-        let exam_seed = derive_seed(self.run_seed.wrapping_add(EXAM_STREAM_OFFSET), era as usize);
-        let mut perm = self.gating_pool.clone();
-        let mut rng = fastrand::Rng::with_seed(exam_seed);
-        for i in (1..perm.len()).rev() {
-            let j = rng.usize(0..=i);
-            perm.swap(i, j);
-        }
-        // One exam batch per era: up to `held_out_eval_rows` rows.
-        let n = self.held_out_eval_rows.min(perm.len()).max(1);
-        Self::gather(dataset, &perm[..n])
-    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -316,16 +248,14 @@ mod tests {
     fn pool_split_is_disjoint_and_covering() {
         let ds = small_dataset();
         let split = PoolSplit::of(&ds, 0.25, 42);
-        assert_eq!(
-            split.train.len() + split.eval.len() + split.gating.len(),
-            ds.len()
-        );
+        assert_eq!(split.train.len() + split.eval.len(), ds.len());
         let mut seen = split.train.clone();
         seen.extend(split.eval.clone());
-        seen.extend(split.gating.clone());
         seen.sort();
         seen.dedup();
         assert_eq!(seen.len(), ds.len(), "pools must not overlap");
+        // Every held-out row is evaluated — no row is set aside from the reading.
+        assert_eq!(split.eval.len(), ds.len() - split.train.len());
     }
 
     #[test]
@@ -347,22 +277,19 @@ mod tests {
             (0..80).collect::<Vec<i64>>(),
             "every train row is a training row"
         );
-        // Eval + gating = EXACTLY the test rows — disjoint from train by
-        // construction, covering all of them.
+        // Eval = EXACTLY the test rows — disjoint from train by construction,
+        // covering all of them.
         let mut held: Vec<i64> = split.eval.clone();
-        held.extend(split.gating.clone());
         held.sort();
         assert_eq!(held, (80..100).collect::<Vec<i64>>());
         // Seeded: same (train_len, test_len, seed) ⇒ same split; a different
         // seed re-shuffles the test side only.
         let again = PoolSplit::explicit(80, 20, 42);
         assert_eq!(split.eval, again.eval);
-        assert_eq!(split.gating, again.gating);
         let other = PoolSplit::explicit(80, 20, 43);
         assert_ne!(split.eval, other.eval, "seed re-shuffles the test pool");
         // The shuffled side still covers exactly the test rows.
         let mut other_held: Vec<i64> = other.eval.clone();
-        other_held.extend(other.gating.clone());
         other_held.sort();
         assert_eq!(other_held, (80..100).collect::<Vec<i64>>());
     }
@@ -420,27 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn gating_pool_is_disjoint_from_train_and_eval() {
-        let ds = small_dataset();
-        let split = PoolSplit::of(&ds, 0.25, 7);
-        let mut all: Vec<i64> = split
-            .train
-            .iter()
-            .chain(split.eval.iter())
-            .chain(split.gating.iter())
-            .copied()
-            .collect();
-        all.sort();
-        all.dedup();
-        assert_eq!(
-            all.len(),
-            ds.len(),
-            "train+eval+gating must cover the dataset"
-        );
-        assert!(!split.gating.is_empty(), "gating pool must be non-empty");
-    }
-
-    #[test]
     fn eval_permutation_rotates_per_era() {
         let ds = small_dataset();
         let s = BatchStream::new(99, 8, PoolSplit::of(&ds, 0.25, 99))
@@ -478,23 +384,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn exam_batch_is_deterministic_and_era_dependent() {
-        let ds = small_dataset();
-        let s = BatchStream::new(99, 8, PoolSplit::of(&ds, 0.25, 99));
-        let (e0x, e0y) = s.exam_batch(&ds, 0).unwrap();
-        let (e0_again, _) = s.exam_batch(&ds, 0).unwrap();
-        assert_eq!(
-            e0x.to_f32_vec().unwrap(),
-            e0_again.to_f32_vec().unwrap(),
-            "exam is a pure function of (run_seed, era)"
-        );
-        let (e1x, _) = s.exam_batch(&ds, 1).unwrap();
-        assert_ne!(
-            e0x.to_f32_vec().unwrap(),
-            e1x.to_f32_vec().unwrap(),
-            "each era gets a fresh exam"
-        );
-        assert_eq!(e0y.shape(), e0x.shape());
-    }
 }

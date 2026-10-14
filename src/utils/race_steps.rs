@@ -25,7 +25,7 @@ pub fn rng_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Seed both RNG systems (fastrand + libtorch) deterministically for one
-/// `(net, step)` pair — the replay/catch-up contract.
+/// `(net, step)` pair — the replay contract.
 pub fn seed_step_randomness(net_seed: u64, step: u64, call_index: u64) {
     let mixed = net_seed
         .wrapping_add(step.wrapping_mul(0x9E37_79B9_7F4A_7C15))

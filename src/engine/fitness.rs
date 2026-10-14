@@ -321,22 +321,6 @@ mod tests {
     // `from_loss_with_other` is re-enabled.
 
     #[test]
-    fn test_scoring_helpers() {
-        let net = tiny_net();
-        let x = input(&[1.0, 2.0, 3.0]);
-        let pred = net.forward(&x).unwrap();
-        // Use pred as both pred and y for perfect fit.
-        let y = Variable::new(pred.data().clone(), false);
-        let r2 = r2_score(&pred, &y).unwrap();
-        assert!((r2 - 1.0).abs() < 1e-3, "perfect fit → R2 ≈ 1, got {r2}");
-        let mse = flodl::nn::loss::mse_loss(&pred, &y)
-            .unwrap()
-            .item()
-            .unwrap() as f32;
-        assert!(mse < 1e-6);
-    }
-
-    #[test]
     fn test_categorical_helpers() {
         let mut graph = Topology::new(0, None);
         graph.options.input_dim = Some(2);
