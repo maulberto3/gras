@@ -664,7 +664,6 @@ fn main() {
         // 0-or-positive and bursty (one lucky solve among failures), so a
         // wider window keeps the ranking from whipsawing on single matches.
         .set_run_smoothing_window(10)
-        .set_run_pop_catch_up(false)
         .set_run_checkpoint_every(4)
         // Challenges are TRAINER-owned since 2026-10-10: `CHALLENGE_PROB` /
         // `CHALLENGE_DECAY_EXPONENT` (below) roll inside `train_step` via
@@ -683,19 +682,14 @@ fn main() {
             })
         })])
         .set_crossover_prob(0.5)
-        .set_crossover_retries(2)
         .set_crossover_rolls(pop / 2)
         .set_crossover_ops_pool(["one_point", "uniform"])
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
-        .set_crossover_catch_up(true)
-        .set_crossover_gate(CrossoverGate::Soft)
-        .set_crossover_gate_window(5)
         // Mutation matters more here than in CartPole: crossover recombines
         // existing behavior; the momentum trick is a NOVEL behavior — whole
         // random immigrants are the channel that can invent it.
         .set_mutate_prob(0.5)
         .set_mutate_rolls(pop / 5)
-        .set_mutation_catch_up(false)
         .set_mutation_cull_policy(MutationCullPolicy::InverseFitness)
         .set_mutation_probation_steps(5)
         .set_elite_guardrail_matches(HOLDOUT_MATCHES)

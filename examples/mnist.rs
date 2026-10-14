@@ -175,7 +175,7 @@ impl TabularStep for MnistTrainer {
         ctx: &TabularContext<'_>,
     ) -> TensorResult<TabularStepReport> {
         // Determinism: seed per (net, step) so dropout/jitter replay exactly
-        // across catch-up and resume.
+        // across a resume.
         gras::seed_step_randomness(ctx.net_seed, step as u64, 0);
         let loss_fn: gras::trainer::LossFn<'_> = &*self.loss_fn;
 
@@ -391,16 +391,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_run_smoothing_window(5)
         .set_crossover_prob(0.5)
         .set_crossover_rolls(pop / 2)
-        .set_crossover_gate(gras::engine::config::CrossoverGate::Soft)
-        .set_crossover_retries(3)
         // --- Challenge (anti-plateau): TRAINER-owned since 2026-10-10 —
         // `CHALLENGE_PROB` lives on the trainer and rolls inside `train_step`
         // via `gras::trainer::effective_challenge_prob`. No engine knob.
-        // --- Mutation & catch-up (both modes; the tabular arm carries its own copy) ---
+        // --- Mutation (both modes) ---
         .set_mutate_prob(MUTATE_PROB) // per-roll chance a random immigrant is inserted
         .set_mutate_rolls(pop / 5)
-        .set_mutation_catch_up(false) // immigrants start at the current clock (no handicap)
-        .set_crossover_catch_up(true) // children replay the stream, then pass the gate
         // --- Post-race pruner ---
         .set_pruner_enabled(POP_PRUNER)
         .set_pruner_method(gras::engine::config::PopPrunerMethod::Hard)

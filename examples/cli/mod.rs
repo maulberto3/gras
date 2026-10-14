@@ -148,12 +148,6 @@ pub struct EngineArgs {
     #[arg(long, value_name = "N")]
     pub pruner_steps: Option<usize>,
 
-    /// Crossover gate strictness: `hard` (beat the population mean at EVERY
-    /// checkpoint the child replays through) or `soft` (beat the mean of the
-    /// checkpoint means — one aggregate bar, so an early dip can be survived).
-    #[arg(long, value_name = "MODE")]
-    pub crossover_gate: Option<String>,
-
     /// Who an admitted crossover child evicts: `worst` (default, merit-based)
     /// or `random` (keeps slots turning over). Mutation victims are always
     /// fitness-inverse and ignore this.
@@ -173,11 +167,6 @@ pub struct EngineArgs {
     /// itself, and how to run without it entirely.
     #[arg(long, value_name = "N")]
     pub grace_periods: Option<usize>,
-
-    /// Extra parent-pairing attempts when a crossover draw finds no compatible
-    /// parents (0 = give up immediately; a failed roll stays a no-op).
-    #[arg(long, value_name = "N")]
-    pub crossover_retries: Option<usize>,
 
     /// Which post-race pruner: `hard` (keep the elite, train it solo for
     /// --pruner-steps).
@@ -207,23 +196,13 @@ pub struct EngineArgs {
     pub history_flush: Option<String>,
 }
 
-/// RL-only engine flags — the mode-specific twin of [`EngineArgs`], mirroring
-/// the config split: `ModeConfig::Rl` knobs get their own clap struct so a
-/// tabular example can't even PARSE `--fresh-immigrants` (clap rejects it at
-/// the usage line instead of the old behavior: a runtime panic when the
-/// RL-only setter hit the tabular arm).
+/// RL-only engine flags — the mode-specific twin of [`EngineArgs`]. No RL-only
+/// flags exist today; the wrapper is kept so the mode split has one home.
 #[derive(Parser, Debug, Clone, Default)]
 pub struct RlEngineArgs {
     /// The shared engine surface every mode has.
     #[command(flatten)]
     pub engine: EngineArgs,
-
-    /// Mutation catch-up toggle (RL only): OFF (default) = no handicap —
-    /// the immigrant keeps fresh weights and trains from the current clock.
-    /// ON = the immigrant replays the training stream first (comparable
-    /// step-count on entry).
-    #[arg(long)]
-    pub fresh_immigrants: bool,
 }
 
 impl std::ops::Deref for RlEngineArgs {
@@ -239,14 +218,9 @@ impl std::ops::Deref for RlEngineArgs {
 // union surface of all examples.
 #[allow(dead_code)]
 impl RlEngineArgs {
-    /// Overlay the shared flags, then the RL-only ones.
+    /// Overlay the shared flags (the RL-only set is empty today).
     pub fn apply(&self, b: RaceConfigBuilder) -> RaceConfigBuilder {
-        let b = self.engine.apply(b);
-        if self.fresh_immigrants {
-            b.set_mutation_catch_up(true)
-        } else {
-            b
-        }
+        self.engine.apply(b)
     }
 
     /// Delegate: the seed for `RunSpec` (see [`EngineArgs::seed_or`]).
@@ -306,17 +280,6 @@ impl EngineArgs {
             b = b.set_pruner_steps(steps);
         }
         b = b.set_elite_freeze(self.freeze_elites);
-        if let Some(mode) = &self.crossover_gate {
-            b = b.set_crossover_gate(match mode.trim().to_ascii_lowercase().as_str() {
-                "hard" => gras::engine::config::CrossoverGate::Hard,
-                "soft" => gras::engine::config::CrossoverGate::Soft,
-                "off" => gras::engine::config::CrossoverGate::Off,
-                other => {
-                    eprintln!("--crossover-gate {other}: expected `hard`, `soft`, or `off`");
-                    std::process::exit(2);
-                }
-            });
-        }
         if let Some(policy) = &self.crossover_cull_policy {
             b = b.set_crossover_cull_policy(match policy.trim().to_ascii_lowercase().as_str() {
                 "worst" => gras::engine::config::CrossCullPolicy::Worst,
@@ -341,9 +304,6 @@ impl EngineArgs {
                     std::process::exit(2);
                 }
             });
-        }
-        if let Some(n) = self.crossover_retries {
-            b = b.set_crossover_retries(n);
         }
         if let Some(method) = &self.pruner_method {
             b = b.set_pruner_method(match method.trim().to_ascii_lowercase().as_str() {
