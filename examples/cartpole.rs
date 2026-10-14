@@ -456,6 +456,42 @@ impl RlStep for CartPoleTrainer {
 /// Fresh unseen games the champion is re-scored on at stop.
 const GUARDRAIL_MATCHES: usize = 100;
 
+/// Score the champion on fresh unseen games and print the domain gloss.
+///
+/// The engine's `guardrail(device)` already scores through this run's trainer
+/// (`RlStep::holdout_score`) and logs the detailed verdict; this wrapper adds the
+/// cartpole-specific reading (turns survived vs the random baseline) so `main`
+/// ends with one clean call.
+fn report_guardrail(engine: &mut RlEngine, device: Device, baseline: f64) {
+    let Some(v) = engine.guardrail(device) else {
+        println!("guardrail: no champion to score — skipped");
+        return;
+    };
+    let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
+    // The race side carries its own error bar — a swinging window can't resolve
+    // better than ±80, so a holdout below its mean isn't damning.
+    let smoothed_note = match v.race_smoothed {
+        Some(s) => match v.race_se {
+            Some(se) if v.race_samples > 0 => format!(
+                " (race smoothed {s:.1} ±{se:.1} SE over {} step reading(s))",
+                v.race_samples
+            ),
+            _ => format!(" (race smoothed {s:.1}, no window spread recorded)"),
+        },
+        None => String::new(),
+    };
+    let verdict = if holdout >= MAX_TURNS_PER_MATCH as f32 {
+        "SOLVED ✅"
+    } else if holdout > 4.0 * baseline as f32 {
+        "well above random baseline 👍"
+    } else {
+        "weak — REINFORCE may have collapsed ❌"
+    };
+    println!(
+        "guardrail: holdout survival {holdout:.0} ± {std:.0}/{MAX_TURNS_PER_MATCH} turns{smoothed_note} — {verdict}"
+    );
+}
+
 // ═══ SECTION 4 — main(): config → spec → run → guardrail ═══════════════
 
 // RunSpec::rl declares the mode; Fitness::reported takes the value from the
@@ -539,8 +575,10 @@ fn main() {
         .set_stop_max_steps(Some(race_steps))
         // .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
         // .set_pruner_{enabled,method,steps}(..) · .set_run_topologies(vec![])
-        .set_run_seed_previous(true)
-        // .set_run_seed_previous_dir("assets/1790920031289_500")
+        // Elites inherit AUTOMATICALLY from the newest compatible run under `results/`
+        // (the engine logs the receipt, or why it fell back to an all-random batch).
+        // Point it elsewhere with `.set_elite_previous_dir("assets/1790920031289_500")`,
+        // or force a fresh batch with `.set_elite_previous_load(false)`.
         .set_crossover_prob(0.5)
         .set_crossover_rolls(pop / 10)
         // .set_crossover_ops_pool(["uniform"]) // ["one_point", "uniform"]
@@ -609,74 +647,13 @@ fn main() {
         }
     );
 
-    // SHOWCASE — the inheritance receipt (`engine.json` →
-    // `run_topology_source`); `None` means nothing was inheritable.
-    match gras::state::load_engine_json(engine.run_dir())
-        .ok()
-        .and_then(|h| h.run_topology_source)
-    {
-        Some(src) if src.elite_hashes.len() > 1 => println!(
-            "Seed: slots 0-{} ← ranks 1..{} of run {} (topology-only, \
-             champion {} certified, holdout {})",
-            src.elite_hashes.len() - 1,
-            src.elite_hashes.len(),
-            src.source_run_id,
-            &src.champion_hash[..8.min(src.champion_hash.len())],
-            src.guardrail_mean
-                .map(|m| format!("{m:.1}"))
-                .unwrap_or_else(|| "—".to_string()),
-        ),
-        Some(src) => println!(
-            "Seed: slot 0 ← guardrail champion {} of run {} ({}, holdout {})",
-            &src.champion_hash[..8.min(src.champion_hash.len())],
-            src.source_run_id,
-            src.champion_params
-                .map(|p| format!("params {p}"))
-                .unwrap_or_else(|| "params unknown".to_string()),
-            src.guardrail_mean
-                .map(|m| format!("{m:.1}"))
-                .unwrap_or_else(|| "—".to_string()),
-        ),
-        None => println!(
-            "Seed: nothing inherited — population is all-random (a run is only \
-             inheritable once its guardrail certifies a champion; the engine \
-             printed the reason above)"
-        ),
-    }
-
     match engine.run() {
         Ok(reason) => println!("race stopped: {reason:?}"),
         Err(e) => eprintln!("race error: {e}"),
     }
 
     // STEP D — guardrail: GUARDRAIL_MATCHES fresh games the run never trained
-    // on, scored from the LIVE champion; the verdict lands in `engine.json`.
-    match engine.guardrail(device) {
-        Some(v) => {
-            let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
-            // The race side carries its own error bar — a swinging window can't
-            // resolve better than ±80, so a holdout below its mean isn't damning.
-            let smoothed_note = match v.race_smoothed {
-                Some(s) => match v.race_se {
-                    Some(se) if v.race_samples > 0 => format!(
-                        " (race smoothed {s:.1} ±{se:.1} SE over {} step reading(s))",
-                        v.race_samples
-                    ),
-                    _ => format!(" (race smoothed {s:.1}, no window spread recorded)"),
-                },
-                None => String::new(),
-            };
-            let verdict = if holdout >= MAX_TURNS_PER_MATCH as f32 {
-                "SOLVED ✅"
-            } else if holdout > 4.0 * baseline as f32 {
-                "well above random baseline 👍"
-            } else {
-                "weak — REINFORCE may have collapsed ❌"
-            };
-            println!(
-                "guardrail: holdout survival {holdout:.0} ± {std:.0}/{MAX_TURNS_PER_MATCH} turns{smoothed_note} — {verdict}"
-            );
-        }
-        None => println!("guardrail: no champion to score — skipped"),
-    }
+    // on, scored from the LIVE champion through the run's own trainer; the
+    // engine logs the detailed verdict and records it in `engine.json`.
+    report_guardrail(&mut engine, device, baseline);
 }
