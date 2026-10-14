@@ -570,6 +570,11 @@ fn main() {
         // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
         .set_run_pop_size(pop)
         .set_run_smoothing_window(5)
+        // FIT: ranking charges each net λ=1.0 window-σs for its own spread, so a net
+        // surviving ~300 turns every step outranks one with the same mean that
+        // alternates 40 and 500. `.set_run_risk_aversion(0.0)` ranks on the plain
+        // window mean again; 2.0 doubles the preference for steadiness.
+        .set_run_risk_aversion(1.0)
         // .set_run_checkpoint_every(5)
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra history.csv column
         .set_stop_max_steps(Some(race_steps))
