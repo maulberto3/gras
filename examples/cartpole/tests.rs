@@ -1,5 +1,9 @@
-//! CartPole example tests — run with `cargo test --example cartpole`. Kept out
-//! of cartpole.rs so the example reads as the walkthrough; checks its logic.
+//! CartPole example tests — run with `cargo test --example cartpole`.
+//!
+//! Kept in a sibling file so the example itself reads as the walkthrough. These
+//! are pure checks of the example's own logic: reward shaping, the seed
+//! namespaces (train / eval / guardrail), replay stability, the challenge draw,
+//! metric scoring, and that one REINFORCE step actually moves the weights.
 
 // This file is `mod cartpole_tests` INSIDE cartpole.rs — `crate::*` is the
 // example's root, so every item there is directly visible.

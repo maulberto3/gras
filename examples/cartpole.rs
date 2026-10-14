@@ -1,5 +1,16 @@
-//! CartPole — the RL example: pure-Rust env, REINFORCE policy, reported
-//! fitness, post-race guardrail. Vocabulary: match = one episode, turn = one env step.
+//! CartPole — the RL example: a pure-Rust environment, a REINFORCE policy, a
+//! trainer-reported fitness, and a post-race guardrail.
+//!
+//! Four sections: **1** the environment, **2** the trainer (the `RlStep`
+//! contract), **3** the guardrail, **4** `main()` wiring config → spec → run.
+//! Vocabulary: **match** = one episode, **turn** = one env step.
+//!
+//! Every knob is a const or a builder line; the only flags are the smoke-run
+//! ones (`--pop`, `--max-steps`, `--seed`, `--log-level`). The action head is
+//! greedy everywhere and exploration comes from the challenge (a forced action
+//! on a fired step); the REINFORCE loss still scores `log_softmax(pred)` of the
+//! action taken, which is what makes the update a gradient. Head history and
+//! the sampler's removal: `CARTPOLE_EXPERIMENTS.md`.
 
 /// The example's tests, kept in a sibling file so the example reads cleanly.
 #[cfg(test)]
