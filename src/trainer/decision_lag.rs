@@ -191,11 +191,17 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
                 } else {
                     String::new()
                 };
-                tracing::info!(
-                    "decision-lag relay active (lag {} engine step(s){}): each net DECIDES and ranks on held (frozen) weights while a shadow forked from them takes its optimizer step(s) and is promoted at the cycle boundary — ≈2× env per step",
-                    self.lag,
-                    grace_note
-                );
+                // CFY: the relay notice is a table; the mechanism is a footnote.
+                crate::engine::cfy::emit(&crate::engine::cfy::card(
+                    "Decision-lag relay active",
+                    &crate::engine::cfy::kv(&[
+                        (
+                            "lag".to_string(),
+                            format!("{} engine step(s){grace_note}", self.lag),
+                        ),
+                    ]),
+                    Some("each net DECIDES and ranks on held (frozen) weights while a shadow forked from them takes its optimizer step(s) and is promoted at the cycle boundary — ≈2× env per step"),
+                ));
             }
             self.relay = RelayStats {
                 step: Some(step),
