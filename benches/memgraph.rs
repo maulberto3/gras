@@ -82,7 +82,9 @@ fn main() {
         .set_topology_input_dim(d_in)
         .set_topology_output_dim(d_out)
         .set_run_log_level(LogLevel::None)
-        .set_run_checkpoint_every(steps + 1);
+        // `0` = durability tick OFF (no per-tick frontier/snapshot writes to skew the
+        // heap profile); the stop-time writers still run once at the end.
+        .set_run_checkpoint_every(0);
     if evolve {
         builder = builder.set_crossover_rolls(1).set_mutate_rolls(1);
     } else {

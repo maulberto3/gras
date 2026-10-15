@@ -74,9 +74,11 @@ fn main() {
         .set_topology_input_dim(d_in)
         .set_topology_output_dim(d_out)
         .set_run_log_level(LogLevel::None)
-        // No checkpoint inside the run ⇒ no nets/*.json or checkpoint-elite-*
-        // snapshot writes, and no history.csv flush, to pollute the profile.
-        .set_run_checkpoint_every(steps + 1);
+        // `0` = durability tick OFF: no nets/*.json or checkpoint-elite-* snapshot
+        // writes and no per-tick history.csv flush to pollute the profile (the stop-time
+        // writers still run once, at the end). It also freezes the eval permutation on era
+        // 0 — exactly what the old `steps + 1` approximation did, minus the lie.
+        .set_run_checkpoint_every(0);
 
     if evolve {
         builder = builder.set_crossover_rolls(1).set_mutate_rolls(1);
