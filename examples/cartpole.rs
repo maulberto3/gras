@@ -6,7 +6,8 @@
 //! Vocabulary: **match** = one episode, **turn** = one env step.
 //!
 //! Every knob is a const or a builder line; the only flags are the smoke-run
-//! ones (`--pop`, `--max-steps`, `--seed`, `--log-level`). The action head is
+//! ones (`--pop`, `--max-steps`, `--seed`, `--log-level`, `--risk-aversion`
+//! — alias `--risk-based`). The action head is
 //! greedy everywhere and exploration comes from the challenge (a forced action
 //! on a fired step); the REINFORCE loss still scores `log_softmax(pred)` of the
 //! action taken, which is what makes the update a gradient. Head history and
@@ -506,13 +507,17 @@ const MATCHES_PER_STEP: usize = 1;
 /// Eval matches each net plays per step — the ranking signal. Raising it
 /// resolves fitness more finely and multiplies both turns and step time.
 const EVAL_MATCHES_PER_STEP: usize = 10;
+/// FIT risk aversion λ (default; `--risk-aversion` overrides). Window-σs a net
+/// pays for its own spread; 0.0 ranks on the plain window mean.
+const RISK_AVERSION: f32 = 0.0;
 
-/// The smoke-test CLI: `--pop`, `--max-steps`, `--seed`, `--log-level`.
-/// Everything else is a const above — clap rejects any other flag at the usage line.
+/// The smoke-test CLI: `--pop`, `--max-steps`, `--seed`, `--log-level`,
+/// `--risk-aversion`. Everything else is a const above — clap rejects any other
+/// flag at the usage line.
 #[derive(clap::Parser, Debug)]
 #[command(
     name = "cartpole",
-    about = "CartPole RL race. Smoke flags: --pop, --max-steps, --seed, --log-level (all else is a const)."
+    about = "CartPole RL race. Smoke flags: --pop, --max-steps, --seed, --log-level, --risk-aversion (all else is a const)."
 )]
 struct Cli {
     /// Live networks in the race (default: the `POP` const).
@@ -525,6 +530,13 @@ struct Cli {
     /// always recorded in `engine.json`, so any run stays replayable.
     #[arg(long, value_name = "U64")]
     seed: Option<u64>,
+    /// FIT risk aversion λ: window-σs a net pays for its own spread, so a net
+    /// surviving ~300 turns every step outranks one with the same mean that
+    /// alternates 40 and 500. 0.0 ranks on the plain window mean; 2.0 doubles
+    /// the preference for steadiness. `--risk-based` is the same flag (default:
+    /// the `RISK_AVERSION` const).
+    #[arg(long, value_name = "F32", visible_alias = "risk-based")]
+    risk_aversion: Option<f32>,
     /// Log level (default: the `LOG_LEVEL` const). `none`/`summ`/`minimal` pick
     /// the shape; `debug`/`trace` add the engine's per-roll detail.
     #[arg(
@@ -568,26 +580,15 @@ fn main() {
         .set_run_log_level(log_level)
         // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
         .set_run_pop_size(pop)
-        .set_run_smoothing_window(5)
-        // FIT: ranking charges each net λ=1.0 window-σs for its own spread, so a net
-        // surviving ~300 turns every step outranks one with the same mean that
-        // alternates 40 and 500. `.set_run_risk_aversion(0.0)` ranks on the plain
-        // window mean again; 2.0 doubles the preference for steadiness.
-        .set_run_risk_aversion(0.0)
-        // .set_run_checkpoint_every(5)
+        .set_run_smoothing_window(10)
+        .set_run_risk_aversion(cli.risk_aversion.unwrap_or(RISK_AVERSION))
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra history.csv column
         .set_stop_max_steps(Some(race_steps))
         // .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
         // .set_pruner_{enabled,method,steps}(..) · .set_run_topologies(vec![])
-        // Elites inherit AUTOMATICALLY from the newest compatible run under `results/`
-        // (the engine logs the receipt, or why it fell back to an all-random batch).
-        // Point it elsewhere with `.set_elite_previous_dir("assets/1790920031289_500")`,
-        // or force a fresh batch with `.set_elite_previous_load(false)`.
-        // Only DEVIATIONS from the built-in defaults are spelled out below — a
-        // line here is a real choice, not a restatement (crossover prob, cull
-        // policy, probation lengths and the like already hold these values).
+        // .set_elite_previous_load(false)
         .set_crossover_rolls(pop / 10)
-        // .set_crossover_ops_pool(["uniform"]) // ["one_point", "uniform"]
+        // .set_crossover_ops_pool(["uniform"]) // if not specified, use all
         .set_mutation_cull_policy(MutationCullPolicy::Worst)
         .set_mutate_rolls(pop / 20)
         .set_topology_dropout_prob(DROPOUT_PROB)
@@ -606,6 +607,8 @@ fn main() {
         // Topology-only run: NO weight files are written at all, and this example
         // needs none — the guardrail re-tests the LIVE champion in memory. Turn
         // these on only if a later tool must load the trained net.
+        // .set_elite_previous_dir("assets/1790920031289_500")
+        // .set_elite_previous_load(false)
         .set_elite_save_safetensors(false)
         .set_elite_checkpoint_weights(false)
         .set_worst_save_topology(true)

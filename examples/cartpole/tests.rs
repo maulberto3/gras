@@ -310,4 +310,19 @@ mod tests {
         );
         Ok(())
     }
+
+    /// The λ flag: both spellings write the same field, and omitting it leaves
+    /// `main`'s `RISK_AVERSION` const in charge (`unwrap_or`, never a default here).
+    #[test]
+    fn risk_aversion_flag_parses_under_both_names() {
+        let parse = |args: &[&str]| <Cli as clap::Parser>::parse_from(args).risk_aversion;
+        assert_eq!(parse(&["cartpole"]), None, "no flag ⇒ the const decides");
+        assert_eq!(parse(&["cartpole", "--risk-aversion", "0.5"]), Some(0.5));
+        assert_eq!(
+            parse(&["cartpole", "--risk-based", "0.5"]),
+            Some(0.5),
+            "the alias must land on the same field"
+        );
+        assert_eq!(parse(&["cartpole", "--risk-aversion", "0"]), Some(0.0));
+    }
 }
