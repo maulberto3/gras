@@ -10,7 +10,6 @@
 //! `train_step`, so the engine neither suppresses nor accounts for one here.)
 
 use flodl::tensor::Result;
-use tracing::info;
 
 use super::config::{PopPruner, StopReason};
 use super::core::{CoreEngine, RlVolume, StepEvolve};
@@ -42,18 +41,24 @@ impl CoreEngine {
             .filter(|h| !keep.contains(h))
             .collect();
         if self.verbose_detail() {
-            info!(
-                "── pruner phase ── race stop: {:?} at step {} → keeping top-{} ({}), culling {} → solo training for {} steps (freeze bypassed — real weight updates)",
-                reason,
-                clock,
-                keep.len(),
-                keep.iter()
-                    .map(|h| h[..8].to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                victims.len(),
-                pruner.steps,
-            );
+            // CFY: the pruner transition is a table, not a prose sentence.
+            let survivors: Vec<String> = keep
+                .iter()
+                .enumerate()
+                .map(|(rank, h)| format!("{}:{}", rank + 1, &h[..8.min(h.len())]))
+                .collect();
+            crate::engine::cfy::emit(&crate::engine::cfy::card(
+                "Pruner phase",
+                &crate::engine::cfy::kv(&[
+                    ("stop reason".to_string(), format!("{reason:?}")),
+                    ("stop step".to_string(), clock.to_string()),
+                    ("keeping".to_string(), format!("top-{}", keep.len())),
+                    ("survivors".to_string(), survivors.join(" ")),
+                    ("culling".to_string(), victims.len().to_string()),
+                    ("solo steps".to_string(), pruner.steps.to_string()),
+                ]),
+                Some("elite freeze bypassed — solo steps are real weight updates"),
+            ));
         }
         for v in &victims {
             // Attempt row first (victim identity readable), then the cull —
@@ -82,7 +87,14 @@ impl CoreEngine {
             self.write_champion_markdown()?;
             self.write_champion_safetensors()?;
             if self.verbose_detail() {
-                info!("  pruner phase: 0 steps configured — nothing further to train");
+                crate::engine::cfy::emit(&crate::engine::cfy::card(
+                    "Pruner phase",
+                    &crate::engine::cfy::kv(&[(
+                        "solo steps".to_string(),
+                        "0".to_string(),
+                    )]),
+                    Some("nothing further to train"),
+                ));
             }
             self.persist_run_counters();
             return Ok(reason);
@@ -122,10 +134,14 @@ impl CoreEngine {
         // NOTE: no worst dump here — the population was already culled to
         // elites above (the worst was dumped pre-cull, before that).
         if self.verbose_detail() {
-            info!(
-                "── pruner phase complete ── trained to step {} ({} solo step(s))",
-                final_step, pruner.steps,
-            );
+            crate::engine::cfy::emit(&crate::engine::cfy::card(
+                "Pruner phase complete",
+                &crate::engine::cfy::kv(&[
+                    ("trained to step".to_string(), final_step.to_string()),
+                    ("solo steps".to_string(), pruner.steps.to_string()),
+                ]),
+                None,
+            ));
             self.log_stop_summary(final_step)?;
         }
         self.write_live_frontier_states()?;

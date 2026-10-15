@@ -75,10 +75,15 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
             out.push(topo);
             continue;
         }
-        tracing::info!(
-            "initial population: duplicate topology {} → discarded, re-rolling a unique seed",
-            &hash[..8]
-        );
+        // CFY: the duplicate notice is a table, not a prose line.
+        crate::engine::cfy::emit(&crate::engine::cfy::card(
+            "Initial population",
+            &crate::engine::cfy::kv(&[(
+                "duplicate topology".to_string(),
+                hash[..8.min(hash.len())].to_string(),
+            )]),
+            Some("discarded, re-rolling a unique seed"),
+        ));
         // Duplicate — re-roll at ordinals past the initial batch, bounded.
         let mut replaced = false;
         for attempt in 0..8 {
@@ -147,10 +152,14 @@ pub fn fill_unique(
         if seen.insert(topo_hash(&json)) {
             out.push(topo);
             continue;
-        }
-        tracing::info!(
-            "founder batch: random draw duplicates a founder → re-rolling a unique seed"
-        );
+        }        crate::engine::cfy::emit(&crate::engine::cfy::card(
+            "Founder batch",
+            &crate::engine::cfy::kv(&[(
+                "random draw".to_string(),
+                "duplicates a founder".to_string(),
+            )]),
+            Some("re-rolling a unique seed"),
+        ));
         let mut replaced = false;
         for attempt in 0..8 {
             // Ordinals past `initial_population`'s own re-roll window

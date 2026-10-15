@@ -238,33 +238,49 @@ impl CoreEngine {
     /// the resume command to continue from here.
     pub(crate) fn log_stop_summary(&self, clock: usize) -> flodl::tensor::Result<()> {
         let live = self.state.live_hashes();
-        info!(
-            "  wrote {} frontier snapshot(s) → nets/<hash>.json (one per live net)",
-            live.len(),
-        );
-            // Print the pop size the caller must pass (the engine refuses a mismatch) —
-            // phrased in ENGINE terms, not CLI flags.
-        info!(
-            "  {} live net(s) at step {} → resume from {} with pop_size {}",
-            live.len(),
-            clock,
-            self.run_dir.display(),
-            live.len(),
-        );
-            // Parity is a property of the CONFIG: the engine re-reads the replay-relevant
-            // knobs and REFUSES a mismatch, so the resume call has to agree.
-        info!(
-            "  resume parity: replay-relevant knobs come from engine.json (K={}, checkpoint_every={}, probation windows) — a mismatch is refused, not patched",
-            self.config.smoothing_window,
-            self.config.checkpoint_every,
-        );
+        // CFY: the stop block is comfy tables — an artifact/resume card, the accounting
+        // matrix, then the elite card. None of these lines starts with `step`, so none
+        // stays a one-liner; the prose collapses into a card footnote.
+        let artifact_rows = vec![
+            (
+                "frontier snapshots".to_string(),
+                format!("{} → nets/<hash>.json (one per live net)", live.len()),
+            ),
+            ("live nets at stop".to_string(), live.len().to_string()),
+            ("stop step".to_string(), clock.to_string()),
+            (
+                "resume dir".to_string(),
+                self.run_dir.display().to_string(),
+            ),
+            ("resume pop_size".to_string(), live.len().to_string()),
+            (
+                "smoothing_window (K)".to_string(),
+                self.config.smoothing_window.to_string(),
+            ),
+            (
+                "checkpoint_every".to_string(),
+                self.config.checkpoint_every.to_string(),
+            ),
+        ];
+        crate::engine::cfy::emit(&crate::engine::cfy::card(
+            "Artifacts & resume",
+            &crate::engine::cfy::kv(&artifact_rows),
+            Some("resume parity: replay-relevant knobs come from engine.json — a mismatch is refused, not patched"),
+        ));
 
-            // What the run DID comes before what it produced: births, deaths, and what
-            // the roll budget bought. Read from the engine's own persisted counters.
-        info!("  ── run accounting ──");
-        for line in accounting_lines(&self.accounting, live.len()) {
-            info!("{line}");
-        }
+            // What the run DID comes before what it produced: a population tally and a
+            // rolls matrix, both read from the engine's own persisted counters.
+        let (rolls_header, rolls_rows) = accounting_rolls(&self.accounting);
+        let accounting_body = format!(
+            "{}\n{}",
+            crate::engine::cfy::kv(&accounting_population(&self.accounting, live.len())),
+            crate::engine::cfy::table(&rolls_header, &rolls_rows),
+        );
+        crate::engine::cfy::emit(&crate::engine::cfy::card(
+            "Run accounting",
+            &accounting_body,
+            Some("built = nets admitted; discarded = crossover rolls that bought no viable child; blocked = immigrant rolls stopped by the cull shield"),
+        ));
 
             // Final elite report: the top-k nets by smoothed fitness — the run's
             // champions. Elite = rank, not identity.
@@ -393,17 +409,14 @@ impl CoreEngine {
             }
             table.add_row(row);
         }
-        // comfy-table computes the widths; indent each line so the block
-        // sits inside the summary's two-space margin.
-        for line in table.to_string().lines() {
-            info!("  {line}");
-        }
-            // One line: the header names the list, then the gate tally follows inline,
-            // separated by ` · ` (it was the longest of the twelve fields).
-        info!(
-            "  ── final elites (top-{k}, ranked by fitness{arrow} smt = risk-adjusted score; mean = window level, spread = σ) ──{}",
-            detail_inline(&format!(
-                "crown {}/{} seats · {} eligible · {} on probation (k={}) · {} age-blocked (j={})",
+        // CFY: the elite report is a card — the same comfy table, now with the gate
+        // tally and the smt/μ/σ legend as its footnote (they were a trailing prose line).
+        crate::engine::cfy::emit(&crate::engine::cfy::card(
+            &format!("Final elites (top-{k}, ranked by fitness{arrow})"),
+            &table.to_string(),
+            Some(&format!(
+                "smt = risk-adjusted score (μ paid λ={:.2}σ) · mean = window level · spread = σ · crown {}/{} seats · {} eligible · {} on probation (k={}) · {} age-blocked (j={})",
+                self.config.risk_aversion,
                 self.frozen_crown.len(),
                 self.config
                     .elite_count
@@ -414,7 +427,7 @@ impl CoreEngine {
                 age_blocked,
                 self.config.elite_crown_lifetime_steps,
             )),
-        );
+        ));
         Ok(())
     }
 }
@@ -459,49 +472,89 @@ fn origin_cell(created_from: Option<&str>, born: usize) -> String {
     raw.to_string()
 }
 
-/// The run-accounting block for the stop summary: what the evolution did, one labeled
-/// line per fact (born → died → what the rolls bought). `alive` is passed in at stop.
-pub(crate) fn accounting_lines(a: &crate::state::RunAccounting, alive: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "  born {} = {} founders ({} random + {} inherited) + {} immigrants + {} crossover children",
-        a.born,
-        a.founders + a.inherited_founders,
-        a.founders,
-        a.inherited_founders,
-        a.immigrants,
-        a.crossover_children
-    ));
-    lines.push(format!(
-        "  culled {} ({} crossover slot(s), {} immigrant slot(s)) │ {} alive at stop",
-        a.culls, a.culls_crossover, a.culls_immigrant, alive
-    ));
-    lines.push(format!(
-        "  crossover rolls {}: {} fired → {} attempt(s), {} child(ren) built, {} discarded (no viable child)",
-        a.crossover_rolls, a.crossover_fired, a.crossover_attempts, a.crossover_children,
-        a.crossover_discarded
-    ));
-    lines.push(format!(
-        "  mutation rolls {}: {} fired → {} immigrant(s), {} blocked by the cull shield",
-        a.mutation_rolls, a.mutation_fired, a.immigrants, a.mutation_blocked
-    ));
-    if a.deferred_clocks > 0 {
-        lines.push(format!(
-            "  evolution deferred on {} clock(s): no cull-eligible net (every non-elite net was fresh or elite)",
-            a.deferred_clocks
-        ));
-    }
-    lines
+/// Run-accounting population tally as `field | count` rows for the CFY stop card.
+/// Every counter the old prose carried is one cell; `alive` is passed in at stop.
+pub(crate) fn accounting_population(
+    a: &crate::state::RunAccounting,
+    alive: usize,
+) -> Vec<(String, String)> {
+    vec![
+        ("born".to_string(), a.born.to_string()),
+        ("  founders (random)".to_string(), a.founders.to_string()),
+        (
+            "  founders (inherited)".to_string(),
+            a.inherited_founders.to_string(),
+        ),
+        ("  immigrants".to_string(), a.immigrants.to_string()),
+        (
+            "  crossover children".to_string(),
+            a.crossover_children.to_string(),
+        ),
+        ("culled".to_string(), a.culls.to_string()),
+        (
+            "  culled (crossover slot)".to_string(),
+            a.culls_crossover.to_string(),
+        ),
+        (
+            "  culled (immigrant slot)".to_string(),
+            a.culls_immigrant.to_string(),
+        ),
+        ("alive at stop".to_string(), alive.to_string()),
+        (
+            "evolution-deferred clocks".to_string(),
+            a.deferred_clocks.to_string(),
+        ),
+    ]
 }
 
-/// Flatten a trainer's `describe()` blob into one readable line
-/// (`key=value │ nested.key=value`). Bounded at `MAX_FIELDS` with an explicit `… +n more`.
-pub(crate) fn summarize_json(v: &serde_json::Value) -> String {
-    /// Max facts rendered before an explicit `… +n more` marker.
+/// Run-accounting rolls MATRIX (CFY-C): one row per roll kind, one column per outcome.
+/// Returns `(header, rows)` ready for [`crate::engine::cfy::table`].
+pub(crate) fn accounting_rolls(
+    a: &crate::state::RunAccounting,
+) -> (Vec<&'static str>, Vec<Vec<String>>) {
+    let dash = || "—".to_string();
+    let header = vec![
+        "event",
+        "rolls",
+        "fired",
+        "attempts",
+        "built",
+        "discarded",
+        "blocked",
+    ];
+    let rows = vec![
+        vec![
+            "crossover".to_string(),
+            a.crossover_rolls.to_string(),
+            a.crossover_fired.to_string(),
+            a.crossover_attempts.to_string(),
+            a.crossover_children.to_string(),
+            a.crossover_discarded.to_string(),
+            dash(),
+        ],
+        vec![
+            "mutation".to_string(),
+            a.mutation_rolls.to_string(),
+            a.mutation_fired.to_string(),
+            dash(),
+            a.immigrants.to_string(),
+            dash(),
+            a.mutation_blocked.to_string(),
+        ],
+    ];
+    (header, rows)
+}
+
+/// Flatten a trainer's `describe()` blob into `field | value` ROWS for a CFY table
+/// (`nested.key` for nested objects; arrays join into one cell). Bounded at
+/// `MAX_FIELDS` with an explicit `… | +n more` row. Nulls flatten to nothing, so an
+/// empty `describe()` yields no rows.
+pub(crate) fn summarize_rows(v: &serde_json::Value) -> Vec<(String, String)> {
+    /// Max facts rendered before an explicit `… +n more` row.
     const MAX_FIELDS: usize = 12;
 
-    /// Flatten a nested JSON object into `key=value` fragments.
-    fn flat(out: &mut Vec<String>, prefix: &str, v: &serde_json::Value) {
+    /// Flatten a nested JSON object into `(key, value)` fragments.
+    fn flat(out: &mut Vec<(String, String)>, prefix: &str, v: &serde_json::Value) {
         let key = |k: &str| {
             if prefix.is_empty() {
                 k.to_string()
@@ -515,17 +568,27 @@ pub(crate) fn summarize_json(v: &serde_json::Value) -> String {
                     flat(out, &key(k), val);
                 }
             }
-            serde_json::Value::String(s) => out.push(format!("{}={s}", prefix)),
-            serde_json::Value::Number(n) => out.push(format!("{}={n}", prefix)),
-            serde_json::Value::Bool(b) => out.push(format!("{}={b}", prefix)),
+            serde_json::Value::String(s) => out.push((prefix.to_string(), s.clone())),
+            // Display-only: a float shows 4 decimals (an f32 round-trips as f64 as
+            // `0.10000000149011612`); integers stay integers. The stored value is
+            // never touched — only this table cell is rounded.
+            serde_json::Value::Number(n) => {
+                let text = if n.is_f64() {
+                    format!("{:.4}", n.as_f64().unwrap_or(0.0))
+                } else {
+                    n.to_string()
+                };
+                out.push((prefix.to_string(), text));
+            }
+            serde_json::Value::Bool(b) => out.push((prefix.to_string(), b.to_string())),
             // Arrays: the elements are already short scalars in practice
             // (`["linear", "relu"]`), so one comma-joined cell beats N lines.
             serde_json::Value::Array(items) => {
                 let cells: Vec<String> = items.iter().map(|x| x.to_string()).collect();
-                out.push(format!("{}=[{}]", prefix, cells.join(",")));
+                out.push((prefix.to_string(), format!("[{}]", cells.join(","))));
             }
             // Null carries no information; `{}` (an empty object) flattens to
-            // nothing, which is how an empty `describe()` reads as "no line".
+            // nothing, which is how an empty `describe()` reads as "no table".
             serde_json::Value::Null => {}
         }
     }
@@ -535,9 +598,9 @@ pub(crate) fn summarize_json(v: &serde_json::Value) -> String {
     if parts.len() > MAX_FIELDS {
         let extra = parts.len() - MAX_FIELDS;
         parts.truncate(MAX_FIELDS);
-        parts.push(format!("… +{extra} more"));
+        parts.push(("…".to_string(), format!("+{extra} more")));
     }
-    parts.join(" │ ")
+    parts
 }
 
 /// One ★-badge entry: the elite net's short hash plus its seat state. Seated ⇒ tenure
@@ -642,11 +705,11 @@ mod tests {
         assert_eq!(elite_gate_note(7, 0, 5, 0), ", probation served (7≥5), tenure 0");
     }
 
-    use super::{accounting_lines, summarize_json};
+    use super::{accounting_population, accounting_rolls, summarize_rows};
     use crate::state::RunAccounting;
 
     #[test]
-    fn summarize_json_flattens_a_trainer_description() {
+    fn summarize_rows_flattens_a_trainer_description() {
         let blob = serde_json::json!({
             "trainer": "cartpole",
             "lr": 0.01,
@@ -655,27 +718,32 @@ mod tests {
             "activations": ["relu", "tanh"],
             "schedules": null
         });
-        let line = summarize_json(&blob);
-        assert!(line.contains("trainer=cartpole"), "{line}");
-        assert!(line.contains("lr=0.01"), "{line}");
-        assert!(line.contains("challenge_prob=0.25"), "{line}");
-        assert!(line.contains("optimizer.kind=Adam"), "nested keys flatten: {line}");
-        assert!(line.contains("activations=[\"relu\",\"tanh\"]"), "{line}");
-        // Nulls carry nothing and empty objects produce no line at all.
-        assert!(!line.contains("schedules"), "{line}");
-        assert_eq!(summarize_json(&serde_json::json!({})), "");
-        assert_eq!(summarize_json(&serde_json::json!(null)), "");
-        // Bounded: a dump-heavy describe() gets an explicit marker, not a
-        // screenful.
+        let rows = summarize_rows(&blob);
+        let get = |k: &str| rows.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        assert_eq!(get("trainer").as_deref(), Some("cartpole"));
+        // Floats display with 4 decimals (an f32 round-trips as a noisy f64).
+        assert_eq!(get("lr").as_deref(), Some("0.0100"));
+        assert_eq!(get("challenge_prob").as_deref(), Some("0.2500"));
+        assert_eq!(get("optimizer.weight_decay").as_deref(), Some("0.0000"));
+        assert_eq!(get("optimizer.kind").as_deref(), Some("Adam"), "nested keys flatten: {rows:?}");
+        assert_eq!(get("activations").as_deref(), Some("[\"relu\",\"tanh\"]"));
+        // Nulls carry nothing and empty objects produce no rows at all.
+        assert!(get("schedules").is_none(), "{rows:?}");
+        assert!(summarize_rows(&serde_json::json!({})).is_empty());
+        assert!(summarize_rows(&serde_json::json!(null)).is_empty());
+        // Bounded: a dump-heavy describe() gets an explicit marker row, not a screenful.
         let big: serde_json::Map<String, serde_json::Value> = (0..30)
             .map(|i| (format!("k{i}"), serde_json::json!(i)))
             .collect();
-        let line = summarize_json(&serde_json::Value::Object(big));
-        assert!(line.contains("… +18 more"), "{line}");
+        let rows = summarize_rows(&serde_json::Value::Object(big));
+        assert!(
+            rows.iter().any(|(k, v)| k == "…" && v == "+18 more"),
+            "{rows:?}"
+        );
     }
 
     #[test]
-    fn accounting_lines_report_births_deaths_and_wasted_rolls() {
+    fn accounting_tables_tally_births_deaths_and_wasted_rolls() {
         let a = RunAccounting {
             born: 214,
             founders: 45,
@@ -694,33 +762,31 @@ mod tests {
             mutation_blocked: 0,
             deferred_clocks: 12,
         };
-        let lines = accounting_lines(&a, 50);
+        // Population tally: every counter the old prose carried, one cell each.
+        let pop = accounting_population(&a, 50);
+        let get = |k: &str| pop.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        assert_eq!(get("born").as_deref(), Some("214"));
+        assert_eq!(get("  founders (random)").as_deref(), Some("45"));
+        assert_eq!(get("  founders (inherited)").as_deref(), Some("5"));
+        assert_eq!(get("  immigrants").as_deref(), Some("99"));
+        assert_eq!(get("  crossover children").as_deref(), Some("65"));
+        assert_eq!(get("culled").as_deref(), Some("164"));
+        assert_eq!(get("  culled (crossover slot)").as_deref(), Some("65"));
+        assert_eq!(get("  culled (immigrant slot)").as_deref(), Some("99"));
+        assert_eq!(get("alive at stop").as_deref(), Some("50"));
+        assert_eq!(get("evolution-deferred clocks").as_deref(), Some("12"));
+        // Rolls matrix: one row per roll kind, one column per outcome. A roll that
+        // bought nothing is reported, not hidden.
+        let (header, rows) = accounting_rolls(&a);
         assert_eq!(
-            lines[0],
-            "  born 214 = 50 founders (45 random + 5 inherited) + 99 immigrants + 65 crossover children"
+            header,
+            vec!["event", "rolls", "fired", "attempts", "built", "discarded", "blocked"]
         );
         assert_eq!(
-            lines[1],
-            "  culled 164 (65 crossover slot(s), 99 immigrant slot(s)) │ 50 alive at stop"
+            rows[0],
+            vec!["crossover", "250", "62", "171", "65", "7", "—"]
         );
-            // A roll that bought nothing is reported, not hidden: "no viable child".
-        assert_eq!(
-            lines[2],
-            "  crossover rolls 250: 62 fired → 171 attempt(s), 65 child(ren) built, 7 discarded (no viable child)"
-        );
-        assert_eq!(
-            lines[3],
-            "  mutation rolls 250: 49 fired → 99 immigrant(s), 0 blocked by the cull shield"
-        );
-        assert_eq!(
-            lines[4],
-            "  evolution deferred on 12 clock(s): no cull-eligible net (every non-elite net was fresh or elite)"
-        );
-        // Nothing deferred (the usual steady-state run): that line is omitted
-        // rather than printed as a zero.
-        let mut b = a;
-        b.deferred_clocks = 0;
-        assert_eq!(accounting_lines(&b, 50).len(), 4);
+        assert_eq!(rows[1], vec!["mutation", "250", "49", "—", "99", "—", "0"]);
     }
 
     /// The origin cell: crossover → TYPE + birth clock (no parent ids),

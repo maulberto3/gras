@@ -30,6 +30,7 @@
 //! - [`fitness`] — `Fitness`, `Direction`, `Metric`, `FitnessLabel`
 
 pub mod artifacts;
+pub mod cfy;
 pub mod child;
 pub mod config;
 pub mod core;

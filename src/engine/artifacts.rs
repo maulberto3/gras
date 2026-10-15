@@ -9,7 +9,6 @@
 
 use super::core::CoreEngine;
 use flodl::tensor::Result;
-use tracing::info;
 
 impl CoreEngine {
     /// Write the MACHINE-READABLE elite ranking — `elites.json`, best first,
@@ -49,11 +48,14 @@ impl CoreEngine {
                 }
             );
         } else if self.verbose_detail() {
-            info!(
-                "  elite index → {} ({} ranked, inheritable by the next run)",
-                path.display(),
-                entries.len()
-            );
+            crate::engine::cfy::emit(&crate::engine::cfy::card(
+                "Elite index",
+                &crate::engine::cfy::kv(&[
+                    ("file".to_string(), path.display().to_string()),
+                    ("ranked".to_string(), entries.len().to_string()),
+                ]),
+                Some("inheritable by the next run"),
+            ));
         }
         Ok(())
     }
@@ -68,6 +70,8 @@ impl CoreEngine {
         // The champion count is known without consuming the iterator — read
         // it from the config (the same k the iterator caps at).
         let k = self.config.elite_count.max(1);
+        // CFY: rows of the written files, emitted as one table after the loop.
+        let mut written: Vec<Vec<String>> = Vec::new();
         for (rank, (hash, fitness)) in self.champion_ranked().enumerate() {
             let Some(state) = self.state.net(&hash) else {
                 continue;
@@ -101,12 +105,11 @@ impl CoreEngine {
             );
             match std::fs::write(&path, &md) {
                 Ok(()) => {
-                    if self.verbose_detail() {
-                        info!(
-                            "  elite topology → {} (markdown, ready to view)",
-                            path.display()
-                        );
-                    }
+                    written.push(vec![
+                        (rank + 1).to_string(),
+                        short.to_string(),
+                        path.display().to_string(),
+                    ]);
                 }
                 Err(source) => tracing::warn!(
                     "elite markdown write failed: {}",
@@ -116,6 +119,13 @@ impl CoreEngine {
                     }
                 ),
             }
+        }
+        if self.verbose_detail() && !written.is_empty() {
+            crate::engine::cfy::emit(&crate::engine::cfy::card(
+                "Elite topology (markdown)",
+                &crate::engine::cfy::table(&["#", "hash", "file"], &written),
+                Some("ready to view"),
+            ));
         }
         Ok(())
     }
@@ -127,6 +137,8 @@ impl CoreEngine {
             return Ok(());
         }
         self.record_champions();
+        // CFY: one table for all exported weight files, emitted after the loop.
+        let mut written: Vec<Vec<String>> = Vec::new();
         for (hash, _) in self.champion_ranked() {
             let short = &hash[..8.min(hash.len())];
             let path = self.run_dir.join(format!("elite-{short}.safetensors"));
@@ -136,12 +148,19 @@ impl CoreEngine {
                 Some(net) => {
                     if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
                         tracing::warn!("elite safetensors export failed: {e}");
-                    } else if self.verbose_detail() {
-                        info!("  elite weights → {} (safetensors)", path.display());
+                    } else {
+                        written.push(vec![short.to_string(), path.display().to_string()]);
                     }
                 }
                 None => tracing::warn!("elite safetensors export failed: live network missing"),
             }
+        }
+        if self.verbose_detail() && !written.is_empty() {
+            crate::engine::cfy::emit(&crate::engine::cfy::card(
+                "Elite weights (safetensors)",
+                &crate::engine::cfy::table(&["hash", "file"], &written),
+                None,
+            ));
         }
         Ok(())
     }
@@ -237,7 +256,15 @@ impl CoreEngine {
                     if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
                         tracing::warn!("worst safetensors export failed: {e}");
                     } else if self.verbose_detail() {
-                        info!("  worst-net artifacts → worst-{short}.md / .safetensors");
+                        crate::engine::cfy::emit(&crate::engine::cfy::card(
+                            "Worst-net artifacts",
+                            &crate::engine::cfy::kv(&[
+                                ("hash".to_string(), short.to_string()),
+                                ("markdown".to_string(), format!("worst-{short}.md")),
+                                ("weights".to_string(), format!("worst-{short}.safetensors")),
+                            ]),
+                            None,
+                        ));
                     }
                 }
                 None => tracing::warn!("worst safetensors export failed: live network missing"),

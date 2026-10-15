@@ -4,8 +4,6 @@
 //! pluggable `custom_stop`, which joins the race in addition to the built-ins
 //! and receives a read-only [`RaceSnapshot`].
 
-use tracing::info;
-
 use super::config::{RaceSnapshot, StopReason};
 use super::core::CoreEngine;
 
@@ -17,10 +15,15 @@ impl CoreEngine {
         // flows through the same artifact path as a natural stop (step included).
         if let Some(flag) = &self.interrupt_flag {
             if flag.load(std::sync::atomic::Ordering::SeqCst) {
-                info!(
-                    "race: Ctrl+C — shutting down gracefully after step {}",
-                    step
-                );
+                // CFY: the interrupt notice is a table, not a one-liner.
+                crate::engine::cfy::emit(&crate::engine::cfy::card(
+                    "Race",
+                    &crate::engine::cfy::kv(&[(
+                        "ctrl+c".to_string(),
+                        format!("graceful shutdown after step {step}"),
+                    )]),
+                    None,
+                ));
                 return Some(StopReason::Interrupted);
             }
         }

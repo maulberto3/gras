@@ -485,11 +485,16 @@ impl CoreEngine {
         // engine must not inject a net they did not ask for (or shift every ordinal).
         let manual_founders = !config.run_topologies.is_empty();
         if config.elite_previous_load && manual_founders {
-            println!(
-                "elite_previous_load: skipped — {} founder blueprint(s) supplied via \
-                 set_run_topologies (manual founders win)",
-                config.run_topologies.len()
-            );
+            // CFY + always-visible: the inheritance receipt is a table that must show at
+            // any log level (it is a fact about what the run INHERITED).
+            crate::engine::cfy::emit_always(&crate::engine::cfy::card(
+                "Inheritance",
+                &crate::engine::cfy::kv(&[(
+                    "founder blueprints".to_string(),
+                    config.run_topologies.len().to_string(),
+                )]),
+                Some("elite_previous_load skipped — manual founders win (set_run_topologies)"),
+            ));
         } else if config.elite_previous_load {
             // The compatibility gate reads the candidate's engine.json header,
             // so this run's own header (mode, dims, trainer name) is the input.
@@ -515,30 +520,47 @@ impl CoreEngine {
                     let champ = plan.champion();
                     let short = &champ.champion_hash[..8.min(champ.champion_hash.len())];
                     let n = plan.picks.len();
-                    // Deliberately a plain println, like the skip line below: the
-                    // inheritance receipt must be visible at any log level.
-                    println!(
-                        "elite_previous_load: inherited ranks 1..{n} of run {} ({}{}) → founder slot(s) {}{}",
-                        plan.source_run_id,
-                        plan.source_dir.display(),
-                        champ
-                            .guardrail_mean
-                            .map(|m| format!(", holdout {m:.4}"))
-                            .unwrap_or_default(),
-                        if n == 1 {
-                            "0".to_string()
+                    // Deliberately a plain emit (not level-filtered), like the skip
+                    // branch: the inheritance receipt must be visible at any log level.
+                    crate::engine::cfy::emit_always(&crate::engine::cfy::card(
+                        "Inheritance",
+                        &crate::engine::cfy::kv(&[
+                            ("source run".to_string(), plan.source_run_id.clone()),
+                            (
+                                "source dir".to_string(),
+                                plan.source_dir.display().to_string(),
+                            ),
+                            ("champion".to_string(), short.to_string()),
+                            (
+                                "champion holdout".to_string(),
+                                champ
+                                    .guardrail_mean
+                                    .map(|m| format!("{m:.4}"))
+                                    .unwrap_or_else(|| "—".to_string()),
+                            ),
+                            (
+                                "ranks inherited".to_string(),
+                                if n == 1 {
+                                    "rank 1".to_string()
+                                } else {
+                                    format!("ranks 1..{n}")
+                                },
+                            ),
+                            (
+                                "founder slots".to_string(),
+                                if n == 1 {
+                                    "0".to_string()
+                                } else {
+                                    format!("0-{}", n - 1)
+                                },
+                            ),
+                        ]),
+                        Some(if n == 1 {
+                            "champion certified by the guardrail"
                         } else {
-                            format!("0-{}", n - 1)
-                        },
-                        if n == 1 {
-                            format!(", champion {short} certified by the guardrail")
-                        } else {
-                            format!(
-                                ", champion {short} rank 1 (certified by the guardrail), the rest by \
-                                 the source run's own elite ranking"
-                            )
-                        },
-                    );
+                            "champion rank 1 certified by the guardrail; the rest by the source run's own elite ranking"
+                        }),
+                    ));
                     let elite_hashes: Vec<String> =
                         plan.picks.iter().map(|p| p.champion_hash.clone()).collect();
                     for pick in &plan.picks {
@@ -554,9 +576,16 @@ impl CoreEngine {
                     });
                 }
                 super::seed::SeedOutcome::Skipped(why) => {
-                    // Deliberately a plain println: this is a fact about what the run INHERITED and
-                    // must be visible at any log level. The run continues all-random either way.
-                    println!("elite_previous_load: {why} — starting from an all-random population");
+                    // Deliberately a plain emit: a fact about what the run INHERITED must be
+                    // visible at any log level. The run continues all-random either way.
+                    crate::engine::cfy::emit_always(&crate::engine::cfy::card(
+                        "Inheritance",
+                        &crate::engine::cfy::kv(&[(
+                            "elite_previous_load".to_string(),
+                            "skipped".to_string(),
+                        )]),
+                        Some(&format!("{why} — starting from an all-random population")),
+                    ));
                 }
             }
         }
@@ -741,6 +770,8 @@ impl CoreEngine {
                 source,
             }
         })?;
+        // CFY: per-net replay rows collected here, emitted as one table after the load.
+        let mut replayed: Vec<Vec<String>> = Vec::new();
         for entry in entries {
             let path = entry
                 .map_err(|source| crate::utils::error::EngineError::Io {
@@ -810,10 +841,7 @@ impl CoreEngine {
             self.rolling_train.insert(hash.clone(), train_buf);
             self.rolling_eval.insert(hash.clone(), eval_buf);
             loaded += 1;
-            info!(
-                "race resume: net {} replayed to step {} (parity ok)",
-                hash, step
-            );
+            replayed.push(vec![hash.clone(), step.to_string()]);
         }
         if loaded != self.config.pop_size {
             return Err(crate::utils::error::EngineError::InvalidOptions(format!(
@@ -821,11 +849,11 @@ impl CoreEngine {
                 self.config.pop_size, loaded, nets_dir.display()
             )).into());
         }
-        info!(
-            "race resume: loaded {} nets from {}",
-            loaded,
-            run_dir.display()
-        );
+        crate::engine::cfy::emit(&crate::engine::cfy::card(
+            "Race resume",
+            &crate::engine::cfy::table(&["hash", "replayed step"], &replayed),
+            Some(&format!("loaded {loaded} nets from {}", run_dir.display())),
+        ));
         Ok(())
     }
 
@@ -884,35 +912,42 @@ impl CoreEngine {
             .iter()
             .filter(|(_, label)| label.is_some())
             .count();
-        match (seeded_slots, self.header.run_topology_source.as_ref()) {
-            (0, _) => info!(
-                "race init: populated {} live nets into {}",
-                count,
-                self.run_dir.display()
+        // CFY: the init line is a table; inheritance provenance becomes its own rows.
+        let mut rows: Vec<(String, String)> = vec![
+            ("live nets".to_string(), count.to_string()),
+            (
+                "run dir".to_string(),
+                self.run_dir.display().to_string(),
             ),
-            (n, Some(src)) if n == 1 => info!(
-                "race init: populated {} live nets into {} (1 seeded from run {}'s guardrail champion {})",
-                count,
-                self.run_dir.display(),
-                src.source_run_id,
-                &src.champion_hash[..8.min(src.champion_hash.len())],
-            ),
-            (n, Some(src)) => info!(
-                "race init: populated {} live nets into {} ({} seeded — ranks 1..{} of run {}, champion {})",
-                count,
-                self.run_dir.display(),
-                n,
-                n,
-                src.source_run_id,
-                &src.champion_hash[..8.min(src.champion_hash.len())],
-            ),
-            (n, None) => info!(
-                "race init: populated {} live nets into {} ({} seeded from a previous experiment)",
-                count,
-                self.run_dir.display(),
-                n,
-            ),
+            ("seeded slots".to_string(), seeded_slots.to_string()),
+        ];
+        if let Some(src) = self.header.run_topology_source.as_ref() {
+            rows.push(("source run".to_string(), src.source_run_id.clone()));
+            rows.push((
+                "champion".to_string(),
+                src.champion_hash[..8.min(src.champion_hash.len())].to_string(),
+            ));
+            rows.push((
+                "ranks inherited".to_string(),
+                if seeded_slots == 1 {
+                    "rank 1".to_string()
+                } else {
+                    format!("ranks 1..{seeded_slots}")
+                },
+            ));
+            if let Some(m) = src.guardrail_mean {
+                rows.push(("champion holdout".to_string(), format!("{m:.4}")));
+            }
         }
+        crate::engine::cfy::emit(&crate::engine::cfy::card(
+            "Race init",
+            &crate::engine::cfy::kv(&rows),
+            Some(if seeded_slots == 0 {
+                "all-random founder batch"
+            } else {
+                "seeded slots inherit a previous experiment's champion topology"
+            }),
+        ));
         Ok(())
     }
 
@@ -927,8 +962,10 @@ impl CoreEngine {
         if let Some(stream) = self.stream.as_mut() {
             stream.set_run_checkpoint_every(self.config.checkpoint_every);
         }
-        // Run-start config resolution line: everything that shapes the search,
-        // logged once so the log is self-describing (empty pools ⇒ all ops).
+        // CFY: the whole start-up block is comfy tables — a run manifest (B), a
+        // search-space section (A), a trainer section, and the log legend as a
+        // card footnote (E). None of these lines start with `step`, so none
+        // stays a one-liner; every field the old prose carried is a cell here.
         if self.verbose_detail() {
             let ops = self
                 .config
@@ -958,61 +995,148 @@ impl CoreEngine {
             } else {
                 self.config.standardize_op_pool.join(",")
             };
-            info!(
-                "search space: crossover_ops=[{}] │ activations=[{}] │ combine=[{}] │ standardize=[{}] │ cull_policy={:?} │ elite_count={}",
-                ops,
-                acts,
-                combines,
-                std_ops,
-                self.config.crossover_cull_policy,
-                self.config.elite_count,
+            let transforms = if self.config.transform_pool.is_empty() {
+                "off".to_string()
+            } else {
+                self.config.transform_pool.join(",")
+            };
+            let mut manifest: Vec<(String, String)> = vec![
+                ("run_id".to_string(), self.header.run_id.clone()),
+                ("seed".to_string(), self.header.run_seed.to_string()),
+                ("pid".to_string(), std::process::id().to_string()),
+                (
+                    "mode".to_string(),
+                    self.header
+                        .engine_mode
+                        .clone()
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+                ("pop_size".to_string(), self.config.pop_size.to_string()),
+                (
+                    "max_steps".to_string(),
+                    self.config
+                        .max_steps
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "unbounded".to_string()),
+                ),
+                (
+                    "smoothing_window (K)".to_string(),
+                    self.config.smoothing_window.to_string(),
+                ),
+                (
+                    "risk_aversion (λ)".to_string(),
+                    format!("{:.2}", self.config.risk_aversion),
+                ),
+                (
+                    "checkpoint_every".to_string(),
+                    self.config.checkpoint_every.to_string(),
+                ),
+                (
+                    "crossover_rolls".to_string(),
+                    self.config.crossover_rolls.to_string(),
+                ),
+                ("mutate_rolls".to_string(), self.config.mutate_rolls.to_string()),
+                (
+                    "crossover_prob".to_string(),
+                    format!("{:.2}", self.config.crossover_prob),
+                ),
+                ("mutate_prob".to_string(), format!("{:.2}", self.config.mutate_prob)),
+                ("elite_count".to_string(), self.config.elite_count.to_string()),
+                (
+                    "freeze_elites".to_string(),
+                    self.config.freeze_elites.to_string(),
+                ),
+                (
+                    "guardrail_matches".to_string(),
+                    self.config.guardrail_matches.to_string(),
+                ),
+                (
+                    "fitness".to_string(),
+                    format!("{} ({})", self.meta_ctx.fitness_label, self.meta_ctx.direction),
+                ),
+                ("input_dim".to_string(), self.meta_ctx.input_dim.to_string()),
+                ("output_dim".to_string(), self.meta_ctx.output_dim.to_string()),
+                (
+                    "batch_size".to_string(),
+                    self.meta_ctx
+                        .batch_size
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+                ("dropout".to_string(), format!("{}", self.meta_ctx.dropout_prob)),
+                ("build".to_string(), build_stamp()),
+            ];
+            // Knobs that silently change what a run MEANS — kept beside the identity so a
+            // resumed command stays reconstructible from the log alone.
+            for (k, v) in [
+                (
+                    "cull_policy",
+                    format!("{:?}", self.config.crossover_cull_policy),
+                ),
+                ("elite_save", self.config.elite_save_topology.to_string()),
+                ("worst_save", self.config.worst_save_topology.to_string()),
+                (
+                    "probation_steps",
+                    self.config.mutation_probation_steps.to_string(),
+                ),
+                (
+                    "crossover_probation_steps",
+                    self.config.crossover_probation_steps.to_string(),
+                ),
+                (
+                    "elite_join_probation_steps",
+                    self.config.elite_join_probation_steps.to_string(),
+                ),
+                (
+                    "elite_crown_lifetime_steps",
+                    self.config.elite_crown_lifetime_steps.to_string(),
+                ),
+            ] {
+                manifest.push((k.to_string(), v));
+            }
+            let legend = format!(
+                "fitness = mean over the `matches` played that clock │ μ = rolling mean of the last K={} clock fitnesses │ σ = their spread │ smt = risk-adjusted score rankings use (μ paid λ={:.2}σ; λ=0 ⇒ smt = μ) │ ★ = elite rank + seat tenure │ trained n/m = optimizer updates over clocks lived",
+                self.config.smoothing_window, self.config.risk_aversion,
             );
-        }
-        // `None` mode: one compact start line, then silence until stop.
-        if self.verbose_detail() {
-            info!(
-                "race start: run={} seed={} checkpoint_every={} crossover_rolls={} mutate_rolls={} K={} pop={} pid={} (kill this pid to end the race; Ctrl+C = graceful)",
-                self.header.run_id,
-                self.header.run_seed,
-                self.config.checkpoint_every,
-                self.config.crossover_rolls,
-                self.config.mutate_rolls,
-                self.config.smoothing_window,
-                self.config.pop_size,
-                std::process::id(),
-            );
-            // The knobs that silently change what a run MEANS, printed up front so a resumed
-            // command is reconstructible from the log alone.
-            info!(
-                "race knobs: cull_policy={:?} dropout={} freeze_elites={} elite_save={} worst_save={} probation_steps={} crossover_probation_steps={} elite_join_probation_steps={} elite_crown_lifetime_steps={} risk_aversion={:.2}",
-                self.config.crossover_cull_policy,
-                self.header.topology_options.dropout_prob,
-                self.config.freeze_elites,
-                self.config.elite_save_topology,
-                self.config.worst_save_topology,
-                self.config.mutation_probation_steps,
-                self.config.crossover_probation_steps,
-                self.config.elite_join_probation_steps,
-                self.config.elite_crown_lifetime_steps,
-                self.config.risk_aversion,
-            );
-            // What the numbers above/below MEAN, stated once — without it a reader cannot
-            // tell a 4-match fitness sample from a 200-match one, nor what `smt`/`μ`/`σ`/`★`
-            // mean. `smt` is no longer the mean: it is the risk-adjusted score.
-            info!(
-                "  log legend: fitness = mean over the `matches` played that clock │ μ = rolling mean of the last K={} clock fitnesses (the readable level) │ σ = their spread │ smt = the risk-adjusted score rankings use (μ paid λ={:.2}σ in the run's own direction; λ=0 ⇒ smt = μ) │ ★ = elite rank (each with its seat tenure) │ trained n/m = optimizer updates over clocks lived",
-                self.config.smoothing_window,
-                self.config.risk_aversion,
-            );
+            crate::engine::cfy::emit(&crate::engine::cfy::card(
+                "Run manifest",
+                &crate::engine::cfy::kv(&manifest),
+                Some(&legend),
+            ));
+
+            let search = crate::engine::cfy::kv(&[
+                ("crossover_ops".to_string(), ops),
+                ("activations".to_string(), acts),
+                ("combine".to_string(), combines),
+                ("standardize".to_string(), std_ops),
+                ("transform".to_string(), transforms),
+                (
+                    "hidden_dim_pool".to_string(),
+                    match &self.config.hidden_dim_pool {
+                        Some(r) => format!(
+                            "{}..={} (stride {})",
+                            r.start(),
+                            r.end(),
+                            self.config.hidden_dim_stride
+                        ),
+                        None => "default 4..=8".to_string(),
+                    },
+                ),
+            ]);
+            crate::engine::cfy::emit(&crate::engine::cfy::card("Search space", &search, None));
+
             // The trainer's own self-description: the only visible record of trainer-side
             // knobs (challenge trigger, schedules, clipping), which left with the trainer.
             if let Some(trainer) = self.header.trainer.as_ref() {
-                let flat = crate::engine::reporting::summarize_json(trainer);
-                if !flat.is_empty() {
-                    info!("  trainer: {flat}");
+                let rows = crate::engine::reporting::summarize_rows(trainer);
+                if !rows.is_empty() {
+                    crate::engine::cfy::emit(&crate::engine::cfy::card(
+                        "Trainer",
+                        &crate::engine::cfy::kv(&rows),
+                        None,
+                    ));
                 }
             }
-            info!("  {}", build_stamp());
         }
 
         // ── Graceful Ctrl+C (always on) ─────────────────────────────────
@@ -1029,8 +1153,18 @@ impl CoreEngine {
                     std::process::exit(130);
                 }
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                // CFY: the interrupt notice is a table, kept on stderr so it does not
+                // disturb the `Minimal` frame's stdout redraw.
                 eprintln!(
-                    "\n── Ctrl+C received: shutting down gracefully at the next step boundary (press again to force-kill) …"
+                    "{}",
+                    crate::engine::cfy::card(
+                        "Ctrl+C",
+                        &crate::engine::cfy::kv(&[(
+                            "action".to_string(),
+                            "graceful shutdown at the next step boundary".to_string(),
+                        )]),
+                        Some("press again to force-kill"),
+                    )
                 );
             });
         }
@@ -1259,7 +1393,11 @@ impl CoreEngine {
                 })
                 .collect();
             if hashes.is_empty() {
-                info!("race: population empty — stopping");
+                crate::engine::cfy::emit(&crate::engine::cfy::card(
+                    "Race",
+                    &crate::engine::cfy::kv(&[("live nets".to_string(), "0".to_string())]),
+                    Some("population empty — stopping"),
+                ));
                 return Ok(StopReason::MaxSteps);
             }
             // 1-pre. KISS crown: the crown IS the elite take(k) set, recomputed fresh every
@@ -1383,8 +1521,15 @@ impl CoreEngine {
         self.write_worst_artifacts()?;
         // `None` mode stays silent until the caller's final stop print.
         if self.verbose_detail() {
-            info!("── stop ──");
-            info!("  race stop: {:?} at step {}", reason, clock);
+            // CFY: the stop banner is a table too.
+            crate::engine::cfy::emit(&crate::engine::cfy::card(
+                "Stop",
+                &crate::engine::cfy::kv(&[
+                    ("reason".to_string(), format!("{reason:?}")),
+                    ("step".to_string(), clock.to_string()),
+                ]),
+                None,
+            ));
             self.log_stop_summary(clock)?;
         }
         self.write_live_frontier_states()?;
@@ -1452,9 +1597,14 @@ impl CoreEngine {
         // game, no verdict. `engine.json` keeps any earlier record, and the
         // next run's inheritance never depended on the verdict (`elites.json`).
         if self.config.guardrail_matches == 0 {
-            tracing::info!(
-                "guardrail: skipped — guardrail_matches = 0 (no holdout exam configured; nothing recorded)"
-            );
+            crate::engine::cfy::emit(&crate::engine::cfy::card(
+                "Guardrail",
+                &crate::engine::cfy::kv(&[(
+                    "guardrail_matches".to_string(),
+                    "0".to_string(),
+                )]),
+                Some("skipped — no holdout exam configured; nothing recorded"),
+            ));
             return None;
         }
         // The champion set is written by the stop-time writers; recompute it when empty
@@ -1507,7 +1657,7 @@ impl CoreEngine {
             .unwrap_or_default();
         let race_note = match race {
             Some(r) => format!(
-                "race reading μ{:.1} over {} step reading(s) (±σ{:.1}, SE {:.1}, window min {:.1} / max {:.1}, latest {:.1} │ risk-adj {:.1} at λ={:.2})",
+                "μ{:.1} over {} step reading(s) (±σ{:.1}, SE {:.1}, window min {:.1} / max {:.1}, latest {:.1} │ risk-adj {:.1} at λ={:.2})",
                 r.mean,
                 r.n,
                 r.std,
@@ -1518,15 +1668,8 @@ impl CoreEngine {
                 race_score.unwrap_or(r.mean),
                 self.config.risk_aversion,
             ),
-            None => "race reading unavailable (no rolling window recorded)".to_string(),
+            None => "unavailable (no rolling window recorded)".to_string(),
         };
-        tracing::info!(
-            "guardrail: champion {} — {race_note}, the best of {} live net(s) on that reading │ exam {:.1} over {} unseen game(s){exam_se}",
-            &verdict.hash[..8.min(verdict.hash.len())],
-            self.state.live_count(),
-            verdict.mean().unwrap_or(0.0),
-            verdict.scores.len(),
-        );
         let verdict_line = crate::engine::guardrail::agreement_verdict_noisy(
             verdict.race_smoothed,
             verdict.race_se,
@@ -1537,9 +1680,29 @@ impl CoreEngine {
             verdict.scores.len(),
             self.fitness.direction(),
         );
-        // ELI5, line 2: WHAT IT MEANS — the verdict sentence carries the mechanism
-        // (short window mean + best-of-population selection) whenever the bars allow it.
-        tracing::info!("guardrail: {verdict_line}");
+        // CFY: one guardrail card — every reading a row, the verdict sentence a footnote
+        // (it carries the mechanism whenever the bars allow it). The old two info! lines
+        // were ELI5 "what was compared" + "what it means"; both live here now.
+        crate::engine::cfy::emit(&crate::engine::cfy::card(
+            "Guardrail (champion on fresh unseen games)",
+            &crate::engine::cfy::kv(&[
+                (
+                    "champion".to_string(),
+                    verdict.hash[..8.min(verdict.hash.len())].to_string(),
+                ),
+                ("race reading".to_string(), race_note),
+                (
+                    "best of live".to_string(),
+                    format!("{} net(s) on that reading", self.state.live_count()),
+                ),
+                (
+                    "exam mean".to_string(),
+                    format!("{:.1}{exam_se}", verdict.mean().unwrap_or(0.0)),
+                ),
+                ("unseen games".to_string(), verdict.scores.len().to_string()),
+            ]),
+            Some(&verdict_line),
+        ));
         // Record it: the guardrail is a run OUTPUT (the only reading on unseen games), so
         // it lives in engine.json and the next experiment inherits its champion.
         let record = crate::state::GuardrailRecord {
