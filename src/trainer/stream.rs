@@ -114,16 +114,20 @@ impl BatchStream {
     }
 
         /// Set the checkpoint cadence — the eval permutation rotates per era, so it
-        /// must agree with the engine's `checkpoint_every`.
+        /// must agree with the engine's `checkpoint_every`. **`0` = never rotate**: the
+        /// eval permutation is frozen on era 0 for the whole run, matching an engine
+        /// whose durability tick is off (it must not silently become "rotate every
+        /// step", which would hand every step a different eval batch).
     pub fn with_checkpoint_every(mut self, n: usize) -> Self {
-        self.checkpoint_every = n.max(1);
+        self.checkpoint_every = n;
         self
     }
 
         /// In-place variant of [`Self::with_checkpoint_every`], called by the engine at
-        /// run start / resume so a config edit can't desync the eval rotation.
+        /// run start / resume so a config edit can't desync the eval rotation. `0` =
+        /// never rotate (see [`Self::with_checkpoint_every`]).
     pub fn set_run_checkpoint_every(&mut self, n: usize) {
-        self.checkpoint_every = n.max(1);
+        self.checkpoint_every = n;
     }
 
     /// Train batch size the stream materializes.
@@ -132,7 +136,7 @@ impl BatchStream {
     }
 
     /// The checkpoint cadence this stream was built with — the eval
-    /// permutation rotates per era = `step / checkpoint_every`.
+    /// permutation rotates per era = `step / checkpoint_every` (`0` = never rotate).
     pub fn checkpoint_every(&self) -> usize {
         self.checkpoint_every
     }
@@ -142,16 +146,16 @@ impl BatchStream {
         self.eval_batch_size
     }
 
-    /// The train/eval split ratio this stream was built with (from
-    /// RunSpec::stream / header). For engine bookkeeping.
-    pub fn train_eval_split_ratio(&self) -> f32 {
-        self.train_pool.len() as f32 / (self.train_pool.len() + self.eval_pool.len()) as f32
-    }
-
         /// The pool index vectors this stream draws from (train, eval) — read-only
         /// view; never mutated after construction.
     pub fn pools(&self) -> (&[i64], &[i64]) {
         (&self.train_pool, &self.eval_pool)
+    }
+
+    /// The train/eval split ratio this stream was built with (from
+    /// RunSpec::stream / header). For engine bookkeeping.
+    pub fn train_eval_split_ratio(&self) -> f32 {
+        self.train_pool.len() as f32 / (self.train_pool.len() + self.eval_pool.len()) as f32
     }
 
     /// Gather `indices` into one `(inputs, targets)` batch tensor pair.
@@ -185,25 +189,6 @@ impl BatchStream {
         Self::gather(dataset, &Self::window(&perm, self.batch_size, offset))
     }
 
-        /// The first `n` rows of the eval permutation **at era 0** (legacy stable
-        /// reading; the engine uses the era-aware `eval_pool_rows_at`).
-    pub fn eval_pool_rows(&self, n: usize) -> Result<Vec<i64>> {
-        self.eval_pool_rows_at(n, 0)
-    }
-
-        /// First `n` rows of the eval permutation at `era` — deterministic in
-        /// `(run_seed, era)`, rotated per checkpoint so the reading isn't fixed rows.
-    pub fn eval_pool_rows_at(&self, n: usize, era: u64) -> Result<Vec<i64>> {
-        let perm = self.eval_permutation(era);
-        Ok(Self::window(&perm, n.max(1), 0))
-    }
-
-    /// Gather arbitrary pool rows into a batch. Public wrapper over the
-    /// private `gather` for engine-side ad-hoc evals.
-    pub fn gather_rows(&self, dataset: &Dataset, indices: &[i64]) -> Result<(Tensor, Tensor)> {
-        Self::gather(dataset, indices)
-    }
-
         /// The eval permutation for `era` — re-shuffled per checkpoint; pure function
         /// of `(run_seed, era)`; era 0 matches the legacy fixed permutation.
     fn eval_permutation(&self, era: u64) -> Vec<i64> {
@@ -217,9 +202,13 @@ impl BatchStream {
         perm
     }
 
-    /// The era a step belongs to (steps in the same era share one eval
-    /// permutation — the rotation boundary is the engine's checkpoint).
+        /// The era a step belongs to (steps in the same era share one eval
+        /// permutation — the rotation boundary is the engine's checkpoint). A cadence of
+        /// `0` is ONE eternal era: the guard is load-bearing, since `step / 0` would panic.
     fn era_of(&self, step: u64) -> u64 {
+        if self.checkpoint_every == 0 {
+            return 0;
+        }
         (step as usize / self.checkpoint_every) as u64
     }
 
@@ -343,6 +332,38 @@ mod tests {
             x0.to_f32_vec().unwrap(),
             x6.to_f32_vec().unwrap(),
             "step 6 wraps to the lap-1 start"
+        );
+    }
+
+        /// `0` is a real cadence, not a clamp: the eval permutation must stay frozen on
+        /// era 0 forever (and `era_of` must not divide by zero).
+    #[test]
+    fn zero_cadence_freezes_the_eval_permutation() {
+        let ds = small_dataset();
+        let s = BatchStream::new(7, 8, PoolSplit::of(&ds, 0.25, 7))
+            .with_eval_batch_size(4)
+            .with_checkpoint_every(0);
+        assert_eq!(s.checkpoint_every(), 0);
+        // Every step is era 0 — including steps that would cross many boundaries at
+        // cadence 1 (where step 5 would be era 5).
+        for step in [0u64, 1, 5, 4096] {
+            let perm = s.eval_permutation(s.era_of(step));
+            let frozen = s.eval_permutation(0);
+            assert_eq!(perm, frozen, "step {step} must stay in the eternal era 0");
+        }
+        // Same batch for the same step (still pure), and the eval batch is unaffected
+        // by the cadence knob beyond the permutation choice.
+        assert_eq!(
+            s.eval_batch(&ds, 3).unwrap().0.to_f32_vec().unwrap(),
+            s.eval_batch(&ds, 3).unwrap().0.to_f32_vec().unwrap()
+        );
+        // A non-zero cadence still rotates (the knob kept its old meaning).
+        let rotating = BatchStream::new(7, 8, PoolSplit::of(&ds, 0.25, 7))
+            .with_eval_batch_size(4)
+            .with_checkpoint_every(1);
+        assert_ne!(
+            rotating.eval_permutation(rotating.era_of(0)),
+            rotating.eval_permutation(rotating.era_of(1))
         );
     }
 

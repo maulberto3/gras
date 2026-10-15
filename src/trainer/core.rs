@@ -146,6 +146,8 @@ pub struct StepEnv {
     pub live_count: usize,
     /// Checkpoint cadence — the durability tick (frontier + elite weight
     /// snapshots) and the stream's eval-permutation era fire every N steps.
+    /// **`0` = the tick is off** and the eval permutation never rotates (one eternal
+    /// era); a trainer must not `% 0` it.
     pub checkpoint_every: usize,
     /// The per-net fitness smoothing window, in steps (K).
     pub smoothing_window: usize,
