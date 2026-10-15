@@ -56,7 +56,7 @@ pub use config::{
 };
 pub use core::CoreEngine;
 pub use fitness::{Direction, Fitness, FitnessLabel};
-pub use guardrail::{ChampionScorer, GuardrailVerdict, check_champion};
+pub use guardrail::GuardrailVerdict;
 pub use rl_engine::RlEngine;
 pub use run_spec::{RLSpec, RunSpec, StreamShape, TabularSpec};
 pub use seed::{SeedOutcome, SeedPick, resolve as resolve_seed_source};

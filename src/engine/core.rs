@@ -1334,7 +1334,10 @@ impl CoreEngine {
             }
 
             // ── 2. durability tick (every `checkpoint_every` steps) ─────────
-            if clock > 0 && clock % self.config.checkpoint_every == 0 {
+            // `> 0` is load-bearing twice: `checkpoint_every = 0` is the documented OFF
+            // (no tick, no era rotation) and `clock % 0` would panic.
+            if self.config.checkpoint_every > 0 && clock > 0 && clock % self.config.checkpoint_every == 0
+            {
                 // Snapshot the live frontier so a hard kill loses at most one tick.
                 if let Err(e) = self.write_live_frontier_states() {
                     tracing::warn!("checkpoint live states write failed: {e}");
@@ -1451,12 +1454,20 @@ impl CoreEngine {
         self.rolling_fitness.get(hash).and_then(rolling_stats)
     }
 
-    /// The post-race holdout guardrail: score the champion on fresh unseen games
-    /// through the run's own trainer. `None` = no champion (each case logs a warning).
-    pub fn guardrail(
-        &mut self,
-        device: flodl::Device,
-    ) -> Option<crate::engine::guardrail::GuardrailVerdict> {
+    /// The post-race holdout guardrail: score the LIVE champion on fresh unseen games
+    /// through the run's own trainer. `None` = no champion (each case logs a warning),
+    /// the champion is no longer live, or the exam is switched off (`guardrail_matches = 0`).
+    pub fn guardrail(&mut self) -> Option<crate::engine::guardrail::GuardrailVerdict> {
+        // `0` matches = the exam is OFF (see `set_elite_guardrail_matches`): return
+        // BEFORE anything expensive or observable — no champion lookup, no holdout
+        // game, no verdict. `engine.json` keeps any earlier record, and the
+        // next run's inheritance never depended on the verdict (`elites.json`).
+        if self.config.guardrail_matches == 0 {
+            tracing::info!(
+                "guardrail: skipped — guardrail_matches = 0 (no holdout exam configured; nothing recorded)"
+            );
+            return None;
+        }
         // The champion set is written by the stop-time writers; recompute it when empty
         // so the guardrail never depends on whether a writer happened to run.
         if self.champions.is_empty() {
@@ -1473,30 +1484,27 @@ impl CoreEngine {
         // so a reader can see how much of the rank came from steadiness.
         let race_smoothed = race.map(|r| r.mean);
         let race_score = self.smoothed_fitness_of(&champion);
-        let mut verdict = match self.networks.get_mut(&champion) {
-            Some(net) => {
-                // `eval()` first: the resting state a fresh disk rebuild gets for free, and the
-                // state the holdout MUST be measured in (dropout would sample a random policy).
-                flodl::Module::eval(net);
-                crate::engine::guardrail::score_net(
-                    net,
-                    &champion,
-                    race_smoothed,
-                    matches,
-                    &mut self.trainer,
-                    |t, net, game_i| t.holdout_score(net, game_i),
-                )
-            }
-            None => crate::engine::guardrail::score_with(
-                &self.run_dir,
-                &champion,
-                race_smoothed,
-                matches,
-                device,
-                &mut self.trainer,
-                |t, net, game_i| t.holdout_score(net, game_i),
-            ),
-        }?;
+        let Some(net) = self.networks.get_mut(&champion) else {
+            // The champion is not in memory (already gone from the population): there
+            // is nothing honest to score, so the exam is skipped rather than run on a
+            // net rebuilt from disk — a fresh-init net measures like noise.
+            tracing::warn!(
+                "guardrail: champion {} is not one of the live nets — exam skipped",
+                &champion[..8.min(champion.len())]
+            );
+            return None;
+        };
+        // `eval()` first: the resting state a reloaded net would get for free, and the
+        // state the holdout MUST be measured in (dropout would sample a random policy).
+        flodl::Module::eval(net);
+        let mut verdict = crate::engine::guardrail::score_net(
+            net,
+            &champion,
+            race_smoothed,
+            matches,
+            &mut self.trainer,
+            |t, net, game_i| t.holdout_score(net, game_i),
+        )?;
         // Carry the race side's noise onto the verdict, so the example's print
         // and this module's own line quote the same error bar.
         verdict.race_se = race.and_then(|r| r.se());
@@ -2558,6 +2566,61 @@ mod tests {
             vec![hashes[1].clone()],
             "the cull victim must be the volatile net"
         );
+    }
+
+        /// The OFF path in the direction that makes the penalty ADDITIVE: with λ = 0 a
+        /// Minimize run must ignore spread completely (score == window mean, and the net
+        /// with the better mean wins even when it is the volatile one) — finite, no NaN,
+        /// no inversion. The `+ λσ` arm only bites for λ > 0.
+    #[test]
+    fn minimize_with_lambda_zero_ignores_spread_entirely() {
+        let dir = std::env::temp_dir().join("gras-fit-minimize-off");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 13).unwrap();
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        let mut hashes = eng.state.live_hashes();
+        hashes.sort();
+        // Minimize (the test fitness): lower is better. `hashes[0]` has the BETTER mean
+        // (0.40) but is volatile; `hashes[1]` is perfectly steady at a worse 0.60.
+        for (h, values) in [
+            (&hashes[0], [0.20_f32, 0.60, 0.20, 0.60]),
+            (&hashes[1], [0.60_f32, 0.60, 0.60, 0.60]),
+        ] {
+            let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+            for v in values {
+                buf.push(v);
+            }
+            *eng.rolling_fitness.get_mut(h).unwrap() = buf;
+        }
+        // λ = 0 — also what a clamped negative λ becomes at the builder (pinned by
+        // `config::tests::risk_aversion_defaults_on_and_clamps_at_off`).
+        eng.config.risk_aversion = 0.0;
+        let ranked = eng.ranked_live();
+        for (h, score) in &ranked {
+            let reading = eng.race_reading_of(h).unwrap();
+            assert!(score.is_finite(), "λ=0 must never produce a NaN score: {h}");
+            assert_eq!(*score, reading.mean, "λ=0 must score exactly the mean");
+        }
+        assert_eq!(
+            ranked[0].0, hashes[0],
+            "with the risk term off the better MEAN wins — steadiness earns nothing"
+        );
+        assert!((ranked[0].1 - 0.40).abs() < 1e-6, "mean was {}", ranked[0].1);
+        assert!((ranked[1].1 - 0.60).abs() < 1e-6, "mean was {}", ranked[1].1);
+        // Switched on, the same direction charges the spread ON TOP of the mean: the
+        // steady net's 0.60 beats the volatile net's 0.40 + 0.20σ = 0.60 in a Minimize
+        // sort, and both readings are untouched.
+        eng.config.risk_aversion = 1.0;
+        let ranked = eng.ranked_live();
+        assert!((ranked[1].1 - 0.60).abs() < 1e-6, "volatile score was {}", ranked[1].1);
+        assert!((ranked[0].1 - 0.60).abs() < 1e-6, "steady score was {}", ranked[0].1);
+        assert_eq!(
+            eng.race_reading_of(&hashes[0]).unwrap().mean,
+            0.40,
+            "the readable mean is not perturbed by λ"
+        );
+        assert_eq!(ranked.len(), 2, "a score tie drops nobody");
     }
 
     /// The tombstone a cull writes records all three legs of the reading the net died
@@ -5068,7 +5131,7 @@ mod tests {
         );
 
         let verdict = eng
-            .guardrail(flodl::Device::CPU)
+            .guardrail()
             .expect("the live champion must be scoreable in memory");
         assert_eq!(verdict.scores.len(), 3);
         let record = crate::state::load_engine_json(&dir)
@@ -5272,6 +5335,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+        /// `guardrail_matches = 0` is the OFF switch: the exam returns `None` and records
+        /// nothing. The engine's test trainer has NO holdout scorer (its default panics if
+        /// called), so a clean `None` here is proof the skip happens BEFORE any game —
+        /// a clamped-to-1 implementation would panic.
+    #[test]
+    fn zero_guardrail_matches_skips_the_exam_entirely() {
+        let dir = std::env::temp_dir().join("gras-guardrail-off");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        eng.config.guardrail_matches = 0;
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        seed_raw_fitness(&mut eng, 0.5);
+        assert!(
+            eng.guardrail().is_none(),
+            "0 matches must skip the exam, not run one game"
+        );
+        // Nothing recorded: a later reader sees "not scored", never a fake verdict.
+        assert!(
+            eng.header.guardrail.is_none(),
+            "a skipped exam must not stamp a verdict into engine.json"
+        );
+        // And the OFF path does not even need a champion: an empty field is fine.
+        let empty_dir = std::env::temp_dir().join("gras-guardrail-off-empty");
+        let _ = std::fs::remove_dir_all(&empty_dir);
+        let mut empty = engine(&empty_dir, 8).unwrap();
+        empty.config.guardrail_matches = 0;
+        assert!(empty.guardrail().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty_dir);
+    }
+
     // ── Checkpoint elite weight snapshot ────────────────────────────────
 
     #[test]
@@ -5316,6 +5411,48 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+        /// `checkpoint_every = 0` is the OFF switch for the durability tick: no
+        /// `checkpoint-elite-*` snapshots, no per-tick CSV flush — but the run is still a
+        /// COMPLETE run (stop-time artifacts and frontier states land).
+    #[test]
+    fn zero_checkpoint_every_skips_the_tick_but_still_finishes_the_run() {
+        let dir = std::env::temp_dir().join("gras-ckpt-off");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        eng.config.checkpoint_every = 0;
+        eng.config.max_steps = Some(4);
+        eng.config.elite_checkpoint_weights = true; // would snapshot on any tick
+        // Both OFF switches at once, through a REAL completed run: the exam skip must
+        // also survive the run path (not just a hand-built engine).
+        eng.config.guardrail_matches = 0;
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        assert_eq!(eng.run().unwrap(), StopReason::MaxSteps);
+        assert!(
+            eng.guardrail().is_none(),
+            "guardrail_matches = 0 must skip after a real run too"
+        );
+        let snaps: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("checkpoint-elite-"))
+            .collect();
+        assert!(
+            snaps.is_empty(),
+            "0 cadence must write no durability snapshots, got {snaps:?}"
+        );
+        // …and the stop-time writers still ran: the run is complete, not truncated.
+        assert!(dir.join("elites.json").exists(), "elite index is a stop artifact");
+        assert!(dir.join("engine.json").exists());
+        let nets = std::fs::read_dir(dir.join("nets"))
+            .unwrap()
+            .flatten()
+            .count();
+        assert!(nets > 0, "frontier states land at stop even with the tick off");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Mutation probation ─────────────────────────────────────────────

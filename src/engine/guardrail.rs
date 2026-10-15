@@ -1,23 +1,14 @@
 //! Post-race guardrail — the honest holdout re-check of the exported
 //! champion. Users call it through the ENGINE method
-//! [`crate::CoreEngine::guardrail`] (which fills in run_dir/champion/race
-//! smoothed automatically) or via [`check_champion`] directly for saved-run
-//! scoring (`--score-only` style, no engine).
-//!
-//! Two ways to get the net to score, same aggregation:
-//! - [`score_net`] — a net the caller ALREADY holds (the engine's live
-//!   champion, still in memory at stop time). No files involved, so a run can
-//!   leave `elite_save_safetensors` off and still certify a champion.
-//! - [`score_with`] / [`check_champion`] — rebuild it from
-//!   `nets/<hash>.json` + load the TRAINED weights from
-//!   `elite-<hash>.safetensors` (or the `checkpoint-elite-*` fallback). This is
-//!   the path for saved runs with no live engine (`--score-only`).
+//! [`crate::CoreEngine::guardrail`], which fills in run_dir/champion/race
+//! smoothed automatically and scores the champion's LIVE net (still in memory
+//! at stop time). No weight file is involved, so a run can leave
+//! `elite_save_safetensors` off and still certify a champion.
 //!
 //! Ownership split:
-//! - **Module** (here): which net is the champion (`champion_hashes`), getting
-//!   its trained state (live or reloaded), and aggregating per-game scores into
-//!   a [`GuardrailVerdict`].
-//! - **User** ([`ChampionScorer`]): play ONE fresh game with the given net —
+//! - **Module** (here): play `matches` fresh games on that net ([`score_net`])
+//!   and aggregate the per-game scores into a [`GuardrailVerdict`].
+//! - **Trainer** (`holdout_score`): play ONE fresh game with the given net —
 //!   only the trainer's domain code knows the environment.
 //!
 //! Contract (the one honesty rule): `holdout_score` must return values in
@@ -28,22 +19,6 @@
 use crate::engine::fitness::Direction;
 use crate::graph::network::Network;
 
-/// The user-owned half of the guardrail: score ONE fresh holdout game. The engine
-/// has loaded the champion's TRAINED weights; play one game, measure only.
-pub trait ChampionScorer: Send {
-        /// Score one holdout game. `game_i` is the deterministic game index — seed
-        /// your env from it so the batch is reproducible and disjoint from race games.
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32>;
-}
-
-/// The engine's own trainer is a scorer: implementing `holdout_score` on the trainer
-/// type IS the guardrail capability, so `engine.guardrail(device)` needs no second object.
-impl ChampionScorer for crate::trainer::AnyTrainer {
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
-        crate::trainer::AnyTrainer::holdout_score(self, net, game_i)
-    }
-}
-
 /// The guardrail's verdict: per-game scores plus the two readings users compare.
 /// `scores` is empty only when scoring failed entirely.
 #[derive(Clone, Debug)]
@@ -53,14 +28,14 @@ pub struct GuardrailVerdict {
     /// The champion's final smoothed fitness as the race recorded it
     /// (None if no verdict was ever recorded).
     pub race_smoothed: Option<f32>,
-        /// Standard error of `race_smoothed` (`window std / √n`); `None` on the
-        /// saved-run path (a reloaded net has no window), falling back to the flat rule.
+        /// Standard error of `race_smoothed` (`window std / √n`); `None` until the
+        /// engine fills it in, falling back to the flat rule.
     pub race_se: Option<f32>,
         /// Step readings behind `race_smoothed` (`0` = unknown); a one-reading window
         /// is unobservable spread, NOT precision.
     pub race_samples: usize,
     /// The champion's most recent step reading — the smoothed mean LAGS it by up
-    /// to the window length. `None` on the saved-run path (no live buffer).
+    /// to the window length. `None` when the engine has no live buffer for the net.
     pub race_latest: Option<f32>,
     /// One score per successfully played game, in report units.
     pub scores: Vec<f32>,
@@ -83,18 +58,6 @@ impl GuardrailVerdict {
         (n > 0.0).then(|| std / n.sqrt())
     }
 
-        /// `(min, p25, median, p75, max)` of the per-game scores, nearest-rank — the
-        /// SHAPE is the diagnosis (luck on some starts vs a tight, learned batch).
-    pub fn percentiles(&self) -> Option<(f32, f32, f32, f32, f32)> {
-        if self.scores.is_empty() {
-            return None;
-        }
-        let mut s = self.scores.clone();
-        s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let at = |q: f32| s[((q * (s.len() as f32 - 1.0)).round() as usize).min(s.len() - 1)];
-        Some((s[0], at(0.25), at(0.5), at(0.75), s[s.len() - 1]))
-    }
-
     /// Population std of the per-game scores (a wide ± hides a mix of
     /// solved and fluke games).
     pub fn std(&self) -> Option<f32> {
@@ -113,59 +76,6 @@ impl GuardrailVerdict {
             / self.scores.len() as f32;
         Some(var.sqrt())
     }
-}
-
-/// Rebuild the champion from its saved state and load its TRAINED weights (stop-time
-/// `elite-*.safetensors`, else `checkpoint-elite-*`); refuses rather than scoring a newborn.
-pub fn reload_champion(
-    run_dir: &std::path::Path,
-    hash: &str,
-    device: flodl::Device,
-) -> Option<Network> {
-    let state_raw =
-        std::fs::read_to_string(run_dir.join("nets").join(format!("{hash}.json"))).ok()?;
-    let topo_json = serde_json::from_str::<serde_json::Value>(&state_raw)
-        .ok()?
-        .get("topology")
-        .and_then(|t| t.as_str())
-        .map(String::from)?;
-    let topo = crate::graph::topology::Topology::from_json(&topo_json).ok()?;
-    let mut net = Network::build(&topo, device).ok()?;
-    let short = &hash[..8.min(hash.len())];
-    let elite = run_dir.join(format!("elite-{short}.safetensors"));
-    let weights = if elite.exists() {
-        elite
-    } else {
-        run_dir.join(format!("checkpoint-elite-{short}.safetensors"))
-    };
-    if !weights.exists() {
-        tracing::warn!(
-            "guardrail: no trained weights for {short} (looked for elite-*.safetensors and checkpoint-elite-*.safetensors) — refusing to score a fresh-init net"
-        );
-        return None;
-    }
-    if let Err(e) = crate::utils::safetensors::load_safetensors(&mut net, &weights) {
-        tracing::warn!(
-            "guardrail: loading {} failed ({e}) — refusing to score a partially-loaded net",
-            weights.display()
-        );
-        return None;
-    }
-    Some(net)
-}
-
-/// Unit-free agreement between the race reading and the holdout mean: how far the
-/// holdout landed below the claim, relative to the claim's magnitude.
-pub fn agreement_verdict(
-    race_smoothed: Option<f32>,
-    holdout_mean: Option<f32>,
-    direction: Direction,
-) -> String {
-            // No noise information: the flat relative rule, the fallback for call sites
-            // that cannot supply sampling error.
-    agreement_verdict_noisy(
-        race_smoothed, None, None, None, holdout_mean, None, 0, direction,
-    )
 }
 
 /// [`agreement_verdict`] WITH the sampling error of both readings. The race reading
@@ -234,8 +144,8 @@ pub fn agreement_verdict_noisy(
             rel * 100.0
         );
     }
-    // Flat fallback: no usable error bar (saved-run scoring, a one-reading
-    // window, or no live buffer).
+    // Flat fallback: no usable error bar (a one-reading window, no live buffer,
+    // or no games scored).
     if rel <= 0.0 {
         "consistent with the race signal ✅".to_string()
     } else if rel <= 0.10 {
@@ -245,69 +155,6 @@ pub fn agreement_verdict_noisy(
             "weak — the holdout disagrees with the race signal ❌ ({:.0}% below)",
             rel * 100.0
         )
-    }
-}
-
-/// Score a SAVED champion without an engine (the `--score-only` path): reload from
-/// `run_dir`, play `matches` fresh games, aggregate, stamp into `engine.json`.
-pub fn score_saved(
-    run_dir: &std::path::Path,
-    champion_hash: &str,
-    scorer: &mut dyn ChampionScorer,
-    matches: usize,
-    device: flodl::Device,
-) -> Option<GuardrailVerdict> {
-    let verdict = check_champion(run_dir, champion_hash, None, scorer, matches, device)?;
-    record_guardrail(run_dir, champion_hash, &verdict);
-    Some(verdict)
-}
-
-/// Stamp a scored saved-run champion into the run's `engine.json`. Best-effort: an
-/// unreadable header still hands back the verdict — recording failure is a warning.
-fn record_guardrail(run_dir: &std::path::Path, champion_hash: &str, verdict: &GuardrailVerdict) {
-    let header = crate::state::load_engine_json(run_dir).ok();
-    let direction = header
-        .as_ref()
-        .map(|h| h.fitness_direction)
-        .unwrap_or(Direction::Maximize);
-    // The race reference, when the run already recorded one. This path has no live
-    // rolling window (the population is gone), so the race side is CARRIED from the
-    // existing record rather than recomputed — `race_std`/`race_score` included, or
-    // a rescore would silently drop how the champion was ranked.
-    let race = header.as_ref().and_then(|h| h.guardrail.as_ref());
-    let race_smoothed = race.and_then(|g| g.race_smoothed);
-    let race_std = race.and_then(|g| g.race_std);
-    let race_score = race.and_then(|g| g.race_score);
-    let params = crate::state::load_net_state(run_dir, champion_hash)
-        .ok()
-        .and_then(|s| s.meta.params);
-    let record = crate::state::GuardrailRecord {
-        champion_hash: champion_hash.to_string(),
-        champion_params: params,
-        race_smoothed,
-        race_std,
-        race_score,
-        // The live engine fills these in; a reloaded saved run has no window,
-        // so they stay `None`/0 and the verdict falls back to the flat rule.
-        race_se: verdict.race_se,
-        race_samples: verdict.race_samples,
-        race_latest: verdict.race_latest,
-        holdout_mean: verdict.mean(),
-        holdout_std: verdict.std(),
-        matches_scored: verdict.scores.len(),
-        verdict: agreement_verdict_noisy(
-            race_smoothed,
-            verdict.race_se,
-            Some(verdict.race_samples).filter(|n| *n > 0),
-            verdict.race_latest,
-            verdict.mean(),
-            verdict.se(),
-            verdict.scores.len(),
-            direction,
-        ),
-    };
-    if let Err(e) = crate::state::write_guardrail_record(run_dir, &record) {
-        tracing::warn!("engine.json guardrail record failed: {e}");
     }
 }
 
@@ -331,16 +178,8 @@ where
             Err(e) => tracing::warn!("guardrail: holdout game {game_i} failed ({e}) — skipped"),
         }
     }
-    verdict_from(champion_hash, race_smoothed, scores)
-}
-
-/// Assemble a verdict from collected scores — `None` when there were none (a
-/// failed run must read as "not scored", never as a fake 0).
-fn verdict_from(
-    champion_hash: &str,
-    race_smoothed: Option<f32>,
-    scores: Vec<f32>,
-) -> Option<GuardrailVerdict> {
+    // No games scored = no verdict (a failed run must read as "not scored",
+    // never as a fake 0).
     if scores.is_empty() {
         return None;
     }
@@ -354,52 +193,6 @@ fn verdict_from(
         race_latest: None,
         scores,
     })
-}
-
-/// The engine's DISK seam: reload + play + aggregate, where the scorer IS the run's
-/// own trainer (via `AnyTrainer` dispatch). For embedders with no live engine.
-pub fn score_with<T, F>(
-    run_dir: &std::path::Path,
-    champion_hash: &str,
-    race_smoothed: Option<f32>,
-    matches: usize,
-    device: flodl::Device,
-    trainer: &mut T,
-    score: F,
-) -> Option<GuardrailVerdict>
-where
-    F: Fn(&mut T, &mut Network, usize) -> flodl::tensor::Result<f32>,
-{
-    let mut net = reload_champion(run_dir, champion_hash, device)?;
-    score_net(
-        &mut net,
-        champion_hash,
-        race_smoothed,
-        matches,
-        trainer,
-        score,
-    )
-}
-
-/// Run the guardrail: reload the champion's TRAINED weights, play `matches` fresh games
-/// through the user's [`ChampionScorer`], aggregate. `None` if reload or all games fail.
-pub fn check_champion(
-    run_dir: &std::path::Path,
-    champion_hash: &str,
-    race_smoothed: Option<f32>,
-    scorer: &mut dyn ChampionScorer,
-    matches: usize,
-    device: flodl::Device,
-) -> Option<GuardrailVerdict> {
-    let mut net = reload_champion(run_dir, champion_hash, device)?;
-    let mut scores = Vec::with_capacity(matches);
-    for game_i in 0..matches {
-        match scorer.holdout_score(&mut net, game_i) {
-            Ok(s) => scores.push(s),
-            Err(e) => tracing::warn!("guardrail: holdout game {game_i} failed ({e}) — skipped"),
-        }
-    }
-    verdict_from(champion_hash, race_smoothed, scores)
 }
 
 #[cfg(test)]
@@ -433,26 +226,33 @@ mod tests {
         assert!(empty.mean().is_none() && empty.std().is_none());
     }
 
-        /// The generic verdict is direction-aware and unit-free: a holdout at or above
-        /// the race reading is consistent; a large relative shortfall is weak (both directions).
+        /// The flat rule (no usable race error bar) is direction-aware and unit-free: a
+        /// holdout at or above the race reading is consistent; a large relative shortfall is weak.
     #[test]
     fn agreement_verdict_is_direction_aware() {
         use Direction::{Maximize, Minimize};
         // Maximize: race 500, holdout 495 → consistent-ish (≤10%).
-        let v = agreement_verdict(Some(500.0), Some(495.0), Maximize);
+        let v = flat(Some(500.0), Some(495.0), Maximize);
         assert!(v.contains("≤10%"), "{v}");
-        let v = agreement_verdict(Some(500.0), Some(100.0), Maximize);
+        let v = flat(Some(500.0), Some(100.0), Maximize);
         assert!(v.contains("weak"), "{v}");
         // Above the race reading is never a shortfall.
-        let v = agreement_verdict(Some(0.5), Some(0.9), Maximize);
+        let v = flat(Some(0.5), Some(0.9), Maximize);
         assert!(v.contains("consistent"), "{v}");
         // Minimize: a HOLDout worse (higher) than the race loss is the bad case.
-        let v = agreement_verdict(Some(0.1), Some(0.5), Minimize);
+        let v = flat(Some(0.1), Some(0.5), Minimize);
         assert!(v.contains("weak"), "{v}");
-        let v = agreement_verdict(Some(0.1), Some(0.05), Minimize);
+        let v = flat(Some(0.1), Some(0.05), Minimize);
         assert!(v.contains("consistent"), "{v}");
         // No reference → honest "unscored", never a fake pass.
-        assert!(agreement_verdict(None, Some(1.0), Maximize).contains("unscored"));
+        assert!(flat(None, Some(1.0), Maximize).contains("unscored"));
+    }
+
+        /// The flat-rule branch, reached through the one verdict fn: no race SE, no
+        /// window, no games — exactly what the live engine passes when it cannot measure
+        /// the race side's spread.
+    fn flat(race: Option<f32>, hold: Option<f32>, dir: Direction) -> String {
+        agreement_verdict_noisy(race, None, None, None, hold, None, 0, dir)
     }
 
         /// The noisy verdict on numbers a REAL cartpole run produced
@@ -562,10 +362,10 @@ mod tests {
     }
 
         /// The noisy branch must only fire when the race error bar is USABLE: no spread
-        /// (single reading) or no exam games degrades to the flat rule.
+        /// (single reading) or no exam games degrades to the flat rule (the `flat` helper).
     #[test]
     fn noisy_verdict_degrades_to_the_flat_rule() {
-        let flat = agreement_verdict(Some(500.0), Some(100.0), Direction::Maximize);
+        let expected = flat(Some(500.0), Some(100.0), Direction::Maximize);
         for se in [None, Some(0.0)] {
             let v = agreement_verdict_noisy(
                 Some(500.0),
@@ -577,7 +377,7 @@ mod tests {
                 100,
                 Direction::Maximize,
             );
-            assert_eq!(v, flat, "SE {se:?} must fall back to the flat rule");
+            assert_eq!(v, expected, "SE {se:?} must fall back to the flat rule");
         }
         // Same when the exam produced no game at all.
         let v = agreement_verdict_noisy(
@@ -590,7 +390,7 @@ mod tests {
             0,
             Direction::Maximize,
         );
-        assert_eq!(v, flat);
+        assert_eq!(v, expected);
     }
 
         /// Scoring a net the caller holds needs no run dir or weight file — the engine's
@@ -658,20 +458,4 @@ mod tests {
         assert!(failed.is_none(), "an all-failed batch is not a verdict");
     }
 
-        /// The reload path must refuse when no weights exist — a fresh-init net measures
-        /// like noise and the verdict would be about a stranger.
-    #[test]
-    fn reload_refuses_without_weights() {
-        let dir = std::env::temp_dir().join("gras-guardrail-no-weights");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("nets")).unwrap();
-        std::fs::write(
-            dir.join("nets/deadbeefdeadbeef.json"),
-            r#"{"topology":"{}"}"#,
-        )
-        .unwrap();
-        // Topology is unparseable here — either way the reload must refuse.
-        assert!(reload_champion(&dir, "deadbeefdeadbeef", flodl::Device::CPU).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

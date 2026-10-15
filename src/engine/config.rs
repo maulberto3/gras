@@ -30,7 +30,8 @@ pub const SMOOTHING_WINDOW: usize = 10;
 pub const RISK_AVERSION: f32 = 1.0;
 
 /// Steps between population checkpoints — the cadence the stream's era rotation
-/// and the CSV flush key off.
+/// and the CSV flush key off. `0` is a legal value meaning "no tick" (see
+/// [`RaceConfigBuilder::set_run_checkpoint_every`]); this is the default when unset.
 pub const DEFAULT_CHECKPOINT_EVERY: usize = 10;
 
 /// Learning rate default for the Adam optimizers.
@@ -174,7 +175,9 @@ pub struct RaceConfig {
     /// Number of live nets in the population.
     pub pop_size: usize,
         /// Steps between population checkpoints (the stream's era rotation and the
-        /// CSV flush cadence key off this).
+        /// CSV flush cadence key off this). **`0` = no durability tick**, and no era
+        /// rotation either (one eternal era) — see
+        /// [`RaceConfigBuilder::set_run_checkpoint_every`].
     pub checkpoint_every: usize,
         /// Independent crossover rolls per step; each fires with `crossover_prob`. A
         /// not-fired or failed roll is SPENT (no random fallback).
@@ -297,7 +300,8 @@ pub struct RaceConfig {
         /// `elite_crown_lifetime_steps` clocks. Default `5`; zero = permanent until rank moves.
     pub elite_crown_lifetime_steps: usize,
         /// Fresh holdout games the post-race guardrail plays. Diagnostic only — never touches
-        /// a step's dynamics. Default [`DEFAULT_GUARDRAIL_MATCHES`].
+        /// a step's dynamics. **`0` = skip the exam** (no games, no verdict recorded).
+        /// Default [`DEFAULT_GUARDRAIL_MATCHES`].
     pub guardrail_matches: usize,
 }
 
@@ -590,9 +594,14 @@ impl RaceConfigBuilder {
         self.cfg.pop_size = n;
         self
     }
-    /// Set steps between checkpoints.
+        /// Set steps between checkpoints — the durability tick (frontier snapshot + `elite_
+        /// checkpoint_weights` snapshot + CSV flush) and the stream's eval-permutation era.
+        /// **`0` = OFF**: no tick and no era rotation (one eternal era), for profiling or a
+        /// smoke run that wants no `nets/` churn from checkpoints. The STOP-time writers are
+        /// unaffected — `elites.json`, the elite/worst artifacts and the final CSV flush still
+        /// land, so a 0-cadence run is still a complete run.
     pub fn set_run_checkpoint_every(mut self, n: usize) -> Self {
-        self.cfg.checkpoint_every = n.max(1);
+        self.cfg.checkpoint_every = n;
         self
     }
     /// Set crossover rolls per step.
@@ -911,8 +920,12 @@ impl RaceConfigBuilder {
     }
         /// Fresh holdout games the post-race guardrail plays ([`DEFAULT_GUARDRAIL_MATCHES`] = 16).
         /// Diagnostic only. (Challenges moved to the TRAINER side — roll `trainer::challenge_fires`.)
+        /// **`0` = skip the exam entirely**: no holdout game is played, no verdict is recorded,
+        /// and `engine.guardrail(..)` returns `None`. Nothing else changes — the run still ranks,
+        /// stops and writes its artifacts, and the next run still inherits via `elites.json`
+        /// (which never depended on the verdict).
     pub fn set_elite_guardrail_matches(mut self, n: usize) -> Self {
-        self.cfg.guardrail_matches = n.max(1);
+        self.cfg.guardrail_matches = n;
         self
     }
     /// At stop, save the elite's topology markdown (`elite-<hash>.md`).
@@ -1059,7 +1072,7 @@ impl RaceConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogLevel, RaceConfig, run_progress};
+    use super::{LogLevel, RISK_AVERSION, RaceConfig, run_progress};
 
         /// One progress convention for the whole crate: linear to 1.0 at the budget, clamped,
         /// and flat when unbounded.
@@ -1091,6 +1104,33 @@ mod tests {
         assert_eq!(LogLevel::Summ.env_filter(), "info");
         assert_eq!(LogLevel::Minimal.env_filter(), "warn");
         assert_eq!(LogLevel::None.env_filter(), "warn");
+    }
+
+        /// FIT's one knob: the default is the risk-adjusted ranking, `0.0` is the
+        /// documented OFF switch (the pre-FIT plain mean), negatives clamp to `0.0`
+        /// (no risk-SEEKING ranking exists) and a non-finite λ falls back to the
+        /// default rather than poisoning every comparison with NaN.
+    #[test]
+    fn risk_aversion_defaults_on_and_clamps_at_off() {
+        // Default: the risk term is ON.
+        assert_eq!(RaceConfig::defaults().risk_aversion, RISK_AVERSION);
+        assert!(RISK_AVERSION > 0.0, "the feature ships enabled");
+        let set = |lambda: f32| {
+            RaceConfig::builder()
+                .set_run_risk_aversion(lambda)
+                .build()
+                .risk_aversion
+        };
+        // Off is expressible, and it is exactly the plain mean (λ = 0).
+        assert_eq!(set(0.0), 0.0);
+        // A stronger preference passes through unchanged.
+        assert_eq!(set(2.5), 2.5);
+        // Negative = risk-seeking: not offered, clamped to off.
+        assert_eq!(set(-3.0), 0.0);
+        // NaN / ∞ would make every score NaN (or worse, "best" undefined).
+        assert_eq!(set(f32::NAN), RISK_AVERSION);
+        assert_eq!(set(f32::INFINITY), RISK_AVERSION);
+        assert_eq!(set(f32::NEG_INFINITY), RISK_AVERSION);
     }
 
         /// The stop field setters are mutually exclusive BY CONSTRUCTION: each write clears its
