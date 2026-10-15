@@ -108,30 +108,6 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
             run_dir,
         })
     }
-        /// Build a spec with the trainer auto-boxed: accepts any
-        /// `U: TabularStep + 'static` instead of `trainer: Box::new(...)`.
-    pub fn with_trainer<U: TabularStep + 'static>(
-        self,
-        trainer: U,
-    ) -> RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
-        match self {
-            RunSpec::Tabular(s) => RunSpec::Tabular(TabularSpec {
-                data_dir: s.data_dir,
-                config: s.config,
-                fitness: s.fitness,
-                trainer: Box::new(trainer),
-                seed: s.seed,
-                run_dir: s.run_dir,
-            }),
-            RunSpec::RL(s) => RunSpec::RL(RLSpec {
-                config: s.config,
-                fitness: s.fitness,
-                trainer: s.trainer,
-                seed: s.seed,
-                run_dir: s.run_dir,
-            }),
-        }
-    }
 }
 
 // Deliberately no engine-side "default trainer": a run without a trainer is a type

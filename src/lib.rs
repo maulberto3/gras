@@ -34,9 +34,9 @@ pub use utils::tabular_data;
 
 // ── engine — the step-race loop ──────────────────────────────────────
 pub use engine::{
-    ChampionScorer, Direction, Fitness, FitnessLabel, GuardrailVerdict, RLSpec, RaceConfig,
+    Direction, Fitness, FitnessLabel, GuardrailVerdict, RLSpec, RaceConfig,
     RaceSnapshot, RlConfig, RlEngine, RlRaceConfig, RunMode, RunSpec, StopReason, TabularConfig,
-    TabularEngine, TabularRaceConfig, TabularSpec, check_champion, rl_race_config_builder,
+    TabularEngine, TabularRaceConfig, TabularSpec, rl_race_config_builder,
     tabular_race_config_builder,
 };
 
@@ -61,8 +61,8 @@ pub use trainer::{
 
 // ── data ─────────────────────────────────────────────────────────────
 pub use utils::tabular_data::{
-    DataFormat, Dataset, load_csv_dataset, load_dataset, load_dataset_auto, load_tensor, make_sine,
-    make_xor, one_hot, resolve_dataset, resolve_inputs_targets_datasets,
+    DataFormat, Dataset, load_csv_dataset, load_dataset, load_dataset_auto, load_tensor, one_hot,
+    resolve_dataset, resolve_inputs_targets_datasets,
     resolve_train_test_datasets, save_csv_dataset, save_dataset, save_dataset_as, save_tensor,
 };
 
@@ -105,7 +105,7 @@ pub mod prelude {
         TabularConfig, TabularRaceConfig, rl_race_config_builder, tabular_race_config_builder,
     };
     pub use crate::engine::fitness::Metric;
-    pub use crate::engine::guardrail::{ChampionScorer, GuardrailVerdict, check_champion};
+    pub use crate::engine::guardrail::GuardrailVerdict;
     pub use crate::engine::{
         Direction, Fitness, FitnessLabel, RLSpec, RlEngine, RunSpec, TabularEngine, TabularSpec,
     };

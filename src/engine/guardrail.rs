@@ -78,8 +78,10 @@ impl GuardrailVerdict {
     }
 }
 
-/// [`agreement_verdict`] WITH the sampling error of both readings. The race reading
+/// The verdict sentence WITH the sampling error of both readings. The race reading
 /// is a noisy ARGMAX (winner's curse), so the gap is judged against the combined band.
+/// Without a usable error bar (`race_se` unset or zero, no games scored) it degrades
+/// to the flat relative rule.
 pub fn agreement_verdict_noisy(
     race_smoothed: Option<f32>,
     race_se: Option<f32>,

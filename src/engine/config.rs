@@ -326,14 +326,6 @@ pub enum ModeConfig {
 }
 
 impl ModeConfig {
-    /// The recorded `RunMode` this arm stands for (wire-format vocabulary).
-    pub fn run_mode(&self) -> RunMode {
-        match self {
-            ModeConfig::Tabular(_) => RunMode::Tabular,
-            ModeConfig::Rl(_) => RunMode::Rl,
-        }
-    }
-
     /// The RL arm, when this IS the RL arm.
     pub fn rl(&self) -> Option<&RlConfig> {
         match self {
@@ -789,6 +781,7 @@ impl RaceConfigBuilder {
         self
     }
     // ── individual topology fields (direct, no need to build a full TopologyOptions)
+    /// Set the min hidden nodes per individual.
     pub fn set_topology_min_hidden_num_nodes(mut self, n: usize) -> Self {
         self.cfg.topology_options.min_hidden_num_nodes = n;
         self

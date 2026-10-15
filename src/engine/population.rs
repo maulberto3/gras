@@ -175,18 +175,6 @@ pub fn fill_unique(
     out
 }
 
-/// Same shape as [`initial_population`], seeded from the header's recorded split
-/// ratio so a resumed run's entrants see the same pools.
-pub fn initial_population_from_header(
-    config: &RaceConfig,
-    run_seed: u64,
-    _train_eval_split_ratio: f32,
-) -> Vec<Topology> {
-    // The initial population topology draw does not depend on the split ratio
-    // (that only affects the data stream), so delegate to the shared builder.
-    initial_population(config, run_seed)
-}
-
 // ── Run topology (founding batch) loading ──────────────────────────────
 
 /// Load a run topology from a saved artifact (a topology JSON, or a

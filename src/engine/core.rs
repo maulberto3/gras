@@ -699,17 +699,6 @@ impl CoreEngine {
         self.state.live_count()
     }
 
-    /// Cumulative culls so far (tombstones written + slots freed).
-    pub fn cull_count(&self) -> usize {
-        self.culls
-    }
-
-    /// Cumulative successful insertions (crossover survivors + immigrants). Counts
-    /// only nets that actually joined, unlike `children_born_at_clock`.
-    pub fn insert_count(&self) -> usize {
-        self.culls
-    }
-
     /// Expose the underlying population state.
     pub fn state(&self) -> &RaceState {
         &self.state
