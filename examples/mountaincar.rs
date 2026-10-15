@@ -476,7 +476,7 @@ impl RlStep for MountainCarTrainer {
     /// exactly the sequential episode). Same units as the reported fitness
     /// (shaped solve score) — ranking and holdout agree by construction.
     /// The engine calls this through the run's own trainer, so
-    /// `engine.guardrail(device)` is the whole call.
+    /// `engine.guardrail()` is the whole call.
     fn holdout_score(
         &mut self,
         net: &mut Network,
@@ -768,7 +768,7 @@ fn main() {
     // STEP D — guardrail: HOLDOUT_MATCHES fresh matches (HOLDOUT_SEED, seen
     // by no step). A 0.0 holdout with a high race fitness = the champion
     // never actually learned to solve, only to rank.
-    match engine.guardrail(device) {
+    match engine.guardrail() {
         Some(v) => {
             let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
             let smoothed_note = v

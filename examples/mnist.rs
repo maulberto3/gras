@@ -437,7 +437,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => eprintln!("Race encountered an error: {e}"),
     }
 
-    match engine.guardrail(gras::auto_device()) {
+    match engine.guardrail() {
         Some(v) => {
             let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
             let smoothed = v

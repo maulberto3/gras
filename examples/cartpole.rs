@@ -458,12 +458,12 @@ const GUARDRAIL_MATCHES: usize = 100;
 
 /// Score the champion on fresh unseen games and print the domain gloss.
 ///
-/// The engine's `guardrail(device)` already scores through this run's trainer
+/// The engine's `guardrail()` already scores through this run's trainer
 /// (`RlStep::holdout_score`) and logs the detailed verdict; this wrapper adds the
 /// cartpole-specific reading (turns survived vs the random baseline) so `main`
 /// ends with one clean call.
-fn report_guardrail(engine: &mut RlEngine, device: Device, baseline: f64) {
-    let Some(v) = engine.guardrail(device) else {
+fn report_guardrail(engine: &mut RlEngine, baseline: f64) {
+    let Some(v) = engine.guardrail() else {
         println!("guardrail: no champion to score — skipped");
         return;
     };
@@ -565,7 +565,6 @@ fn main() {
 
     let config = rl_race_config_builder()
         .set_run_name("cartpole")
-        .set_run_csv_export(true)
         .set_run_log_level(log_level)
         // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
         .set_run_pop_size(pop)
@@ -574,7 +573,7 @@ fn main() {
         // surviving ~300 turns every step outranks one with the same mean that
         // alternates 40 and 500. `.set_run_risk_aversion(0.0)` ranks on the plain
         // window mean again; 2.0 doubles the preference for steadiness.
-        .set_run_risk_aversion(1.0)
+        .set_run_risk_aversion(0.0)
         // .set_run_checkpoint_every(5)
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra history.csv column
         .set_stop_max_steps(Some(race_steps))
@@ -584,44 +583,33 @@ fn main() {
         // (the engine logs the receipt, or why it fell back to an all-random batch).
         // Point it elsewhere with `.set_elite_previous_dir("assets/1790920031289_500")`,
         // or force a fresh batch with `.set_elite_previous_load(false)`.
-        .set_crossover_prob(0.5)
+        // Only DEVIATIONS from the built-in defaults are spelled out below — a
+        // line here is a real choice, not a restatement (crossover prob, cull
+        // policy, probation lengths and the like already hold these values).
         .set_crossover_rolls(pop / 10)
         // .set_crossover_ops_pool(["uniform"]) // ["one_point", "uniform"]
-        .set_crossover_cull_policy(CrossCullPolicy::Worst)
-        .set_crossover_probation_steps(5)
-        .set_mutate_prob(0.5)
-        .set_mutate_rolls(pop / 20)
         .set_mutation_cull_policy(MutationCullPolicy::Worst)
-        .set_mutation_probation_steps(5)
+        .set_mutate_rolls(pop / 20)
         .set_topology_dropout_prob(DROPOUT_PROB)
-        .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(15)
-        .set_topology_min_inputs_per_node(2)
         .set_topology_max_inputs_per_node(15)
-        .set_topology_min_outputs_per_node(2)
         .set_topology_max_outputs_per_node(15)
         .set_topology_input_dim(4)
         .set_topology_output_dim(2)
         .set_topology_hidden_dim_range(16, 64)
-        .set_topology_hidden_dim_stride(16)
         .set_topology_combine_op_pool([
             "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
         ])
         // .set_topology_activation_pool(["ReLU", "Tanh", …]) — evolve activations
         // .set_topology_standardize_op_pool(["LayerNorm", …]) — per-node norm ops
-        .set_elite_freeze(true)
         .set_elite_count(pop / 20)
-        .set_elite_join_probation_steps(5)
-        .set_elite_crown_lifetime_steps(5)
-        .set_elite_save_topology(true)
-        // Champion weights for later tools (`export_champion`); not needed to
-        // certify this run — the guardrail scores the live in-memory champion.
+        // Topology-only run: NO weight files are written at all, and this example
+        // needs none — the guardrail re-tests the LIVE champion in memory. Turn
+        // these on only if a later tool must load the trained net.
         .set_elite_save_safetensors(false)
         .set_elite_checkpoint_weights(false)
         .set_worst_save_topology(true)
-        .set_worst_save_safetensors(false)
         .set_elite_guardrail_matches(GUARDRAIL_MATCHES)
-        // .set_checkpoint_elite_weights(true) // per-checkpoint elite weight snapshot ???
         .build();
 
     let fitness = Fitness::reported(Direction::Maximize, "match_survival");
@@ -660,5 +648,5 @@ fn main() {
     // STEP D — guardrail: GUARDRAIL_MATCHES fresh games the run never trained
     // on, scored from the LIVE champion through the run's own trainer; the
     // engine logs the detailed verdict and records it in `engine.json`.
-    report_guardrail(&mut engine, device, baseline);
+    report_guardrail(&mut engine, baseline);
 }
