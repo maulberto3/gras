@@ -20,6 +20,9 @@ a champion you can actually trust.
   environment, and fitness; the crate owns the search around them.
 - **Results you can trust.** Champions are certified by a guardrail —
   re-tested on data they never trained on before you rely on them.
+- **Effective *and* steady.** Ranking charges each candidate for its own
+  spread (`mean ∓ λσ` over its recent readings), so a network that is
+  reliably good outranks one that is occasionally brilliant.
 - **Each run builds on the last.** A new experiment automatically inherits
   the ranked elites of the newest compatible prior run, so progress
   accumulates instead of restarting from scratch.
@@ -33,6 +36,11 @@ as they fall behind; strong ones hold their place and keep learning; new
 candidates are born continuously. Because the whole run is a pure function of
 its seed, any run replays exactly — and the surviving champion is measured
 against fresh, unseen data at the end.
+
+Ranking is risk-adjusted: each candidate is scored by the mean of its recent
+readings shifted by `λ` standard deviations toward the worse side — a single
+number, no second objective to trade off. Raise `set_run_risk_aversion` to
+prefer consistency, set it to `0.0` to rank on the plain mean.
 
 Two runs chain together automatically. At stop, the champion is certified by
 the guardrail and the run's ranked elites are recorded; the next compatible
