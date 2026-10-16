@@ -16,6 +16,7 @@
 //! in `StepReport` — mean-of-batch vs best-of-batch disagreements are how a
 //! race signal hides its own collapse.
 
+use crate::engine::format::fmt_line;
 use crate::engine::fitness::Direction;
 use crate::graph::network::Network;
 
@@ -111,13 +112,15 @@ pub fn agreement_verdict_noisy(
             .unwrap_or_else(|| "an undeclared number of readings".to_string());
         let exam = format!("{matches_scored} unseen game(s)");
         let exam_note = exam_se
-            .map(|e| format!(", ±{:.1} of its own", 2.0 * e))
+            .map(|e| format!(", ±{} of its own", fmt_line(2.0 * e)))
             .unwrap_or_default();
                 // Freshness clause (only when worth stating): a LATEST reading far from the
                 // window mean disambiguates a "collapsed" verdict. Phrased neutrally.
         let latest_note = match race_latest {
             Some(l) if (l - race).abs() > 0.25 * race.abs().max(1.0) => format!(
-                " (the champion's latest reading was {l:.1}, against the {race:.1} window mean — the window also averages older steps, so it need not describe the weights the exam just played)"
+                " (the champion's latest reading was {}, against the {} window mean — the window also averages older steps, so it need not describe the weights the exam just played)",
+                fmt_line(l),
+                fmt_line(race)
             ),
             _ => String::new(),
         };
@@ -131,19 +134,31 @@ pub fn agreement_verdict_noisy(
         }
         if shortfall <= band {
             return format!(
-                "consistent within noise — the exam ({exam}{exam_note}) sits {shortfall:.1} under the race reading, inside the {band:.1} band of combined sampling error (race SE {se:.1} over {race_n}, {ratio:.1}× that band). The race mean is a short-window average and the champion is that average's BEST of the whole population, so a gap this size is expected even from an unchanged net — NOT evidence of a collapse ✅{latest_note}"
+                "consistent within noise — the exam ({exam}{exam_note}) sits {} under the race reading, inside the {} band of combined sampling error (race SE {} over {race_n}, {}× that band). The race mean is a short-window average and the champion is that average's BEST of the whole population, so a gap this size is expected even from an unchanged net — NOT evidence of a collapse ✅{latest_note}",
+                fmt_line(shortfall),
+                fmt_line(band),
+                fmt_line(se),
+                fmt_line(ratio),
             );
         }
         if ratio <= 1.5 {
             return format!(
-                "borderline ⚠️ — the exam ({exam}{exam_note}) is {shortfall:.1} under the race reading ({:.0}% of it), just outside the {band:.1} band of combined sampling error ({ratio:.1}×, race SE {se:.1} over {race_n}). The two readings disagree but barely: quote the exam (it is the tighter estimate — {race_n} cannot resolve better than ±{:.1}) and re-run with a longer smoothing window before calling it a collapse. The forecast from a short window is what is failing here, not necessarily the policy.{latest_note}",
+                "borderline ⚠️ — the exam ({exam}{exam_note}) is {} under the race reading ({:.0}% of it), just outside the {} band of combined sampling error ({}×, race SE {} over {race_n}). The two readings disagree but barely: quote the exam (it is the tighter estimate — {race_n} cannot resolve better than ±{}) and re-run with a longer smoothing window before calling it a collapse. The forecast from a short window is what is failing here, not necessarily the policy.{latest_note}",
+                fmt_line(shortfall),
                 rel * 100.0,
-                2.0 * se
+                fmt_line(band),
+                fmt_line(ratio),
+                fmt_line(se),
+                fmt_line(2.0 * se)
             );
         }
         return format!(
-            "weak — the race OVER-REPORTED: the exam ({exam}{exam_note}) is {shortfall:.1} under the race reading ({:.0}% of it), i.e. {ratio:.1}× the {band:.1} band of combined sampling error (race SE {se:.1} over {race_n}). Expected when the champion won on a lucky draw — the exam is the better estimate ❌{latest_note}",
-            rel * 100.0
+            "weak — the race OVER-REPORTED: the exam ({exam}{exam_note}) is {} under the race reading ({:.0}% of it), i.e. {}× the {} band of combined sampling error (race SE {} over {race_n}). Expected when the champion won on a lucky draw — the exam is the better estimate ❌{latest_note}",
+            fmt_line(shortfall),
+            rel * 100.0,
+            fmt_line(ratio),
+            fmt_line(band),
+            fmt_line(se)
         );
     }
     // Flat fallback: no usable error bar (a one-reading window, no live buffer,

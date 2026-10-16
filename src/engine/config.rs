@@ -3,6 +3,7 @@
 //! context stamped into every net's `meta` block (`RunMetaCtx`).
 
 use crate::engine::fitness::Metric;
+use crate::graph::topology::FeatureSplitPolicy;
 
 /// What the scheduler checks to decide whether to stop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,13 +221,15 @@ pub struct RaceConfig {
         /// Combine/activation/standardize pools actually used by the run; empty uses all
         /// known ops (`empty ⇒ all` convention).
     pub combine_op_pool: Vec<String>,
+    /// Feature split: how the Input node's per-port feature masks are drawn, or
+    /// `None` (**default**) for no split at all — every port keeps cloning the one
+    /// mixed input vector. See [`FeatureSplitPolicy`]; set with
+    /// `set_topology_feature_split` (there is deliberately no bool).
+    pub feature_split: Option<FeatureSplitPolicy>,
     /// Activation pool (empty ⇒ all).
     pub activation_pool: Vec<String>,
     /// Standardize-op pool (empty ⇒ all).
     pub standardize_op_pool: Vec<String>,
-        /// Per-node elementwise transforms. Unlike the other pools, EMPTY means OFF — the
-        /// slot is opt-in so existing search spaces don't silently widen.
-    pub transform_pool: Vec<String>,
     /// Topology template (input/output dims, hidden node ranges, dropout, etc.)
     /// shared by every individual in the run.
     pub topology_options: crate::graph::topology::TopologyOptions,
@@ -497,9 +500,9 @@ impl RaceConfig {
             hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
             hidden_dim_stride: 16,
             combine_op_pool: Vec::new(),
+            feature_split: None,
             activation_pool: Vec::new(),
             standardize_op_pool: Vec::new(),
-            transform_pool: Vec::new(),
             topology_options: crate::graph::topology::TopologyOptions::default(),
             crossover_prob: 0.5,
             mutate_prob: 0.5,
@@ -669,6 +672,13 @@ impl RaceConfigBuilder {
         self.cfg.crossover_ops_pool = ops.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
+        /// Enable the feature split and choose how the Input node's per-port masks
+        /// are drawn. Unset (`None`, the default) = no split. Off/value rather than a
+        /// bool: the policy IS the value, and "off" is simply not calling this.
+    pub fn set_topology_feature_split(mut self, policy: FeatureSplitPolicy) -> Self {
+        self.cfg.feature_split = Some(policy);
+        self
+    }
         /// Explicit step budget — the only built-in stop criterion. Accepts a bare value or an
         /// `Option`; `None` (default) = run until externally stopped.
     pub fn set_stop_max_steps(mut self, n: impl Into<Option<usize>>) -> Self {
@@ -762,16 +772,6 @@ impl RaceConfigBuilder {
         S: AsRef<str>,
     {
         self.cfg.standardize_op_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
-        self
-    }
-        /// Per-node elementwise transforms; OPT-IN — an empty pool (default) means no node
-        /// carries a transform. Accepts owned or borrowed strings.
-    pub fn set_topology_transform_pool<I, S>(mut self, pool: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.cfg.transform_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
         /// Dropout probability applied when building this run's networks (part of
@@ -1053,14 +1053,6 @@ impl RaceConfig {
             .collect()
     }
 
-    /// Resolve the transform sampling pool — OPT-IN, unlike the other pools:
-    /// empty ⇒ `None` (no transforms anywhere), not "all known".
-    pub fn resolved_transform_pool(&self) -> Result<Vec<crate::graph::node::Transform>, String> {
-        self.transform_pool
-            .iter()
-            .map(|s| crate::graph::node::Transform::try_from(s.as_str()))
-            .collect()
-    }
 }
 
 #[cfg(test)]

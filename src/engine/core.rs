@@ -67,7 +67,7 @@ use crate::engine::evolve::RollKind;
 use crate::trainer::stream::{BatchStream, PoolSplit};
 
 use super::config::{RaceConfig, StopReason};
-use super::format::{build_stamp, csv_field};
+use super::format::{build_stamp, csv_field, fmt_cell, fmt_cfg, fmt_line, fmt_line_smt};
 use super::smoothing::{RollingBuffer, WindowStats, rolling_stats};
 
 // ── CoreEngine ───────────────────────────────────────────────────────────────
@@ -264,7 +264,7 @@ impl RlVolume {
         let per_turn = if turns == 0 {
             "—".to_string()
         } else {
-            format!("{:.1}", step_secs * 1000.0 / turns as f32)
+            fmt_line(step_secs * 1000.0 / turns as f32)
         };
         format!(
             "matches {} │ train {} │ eval {} │ turns/match {:.0} │ ms/turn {}",
@@ -535,7 +535,7 @@ impl CoreEngine {
                                 "champion holdout".to_string(),
                                 champ
                                     .guardrail_mean
-                                    .map(|m| format!("{m:.4}"))
+                                    .map(fmt_cell)
                                     .unwrap_or_else(|| "—".to_string()),
                             ),
                             (
@@ -753,12 +753,12 @@ impl CoreEngine {
         // `set_run_risk_aversion(0.0)` — the refusal names that value.
         if (self.config.risk_aversion - self.header.config.risk_aversion).abs() > 1e-6 {
             return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume: risk_aversion mismatch — run recorded λ={:.2} but the resume config sets λ={:.2} — \
-                 ranking semantics would change; set set_run_risk_aversion({:.2}) (or omit) to resume \
+                "resume: risk_aversion mismatch — run recorded λ={} but the resume config sets λ={} — \
+                 ranking semantics would change; set set_run_risk_aversion({}) (or omit) to resume \
                  (a run that predates FIT recorded 0.00: it ranked on the plain mean)",
-                self.header.config.risk_aversion,
-                self.config.risk_aversion,
-                self.header.config.risk_aversion
+                fmt_cfg(self.header.config.risk_aversion),
+                fmt_cfg(self.config.risk_aversion),
+                fmt_cfg(self.header.config.risk_aversion)
             )).into());
         }
         let run_dir = self.run_dir.clone();
@@ -936,7 +936,7 @@ impl CoreEngine {
                 },
             ));
             if let Some(m) = src.guardrail_mean {
-                rows.push(("champion holdout".to_string(), format!("{m:.4}")));
+                rows.push(("champion holdout".to_string(), fmt_cell(m)));
             }
         }
         crate::engine::cfy::emit(&crate::engine::cfy::card(
@@ -995,11 +995,6 @@ impl CoreEngine {
             } else {
                 self.config.standardize_op_pool.join(",")
             };
-            let transforms = if self.config.transform_pool.is_empty() {
-                "off".to_string()
-            } else {
-                self.config.transform_pool.join(",")
-            };
             let mut manifest: Vec<(String, String)> = vec![
                 ("run_id".to_string(), self.header.run_id.clone()),
                 ("seed".to_string(), self.header.run_seed.to_string()),
@@ -1025,7 +1020,7 @@ impl CoreEngine {
                 ),
                 (
                     "risk_aversion (λ)".to_string(),
-                    format!("{:.2}", self.config.risk_aversion),
+                    fmt_cfg(self.config.risk_aversion),
                 ),
                 (
                     "checkpoint_every".to_string(),
@@ -1038,9 +1033,9 @@ impl CoreEngine {
                 ("mutate_rolls".to_string(), self.config.mutate_rolls.to_string()),
                 (
                     "crossover_prob".to_string(),
-                    format!("{:.2}", self.config.crossover_prob),
+                    fmt_cfg(self.config.crossover_prob),
                 ),
-                ("mutate_prob".to_string(), format!("{:.2}", self.config.mutate_prob)),
+                ("mutate_prob".to_string(), fmt_cfg(self.config.mutate_prob)),
                 ("elite_count".to_string(), self.config.elite_count.to_string()),
                 (
                     "freeze_elites".to_string(),
@@ -1095,8 +1090,8 @@ impl CoreEngine {
                 manifest.push((k.to_string(), v));
             }
             let legend = format!(
-                "fitness = mean over the `matches` played that clock │ μ = rolling mean of the last K={} clock fitnesses │ σ = their spread │ smt = risk-adjusted score rankings use (μ paid λ={:.2}σ; λ=0 ⇒ smt = μ) │ ★ = elite rank + seat tenure │ trained n/m = optimizer updates over clocks lived",
-                self.config.smoothing_window, self.config.risk_aversion,
+                "fitness = mean over the `matches` played that clock │ μ = rolling mean of the last K={} clock fitnesses │ σ = their spread │ smt = risk-adjusted score rankings use (μ paid λ={}σ; λ=0 ⇒ smt = μ) │ ★ = elite rank + seat tenure │ trained n/m = optimizer updates over clocks lived",
+                self.config.smoothing_window, fmt_cfg(self.config.risk_aversion),
             );
             crate::engine::cfy::emit(&crate::engine::cfy::card(
                 "Run manifest",
@@ -1109,7 +1104,6 @@ impl CoreEngine {
                 ("activations".to_string(), acts),
                 ("combine".to_string(), combines),
                 ("standardize".to_string(), std_ops),
-                ("transform".to_string(), transforms),
                 (
                     "hidden_dim_pool".to_string(),
                     match &self.config.hidden_dim_pool {
@@ -1246,11 +1240,11 @@ impl CoreEngine {
                         // debug: a roll that did not fire is the NORMAL case (p < 1), so it is per-roll
                         // detail, not a per-clock event; `--log-level debug` shows them all.
                         debug!(
-                            "step {} │ crossover {}/{} did not fire (p={:.2})",
+                            "step {} │ crossover {}/{} did not fire (p={})",
                             clock,
                             roll + 1,
                             cross_total,
-                            self.config.crossover_prob,
+                            fmt_cfg(self.config.crossover_prob),
                         );
                         continue;
                     }
@@ -1319,11 +1313,11 @@ impl CoreEngine {
                     if !self.roll_fires(RollKind::Mutation, clock, roll) {
                         // Same as the crossover no-fire line: per-roll detail.
                         debug!(
-                            "step {} │ mutation {}/{} did not fire (p={:.2})",
+                            "step {} │ mutation {}/{} did not fire (p={})",
                             clock,
                             roll + 1,
                             mutate_total,
-                            self.config.mutate_prob,
+                            fmt_cfg(self.config.mutate_prob),
                         );
                         continue;
                     }
@@ -1653,20 +1647,20 @@ impl CoreEngine {
         // min/max matter as much as its mean — 191.7 out of [41.5 .. 500.0] is a fluke.
         let exam_se = verdict
             .se()
-            .map(|se| format!(" (SE {se:.1})"))
+            .map(|se| format!(" (SE {})", fmt_cell(se)))
             .unwrap_or_default();
         let race_note = match race {
             Some(r) => format!(
-                "μ{:.1} over {} step reading(s) (±σ{:.1}, SE {:.1}, window min {:.1} / max {:.1}, latest {:.1} │ risk-adj {:.1} at λ={:.2})",
-                r.mean,
+                "μ{} over {} step reading(s) (±σ{}, SE {}, window min {} / max {}, latest {} │ risk-adj {} at λ={})",
+                fmt_cell(r.mean),
                 r.n,
-                r.std,
-                r.se().unwrap_or(0.0),
-                r.min,
-                r.max,
-                r.latest,
-                race_score.unwrap_or(r.mean),
-                self.config.risk_aversion,
+                fmt_cell(r.std),
+                fmt_cell(r.se().unwrap_or(0.0)),
+                fmt_cell(r.min),
+                fmt_cell(r.max),
+                fmt_cell(r.latest),
+                fmt_cell(race_score.unwrap_or(r.mean)),
+                fmt_cfg(self.config.risk_aversion),
             ),
             None => "unavailable (no rolling window recorded)".to_string(),
         };
@@ -1697,7 +1691,7 @@ impl CoreEngine {
                 ),
                 (
                     "exam mean".to_string(),
-                    format!("{:.1}{exam_se}", verdict.mean().unwrap_or(0.0)),
+                    format!("{}{exam_se}", fmt_cell(verdict.mean().unwrap_or(0.0))),
                 ),
                 ("unseen games".to_string(), verdict.scores.len().to_string()),
             ]),
@@ -1913,10 +1907,10 @@ impl CoreEngine {
             let details = format!(
                 "μ{} σ{} · age {age_now} · {} · {} params{gate}",
                 reading
-                    .map(|r| format!("{:.1}", r.mean))
+                    .map(|r| fmt_line(r.mean))
                     .unwrap_or_else(|| "—".into()),
                 reading
-                    .and_then(|r| (r.n > 1).then(|| format!("{:.1}", r.std)))
+                    .and_then(|r| (r.n > 1).then(|| fmt_line(r.std)))
                     .unwrap_or_else(|| "—".into()),
                 crate::engine::reporting::trained_note(trainings, age_now),
                 params.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
@@ -1931,8 +1925,7 @@ impl CoreEngine {
                 &h[..8.min(h.len())],
                 rank_note,
                 self.fitness.direction().arrow(),
-                fit.map(crate::engine::format::fmt2_smt)
-                    .unwrap_or_else(|| "—".into()),
+                fit.map(fmt_line_smt).unwrap_or_else(|| "—".into()),
                 tail,
             );
         }
@@ -1956,14 +1949,14 @@ impl CoreEngine {
                     (Some(a), Some(b)) => format!(
                         " (fitness {} {} → {} {})",
                         self.fitness.direction().arrow(),
-                        crate::engine::format::fmt2_smt(a),
+                        fmt_line_smt(a),
                         self.fitness.direction().arrow(),
-                        crate::engine::format::fmt2_smt(b)
+                        fmt_line_smt(b)
                     ),
                     (Some(a), None) => format!(
                         " (fitness{} {})",
                         self.fitness.direction().arrow(),
-                        crate::engine::format::fmt2_smt(a)
+                        fmt_line_smt(a)
                     ),
                     _ => String::new(),
                 };

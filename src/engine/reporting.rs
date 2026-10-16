@@ -10,6 +10,7 @@ use tracing::info;
 
 use super::core::CoreEngine;
 use crate::engine::child::frozen_act_count;
+use crate::engine::format::{fmt_cell, fmt_cell_opt, fmt_cell_smt, fmt_cfg, fmt_line};
 use crate::engine::smoothing::rolling_mean;
 
 impl CoreEngine {
@@ -30,7 +31,8 @@ impl CoreEngine {
                 }
             }
         }
-        // Population mean ± population std, 2 decimals.
+        // Population mean ± population std, log-line precision (see
+        // `format::fmt_line`: 1dp, floored so a small loss never reads as zero).
         let stats = |v: &[f32]| {
             if v.is_empty() {
                 "—".to_string()
@@ -38,7 +40,7 @@ impl CoreEngine {
                 let n = v.len() as f32;
                 let mean = v.iter().sum::<f32>() / n;
                 let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n;
-                format!("{mean:.2} ± {:.2}", var.sqrt())
+                format!("{} ± {}", fmt_line(mean), fmt_line(var.sqrt()))
             }
         };
         // Per-step wall time: the step's own cost (train + evolve), not time
@@ -103,16 +105,16 @@ impl CoreEngine {
             self.log_minimal_table(&trains, &evals, &fits, avg(&windows), avg(&spreads), step_secs);
         } else {
             info!(
-                "step {} │ pop {} │ train_loss↓ {} │ {} │ fitness{} {} │ μ{:.1} σ{:.1} │ took {:.1}s{}",
+                "step {} │ pop {} │ train_loss↓ {} │ {} │ fitness{} {} │ μ{} σ{} │ took {}s{}",
                 clock,
                 self.state.live_count(),
                 stats(&trains),
                 mid,
                 self.fitness.direction().arrow(),
                 fit_stats,
-                avg(&windows),
-                avg(&spreads),
-                step_secs,
+                fmt_line(avg(&windows)),
+                fmt_line(avg(&spreads)),
+                fmt_line(step_secs),
                 freeze_badge,
             );
         }
@@ -139,9 +141,22 @@ impl CoreEngine {
         let (train_m, eval_m, fit_m) = (mean(trains), mean(evals), mean(fits));
             // Delta vs the previous step's mean; omitted when 0 or when it dies at
             // 2-decimal rounding (the first render sets the baseline).
+        // Gate the delta on the PRINTED form, not a magic epsilon: a change is
+        // shown exactly when the line's own precision can represent it. The first
+        // render carries a NaN baseline, which is omitted (`!is_finite`).
         let delta = |cur: f32, prev: Option<f32>| match prev {
-            Some(p) if (cur - p).abs() >= 5e-3 => format!(" (∆{:+.2})", cur - p),
-            _ => String::new(),
+            Some(p) => {
+                let d = cur - p;
+                let s = fmt_line(d);
+                if !d.is_finite() || s.parse::<f32>() == Ok(0.0) {
+                    String::new()
+                } else if d > 0.0 {
+                    format!(" (∆+{s})")
+                } else {
+                    format!(" (∆{s})")
+                }
+            }
+            None => String::new(),
         };
         let (pt, pe, pf) = self
             .minimal_prev_means
@@ -153,18 +168,18 @@ impl CoreEngine {
         let mut rows: Vec<String> = vec![
             if !self.trainer.is_rl() {
                 format!(
-                    "pop {:>3} │ train_loss↓ {:.2}{} │ eval_loss↓ {:.2}{}",
+                    "pop {:>3} │ train_loss↓ {}{} │ eval_loss↓ {}{}",
                     pop,
-                    train_m,
+                    fmt_line(train_m),
                     delta(train_m, Some(pt)),
-                    eval_m,
+                    fmt_line(eval_m),
                     delta(eval_m, Some(pe)),
                 )
             } else {
                 format!(
-                    "pop {:>3} │ train_loss↓ {:.2}{} │ {}",
+                    "pop {:>3} │ train_loss↓ {}{} │ {}",
                     pop,
-                    train_m,
+                    fmt_line(train_m),
                     delta(train_m, Some(pt)),
                     self.step_rl.label(step_secs),
                 )
@@ -174,12 +189,12 @@ impl CoreEngine {
                 // `smt` is the risk-adjusted score (FIT); `μ`/`σ` are the window level and
                 // spread behind it, so the readable value is never lost.
             format!(
-                "fitness{} smt{:.2}{} │ μ{:.2} σ{:.2} │ culls {} │ inserts {}",
+                "fitness{} smt{}{} │ μ{} σ{} │ culls {} │ inserts {}",
                 self.fitness.direction().arrow(),
-                fit_m,
+                fmt_line(fit_m),
                 delta(fit_m, Some(pf)),
-                window_mean,
-                window_std,
+                fmt_line(window_mean),
+                fmt_line(window_std),
                 e.culls,
                 e.inserts,
             ),
@@ -187,7 +202,7 @@ impl CoreEngine {
                 "crossover fired {} ({} inserted, {} spent) │ mutation rolled {} ({} immigrant(s))",
                 e.cross_fired, e.cross_survived, e.cross_discarded, e.mutate_fired, e.mutate_fired,
             ),
-            format!("step took {:.1}s", step_secs),
+            format!("step took {}s", fmt_line(step_secs)),
         ];
             // Anti-devolution row — only when a knob is on (zero noise by default): the
             // elite set and/or the current demotion count.
@@ -338,10 +353,8 @@ impl CoreEngine {
                 // Three legs of ONE reading: `smt` = the risk-adjusted score the rank was
                 // decided on (FIT), `mean` = the readable window level, `spread` = its σ. A
                 // wide σ means the ordering is luck-sensitive; eval_loss `—` when N/A.
-            let smt = crate::engine::format::fmt2_smt(*fit);
-            let mean_cell = mean
-                .map(|m| format!("{m:.2}"))
-                .unwrap_or_else(|| "—".to_string());
+            let smt = fmt_cell_smt(*fit);
+            let mean_cell = fmt_cell_opt(mean);
             let short = &h[..8.min(h.len())];
             let state = self.state.net(h);
             let on_crown = self.config.freeze_elites && self.frozen_crown.contains(h);
@@ -363,9 +376,7 @@ impl CoreEngine {
                 .unwrap_or_else(|| "?".to_string());
                 // The spread behind `smt`: two nets at the same score can be "always that
                 // good" or "one lucky step".
-            let spread = std
-                .map(|s| format!("{s:.1}"))
-                .unwrap_or_else(|| "—".to_string());
+            let spread = fmt_cell_opt(std);
                 // Clocks lived INCLUSIVE of the birth clock and the last run — same
                 // convention the freeze lines use (`clock − entered_at_step`).
             let age = dealt_clock.saturating_sub(born_num) + 1;
@@ -391,9 +402,7 @@ impl CoreEngine {
             ];
             if has_eval {
                 row.push(
-                    eval_loss
-                        .map(|l| format!("{l:.4}"))
-                        .unwrap_or_else(|| "—".to_string()),
+                    fmt_cell_opt(eval_loss),
                 );
             }
             // One cell per configured informative metric, in config order —
@@ -403,7 +412,7 @@ impl CoreEngine {
                 row.push(
                     metrics
                         .and_then(|m| m.informative.get(i).copied())
-                        .map(|v| format!("{v:.2}"))
+                        .map(fmt_cell)
                         .unwrap_or_else(|| "—".to_string()),
                 );
             }
@@ -415,8 +424,8 @@ impl CoreEngine {
             &format!("Final elites (top-{k}, ranked by fitness{arrow})"),
             &table.to_string(),
             Some(&format!(
-                "smt = risk-adjusted score (μ paid λ={:.2}σ) · mean = window level · spread = σ · crown {}/{} seats · {} eligible · {} on probation (k={}) · {} age-blocked (j={})",
-                self.config.risk_aversion,
+                "smt = risk-adjusted score (μ paid λ={}σ) · mean = window level · spread = σ · crown {}/{} seats · {} eligible · {} on probation (k={}) · {} age-blocked (j={})",
+                fmt_cfg(self.config.risk_aversion),
                 self.frozen_crown.len(),
                 self.config
                     .elite_count

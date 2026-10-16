@@ -20,7 +20,7 @@
 use flodl::tensor::Result;
 
 use super::core::{CoreEngine, NoopOptimizer};
-use super::format::{fmt_opt2, fmt2};
+use super::format::{fmt_line, fmt_line_opt};
 use crate::state::NetMetrics;
 #[cfg(debug_assertions)]
 use crate::utils::race_steps::eval_one_step;
@@ -64,7 +64,7 @@ impl CoreEngine {
                 clock,
                 &hash[..8.min(hash.len())],
                 self.fitness.direction().arrow(),
-                fmt2(metrics.fitness),
+                fmt_line(metrics.fitness),
             );
             return Ok(());
         }
@@ -112,10 +112,10 @@ impl CoreEngine {
             "step {} │ net {} │ train_loss↓ {} │ eval_loss↓ {} │ fitness{} {}",
             clock,
             hash,
-            fmt2(metrics.train_loss),
-            fmt_opt2(&metrics.eval_loss),
+            fmt_line(metrics.train_loss),
+            fmt_line_opt(&metrics.eval_loss),
             dir,
-            fmt2(metrics.fitness),
+            fmt_line(metrics.fitness),
         );
         Ok(())
     }

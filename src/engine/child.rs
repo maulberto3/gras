@@ -184,6 +184,12 @@ impl CoreEngine {
                 .resolved_activation_pool()
                 .unwrap_or_else(|_| crate::evolution::pools::all_activations()),
         );
+            // Crossover children get feature masks from the run's policy as well — the port
+            // pool is part of the search space on this path too, and re-drawing keeps the
+            // mask length in step with the post-finalize port count.
+        if let Some(policy) = self.config.feature_split {
+            child_topo.assign_feature_masks(policy);
+        }
         Ok(Some(self.finalize_child(
             child_topo,
             clock,
@@ -236,9 +242,6 @@ impl CoreEngine {
             .config
             .resolved_standardize_pool()
             .unwrap_or_else(|_| crate::evolution::pools::all_standardize_ops());
-            // Transform pool is OPT-IN: empty ⇒ identity; non-empty ⇒ each hidden node
-            // draws from it (the empty string never appears).
-        let transforms = self.config.resolved_transform_pool().unwrap_or_default();
         let hidden_dim_pool = self.config.hidden_dim_pool.clone().unwrap_or(4..=8);
         let stride = self.config.hidden_dim_stride.max(1);
         for node in &mut graph.nodes {
@@ -248,11 +251,6 @@ impl CoreEngine {
                 node.activation = activation[rng.usize(0..activation.len())];
                 node.combine_op = Some(combine[rng.usize(0..combine.len())]);
                 node.standardize = Some(standardize[rng.usize(0..standardize.len())]);
-                node.transform = if transforms.is_empty() {
-                    None
-                } else {
-                    Some(transforms[rng.usize(0..transforms.len())])
-                };
             }
         }
         graph.refresh_labels();
@@ -264,6 +262,11 @@ impl CoreEngine {
             .resolved_activation_pool()
             .unwrap_or_else(|_| crate::evolution::pools::all_activations());
         graph.assign_port_activations(&act_pool);
+            // Feature split for immigrants too — the run's policy owns both paths, and
+            // masks must be drawn after finalize so the port count is already final.
+        if let Some(policy) = self.config.feature_split {
+            graph.assign_feature_masks(policy);
+        }
             // NO mutation roll on the immigrant path: a brand-new random topology is
             // already maximal exploration; the mutation roll belongs to crossover only.
         self.finalize_child(graph, clock, child_idx, "random", &[], false)

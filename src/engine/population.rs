@@ -25,7 +25,6 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     let standardize = config
         .resolved_standardize_pool()
         .unwrap_or_else(|_| crate::evolution::pools::all_standardize_ops());
-
     let seed = derive_seed(run_seed, ordinal) as usize;
     let mut rng = fastrand::Rng::with_seed(seed as u64);
         // Per-individual identity seed. `options.topology_seed` keys the whole engine;
@@ -48,6 +47,11 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     }
     graph.refresh_labels();
     graph.finalize();
+        // Feature split AFTER finalize: the Input node's port count is final only once
+        // `trim_orphaned_ports` compacted the ports (same rule as port activations).
+    if let Some(policy) = config.feature_split {
+        graph.assign_feature_masks(policy);
+    }
     graph
 }
 
@@ -378,5 +382,64 @@ mod tests {
             8,
             "each founder must carry a distinct net_seed"
         );
+    }
+
+    #[test]
+    fn feature_split_masks_match_the_final_port_count() {
+            // End-to-end through the real engine draw: with the policy on, every founder
+            // must carry masks whose length matches the POST-finalize port count (a stale
+            // port count is exactly what would break the validate rule), and Exclusive
+            // must still partition the features.
+        let opts = crate::graph::topology::TopologyOptions {
+            min_hidden_num_nodes: 4,
+            max_hidden_num_nodes: 4,
+            input_dim: Some(3),
+            output_dim: Some(2),
+            ..Default::default()
+        };
+        let mut cfg = RaceConfig::defaults();
+        cfg.pop_size = 4;
+        cfg.topology_options = opts;
+        cfg.hidden_dim_pool = Some(4..=4);
+        cfg.feature_split = Some(crate::graph::topology::FeatureSplitPolicy::Exclusive);
+
+        for topo in initial_population(&cfg, 42) {
+            topo.validate().expect("a split topology must validate");
+            let input = topo
+                .nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Input)
+                .unwrap();
+            let masks = input
+                .feature_masks
+                .as_ref()
+                .expect("the policy is on, so founders carry masks");
+            assert_eq!(masks.len(), input.num_outputs, "one mask per final port");
+            assert!(
+                masks.iter().all(|m| m.len() == 3),
+                "every mask spans input_dim"
+            );
+            let placed: usize = masks
+                .iter()
+                .map(|m| m.iter().filter(|b| **b == 1).count())
+                .sum();
+            assert_eq!(placed, 3, "Exclusive places every feature exactly once");
+        }
+    }
+
+    #[test]
+    fn feature_split_off_leaves_every_port_unmasked() {
+            // The default (`None`) is today's behaviour: no masks anywhere, so nothing
+            // about an existing run's population changes.
+        let cfg = tiny_config(4);
+        assert!(cfg.feature_split.is_none(), "the split is opt-in");
+        for topo in initial_population(&cfg, 42) {
+            let input = topo
+                .nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Input)
+                .unwrap();
+            assert_eq!(input.feature_masks, None, "no policy ⇒ no masks");
+        }
     }
 }
