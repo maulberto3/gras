@@ -2,7 +2,7 @@
 //!
 //! Nodes hold no tensors; execution happens in
 //! [`Network`](crate::graph::network::Network). The NAS knobs live here:
-//! `hidden_dim`, `activation`, `combine_op`, `standardize`.
+//! `hidden_dim`, `activation`, `combine_op`, `standardize`, `feature_masks`.
 
 use flodl::Variable;
 use serde::{Deserialize, Serialize};
@@ -186,7 +186,8 @@ pub enum StandardizeOp {
     GroupNorm,
 }
 
-/// The label parse lives with the enum (same as [`Transform`]).
+/// The label parse lives with the enum, so every new arm's label is added in
+/// one place and any tooling can reuse it.
 impl TryFrom<&str> for StandardizeOp {
     /// The unknown-label message.
     type Error = String;
@@ -281,89 +282,6 @@ impl StandardizeOp {
     }
 }
 
-/// Per-node elementwise feature transform: applied to the linear output after
-/// standardize, before activation. All variants are pure `f(x)` -- replay-safe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Transform {
-    /// ln(1 + x) — compresses income-like heavy tails while keeping order.
-    /// Numerically stable for x > -1; the apply guard clamps below -1.
-    Log1p,
-    /// √|x| · sign(x) — signed square root: gentler compression than log.
-    Sqrt,
-    /// x clamped to [-1, 1] — hard saturation rail.
-    Clamp,
-    /// sign(x) in {-1, 0, +1} — a hard three-state quantizer.
-    Sign,
-    /// 1/x guarded (x clamped away from 0 by ±1e-6 before the divide) —
-    /// inverse-magnitude feature (rarity weighting).
-    Reciprocal,
-    /// e^x clamped at input to [-10, 10] — smooth expansion with an
-    /// overflow rail.
-    Exp,
-}
-
-// The label parse lives on the enum, so every new arm's label is added in one
-// place and any tooling can reuse it. Config pools store labels as strings.
-impl TryFrom<&str> for Transform {
-    /// The unknown-label message.
-    type Error = String;
-    /// Case-insensitive label → variant; an unknown label errors with its name.
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        Ok(match s.to_lowercase().as_str() {
-            "log1p" => Transform::Log1p,
-            "sqrt" => Transform::Sqrt,
-            "clamp" => Transform::Clamp,
-            "sign" => Transform::Sign,
-            "reciprocal" => Transform::Reciprocal,
-            "exp" => Transform::Exp,
-            other => return Err(format!("unknown transform '{other}'")),
-        })
-    }
-}
-
-impl Transform {
-    /// Apply this transform. Every branch is elementwise and stateless —
-    /// the same input always yields the same output (replay contract).
-    pub fn apply(&self, x: &Variable) -> flodl::tensor::Result<Variable> {
-        match self {
-            // log1p needs x > -1: clamp into the stable domain (the 1e9 rail
-            // only keeps extreme inputs finite).
-            Transform::Log1p => x.clamp(-0.999_999_f64, 1.0e9_f64)?.log1p(),
-            // Signed sqrt: sign(x) · √|x|.
-            Transform::Sqrt => {
-                let sign = x.data().sign()?;
-                let abs_sqrt = x.data().abs()?.sqrt()?;
-                let out = sign.mul(&abs_sqrt)?;
-                Ok(Variable::new(out, false))
-            }
-            Transform::Clamp => x.clamp(-1.0_f64, 1.0_f64),
-            Transform::Sign => x.sign(),
-            // Divide-safe: sign-preserving, |x| clamped above 1e-6.
-            Transform::Reciprocal => {
-                let sign = x.data().sign()?;
-                let abs = x.data().abs()?.clamp_min(1e-6_f64)?;
-                let inv = abs.reciprocal()?;
-                let out = sign.mul(&inv)?;
-                Ok(Variable::new(out, false))
-            }
-            // Rail the input: e^x overflows quickly; ±10 (e^10 ≈ 22026)
-            // keeps every finite input finite.
-            Transform::Exp => x.clamp(-10.0_f64, 10.0_f64)?.exp(),
-        }
-    }
-
-    /// The `Display`-form label (config pools / topology JSON are strings).
-    pub fn label(&self) -> &'static str {
-        match self {
-            Transform::Log1p => "log1p",
-            Transform::Sqrt => "sqrt",
-            Transform::Clamp => "clamp",
-            Transform::Sign => "sign",
-            Transform::Reciprocal => "reciprocal",
-            Transform::Exp => "exp",
-        }
-    }
-}
 
 /// A node in the computational graph: receives tensors, transforms them,
 /// applies an activation, exposes outputs. Invariants live in `Topology::validate`.
@@ -390,10 +308,20 @@ pub struct Node {
     /// activation (`None` = inherit the graph's `standardize_op`).
     #[serde(default)]
     pub standardize: Option<StandardizeOp>,
-    /// Per-node feature transform (see [`Transform`]) after standardize, before
-    /// activation; `None` = identity, and serde default keeps old JSON loadable.
+    /// Per-output-port **feature masks** over the raw input features — the feature
+    /// split. Input nodes only (`validate()` enforces it). Entry `i` belongs to
+    /// output port `i`: `1` keeps that feature, `0` hides it, so port `i` carries
+    /// `Linear(input ⊙ mask_i)` — one weight matrix with its input columns gated
+    /// per port, which is how one node can see features `{0,1}` while another sees
+    /// `{2,3,4}`. `None` (the default) is today's behaviour: every port clones the
+    /// single mixed vector. An all-zero mask is a port with no features at all —
+    /// it emits the layer's bias alone (see `assign_feature_masks`).
+    ///
+    /// Masks are bound to the port count, so `Topology::finalize` **drops** them: any
+    /// rebuild re-wires and may re-count the ports, and the engine re-derives masks
+    /// from the run's policy right after finalizing.
     #[serde(default)]
-    pub transform: Option<Transform>,
+    pub feature_masks: Option<Vec<Vec<u8>>>,
 }
 
 /// The role a node plays — where it sits in the forward pass, and its ports.
@@ -401,7 +329,7 @@ pub struct Node {
 pub enum NodeKind {
     /// Start of the network: no inputs, feeds the rest.
     Input,
-    /// Middle of the network: combine → transform → pass on.
+    /// Middle of the network: combine → pass on.
     Hidden,
     /// End of the network: its output becomes the network output.
     Output,
@@ -420,7 +348,7 @@ impl Node {
             port_activations: None,
             combine_op: None,
             standardize: None,
-            transform: None,
+            feature_masks: None,
         }
     }
 
@@ -436,7 +364,7 @@ impl Node {
             port_activations: None,
             combine_op: None,
             standardize: None,
-            transform: None,
+            feature_masks: None,
         }
     }
 
@@ -452,7 +380,7 @@ impl Node {
             port_activations: None,
             combine_op: None,
             standardize: None,
-            transform: None,
+            feature_masks: None,
         }
     }
 
@@ -465,12 +393,6 @@ impl Node {
     /// Set combine-op override (builder style).
     pub fn with_combine_op(mut self, combine_op: CombineOp) -> Self {
         self.combine_op = Some(combine_op);
-        self
-    }
-
-    /// Set per-node elementwise feature transform (builder style).
-    pub fn with_transform(mut self, transform: Transform) -> Self {
-        self.transform = Some(transform);
         self
     }
 
@@ -494,6 +416,23 @@ impl Node {
             .as_ref()
             .and_then(|v| v.get(i).copied())
             .unwrap_or(self.activation)
+    }
+
+    /// Set per-output-port feature masks (builder style). Empty = no split at all;
+    /// otherwise the outer length must be `num_outputs` and every mask
+    /// `input_dim` long — `validate()` enforces both.
+    pub fn with_feature_masks(mut self, masks: Vec<Vec<u8>>) -> Self {
+        self.feature_masks = if masks.is_empty() { None } else { Some(masks) };
+        self
+    }
+
+    /// The feature mask carried by output port `i`, if this node has one. `None`
+    /// means the port is unmasked and carries the shared mixed vector.
+    pub fn port_feature_mask(&self, i: usize) -> Option<&[u8]> {
+        self.feature_masks
+            .as_ref()
+            .and_then(|v| v.get(i))
+            .map(|m| m.as_slice())
     }
 }
 
@@ -634,110 +573,6 @@ mod tests {
         assert!((r10[6] - r10[0]).abs() < 1e-4);
     }
 
-    #[test]
-    fn transform_ops_are_pure_and_bounded() {
-        let x = flodl::Tensor::from_f32(
-            &[0.0, 1.0, -2.0, 100.0, -100.0, 3.0],
-            &[2, 3],
-            flodl::Device::CPU,
-        )
-        .unwrap();
-        let x = flodl::Variable::new(x, false);
-
-        // log1p: clamped domain, ln(1+x) for the safe parts.
-        let l = Transform::Log1p
-            .apply(&x)
-            .unwrap()
-            .data()
-            .to_f32_vec()
-            .unwrap();
-        assert!((l[0] - 0.0).abs() < 1e-6); // ln(1)
-        assert!((l[1] - 2.0_f32.ln()).abs() < 1e-5); // ln(3)?? no — row flat
-        assert!(!l.iter().any(|v| v.is_nan()), "log1p must never NaN");
-
-        // Sign: exactly {-1, 0, 1}.
-        let s = Transform::Sign
-            .apply(&x)
-            .unwrap()
-            .data()
-            .to_f32_vec()
-            .unwrap();
-        assert_eq!(s, vec![0.0, 1.0, -1.0, 1.0, -1.0, 1.0]);
-
-        // Clamp: rails at ±1.
-        let c = Transform::Clamp
-            .apply(&x)
-            .unwrap()
-            .data()
-            .to_f32_vec()
-            .unwrap();
-        assert_eq!(c, vec![0.0, 1.0, -1.0, 1.0, -1.0, 1.0]);
-
-        // Sqrt: signed root of |x|.
-        let sq = Transform::Sqrt
-            .apply(&x)
-            .unwrap()
-            .data()
-            .to_f32_vec()
-            .unwrap();
-        assert!((sq[0] - 0.0).abs() < 1e-6);
-        assert!((sq[1] - 1.0).abs() < 1e-6);
-        assert!((sq[2] + 2.0_f32.sqrt()).abs() < 1e-6);
-        assert!((sq[3] - 10.0).abs() < 1e-5);
-
-        // Reciprocal: never overflows even at x→0 (guard clamps |x| ≥ 1e-6).
-        let r = Transform::Reciprocal
-            .apply(&x)
-            .unwrap()
-            .data()
-            .to_f32_vec()
-            .unwrap();
-        assert!(
-            r[0].abs() <= 1e6 + 1.0,
-            "guarded 1/0 must be finite (got {})",
-            r[0]
-        );
-        assert!((r[1] - 1.0).abs() < 1e-5);
-        assert!((r[2] + 0.5).abs() < 1e-6);
-
-        // Exp: input railed at ±10, output always finite.
-        let e = Transform::Exp
-            .apply(&x)
-            .unwrap()
-            .data()
-            .to_f32_vec()
-            .unwrap();
-        assert!(!e.iter().any(|v| v.is_infinite() || v.is_nan()));
-        assert!((e[0] - 1.0).abs() < 1e-6); // e^0
-        assert!((e[4] - (-100.0_f32).exp().min(10.0_f32.exp())).abs() < 1e-3);
-
-        // Purity: applying twice gives identical values (replay contract).
-        let twice = Transform::Sign
-            .apply(&Transform::Sign.apply(&x).unwrap())
-            .unwrap()
-            .data()
-            .to_f32_vec()
-            .unwrap();
-        assert_eq!(s, twice);
-    }
-
-    #[test]
-    fn node_transform_survives_json_roundtrip() {
-        let node = Node::new_hidden(1, 2, 2).with_transform(Transform::Log1p);
-        assert_eq!(node.transform, Some(Transform::Log1p));
-        let json = serde_json::to_string(&node).unwrap();
-        let back: Node = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.transform, Some(Transform::Log1p));
-        // Legacy topology JSON (no `transform` field) loads as None.
-        let legacy = serde_json::json!({
-            "id": 1, "num_inputs": 2, "num_outputs": 2, "kind": "Hidden",
-            "hidden_dim": null, "activation": "Identity",
-            "port_activations": null, "combine_op": null, "standardize": null,
-        });
-        let old: Node = serde_json::from_value(legacy).unwrap();
-        assert_eq!(old.transform, None, "serde default keeps old JSON loadable");
-    }
-
     /// Arbitrary valid node metadata (port counts, kind, id).
     fn node_strategy() -> impl Strategy<Value = Node> {
         (0usize..100, 0usize..8, 0usize..8, 0usize..3).prop_map(
@@ -755,7 +590,7 @@ mod tests {
                 port_activations: None,
                 combine_op: None,
                 standardize: None,
-                transform: None,
+                feature_masks: None,
             },
         )
     }

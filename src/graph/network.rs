@@ -97,6 +97,10 @@ pub struct Network {
     pub(crate) port_projections: Vec<Vec<Vec<Option<Linear>>>>,
     /// Per-node dropout layer (None when dropout_prob == 0 or non-hidden node).
     pub(crate) dropout_layers: Vec<Option<flodl::nn::Dropout>>,
+    /// Per-node, per-port feature masks (the feature split), as constant 0/1
+    /// `[1, input_dim]` tensors shaped for broadcasting over the input batch.
+    /// `None` = the port is unmasked. Only Input nodes ever carry one.
+    pub(crate) port_masks: Vec<Vec<Option<Tensor>>>,
 }
 
 /// Intermediate build state from `prepare_build`: the seeded RNG plus the
@@ -153,6 +157,10 @@ impl Network {
         // Step 4: Per-hidden-node regularization
         let dropout_layers = Self::build_dropout_layers(graph, opts);
 
+        // Step 4b: Per-port feature masks (the feature split; empty unless the
+        // topology carries them). Constants — no parameters, nothing exported.
+        let port_masks = Self::build_port_masks(graph, opts)?;
+
         // Step 5: Construct the Network struct
         Self::assemble(
             graph,
@@ -161,6 +169,7 @@ impl Network {
             layers,
             port_projections,
             dropout_layers,
+            port_masks,
         )
     }
 
@@ -270,6 +279,48 @@ impl Network {
             .collect()
     }
 
+        /// Step 4b: Per-port feature masks as constant 0/1 tensors. A mask is stored
+        /// as one row (`[1, input_dim]`) so it broadcasts over the input batch, and it
+        /// carries no parameters — the split costs no exported tensors.
+    fn build_port_masks(
+        graph: &Topology,
+        opts: &NetworkOptions,
+    ) -> flodl::tensor::Result<Vec<Vec<Option<Tensor>>>> {
+        let d = graph.options.input_dim.unwrap_or(1) as i64;
+        graph
+            .nodes
+            .iter()
+            .map(|node| {
+                (0..node.num_outputs.max(1))
+                    .map(|p| {
+                        let Some(mask) = node.port_feature_mask(p) else {
+                            return Ok(None);
+                        };
+                        let t = match opts.dtype {
+                            DType::Float64 => Tensor::from_f64(
+                                &mask
+                                    .iter()
+                                    .map(|b| if *b == 0 { 0.0 } else { 1.0 })
+                                    .collect::<Vec<f64>>(),
+                                &[1, d],
+                                opts.device,
+                            )?,
+                            _ => Tensor::from_f32(
+                                &mask
+                                    .iter()
+                                    .map(|b| if *b == 0 { 0.0 } else { 1.0 })
+                                    .collect::<Vec<f32>>(),
+                                &[1, d],
+                                opts.device,
+                            )?,
+                        };
+                        Ok(Some(t))
+                    })
+                    .collect::<flodl::tensor::Result<Vec<_>>>()
+            })
+            .collect()
+    }
+
     /// Step 6: Construct the Network struct from all built pieces.
     fn assemble(
         graph: &Topology,
@@ -278,6 +329,7 @@ impl Network {
         layers: Vec<Linear>,
         port_projections: Vec<Vec<Vec<Option<Linear>>>>,
         dropout_layers: Vec<Option<flodl::nn::Dropout>>,
+        port_masks: Vec<Vec<Option<Tensor>>>,
     ) -> flodl::tensor::Result<Network> {
         let topo = &graph.options;
         let output_node = graph.nodes.len() - 1;
@@ -302,6 +354,7 @@ impl Network {
             output_node,
             port_projections,
             dropout_layers,
+            port_masks,
         })
     }
 
@@ -509,15 +562,6 @@ impl Network {
         }
     }
 
-    /// Step 5b: Apply the node's elementwise feature transform
-    /// ([`Transform`], or identity when unset).
-    fn transform(&self, node_id: usize, x: Variable) -> flodl::tensor::Result<Variable> {
-        match self.nodes[node_id].transform {
-            Some(t) => t.apply(&x),
-            None => Ok(x),
-        }
-    }
-
         /// Step 6: apply dropout (hidden nodes only, training mode only) to the node's
         /// SHARED base tensor — one mask draw per node, so replay determinism holds.
     fn apply_dropout(&self, node_id: usize, x: Variable) -> flodl::tensor::Result<Variable> {
@@ -721,7 +765,7 @@ impl Network {
 
 impl Module for Network {
         /// Execute the graph on an input tensor: input → project → [gather → combine →
-        /// transform → per-port activate] × N nodes → output.
+        /// per-port activate] × N nodes → output.
     fn forward(&self, input: &Variable) -> flodl::tensor::Result<Variable> {
             // Per-port outputs, keyed by (node_id, port_index); consumers look up the
             // exact port they are wired to.
@@ -736,19 +780,29 @@ impl Module for Network {
             } else {
                 let gathered = self.gather_inputs(&port_outputs, node_id)?;
                 let combined = self.combine_inputs(gathered, &port_outputs, node_id)?;
-                let transformed = self.layers[node_id].forward(&combined)?;
-                    // Standardize + transform + dropout BEFORE the port split, so every
-                    // port sees the same tensor and the mask draw is one-per-node.
-                let standardized = self.standardize(node_id, transformed)?;
-                let transformed = self.transform(node_id, standardized)?;
-                self.apply_dropout(node_id, transformed)?
+                let projected = self.layers[node_id].forward(&combined)?;
+                    // Standardize + dropout BEFORE the port split, so every port sees
+                    // the same tensor and the mask draw is one-per-node.
+                let standardized = self.standardize(node_id, projected)?;
+                self.apply_dropout(node_id, standardized)?
             };
 
                 // Per-port activation: port i applies its own non-linearity to the shared
                 // base; port 0 conventionally mirrors the node-level activation.
             if self.nodes[node_id].kind == crate::graph::node::NodeKind::Input {
                 for o in 0..self.nodes[node_id].num_outputs.max(1) {
-                    port_outputs.insert((node_id, o), base.clone());
+                        // Feature split: a port carrying a mask gets the projection of the
+                        // MASKED raw input — the same weight matrix with its input columns
+                        // gated — so different ports see different feature subsets. A port
+                        // with no mask reuses the shared base, exactly as before.
+                    let out = match self.port_masks[node_id].get(o).and_then(|m| m.as_ref()) {
+                        Some(mask) => {
+                            let gated = Variable::new(input.data().mul(mask)?, false);
+                            self.layers[node_id].forward(&gated)?
+                        }
+                        None => base.clone(),
+                    };
+                    port_outputs.insert((node_id, o), out);
                 }
             } else {
                 for o in 0..self.nodes[node_id].num_outputs.max(1) {
@@ -1285,5 +1339,66 @@ mod var_dim_test {
             prop_assert_eq!(out.shape()[0], bs as i64);
             prop_assert_eq!(out.shape()[1], topo.options.output_dim.unwrap_or(1) as i64);
         }
+    }
+
+    #[test]
+    fn test_feature_mask_hides_a_feature_from_every_port() {
+            // Feature 0 is masked out on EVERY Input port, so no wire in the graph can
+            // carry it: two inputs differing only in feature 0 must give identical
+            // outputs. The unmasked control proves the assertion cannot pass by accident.
+        let opts = crate::graph::topology::TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let mut graph = Topology::new(7, Some(opts));
+        graph.create_random_hidden_nodes(3);
+        graph.finalize();
+
+        let input_idx = graph
+            .nodes
+            .iter()
+            .position(|n| n.kind == crate::graph::node::NodeKind::Input)
+            .unwrap();
+        let n_ports = graph.nodes[input_idx].num_outputs.max(1);
+        graph.nodes[input_idx].feature_masks = Some(vec![vec![0u8, 1, 1, 1]; n_ports]);
+
+        let net = Network::build(&graph, Device::CPU).unwrap();
+        let a = Variable::new(
+            Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4], Device::CPU).unwrap(),
+            false,
+        );
+        let b = Variable::new(
+                // differs ONLY in feature 0 — the masked one
+            Tensor::from_f32(&[9.0, 2.0, 3.0, 4.0], &[1, 4], Device::CPU).unwrap(),
+            false,
+        );
+        let spread = |net: &Network| {
+            net.forward(&a)
+                .unwrap()
+                .data()
+                .sub(&net.forward(&b).unwrap().data())
+                .unwrap()
+                .abs()
+                .unwrap()
+                .sum()
+                .unwrap()
+                .item()
+                .unwrap() as f32
+        };
+
+        let masked_spread = spread(&net);
+        assert!(
+            masked_spread < 1e-6,
+            "a feature masked out of every port must not reach the output (spread {masked_spread})"
+        );
+
+        graph.nodes[input_idx].feature_masks = None;
+        let unmasked = Network::build(&graph, Device::CPU).unwrap();
+        let unmasked_spread = spread(&unmasked);
+        assert!(
+            unmasked_spread > 1e-6,
+            "control: without masks the same net DOES see feature 0 (spread {unmasked_spread})"
+        );
     }
 }

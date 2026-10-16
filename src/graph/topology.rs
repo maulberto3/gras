@@ -97,6 +97,22 @@ impl std::hash::Hash for TopologyOptions {
     }
 }
 
+/// How a run draws the Input node's per-port feature masks — the feature split.
+/// Stored on the engine config, never in a blueprint: the masks themselves are
+/// genome (they live in [`Node::feature_masks`]), and this only says how they are
+/// generated. `None` on the config = no split at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeatureSplitPolicy {
+    /// **Exclusive** — every feature lands in exactly one port (a true partition):
+    /// drawn as "each feature picks one random port". Nothing is dropped and
+    /// nothing is duplicated, so no two branches can see the same feature. The
+    /// split is uneven by construction, and a port may end up with no features.
+    Exclusive,
+    /// **Random** — every port flips an independent `p = 0.5` coin per feature.
+    /// A feature can land in several ports, and some features may go unused.
+    Random,
+}
+
 impl Default for TopologyOptions {
     fn default() -> Self {
         TopologyOptions {
@@ -233,6 +249,46 @@ impl Topology {
         }
     }
 
+        /// Assign per-output-port feature masks to the Input node from `policy` —
+        /// the feature split. MUST run **after** `finalize()`: the Input node's port
+        /// count is final only once `trim_orphaned_ports` compacted it (the same rule
+        /// `assign_port_activations` follows), and `finalize` drops any masks from a
+        /// previous build rather than let a stale port count through.
+    pub fn assign_feature_masks(&mut self, policy: FeatureSplitPolicy) {
+        let input_dim = self.options.input_dim.unwrap_or(1);
+        let Some(input) = self.nodes.iter().position(|n| n.kind == NodeKind::Input) else {
+            return;
+        };
+        let n_ports = self.nodes[input].num_outputs.max(1);
+        if input_dim == 0 {
+            return;
+        }
+        let mut masks = vec![vec![0u8; input_dim]; n_ports];
+        match policy {
+            FeatureSplitPolicy::Exclusive => {
+                    // Each feature picks one random port: by construction every feature is
+                    // placed exactly once and none is shared. Naturally uneven, and a port
+                    // can end up empty (it then emits only the shared bias).
+                let owners: Vec<usize> = (0..input_dim)
+                    .map(|_| self.rng.usize(0..n_ports))
+                    .collect();
+                for (feat, &port) in owners.iter().enumerate() {
+                    masks[port][feat] = 1;
+                }
+            }
+            FeatureSplitPolicy::Random => {
+                    // Independent coin flip per (port, feature): overlaps allowed, and some
+                    // features may go unused.
+                for mask in masks.iter_mut() {
+                    for slot in mask.iter_mut() {
+                        *slot = u8::from(self.rng.f32() < 0.5);
+                    }
+                }
+            }
+        }
+        self.nodes[input].feature_masks = Some(masks);
+    }
+
         /// Assign every hidden node a random activation from `pool` (Input/Output stay
         /// `Identity`). Refresh the port labels (`n1_i0`, `n2_o3`, …) for printing.
     pub fn renumber_ids(&mut self) {
@@ -261,6 +317,18 @@ impl Topology {
         /// dangling outputs — one call turns a pile of nodes into a complete graph.
     pub fn finalize(&mut self) {
         self.connections.clear();
+
+            // Feature masks are bound to the Input node's port COUNT, and this rebuild
+            // re-wires and re-counts those ports (`set_input_fanout` can raise the count,
+            // `trim_orphaned_ports` compacts it). A mask from before the rebuild can
+            // therefore have the wrong length — which `validate` rightly refuses, and
+            // since `finalize` validates, that would panic. Crossover re-finalizes both
+            // parents, and those parents already carry masks, so this is a real path.
+            // Dropping them here loses nothing: every creation path re-derives masks from
+            // the run's policy AFTER `finalize` (`assign_feature_masks`).
+        for node in &mut self.nodes {
+            node.feature_masks = None;
+        }
 
         // Step 1: build_skeleton — ensure Input + Output nodes exist
         self.ensure_scaffold();
@@ -487,6 +555,34 @@ impl Topology {
                 {
                     return Err(TopologyError::InvalidOptions(format!(
                         "node n{i} is an Input node — its ports must stay Identity"
+                    )));
+                }
+            }
+            // Feature masks (the feature split): Input nodes only, one mask per
+            // output port, each `input_dim` wide and 0/1-valued.
+            if let Some(masks) = &node.feature_masks {
+                if node.kind != NodeKind::Input {
+                    return Err(TopologyError::InvalidOptions(format!(
+                        "node n{i} carries feature masks but is not an Input node"
+                    )));
+                }
+                let d = self.options.input_dim.unwrap_or(1);
+                if masks.len() != node.num_outputs {
+                    return Err(TopologyError::InvalidOptions(format!(
+                        "node n{i} has {} feature masks but {} output ports",
+                        masks.len(),
+                        node.num_outputs
+                    )));
+                }
+                if let Some(bad) = masks.iter().position(|m| m.len() != d) {
+                    return Err(TopologyError::InvalidOptions(format!(
+                        "node n{i} port {bad} carries a {}-entry feature mask but input_dim is {d}",
+                        masks[bad].len()
+                    )));
+                }
+                if masks.iter().flatten().any(|b| *b > 1) {
+                    return Err(TopologyError::InvalidOptions(format!(
+                        "node n{i} feature masks must be 0/1"
                     )));
                 }
             }
@@ -2030,5 +2126,173 @@ mod fanout_bounds_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn exclusive_feature_masks_partition_without_sharing() {
+            // Exclusive is a true partition: every feature lands in exactly one port, so
+            // no two branches can ever see the same feature.
+        let opts = TopologyOptions {
+            input_dim: Some(6),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let mut g = Topology::new(11, Some(opts));
+        g.create_random_hidden_nodes(4);
+        g.finalize();
+        g.assign_feature_masks(FeatureSplitPolicy::Exclusive);
+
+        let input = g.nodes.iter().find(|n| n.kind == NodeKind::Input).unwrap();
+        let masks = input.feature_masks.as_ref().expect("masks assigned");
+        assert_eq!(masks.len(), input.num_outputs, "one mask per output port");
+        for feat in 0..6 {
+            let owners = masks.iter().filter(|m| m[feat] == 1).count();
+            assert_eq!(owners, 1, "feature {feat} must belong to exactly one port");
+        }
+        let placed: usize = masks
+            .iter()
+            .map(|m| m.iter().filter(|b| **b == 1).count())
+            .sum();
+        assert_eq!(placed, 6, "every feature is used exactly once");
+    }
+
+    #[test]
+    fn random_feature_masks_are_per_port_and_may_overlap() {
+            // Random flips an independent coin per (port, feature): no exclusivity, so the
+            // only guarantees are the shape and that it is not degenerate.
+        let opts = TopologyOptions {
+            input_dim: Some(8),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let mut g = Topology::new(3, Some(opts));
+        g.create_random_hidden_nodes(6);
+        g.finalize();
+        g.assign_feature_masks(FeatureSplitPolicy::Random);
+
+        let input = g.nodes.iter().find(|n| n.kind == NodeKind::Input).unwrap();
+        let masks = input.feature_masks.as_ref().expect("masks assigned");
+        assert_eq!(masks.len(), input.num_outputs);
+        assert!(masks.iter().all(|m| m.len() == 8), "every mask spans input_dim");
+        assert!(masks.iter().flatten().all(|b| *b <= 1), "masks are 0/1");
+        let ones: usize = masks
+            .iter()
+            .map(|m| m.iter().filter(|b| **b == 1).count())
+            .sum();
+        assert!(
+            ones > 0 && ones < masks.len() * 8,
+            "random masks should be mixed, got {ones} ones"
+        );
+    }
+
+    #[test]
+    fn feature_masks_are_refused_off_the_input_node_and_at_the_wrong_width() {
+        let opts = TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+            // Wrong width: a mask must span exactly `input_dim`.
+        let mut g = Topology::new(5, Some(opts));
+        g.create_random_hidden_nodes(2);
+        g.finalize();
+        let idx = g
+            .nodes
+            .iter()
+            .position(|n| n.kind == NodeKind::Input)
+            .unwrap();
+        let ports = g.nodes[idx].num_outputs.max(1);
+        g.nodes[idx].feature_masks = Some(vec![vec![1u8, 0u8]; ports]); // 2 entries, not 4
+        assert!(
+            g.validate().is_err(),
+            "a feature mask of the wrong width must be refused"
+        );
+
+            // Masks on a non-Input node: the split is an Input-side feature.
+        let mut g2 = Topology::new(5, Some(opts));
+        g2.create_random_hidden_nodes(2);
+        g2.finalize();
+        let hidden = g2
+            .nodes
+            .iter()
+            .position(|n| n.kind == NodeKind::Hidden)
+            .unwrap();
+        g2.nodes[hidden].feature_masks = Some(vec![vec![1u8; 4]]);
+        assert!(
+            g2.validate().is_err(),
+            "only Input nodes may carry feature masks"
+        );
+    }
+
+    #[test]
+    fn finalize_drops_masks_instead_of_letting_a_stale_count_panic() {
+            // Crossover re-finalizes both parents, and those parents already carry masks
+            // from their own build. A mask sized for the OLD port count must never reach
+            // `validate` — finalize drops it, and the engine re-derives right after.
+        let opts = TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let mut g = Topology::new(13, Some(opts));
+        g.create_random_hidden_nodes(3);
+        g.finalize();
+        g.assign_feature_masks(FeatureSplitPolicy::Exclusive);
+        assert!(
+            g.nodes.iter().any(|n| n.feature_masks.is_some()),
+            "the split must actually be present before the rebuild"
+        );
+
+            // The rebuild itself: it must not panic on the stale masks.
+        g.finalize();
+        assert!(
+            g.nodes.iter().all(|n| n.feature_masks.is_none()),
+            "finalize must drop port-count-bound masks"
+        );
+
+            // And re-deriving immediately afterwards is the engine's flow — it must validate.
+        g.assign_feature_masks(FeatureSplitPolicy::Exclusive);
+        g.validate().expect("re-derived masks must validate");
+    }
+
+    #[test]
+    fn feature_masks_survive_the_blueprint_round_trip() {
+            // The split is genome, so the masks must come back identical from the
+            // blueprint JSON — that file (not the weights) is also the Python side of
+            // the contract, so the field has to travel.
+        let opts = TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let mut g = Topology::new(9, Some(opts));
+        g.create_random_hidden_nodes(2);
+        g.finalize();
+        g.assign_feature_masks(FeatureSplitPolicy::Random);
+
+        let json = g.to_json().unwrap();
+        assert!(
+            json.contains("feature_masks"),
+            "the field must be part of the blueprint"
+        );
+        let back: Topology = serde_json::from_str(&json).unwrap();
+        let idx = back
+            .nodes
+            .iter()
+            .position(|n| n.kind == NodeKind::Input)
+            .unwrap();
+        assert_eq!(
+            back.nodes[idx].feature_masks, g.nodes[idx].feature_masks,
+            "masks must round-trip byte for byte"
+        );
+
+            // Old JSON predates the field: it must load as "no split".
+        let legacy: Node = serde_json::from_value(serde_json::json!({
+            "id": 0, "num_inputs": 0, "num_outputs": 2, "kind": "Input",
+            "hidden_dim": null, "activation": "Identity",
+            "port_activations": null, "combine_op": null, "standardize": null,
+        }))
+        .unwrap();
+        assert_eq!(legacy.feature_masks, None, "serde default keeps old JSON loadable");
     }
 }
