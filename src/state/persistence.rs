@@ -19,7 +19,7 @@ use flodl::tensor::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::config::RaceConfig;
-use crate::engine::fitness::{Direction, FitnessLabel, Metric};
+use crate::utils::fitness::{Direction, FitnessLabel, Metric};
 use crate::graph::topology::{Topology, TopologyOptions};
 use crate::utils::error::EngineError;
 use crate::utils::seed::topo_hash;
@@ -1258,7 +1258,7 @@ pub fn remove_net_state(dir: &Path, hash: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::fitness::{Direction, FitnessLabel};
+    use crate::utils::fitness::{Direction, FitnessLabel};
     use crate::graph::topology::TopologyOptions;
     use std::path::PathBuf;
 
