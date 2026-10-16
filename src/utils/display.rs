@@ -11,6 +11,7 @@ use std::fmt::Display;
 use crate::engine::fitness::{Direction, FitnessLabel};
 use crate::evolution::crossover::CrossoverMethod;
 use crate::evolution::mutation::MutationMethod;
+use crate::graph::topology::FeatureSplitPolicy;
 use crate::evolution::selection::SelectionMethod;
 use crate::graph::network::NetworkOptions;
 use crate::graph::node::{Activation, Node};
@@ -114,20 +115,6 @@ impl Display for crate::graph::node::StandardizeOp {
     }
 }
 
-impl Display for crate::graph::node::Transform {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            crate::graph::node::Transform::Log1p => "log1p",
-            crate::graph::node::Transform::Sqrt => "sqrt",
-            crate::graph::node::Transform::Clamp => "clamp",
-            crate::graph::node::Transform::Sign => "sign",
-            crate::graph::node::Transform::Reciprocal => "reciprocal",
-            crate::graph::node::Transform::Exp => "exp",
-        };
-        write!(f, "{name}")
-    }
-}
-
 impl Display for FitnessLabel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -197,12 +184,18 @@ impl Display for MutationMethod {
             MutationMethod::Standardize { prob } => {
                 write!(f, "mut_standardize(p={:.0}%)", prob * 100.0)
             }
-            MutationMethod::Transform { prob } => {
-                write!(f, "mut_transform(p={:.0}%)", prob * 100.0)
-            }
             MutationMethod::PortActivation { prob } => {
                 write!(f, "mut_port_activation(p={:.0}%)", prob * 100.0)
             }
+        }
+    }
+}
+
+impl Display for FeatureSplitPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeatureSplitPolicy::Exclusive => write!(f, "split_exclusive"),
+            FeatureSplitPolicy::Random => write!(f, "split_random"),
         }
     }
 }
