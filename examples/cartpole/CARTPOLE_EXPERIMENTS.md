@@ -3,7 +3,8 @@
 *Everything in this file was implemented, run, measured, and **removed** from
 `examples/cartpole.rs`. The engine's `RlStep::pop_phase` hook that this work
 motivated **stays** — it is generic infrastructure (a pop-wide phase before
-the per-net steps). The schemes tried on top of it failed. Here is the record.*
+the per-net steps, now opt-in via `wants_pop_phase`). The schemes tried on top
+of it failed. Here is the record.*
 
 ## The question
 
@@ -129,7 +130,9 @@ with it.
 ## What survived into the codebase
 
 - `RlStep::pop_phase` — the pop-wide phase hook in the engine (generic, no-op
-  by default; the referee idea fits here).
+  by default; the referee idea fits here). A scheme opts in by also returning
+  `true` from `wants_pop_phase` — the engine asks that BEFORE gathering the
+  live-net slice, so unused it costs nothing.
 - The "N-inits per individual" TODO item (the *principled* version of
   averaging across inits — across generations, not within a step).
 - The ghost-file engine fix and the Ctrl+C graceful shutdown (both born from

@@ -19,6 +19,9 @@
 mod cartpole_tests;
 
 use fastrand::Rng;
+// Not in the prelude: the engine's own durability-tick default, cited by the config
+// chain below so the showcased value can't drift from the engine's.
+use gras::engine::config::DEFAULT_CHECKPOINT_EVERY;
 use gras::prelude::*;
 /// One played turn: the observation, and the action taken from it.
 type Transition = ([f32; 4], usize);
@@ -553,8 +556,9 @@ fn main() {
     const LOG_LEVEL: LogLevel = LogLevel::Summ;
 
     let cli = <Cli as clap::Parser>::parse();
+    // The roll counts and the elite count are sized off the live population.
     let pop = cli.pop.unwrap_or(POP);
-    let race_steps = cli.max_steps.unwrap_or(RACE_STEPS);
+
     // A fresh seed per launch unless `--seed` pins it (engine reproducibility
     // is a property of a fixed seed, not of the example's default).
     let run_seed = cli.seed.unwrap_or_else(|| fastrand::u64(..));
@@ -566,6 +570,7 @@ fn main() {
         .as_deref()
         .and_then(LogLevel::parse_verbose)
         .unwrap_or((LOG_LEVEL, None));
+    
     // Install the run's log sinks — without this the console stays silent and
     // the run LOOKS hung while the race grinds.
     gras::engine::logging::init(log_level, log_verbosity);
@@ -578,48 +583,60 @@ fn main() {
     let config = rl_race_config_builder()
         .set_run_name("cartpole")
         .set_run_log_level(log_level)
+        .set_run_checkpoint_every(DEFAULT_CHECKPOINT_EVERY) // 10 — the durability tick
+        .set_run_csv_export(true) // history.csv + attempts.csv
         // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
-        .set_run_pop_size(pop)
+        .set_run_pop_size(cli.pop.unwrap_or(POP))
         .set_run_smoothing_window(10)
         .set_run_risk_aversion(cli.risk_aversion.unwrap_or(RISK_AVERSION))
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra history.csv column
-        .set_stop_max_steps(Some(race_steps))
+        .set_stop_max_steps(Some(cli.max_steps.unwrap_or(RACE_STEPS)))
         // .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
-        // .set_pruner_{enabled,method,steps}(..) · .set_run_topologies(vec![])
-        // .set_elite_previous_load(false)
+        // .set_pruner_{enabled,method,steps}(..) · 
+        // .set_run_topologies(vec![])
         .set_crossover_rolls(pop / 10)
+        .set_crossover_prob(0.5)
+        .set_crossover_cull_policy(CrossCullPolicy::Worst)
+        .set_crossover_probation_steps(5)
         // .set_crossover_ops_pool(["uniform"]) // if not specified, use all
         .set_mutation_cull_policy(MutationCullPolicy::Worst)
         .set_mutate_rolls(pop / 20)
+        .set_mutate_prob(0.5)
+        .set_mutation_probation_steps(5)
         .set_topology_dropout_prob(DROPOUT_PROB)
+        .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(15)
+        .set_topology_min_inputs_per_node(2)
         .set_topology_max_inputs_per_node(15)
         .set_topology_max_outputs_per_node(15)
+        .set_topology_min_outputs_per_node(2)
         .set_topology_input_dim(4)
         .set_topology_output_dim(2)
         .set_topology_hidden_dim_range(16, 64)
-        .set_topology_combine_op_pool([
-            "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
-        ])
-        // Feature split: every Input port keeps an independent ~half of the 4 cart
-        // features (p = 0.5), so branches specialise on different feature subsets.
-        // NOTE: `Exclusive` is the wrong tool at this width — it places each of the 4
-        // features in exactly one port, so with up to 15 hidden nodes most would get no
-        // features at all and emit only their bias.
-        .set_topology_feature_split(FeatureSplitPolicy::Random)
-        // .set_topology_feature_split(FeatureSplitPolicy::Exclusive)
-        // .set_topology_activation_pool(["ReLU", "Tanh", …]) — evolve activations
-        // .set_topology_standardize_op_pool(["LayerNorm", …]) — per-node norm ops
+        .set_topology_hidden_dim_stride(16)
+        // .set_topology_combine_op_pool([
+        //     "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
+        // ])
+        // .set_topology_activation_pool(["ReLU", "Tanh", …]) // if not specified, use all
+        // .set_topology_standardize_op_pool(["LayerNorm", …]) // if not specified, use all
+        .set_topology_feature_split(FeatureSplitPolicy::Random) // Other one Exclusive
         .set_elite_count(pop / 20)
-        // Topology-only run: NO weight files are written at all, and this example
-        // needs none — the guardrail re-tests the LIVE champion in memory. Turn
-        // these on only if a later tool must load the trained net.
         // .set_elite_previous_dir("assets/1790920031289_500")
-        // .set_elite_previous_load(false)
+        // .set_elite_previous_load(false) // on by default
         .set_elite_save_safetensors(false)
         .set_elite_checkpoint_weights(false)
-        .set_worst_save_topology(true)
         .set_elite_guardrail_matches(GUARDRAIL_MATCHES)
+        .set_elite_freeze(true) // frozen elites still score, rank and sire
+        .set_elite_join_probation_steps(5) // age before a net may join the elite set
+        .set_elite_crown_lifetime_steps(5) // how long the frozen crown may sit at peak
+        .set_elite_save_topology(true) // elite-<hash>.md at stop
+        .set_worst_save_topology(true)
+        .set_worst_save_safetensors(false) // worst-<hash>.safetensors at stop
+        
+        .set_pruner_enabled(false) // no post-race solo-training phase
+        // The mins are `TopologyOptions::default`; the max_* twins above are raised by
+        // this example, so the sampler still varies topology width.
+
         .build();
 
     let fitness = Fitness::reported(Direction::Maximize, "match_survival");
@@ -639,16 +656,6 @@ fn main() {
         None, // run dir: the engine picks results/<timestamp>
     ))
     .expect("engine construction (RL spec)");
-
-    println!("Run Dir: {}", engine.run_dir().display());
-    println!(
-        "Run Seed: {run_seed}{}",
-        if cli.seed.is_some() {
-            " (from --seed)"
-        } else {
-            " (const default)"
-        }
-    );
 
     match engine.run() {
         Ok(reason) => println!("race stopped: {reason:?}"),

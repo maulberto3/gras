@@ -102,7 +102,7 @@ impl Default for TabularTrainer {
     fn default() -> Self {
         Self {
             loss_fn: Box::new(gras::utils::score::cross_entropy_onehot_loss),
-            learning_rate: gras::engine::config::DEFAULT_LR,
+            learning_rate: gras::utils::training::DEFAULT_LR,
             grad_clip: 1.0,
             batch_size: 16,
             eval_batch_size: 16,
