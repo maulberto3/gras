@@ -3,7 +3,7 @@
 //! When the user doesn't call `set_*_pool()` on the engine builder,
 //! these defaults are used to fill the empty pools.
 
-use crate::graph::node::{Activation, CombineOp, StandardizeOp, Transform};
+use crate::graph::node::{Activation, CombineOp, StandardizeOp};
 
 /// All built-in activations.
 pub fn all_activations() -> Vec<Activation> {
@@ -52,15 +52,3 @@ pub fn all_standardize_ops() -> Vec<StandardizeOp> {
     ]
 }
 
-/// All built-in elementwise feature transforms. Opt-in, unlike the other pools:
-/// an unconfigured run draws `None` (identity), keeping old search spaces intact.
-pub fn all_transforms() -> Vec<Transform> {
-    vec![
-        Transform::Log1p,
-        Transform::Sqrt,
-        Transform::Clamp,
-        Transform::Sign,
-        Transform::Reciprocal,
-        Transform::Exp,
-    ]
-}
