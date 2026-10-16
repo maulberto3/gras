@@ -46,7 +46,7 @@
 //! stateful schedule (a counter, an RNG stream) would advance on every
 //! replay and silently break determinism — don't keep one.
 
-use crate::engine::config::run_progress;
+use crate::utils::training::run_progress;
 
 /// The decay shape of the challenge knob: `eff = prob × (1 − progress^k)` — one
 /// closed form so replay/resume re-derive the identical probability.

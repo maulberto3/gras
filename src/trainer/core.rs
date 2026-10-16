@@ -160,7 +160,7 @@ impl StepEnv {
         /// Fraction of the step budget consumed (`0.0` → `1.0`), or `None` when
         /// unbounded — pure arithmetic on the clock, so replays match.
     pub fn progress(&self) -> Option<f32> {
-        crate::engine::config::run_progress(self.step, self.max_steps)
+        crate::utils::training::run_progress(self.step, self.max_steps)
     }
 }
 
@@ -191,9 +191,9 @@ pub struct TabularContext<'a> {
     /// The run's dataset and shared batch stream.
     pub data: RunData<'a>,
     /// The ranking fitness metric (gives the direction and label).
-    pub fitness: &'a crate::engine::fitness::Fitness,
+    pub fitness: &'a crate::utils::fitness::Fitness,
     /// Informative non-ranking metrics configured for the run.
-    pub metrics: &'a [crate::engine::fitness::Metric],
+    pub metrics: &'a [crate::utils::fitness::Metric],
     /// Lightweight snapshot of current run/epoch metadata.
     pub env: StepEnv,
     /// Canonical hash of the net being trained (for logs or tracking).
@@ -207,9 +207,9 @@ pub struct TabularContext<'a> {
 pub struct RlContext<'a> {
     /// The ranking fitness metric (direction + label; the VALUE is the
     /// trainer's to produce in `RlStepReport.fitness`).
-    pub fitness: &'a crate::engine::fitness::Fitness,
+    pub fitness: &'a crate::utils::fitness::Fitness,
     /// Informative non-ranking metrics configured for the run.
-    pub metrics: &'a [crate::engine::fitness::Metric],
+    pub metrics: &'a [crate::utils::fitness::Metric],
     /// Lightweight snapshot of current run/epoch metadata.
     pub env: StepEnv,
     /// Canonical hash of the net being trained (for logs or tracking).
@@ -325,7 +325,17 @@ pub trait RlStep: Send {
 
         /// Pop-wide phase: called ONCE per step with ALL live nets, BEFORE any per-net
         /// `train_step`. Default: no-op; for loop-breaking schemes needing the population.
+        /// A scheme that implements this MUST also return `true` from
+        /// [`Self::wants_pop_phase`], or the engine will never call it.
     fn pop_phase(&mut self, _nets: &mut [(String, &mut Network)], _step: usize) {}
+
+        /// Does this scheme use [`Self::pop_phase`]? The engine asks this BEFORE gathering
+        /// the live-net slice — an O(population) pass per step — so `false` is what keeps a
+        /// scheme that ignores the hook free. Return `true` only alongside a real
+        /// `pop_phase` override.
+    fn wants_pop_phase(&self) -> bool {
+        false
+    }
 }
 
 // ── The engine's trainer seam ────────────────────────────────────────────────────
@@ -379,6 +389,16 @@ impl AnyTrainer {
         }
     }
 
+    /// Does the pop-wide phase need to run this step? `false` for the tabular arm and for
+    /// any RL scheme that leaves [`RlStep::pop_phase`] alone, so the engine skips building
+    /// the live-net slice entirely: see [`RlStep::wants_pop_phase`].
+    pub fn wants_pop_phase(&self) -> bool {
+        match self {
+            Self::Tabular(_) => false,
+            Self::Rl(t) => t.wants_pop_phase(),
+        }
+    }
+
     /// One training step — the arm decides which context type to build.
     #[allow(clippy::too_many_arguments)]
     pub fn train_step(
@@ -387,8 +407,8 @@ impl AnyTrainer {
         optimizer: &mut dyn flodl::nn::optim::Optimizer,
         step: usize,
         data: Option<&RunData<'_>>,
-        fitness: &crate::engine::fitness::Fitness,
-        metrics: &[crate::engine::fitness::Metric],
+        fitness: &crate::utils::fitness::Fitness,
+        metrics: &[crate::utils::fitness::Metric],
         env: StepEnv,
         net_hash: &str,
         net_seed: u64,
@@ -483,7 +503,54 @@ mod tests {
         }
     }
 
-        /// The ctx carries the run clock (`step` + `max_steps`), so a trainer can anneal
+        /// An RL scheme that DOES use the pop-wide hook — the opt-in half of the
+    /// `pop_phase_is_opt_in` test.
+    struct PopPhaseRl;
+
+    impl RlStep for PopPhaseRl {
+        fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
+            Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
+        }
+        fn train_step(
+            &mut self,
+            _net: &mut Network,
+            _optimizer: &mut dyn flodl::nn::optim::Optimizer,
+            _step: usize,
+            _ctx: &RlContext<'_>,
+        ) -> flodl::tensor::Result<RlStepReport> {
+            unimplemented!("the pop-phase test never trains")
+        }
+        fn pop_phase(&mut self, _nets: &mut [(String, &mut Network)], _step: usize) {}
+        fn wants_pop_phase(&self) -> bool {
+            true
+        }
+    }
+
+        /// REGRESSION: the pop-wide phase is opt-in. The engine asks `wants_pop_phase`
+        /// BEFORE gathering the live nets, so the tabular arm and any RL scheme that
+        /// leaves the hook alone must say `false` and skip the per-step allocation.
+    #[test]
+    fn pop_phase_is_opt_in() {
+        let tabular = crate::trainer::TabularTrainer::new(
+            |_pred, _y| -> flodl::tensor::Result<flodl::Variable> {
+                unimplemented!("the pop-phase test never trains")
+            },
+        );
+        assert!(
+            !AnyTrainer::tabular(tabular).wants_pop_phase(),
+            "the tabular arm has no pop-wide phase"
+        );
+        assert!(
+            !AnyTrainer::rl(SentinelRl).wants_pop_phase(),
+            "an RL scheme that leaves pop_phase alone must not trigger the gather"
+        );
+        assert!(
+            AnyTrainer::rl(PopPhaseRl).wants_pop_phase(),
+            "a scheme that implements pop_phase must opt in"
+        );
+    }
+
+    /// The ctx carries the run clock (`step` + `max_steps`), so a trainer can anneal
         /// its own schedule; `None` = unbounded, the same convention as challenge decay.
     #[test]
     fn step_env_progress_reads_the_run_clock() {

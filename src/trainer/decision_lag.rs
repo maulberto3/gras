@@ -192,9 +192,9 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
                     String::new()
                 };
                 // CFY: the relay notice is a table; the mechanism is a footnote.
-                crate::engine::cfy::emit(&crate::engine::cfy::card(
+                crate::utils::cfy::emit(&crate::utils::cfy::card(
                     "Decision-lag relay active",
-                    &crate::engine::cfy::kv(&[
+                    &crate::utils::cfy::kv(&[
                         (
                             "lag".to_string(),
                             format!("{} engine step(s){grace_note}", self.lag),
@@ -304,7 +304,7 @@ fn net_device(net: &Network) -> flodl::Device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::fitness::{Direction, Fitness};
+    use crate::utils::fitness::{Direction, Fitness};
     use crate::trainer::core::{RlContext, StepEnv};
     use flodl::nn::Module;
 
@@ -354,7 +354,7 @@ mod tests {
             // the test constructs it with leaked refs (test-scoped, bounded).
         let fitness: &'static Fitness =
             Box::leak(Box::new(Fitness::reported(Direction::Maximize, "reward")));
-        let metrics: &'static [crate::engine::fitness::Metric] = &[];
+        let metrics: &'static [crate::utils::fitness::Metric] = &[];
         RlContext {
             fitness,
             metrics,

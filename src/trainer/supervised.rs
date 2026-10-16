@@ -110,7 +110,7 @@ impl Default for TabularTrainer {
             // Fallback loss (plain cross-entropy) so `Default` stays
             // available; real runs construct via `TabularTrainer::new(loss)`.
             loss_fn: Box::new(crate::utils::score::cross_entropy_onehot_loss),
-            learning_rate: crate::engine::config::DEFAULT_LR,
+            learning_rate: crate::utils::training::DEFAULT_LR,
             grad_clip: 1.0,
             batch_size: 16,
             eval_batch_size: 16,
