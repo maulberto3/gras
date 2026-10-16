@@ -17,6 +17,54 @@ use tracing::debug;
 /// the draw of fresh parent PAIRS (distinct from rolls/retries).
 pub(crate) const MAX_PARENT_PAIRINGS: usize = 3;
 
+/// Coin probability for the uniform feature-mask pick — mirrors the topology
+/// operator's own per-node swap probability, so the split mixes at the same rate
+/// the nodes did.
+const UNIFORM_MASK_PICK: f32 = 0.5;
+
+/// Blend the two parents' feature-mask rows into the child's starting split:
+/// `Uniform` flips a coin per port, `OnePoint` takes one parent up to a pivot and
+/// the other from there on — the same two shapes the topology operators use.
+///
+/// A parent that carries no split does not blank the child's: the masked parent
+/// wins, so a split can't fade out of a lineage just because its partner was
+/// unmasked. Rows are mapped by port index; a donor too short for a port falls back
+/// to the other parent's row. Draws come from the shared child RNG in a fixed
+/// order, so the same seed reproduces the same child.
+fn mix_feature_masks(
+    a: Option<Vec<Vec<u8>>>,
+    b: Option<Vec<Vec<u8>>>,
+    op: CrossoverOp,
+    rng: &mut fastrand::Rng,
+) -> Vec<Vec<u8>> {
+    let (a, b) = match (a, b) {
+        (None, None) => return Vec::new(),
+        (Some(rows), None) | (None, Some(rows)) => return rows,
+        (Some(a), Some(b)) => (a, b),
+    };
+    let n = a.len().max(b.len());
+    // Row `i` from the chosen donor, falling back to the other parent when the donor
+    // has fewer ports than the child needs.
+    let pick = |i: usize, take_a: bool| -> Vec<u8> {
+        let (first, second) = if take_a { (&a, &b) } else { (&b, &a) };
+        first.get(i).or_else(|| second.get(i)).cloned().unwrap_or_default()
+    };
+    match op {
+        CrossoverOp::Uniform => (0..n)
+            .map(|i| pick(i, rng.f32() < UNIFORM_MASK_PICK))
+            .collect(),
+        CrossoverOp::OnePoint => {
+            if n <= 1 {
+                return vec![pick(0, rng.f32() < UNIFORM_MASK_PICK)];
+            }
+            // Both sides of the pivot stay non-empty.
+            let pivot = rng.usize(1..n);
+            (0..n).map(|i| pick(i, i < pivot)).collect()
+        }
+    }
+}
+
+use crate::engine::config::CrossoverOp;
 use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
 use crate::graph::topology::Topology;
@@ -91,6 +139,10 @@ impl CoreEngine {
             // 3. Crossover: up to 3 attempts; a no-op (incompatible dims) retries with
             // FRESH roulette-drawn parents.
         let mut child_topo = None;
+            // Inherited feature-mask rows for the child (empty = neither parent carried a
+            // split). Captured BEFORE crossover, because `cx_*` re-finalizes both parents
+            // and `finalize` drops port-count-bound masks.
+        let mut child_masks: Vec<Vec<u8>> = Vec::new();
         let mut cx_note = String::new();
             // Operator pool resolved once per child (not per attempt) so retries vary the
             // PARENTS, not the op. Uniform uses its own swap_prob — no magic 0.5.
@@ -132,13 +184,13 @@ impl CoreEngine {
                 .map(|&p| ranked[p].0.clone())
                 .collect();
             let mut pa = self.load_parent_topology(&attempt_parents[0])?;
+            let pa_masks = pa.input_feature_masks();
             if n_parents == 2 {
                 let mut pb = self.load_parent_topology(&attempt_parents[1])?;
+                let pb_masks = pb.input_feature_masks();
                 let cx = match op {
-                    crate::engine::config::CrossoverOp::OnePoint => {
-                        Topology::cx_one_point(&mut pa, &mut pb, rng)
-                    }
-                    crate::engine::config::CrossoverOp::Uniform => {
+                    CrossoverOp::OnePoint => Topology::cx_one_point(&mut pa, &mut pb, rng),
+                    CrossoverOp::Uniform => {
                         // Per-swap probability for the uniform operator.
                         const UNIFORM_SWAP_PROB: f32 = 0.5;
                         Topology::cx_uniform(&mut pa, &mut pb, UNIFORM_SWAP_PROB, rng)
@@ -146,9 +198,10 @@ impl CoreEngine {
                 };
                 if cx {
                     child_topo = Some(pa);
+                    child_masks = mix_feature_masks(pa_masks, pb_masks, op, rng);
                     cx_note = match op {
-                        crate::engine::config::CrossoverOp::OnePoint => "crossover-one-point",
-                        crate::engine::config::CrossoverOp::Uniform => "crossover-uniform",
+                        CrossoverOp::OnePoint => "crossover-one-point",
+                        CrossoverOp::Uniform => "crossover-uniform",
                     }
                     .to_string();
                     parent_hashes = attempt_parents;
@@ -159,6 +212,9 @@ impl CoreEngine {
                 // Single-parent mode: the child is the parent with a new seed
                 // (asexual reproduction; crossover needs two).
                 child_topo = Some(pa);
+                    // Asexual reproduction inherits the parent's own split verbatim — no
+                    // re-draw, since no rebuild ran and the rows already fit the ports.
+                child_masks = pa_masks.unwrap_or_default();
                 cx_note = "clone".to_string();
                 parent_hashes = attempt_parents;
                 break;
@@ -184,11 +240,16 @@ impl CoreEngine {
                 .resolved_activation_pool()
                 .unwrap_or_else(|_| crate::evolution::pools::all_activations()),
         );
-            // Crossover children get feature masks from the run's policy as well — the port
-            // pool is part of the search space on this path too, and re-drawing keeps the
-            // mask length in step with the post-finalize port count.
-        if let Some(policy) = self.config.feature_split {
-            child_topo.assign_feature_masks(policy);
+            // Feature masks: INHERIT what the parents carried (the child's rows are
+            // mapped to the post-finalize port count — extra ports stay unmasked). Only
+            // when there is nothing to inherit does the run's policy draw a fresh split,
+            // which is also the founder/immigrant path's behaviour.
+        if child_masks.is_empty() {
+            if let Some(policy) = self.config.feature_split {
+                child_topo.assign_feature_masks(policy);
+            }
+        } else {
+            child_topo.install_input_feature_masks(&child_masks);
         }
         Ok(Some(self.finalize_child(
             child_topo,
@@ -532,4 +593,96 @@ pub(crate) fn frozen_act_count(state: &NetState) -> usize {
         .iter()
         .map(|&(s, e)| e.saturating_sub(s) + 1)
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deterministic child RNG — the mixer draws from it, so every case below
+    /// pins its seed.
+    fn rng(seed: u64) -> fastrand::Rng {
+        fastrand::Rng::with_seed(seed)
+    }
+
+    fn row(bits: [u8; 2]) -> Vec<u8> {
+        bits.to_vec()
+    }
+
+    /// One parent with a split, one without: the masked parent's rows survive, so a
+    /// split cannot fade out of a lineage just because its partner was unmasked.
+    #[test]
+    fn mix_keeps_the_masked_parent_when_only_one_has_a_split() {
+        let masked = vec![row([1, 0]), row([0, 1])];
+        assert_eq!(
+            mix_feature_masks(
+                Some(masked.clone()),
+                None,
+                CrossoverOp::Uniform,
+                &mut rng(7)
+            ),
+            masked,
+            "the masked parent's rows are kept verbatim"
+        );
+        assert_eq!(
+            mix_feature_masks(
+                None,
+                Some(masked.clone()),
+                CrossoverOp::OnePoint,
+                &mut rng(7)
+            ),
+            masked,
+        );
+        // Neither parent carries one: nothing to inherit, so the caller falls back to
+        // the run's policy (or leaves the child unmasked).
+        assert!(mix_feature_masks(None, None, CrossoverOp::Uniform, &mut rng(1)).is_empty());
+    }
+
+    /// Uniform: every row comes from one parent or the other, at 0.5 per port — and
+    /// the same seed reproduces the same child.
+    #[test]
+    fn uniform_mix_takes_each_row_from_a_parent() {
+        let a = vec![row([1, 1]), row([1, 1]), row([1, 1]), row([1, 1])];
+        let b = vec![row([0, 0]), row([0, 0]), row([0, 0]), row([0, 0])];
+        let mixed = mix_feature_masks(Some(a.clone()), Some(b.clone()), CrossoverOp::Uniform, &mut rng(3));
+        assert_eq!(mixed.len(), 4);
+        for r in &mixed {
+            assert!(r == &row([1, 1]) || r == &row([0, 0]), "invented a row: {r:?}");
+        }
+        assert_eq!(
+            mixed,
+            mix_feature_masks(Some(a), Some(b), CrossoverOp::Uniform, &mut rng(3)),
+            "the same seed must reproduce the same child"
+        );
+    }
+
+    /// One-point: A's rows up to the pivot, B's from there on — both sides non-empty,
+    /// exactly as the topology operator swaps a node suffix.
+    #[test]
+    fn one_point_mix_takes_a_prefix_from_a_and_a_suffix_from_b() {
+        let a = vec![row([1, 1]); 4];
+        let b = vec![row([0, 0]); 4];
+        let mixed = mix_feature_masks(Some(a), Some(b), CrossoverOp::OnePoint, &mut rng(5));
+        assert_eq!(mixed.len(), 4);
+        let pivot = mixed
+            .iter()
+            .position(|r| r == &row([0, 0]))
+            .expect("B's suffix must appear");
+        assert!(pivot > 0, "the pivot keeps both sides non-empty");
+        assert!(mixed[..pivot].iter().all(|r| r == &row([1, 1])));
+        assert!(mixed[pivot..].iter().all(|r| r == &row([0, 0])));
+    }
+
+    /// A donor with fewer ports than the child needs falls back to the OTHER parent's
+    /// row for that port — never to an empty row.
+    #[test]
+    fn mix_maps_donors_by_port_index_with_a_fallback() {
+        let a = vec![row([1, 0]), row([0, 1])];
+        let b = vec![row([1, 1]); 4];
+        let mixed = mix_feature_masks(Some(a), Some(b), CrossoverOp::Uniform, &mut rng(11));
+        assert_eq!(mixed.len(), 4, "one row per port the donors can cover");
+        for (i, r) in mixed.iter().enumerate() {
+            assert_ne!(r, &row([0, 0]), "port {i} fell back to an empty row");
+        }
+    }
 }

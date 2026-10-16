@@ -48,9 +48,9 @@ impl CoreEngine {
                 }
             );
         } else if self.verbose_detail() {
-            crate::engine::cfy::emit(&crate::engine::cfy::card(
+            crate::utils::cfy::emit(&crate::utils::cfy::card(
                 "Elite index",
-                &crate::engine::cfy::kv(&[
+                &crate::utils::cfy::kv(&[
                     ("file".to_string(), path.display().to_string()),
                     ("ranked".to_string(), entries.len().to_string()),
                 ]),
@@ -121,9 +121,9 @@ impl CoreEngine {
             }
         }
         if self.verbose_detail() && !written.is_empty() {
-            crate::engine::cfy::emit(&crate::engine::cfy::card(
+            crate::utils::cfy::emit(&crate::utils::cfy::card(
                 "Elite topology (markdown)",
-                &crate::engine::cfy::table(&["#", "hash", "file"], &written),
+                &crate::utils::cfy::table(&["#", "hash", "file"], &written),
                 Some("ready to view"),
             ));
         }
@@ -156,9 +156,9 @@ impl CoreEngine {
             }
         }
         if self.verbose_detail() && !written.is_empty() {
-            crate::engine::cfy::emit(&crate::engine::cfy::card(
+            crate::utils::cfy::emit(&crate::utils::cfy::card(
                 "Elite weights (safetensors)",
-                &crate::engine::cfy::table(&["hash", "file"], &written),
+                &crate::utils::cfy::table(&["hash", "file"], &written),
                 None,
             ));
         }
@@ -256,9 +256,9 @@ impl CoreEngine {
                     if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
                         tracing::warn!("worst safetensors export failed: {e}");
                     } else if self.verbose_detail() {
-                        crate::engine::cfy::emit(&crate::engine::cfy::card(
+                        crate::utils::cfy::emit(&crate::utils::cfy::card(
                             "Worst-net artifacts",
-                            &crate::engine::cfy::kv(&[
+                            &crate::utils::cfy::kv(&[
                                 ("hash".to_string(), short.to_string()),
                                 ("markdown".to_string(), format!("worst-{short}.md")),
                                 ("weights".to_string(), format!("worst-{short}.safetensors")),

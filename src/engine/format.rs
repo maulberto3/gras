@@ -16,12 +16,16 @@
 //! that reads as zero is worse than a wider column. The floor is capped, so a
 //! value small enough to vanish even at the cap still prints honestly.
 
-/// One-line description of the RUNNING binary: crate version, profile, and
-/// the exe path + mtime — so "stale process, not stale logic" is one glance.
+/// One-line description of the RUNNING binary: crate version, profile, and the
+/// exe's build mtime — so "stale process, not stale logic" is one glance.
+///
+/// The exe PATH is deliberately NOT printed: it is long enough to dominate the
+/// manifest row it sits in, and the mtime already answers the staleness
+/// question. The stamp is recorded in `engine.json` too, but never compared on
+/// resume (the gate is the trainer blob), so its shape is free to change.
 pub(crate) fn build_stamp() -> String {
-    let exe = std::env::current_exe().ok();
-    let built = exe
-        .as_ref()
+    let built = std::env::current_exe()
+        .ok()
         .and_then(|p| std::fs::metadata(p).ok())
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -34,11 +38,8 @@ pub(crate) fn build_stamp() -> String {
             format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}Z")
         })
         .unwrap_or_else(|| "unknown".into());
-    let path = exe
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "-".into());
     format!(
-        "gras {} [{}] built {built} — exe {path}",
+        "gras {} [{}] built {built}",
         env!("CARGO_PKG_VERSION"),
         if cfg!(debug_assertions) {
             "debug"

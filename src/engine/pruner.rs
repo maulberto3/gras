@@ -47,9 +47,9 @@ impl CoreEngine {
                 .enumerate()
                 .map(|(rank, h)| format!("{}:{}", rank + 1, &h[..8.min(h.len())]))
                 .collect();
-            crate::engine::cfy::emit(&crate::engine::cfy::card(
+            crate::utils::cfy::emit(&crate::utils::cfy::card(
                 "Pruner phase",
-                &crate::engine::cfy::kv(&[
+                &crate::utils::cfy::kv(&[
                     ("stop reason".to_string(), format!("{reason:?}")),
                     ("stop step".to_string(), clock.to_string()),
                     ("keeping".to_string(), format!("top-{}", keep.len())),
@@ -87,9 +87,9 @@ impl CoreEngine {
             self.write_champion_markdown()?;
             self.write_champion_safetensors()?;
             if self.verbose_detail() {
-                crate::engine::cfy::emit(&crate::engine::cfy::card(
+                crate::utils::cfy::emit(&crate::utils::cfy::card(
                     "Pruner phase",
-                    &crate::engine::cfy::kv(&[(
+                    &crate::utils::cfy::kv(&[(
                         "solo steps".to_string(),
                         "0".to_string(),
                     )]),
@@ -134,9 +134,9 @@ impl CoreEngine {
         // NOTE: no worst dump here — the population was already culled to
         // elites above (the worst was dumped pre-cull, before that).
         if self.verbose_detail() {
-            crate::engine::cfy::emit(&crate::engine::cfy::card(
+            crate::utils::cfy::emit(&crate::utils::cfy::card(
                 "Pruner phase complete",
-                &crate::engine::cfy::kv(&[
+                &crate::utils::cfy::kv(&[
                     ("trained to step".to_string(), final_step.to_string()),
                     ("solo steps".to_string(), pruner.steps.to_string()),
                 ]),

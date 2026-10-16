@@ -27,15 +27,16 @@
 //! - [`tabular_engine`] — tabular-mode constructors (`resume`)
 //! - [`rl_engine`] — RL-mode constructors (`resume_rl`)
 //! - [`seed`] — founder-batch seeding from a previous run's guardrail champion
-//! - [`fitness`] — `Fitness`, `Direction`, `Metric`, `FitnessLabel`
+//! - `fitness` / `cfy` — **MOVED to [`crate::utils`]**: `Fitness`, `Direction`,
+//!   `Metric`, `FitnessLabel` and the CFY log tables are vocabulary the engine
+//!   *shares* with any training scheme, so they live below both layers and a
+//!   trainer can reach them without importing the engine.
 
 pub mod artifacts;
-pub mod cfy;
 pub mod child;
 pub mod config;
 pub mod core;
 pub mod evolve;
-pub mod fitness;
 pub mod format;
 pub mod guardrail;
 pub mod logging;
@@ -56,7 +57,6 @@ pub use config::{
     tabular_race_config_builder,
 };
 pub use core::CoreEngine;
-pub use fitness::{Direction, Fitness, FitnessLabel};
 pub use guardrail::GuardrailVerdict;
 pub use rl_engine::RlEngine;
 pub use run_spec::{RLSpec, RunSpec, StreamShape, TabularSpec};

@@ -40,7 +40,7 @@
 
 use super::config::RaceConfig;
 use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
-use crate::engine::fitness::Fitness;
+use crate::utils::fitness::Fitness;
 use crate::state::{RaceState, RunHeader};
 use crate::trainer::stream::{BatchStream, PoolSplit};
 use flodl::tensor::Result;

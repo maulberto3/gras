@@ -13,7 +13,7 @@
 //! [`crate::RaceEngine::run_dir`] and [`crate::RaceEngine::run_seed`].
 
 use crate::engine::config::RaceConfig;
-use crate::engine::fitness::Fitness;
+use crate::utils::fitness::Fitness;
 use crate::trainer::{RlStep, TabularStep};
 
 /// Start-a-race spec: the entire `new` argument surface. `fitness` is the

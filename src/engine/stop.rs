@@ -16,9 +16,9 @@ impl CoreEngine {
         if let Some(flag) = &self.interrupt_flag {
             if flag.load(std::sync::atomic::Ordering::SeqCst) {
                 // CFY: the interrupt notice is a table, not a one-liner.
-                crate::engine::cfy::emit(&crate::engine::cfy::card(
+                crate::utils::cfy::emit(&crate::utils::cfy::card(
                     "Race",
-                    &crate::engine::cfy::kv(&[(
+                    &crate::utils::cfy::kv(&[(
                         "ctrl+c".to_string(),
                         format!("graceful shutdown after step {step}"),
                     )]),

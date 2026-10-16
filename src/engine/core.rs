@@ -58,7 +58,7 @@ use flodl::tensor::Result;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
-use crate::engine::fitness::{Fitness, FitnessLabel, Metric};
+use crate::utils::fitness::{Fitness, FitnessLabel, Metric};
 use crate::graph::network::Network;
 use crate::state::{
     ConfigSnapshot, NetState, RaceState, RunConfig, RunHeader, write_engine_json, write_net_state,
@@ -487,9 +487,9 @@ impl CoreEngine {
         if config.elite_previous_load && manual_founders {
             // CFY + always-visible: the inheritance receipt is a table that must show at
             // any log level (it is a fact about what the run INHERITED).
-            crate::engine::cfy::emit_always(&crate::engine::cfy::card(
+            crate::utils::cfy::emit_always(&crate::utils::cfy::card(
                 "Inheritance",
-                &crate::engine::cfy::kv(&[(
+                &crate::utils::cfy::kv(&[(
                     "founder blueprints".to_string(),
                     config.run_topologies.len().to_string(),
                 )]),
@@ -522,9 +522,9 @@ impl CoreEngine {
                     let n = plan.picks.len();
                     // Deliberately a plain emit (not level-filtered), like the skip
                     // branch: the inheritance receipt must be visible at any log level.
-                    crate::engine::cfy::emit_always(&crate::engine::cfy::card(
+                    crate::utils::cfy::emit_always(&crate::utils::cfy::card(
                         "Inheritance",
-                        &crate::engine::cfy::kv(&[
+                        &crate::utils::cfy::kv(&[
                             ("source run".to_string(), plan.source_run_id.clone()),
                             (
                                 "source dir".to_string(),
@@ -578,9 +578,9 @@ impl CoreEngine {
                 super::seed::SeedOutcome::Skipped(why) => {
                     // Deliberately a plain emit: a fact about what the run INHERITED must be
                     // visible at any log level. The run continues all-random either way.
-                    crate::engine::cfy::emit_always(&crate::engine::cfy::card(
+                    crate::utils::cfy::emit_always(&crate::utils::cfy::card(
                         "Inheritance",
-                        &crate::engine::cfy::kv(&[(
+                        &crate::utils::cfy::kv(&[(
                             "elite_previous_load".to_string(),
                             "skipped".to_string(),
                         )]),
@@ -849,9 +849,9 @@ impl CoreEngine {
                 self.config.pop_size, loaded, nets_dir.display()
             )).into());
         }
-        crate::engine::cfy::emit(&crate::engine::cfy::card(
+        crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Race resume",
-            &crate::engine::cfy::table(&["hash", "replayed step"], &replayed),
+            &crate::utils::cfy::table(&["hash", "replayed step"], &replayed),
             Some(&format!("loaded {loaded} nets from {}", run_dir.display())),
         ));
         Ok(())
@@ -939,9 +939,9 @@ impl CoreEngine {
                 rows.push(("champion holdout".to_string(), fmt_cell(m)));
             }
         }
-        crate::engine::cfy::emit(&crate::engine::cfy::card(
+        crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Race init",
-            &crate::engine::cfy::kv(&rows),
+            &crate::utils::cfy::kv(&rows),
             Some(if seeded_slots == 0 {
                 "all-random founder batch"
             } else {
@@ -1090,16 +1090,16 @@ impl CoreEngine {
                 manifest.push((k.to_string(), v));
             }
             let legend = format!(
-                "fitness = mean over the `matches` played that clock │ μ = rolling mean of the last K={} clock fitnesses │ σ = their spread │ smt = risk-adjusted score rankings use (μ paid λ={}σ; λ=0 ⇒ smt = μ) │ ★ = elite rank + seat tenure │ trained n/m = optimizer updates over clocks lived",
+                "fitness = mean over the `matches` played that clock │ μ = rolling mean of the last K={} fitnesses │ σ = spread │ smt = risk-adjusted score used to rank (μ ∓ λσ, λ={}; λ=0 ⇒ smt = μ) │ ★ = elite rank + seat tenure │ trained n/m = optimizer updates over clocks lived",
                 self.config.smoothing_window, fmt_cfg(self.config.risk_aversion),
             );
-            crate::engine::cfy::emit(&crate::engine::cfy::card(
+            crate::utils::cfy::emit(&crate::utils::cfy::card(
                 "Run manifest",
-                &crate::engine::cfy::kv(&manifest),
+                &crate::utils::cfy::kv(&manifest),
                 Some(&legend),
             ));
 
-            let search = crate::engine::cfy::kv(&[
+            let search = crate::utils::cfy::kv(&[
                 ("crossover_ops".to_string(), ops),
                 ("activations".to_string(), acts),
                 ("combine".to_string(), combines),
@@ -1117,16 +1117,16 @@ impl CoreEngine {
                     },
                 ),
             ]);
-            crate::engine::cfy::emit(&crate::engine::cfy::card("Search space", &search, None));
+            crate::utils::cfy::emit(&crate::utils::cfy::card("Search space", &search, None));
 
             // The trainer's own self-description: the only visible record of trainer-side
             // knobs (challenge trigger, schedules, clipping), which left with the trainer.
             if let Some(trainer) = self.header.trainer.as_ref() {
                 let rows = crate::engine::reporting::summarize_rows(trainer);
                 if !rows.is_empty() {
-                    crate::engine::cfy::emit(&crate::engine::cfy::card(
+                    crate::utils::cfy::emit(&crate::utils::cfy::card(
                         "Trainer",
-                        &crate::engine::cfy::kv(&rows),
+                        &crate::utils::cfy::kv(&rows),
                         None,
                     ));
                 }
@@ -1151,9 +1151,9 @@ impl CoreEngine {
                 // disturb the `Minimal` frame's stdout redraw.
                 eprintln!(
                     "{}",
-                    crate::engine::cfy::card(
+                    crate::utils::cfy::card(
                         "Ctrl+C",
-                        &crate::engine::cfy::kv(&[(
+                        &crate::utils::cfy::kv(&[(
                             "action".to_string(),
                             "graceful shutdown at the next step boundary".to_string(),
                         )]),
@@ -1194,7 +1194,7 @@ impl CoreEngine {
                 if !evolve_allowed {
                     self.accounting.deferred_clocks += 1;
                     info!(
-                        "step {} │ evolution deferred: no cull-eligible net — every non-elite net is inside its probation window or elite ({} crossover + {} mutation roll(s) forgone; nothing culled/inserted)",
+                        "step {} │ evolution deferred: no cull-eligible net — every non-elite net is inside its cull shield window or elite ({} crossover + {} mutation roll(s) forgone; nothing culled/inserted)",
                         clock,
                         cross_total,
                         mutate_total,
@@ -1387,9 +1387,9 @@ impl CoreEngine {
                 })
                 .collect();
             if hashes.is_empty() {
-                crate::engine::cfy::emit(&crate::engine::cfy::card(
+                crate::utils::cfy::emit(&crate::utils::cfy::card(
                     "Race",
-                    &crate::engine::cfy::kv(&[("live nets".to_string(), "0".to_string())]),
+                    &crate::utils::cfy::kv(&[("live nets".to_string(), "0".to_string())]),
                     Some("population empty — stopping"),
                 ));
                 return Ok(StopReason::MaxSteps);
@@ -1398,8 +1398,10 @@ impl CoreEngine {
             // step (refresh_crown prints the freeze/dethrone diffs up front).
             self.refresh_crown(clock);
             // 1a. pop-wide phase (RL only): hand the trainer the whole live population once
-            // per step, before any per-net step — the `if let` IS the mode check.
-            if let crate::trainer::AnyTrainer::Rl(trainer) = &mut self.trainer {
+            // per step, before any per-net step. The trainer is asked FIRST whether it uses
+            // the hook — the gather below is O(population), so a mode (or scheme) that
+            // ignores `pop_phase` must not pay for it every step.
+            if self.trainer.wants_pop_phase() {
                 // One pass over the map — multiple get_mut borrows stored at
                 // once don't compile (NLL), but iter_mut does.
                 let live: std::collections::HashSet<&String> = hashes.iter().collect();
@@ -1409,7 +1411,7 @@ impl CoreEngine {
                     .filter(|(h, _)| live.contains(h))
                     .map(|(h, net)| (h.clone(), net))
                     .collect();
-                trainer.pop_phase(&mut nets, clock);
+                self.trainer.pop_phase(&mut nets, clock);
             }
             for hash in &hashes {
                 // Mid-step Ctrl+C: abandon the step immediately. Nothing of it is recorded —
@@ -1516,9 +1518,9 @@ impl CoreEngine {
         // `None` mode stays silent until the caller's final stop print.
         if self.verbose_detail() {
             // CFY: the stop banner is a table too.
-            crate::engine::cfy::emit(&crate::engine::cfy::card(
+            crate::utils::cfy::emit(&crate::utils::cfy::card(
                 "Stop",
-                &crate::engine::cfy::kv(&[
+                &crate::utils::cfy::kv(&[
                     ("reason".to_string(), format!("{reason:?}")),
                     ("step".to_string(), clock.to_string()),
                 ]),
@@ -1591,9 +1593,9 @@ impl CoreEngine {
         // game, no verdict. `engine.json` keeps any earlier record, and the
         // next run's inheritance never depended on the verdict (`elites.json`).
         if self.config.guardrail_matches == 0 {
-            crate::engine::cfy::emit(&crate::engine::cfy::card(
+            crate::utils::cfy::emit(&crate::utils::cfy::card(
                 "Guardrail",
-                &crate::engine::cfy::kv(&[(
+                &crate::utils::cfy::kv(&[(
                     "guardrail_matches".to_string(),
                     "0".to_string(),
                 )]),
@@ -1677,9 +1679,9 @@ impl CoreEngine {
         // CFY: one guardrail card — every reading a row, the verdict sentence a footnote
         // (it carries the mechanism whenever the bars allow it). The old two info! lines
         // were ELI5 "what was compared" + "what it means"; both live here now.
-        crate::engine::cfy::emit(&crate::engine::cfy::card(
+        crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Guardrail (champion on fresh unseen games)",
-            &crate::engine::cfy::kv(&[
+            &crate::utils::cfy::kv(&[
                 (
                     "champion".to_string(),
                     verdict.hash[..8.min(verdict.hash.len())].to_string(),
@@ -1793,9 +1795,9 @@ impl CoreEngine {
             .into_iter()
             .filter(|(h, _)| {
                 self.state.net(h).is_some_and(|s| {
-                    // (a) regular probation served (born-based, never resets).
+                    // (a) cull shield passed (born-based, never resets) — Rust `on_probation`.
                     !self.on_probation(h, clock)
-                        // (b) elite probation served (resets on every seat exit).
+                        // (b) join window served (resets on every seat exit) — Rust `elite_probation_age`.
                         && s.elite_probation_age >= probation
                         // (c) seat still inside its lifetime (0 = no lifetime).
                         && (lifetime == 0 || s.elite_seat_age < lifetime)
@@ -1991,7 +1993,7 @@ impl CoreEngine {
                 Some(r) => format!(" (still rank {r} of {} overall)", self.state.live_count()),
                 None => String::new(),
             };
-            // The ex-elite was just re-probated: it trains like any
+            // The ex-elite just re-entered the JOIN WINDOW: it trains like any
             // non-elite until it has re-served the k-clock window.
             info!(
                 "step {} │ freeze │ {} dethroned: {}{}{} — resumes with updates (optimizer state intact){}",
@@ -2001,7 +2003,7 @@ impl CoreEngine {
                 rank_note,
                 detail,
                 crate::engine::reporting::detail_inline(&format!(
-                    "{} · probation restarts at 0 (serves {} to sit again) · crown {}/{}",
+                    "{} · join window restarts at 0 (serves {} to sit again) · crown {}/{}",
                     crate::engine::reporting::trained_note(trainings, age),
                     self.config.elite_join_probation_steps,
                     self.frozen_crown.len(),
@@ -2433,7 +2435,7 @@ fn step_rollup_line(v: &StepVitals) -> String {
         v.seats_held,
         v.seats_capacity,
         crate::engine::reporting::detail_inline(&format!(
-            "{} eligible · {} on probation (k={}) · {} age-blocked (j={})",
+            "{} eligible · {} gated (join window or cull shield, k={}) · {} age-blocked (j={})",
             v.eligible, v.probation, v.join_k, v.age_blocked, v.lifetime_j
         ))
     ));
@@ -2513,7 +2515,7 @@ mod tests {
     use super::*;
     // Direction only appears in test helpers, so it is imported here to keep
     // the lib-only `cargo check` warning-free.
-    use crate::engine::fitness::Direction;
+    use crate::utils::fitness::Direction;
     use crate::graph::node::Node;
     use crate::graph::topology::Topology;
     use crate::graph::topology::TopologyOptions;
@@ -3563,8 +3565,8 @@ mod tests {
     fn rl_engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::RlEngine> {
         crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
             rl_config(0),
-            crate::engine::fitness::Fitness::reported(
-                crate::engine::fitness::Direction::Maximize,
+            crate::utils::fitness::Fitness::reported(
+                crate::utils::fitness::Direction::Maximize,
                 "reward",
             ),
             SeededRlTrainer,
@@ -3616,8 +3618,8 @@ mod tests {
         let mut resumed = crate::engine::RlEngine::resume(
             dir_b.clone(),
             rl_config(2),
-            crate::engine::fitness::Fitness::reported(
-                crate::engine::fitness::Direction::Maximize,
+            crate::utils::fitness::Fitness::reported(
+                crate::utils::fitness::Direction::Maximize,
                 "reward",
             ),
             SeededRlTrainer,
@@ -3648,8 +3650,8 @@ mod tests {
         let cfg = rl_config(0);
         let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
             cfg,
-            crate::engine::fitness::Fitness::reported(
-                crate::engine::fitness::Direction::Maximize,
+            crate::utils::fitness::Fitness::reported(
+                crate::utils::fitness::Direction::Maximize,
                 "reward",
             ),
             ChallengingRlTrainer, // rolls its own trigger → sentinel every step
@@ -3679,8 +3681,8 @@ mod tests {
         cfg.freeze_elites = false; // isolate the challenge from the freeze
         let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
             cfg,
-            crate::engine::fitness::Fitness::reported(
-                crate::engine::fitness::Direction::Maximize,
+            crate::utils::fitness::Fitness::reported(
+                crate::utils::fitness::Direction::Maximize,
                 "reward",
             ),
             ChallengingRlTrainer,
@@ -3735,8 +3737,8 @@ mod tests {
          -> Vec<(String, Option<crate::state::NetMetrics>)> {
             let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
                 challenge_cfg(0),
-                crate::engine::fitness::Fitness::reported(
-                    crate::engine::fitness::Direction::Maximize,
+                crate::utils::fitness::Fitness::reported(
+                    crate::utils::fitness::Direction::Maximize,
                     "reward",
                 ),
                 ChallengingRlTrainer,
@@ -3771,8 +3773,8 @@ mod tests {
         let mut resumed = crate::engine::RlEngine::resume(
             dir_b.clone(),
             challenge_cfg(2),
-            crate::engine::fitness::Fitness::reported(
-                crate::engine::fitness::Direction::Maximize,
+            crate::utils::fitness::Fitness::reported(
+                crate::utils::fitness::Direction::Maximize,
                 "reward",
             ),
             ChallengingRlTrainer,
@@ -3806,8 +3808,8 @@ mod tests {
         let err = match crate::engine::RlEngine::resume(
             dir.clone(),
             rl_config(1),
-            crate::engine::fitness::Fitness::reported(
-                crate::engine::fitness::Direction::Maximize,
+            crate::utils::fitness::Fitness::reported(
+                crate::utils::fitness::Direction::Maximize,
                 "reward",
             ),
             SeededRlTrainer,
@@ -3835,8 +3837,8 @@ mod tests {
         };
         let spec = crate::engine::run_spec::RunSpec::rl(
             config,
-            crate::engine::fitness::Fitness::reported(
-                crate::engine::fitness::Direction::Maximize,
+            crate::utils::fitness::Fitness::reported(
+                crate::utils::fitness::Direction::Maximize,
                 "reward",
             ),
             TestRlTrainer,
@@ -4068,6 +4070,80 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// REGRESSION: a crossover child INHERITS its parents' feature split. `cx_*`
+    /// re-finalizes both parents, which drops port-count-bound masks — so the engine
+    /// snapshots them before the mix and reinstalls the blend afterwards. With the
+    /// operator pinned to one-point, every child's rows must be A's prefix + B's
+    /// suffix; a fresh policy draw would satisfy that only by coincidence.
+    #[test]
+    fn crossover_children_inherit_the_parents_feature_split() {
+        let dir = std::env::temp_dir().join("gras-mask-inherit");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 11).unwrap();
+        eng.config.feature_split = Some(crate::graph::topology::FeatureSplitPolicy::Random);
+        eng.config.crossover_prob = 1.0;
+        eng.config.crossover_ops_pool = vec!["one_point".to_string()];
+        // Founders carry a split, installed after their finalize exactly as a real run
+        // does; distinct rows per founder make the mix observable.
+        let founders: Vec<crate::graph::topology::Topology> = [7usize, 8, 9]
+            .into_iter()
+            .map(|seed| {
+                let mut topo = tiny_topology(seed);
+                topo.install_input_feature_masks(&[
+                    vec![1, 0],
+                    vec![(seed % 2) as u8, ((seed + 1) % 2) as u8],
+                ]);
+                topo
+            })
+            .collect();
+        eng.seed_population_internal(founders, Some(0.5)).unwrap();
+
+        let live = eng.state.live_hashes();
+        let masks_of = |hash: &str| {
+            eng.state
+                .net(hash)
+                .expect("parent is live")
+                .topology()
+                .expect("topology parses")
+                .input_feature_masks()
+                .expect("a founder of a masked run carries a split")
+        };
+        let parents: Vec<Vec<Vec<u8>>> = live.iter().map(|h| masks_of(h)).collect();
+
+        let mut checked = 0usize;
+        for clock in 0..16 {
+            let Some(child) = eng.generate_child(clock, 0).unwrap() else {
+                continue;
+            };
+            let lineage = child.state.created_from.clone().unwrap_or_default();
+            let Some(pair) = lineage.strip_prefix("crossover-one-point:parents=") else {
+                continue;
+            };
+            let pair: Vec<&str> = pair.split(',').collect();
+            let (Some(ia), Some(ib)) = (
+                live.iter().position(|h| h == pair[0]),
+                live.iter().position(|h| h == pair[1]),
+            ) else {
+                panic!("clock {clock}: lineage names an unknown parent ({lineage})");
+            };
+            let (a, b) = (&parents[ia], &parents[ib]);
+            let child_rows = child
+                .state
+                .topology()
+                .expect("topology parses")
+                .input_feature_masks()
+                .expect("the child keeps the inherited split");
+            assert_eq!(child_rows.len(), a.len(), "one row per input port");
+            assert!(
+                (1..child_rows.len()).any(|p| child_rows[..p] == a[..p] && child_rows[p..] == b[p..]),
+                "clock {clock}: {child_rows:?} is not A's prefix + B's suffix of {a:?} / {b:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no crossover child was generated to check");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4826,7 +4902,7 @@ mod tests {
         let mut eng = pruned_engine(&run_dir, 42, 1, 2);
         // A configured metric widens the history header — the shape most
         // likely to drift from the attempt layout.
-        eng.metrics = vec![crate::engine::fitness::Metric::custom("dummy", |_p, _y| {
+        eng.metrics = vec![crate::utils::fitness::Metric::custom("dummy", |_p, _y| {
             Ok(0.0)
         })];
         eng.seed_population_internal(
@@ -5942,7 +6018,7 @@ mod tests {
         let line = rollup([74, 100, 10, 16, 74, 26, 0, 10, 10, 5, 5]);
         assert_eq!(
             line,
-            "stepped 74/100 live nets (weights updated) │ 26 sat out: 10 elite frozen (act+measure, no update) + 16 newborn (born this clock, first step next clock) │ crown 10/10 seats · 74 eligible · 26 on probation (k=5) · 0 age-blocked (j=5)"
+            "stepped 74/100 live nets (weights updated) │ 26 sat out: 10 elite frozen (act+measure, no update) + 16 newborn (born this clock, first step next clock) │ crown 10/10 seats · 74 eligible · 26 gated (join window or cull shield, k=5) · 0 age-blocked (j=5)"
         );
         // The rollup is ONE log line: the crown tally rides inline, never an indent.
         assert!(!line.contains('\n'), "rollup stays one line: {line}");
@@ -5971,7 +6047,7 @@ mod tests {
         let clean = rollup([4, 4, 0, 0, 0, 4, 0, 0, 1, 5, 5]);
         assert_eq!(
             clean,
-            "stepped 4/4 live nets (weights updated) │ crown 0/1 seats · 0 eligible · 4 on probation (k=5) · 0 age-blocked (j=5)"
+            "stepped 4/4 live nets (weights updated) │ crown 0/1 seats · 0 eligible · 4 gated (join window or cull shield, k=5) · 0 age-blocked (j=5)"
         );
     }
 }

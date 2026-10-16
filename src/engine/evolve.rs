@@ -315,7 +315,7 @@ impl CoreEngine {
             self.config.mutation_probation_steps
         };
         format!(
-            "no cull-eligible victim — every non-elite net is inside its {branch} probation window (k={k}) or elite; roll spent, nothing culled/inserted"
+            "no cull-eligible victim — every non-elite net is inside its {branch} cull shield window (k={k}) or elite; roll spent, nothing culled/inserted"
         )
     }
 
@@ -491,8 +491,8 @@ impl CoreEngine {
             return Ok(None);
         }
         let adjusted = |v: f32| match direction {
-            crate::engine::fitness::Direction::Maximize => v,
-            crate::engine::fitness::Direction::Minimize => -v,
+            crate::utils::fitness::Direction::Maximize => v,
+            crate::utils::fitness::Direction::Minimize => -v,
         };
         let adj_best = scored
             .iter()
@@ -531,8 +531,10 @@ impl CoreEngine {
         fastrand::Rng::with_seed(kind.seed(self.header.run_seed, clock, roll)).f32() < p
     }
 
-    /// Whether `hash` is on probation at `clock`: cull-IMMUNE for its first few
-    /// clocks (from the persisted `entered_at_step`); a status, not a queue.
+    /// Whether `hash` is still under its **cull shield** at `clock` — what the log
+    /// calls `cull shield` (NOT the elite `join window`, which is
+    /// `elite_probation_age`): cull-IMMUNE for its first few clocks (from the
+    /// persisted `entered_at_step`); a status, not a queue.
     pub(crate) fn on_probation(&self, hash: &str, clock: usize) -> bool {
         let Some(state) = self.state.net(hash) else {
             return false;

@@ -2,7 +2,7 @@
 //! stop closure alias, the read-only `RaceSnapshot`, and the run-level
 //! context stamped into every net's `meta` block (`RunMetaCtx`).
 
-use crate::engine::fitness::Metric;
+use crate::utils::fitness::Metric;
 use crate::graph::topology::FeatureSplitPolicy;
 
 /// What the scheduler checks to decide whether to stop.
@@ -35,8 +35,9 @@ pub const RISK_AVERSION: f32 = 1.0;
 /// [`RaceConfigBuilder::set_run_checkpoint_every`]); this is the default when unset.
 pub const DEFAULT_CHECKPOINT_EVERY: usize = 10;
 
-/// Learning rate default for the Adam optimizers.
-pub const DEFAULT_LR: f32 = 1e-3;
+// `DEFAULT_LR` moved to `crate::utils::training`: a training scheme reads it
+// (the reference trainer and the example both do), so it belongs below both
+// layers rather than in the engine's config surface.
 
 /// Default number of fresh holdout games the post-race guardrail plays
 /// ([`RaceConfigBuilder::set_elite_guardrail_matches`]).
@@ -308,15 +309,8 @@ pub struct RaceConfig {
     pub guardrail_matches: usize,
 }
 
-    /// How far through its step budget a run is (`0.0` → `1.0`, clamped), or `None` when
-    /// unbounded/degenerate. THE one progress definition; pure arithmetic, replay-safe.
-pub fn run_progress(step: usize, max_steps: Option<usize>) -> Option<f32> {
-    let max = max_steps?;
-    if max == 0 {
-        return None;
-    }
-    Some((step as f32 / max as f32).min(1.0))
-}
+// `run_progress` and `DEFAULT_LR` live in `crate::utils::training` — the run
+// loop and any training scheme both need them, so they sit below both layers.
 
     /// Mode-specific knob set — the arm is carried in the TYPE. Built via
     /// `TabularConfig::builder()`/`RlConfig::builder()`; the engine derives it from `RunSpec`.
@@ -1057,21 +1051,7 @@ impl RaceConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogLevel, RISK_AVERSION, RaceConfig, run_progress};
-
-        /// One progress convention for the whole crate: linear to 1.0 at the budget, clamped,
-        /// and flat when unbounded.
-    #[test]
-    fn run_progress_clamps_and_is_flat_unbounded() {
-        assert_eq!(run_progress(0, Some(10)), Some(0.0));
-        assert_eq!(run_progress(5, Some(10)), Some(0.5));
-        assert_eq!(run_progress(10, Some(10)), Some(1.0));
-        // Overshoot clamps: a run resumed past its budget must not go negative.
-        assert_eq!(run_progress(99, Some(10)), Some(1.0));
-        // No budget (or a degenerate one) = no schedule at all.
-        assert_eq!(run_progress(3, None), None);
-        assert_eq!(run_progress(3, Some(0)), None);
-    }
+    use super::{LogLevel, RISK_AVERSION, RaceConfig};
 
         /// The examples' `--log-level` vocabulary must parse: handed to env_logger verbatim,
         /// `summ` is read as a module name and mutes the whole run — this mapping is load-bearing.

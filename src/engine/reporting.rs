@@ -105,7 +105,10 @@ impl CoreEngine {
             self.log_minimal_table(&trains, &evals, &fits, avg(&windows), avg(&spreads), step_secs);
         } else {
             info!(
-                "step {} │ pop {} │ train_loss↓ {} │ {} │ fitness{} {} │ μ{} σ{} │ took {}s{}",
+                // The score cell is tagged `smt` (not `fitness`): it is the
+                // risk-adjusted value `μ ∓ λσ` the ranking used, so the legend's
+                // equation and this line name the same quantity.
+                "step {} │ pop {} │ train_loss↓ {} │ {} │ smt{} {} │ μ{} σ{} │ took {}s{}",
                 clock,
                 self.state.live_count(),
                 stats(&trains),
@@ -277,9 +280,9 @@ impl CoreEngine {
                 self.config.checkpoint_every.to_string(),
             ),
         ];
-        crate::engine::cfy::emit(&crate::engine::cfy::card(
+        crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Artifacts & resume",
-            &crate::engine::cfy::kv(&artifact_rows),
+            &crate::utils::cfy::kv(&artifact_rows),
             Some("resume parity: replay-relevant knobs come from engine.json — a mismatch is refused, not patched"),
         ));
 
@@ -288,10 +291,10 @@ impl CoreEngine {
         let (rolls_header, rolls_rows) = accounting_rolls(&self.accounting);
         let accounting_body = format!(
             "{}\n{}",
-            crate::engine::cfy::kv(&accounting_population(&self.accounting, live.len())),
-            crate::engine::cfy::table(&rolls_header, &rolls_rows),
+            crate::utils::cfy::kv(&accounting_population(&self.accounting, live.len())),
+            crate::utils::cfy::table(&rolls_header, &rolls_rows),
         );
-        crate::engine::cfy::emit(&crate::engine::cfy::card(
+        crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Run accounting",
             &accounting_body,
             Some("built = nets admitted; discarded = crossover rolls that bought no viable child; blocked = immigrant rolls stopped by the cull shield"),
@@ -420,11 +423,11 @@ impl CoreEngine {
         }
         // CFY: the elite report is a card — the same comfy table, now with the gate
         // tally and the smt/μ/σ legend as its footnote (they were a trailing prose line).
-        crate::engine::cfy::emit(&crate::engine::cfy::card(
+        crate::utils::cfy::emit(&crate::utils::cfy::card(
             &format!("Final elites (top-{k}, ranked by fitness{arrow})"),
             &table.to_string(),
             Some(&format!(
-                "smt = risk-adjusted score (μ paid λ={}σ) · mean = window level · spread = σ · crown {}/{} seats · {} eligible · {} on probation (k={}) · {} age-blocked (j={})",
+                "smt = risk-adjusted score (μ paid λ={}σ) · mean = window level · spread = σ · crown {}/{} seats · {} eligible · {} gated (join window or cull shield, k={}) · {} age-blocked (j={})",
                 fmt_cfg(self.config.risk_aversion),
                 self.frozen_crown.len(),
                 self.config
@@ -517,7 +520,7 @@ pub(crate) fn accounting_population(
 }
 
 /// Run-accounting rolls MATRIX (CFY-C): one row per roll kind, one column per outcome.
-/// Returns `(header, rows)` ready for [`crate::engine::cfy::table`].
+/// Returns `(header, rows)` ready for [`crate::utils::cfy::table`].
 pub(crate) fn accounting_rolls(
     a: &crate::state::RunAccounting,
 ) -> (Vec<&'static str>, Vec<Vec<String>>) {
@@ -640,20 +643,26 @@ pub(crate) fn detail_inline(detail: &str) -> String {
     }
 }
 
-/// The elite gate in words for the freeze lines: `probation` is the window a fresh net
-/// must serve before a seat; `tenure` is the seat-age countdown against `j`.
-pub(crate) fn elite_gate_note(probation_age: usize, seat_age: usize, k: usize, j: usize) -> String {
-    let probation = if probation_age >= k {
-        format!("probation served ({probation_age}≥{k})")
+/// The elite gate in words for the freeze lines: the **join window** is the
+/// k-clock window a net must serve before it may hold a seat (it restarts at 0
+/// on every seat exit); `tenure` is the seat-age countdown against `j`.
+///
+/// Deliberately NOT a bare `probation`: the born **cull shield** is a different
+/// clock under a different rule — it never resets, and `unseated_reason` already
+/// prints `cull shield` for it. Naming both "probation" made the two
+/// indistinguishable in the log.
+pub(crate) fn elite_gate_note(join_age: usize, seat_age: usize, k: usize, j: usize) -> String {
+    let join = if join_age >= k {
+        format!("join window served ({join_age}≥{k})")
     } else {
-        format!("probation {probation_age}/{k}")
+        format!("join window {join_age}/{k}")
     };
     let tenure = if j == 0 {
         format!("tenure {seat_age}")
     } else {
         format!("tenure {seat_age}/{j}")
     };
-    format!(", {probation}, {tenure}")
+    format!(", {join}, {tenure}")
 }
 
 #[cfg(test)]
@@ -683,11 +692,11 @@ mod tests {
     fn detail_inline_keeps_an_event_on_one_line() {
         // The seat line's bookkeeping: inline joins mid-line, never a wrap.
         let tail = detail_inline(
-            "age 5 · trained 5/5 clocks · 10850 params, probation served (5≥5), tenure 0/5",
+            "age 5 · trained 5/5 clocks · 10850 params, join window served (5≥5), tenure 0/5",
         );
         assert_eq!(
             tail,
-            " · age 5 · trained 5/5 clocks · 10850 params, probation served (5≥5), tenure 0/5"
+            " · age 5 · trained 5/5 clocks · 10850 params, join window served (5≥5), tenure 0/5"
         );
         assert!(!tail.contains('\n'), "the seat line stays one log line: {tail}");
         // Empty detail adds nothing — no dangling separator.
@@ -696,22 +705,23 @@ mod tests {
 
     #[test]
     fn elite_gate_note_never_prints_a_bar_that_was_overshot() {
-        // Still serving: numerator < k, plain fraction.
-        assert_eq!(elite_gate_note(3, 0, 5, 5), ", probation 3/5, tenure 0/5");
+        // Still serving: numerator < k, plain fraction. Never a bare "probation" —
+        // this is the ELITE join window, not the born cull shield.
+        assert_eq!(elite_gate_note(3, 0, 5, 5), ", join window 3/5, tenure 0/5");
         // Served and ticking on: reported as served, never `16/5`.
         assert_eq!(
             elite_gate_note(16, 2, 5, 5),
-            ", probation served (16≥5), tenure 2/5"
+            ", join window served (16≥5), tenure 2/5"
         );
         // Exactly at the bar is served, not "5/5 of the window remaining".
         assert_eq!(
             elite_gate_note(5, 5, 5, 5),
-            ", probation served (5≥5), tenure 5/5"
+            ", join window served (5≥5), tenure 5/5"
         );
-        // k = 0: every net is served at once (the shield is off).
-        assert_eq!(elite_gate_note(0, 0, 0, 5), ", probation served (0≥0), tenure 0/5");
+        // k = 0: every net is served at once (the window is off).
+        assert_eq!(elite_gate_note(0, 0, 0, 5), ", join window served (0≥0), tenure 0/5");
         // j = 0: no lifetime armed, so no denominator is invented.
-        assert_eq!(elite_gate_note(7, 0, 5, 0), ", probation served (7≥5), tenure 0");
+        assert_eq!(elite_gate_note(7, 0, 5, 0), ", join window served (7≥5), tenure 0");
     }
 
     use super::{accounting_population, accounting_rolls, summarize_rows};

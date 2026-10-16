@@ -19,7 +19,7 @@
 //! objective. The spread term is symmetric, which is why one λ covers both
 //! directions.
 
-use crate::engine::fitness::Direction;
+use crate::utils::fitness::Direction;
 
 /// A small fixed-capacity rolling buffer — the in-memory equivalent of reading
 /// back the last K `NetMetrics` snapshots from a net's state file.

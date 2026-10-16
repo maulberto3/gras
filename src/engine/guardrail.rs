@@ -17,7 +17,7 @@
 //! race signal hides its own collapse.
 
 use crate::engine::format::fmt_line;
-use crate::engine::fitness::Direction;
+use crate::utils::fitness::Direction;
 use crate::graph::network::Network;
 
 /// The guardrail's verdict: per-game scores plus the two readings users compare.

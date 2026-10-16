@@ -80,9 +80,9 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
             continue;
         }
         // CFY: the duplicate notice is a table, not a prose line.
-        crate::engine::cfy::emit(&crate::engine::cfy::card(
+        crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Initial population",
-            &crate::engine::cfy::kv(&[(
+            &crate::utils::cfy::kv(&[(
                 "duplicate topology".to_string(),
                 hash[..8.min(hash.len())].to_string(),
             )]),
@@ -156,9 +156,9 @@ pub fn fill_unique(
         if seen.insert(topo_hash(&json)) {
             out.push(topo);
             continue;
-        }        crate::engine::cfy::emit(&crate::engine::cfy::card(
+        }        crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Founder batch",
-            &crate::engine::cfy::kv(&[(
+            &crate::utils::cfy::kv(&[(
                 "random draw".to_string(),
                 "duplicates a founder".to_string(),
             )]),
