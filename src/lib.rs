@@ -26,7 +26,7 @@ pub mod trainer;
 pub mod utils;
 
 // ── flat paths — the folders are an implementation detail ─────────────
-pub use engine::fitness;
+pub use utils::fitness;
 pub use evolution::{crossover, mutation, pools, selection};
 pub use graph::{network, node, topology};
 pub use utils::markdown;
@@ -34,16 +34,18 @@ pub use utils::tabular_data;
 
 // ── engine — the step-race loop ──────────────────────────────────────
 pub use engine::{
-    Direction, Fitness, FitnessLabel, GuardrailVerdict, RLSpec, RaceConfig,
-    RaceSnapshot, RlConfig, RlEngine, RlRaceConfig, RunMode, RunSpec, StopReason, TabularConfig,
-    TabularEngine, TabularRaceConfig, TabularSpec, rl_race_config_builder,
-    tabular_race_config_builder,
+    GuardrailVerdict, RLSpec, RaceConfig, RaceSnapshot, RlConfig, RlEngine, RlRaceConfig, RunMode,
+    RunSpec, StopReason, TabularConfig, TabularEngine, TabularRaceConfig, TabularSpec,
+    rl_race_config_builder, tabular_race_config_builder,
 };
+// Scoring vocabulary lives in `utils`, not `engine`: a training scheme must be
+// able to rank/report without importing the engine.
+pub use utils::fitness::{Direction, Fitness, FitnessLabel};
 
 // ── graph — blueprints + executable networks ─────────────────────────
 pub use graph::network::{Network, NetworkOptions};
 pub use graph::node::{Activation, CombineOp, Node, NodeKind, StandardizeOp};
-pub use graph::topology::{Topology, TopologyOptions};
+pub use graph::topology::{FeatureSplitPolicy, Topology, TopologyOptions};
 
 // ── evolution — the genetic operators ────────────────────────────────
 pub use evolution::crossover::CrossoverMethod;
@@ -104,11 +106,10 @@ pub mod prelude {
         RaceConfig, RaceConfigBuilder, RaceSnapshot, RlConfig, RlRaceConfig, RunMode, StopReason,
         TabularConfig, TabularRaceConfig, rl_race_config_builder, tabular_race_config_builder,
     };
-    pub use crate::engine::fitness::Metric;
+    // Scoring vocabulary is `utils`-resident: shared with any training scheme.
+    pub use crate::utils::fitness::{Direction, Fitness, FitnessLabel, Metric};
     pub use crate::engine::guardrail::GuardrailVerdict;
-    pub use crate::engine::{
-        Direction, Fitness, FitnessLabel, RLSpec, RlEngine, RunSpec, TabularEngine, TabularSpec,
-    };
+    pub use crate::engine::{RLSpec, RlEngine, RunSpec, TabularEngine, TabularSpec};
 
     // Trainer contracts + report types.
     pub use crate::trainer::{
@@ -124,7 +125,7 @@ pub mod prelude {
     // Graph blueprints + executable networks.
     pub use crate::graph::network::{Network, NetworkOptions};
     pub use crate::graph::node::{Activation, CombineOp, Node, NodeKind, StandardizeOp};
-    pub use crate::graph::topology::{Topology, TopologyOptions};
+    pub use crate::graph::topology::{FeatureSplitPolicy, Topology, TopologyOptions};
 
     // Tensors, devices, and the trainer-facing flodl traits.
     pub use crate::flodl::nn::Module;
