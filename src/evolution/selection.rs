@@ -9,7 +9,7 @@
 //! built networks, so the results are serializable and reproducible like any
 //! other topology.
 
-use crate::engine::fitness::Direction;
+use crate::utils::fitness::Direction;
 use serde::Serialize;
 
 /// Selection strategy used by the engine to pick parents for the next
