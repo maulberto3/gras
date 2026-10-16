@@ -289,6 +289,44 @@ impl Topology {
         self.nodes[input].feature_masks = Some(masks);
     }
 
+        /// The Input node's per-port feature masks, cloned (`None` when this
+        /// topology carries no split). The engine snapshots these BEFORE a
+        /// crossover, which re-finalizes both parents and drops them.
+    pub fn input_feature_masks(&self) -> Option<Vec<Vec<u8>>> {
+        self.nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Input)
+            .and_then(|n| n.feature_masks.clone())
+    }
+
+        /// Install INHERITED masks on the Input node — the crossover path's
+        /// counterpart to [`Self::assign_feature_masks`]. Rows are mapped to ports by
+        /// index; a port the donor rows do not cover (the rebuild grew the port count)
+        /// starts UNMASKED, i.e. it sees every feature — a mask is never invented for a
+        /// port we hold no inherited data for. Truncates when the child has fewer ports.
+        ///
+        /// Deterministic by construction (no RNG): the same inherited rows always give
+        /// the same masks, so resume replays identically.
+    pub fn install_input_feature_masks(&mut self, rows: &[Vec<u8>]) {
+        let input_dim = self.options.input_dim.unwrap_or(1);
+        let Some(input) = self.nodes.iter().position(|n| n.kind == NodeKind::Input) else {
+            return;
+        };
+        if input_dim == 0 {
+            return;
+        }
+        let n_ports = self.nodes[input].num_outputs.max(1);
+        let masks: Vec<Vec<u8>> = (0..n_ports)
+            .map(|i| {
+                rows.get(i)
+                        // No inherited row for this port: every feature reaches it.
+                    .cloned()
+                    .unwrap_or_else(|| vec![1u8; input_dim])
+            })
+            .collect();
+        self.nodes[input].feature_masks = Some(masks);
+    }
+
         /// Assign every hidden node a random activation from `pool` (Input/Output stay
         /// `Identity`). Refresh the port labels (`n1_i0`, `n2_o3`, …) for printing.
     pub fn renumber_ids(&mut self) {
@@ -2294,5 +2332,64 @@ mod fanout_bounds_tests {
         }))
         .unwrap();
         assert_eq!(legacy.feature_masks, None, "serde default keeps old JSON loadable");
+    }
+
+        /// The crossover path's installer: an inherited row lands on its own port, a
+        /// port with no inherited row starts UNMASKED (every feature reaches it), and
+        /// the result always validates against the final port count.
+    #[test]
+    fn install_feature_masks_maps_rows_and_leaves_new_ports_unmasked() {
+        let opts = TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let mut g = Topology::new(23, Some(opts));
+        g.create_random_hidden_nodes(3);
+        g.finalize();
+        fn input_of(t: &Topology) -> &crate::graph::node::Node {
+            t.nodes.iter().find(|n| n.kind == NodeKind::Input).unwrap()
+        }
+        let ports = input_of(&g).num_outputs;
+        assert!(ports >= 2, "fixture needs at least two input ports, got {ports}");
+
+        g.install_input_feature_masks(&[vec![0, 1, 1, 1]]);
+        let masks = input_of(&g)
+            .feature_masks
+            .clone()
+            .expect("rows were installed");
+        assert_eq!(masks.len(), ports, "one row per port");
+        assert_eq!(masks[0], vec![0, 1, 1, 1], "the inherited row rides port 0");
+        assert!(
+            masks[1..].iter().all(|m| m == &vec![1u8; 4]),
+            "a port with no inherited row sees every feature"
+        );
+        g.validate().expect("installed masks must validate");
+        assert_eq!(
+            g.input_feature_masks().expect("readable"),
+            masks,
+            "input_feature_masks must read back exactly what was installed"
+        );
+    }
+
+        /// No inherited rows at all (neither parent carried a split, no policy): the
+        /// input stays unmasked rather than getting an invented one.
+    #[test]
+    fn install_feature_masks_with_no_rows_leaves_every_port_unmasked() {
+        let opts = TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let mut g = Topology::new(24, Some(opts));
+        g.create_random_hidden_nodes(2);
+        g.finalize();
+        g.install_input_feature_masks(&[]);
+        let masks = g.input_feature_masks().expect("installed");
+        assert!(
+            masks.iter().all(|m| m == &vec![1u8; 4]),
+            "every port keeps every feature"
+        );
+        g.validate().expect("unmasked rows must validate");
     }
 }
