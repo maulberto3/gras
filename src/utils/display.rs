@@ -8,7 +8,7 @@
 
 use std::fmt::Display;
 
-use crate::engine::fitness::{Direction, FitnessLabel};
+use crate::utils::fitness::{Direction, FitnessLabel};
 use crate::evolution::crossover::CrossoverMethod;
 use crate::evolution::mutation::MutationMethod;
 use crate::graph::topology::FeatureSplitPolicy;

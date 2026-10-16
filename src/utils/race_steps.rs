@@ -11,7 +11,7 @@ use flodl::nn::optim::Optimizer;
 use flodl::tensor::Result;
 use flodl::{Tensor, Variable};
 
-use crate::engine::fitness::{Fitness, Metric};
+use crate::utils::fitness::{Fitness, Metric};
 use crate::graph::network::Network;
 
 /// Process-global lock over the two seeded RNGs (fastrand + libtorch's
