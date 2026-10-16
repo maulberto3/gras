@@ -72,26 +72,6 @@ class _SeedRng:
                 return x
 
 
-def apply_transform(name: str | None, t: torch.Tensor) -> torch.Tensor:
-    """Per-node elementwise transform after standardize, before activation
-    (mirrors node.rs::Transform::apply — every branch stateless)."""
-    if name in (None, "Identity"):
-        return t
-    if name == "Log1p":
-        return t.clamp(-0.999999, 1e9).log1p()
-    if name == "Sqrt":
-        return t.sign() * t.abs().sqrt()
-    if name == "Clamp":
-        return t.clamp(-1.0, 1.0)
-    if name == "Sign":
-        return torch.sign(t)
-    if name == "Reciprocal":
-        return t.sign() * t.abs().clamp(min=1e-6).reciprocal()
-    if name == "Exp":
-        return t.clamp(-10.0, 10.0).exp()
-    raise ValueError(f"unknown transform op {name!r}")
-
-
 # ── Topology model (mirrors gras's JSON) ────────────────────────────────────
 
 
@@ -106,7 +86,9 @@ class Node:
     port_activations: list | None = None
     combine_op: str = "Add"
     standardize: str | None = None
-    transform: str | None = None
+    # Per-output-port feature masks (the feature split). Input nodes only; entry p is
+    # port p's 0/1 mask over the raw input features. None = unmasked (mixed fan-out).
+    feature_masks: list | None = None
 
 
 @dataclass
@@ -289,10 +271,22 @@ class GrasNet:
 
         for n in self.nodes:
             if n.kind == "Input":
-                base = self.layers[f"node{n.id}"](x)
-                # Raw fan-out — input ports carry no activation.
+                masks = n.feature_masks
+                base = None
                 for p in range(n.num_outputs or 1):
-                    port_outputs[(n.id, p)] = base
+                    # Feature split: a port WITH a mask carries the projection of the
+                    # masked raw input — same weight matrix, its input columns gated —
+                    # so different ports see different feature subsets. A port with no
+                    # mask reuses the shared base, exactly as before.
+                    if masks is not None:
+                        m = torch.tensor(masks[p], dtype=x.dtype, device=x.device)
+                        out = self.layers[f"node{n.id}"](x * m)
+                    else:
+                        if base is None:
+                            base = self.layers[f"node{n.id}"](x)
+                        out = base
+                    # Raw fan-out — input ports carry no activation.
+                    port_outputs[(n.id, p)] = out
                 continue
 
             # Gather ALL wires of this node flat in (port, source) order.
@@ -335,7 +329,6 @@ class GrasNet:
 
             base = self.layers[f"node{n.id}"](z)
             base = standardize(n.standardize, base)
-            base = apply_transform(n.transform, base)
             for p in range(n.num_outputs or 1):
                 a = (
                     n.port_activations[p]

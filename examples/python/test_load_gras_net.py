@@ -123,11 +123,58 @@ def test_init_is_deterministic_and_seed_sensitive() -> None:
     )
 
 
+def test_feature_masks_gate_features_per_port() -> None:
+    """The feature split: an Input port's mask decides which raw features reach it.
+
+    Port 0 carries `[1,0,0,0]` and is the only port wired to node 1, so node 1 sees
+    feature 0 alone — two inputs differing only in features 1..3 must give identical
+    outputs. The mask is genome (it comes from the blueprint), not a weight.
+    """
+    nodes = [
+        loader.Node(id=0, kind="Input", num_inputs=0, num_outputs=2, hidden_dim=8,
+                    feature_masks=[[1, 0, 0, 0], [0, 1, 1, 1]]),
+        loader.Node(id=1, kind="Hidden", num_inputs=1, num_outputs=1, hidden_dim=8),
+        loader.Node(id=2, kind="Output", num_inputs=1, num_outputs=1, hidden_dim=1),
+    ]
+    connections = [
+        {"from": {"node": 0, "index": 0}, "to": {"node": 1, "index": 0}},
+        {"from": {"node": 1, "index": 0}, "to": {"node": 2, "index": 0}},
+    ]
+    net = loader.GrasNet(
+        input_dim=4, output_dim=1, nodes=nodes,
+        connections=connections, topology_seed=3,
+    )
+    net.build_modules()
+    net.init_weights()
+
+    a = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    b = torch.tensor([[1.0, 9.0, 9.0, 9.0]])  # differs ONLY in the masked-out features
+    ya, yb = net.forward(a), net.forward(b)
+    assert torch.allclose(ya, yb, atol=1e-6), (
+        f"features masked out of the wired port must not reach the hidden node: {ya} vs {yb}"
+    )
+
+    # Control: the same wiring WITHOUT the mask does see those features, so the
+    # assertion above cannot pass by accident.
+    for n in nodes:
+        n.feature_masks = None
+    plain = loader.GrasNet(
+        input_dim=4, output_dim=1, nodes=nodes,
+        connections=connections, topology_seed=3,
+    )
+    plain.build_modules()
+    plain.init_weights()
+    assert not torch.allclose(plain.forward(a), plain.forward(b), atol=1e-6), (
+        "control: without masks the same net must respond to those features"
+    )
+
+
 def main() -> int:
     tests = [
         test_seeded_init_matches_rust_bit_for_bit,
         test_seeded_init_sample_values,
         test_init_is_deterministic_and_seed_sensitive,
+        test_feature_masks_gate_features_per_port,
     ]
     failed = 0
     for t in tests:

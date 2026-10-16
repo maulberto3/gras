@@ -601,6 +601,13 @@ fn main() {
         .set_topology_combine_op_pool([
             "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
         ])
+        // Feature split: every Input port keeps an independent ~half of the 4 cart
+        // features (p = 0.5), so branches specialise on different feature subsets.
+        // NOTE: `Exclusive` is the wrong tool at this width — it places each of the 4
+        // features in exactly one port, so with up to 15 hidden nodes most would get no
+        // features at all and emit only their bias.
+        .set_topology_feature_split(FeatureSplitPolicy::Random)
+        // .set_topology_feature_split(FeatureSplitPolicy::Exclusive)
         // .set_topology_activation_pool(["ReLU", "Tanh", …]) — evolve activations
         // .set_topology_standardize_op_pool(["LayerNorm", …]) — per-node norm ops
         .set_elite_count(pop / 20)
