@@ -19,6 +19,7 @@ mod cli;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use gras::engine::format::{ReadingStyle, fmt_reading};
 use gras::flodl::tensor::{Result as TensorResult, TensorError};
 use gras::prelude::*;
 use gras::utils::race_steps::{deterministic_train_step, eval_one_step};
@@ -433,7 +434,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match engine.guardrail() {
         Some(v) => {
-            let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
+            let holdout = v.mean().unwrap_or(0.0);
+            // σ (how mixed the holdout pool was) and SE (how well the mean is
+            // pinned down) are different claims; print both, labelled.
+            let exam = fmt_reading(v.mean(), v.std(), v.scores.len(), ReadingStyle::Line);
             let smoothed = v
                 .race_smoothed
                 .map(|s| format!(" (race smoothed {s:.3})"))
@@ -446,7 +450,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(_) => "consistent with the race signal ✅",
                 None => "no race-smoothed reference",
             };
-            println!("guardrail: holdout accuracy {holdout:.3} ± {std:.3}{smoothed} — {verdict}");
+            println!("guardrail: holdout accuracy {exam}{smoothed} — {verdict}");
         }
         None => println!("guardrail: no champion exported — skipped"),
     }

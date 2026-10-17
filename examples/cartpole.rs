@@ -22,6 +22,8 @@ use fastrand::Rng;
 // Not in the prelude: the engine's own durability-tick default, cited by the config
 // chain below so the showcased value can't drift from the engine's.
 use gras::engine::config::DEFAULT_CHECKPOINT_EVERY;
+// The one sanctioned spelling of a sampled mean — `μ… ±σ… (SE …, n=…)`.
+use gras::engine::format::{ReadingStyle, fmt_reading};
 use gras::prelude::*;
 /// One played turn: the observation, and the action taken from it.
 type Transition = ([f32; 4], usize);
@@ -471,7 +473,11 @@ fn report_guardrail(engine: &mut RlEngine, baseline: f64) {
         println!("guardrail: no champion to score — skipped");
         return;
     };
-    let (holdout, std) = (v.mean().unwrap_or(0.0), v.std().unwrap_or(0.0));
+    let holdout = v.mean().unwrap_or(0.0);
+    // The honest reading of the exam: its mean, the spread of the games behind
+    // it, AND the SE of that mean — a 100-game mean is far better pinned down
+    // than the race's 7-reading window, and the line has to say so.
+    let exam = fmt_reading(v.mean(), v.std(), v.scores.len(), ReadingStyle::Line);
     // The race side carries its own error bar — a swinging window can't resolve
     // better than ±80, so a holdout below its mean isn't damning.
     let smoothed_note = match v.race_smoothed {
@@ -492,7 +498,7 @@ fn report_guardrail(engine: &mut RlEngine, baseline: f64) {
         "weak — REINFORCE may have collapsed ❌"
     };
     println!(
-        "guardrail: holdout survival {holdout:.0} ± {std:.0}/{MAX_TURNS_PER_MATCH} turns{smoothed_note} — {verdict}"
+        "guardrail: holdout survival {exam} of {MAX_TURNS_PER_MATCH} turns{smoothed_note} — {verdict}"
     );
 }
 
@@ -515,8 +521,8 @@ const EVAL_MATCHES_PER_STEP: usize = 5;
 const RISK_AVERSION: f32 = 0.0;
 
 /// The smoke-test CLI: `--pop`, `--max-steps`, `--seed`, `--log-level`,
-/// `--risk-aversion`. Everything else is a const above — clap rejects any other
-/// flag at the usage line.
+/// `--risk-aversion`, `--train-lottery`. Everything else is a const above — clap
+/// rejects any other flag at the usage line.
 #[derive(clap::Parser, Debug)]
 #[command(
     name = "cartpole",
@@ -540,6 +546,11 @@ struct Cli {
     /// the `RISK_AVERSION` const).
     #[arg(long, value_name = "F32", visible_alias = "risk-based")]
     risk_aversion: Option<f32>,
+    /// EXPERIMENTAL training lottery: give each non-crown net's weight update to a
+    /// merit-weighted coin (window level per training, relative to the population).
+    /// A skipped net still acts and is measured. Off by default.
+    #[arg(long)]
+    train_lottery: bool,
     /// Log level (default: the `LOG_LEVEL` const). `none`/`summ`/`minimal` pick
     /// the shape; `debug`/`trace` add the engine's per-roll detail.
     #[arg(
@@ -586,19 +597,22 @@ fn main() {
         .set_run_log_level(log_level)
         .set_run_checkpoint_every(DEFAULT_CHECKPOINT_EVERY) // 10 — the durability tick
         .set_run_csv_export(true) // history.csv + attempts.csv
-        // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
         .set_run_pop_size(cli.pop.unwrap_or(POP))
         .set_run_smoothing_window(10)
         .set_run_risk_aversion(cli.risk_aversion.unwrap_or(RISK_AVERSION))
+        .set_run_train_merit(cli.train_lottery)
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra history.csv column
+        // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
+        // .set_run_topologies(vec![])
+        // STOP
         .set_stop_max_steps(Some(cli.max_steps.unwrap_or(RACE_STEPS)))
         // .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
-        // .set_run_topologies(vec![])
         // CROSSOVER
         .set_crossover_rolls(pop / 10)
         .set_crossover_prob(0.5)
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
         .set_crossover_probation_steps(5)
+        .set_crossover_selection(SelectionMethod::Tournament { tournament_size: 2 })
         // .set_crossover_ops_pool(["uniform"]) // if not specified, use all
         // MUTATION
         .set_mutation_cull_policy(MutationCullPolicy::Worst)
@@ -625,7 +639,6 @@ fn main() {
         // .set_topology_feature_split(FeatureSplitPolicy::Random) // Other one Exclusive
         // ELITES
         .set_elite_count(pop / 20)
-        // .set_elite_previous_dir("assets/1790920031289_500")
         .set_elite_previous_load(true) // on by default
         .set_elite_save_safetensors(false)
         .set_elite_checkpoint_weights(false)
@@ -636,6 +649,7 @@ fn main() {
         .set_elite_save_topology(true) // elite-<hash>.md at stop
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(false) // worst-<hash>.safetensors at stop
+        // .set_elite_previous_dir("assets/1790920031289_500")
         // The mins are `TopologyOptions::default`; the max_* twins above are raised by
         // this example, so the sampler still varies topology width.
 
