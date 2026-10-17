@@ -83,10 +83,6 @@ pub struct ConfigSnapshot {
     pub device: String,
     /// Whether the lossless per-step `metrics.csv` was written.
     pub csv_export: bool,
-    /// Post-race pruner: `(method, extra_steps)`. `None` = off. `#[serde(default)]`
-    /// so legacy `engine.json` headers load cleanly.
-    #[serde(default)]
-    pub pop_pruner: Option<(String, usize)>,
     /// Human label for the experiment (`set_run_name`), verbatim. Purely
     /// informative — never affects the results folder name.
     pub run_name: Option<String>,
@@ -170,9 +166,6 @@ impl ConfigSnapshot {
             }
             .to_string(),
             csv_export: cfg.csv_export,
-            pop_pruner: cfg
-                .pop_pruner
-                .map(|p| (format!("{:?}", p.method).to_lowercase(), p.steps)),
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
             run_topology_count: cfg.run_topologies.len(),
@@ -240,6 +233,59 @@ pub struct GuardrailRecord {
     pub matches_scored: usize,
         /// Unit-free agreement between the race reading and the holdout — which reading to
         /// trust and why. Informational.
+    #[serde(default)]
+    pub verdict: String,
+        /// Every net that took the exam, rank 1 (the champion above) first. Empty on
+        /// records written before the exam covered the whole elite set.
+    #[serde(default)]
+    pub elites: Vec<GuardrailElite>,
+}
+
+/// One elite's line in the guardrail record — the same readings as the champion
+/// block, for a net that is not the champion. The champion's numbers stay in
+/// [`GuardrailRecord`]'s top-level fields (the seeding contract reads those).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct GuardrailElite {
+    /// 1-based rank in the exam order (the same ranking that picked the elites).
+    #[serde(default)]
+    pub rank: usize,
+    /// Full hash of the net scored.
+    pub hash: String,
+    /// Trainable parameter count (elements) — the champion's tie-break key.
+    #[serde(default)]
+    pub params: Option<i64>,
+    /// The net's smoothed race fitness (the readable window mean).
+    #[serde(default)]
+    pub race_mean: Option<f32>,
+    /// Spread of that net's race window (σ).
+    #[serde(default)]
+    pub race_std: Option<f32>,
+    /// The risk-adjusted score (FIT) that placed this net in the elite set.
+    #[serde(default)]
+    pub race_score: Option<f32>,
+    /// Standard error of `race_mean`; `None` when no window was recorded.
+    #[serde(default)]
+    pub race_se: Option<f32>,
+    /// Step readings behind `race_mean` (`0` = unknown).
+    #[serde(default)]
+    pub race_samples: usize,
+    /// The net's most recent step reading (the window mean lags it).
+    #[serde(default)]
+    pub race_latest: Option<f32>,
+    /// Mean holdout score over the games that actually produced one.
+    #[serde(default)]
+    pub holdout_mean: Option<f32>,
+    /// Population std of those scores.
+    #[serde(default)]
+    pub holdout_std: Option<f32>,
+    /// Games that produced a score (per-game failures are skipped).
+    #[serde(default)]
+    pub matches_scored: usize,
+    /// The one-word grade: `consistent` / `within noise` / `≤10% below` /
+    /// `borderline` / `weak` / `not scored`.
+    #[serde(default)]
+    pub agreement: String,
+    /// The full verdict sentence (what the console card prints for rank 1).
     #[serde(default)]
     pub verdict: String,
 }
