@@ -33,7 +33,7 @@
 //! ```
 //!
 //! Note: the engine ALSO writes `elite-<hash>.safetensors` automatically for
-//! the champion at stop (pruner or not) — those files need no replay because
+//! the champion at stop — those files need no replay because
 //! the live network is exported in memory. This example covers every other
 //! net (tombstones included) by replaying its history.
 

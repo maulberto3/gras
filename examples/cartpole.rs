@@ -509,7 +509,7 @@ const RACE_STEPS: usize = 20;
 const MATCHES_PER_STEP: usize = 1;
 /// Eval matches each net plays per step — the ranking signal. Raising it
 /// resolves fitness more finely and multiplies both turns and step time.
-const EVAL_MATCHES_PER_STEP: usize = 10;
+const EVAL_MATCHES_PER_STEP: usize = 5;
 /// FIT risk aversion λ (default; `--risk-aversion` overrides). Window-σs a net
 /// pays for its own spread; 0.0 ranks on the plain window mean.
 const RISK_AVERSION: f32 = 0.0;
@@ -581,6 +581,7 @@ fn main() {
     println!("baseline: random policy survives {baseline:.1} turns (race must beat this)");
 
     let config = rl_race_config_builder()
+        // SETUP
         .set_run_name("cartpole")
         .set_run_log_level(log_level)
         .set_run_checkpoint_every(DEFAULT_CHECKPOINT_EVERY) // 10 — the durability tick
@@ -592,17 +593,19 @@ fn main() {
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra history.csv column
         .set_stop_max_steps(Some(cli.max_steps.unwrap_or(RACE_STEPS)))
         // .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
-        // .set_pruner_{enabled,method,steps}(..) · 
         // .set_run_topologies(vec![])
+        // CROSSOVER
         .set_crossover_rolls(pop / 10)
         .set_crossover_prob(0.5)
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
         .set_crossover_probation_steps(5)
         // .set_crossover_ops_pool(["uniform"]) // if not specified, use all
+        // MUTATION
         .set_mutation_cull_policy(MutationCullPolicy::Worst)
         .set_mutate_rolls(pop / 20)
         .set_mutate_prob(0.5)
         .set_mutation_probation_steps(5)
+        // TOPOLOGY
         .set_topology_dropout_prob(DROPOUT_PROB)
         .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(15)
@@ -619,10 +622,11 @@ fn main() {
         // ])
         // .set_topology_activation_pool(["ReLU", "Tanh", …]) // if not specified, use all
         // .set_topology_standardize_op_pool(["LayerNorm", …]) // if not specified, use all
-        .set_topology_feature_split(FeatureSplitPolicy::Random) // Other one Exclusive
+        // .set_topology_feature_split(FeatureSplitPolicy::Random) // Other one Exclusive
+        // ELITES
         .set_elite_count(pop / 20)
         // .set_elite_previous_dir("assets/1790920031289_500")
-        // .set_elite_previous_load(false) // on by default
+        .set_elite_previous_load(true) // on by default
         .set_elite_save_safetensors(false)
         .set_elite_checkpoint_weights(false)
         .set_elite_guardrail_matches(GUARDRAIL_MATCHES)
@@ -632,8 +636,6 @@ fn main() {
         .set_elite_save_topology(true) // elite-<hash>.md at stop
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(false) // worst-<hash>.safetensors at stop
-        
-        .set_pruner_enabled(false) // no post-race solo-training phase
         // The mins are `TopologyOptions::default`; the max_* twins above are raised by
         // this example, so the sampler still varies topology width.
 

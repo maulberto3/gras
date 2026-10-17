@@ -7,7 +7,7 @@
 //!
 //! Writes `<hash>.md` next to the run dir and prints it to stdout.
 //! Nets are looked up in `nets/<hash>.json` — every net that ever joined the
-//! race (founders, crossover children, immigrants, pruned) has one.
+//! race (founders, crossover children, immigrants, culled) has one.
 //! The full hash is the net's identity: no prefix matching, no guessing.
 
 use clap::Parser;

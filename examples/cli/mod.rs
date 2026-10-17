@@ -140,14 +140,6 @@ pub struct EngineArgs {
     #[arg(long, value_name = "DIR")]
     pub run_dir: Option<PathBuf>,
 
-    /// Skip the post-race solo training of the elites.
-    #[arg(long)]
-    pub no_pruner: bool,
-
-    /// Extra solo steps when the pruner runs.
-    #[arg(long, value_name = "N")]
-    pub pruner_steps: Option<usize>,
-
     /// Who an admitted crossover child evicts: `worst` (default, merit-based)
     /// or `random` (keeps slots turning over). Mutation victims are always
     /// fitness-inverse and ignore this.
@@ -167,11 +159,6 @@ pub struct EngineArgs {
     /// itself, and how to run without it entirely.
     #[arg(long, value_name = "N")]
     pub grace_periods: Option<usize>,
-
-    /// Which post-race pruner: `hard` (keep the elite, train it solo for
-    /// --pruner-steps).
-    #[arg(long, value_name = "METHOD")]
-    pub pruner_method: Option<String>,
 
     /// Also write `worst-<hash>.md` + `.safetensors` at stop — the
     /// anti-champion the search avoided.
@@ -273,12 +260,6 @@ impl EngineArgs {
         if let Some(name) = &self.run_name {
             b = b.set_run_name(name.clone());
         }
-        if self.no_pruner {
-            b = b.set_pruner_enabled(false);
-        }
-        if let Some(steps) = self.pruner_steps {
-            b = b.set_pruner_steps(steps);
-        }
         b = b.set_elite_freeze(self.freeze_elites);
         if let Some(policy) = &self.crossover_cull_policy {
             b = b.set_crossover_cull_policy(match policy.trim().to_ascii_lowercase().as_str() {
@@ -301,15 +282,6 @@ impl EngineArgs {
                     eprintln!(
                         "--mutation-cull-policy {other}: expected `inverse`, `worst`, or `random`"
                     );
-                    std::process::exit(2);
-                }
-            });
-        }
-        if let Some(method) = &self.pruner_method {
-            b = b.set_pruner_method(match method.trim().to_ascii_lowercase().as_str() {
-                "hard" => gras::engine::config::PopPrunerMethod::Hard,
-                other => {
-                    eprintln!("--pruner-method {other}: expected `hard`");
                     std::process::exit(2);
                 }
             });

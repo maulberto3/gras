@@ -737,7 +737,6 @@ fn main() {
         .set_elite_checkpoint_weights(true)
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(false)
-        .set_pruner_enabled(false)
         .build();
 
     let fitness = Fitness::reported(Direction::Maximize, "shaped_solve_score");

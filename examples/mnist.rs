@@ -266,8 +266,6 @@ const RUN_SEED: Option<u64> = Some(16);
 const MAX_STEPS: Option<usize> = Some(50);
 const POP_SIZE: usize = 100;
 const CHECKPOINT_EVERY: usize = 5;
-const POP_PRUNER: bool = true;
-const PRUNER_STEPS: usize = 25;
 /// Per-(net, step) chance an anti-plateau challenge fires (see `train_step`).
 const CHALLENGE_PROB: f32 = 0.15;
 const MUTATE_PROB: f32 = 0.5;
@@ -397,10 +395,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // --- Mutation (both modes) ---
         .set_mutate_prob(MUTATE_PROB) // per-roll chance a random immigrant is inserted
         .set_mutate_rolls(pop / 5)
-        // --- Post-race pruner ---
-        .set_pruner_enabled(POP_PRUNER)
-        .set_pruner_method(gras::engine::config::PopPrunerMethod::Hard)
-        .set_pruner_steps(PRUNER_STEPS)
         // --- Guardrail (post-race honesty check) ---
         .set_elite_guardrail_matches(HOLDOUT_MATCHES) // fresh holdout draws behind the champion verdict
         // --- Topology & network search boundaries ---
