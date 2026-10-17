@@ -5,7 +5,7 @@ edition = "2024"
 description = "A Genetic Programming framework for Neural Architecture Search in Rust"
 license = "MIT"
 readme = "README.md"
-rust-version = "1.85"
+rust-version = "1.91"
 keywords = ["neural-network", "genetic-algorithm", "neural-search", "machine-learning", "evolutionary"]
 categories = ["algorithms", "artificial-intelligence", "mathematics"]
 homepage = "https://github.com/maulberto3/gras"
@@ -18,7 +18,7 @@ default = []
 cuda = ["flodl/cuda"]
 
 [dependencies]
-flodl = "0.7.0"
+flodl = "0.8.0"
 fastrand = "2.5.0"
 # `features = ["log"]` mirrors every gras event into `log` too, so a consumer
 # still on `env_logger`/`RUST_LOG` keeps seeing the same lines with no change.
