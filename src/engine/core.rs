@@ -1701,10 +1701,18 @@ impl CoreEngine {
                 (rank0 + 1).to_string(),
                 v.hash[..8.min(v.hash.len())].to_string(),
                 fmt_cell_opt(&v.race_smoothed),
+                // The race side's sample size: how many step readings the window
+                // mean averages (`0` = no window recorded).
+                match v.race_samples {
+                    0 => "—".to_string(),
+                    n => n.to_string(),
+                },
                 fmt_cell_opt(&v.race_se),
                 fmt_cell_opt(&v.mean()),
                 fmt_cell_opt(&v.se()),
-                v.scores.len().to_string(),
+                // `scored/played`: `score_net` skips a game whose scorer errors, so
+                // a degraded exam must be visible next to the full one.
+                format!("{}/{}", v.scores.len(), matches),
                 grade.tag().to_string(),
             ]);
             elite_records.push(crate::state::GuardrailElite {
@@ -1720,6 +1728,7 @@ impl CoreEngine {
                 holdout_mean: v.mean(),
                 holdout_std: v.std(),
                 matches_scored: v.scores.len(),
+            matches_attempted: matches,
                 agreement: grade.tag().to_string(),
                 verdict: line,
             });
@@ -1765,10 +1774,16 @@ impl CoreEngine {
                     "best of live".to_string(),
                     format!("{} net(s) on that reading", self.state.live_count()),
                 ),
+                (
+                    "columns".to_string(),
+                    "race n = step readings behind the race μ · games = holdout games scored/played"
+                        .to_string(),
+                ),
             ]),
             crate::utils::cfy::table(
                 &[
-                    "#", "net", "race μ", "race SE", "exam μ", "exam SE", "games", "status",
+                    "#", "net", "race μ", "race n", "race SE", "exam μ", "exam SE", "games",
+                    "status",
                 ],
                 &rows,
             ),
@@ -5283,7 +5298,11 @@ mod tests {
         };
         let trainer = crate::trainer::TabularTrainer::new(loss_fn()).with_holdout_scorer(
             move |_net, game_i| -> Result<f32> {
-                counted.fetch_add(1, Ordering::SeqCst);
+                // The 6th call is the LAST elite's first game: fail it, so the test
+                // covers a DEGRADED exam (`scored < played`) beside a full one.
+                if counted.fetch_add(1, Ordering::SeqCst) == 5 {
+                    return Err(flodl::tensor::TensorError::new("holdout game failed"));
+                }
                 Ok(game_i as f32)
             },
         );
@@ -5327,10 +5346,24 @@ mod tests {
         assert_eq!(record.elites.len(), 3, "one record per examined elite");
         assert_eq!(record.elites[0].rank, 1);
         assert_eq!(record.elites[0].hash, record.champion_hash);
+        assert_eq!(record.elites[0].matches_scored, 2, "the champion's exam is full");
+        // `played` is the denominator: every elite was asked for both games…
         assert!(
-            record.elites.iter().all(|e| e.matches_scored == 2),
-            "each elite is scored matches-times: {:?}",
-            record.elites.iter().map(|e| e.matches_scored).collect::<Vec<_>>()
+            record.elites.iter().all(|e| e.matches_attempted == 2),
+            "each elite plays the whole exam: {:?}",
+            record.elites.iter().map(|e| e.matches_attempted).collect::<Vec<_>>()
+        );
+        // …while a scorer error shows up as `scored < played` on that one elite.
+        let degraded: Vec<usize> = record
+            .elites
+            .iter()
+            .filter(|e| e.matches_scored < e.matches_attempted)
+            .map(|e| e.rank)
+            .collect();
+        assert_eq!(
+            degraded,
+            vec![3],
+            "the failed holdout game must read as scored < played"
         );
         assert!(
             record.elites.iter().all(|e| !e.agreement.is_empty()),
