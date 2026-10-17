@@ -122,6 +122,9 @@ pub mod prelude {
     // Shared deterministic batching.
     pub use crate::trainer::stream::{BatchStream, PoolSplit};
 
+    // Genetic operator knobs a builder call needs (e.g. `set_crossover_selection`).
+    pub use crate::evolution::selection::SelectionMethod;
+
     // Graph blueprints + executable networks.
     pub use crate::graph::network::{Network, NetworkOptions};
     pub use crate::graph::node::{Activation, CombineOp, Node, NodeKind, StandardizeOp};
