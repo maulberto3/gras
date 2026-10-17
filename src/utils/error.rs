@@ -177,6 +177,9 @@ pub enum DataError {
         expected: usize,
         found: usize,
     },
+    /// `inputs` and `targets` disagree on how many samples they hold. Raised by
+    /// an IN-MEMORY dataset constructor, so there is no file to name.
+    RowCountMismatch { inputs: usize, targets: usize },
     /// A dtype we can't write to disk (only Float32/Float64/Int64).
     UnsupportedDtype(String),
     /// An unknown dtype tag in a file header.
@@ -204,6 +207,10 @@ impl Display for DataError {
             } => write!(
                 f,
                 "gras data: {path} has {found} data bytes, expected {expected}"
+            ),
+            DataError::RowCountMismatch { inputs, targets } => write!(
+                f,
+                "gras data: inputs and targets disagree on row count: {inputs} vs {targets}"
             ),
             DataError::UnsupportedDtype(msg) => {
                 write!(f, "gras data: unsupported dtype: {msg}")

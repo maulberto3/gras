@@ -5,8 +5,32 @@
 //!
 //! Trait impls are crate-global: moving them here does not change any call
 //! site (`println!("{graph}")` works exactly the same).
+//!
+//! The enums whose `Display` is nothing but a wire name (activation, combine
+//! op, standardize op, direction, feature split) share ONE shape, spelled
+//! through [`variant_names!`]: a variant → its name, one arm per line, with the
+//! `fn fmt` wrapper written once instead of five times.
 
 use std::fmt::Display;
+
+/// A `Display` impl that is exactly a variant → wire-name table.
+///
+/// Each arm is the variant and its name; the separator is nothing (the name IS
+/// the whole output), so this is the same string the hand-written impls printed.
+/// Only unit-variant enums qualify — a variant that carries data needs its own
+/// `write!`.
+macro_rules! variant_names {
+    ($ty:ty { $($variant:pat => $name:literal),+ $(,)? }) => {
+        impl Display for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let name = match self {
+                    $($variant => $name,)+
+                };
+                f.write_str(name)
+            }
+        }
+    };
+}
 
 use crate::utils::fitness::{Direction, FitnessLabel};
 use crate::evolution::crossover::CrossoverMethod;
@@ -14,7 +38,7 @@ use crate::evolution::mutation::MutationMethod;
 use crate::graph::topology::FeatureSplitPolicy;
 use crate::evolution::selection::SelectionMethod;
 use crate::graph::network::NetworkOptions;
-use crate::graph::node::{Activation, Node};
+use crate::graph::node::{Activation, Node, StandardizeOp};
 use crate::graph::topology::{CombineOp, Connection, KindCounts, TopologyOptions};
 
 impl Display for Node {
@@ -27,31 +51,26 @@ impl Display for Node {
     }
 }
 
-impl Display for Activation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            Activation::Identity => "identity",
-            Activation::ReLU => "relu",
-            Activation::GeLU => "gelu",
-            Activation::SiLU => "silu",
-            Activation::SELU => "selu",
-            Activation::Tanh => "tanh",
-            Activation::Sigmoid => "sigmoid",
-            Activation::Mish => "mish",
-            Activation::LeakyReLU => "leaky_relu",
-            Activation::ELU => "elu",
-            Activation::GeluTanh => "gelu_tanh",
-            Activation::Softplus => "softplus",
-            Activation::HardSwish => "hardswish",
-            Activation::HardSigmoid => "hardsigmoid",
-            Activation::Sin => "sin",
-            Activation::Cos => "cos",
-            Activation::Softmax => "softmax",
-            Activation::LogSoftmax => "log_softmax",
-        };
-        write!(f, "{name}")
-    }
-}
+variant_names!(Activation {
+    Activation::Identity => "identity",
+    Activation::ReLU => "relu",
+    Activation::GeLU => "gelu",
+    Activation::SiLU => "silu",
+    Activation::SELU => "selu",
+    Activation::Tanh => "tanh",
+    Activation::Sigmoid => "sigmoid",
+    Activation::Mish => "mish",
+    Activation::LeakyReLU => "leaky_relu",
+    Activation::ELU => "elu",
+    Activation::GeluTanh => "gelu_tanh",
+    Activation::Softplus => "softplus",
+    Activation::HardSwish => "hardswish",
+    Activation::HardSigmoid => "hardsigmoid",
+    Activation::Sin => "sin",
+    Activation::Cos => "cos",
+    Activation::Softmax => "softmax",
+    Activation::LogSoftmax => "log_softmax",
+});
 
 impl Display for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -87,33 +106,23 @@ impl Display for NetworkOptions {
     }
 }
 
-impl Display for CombineOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            CombineOp::Add => "add",
-            CombineOp::Mean => "mean",
-            CombineOp::Multiply => "mul",
-            CombineOp::Subtract => "sub",
-            CombineOp::Divide => "div",
-            CombineOp::Max => "max",
-            CombineOp::Min => "min",
-        };
-        write!(f, "{name}")
-    }
-}
+variant_names!(CombineOp {
+    CombineOp::Add => "add",
+    CombineOp::Mean => "mean",
+    CombineOp::Multiply => "mul",
+    CombineOp::Subtract => "sub",
+    CombineOp::Divide => "div",
+    CombineOp::Max => "max",
+    CombineOp::Min => "min",
+});
 
-impl Display for crate::graph::node::StandardizeOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            crate::graph::node::StandardizeOp::Identity => "identity",
-            crate::graph::node::StandardizeOp::LayerNorm => "layernorm",
-            crate::graph::node::StandardizeOp::RmsNorm => "rmsnorm",
-            crate::graph::node::StandardizeOp::InstanceNorm => "instancenorm",
-            crate::graph::node::StandardizeOp::GroupNorm => "groupnorm",
-        };
-        write!(f, "{name}")
-    }
-}
+variant_names!(StandardizeOp {
+    StandardizeOp::Identity => "identity",
+    StandardizeOp::LayerNorm => "layernorm",
+    StandardizeOp::RmsNorm => "rmsnorm",
+    StandardizeOp::InstanceNorm => "instancenorm",
+    StandardizeOp::GroupNorm => "groupnorm",
+});
 
 impl Display for FitnessLabel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -121,14 +130,10 @@ impl Display for FitnessLabel {
     }
 }
 
-impl Display for Direction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Direction::Minimize => write!(f, "minimize"),
-            Direction::Maximize => write!(f, "maximize"),
-        }
-    }
-}
+variant_names!(Direction {
+    Direction::Minimize => "minimize",
+    Direction::Maximize => "maximize",
+});
 
 impl Display for KindCounts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -191,11 +196,7 @@ impl Display for MutationMethod {
     }
 }
 
-impl Display for FeatureSplitPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FeatureSplitPolicy::Exclusive => write!(f, "split_exclusive"),
-            FeatureSplitPolicy::Random => write!(f, "split_random"),
-        }
-    }
-}
+variant_names!(FeatureSplitPolicy {
+    FeatureSplitPolicy::Exclusive => "split_exclusive",
+    FeatureSplitPolicy::Random => "split_random",
+});

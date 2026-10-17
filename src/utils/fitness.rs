@@ -75,12 +75,17 @@ impl Direction {
 
 /// Ranking signal for the race. [`Fitness::Computed`] = the engine scores
 /// `(pred, target)`; [`Fitness::Reported`] = the trainer ships the scalar.
+///
+/// `Clone` is cheap and shares ONE scorer: cloning a [`Fitness::Computed`]
+/// clones an `Arc`, so the same scoring function can travel into several runs
+/// (and several `RunSpec`s) without being rebuilt per copy.
+#[derive(Clone)]
 pub enum Fitness {
     /// Engine-computed: a pure `(pred, target) → f32` scoring function,
     /// plus the direction and label that travel with it.
     Computed {
         /// Ranking metric: `(pred, target) → f32`.
-        score_fn: Box<ScoreFn>,
+        score_fn: std::sync::Arc<ScoreFn>,
         /// Score direction.
         direction: Direction,
         /// Label for logs.
@@ -103,7 +108,7 @@ impl Fitness {
         F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
     {
         Fitness::Computed {
-            score_fn: Box::new(score_fn) as Box<ScoreFn>,
+            score_fn: std::sync::Arc::new(score_fn) as std::sync::Arc<ScoreFn>,
             direction,
             label: label.to_string(),
         }
@@ -260,6 +265,30 @@ mod tests {
             flodl::Tensor::from_f32(xs, &[xs.len() as i64, 1], flodl::Device::CPU).unwrap(),
             false,
         )
+    }
+
+    /// `Fitness` is `Clone` so one scorer can be shared across runs: the clone
+    /// must run the SAME closure (not a rebuilt one), and carry the same
+    /// direction and label.
+    #[test]
+    fn fitness_clone_shares_the_scorer() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let f = Fitness::maximize("counter", move |_p, _t| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(1.0)
+        });
+        let g = f.clone();
+        assert!(f.is_computed() && g.is_computed());
+        assert_eq!(g.label(), "counter");
+        assert_eq!(g.direction(), Direction::Maximize);
+        let x = input(&[3.5]);
+        assert_eq!(f.score(&x, &x).unwrap(), 1.0);
+        assert_eq!(g.score(&x, &x).unwrap(), 1.0);
+        // Both copies hit ONE counter: a re-built closure would have its own.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

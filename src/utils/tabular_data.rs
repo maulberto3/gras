@@ -44,6 +44,25 @@ impl Dataset {
         self.len() == 0
     }
 
+        /// Build a dataset from tensors already in memory — the same pair
+        /// [`load_dataset`] returns, with no directory in between.
+        ///
+        /// Checks the one invariant the engine relies on: `inputs` and `targets`
+        /// describe the SAME number of samples (row 0 of each). Their column
+        /// counts are free — the graph and the trainer decide those.
+    pub fn from_tensors(inputs: Tensor, targets: Tensor) -> Result<Dataset> {
+        let rows = |t: &Tensor| t.shape().first().copied().unwrap_or(0) as usize;
+        let (rows_in, rows_out) = (rows(&inputs), rows(&targets));
+        if rows_in != rows_out {
+            return Err(DataError::RowCountMismatch {
+                inputs: rows_in,
+                targets: rows_out,
+            }
+            .into());
+        }
+        Ok(Dataset { inputs, targets })
+    }
+
         /// Cast both tensors to `Float32` (flodl's workhorse dtype) so a dataset
         /// written in another dtype is normalized once, up front.
     pub fn to_f32(&self) -> Result<Dataset> {
@@ -648,6 +667,29 @@ mod tests {
         assert_eq!(loaded.shape(), t.shape());
         assert_eq!(loaded.to_f32_vec().unwrap(), t.to_f32_vec().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The in-memory constructor takes the same pair the loaders produce, and
+    /// refuses the one shape the engine cannot use.
+    #[test]
+    fn from_tensors_accepts_matching_rows_and_rejects_a_mismatch() {
+        let inputs = || Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2], Device::CPU).unwrap();
+        let targets = Tensor::from_f32(&[1.0, 0.0], &[2, 1], Device::CPU).unwrap();
+        let ds = Dataset::from_tensors(inputs(), targets).unwrap();
+        assert_eq!(ds.len(), 2);
+        assert_eq!(ds.inputs.shape(), &[2, 2]);
+        assert_eq!(ds.targets.shape(), &[2, 1]);
+
+        // 2 input rows against 1 target row: the mismatch `meta.json` catches
+        // for an on-disk dataset, refused here for an in-memory one.
+        let short = Tensor::from_f32(&[1.0], &[1, 1], Device::CPU).unwrap();
+        let msg = Dataset::from_tensors(inputs(), short)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("row count") && msg.contains('2') && msg.contains('1'),
+            "the mismatch error names both row counts, got: {msg}"
+        );
     }
 
     #[test]

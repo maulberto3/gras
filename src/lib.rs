@@ -102,13 +102,13 @@ pub mod prelude {
     //! the `DataFormat`/loader family.
     // Engine config + entry points.
     pub use crate::engine::config::{
-        CrossCullPolicy, LogLevel, MutationCullPolicy, PopPruner, PopPrunerMethod,
-        RaceConfig, RaceConfigBuilder, RaceSnapshot, RlConfig, RlRaceConfig, RunMode, StopReason,
+        CrossCullPolicy, LogLevel, MutationCullPolicy, RaceConfig, RaceConfigBuilder, RaceSnapshot,
+        RlConfig, RlRaceConfig, RunMode, StopReason,
         TabularConfig, TabularRaceConfig, rl_race_config_builder, tabular_race_config_builder,
     };
     // Scoring vocabulary is `utils`-resident: shared with any training scheme.
     pub use crate::utils::fitness::{Direction, Fitness, FitnessLabel, Metric};
-    pub use crate::engine::guardrail::GuardrailVerdict;
+    pub use crate::engine::guardrail::{AgreementGrade, GuardrailVerdict};
     pub use crate::engine::{RLSpec, RlEngine, RunSpec, TabularEngine, TabularSpec};
 
     // Trainer contracts + report types.

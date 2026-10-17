@@ -249,6 +249,17 @@ impl StreamShape {
 
 /// The dataset-driven training contract — the ONE trait a tabular scheme
 /// implements. Owns the loss (required, not `Option`) and shapes the stream.
+///
+/// # Randomness — the replay contract
+///
+/// The engine re-seeds BOTH generators (`fastrand` + libtorch) once per
+/// `(net, step)` before calling [`TabularStep::train_step`]:
+/// [`seed_step_randomness`](crate::utils::race_steps::seed_step_randomness)
+/// mixes `ctx.net_seed` with `ctx.env.step`. A trainer that draws its own
+/// randomness (dropout, sampling, augmentation) must derive it from those same
+/// inputs — the `(net_seed, step)` pair is the whole address of a step — and
+/// never from a hidden global counter, or the run stops being replayable. The
+/// same rule as [`TabularStep::scheduled_lr`].
 pub trait TabularStep: Send {
     /// Make the optimizer for a newly built or reloaded network.
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
@@ -294,6 +305,15 @@ pub trait TabularStep: Send {
 
 /// The environment-driven training contract — the ONE trait an RL scheme
 /// implements. No `loss()`; the engine's only ranking input is `fitness`.
+///
+/// # Randomness — the replay contract
+///
+/// The engine re-seeds BOTH generators (`fastrand` + libtorch) once per
+/// `(net, step)` before calling [`RlStep::train_step`]:
+/// [`seed_step_randomness`](crate::utils::race_steps::seed_step_randomness)
+/// mixes `ctx.net_seed` with `ctx.env.step`. An environment that randomizes
+/// (initial state, resets, exploration) must derive its draws from those same
+/// inputs so a replay reproduces the episode — never from a hidden global.
 pub trait RlStep: Send {
     /// Make the optimizer for a newly built or reloaded network.
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
