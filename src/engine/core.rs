@@ -67,7 +67,9 @@ use crate::engine::evolve::RollKind;
 use crate::trainer::stream::{BatchStream, PoolSplit};
 
 use super::config::{RaceConfig, StopReason};
-use super::format::{build_stamp, csv_field, fmt_cell, fmt_cfg, fmt_line, fmt_line_smt};
+use super::format::{
+    build_stamp, csv_field, fmt_cell, fmt_cell_opt, fmt_cfg, fmt_line, fmt_line_smt,
+};
 use super::smoothing::{RollingBuffer, WindowStats, rolling_stats};
 
 // ── CoreEngine ───────────────────────────────────────────────────────────────
@@ -147,9 +149,6 @@ pub struct CoreEngine {
     /// Anti-devolution A: the nets holding the freeze crown — the seats the elite gate
     /// dealt, a SUBSET of the count-top nets; tracked so crown lines fire on transitions.
     pub(crate) frozen_crown: std::collections::HashSet<String>,
-    /// Set TRUE only inside the post-race pruner phase: the solo steps are the
-    /// finishing workout, so elite freeze is BYPASSED. Not persisted.
-    pub(crate) pruner_solo_active: bool,
     /// `Minimal` mode: last step's population means (train, eval, fitness) so the
     /// framed table can show what changed. `None` until the first render.
     pub(crate) minimal_prev_means: Option<(f32, f32, f32)>,
@@ -677,7 +676,6 @@ impl CoreEngine {
             total_train_turns: 0,
             champions: Vec::new(),
             frozen_crown: std::collections::HashSet::new(),
-            pruner_solo_active: false,
             minimal_prev_means: None,
             log_level,
             interrupt_flag: None,
@@ -1422,7 +1420,7 @@ impl CoreEngine {
                             "step {} │ interrupted mid-step — abandoning (no partial records), shutting down gracefully",
                             clock
                         );
-                        // Skip to the post-race sequence with Interrupted: the pruner/champion/frontier
+                        // Skip to the post-race sequence with Interrupted: the champion/frontier
                         // path treats this like any stop reason at clock-1's state.
                         return self.finish_race(StopReason::Interrupted, clock.saturating_sub(1));
                     }
@@ -1500,15 +1498,9 @@ impl CoreEngine {
         }
     }
 
-    /// The shared post-race sequence — pruner transition, champion artifacts, stop
-    /// summary, frontier write, metrics flush. Every stop reason flows through here.
+    /// The shared post-race sequence — champion artifacts, stop summary, frontier
+    /// write, metrics flush. Every stop reason flows through here.
     fn finish_race(&mut self, reason: StopReason, clock: usize) -> Result<StopReason> {
-        // Post-race pruner: the stop reason becomes a TRANSITION — cull all but the top
-        // `elite_count` and train them solo; evolution and stop criteria are locked OFF.
-        if let Some(pruner) = self.config.pop_pruner {
-            let reason = self.run_pruner_phase(reason, clock, pruner)?;
-            return Ok(reason);
-        }
         // The champion markdown dump is an ARTIFACT, not a log line —
         // it must land on disk at every log level, even `None`.
         self.write_elite_index()?;
@@ -1584,9 +1576,12 @@ impl CoreEngine {
         self.rolling_fitness.get(hash).and_then(rolling_stats)
     }
 
-    /// The post-race holdout guardrail: score the LIVE champion on fresh unseen games
-    /// through the run's own trainer. `None` = no champion (each case logs a warning),
-    /// the champion is no longer live, or the exam is switched off (`guardrail_matches = 0`).
+    /// The post-race holdout guardrail: score EVERY elite (rank 1 = the champion) on
+    /// fresh unseen games through the run's own trainer — `elite_count` nets ×
+    /// `guardrail_matches` games each. Returns the champion's verdict; the rest are
+    /// printed in the card's table and recorded in `engine.json`.
+    /// `None` = no champion (each case logs a warning), the champion produced no
+    /// verdict, or the exam is switched off (`guardrail_matches = 0`).
     pub fn guardrail(&mut self) -> Option<crate::engine::guardrail::GuardrailVerdict> {
         // `0` matches = the exam is OFF (see `set_elite_guardrail_matches`): return
         // BEFORE anything expensive or observable — no champion lookup, no holdout
@@ -1610,48 +1605,129 @@ impl CoreEngine {
         }
         let champion = self.champion_for_guardrail()?;
         let matches = self.config.guardrail_matches;
-        // The race reading AND its error bar, read from the LIVE rolling buffer before
-        // scoring: the spread is what separates "collapsed" from "an unresolvable mean".
-        let race = self.race_reading_of(&champion);
-        // The race REFERENCE stays the readable window mean: it is the number the
-        // holdout mean is directly comparable with (same units, same quantity). The
-        // risk-adjusted score that actually ranked the champion rides alongside it,
-        // so a reader can see how much of the rank came from steadiness.
-        let race_smoothed = race.map(|r| r.mean);
-        let race_score = self.smoothed_fitness_of(&champion);
-        let Some(net) = self.networks.get_mut(&champion) else {
-            // The champion is not in memory (already gone from the population): there
-            // is nothing honest to score, so the exam is skipped rather than run on a
-            // net rebuilt from disk — a fresh-init net measures like noise.
+        // EVERY elite takes the exam, not just rank 1: `champions` is the stop-time
+        // elite snapshot (top `elite_count`), i.e. exactly the nets the run exported.
+        // The champion leads, so its verdict is the one that certifies the run.
+        let mut exam_set: Vec<String> = Vec::with_capacity(self.champions.len() + 1);
+        exam_set.push(champion.clone());
+        for hash in &self.champions {
+            if !exam_set.contains(hash) {
+                exam_set.push(hash.clone());
+            }
+        }
+        let mut exams: Vec<crate::engine::guardrail::GuardrailVerdict> =
+            Vec::with_capacity(exam_set.len());
+        for hash in &exam_set {
+            // The race reading AND its error bar, read from the LIVE rolling buffer
+            // before scoring: the spread is what separates "collapsed" from "an
+            // unresolvable mean".
+            let race = self.race_reading_of(hash);
+            let Some(net) = self.networks.get_mut(hash.as_str()) else {
+                // Not in memory (already gone from the population): there is nothing
+                // honest to score, so this net's exam is skipped rather than run on a
+                // net rebuilt from disk — a fresh-init net measures like noise.
+                tracing::warn!(
+                    "guardrail: elite {} is not one of the live nets — exam skipped",
+                    &hash[..8.min(hash.len())]
+                );
+                continue;
+            };
+            // `eval()` first: the resting state a reloaded net would get for free, and the
+            // state the holdout MUST be measured in (dropout would sample a random policy).
+            flodl::Module::eval(net);
+            let Some(mut verdict) = crate::engine::guardrail::score_net(
+                net,
+                hash,
+                race.map(|r| r.mean),
+                matches,
+                &mut self.trainer,
+                |t, net, game_i| t.holdout_score(net, game_i),
+            ) else {
+                tracing::warn!(
+                    "guardrail: no holdout game scored on elite {} — exam skipped",
+                    &hash[..8.min(hash.len())]
+                );
+                continue;
+            };
+            // Carry the race side's noise onto the verdict, so the example's print
+            // and this module's own table quote the same error bar.
+            verdict.race_se = race.and_then(|r| r.se());
+            verdict.race_samples = race.map(|r| r.n).unwrap_or(0);
+            verdict.race_latest = race.map(|r| r.latest);
+            exams.push(verdict);
+        }
+        // Rank 1 IS the certification: with no champion verdict nothing is recorded,
+        // exactly like the old single-champion exam.
+        let Some(verdict) = exams.iter().find(|v| v.hash == champion).cloned() else {
             tracing::warn!(
-                "guardrail: champion {} is not one of the live nets — exam skipped",
-                &champion[..8.min(champion.len())]
+                "guardrail: the champion produced no holdout verdict — nothing recorded"
             );
             return None;
         };
-        // `eval()` first: the resting state a reloaded net would get for free, and the
-        // state the holdout MUST be measured in (dropout would sample a random policy).
-        flodl::Module::eval(net);
-        let mut verdict = crate::engine::guardrail::score_net(
-            net,
-            &champion,
-            race_smoothed,
-            matches,
-            &mut self.trainer,
-            |t, net, game_i| t.holdout_score(net, game_i),
-        )?;
-        // Carry the race side's noise onto the verdict, so the example's print
-        // and this module's own line quote the same error bar.
-        verdict.race_se = race.and_then(|r| r.se());
-        verdict.race_samples = race.map(|r| r.n).unwrap_or(0);
-        verdict.race_latest = race.map(|r| r.latest);
-        // ELI5, line 1: WHAT was compared (both readings, both error bars). The window's
-        // min/max matter as much as its mean — 191.7 out of [41.5 .. 500.0] is a fluke.
-        let exam_se = verdict
-            .se()
-            .map(|se| format!(" (SE {})", fmt_cell(se)))
-            .unwrap_or_default();
-        let race_note = match race {
+        let direction = self.fitness.direction();
+        let champion_race = self.race_reading_of(&verdict.hash);
+        // One row per examined elite, in exam (rank) order: the race reading on the
+        // left, the fresh-game exam on the right, the graded tag last. The champion's
+        // full sentence — which carries the mechanism — rides as the card's footnote.
+        let mut rows: Vec<Vec<String>> = Vec::with_capacity(exams.len());
+        let mut elite_records: Vec<crate::state::GuardrailElite> = Vec::with_capacity(exams.len());
+        let mut champion_line = String::new();
+        for (rank0, v) in exams.iter().enumerate() {
+            let race = self.race_reading_of(&v.hash);
+            // ONE grading for the table and the sentence (`agreement_grade`), so a row
+            // can never contradict its own verdict text.
+            let grade = crate::engine::guardrail::agreement_grade(
+                v.race_smoothed,
+                v.race_se,
+                v.mean(),
+                v.se(),
+                v.scores.len(),
+                direction,
+            );
+            let line = crate::engine::guardrail::agreement_verdict_noisy(
+                v.race_smoothed,
+                v.race_se,
+                Some(v.race_samples).filter(|n| *n > 0),
+                v.race_latest,
+                v.mean(),
+                v.se(),
+                v.scores.len(),
+                direction,
+            );
+            if v.hash == verdict.hash {
+                champion_line = line.clone();
+            }
+            rows.push(vec![
+                (rank0 + 1).to_string(),
+                v.hash[..8.min(v.hash.len())].to_string(),
+                fmt_cell_opt(&v.race_smoothed),
+                fmt_cell_opt(&v.race_se),
+                fmt_cell_opt(&v.mean()),
+                fmt_cell_opt(&v.se()),
+                v.scores.len().to_string(),
+                grade.tag().to_string(),
+            ]);
+            elite_records.push(crate::state::GuardrailElite {
+                rank: rank0 + 1,
+                hash: v.hash.clone(),
+                params: self.net_params(&v.hash),
+                race_mean: v.race_smoothed,
+                race_std: race.map(|r| r.std),
+                race_score: self.smoothed_fitness_of(&v.hash),
+                race_se: v.race_se,
+                race_samples: v.race_samples,
+                race_latest: v.race_latest,
+                holdout_mean: v.mean(),
+                holdout_std: v.std(),
+                matches_scored: v.scores.len(),
+                agreement: grade.tag().to_string(),
+                verdict: line,
+            });
+        }
+        // ELI5, line 1: WHAT the champion was compared against. The window's min/max
+        // matter as much as its mean — 191.7 out of [41.5 .. 500.0] is a fluke — so
+        // they stay in the card, though the per-elite table cannot fit them.
+        let race_note = match champion_race {
             Some(r) => format!(
                 "μ{} over {} step reading(s) (±σ{}, SE {}, window min {} / max {}, latest {} │ risk-adj {} at λ={})",
                 fmt_cell(r.mean),
@@ -1661,59 +1737,64 @@ impl CoreEngine {
                 fmt_cell(r.min),
                 fmt_cell(r.max),
                 fmt_cell(r.latest),
-                fmt_cell(race_score.unwrap_or(r.mean)),
+                fmt_cell(self.smoothed_fitness_of(&verdict.hash).unwrap_or(r.mean)),
                 fmt_cfg(self.config.risk_aversion),
             ),
             None => "unavailable (no rolling window recorded)".to_string(),
         };
-        let verdict_line = crate::engine::guardrail::agreement_verdict_noisy(
-            verdict.race_smoothed,
-            verdict.race_se,
-            Some(verdict.race_samples).filter(|n| *n > 0),
-            verdict.race_latest,
-            verdict.mean(),
-            verdict.se(),
-            verdict.scores.len(),
-            self.fitness.direction(),
+        // CFY: one guardrail card — the champion's context as key/value rows, then one
+        // row per examined elite, then the champion's verdict sentence as the footnote.
+        let title = format!(
+            "Guardrail (elite set on fresh unseen games — {} net(s) × {} game(s) each)",
+            exams.len(),
+            matches
         );
-        // CFY: one guardrail card — every reading a row, the verdict sentence a footnote
-        // (it carries the mechanism whenever the bars allow it). The old two info! lines
-        // were ELI5 "what was compared" + "what it means"; both live here now.
-        crate::utils::cfy::emit(&crate::utils::cfy::card(
-            "Guardrail (champion on fresh unseen games)",
-            &crate::utils::cfy::kv(&[
+        let body = format!(
+            "{}\n{}",
+            crate::utils::cfy::kv(&[
                 (
                     "champion".to_string(),
-                    verdict.hash[..8.min(verdict.hash.len())].to_string(),
+                    format!(
+                        "{} (rank 1 of {})",
+                        &verdict.hash[..8.min(verdict.hash.len())],
+                        self.champions.len().max(1)
+                    ),
                 ),
                 ("race reading".to_string(), race_note),
                 (
                     "best of live".to_string(),
                     format!("{} net(s) on that reading", self.state.live_count()),
                 ),
-                (
-                    "exam mean".to_string(),
-                    format!("{}{exam_se}", fmt_cell(verdict.mean().unwrap_or(0.0))),
-                ),
-                ("unseen games".to_string(), verdict.scores.len().to_string()),
             ]),
-            Some(&verdict_line),
+            crate::utils::cfy::table(
+                &[
+                    "#", "net", "race μ", "race SE", "exam μ", "exam SE", "games", "status",
+                ],
+                &rows,
+            ),
+        );
+        crate::utils::cfy::emit(&crate::utils::cfy::card(
+            &title,
+            &body,
+            Some(&champion_line),
         ));
         // Record it: the guardrail is a run OUTPUT (the only reading on unseen games), so
-        // it lives in engine.json and the next experiment inherits its champion.
+        // it lives in engine.json and the next experiment inherits its champion. Rank 1
+        // keeps the top-level block (the seeding contract); every exam is in `elites`.
         let record = crate::state::GuardrailRecord {
             champion_hash: verdict.hash.clone(),
             champion_params: self.net_params(&verdict.hash),
             race_smoothed: verdict.race_smoothed,
-            race_std: race.map(|r| r.std),
-            race_score,
+            race_std: champion_race.map(|r| r.std),
+            race_score: self.smoothed_fitness_of(&verdict.hash),
             race_se: verdict.race_se,
             race_samples: verdict.race_samples,
             race_latest: verdict.race_latest,
             holdout_mean: verdict.mean(),
             holdout_std: verdict.std(),
             matches_scored: verdict.scores.len(),
-            verdict: verdict_line,
+            verdict: champion_line,
+            elites: elite_records,
         };
         self.header.set_guardrail(Some(record.clone()));
         if let Err(e) = crate::state::write_guardrail_record(&self.run_dir, &record) {
@@ -1811,11 +1892,11 @@ impl CoreEngine {
     /// KISS crown refresh (the FREEZE-ELITES model, in one place): the crown IS the
     /// elite take(k) set, recomputed each step; the diff prints one line per transition.
     pub(crate) fn refresh_crown(&mut self, clock: usize) {
-        let enabled = self.config.freeze_elites && !self.pruner_solo_active;
+        let enabled = self.config.freeze_elites;
         let new_crown: std::collections::HashSet<String> = if enabled {
             self.elite_hashes().into_iter().collect()
         } else {
-            // Freeze off / pruner solo: nobody holds a seat.
+            // Freeze off: nobody holds a seat.
             std::collections::HashSet::new()
         };
         let mut entering: Vec<String> = new_crown
@@ -1933,7 +2014,7 @@ impl CoreEngine {
         }
         for h in &leaving {
             // Freeze/dethrone chatter belongs to the elite process only —
-            // a disabled refresh (freeze off / pruner solo) just clears.
+            // a disabled refresh (freeze off) just clears.
             if !enabled {
                 continue;
             }
@@ -4697,7 +4778,7 @@ mod tests {
         assert_eq!(eng.check_stop(7), Some(StopReason::MaxSteps));
     }
 
-    // ── Post-race pruner (pop_pruner) ─────────────────────────────────────
+    // ── Elite crown fixtures ──────────────────────────────────────────────
 
     /// Crown fixtures: every probation window (channel + elite join) zeroed, since
     /// the gate logic itself is pinned by `elite_join_probation_crown_lifetime`.
@@ -4708,177 +4789,6 @@ mod tests {
         eng.config.crossover_probation_steps = 0;
         eng.config.elite_join_probation_steps = 0;
     }
-
-    fn pruned_engine(
-        run_dir: &std::path::Path,
-        seed: u64,
-        keep: usize,
-        solo: usize,
-    ) -> crate::engine::TabularEngine {
-        let data_dir = tiny_dataset_dir("pruner");
-        let config = RaceConfig {
-            pop_size: 0,
-            elite_count: keep,
-            max_steps: Some(2),
-            pop_pruner: Some(crate::engine::config::PopPruner {
-                method: crate::engine::config::PopPrunerMethod::Hard,
-                steps: solo,
-            }),
-            ..RaceConfig::defaults()
-        };
-        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
-            data_dir,
-            config,
-            fitness(),
-            crate::trainer::TabularTrainer::new(loss_fn()),
-            Some(seed),
-            Some(run_dir.to_path_buf()),
-        ))
-        .unwrap()
-    }
-
-    #[test]
-    fn pruner_disabled_stops_at_max_steps() {
-        let run_dir = std::env::temp_dir().join("gras-pruner-off");
-        let _ = std::fs::remove_dir_all(&run_dir);
-        let mut eng = engine(&run_dir, 42).unwrap();
-        eng.config.max_steps = Some(2);
-        eng.config.pop_pruner = None;
-        eng.seed_population_internal(
-            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
-            Some(0.5),
-        )
-        .unwrap();
-        let reason = eng.run().unwrap();
-        assert_eq!(reason, StopReason::MaxSteps);
-        assert_eq!(
-            eng.state.live_count(),
-            3,
-            "pruner off: nobody is culled at stop"
-        );
-    }
-
-    #[test]
-    fn pruner_hard_culls_to_elites_and_trains_solo_steps() {
-        let run_dir = std::env::temp_dir().join("gras-pruner-hard");
-        let _ = std::fs::remove_dir_all(&run_dir);
-        let mut eng = pruned_engine(&run_dir, 42, 1, 3);
-        eng.seed_population_internal(
-            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
-            Some(0.5),
-        )
-        .unwrap();
-        let reason = eng.run().unwrap();
-        assert_eq!(reason, StopReason::MaxSteps);
-        // Race steps 0..=2 (stop checks fire AFTER the step at max_steps) +
-        // 3 solo steps — the elites trained THROUGH the phase.
-        let live = eng.state.live_hashes();
-        assert_eq!(live.len(), 1, "Hard pruner keeps only the top-1");
-        let survivor = eng.state.net(&live[0]).unwrap();
-        assert_eq!(survivor.step, 3 + 3, "survivor advanced through solo phase");
-        // The pruner phase is recorded too: culls as `pruner` rows in
-        // attempts.csv, solo steps as ordinary history.csv metric rows.
-        let history = std::fs::read_to_string(run_dir.join("history.csv")).unwrap();
-        let attempts = std::fs::read_to_string(run_dir.join("attempts.csv")).unwrap();
-        assert!(
-            attempts.lines().any(|l| l.contains("pruner")),
-            "culls are recorded as pruner attempt rows"
-        );
-        for solo_step in [3usize, 4, 5] {
-            assert!(
-                history
-                    .lines()
-                    .any(|l| l.starts_with(&format!("{solo_step},"))),
-                "solo step {solo_step} appears as a history.csv metric row"
-            );
-        }
-        // Freeze bypass: with freeze_elites on (the default) the pruner survivor is
-        // an elite by construction, so solo steps must TRAIN, never act-and-measure.
-        let survivor = eng.state.net(&live[0]).unwrap();
-        for solo_step in [3usize, 4, 5] {
-            assert!(
-                !survivor.is_frozen_step(solo_step),
-                "solo step {solo_step} must be a REAL trained step, not frozen"
-            );
-        }
-        // The pruner path returns from `finish_race` before its counter stamp, so the
-        // phase persists its culls to engine.json itself.
-        let json = std::fs::read_to_string(run_dir.join("engine.json")).unwrap();
-        let header: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            header["culls"].as_u64().unwrap() as usize,
-            eng.culls,
-            "pruner culls are stamped into engine.json"
-        );
-        assert!(eng.culls > 0, "the pruner did cull someone");
-    }
-
-    #[test]
-    fn pruner_solo_steps_train_even_when_freeze_elites_is_on() {
-        let run_dir = std::env::temp_dir().join("gras-pruner-freeze-on");
-        let _ = std::fs::remove_dir_all(&run_dir);
-        // freeze_elites = TRUE (the default) is exactly where every solo step used to
-        // freeze: the survivor's trained-step count must advance through the phase.
-        let mut eng = pruned_engine(&run_dir, 42, 1, 3);
-        assert!(eng.config.freeze_elites, "freeze_elites default is on");
-        // All windows 0: the race is 3 clocks, so the default windows (5) would crown
-        // nobody and the race-phase freeze could not be observed.
-        open_crown(&mut eng);
-        eng.seed_population_internal(
-            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
-            Some(0.5),
-        )
-        .unwrap();
-        let live = {
-            let reason = eng.run().unwrap();
-            assert_eq!(reason, StopReason::MaxSteps);
-            eng.state.live_hashes()
-        };
-        let survivor = eng.state.net(&live[0]).unwrap();
-        // Dual assertion: freeze DOES engage during the race (so the bypass below is
-        // real) but NONE of the pruner solo steps froze — they took real steps.
-        let race_frozen = (0..=2).filter(|s| survivor.is_frozen_step(*s)).count();
-        assert!(
-            race_frozen > 0,
-            "freeze engaged during the race (the top net was frozen at least once)"
-        );
-        for solo_step in [3usize, 4, 5] {
-            assert!(
-                !survivor.is_frozen_step(solo_step),
-                "solo step {solo_step} must train (real optimizer) even with freeze_elites on"
-            );
-        }
-        assert!(
-            !eng.frozen_crown.contains(&live[0]),
-            "no crown membership should persist from the bypassed phase"
-        );
-    }
-
-    #[test]
-    fn pruner_keeps_top_elite_count_nets() {
-        let run_dir = std::env::temp_dir().join("gras-pruner-two");
-        let _ = std::fs::remove_dir_all(&run_dir);
-        let mut eng = pruned_engine(&run_dir, 42, 2, 1);
-        eng.seed_population_internal(
-            vec![
-                tiny_topology(7),
-                tiny_topology(8),
-                tiny_topology(9),
-                tiny_topology(10),
-            ],
-            Some(0.5),
-        )
-        .unwrap();
-        eng.run().unwrap();
-        assert_eq!(
-            eng.state.live_count(),
-            2,
-            "elite_count=2 keeps two nets racing"
-        );
-    }
-
-    // (2026-10-10: `pruner_phase_never_fires_challenges` removed with the
-    // engine-side challenge wiring; the recipe now lives in `trainer::challenge`.)
 
     /// Both CSV exports must be self-consistent: every data row has exactly as
     /// many fields as its own header (the old shared layout shifted columns).
@@ -4899,7 +4809,21 @@ mod tests {
         }
         let run_dir = std::env::temp_dir().join("gras-csv-alignment");
         let _ = std::fs::remove_dir_all(&run_dir);
-        let mut eng = pruned_engine(&run_dir, 42, 1, 2);
+        let mut eng = engine(&run_dir, 42).unwrap();
+        // The ledger is fed by EVOLUTION events, so force both roll channels to
+        // fire on every step: probation windows zeroed (a shield would swallow
+        // the early rolls) and freeze off (it hides the non-elite nets a cull
+        // needs). `max_steps` buys 3 clocks, so the rolls have measured nets to
+        // choose victims from.
+        eng.config.max_steps = Some(3);
+        eng.config.crossover_rolls = 1;
+        eng.config.crossover_prob = 1.0;
+        eng.config.mutate_rolls = 1;
+        eng.config.mutate_prob = 1.0;
+        eng.config.mutation_probation_steps = 0;
+        eng.config.crossover_probation_steps = 0;
+        eng.config.elite_join_probation_steps = 0;
+        eng.config.freeze_elites = false;
         // A configured metric widens the history header — the shape most
         // likely to drift from the attempt layout.
         eng.metrics = vec![crate::utils::fitness::Metric::custom("dummy", |_p, _y| {
@@ -4927,9 +4851,13 @@ mod tests {
             }
             assert!(rows > 0, "{file} has data rows");
         }
-        // The attempt ledger really landed in its own file (the pruner culls).
+        // The attempt ledger really landed in its own file — populated by the
+        // evolution rolls above, not by a stop-time writer.
         let attempts = std::fs::read_to_string(run_dir.join("attempts.csv")).unwrap();
-        assert!(attempts.lines().any(|l| l.contains("pruner")));
+        assert!(
+            attempts.lines().any(|l| l.contains("inserted")),
+            "the attempt ledger records a real evolution insert"
+        );
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 
@@ -5044,36 +4972,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&run_dir);
-    }
-
-    #[test]
-    fn pruner_is_deterministic() {
-        let (dir_a, dir_b) = (
-            std::env::temp_dir().join("gras-pruner-det-a"),
-            std::env::temp_dir().join("gras-pruner-det-b"),
-        );
-        let _ = std::fs::remove_dir_all(&dir_a);
-        let _ = std::fs::remove_dir_all(&dir_b);
-        let mut a = pruned_engine(&dir_a, 7, 1, 2);
-        let mut b = pruned_engine(&dir_b, 7, 1, 2);
-        let pop = vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)];
-        a.seed_population_internal(pop.clone(), Some(0.5)).unwrap();
-        b.seed_population_internal(pop, Some(0.5)).unwrap();
-        a.run().unwrap();
-        b.run().unwrap();
-        assert_eq!(
-            a.state.live_hashes(),
-            b.state.live_hashes(),
-            "same seed ⇒ same survivor"
-        );
-        let ha = a.state.net(&a.state.live_hashes()[0]).unwrap();
-        let hb = b.state.net(&b.state.live_hashes()[0]).unwrap();
-        assert_eq!(ha.step, hb.step);
-        assert_eq!(
-            ha.last_metrics.as_ref().map(|m| m.fitness),
-            hb.last_metrics.as_ref().map(|m| m.fitness),
-            "same seed ⇒ identical solo trajectory"
-        );
     }
 
     // ── Founder topologies ──────────────────────────────────────────────
@@ -5365,6 +5263,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+        /// The exam covers the WHOLE elite set, not just rank 1: every elite is scored
+        /// `guardrail_matches` times and recorded with its own grade. The champion keeps
+        /// the top-level block (the seeding contract).
+    #[test]
+    fn the_guardrail_examines_every_elite() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join("gras-guardrail-elites");
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = tiny_dataset_dir("guardrail-elites");
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let config = RaceConfig {
+            pop_size: 0,
+            max_steps: Some(2),
+            guardrail_matches: 2,
+            elite_count: 3,
+            ..RaceConfig::defaults()
+        };
+        let trainer = crate::trainer::TabularTrainer::new(loss_fn()).with_holdout_scorer(
+            move |_net, game_i| -> Result<f32> {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(game_i as f32)
+            },
+        );
+        let mut eng =
+            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+                data_dir,
+                config,
+                fitness(),
+                trainer,
+                Some(7),
+                Some(dir.clone()),
+            ))
+            .unwrap();
+        eng.seed_population_internal(
+            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+            Some(0.5),
+        )
+        .unwrap();
+        eng.run().unwrap();
+        assert_eq!(
+            eng.champion_hashes().len(),
+            3,
+            "the run must export three elites for this test to mean anything"
+        );
+
+        let verdict = eng
+            .guardrail()
+            .expect("the champion must be scored on fresh games");
+        assert_eq!(verdict.scores.len(), 2, "the champion's own exam");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3 * 2,
+            "every elite × every holdout game, not just the champion's"
+        );
+
+        let record = crate::state::load_engine_json(&dir)
+            .unwrap()
+            .guardrail
+            .expect("the exam must be recorded");
+        assert_eq!(record.champion_hash, verdict.hash);
+        assert_eq!(record.elites.len(), 3, "one record per examined elite");
+        assert_eq!(record.elites[0].rank, 1);
+        assert_eq!(record.elites[0].hash, record.champion_hash);
+        assert!(
+            record.elites.iter().all(|e| e.matches_scored == 2),
+            "each elite is scored matches-times: {:?}",
+            record.elites.iter().map(|e| e.matches_scored).collect::<Vec<_>>()
+        );
+        assert!(
+            record.elites.iter().all(|e| !e.agreement.is_empty()),
+            "every exam is graded, even a degraded one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `set_run_topologies` takes precedence: no extra net is injected above the
     /// user's list, ordinals do not shift, and nothing is recorded as inherited.
     #[test]
@@ -5537,6 +5511,14 @@ mod tests {
             holdout_std: Some(0.01),
             matches_scored: 16,
             verdict: "consistent with the race signal ✅".into(),
+            elites: vec![crate::state::GuardrailElite {
+                rank: 1,
+                hash: "abcdefghabcdefgh".into(),
+                holdout_mean: Some(0.55),
+                matches_scored: 16,
+                agreement: "consistent".into(),
+                ..Default::default()
+            }],
         };
         eng.header.set_guardrail(Some(record.clone()));
         crate::state::write_guardrail_record(&dir, &record).unwrap();

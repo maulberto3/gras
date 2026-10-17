@@ -415,7 +415,7 @@ impl CoreEngine {
     /// Cull one net: final state snapshot to disk, drop from all live maps.
     pub(crate) fn cull_net(&mut self, hash: &str, clock: usize, reason: &str) -> Result<()> {
         // NO per-event log here: culls are reported on the calling roll's
-        // single line (crossover/mutation/pruned) — one roll, one line.
+        // single line (crossover/mutation) — one roll, one line.
         // The tombstone records all three legs of the reading it died with: the
         // readable window mean, its spread, and the risk-adjusted score it was
         // actually ranked by (FIT). An unmeasured net records NaN throughout.

@@ -39,7 +39,7 @@ pub const DEFAULT_CHECKPOINT_EVERY: usize = 10;
 // (the reference trainer and the example both do), so it belongs below both
 // layers rather than in the engine's config surface.
 
-/// Default number of fresh holdout games the post-race guardrail plays
+/// Default number of fresh holdout games the post-race guardrail plays PER ELITE
 /// ([`RaceConfigBuilder::set_elite_guardrail_matches`]).
 pub const DEFAULT_GUARDRAIL_MATCHES: usize = 16;
 
@@ -270,9 +270,6 @@ pub struct RaceConfig {
     /// At stop, additionally save the worst net's weights
     /// (`worst-<hash>.safetensors`). Default false.
     pub worst_save_safetensors: bool,
-        /// Post-race pruner: when a stop fires and this is `Some`, cull all but the elite and
-        /// train the champion solo for `steps` more steps. `None` (default) = stop ends the run.
-    pub pop_pruner: Option<PopPruner>,
         /// Human label for the experiment, recorded verbatim in `engine.json` as
         /// `"run_name"`. Informational — does not affect the results folder name.
     pub run_name: Option<String>,
@@ -303,9 +300,10 @@ pub struct RaceConfig {
         /// Elite crown lifetime: a net on the frozen crown is culled out after
         /// `elite_crown_lifetime_steps` clocks. Default `5`; zero = permanent until rank moves.
     pub elite_crown_lifetime_steps: usize,
-        /// Fresh holdout games the post-race guardrail plays. Diagnostic only — never touches
-        /// a step's dynamics. **`0` = skip the exam** (no games, no verdict recorded).
-        /// Default [`DEFAULT_GUARDRAIL_MATCHES`].
+        /// Fresh holdout games the post-race guardrail plays PER ELITE (`elite_count` nets
+        /// take the exam, so the cost is `elite_count × guardrail_matches` games).
+        /// Diagnostic only — never touches a step's dynamics. **`0` = skip the exam**
+        /// (no games, no verdict recorded). Default [`DEFAULT_GUARDRAIL_MATCHES`].
     pub guardrail_matches: usize,
 }
 
@@ -390,25 +388,6 @@ impl RlConfigBuilder {
     /// Type alias for the pluggable stop closure. Plain alias, so `RaceConfig` derives
     /// neither `Clone` nor `Debug`.
 pub type StopFn = Option<Box<dyn Fn(&RaceSnapshot) -> bool + Send + Sync + 'static>>;
-
-    /// Post-race pruner strategy: `Hard` = after a stop, cull all but the elite and keep
-    /// training the champion alone for fixed extra steps.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PopPrunerMethod {
-    /// On stop: keep only the elite, train it solo for `pop_pruner_steps`.
-    #[default]
-    Hard,
-}
-
-    /// Post-race pruner knob pair. `None` = off; `Some(method)` = after the stop, cull all
-    /// but the elite and train them solo for `steps` more steps (no evolution/stop checks).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PopPruner {
-    /// Pruner strategy.
-    pub method: PopPrunerMethod,
-    /// Extra solo-training steps after the stop fires.
-    pub steps: usize,
-}
 
     /// The run-level context stamped into every net's `meta` block. Built once at engine
     /// construction; cheap to pass around.
@@ -511,7 +490,6 @@ impl RaceConfig {
             elite_save_safetensors: true,
             worst_save_topology: false,
             worst_save_safetensors: false,
-            pop_pruner: None,
             run_name: None,
             run_topologies: Vec::new(),
             elite_previous_load: true,
@@ -528,7 +506,6 @@ impl RaceConfig {
     pub fn builder() -> RaceConfigBuilder {
         RaceConfigBuilder {
             cfg: RaceConfig::defaults(),
-            pending_pruner: None,
         }
     }
 }
@@ -545,7 +522,6 @@ pub type TabularRaceConfig = RaceConfig;
 pub fn tabular_race_config_builder() -> RaceConfigBuilder {
     RaceConfigBuilder {
         cfg: RaceConfig::defaults(),
-        pending_pruner: None,
     }
 }
 
@@ -558,7 +534,6 @@ pub fn rl_race_config_builder() -> RaceConfigBuilder {
             mode_specific: ModeConfig::Rl(RlConfig::default()),
             ..RaceConfig::defaults()
         },
-        pending_pruner: None,
     }
 }
 
@@ -572,9 +547,6 @@ impl Default for RaceConfig {
     /// untouched fields keep conservative defaults.
 pub struct RaceConfigBuilder {
     cfg: RaceConfig,
-        /// Pruner params stored while the pruner switch is off — replayed by `build()` if
-        /// `set_pruner_enabled(true)` comes later. Either call order works.
-    pending_pruner: Option<PopPruner>,
 }
 
 impl RaceConfigBuilder {
@@ -677,55 +649,6 @@ impl RaceConfigBuilder {
         /// `Option`; `None` (default) = run until externally stopped.
     pub fn set_stop_max_steps(mut self, n: impl Into<Option<usize>>) -> Self {
         self.cfg.max_steps = n.into();
-        self
-    }
-        /// Whole-bundle pruner: the struct form of `set_pruner_enabled`/`_method`/`_steps`.
-        /// An `enabled == false` pruner is still stored.
-    pub fn set_pruner(mut self, pruner: PopPruner) -> Self {
-        self.cfg.pop_pruner = Some(pruner);
-        self
-    }
-        /// Post-race pruner switch: `true` = after a stop, cull all but the elite and keep
-        /// training for `steps` more steps. `false` (default) = the stop ends the run.
-    pub fn set_pruner_enabled(mut self, enabled: bool) -> Self {
-        self.cfg.pop_pruner = enabled.then(|| {
-            self.pending_pruner.take().unwrap_or(PopPruner {
-                method: PopPrunerMethod::Hard,
-                steps: 0,
-            })
-        });
-        self
-    }
-        /// Pruner strategy. Takes effect only when `set_pruner_enabled(true)` is also called —
-        /// either call order works.
-    pub fn set_pruner_method(mut self, method: PopPrunerMethod) -> Self {
-        match self.cfg.pop_pruner.as_mut() {
-            Some(pruner) => pruner.method = method,
-            None => {
-                let mut p = self.pending_pruner.take().unwrap_or(PopPruner {
-                    method: PopPrunerMethod::Hard,
-                    steps: 0,
-                });
-                p.method = method;
-                self.pending_pruner = Some(p);
-            }
-        }
-        self
-    }
-        /// Extra solo-training steps after the stop. Effective only with
-        /// `set_pruner_enabled(true)` — either call order works.
-    pub fn set_pruner_steps(mut self, steps: usize) -> Self {
-        match self.cfg.pop_pruner.as_mut() {
-            Some(pruner) => pruner.steps = steps,
-            None => {
-                let mut p = self.pending_pruner.take().unwrap_or(PopPruner {
-                    method: PopPrunerMethod::Hard,
-                    steps: 0,
-                });
-                p.steps = steps;
-                self.pending_pruner = Some(p);
-            }
-        }
         self
     }
     /// Set the hidden-dim sampling range.
@@ -905,8 +828,10 @@ impl RaceConfigBuilder {
         self.cfg.elite_crown_lifetime_steps = k;
         self
     }
-        /// Fresh holdout games the post-race guardrail plays ([`DEFAULT_GUARDRAIL_MATCHES`] = 16).
-        /// Diagnostic only. (Challenges moved to the TRAINER side — roll `trainer::challenge_fires`.)
+        /// Fresh holdout games the post-race guardrail plays per elite
+        /// ([`DEFAULT_GUARDRAIL_MATCHES`] = 16; every elite takes the exam, so the run plays
+        /// `elite_count × n` games). Diagnostic only. (Challenges moved to the TRAINER
+        /// side — roll `trainer::challenge_fires`.)
         /// **`0` = skip the exam entirely**: no holdout game is played, no verdict is recorded,
         /// and `engine.guardrail(..)` returns `None`. Nothing else changes — the run still ranks,
         /// stops and writes its artifacts, and the next run still inherits via `elites.json`
@@ -940,18 +865,8 @@ impl RaceConfigBuilder {
         self
     }
     /// Finish and return the configured [`RaceConfig`].
-    pub fn build(mut self) -> RaceConfig {
-        let cfg = self.cfg;
-        // Params set by the pruner setters while the switch was still off:
-        // surfaced loudly (a silent no-op would hide the misconfig).
-        if let Some(p) = self.pending_pruner.take() {
-            tracing::warn!(
-                "set_pruner_method({:?})/set_pruner_steps({}) were called without set_pruner_enabled(true) — pruner is OFF",
-                p.method,
-                p.steps
-            );
-        }
-        cfg
+    pub fn build(self) -> RaceConfig {
+        self.cfg
     }
 }
 

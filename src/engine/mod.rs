@@ -21,7 +21,6 @@
 //! - [`format`] — display/CSV formatting + the build identity stamp
 //! - [`artifacts`] — champion/worst dumps + their ranking helpers
 //! - [`evolve`] — the crossover/immigrant rolls, cull/insert, victim selection
-//! - [`pruner`] — the post-race solo-training phase
 //! - [`step`] — one net's step path (trainer dispatch, freeze pass, RNG seeding)
 //! - [`stop`] — stop criteria + `RaceSnapshot`
 //! - [`tabular_engine`] — tabular-mode constructors (`resume`)
@@ -41,7 +40,6 @@ pub mod format;
 pub mod guardrail;
 pub mod logging;
 pub mod population;
-pub mod pruner;
 pub mod reporting;
 pub mod rl_engine;
 pub mod run_spec;

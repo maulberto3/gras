@@ -1,13 +1,15 @@
-//! Post-race guardrail — the honest holdout re-check of the exported
-//! champion. Users call it through the ENGINE method
-//! [`crate::CoreEngine::guardrail`], which fills in run_dir/champion/race
-//! smoothed automatically and scores the champion's LIVE net (still in memory
-//! at stop time). No weight file is involved, so a run can leave
-//! `elite_save_safetensors` off and still certify a champion.
+//! Post-race guardrail — the honest holdout re-check of the exported elites.
+//! Users call it through the ENGINE method [`crate::CoreEngine::guardrail`],
+//! which fills in run_dir/race smoothed automatically and scores every elite's
+//! LIVE net (still in memory at stop time) — rank 1 is the certified champion,
+//! the rest are its measured field. No weight file is involved, so a run can
+//! leave `elite_save_safetensors` off and still certify a champion.
 //!
 //! Ownership split:
-//! - **Module** (here): play `matches` fresh games on that net ([`score_net`])
-//!   and aggregate the per-game scores into a [`GuardrailVerdict`].
+//! - **Module** (here): play `matches` fresh games on each net ([`score_net`])
+//!   and aggregate the per-game scores into a [`GuardrailVerdict`], then grade
+//!   race-vs-exam in ONE place ([`agreement_grade`]) so the log table's `status`
+//!   and the verdict sentence can never disagree.
 //! - **Trainer** (`holdout_score`): play ONE fresh game with the given net —
 //!   only the trainer's domain code knows the environment.
 //!
@@ -24,7 +26,7 @@ use crate::graph::network::Network;
 /// `scores` is empty only when scoring failed entirely.
 #[derive(Clone, Debug)]
 pub struct GuardrailVerdict {
-    /// Full hash of the champion scored.
+    /// Full hash of the net scored (rank 1 is the certified champion).
     pub hash: String,
     /// The champion's final smoothed fitness as the race recorded it
     /// (None if no verdict was ever recorded).
@@ -79,6 +81,147 @@ impl GuardrailVerdict {
     }
 }
 
+/// How the exam's reading compares with the race reading — the ONE grading behind
+/// both the verdict sentence ([`agreement_verdict_noisy`]) and the guardrail
+/// table's `status` cell ([`AgreementGrade::tag`]): the log and the sentence can
+/// never disagree about which case was reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgreementGrade {
+    /// No race reference or no scored game: nothing was compared (never a pass).
+    Unscored,
+    /// The exam is at or above the race reading — it held up.
+    Consistent,
+    /// Below the race reading, inside the combined sampling-error band.
+    WithinNoise,
+    /// Below the race reading by ≤10%, with no usable error bar (the flat rule).
+    WithinTolerance,
+    /// Just outside the band — a disagreement too small to call a collapse.
+    Borderline,
+    /// Far outside the band, or far below under the flat rule: the race over-reported.
+    Weak,
+}
+
+impl AgreementGrade {
+    /// The table's `status` cell: one short tag, no prose (the champion's full
+    /// sentence rides in the card's footnote).
+    pub fn tag(self) -> &'static str {
+        match self {
+            AgreementGrade::Unscored => "not scored",
+            AgreementGrade::Consistent => "consistent",
+            AgreementGrade::WithinNoise => "within noise",
+            AgreementGrade::WithinTolerance => "≤10% below",
+            AgreementGrade::Borderline => "borderline",
+            AgreementGrade::Weak => "weak",
+        }
+    }
+}
+
+/// The graded comparison plus every number the verdict sentence quotes.
+/// `band`/`ratio`/`race_se` are meaningful only when `noisy`.
+struct Agreement {
+    grade: AgreementGrade,
+    shortfall: f32,
+    rel: f32,
+    band: f32,
+    ratio: f32,
+    race_se: f32,
+    noisy: bool,
+}
+
+/// The ONE place the race-vs-exam comparison is graded: shared thresholds, one
+/// branch order. The shortfall is direction-aware, so "below" means "worse" in
+/// both directions.
+fn evaluate_agreement(
+    race_smoothed: Option<f32>,
+    race_se: Option<f32>,
+    holdout_mean: Option<f32>,
+    exam_se: Option<f32>,
+    matches_scored: usize,
+    direction: Direction,
+) -> Agreement {
+    let (Some(race), Some(hold)) = (race_smoothed, holdout_mean) else {
+        return Agreement {
+            grade: AgreementGrade::Unscored,
+            shortfall: 0.0,
+            rel: 0.0,
+            band: 0.0,
+            ratio: 0.0,
+            race_se: 0.0,
+            noisy: false,
+        };
+    };
+    let shortfall = match direction {
+        Direction::Maximize => race - hold,
+        Direction::Minimize => hold - race,
+    };
+    let rel = shortfall / race.abs().max(1e-6);
+    // The noise-aware branch. `se > 0` is load-bearing: a single reading has
+    // unobservable spread and must fall through to the flat rule.
+    if let (Some(se), true) = (race_se.filter(|se| *se > 0.0), matches_scored > 0) {
+        // Judged against the COMBINED error bar: 2×√(race_se² + exam_se²) — a plain
+        // 2σ difference test; with a tiny exam SE this is the race band, as before.
+        let band = 2.0 * (se * se + exam_se.unwrap_or(0.0).powi(2)).sqrt();
+        let ratio = shortfall / band;
+        let grade = if shortfall <= 0.0 {
+            AgreementGrade::Consistent
+        } else if shortfall <= band {
+            AgreementGrade::WithinNoise
+        } else if ratio <= 1.5 {
+            AgreementGrade::Borderline
+        } else {
+            AgreementGrade::Weak
+        };
+        return Agreement {
+            grade,
+            shortfall,
+            rel,
+            band,
+            ratio,
+            race_se: se,
+            noisy: true,
+        };
+    }
+    // Flat fallback: no usable error bar (a one-reading window, no live buffer,
+    // or no games scored).
+    let grade = if rel <= 0.0 {
+        AgreementGrade::Consistent
+    } else if rel <= 0.10 {
+        AgreementGrade::WithinTolerance
+    } else {
+        AgreementGrade::Weak
+    };
+    Agreement {
+        grade,
+        shortfall,
+        rel,
+        band: 0.0,
+        ratio: 0.0,
+        race_se: 0.0,
+        noisy: false,
+    }
+}
+
+/// The grade alone — the guardrail table's per-elite `status` column, from the
+/// same grading the verdict sentence uses.
+pub fn agreement_grade(
+    race_smoothed: Option<f32>,
+    race_se: Option<f32>,
+    holdout_mean: Option<f32>,
+    exam_se: Option<f32>,
+    matches_scored: usize,
+    direction: Direction,
+) -> AgreementGrade {
+    evaluate_agreement(
+        race_smoothed,
+        race_se,
+        holdout_mean,
+        exam_se,
+        matches_scored,
+        direction,
+    )
+    .grade
+}
+
 /// The verdict sentence WITH the sampling error of both readings. The race reading
 /// is a noisy ARGMAX (winner's curse), so the gap is judged against the combined band.
 /// Without a usable error bar (`race_se` unset or zero, no games scored) it degrades
@@ -93,19 +236,24 @@ pub fn agreement_verdict_noisy(
     matches_scored: usize,
     direction: Direction,
 ) -> String {
-    let (Some(race), Some(hold)) = (race_smoothed, holdout_mean) else {
+    let a = evaluate_agreement(
+        race_smoothed,
+        race_se,
+        holdout_mean,
+        exam_se,
+        matches_scored,
+        direction,
+    );
+    if a.grade == AgreementGrade::Unscored {
         return "unscored (no race reference or no holdout games)".to_string();
-    };
-    // Direction-aware shortfall of the EXAM vs the race reading: positive means
-    // the exam landed BELOW what the race promised (worse), in either direction.
-    let shortfall = match direction {
-        Direction::Maximize => race - hold,
-        Direction::Minimize => hold - race,
-    };
-    let rel = shortfall / race.abs().max(1e-6);
-            // The noise-aware branch. `se > 0` is load-bearing: a single reading has
-            // unobservable spread and must fall through to the flat rule.
-    if let (Some(se), true) = (race_se.filter(|se| *se > 0.0), matches_scored > 0) {
+    }
+    // A grade implies BOTH readings exist — `evaluate_agreement` is the one
+    // place that decides so.
+    let race = race_smoothed.expect("graded ⇒ race reading present");
+    let (shortfall, rel) = (a.shortfall, a.rel);
+    // The noise-aware branch (`noisy`: usable race error bar AND scored games).
+    if a.noisy {
+        let (se, band, ratio) = (a.race_se, a.band, a.ratio);
         let race_n = race_samples
             .filter(|n| *n > 0)
             .map(|n| format!("{n} step reading(s)"))
@@ -124,15 +272,10 @@ pub fn agreement_verdict_noisy(
             ),
             _ => String::new(),
         };
-                // Judged against the COMBINED error bar: 2×√(race_se² + exam_se²) — a plain
-                // 2σ difference test; with a tiny exam SE this is the race band, as before.
-        let se_diff = (se * se + exam_se.unwrap_or(0.0).powi(2)).sqrt();
-        let band = 2.0 * se_diff;
-        let ratio = shortfall / band;
-        if shortfall <= 0.0 {
-            return format!("consistent — the exam ({exam}{exam_note}) is at or above the race reading, so the champion held up ✅");
+        if a.grade == AgreementGrade::Consistent {
+            return format!("consistent — the exam ({exam}{exam_note}) is at or above the race reading, so the net held up ✅");
         }
-        if shortfall <= band {
+        if a.grade == AgreementGrade::WithinNoise {
             return format!(
                 "consistent within noise — the exam ({exam}{exam_note}) sits {} under the race reading, inside the {} band of combined sampling error (race SE {} over {race_n}, {}× that band). The race mean is a short-window average and the champion is that average's BEST of the whole population, so a gap this size is expected even from an unchanged net — NOT evidence of a collapse ✅{latest_note}",
                 fmt_line(shortfall),
@@ -141,7 +284,7 @@ pub fn agreement_verdict_noisy(
                 fmt_line(ratio),
             );
         }
-        if ratio <= 1.5 {
+        if a.grade == AgreementGrade::Borderline {
             return format!(
                 "borderline ⚠️ — the exam ({exam}{exam_note}) is {} under the race reading ({:.0}% of it), just outside the {} band of combined sampling error ({}×, race SE {} over {race_n}). The two readings disagree but barely: quote the exam (it is the tighter estimate — {race_n} cannot resolve better than ±{}) and re-run with a longer smoothing window before calling it a collapse. The forecast from a short window is what is failing here, not necessarily the policy.{latest_note}",
                 fmt_line(shortfall),
@@ -163,9 +306,9 @@ pub fn agreement_verdict_noisy(
     }
     // Flat fallback: no usable error bar (a one-reading window, no live buffer,
     // or no games scored).
-    if rel <= 0.0 {
+    if a.grade == AgreementGrade::Consistent {
         "consistent with the race signal ✅".to_string()
-    } else if rel <= 0.10 {
+    } else if a.grade == AgreementGrade::WithinTolerance {
         "holdout ≤10% below the race signal".to_string()
     } else {
         format!(
@@ -473,6 +616,47 @@ mod tests {
             |_t: &mut u8, _net, _i| Err(flodl::tensor::TensorError::new("nope")),
         );
         assert!(failed.is_none(), "an all-failed batch is not a verdict");
+    }
+
+        /// The table's `status` tag and the verdict sentence come from ONE grading:
+        /// every graded case must agree about what happened.
+    #[test]
+    fn the_table_tag_and_the_sentence_share_one_grade() {
+        use Direction::Maximize;
+        // (race μ, race SE, exam μ, exam SE, games) → grade, tag.
+        let cases = [
+            (Some(100.0), Some(1.0), Some(120.0), Some(1.0), 40, AgreementGrade::Consistent, "consistent"),
+            (Some(100.0), Some(5.0), Some(95.0), Some(1.0), 40, AgreementGrade::WithinNoise, "within noise"),
+            (Some(100.0), Some(10.0), Some(74.0), Some(1.0), 100, AgreementGrade::Borderline, "borderline"),
+            (Some(100.0), Some(5.0), Some(5.0), Some(1.0), 100, AgreementGrade::Weak, "weak"),
+            (Some(100.0), None, Some(95.0), None, 100, AgreementGrade::WithinTolerance, "≤10% below"),
+            (None, None, Some(1.0), None, 100, AgreementGrade::Unscored, "not scored"),
+        ];
+        for (race, race_se, exam, exam_se, games, grade, tag) in cases {
+            let got = agreement_grade(race, race_se, exam, exam_se, games, Maximize);
+            assert_eq!(got, grade, "grade for race {race:?} / exam {exam:?}");
+            assert_eq!(got.tag(), tag);
+            // The sentence must not contradict its own tag.
+            let line = agreement_verdict_noisy(
+                race,
+                race_se,
+                Some(5),
+                None,
+                exam,
+                exam_se,
+                games,
+                Maximize,
+            );
+            let starts = match grade {
+                AgreementGrade::Unscored => "unscored",
+                AgreementGrade::Consistent => "consistent —",
+                AgreementGrade::WithinNoise => "consistent within noise",
+                AgreementGrade::WithinTolerance => "holdout ≤10% below",
+                AgreementGrade::Borderline => "borderline",
+                AgreementGrade::Weak => "weak",
+            };
+            assert!(line.starts_with(starts), "{grade:?} vs {line}");
+        }
     }
 
 }
