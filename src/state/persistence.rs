@@ -281,6 +281,11 @@ pub struct GuardrailElite {
     /// Games that produced a score (per-game failures are skipped).
     #[serde(default)]
     pub matches_scored: usize,
+        /// Games the exam PLAYED (`config.guardrail_matches`) — the denominator of the
+        /// console card's `games` cell, so `matches_scored < matches_attempted` reads as
+        /// a degraded exam without consulting the run's config.
+    #[serde(default)]
+    pub matches_attempted: usize,
     /// The one-word grade: `consistent` / `within noise` / `≤10% below` /
     /// `borderline` / `weak` / `not scored`.
     #[serde(default)]
