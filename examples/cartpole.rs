@@ -546,9 +546,10 @@ struct Cli {
     /// the `RISK_AVERSION` const).
     #[arg(long, value_name = "F32", visible_alias = "risk-based")]
     risk_aversion: Option<f32>,
-    /// EXPERIMENTAL training lottery: give each non-crown net's weight update to a
-    /// merit-weighted coin (window level per training, relative to the population).
-    /// A skipped net still acts and is measured. Off by default.
+    /// EXPERIMENTAL train-eval lottery: a seeded, merit-weighted coin decides which
+    /// non-crown nets get this clock's ticket (train + eval, scored per clock spent).
+    /// A denied net IDLES: no train, no eval, no reading — nothing it is ranked on
+    /// moves. Off by default.
     #[arg(long)]
     train_lottery: bool,
     /// Log level (default: the `LOG_LEVEL` const). `none`/`summ`/`minimal` pick
