@@ -39,13 +39,26 @@ pub struct ConfigSnapshot {
     pub crossover_rolls: usize,
     /// Mutation (immigrant) rolls offered per step.
     pub mutate_rolls: usize,
-    /// Crossover replacement policy (`"worst"` | `"random"`). Crossover-only:
-    /// mutation immigrants always evict via fitness-inverse roulette.
+    /// Crossover replacement policy (`"worst"` | `"random"`). Crossover-only — the
+    /// mutation channel has its own knob, recorded just below.
     pub crossover_cull_policy: String,
+        /// Mutation replacement policy (`"worst"` | `"inverse_fitness"` | `"random"`),
+        /// the channel's own knob — it decides which net a fresh immigrant replaces, so a
+        /// reader cannot reconstruct the run without it. `#[serde(default)]` ⇒ `"worst"`:
+        /// that is what `RaceConfig::defaults()` culls with, and therefore what every run
+        /// recorded before this field existed actually did.
+    #[serde(default = "default_mutation_cull_policy")]
+    pub mutation_cull_policy: String,
     /// Elite guard size: top-k nets by smoothed fitness immune to all culls.
     pub elite_count: usize,
     /// Crossover operator pool (`"one_point"`/`"uniform"`); empty ⇒ both.
     pub crossover_ops_pool: Vec<String>,
+        /// Crossover parent-selection method, as its `Display` label (`"roulette"` /
+        /// `"tournament(size=3)"`). `#[serde(default)]` (⇒ `""`) because every run
+        /// recorded before the knob drew roulette: the resume guard reads `""` as
+        /// `"roulette"`, which is exactly what those runs did. Replay-relevant.
+    #[serde(default)]
+    pub crossover_selection: String,
     /// Probability a crossover roll fires.
     pub crossover_prob: f32,
     /// Probability a mutation roll fires.
@@ -90,6 +103,12 @@ pub struct ConfigSnapshot {
         /// Replay-relevant, so it must match on resume.
     #[serde(default)]
     pub freeze_elites: bool,
+        /// Training lottery (`set_run_train_merit`): each non-crown net's clock
+        /// is a merit-weighted coin between a real update and act-and-measure. Decides
+        /// which clocks were act-only, so it is replay-relevant; `#[serde(default)]`
+        /// (⇒ `false`) keeps every pre-knob header on the old always-train path.
+    #[serde(default)]
+    pub evolution_train_lottery: bool,
         /// How many initial slots were user-supplied run topologies. Informational (lineage
         /// reads: ordinals below this are imports).
     #[serde(default)]
@@ -98,6 +117,23 @@ pub struct ConfigSnapshot {
         /// cadence, not replay semantics.
     #[serde(default = "default_true")]
     pub elite_checkpoint_weights: bool,
+        /// The four end-of-run artifact switches (`*_save_topology` / `*_save_safetensors`).
+        /// Informational — they decide what exists on disk, never how the search ran — but
+        /// an artifact trail with no record of what was asked for is unreadable.
+        /// `default_true` on the elite pair and `false` on the worst pair mirror
+        /// `RaceConfig::defaults()`, so a legacy header reads what those runs did.
+    #[serde(default = "default_true")]
+    pub elite_save_topology: bool,
+    #[serde(default = "default_true")]
+    pub elite_save_safetensors: bool,
+    #[serde(default)]
+    pub worst_save_topology: bool,
+    #[serde(default)]
+    pub worst_save_safetensors: bool,
+        /// Flush `history.csv` / `attempts.csv` every clock (default `false` = at the
+        /// checkpoint tick). Durability cadence, not replay semantics.
+    #[serde(default)]
+    pub history_flush_each: bool,
         /// Mutation probation steps: cull-immunity for an immigrant's first k clocks.
         /// Replay-relevant.
     #[serde(default)]
@@ -114,6 +150,12 @@ pub struct ConfigSnapshot {
         /// at peak (`0` disables). Replay-relevant.
     #[serde(default)]
     pub elite_crown_lifetime_steps: usize,
+        /// The input feature-split policy the run drew masks from (`"split_exclusive"` /
+        /// `"split_random"`); `None` = no split at all. The MASKS are genome and live in
+        /// each net's blueprint (`nets/<hash>.json`) — this records only how they were
+        /// drawn, so a finished run can say what produced it.
+    #[serde(default)]
+    pub feature_split: Option<String>,
         /// Fresh holdout games the post-race guardrail plays. Diagnostic — no resume guard.
     #[serde(default = "default_guardrail_matches")]
     pub guardrail_matches: usize,
@@ -145,9 +187,11 @@ impl ConfigSnapshot {
             checkpoint_every: cfg.checkpoint_every,
             crossover_rolls: cfg.crossover_rolls,
             mutate_rolls: cfg.mutate_rolls,
-            crossover_cull_policy: format!("{:?}", cfg.crossover_cull_policy).to_lowercase(),
+            crossover_cull_policy: cfg.crossover_cull_policy.to_string(),
+            mutation_cull_policy: cfg.mutation_cull_policy.to_string(),
             elite_count: cfg.elite_count,
             crossover_ops_pool: cfg.crossover_ops_pool.clone(),
+            crossover_selection: cfg.crossover_selection.to_string(),
             crossover_prob: cfg.crossover_prob,
             mutate_prob: cfg.mutate_prob,
             max_steps: cfg.max_steps,
@@ -168,6 +212,7 @@ impl ConfigSnapshot {
             csv_export: cfg.csv_export,
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
+            evolution_train_lottery: cfg.evolution_train_lottery,
             run_topology_count: cfg.run_topologies.len(),
             elite_previous_load: cfg.elite_previous_load,
             elite_previous_dir: cfg
@@ -175,10 +220,16 @@ impl ConfigSnapshot {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             elite_checkpoint_weights: cfg.elite_checkpoint_weights,
+            elite_save_topology: cfg.elite_save_topology,
+            elite_save_safetensors: cfg.elite_save_safetensors,
+            worst_save_topology: cfg.worst_save_topology,
+            worst_save_safetensors: cfg.worst_save_safetensors,
+            history_flush_each: cfg.history_flush_each,
             mutation_probation_steps: cfg.mutation_probation_steps,
             crossover_probation_steps: cfg.crossover_probation_steps,
             elite_join_probation_steps: cfg.elite_join_probation_steps,
             elite_crown_lifetime_steps: cfg.elite_crown_lifetime_steps,
+            feature_split: cfg.feature_split.map(|p| p.to_string()),
             guardrail_matches: cfg.guardrail_matches,
             build: crate::engine::format::build_stamp(),
         }
@@ -272,6 +323,18 @@ pub struct GuardrailElite {
     /// The net's most recent step reading (the window mean lags it).
     #[serde(default)]
     pub race_latest: Option<f32>,
+        /// Smallest reading in that net's race window — the readable form of `race_std`
+        /// (e.g. one 500 among fizzles), per elite. `None` = no window recorded.
+    #[serde(default)]
+    pub race_min: Option<f32>,
+    /// Largest reading in that net's race window.
+    #[serde(default)]
+    pub race_max: Option<f32>,
+        /// The exam graded against `race_latest` instead of the window mean — the SECOND
+        /// reference line's tag (same vocabulary as `agreement`). `None` = no latest
+        /// reading or no scored game, so nothing was graded.
+    #[serde(default)]
+    pub latest_agreement: Option<String>,
     /// Mean holdout score over the games that actually produced one.
     #[serde(default)]
     pub holdout_mean: Option<f32>,
@@ -740,6 +803,13 @@ fn default_alive() -> bool {
 }
 
 /// Serde default: `true`.
+/// Legacy default for [`ConfigSnapshot::mutation_cull_policy`]: the policy every run
+/// written before the field existed culled with — `RaceConfig::defaults()` sets
+/// `MutationCullPolicy::Worst`, so that (not the enum's `#[default]` `InverseFitness`).
+fn default_mutation_cull_policy() -> String {
+    "worst".to_string()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -771,22 +841,27 @@ pub struct NetState {
     #[serde(default = "default_alive")]
     pub is_alive: bool,
         /// Step this net was culled (`None` while alive). With `cull_reason` and
-        /// `final_smoothed_fitness` it makes a complete tombstone.
+        /// `final_fitness_mean` it makes a complete tombstone.
     #[serde(default)]
     pub culled_at_step: Option<usize>,
     /// Why it left (`"crossover"` | `"immigrant-slot"`).
     #[serde(default)]
     pub cull_reason: Option<String>,
-        /// Its smoothed fitness at the moment of culling — the READABLE window mean (e.g. the
-        /// turns it survived), NOT the risk-adjusted score that ranked it.
-    #[serde(default)]
-    pub final_smoothed_fitness: Option<f32>,
+        /// Its window fitness MEAN at the moment of culling (e.g. the turns it survived) —
+        /// the readable level, NOT the risk-adjusted score that ranked it (that is
+        /// `final_risk_score`). Named `*_mean` on purpose: "smoothed" means risk-adjusted
+        /// everywhere else in the engine, so the old `final_smoothed_fitness` read like the
+        /// ranking value while holding the plain average. `alias` keeps every tombstone
+        /// written before the rename loadable.
+    #[serde(default, alias = "final_smoothed_fitness")]
+    pub final_fitness_mean: Option<f32>,
         /// Spread of that window (population std of the step readings). With the mean it tells
         /// "always that good" from "one lucky step" at a glance; `None` on legacy tombstones.
     #[serde(default)]
     pub final_fitness_std: Option<f32>,
         /// The RISK-ADJUSTED score (FIT: `mean ∓ λσ`) the net was actually ranked by at the
-        /// moment of culling. Equals `final_smoothed_fitness` when λ = 0.
+        /// moment of culling. Equals `final_fitness_mean` when λ = 0.
+        /// (This is the score every selector used; the mean beside it is for reading.)
     #[serde(default)]
     pub final_risk_score: Option<f32>,
         /// Step readings behind the three values above. `0` on legacy tombstones.
@@ -820,6 +895,14 @@ pub struct NetState {
         /// `elite_crown_lifetime_steps` the net ages out (`0` disables).
     #[serde(default)]
     pub elite_seat_age: usize,
+        /// Clocks this net ACTED but the training lottery skipped its weight update.
+        /// A subset of the act-and-measure clocks in `frozen_spans` (which stay the
+        /// replay ledger: both reasons replay through a no-op optimizer); kept apart so
+        /// the elite table's `frozen` column still means "crown freeze" and the budget
+        /// skips get their own number. `0` on legacy records and whenever the lottery
+        /// is off.
+    #[serde(default)]
+    pub budget_skips: usize,
 }
 
 /// Rich metadata for one individual (embedded in `nets/<hash>.json` under `meta`) — enough
@@ -924,7 +1007,7 @@ impl NetState {
             is_alive: true,
             culled_at_step: None,
             cull_reason: None,
-            final_smoothed_fitness: None,
+            final_fitness_mean: None,
             final_fitness_std: None,
             final_risk_score: None,
             final_fitness_samples: 0,
@@ -936,6 +1019,7 @@ impl NetState {
             last_update_step: step,
             elite_probation_age: 0,
             elite_seat_age: 0,
+            budget_skips: 0,
         })
     }
 
@@ -1352,6 +1436,86 @@ mod tests {
         })
     }
 
+        /// Both cull channels reach `engine.json` under their OWN key, with the stable
+        /// snake_case spelling (not `Debug` casing): a header is a record a reader parses,
+        /// and `InverseFitness` lowercase would come out as `inversefitness`.
+    #[test]
+    fn config_snapshot_records_both_cull_policies_in_snake_case() {
+        use crate::engine::config::{CrossCullPolicy, MutationCullPolicy, RaceConfig};
+        let mut cfg = RaceConfig::defaults();
+        cfg.crossover_cull_policy = CrossCullPolicy::Random;
+        cfg.mutation_cull_policy = MutationCullPolicy::InverseFitness;
+        let snap = ConfigSnapshot::from_config(&cfg, None, None);
+        assert_eq!(snap.crossover_cull_policy, "random");
+        assert_eq!(snap.mutation_cull_policy, "inverse_fitness");
+        // …and the default run records the policy it actually culls with — `worst`, the
+        // value `RaceConfig::defaults()` sets, INDEPENDENT of the enum's `#[default]`.
+        let dflt = ConfigSnapshot::from_config(&RaceConfig::defaults(), None, None);
+        assert_eq!(dflt.mutation_cull_policy, "worst");
+        assert_eq!(dflt.crossover_cull_policy, "worst");
+    }
+
+        /// The tombstone's mean was renamed (`final_smoothed_fitness` →
+        /// `final_fitness_mean`); every file written before the rename must still load,
+        /// or the seeding path silently loses its ranking key on old runs.
+    #[test]
+    fn a_legacy_tombstone_key_still_loads_as_the_mean() {
+        let legacy = serde_json::json!({
+            "hash": "h",
+            "net_seed": 1,
+            "topology": "{}",
+            "step": 0,
+            "entered_at_step": 0,
+            "is_alive": false,
+            "final_smoothed_fitness": 1.5,
+        });
+        let state: NetState = serde_json::from_value(legacy).expect("legacy tombstone loads");
+        assert_eq!(state.final_fitness_mean, Some(1.5));
+        // New files serialize under the new name only (no duplicate key).
+        let raw = serde_json::to_string(&state).unwrap();
+        assert!(raw.contains("\"final_fitness_mean\""), "{raw}");
+        assert!(!raw.contains("final_smoothed_fitness"), "{raw}");
+    }
+
+        /// The artifact switches and the CSV flush cadence reach `engine.json` too: they
+        /// never change the search, but an artifact trail without a record of what was
+        /// ASKED for cannot be read back. Legacy headers fall back to `RaceConfig::defaults()`
+        /// (elite pair on, worst pair off, flush off).
+    #[test]
+    fn config_snapshot_records_artifact_flags_and_flush_cadence() {
+        use crate::engine::config::RaceConfig;
+        let mut cfg = RaceConfig::defaults();
+        cfg.elite_save_topology = false;
+        cfg.elite_save_safetensors = false;
+        cfg.worst_save_topology = true;
+        cfg.worst_save_safetensors = true;
+        cfg.history_flush_each = true;
+        let snap = ConfigSnapshot::from_config(&cfg, None, None);
+        assert!(!snap.elite_save_topology && !snap.elite_save_safetensors);
+        assert!(snap.worst_save_topology && snap.worst_save_safetensors);
+        assert!(snap.history_flush_each);
+
+        // A pre-field header must read the defaults those runs actually ran with.
+        let legacy: ConfigSnapshot = serde_json::from_str("{}").expect("empty snapshot loads");
+        assert!(legacy.elite_save_topology && legacy.elite_save_safetensors);
+        assert!(!legacy.worst_save_topology && !legacy.worst_save_safetensors);
+        assert!(!legacy.history_flush_each);
+    }
+
+        /// A header written before the field existed must read as the policy those runs
+        /// actually used (`worst`) — not as an empty string a reader would have to guess
+        /// at, and not as the enum's `InverseFitness` default, which no config path ever
+        /// selected.
+    #[test]
+    fn a_pre_field_header_reads_the_legacy_mutation_policy() {
+        let legacy: ConfigSnapshot = serde_json::from_str("{}").expect("empty snapshot loads");
+        assert_eq!(legacy.mutation_cull_policy, "worst");
+        // The container-level `serde(default)` must not win over the field default.
+        let explicit: ConfigSnapshot = serde_json::from_str(r#"{"mutation_cull_policy":"random"}"#)
+            .expect("explicit policy loads");
+        assert_eq!(explicit.mutation_cull_policy, "random");
+    }
+
     fn tiny_topology() -> Topology {
         let mut topo = crate::graph::topology::Topology::new(
             0,
@@ -1419,6 +1583,71 @@ mod tests {
         );
         assert_eq!(loaded.smoothing_window, snapshot.smoothing_window);
         assert_eq!(loaded.pop_size, snapshot.pop_size);
+    }
+
+        /// The parent draw is recorded as its label; a pre-knob `engine.json` (no key
+        /// at all) loads as `""`, which the resume guard reads as roulette — the draw
+        /// those runs actually made.
+    #[test]
+    fn config_snapshot_records_the_crossover_selection() {
+        use crate::evolution::selection::SelectionMethod;
+        let snapshot = ConfigSnapshot::from_config(
+            &crate::engine::config::RaceConfig::defaults(),
+            None,
+            None,
+        );
+        assert_eq!(snapshot.crossover_selection, "roulette");
+        // Round-trips at a non-default method…
+        let mut cfg = crate::engine::config::RaceConfig::defaults();
+        cfg.crossover_selection = SelectionMethod::Tournament { tournament_size: 4 };
+        let json = serde_json::to_string(&ConfigSnapshot::from_config(&cfg, None, None)).unwrap();
+        assert!(
+            json.contains("tournament(size=4)"),
+            "the header must name the draw: {json}"
+        );
+        // …and a pre-knob header (key removed) loads as empty, not as a made-up method.
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("crossover_selection");
+        let loaded: ConfigSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(loaded.crossover_selection, "");
+    }
+
+        /// The feature-split POLICY is recorded (the masks themselves are genome and
+        /// live in each net's blueprint): the header must say how the run drew them,
+        /// and a pre-knob `engine.json` (no key at all) must load as "no split".
+    #[test]
+    fn config_snapshot_records_the_feature_split_policy() {
+        use crate::graph::topology::FeatureSplitPolicy;
+        let mut cfg = crate::engine::config::RaceConfig::defaults();
+        cfg.feature_split = None;
+        assert_eq!(
+            ConfigSnapshot::from_config(&cfg, None, None).feature_split,
+            None,
+            "a run with the split off records no policy"
+        );
+        for (policy, wire) in [
+            (FeatureSplitPolicy::Exclusive, "split_exclusive"),
+            (FeatureSplitPolicy::Random, "split_random"),
+        ] {
+            cfg.feature_split = Some(policy);
+            let snap = ConfigSnapshot::from_config(&cfg, None, None);
+            assert_eq!(snap.feature_split.as_deref(), Some(wire));
+            // Round-trips…
+            let json = serde_json::to_string(&snap).unwrap();
+            let back: ConfigSnapshot = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.feature_split, snap.feature_split);
+            // …and a header written before the key existed loads as no split.
+            let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+            legacy.as_object_mut().unwrap().remove("feature_split");
+            let loaded: ConfigSnapshot = serde_json::from_value(legacy).unwrap();
+            assert_eq!(
+                loaded.feature_split, None,
+                "a legacy header predates the split"
+            );
+        }
     }
 
     #[test]
