@@ -4,6 +4,7 @@
 
 use crate::utils::fitness::Metric;
 use crate::graph::topology::FeatureSplitPolicy;
+use crate::evolution::selection::SelectionMethod;
 
 /// What the scheduler checks to decide whether to stop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +104,17 @@ pub enum CrossCullPolicy {
     Random,
 }
 
+impl std::fmt::Display for CrossCullPolicy {
+    /// The STABLE spelling recorded in `engine.json` and the run manifest (snake_case,
+    /// not the `Debug` casing): a header written today must read the same tomorrow.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Worst => "worst",
+            Self::Random => "random",
+        })
+    }
+}
+
     /// Who gets evicted when a MUTATION roll inserts a fresh random immigrant.
     /// **Mutation-only** — the crossover channel has its own policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -117,6 +129,19 @@ pub enum MutationCullPolicy {
         /// **Random** — evict a uniformly random live net, at the cost of occasionally
         /// losing a good one.
     Random,
+}
+
+impl std::fmt::Display for MutationCullPolicy {
+    /// The STABLE spelling recorded in `engine.json` and the run manifest. Note it is NOT
+    /// `format!("{:?}").to_lowercase()`: `InverseFitness` would collapse to
+    /// `inversefitness`, which no reader could parse back to the variant.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InverseFitness => "inverse_fitness",
+            Self::Worst => "worst",
+            Self::Random => "random",
+        })
+    }
 }
 
     /// The two-parent crossover operators, drawn from `crossover_ops_pool` (empty ⇒ both)
@@ -199,6 +224,16 @@ pub struct RaceConfig {
     /// Anti-devolution A: the top-k nets act-and-measure without weight
     /// updates (see [`RaceConfigBuilder::set_elite_freeze`]). Default `true`.
     pub freeze_elites: bool,
+        /// EXPERIMENTAL training lottery. When ON, every clock each non-crown net
+        /// draws whether it earns a weight update this clock from its FINAL fitness per
+        /// training (`smt / state.step` — the risk-adjusted score, so λ is already paid),
+        /// as a fraction of the population's spread. A
+        /// skipped net still ACTS and is measured (same act-and-measure path as the
+        /// crown freeze), so ranking, culling and the guardrail see a fresh reading.
+        /// Default `false` = every non-frozen net trains every clock, as before.
+        /// Replay-relevant: which clocks were act-only is persisted per net
+        /// (`frozen_spans`), so a resumed run must use the same setting.
+    pub evolution_train_lottery: bool,
         /// Per-net smoothed-fitness rolling window (K) — how many recent step fitnesses every
         /// ranking decision averages over. Defaults to [`SMOOTHING_WINDOW`].
     pub smoothing_window: usize,
@@ -212,6 +247,12 @@ pub struct RaceConfig {
         /// Crossover operator pool (`"one_point"` | `"uniform"`), drawn uniformly per attempt.
         /// Empty ⇒ both.
     pub crossover_ops_pool: Vec<String>,
+        /// How a crossover attempt draws its parents: [`SelectionMethod::Roulette`]
+        /// (default — the engine's historical behavior) or a `Tournament { k }`, which
+        /// concentrates recombination on the fittest. See
+        /// [`RaceConfigBuilder::set_crossover_selection`]. Replay-relevant: the draw
+        /// consumes the roll's RNG stream, so a resumed run must use the same method.
+    pub crossover_selection: SelectionMethod,
     /// Max steps before stopping (None = no limit).
     pub max_steps: Option<usize>,
         /// Hidden-dim sampling range (`None` ⇒ default 4..=8). NOTE: batch geometry lives
@@ -463,12 +504,14 @@ impl RaceConfig {
             mutation_cull_policy: MutationCullPolicy::Worst,
             elite_count: 1,
             freeze_elites: true,
+            evolution_train_lottery: false,
             elite_join_probation_steps: 5,
             elite_crown_lifetime_steps: 5,
             smoothing_window: SMOOTHING_WINDOW,
             risk_aversion: RISK_AVERSION,
             mode_specific: ModeConfig::Tabular(TabularConfig::default()),
             crossover_ops_pool: Vec::new(),
+            crossover_selection: SelectionMethod::Roulette,
             max_steps: None,
             hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
             hidden_dim_stride: 16,
@@ -599,6 +642,31 @@ impl RaceConfigBuilder {
         self.cfg.freeze_elites = yes;
         self
     }
+        /// EXPERIMENTAL: the training lottery (default `false` = off, every non-frozen
+        /// net trains every clock).
+        ///
+        /// When ON, each non-crown net's clock is a weighted coin: with probability
+        /// `p` it takes the real optimizer step, otherwise it takes the same
+        /// act-and-measure pass the crown freeze uses (fresh batch, fresh reading, no
+        /// weight change). `p` is the net's **merit** — its FINAL fitness (the same
+        /// risk-adjusted score `smt = μ − λσ` the ranking uses, so a risky net already
+        /// paid for its spread) divided by the trainings it has spent (`state.step`,
+        /// not the clock) — mapped onto `[0, 1]` against the population's own spread,
+        /// so 1 is the best score-per-update and 0 the worst. Training a net grows its
+        /// denominator, so
+        /// its merit decays and the budget rotates: this is a self-limiting allocation,
+        /// not a leader lock-in.
+        ///
+        /// Two floors by design: a net inside its born shield (`on_probation`) and a
+        /// crown member always take the real path, and a net with no trainings yet has
+        /// no ratio to grade. The draw is deterministic in `(run_seed, clock, net hash)`
+        /// — never the loop order — so a resume replays the same decisions. Replay-relevant:
+        /// the act-only clocks are persisted (`frozen_spans`) and a resume at a different
+        /// setting is refused by name.
+    pub fn set_run_train_merit(mut self, enabled: bool) -> Self {
+        self.cfg.evolution_train_lottery = enabled;
+        self
+    }
         /// Per-net smoothed-fitness rolling window (K). Default [`SMOOTHING_WINDOW`] = 10.
         /// Replay-relevant: a resumed run must use the same value or construction fails parity.
     pub fn set_run_smoothing_window(mut self, k: usize) -> Self {
@@ -636,6 +704,23 @@ impl RaceConfigBuilder {
         S: AsRef<str>,
     {
         self.cfg.crossover_ops_pool = ops.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self
+    }
+        /// Parent-selection method for the crossover draw. Default
+        /// [`SelectionMethod::Roulette`] — what every run drew before this knob existed,
+        /// so an untouched builder changes nothing.
+        ///
+        /// `Tournament { tournament_size: k }` holds `k` uniform draws per parent and
+        /// keeps the best under the run's direction. `k = 1` is a plain uniform draw;
+        /// a larger `k` increasingly favours the best (the leader's win rate goes from
+        /// `1/n` toward 1 — at `k = n` it is already ≈63%, because the entrants are
+        /// drawn WITH replacement). Minimize flips the favourite to the lowest score.
+        ///
+        /// Replay-relevant like K and λ: the two methods consume the roll's RNG stream
+        /// differently and pick different parents, so a resumed run must use the method
+        /// its `engine.json` recorded — a mismatch is refused by name, not patched.
+    pub fn set_crossover_selection(mut self, method: SelectionMethod) -> Self {
+        self.cfg.crossover_selection = method;
         self
     }
         /// Enable the feature split and choose how the Input node's per-port masks
@@ -798,8 +883,27 @@ impl RaceConfigBuilder {
         self.cfg.elite_previous_dir = Some(dir.into());
         self
     }
-        /// Per-checkpoint elite weight snapshot (overwritten each checkpoint). Default true —
-        /// pass false to only write weights at stop.
+    /// Per-checkpoint elite weight snapshot (overwritten each checkpoint). Default true —
+    /// pass false to only write weights at stop.
+    ///
+    /// Writes `checkpoint-elite-<hash>.safetensors` for the top-`elite_count` nets
+    /// once per durability tick ([`Self::set_run_checkpoint_every`]); with
+    /// `checkpoint_every = 0` there is no tick, so no snapshot either. Every write
+    /// overwrites the previous one — latest wins.
+    ///
+    /// **Independent of the stop export.** This flag alone decides the checkpoint
+    /// file; it never consults [`Self::set_elite_save_safetensors`]. The four
+    /// combinations a caller has to be able to reason about:
+    ///
+    /// | `save_safetensors` | `checkpoint_weights` | What lands on disk |
+    /// |---|---|---|
+    /// | `true` | `true` | Weights at every checkpoint (`checkpoint-elite-<hash>.safetensors`, overwritten) **and** at stop (`elite-<hash>.safetensors`) — full durability |
+    /// | `true` | `false` | Weights only at stop — a `kill -9` mid-run loses ALL weights |
+    /// | `false` | `true` | Checkpoint weights exist, no stop export — the stop-time `elite-<hash>.safetensors` is simply absent, so the checkpoint file is the only weights on disk |
+    /// | `false` | `false` | No weights anywhere — a topology-only run (no weight file to load later; nothing in the engine reads one today) |
+    ///
+    /// Neither flag touches the guardrail: it scores the LIVE champion in memory,
+    /// never a safetensors file. (cartpole runs the last case.)
     pub fn set_elite_checkpoint_weights(mut self, enabled: bool) -> Self {
         self.cfg.elite_checkpoint_weights = enabled;
         self
@@ -848,6 +952,22 @@ impl RaceConfigBuilder {
     }
     /// At stop, save the elite's weights as safetensors
     /// (`elite-<hash>.safetensors`). Default true.
+    ///
+    /// **STOP artifact, not a checkpoint one.** This flag and
+    /// [`Self::set_elite_checkpoint_weights`] look alike but answer different
+    /// questions — weights at the end of the run vs weights at every durability
+    /// tick — and they are independent: a checkpoint snapshot is written even when
+    /// this flag is `false`. The four combinations:
+    ///
+    /// | this flag | `checkpoint_weights` | What lands on disk |
+    /// |---|---|---|
+    /// | `true` | `true` | Weights at every checkpoint (`checkpoint-elite-<hash>.safetensors`, overwritten) **and** at stop (`elite-<hash>.safetensors`) — full durability |
+    /// | `true` | `false` | Weights only at stop — a `kill -9` mid-run loses ALL weights |
+    /// | `false` | `true` | Checkpoint weights exist, no stop export — the stop-time `elite-<hash>.safetensors` is simply absent, so the checkpoint file is the only weights on disk |
+    /// | `false` | `false` | No weights anywhere — a topology-only run (no weight file to load later; nothing in the engine reads one today) |
+    ///
+    /// Neither flag touches the guardrail: it scores the LIVE champion in memory,
+    /// never a safetensors file. (cartpole runs the last case.)
     pub fn set_elite_save_safetensors(mut self, enabled: bool) -> Self {
         self.cfg.elite_save_safetensors = enabled;
         self
@@ -1011,6 +1131,29 @@ mod tests {
         assert_eq!(set(f32::NAN), RISK_AVERSION);
         assert_eq!(set(f32::INFINITY), RISK_AVERSION);
         assert_eq!(set(f32::NEG_INFINITY), RISK_AVERSION);
+    }
+
+        /// The parent draw's default must be the method every pre-knob run actually
+        /// used (roulette), so an untouched builder is a zero-behavior-change surface;
+        /// the tournament arm must survive the round-trip untouched.
+    #[test]
+    fn crossover_selection_defaults_to_roulette_and_round_trips() {
+        use crate::evolution::selection::SelectionMethod;
+        assert_eq!(
+            RaceConfig::defaults().crossover_selection,
+            SelectionMethod::Roulette,
+            "the knob's default is the engine's historical draw"
+        );
+        let cfg = RaceConfig::builder()
+            .set_crossover_selection(SelectionMethod::Tournament { tournament_size: 3 })
+            .build();
+        assert_eq!(
+            cfg.crossover_selection,
+            SelectionMethod::Tournament { tournament_size: 3 }
+        );
+        // The recorded label is the Display form the snapshot stores.
+        assert_eq!(cfg.crossover_selection.to_string(), "tournament(size=3)");
+        assert_eq!(SelectionMethod::Roulette.to_string(), "roulette");
     }
 
         /// The stop field setters are mutually exclusive BY CONSTRUCTION: each write clears its

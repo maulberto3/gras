@@ -131,9 +131,20 @@ impl CoreEngine {
             ));
         }
         let direction = self.fitness.direction();
-        // Parent selection ranks EVERY live net (a net with no measurement yet
-        // counts as 0.0) — unlike cull/elite sites, which need a verdict.
-        let ranked = self.ranked_live_all();
+            // Parent selection prefers nets that HAVE a verdict. `ranked_live_all` scores
+            // an unmeasured net `0.0`, which reads as worst under Maximize but as BEST
+            // under Minimize (a loss) — a newborn with an empty window could win a
+            // tournament draw. Fall back to the all-live ranking only when fewer than two
+            // nets are measured (clock 0: nothing has a reading yet and a child must still
+            // be buildable from whatever is there).
+        let ranked = {
+            let measured = self.ranked_live();
+            if measured.len() >= 2 {
+                measured
+            } else {
+                self.ranked_live_all()
+            }
+        };
         let scores: Vec<f32> = ranked.iter().map(|(_, s)| *s).collect();
 
             // 3. Crossover: up to 3 attempts; a no-op (incompatible dims) retries with
@@ -154,19 +165,19 @@ impl CoreEngine {
             // Parent count is a property of the OPERATOR, not a config knob: every
             // CrossoverOp is binary (`op.required_parents()`).
         let n_parents = op.required_parents();
-            // Up to 3 attempts, each with fresh roulette parent draws — retrying only the
-            // operator would burn all attempts on a doomed pairing.
+            // Up to 3 attempts, each with FRESH parent draws (the configured selection
+            // method) — retrying only the operator would burn all attempts on a doomed
+            // pairing.
         let mut parent_hashes: Vec<String> = Vec::new();
         for _ in 0..MAX_PARENT_PAIRINGS {
-                // 2. Roulette-select parents INSIDE the attempt loop. Self-pairing guard:
-                // if B duplicated A, redraw B uniformly from the OTHER positions.
+                // 2. Draw parents INSIDE the attempt loop with the configured method
+                // (`set_crossover_selection`; roulette by default). `draw_one` is ONE
+                // parent draw — `apply` would build a whole generation per parent.
+                // Self-pairing guard: if B duplicated A, redraw B uniformly from the
+                // OTHER positions.
+            let method = self.config.crossover_selection.clone();
             let mut parent_positions: Vec<usize> = (0..n_parents)
-                .filter_map(|_| {
-                    crate::evolution::selection::SelectionMethod::Roulette
-                        .apply(&scores, direction, rng, 0)
-                        .into_iter()
-                        .next()
-                })
+                .filter_map(|_| method.draw_one(&scores, direction, rng))
                 .collect();
             if n_parents == 2
                 && parent_positions.len() == 2
@@ -520,7 +531,7 @@ impl CoreEngine {
             // A revived net is alive again: clear any cull markers.
             culled_at_step: None,
             cull_reason: None,
-            final_smoothed_fitness: None,
+            final_fitness_mean: None,
             final_fitness_std: None,
             final_risk_score: None,
             final_fitness_samples: 0,

@@ -222,6 +222,43 @@ pub fn agreement_grade(
     .grade
 }
 
+/// The SECOND reference line: the exam graded against the net's most recent step
+/// reading instead of the window mean. `None` when the net has no reading or no
+/// game was scored — never a fake pass.
+///
+/// The window mean averages weights the net no longer has (it LAGS the latest
+/// reading), so this line answers the other half of the question the primary
+/// grade asks: "does the exam agree with what the net can do NOW".
+///
+/// The reference's own error bar is the window's σ, NOT `σ/√n`: `race_latest` is
+/// ONE reading, so its sampling error is a single reading's spread. A one-reading
+/// window has σ = 0 → the flat rule, exactly like an unusable race SE in the
+/// primary line.
+pub fn latest_agreement_grade(
+    race_latest: Option<f32>,
+    race_std: Option<f32>,
+    holdout_mean: Option<f32>,
+    exam_se: Option<f32>,
+    matches_scored: usize,
+    direction: Direction,
+) -> Option<AgreementGrade> {
+    let latest = race_latest?;
+    if matches_scored == 0 || holdout_mean.is_none() {
+        return None;
+    }
+    Some(
+        evaluate_agreement(
+            Some(latest),
+            race_std,
+            holdout_mean,
+            exam_se,
+            matches_scored,
+            direction,
+        )
+        .grade,
+    )
+}
+
 /// The verdict sentence WITH the sampling error of both readings. The race reading
 /// is a noisy ARGMAX (winner's curse), so the gap is judged against the combined band.
 /// Without a usable error bar (`race_se` unset or zero, no games scored) it degrades
@@ -260,7 +297,7 @@ pub fn agreement_verdict_noisy(
             .unwrap_or_else(|| "an undeclared number of readings".to_string());
         let exam = format!("{matches_scored} unseen game(s)");
         let exam_note = exam_se
-            .map(|e| format!(", ±{} of its own", fmt_line(2.0 * e)))
+            .map(|e| format!(", ±2·SE {} of its own", fmt_line(2.0 * e)))
             .unwrap_or_default();
                 // Freshness clause (only when worth stating): a LATEST reading far from the
                 // window mean disambiguates a "collapsed" verdict. Phrased neutrally.
@@ -286,7 +323,7 @@ pub fn agreement_verdict_noisy(
         }
         if a.grade == AgreementGrade::Borderline {
             return format!(
-                "borderline ⚠️ — the exam ({exam}{exam_note}) is {} under the race reading ({:.0}% of it), just outside the {} band of combined sampling error ({}×, race SE {} over {race_n}). The two readings disagree but barely: quote the exam (it is the tighter estimate — {race_n} cannot resolve better than ±{}) and re-run with a longer smoothing window before calling it a collapse. The forecast from a short window is what is failing here, not necessarily the policy.{latest_note}",
+                "borderline ⚠️ — the exam ({exam}{exam_note}) is {} under the race reading ({:.0}% of it), just outside the {} band of combined sampling error ({}×, race SE {} over {race_n}). The two readings disagree but barely: quote the exam (it is the tighter estimate — {race_n} cannot resolve better than ±2·SE {}) and re-run with a longer smoothing window before calling it a collapse. The forecast from a short window is what is failing here, not necessarily the policy.{latest_note}",
                 fmt_line(shortfall),
                 rel * 100.0,
                 fmt_line(band),
@@ -482,6 +519,51 @@ mod tests {
             Direction::Minimize,
         );
         assert!(min.contains("weak") && min.contains("OVER-REPORTED"), "{min}");
+    }
+
+    /// The second reference line: the exam graded against the LATEST reading, with
+    /// the window's σ as that reading's own error bar (not σ/√n) — and `None` when
+    /// there is no reading or no scored game.
+    #[test]
+    fn latest_reference_line_grades_against_the_newest_reading() {
+        use Direction::Maximize;
+        // A fizzled window mean (191.7) that the exam (53.5 ± 2.1) disagrees with —
+        // the primary line calls the race an over-report…
+        assert_eq!(
+            agreement_grade(Some(191.7), Some(20.0), Some(53.5), Some(2.1), 10, Maximize),
+            AgreementGrade::Weak,
+        );
+        // …while the LATEST reading (41.5 — one reading, so its error bar is the
+        // window σ) agrees with the same exam: the second line separates "the window
+        // is stale" from "the net collapsed".
+        assert_eq!(
+            latest_agreement_grade(Some(41.5), Some(30.0), Some(53.5), Some(2.1), 10, Maximize),
+            Some(AgreementGrade::Consistent),
+        );
+        // A latest reading the exam does NOT match is a real finding on both lines.
+        assert_eq!(
+            latest_agreement_grade(Some(400.0), Some(20.0), Some(53.5), Some(2.1), 10, Maximize),
+            Some(AgreementGrade::Weak),
+        );
+        // One reading ⇒ σ = 0 ⇒ the flat rule, not fake precision: 5% under the
+        // latest reading is within tolerance, half of it is a collapse.
+        assert_eq!(
+            latest_agreement_grade(Some(100.0), Some(0.0), Some(95.0), Some(2.0), 10, Maximize),
+            Some(AgreementGrade::WithinTolerance),
+        );
+        assert_eq!(
+            latest_agreement_grade(Some(100.0), Some(0.0), Some(50.0), Some(2.0), 10, Maximize),
+            Some(AgreementGrade::Weak),
+        );
+        // Nothing to reference / nothing scored ⇒ no grade (never a fake pass).
+        assert_eq!(
+            latest_agreement_grade(None, Some(30.0), Some(53.5), Some(2.1), 10, Maximize),
+            None
+        );
+        assert_eq!(
+            latest_agreement_grade(Some(41.5), Some(30.0), Some(53.5), Some(2.1), 0, Maximize),
+            None
+        );
     }
 
         /// Severity is graded, not binary: barely outside the band is not the same as

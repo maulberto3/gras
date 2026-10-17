@@ -8,6 +8,7 @@
 //! champions from file mtimes or glob order.
 
 use super::core::CoreEngine;
+use super::format::{ReadingStyle, fmt_reading};
 use flodl::tensor::Result;
 
 impl CoreEngine {
@@ -86,20 +87,25 @@ impl CoreEngine {
             } else {
                 format!("Elite #{}", rank + 1)
             };
-                // The header names all three legs: the score it ranked by, and the window
-                // level `μ` / spread `σ` that produced it.
-            let reading = self.race_reading_of(&hash);
-            let (mu, sigma) = match reading {
-                Some(r) => (format!("{:.2}", r.mean), format!("{:.2}", r.std)),
-                None => ("—".to_string(), "—".to_string()),
-            };
+                // The header names both legs: the score it ranked by, and the reading
+                // it was charged from — `μ ±σ (SE, n)` in the same spelling as the logs,
+                // so a reader never has to guess whether `±` meant σ or σ/√n.
+            let reading = self.race_reading_of(&hash).map_or_else(
+                || "—".to_string(),
+                |r| {
+                    fmt_reading(
+                        Some(r.mean),
+                        (r.n > 1).then_some(r.std),
+                        r.n,
+                        ReadingStyle::Doc,
+                    )
+                },
+            );
             let md = format!(
-                "**{label} · fitness {} (risk-adjusted) = {:.4} · window μ{} σ{} over {} reading(s) · λ={:.2}**\n\n{}",
+                "**{label} · fitness {} (risk-adjusted) = {:.4} · window {} · λ={:.2}**\n\n{}",
                 self.fitness.direction().arrow(),
                 fitness,
-                mu,
-                sigma,
-                reading.map(|r| r.n).unwrap_or(0),
+                reading,
                 self.config.risk_aversion,
                 crate::utils::markdown::topology_markdown(&topo, None),
             );
@@ -223,18 +229,22 @@ impl CoreEngine {
             if let Some(state) = self.state.net(&worst) {
                 if let Ok(topo) = state.topology() {
                     let path = self.run_dir.join(format!("worst-{short}.md"));
-                    let reading = self.race_reading_of(&worst);
+                    let reading = self.race_reading_of(&worst).map_or_else(
+                        || "—".to_string(),
+                        |r| {
+                            fmt_reading(
+                                Some(r.mean),
+                                (r.n > 1).then_some(r.std),
+                                r.n,
+                                ReadingStyle::Doc,
+                            )
+                        },
+                    );
                     let md = format!(
-                        "**Worst · fitness {} (risk-adjusted) = {:.4} · window μ{} σ{} over {} reading(s)**\n\n{}",
+                        "**Worst · fitness {} (risk-adjusted) = {:.4} · window {}**\n\n{}",
                         self.fitness.direction().arrow(),
                         worst_fitness,
-                        reading
-                            .map(|r| format!("{:.2}", r.mean))
-                            .unwrap_or_else(|| "—".into()),
-                        reading
-                            .map(|r| format!("{:.2}", r.std))
-                            .unwrap_or_else(|| "—".into()),
-                        reading.map(|r| r.n).unwrap_or(0),
+                        reading,
                         crate::utils::markdown::topology_markdown(&topo, None),
                     );
                     if let Err(source) = std::fs::write(&path, &md) {

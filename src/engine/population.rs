@@ -240,8 +240,12 @@ pub fn run_topologies_from_run_dir(
         let Ok(topo) = Topology::from_json(topo_json) else {
             continue;
         };
+            // The tombstone's readable MEAN (renamed from `final_smoothed_fitness`; both
+            // keys are read so runs written before the rename still seed). This orders the
+            // prior run's topologies — it does not feed any ranking inside the new run.
         let fitness = state
-            .get("final_smoothed_fitness")
+            .get("final_fitness_mean")
+            .or_else(|| state.get("final_smoothed_fitness"))
             .and_then(|f| f.as_f64())
             .map(|f| f as f32);
         scored.push((fitness, topo));

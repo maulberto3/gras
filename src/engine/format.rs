@@ -140,6 +140,82 @@ pub(crate) fn fmt_cell_opt(v: &Option<f32>) -> String {
     v.as_ref().map_or_else(|| "—".into(), |x| fmt_cell(*x))
 }
 
+/// Which sink a reading is rendered for — the ONLY difference between the
+/// sanctioned spellings: a console line rounds to 1dp, a table cell to 4dp, a
+/// document header to a flat 2dp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadingStyle {
+    /// A console/log LINE ([`fmt_line`] precision).
+    Line,
+    /// A CFY TABLE cell ([`fmt_cell`] precision).
+    Cell,
+    /// A markdown/document header ([`fmt_cfg`] precision, flat 2dp).
+    Doc,
+}
+
+/// The scalar rule for a style — the one thing [`fmt_reading`] and
+/// [`fmt_census`] let vary; the SYMBOLS never vary.
+fn scalar(style: ReadingStyle) -> fn(f32) -> String {
+    match style {
+        ReadingStyle::Line => fmt_line,
+        ReadingStyle::Cell => fmt_cell,
+        ReadingStyle::Doc => fmt_cfg,
+    }
+}
+
+/// **The ONE way a sampled mean is spelled** — `μ327.8 ±σ107.8 (SE 34.1, n=10)`.
+///
+/// The two symbols answer different questions and are therefore ALWAYS both
+/// printed, each labelled:
+/// - `σ` is the spread of the samples behind the mean — how variable the thing
+///   being measured is. This is what the ranking charges (`smt = μ − λσ`).
+/// - `SE = σ/√n` is the uncertainty OF that mean — how well we know it. This is
+///   what a comparison between two means has to use (the guardrail's band).
+///
+/// `n` rides along because it is what turns one into the other. A bare `±` used
+/// to mean either of the two depending on the line, which is exactly the
+/// confusion this function removes — callers should not hand-roll one.
+///
+/// A population CENSUS (every net, not a sample) is the one sanctioned shorter
+/// form — [`fmt_census`]: `μ… ±σ…` with no `SE`, since there is no sampling
+/// error to state.
+pub fn fmt_reading(
+    mean: Option<f32>,
+    sigma: Option<f32>,
+    n: usize,
+    style: ReadingStyle,
+) -> String {
+    let f = scalar(style);
+    let Some(mean) = mean else {
+        return "—".to_string();
+    };
+    match sigma {
+        Some(s) if n > 0 => format!(
+            "μ{} ±σ{} (SE {}, n={n})",
+            f(mean),
+            f(s),
+            f(s / (n as f32).sqrt())
+        ),
+            // No observable spread yet (one reading) or none recorded: say so rather
+            // than print `±σ0`, which would read as "perfectly steady".
+        _ => format!("μ{} (n={n}, no spread yet)", f(mean)),
+    }
+}
+
+/// **The census spelling**: `μ… ±σ…` — a mean over the whole population of
+/// nets, not a sample of readings.
+///
+/// [`fmt_reading`] states `SE = σ/√n` because a sample's mean is itself an
+/// estimate; a census *is* the population, so there is no sampling error to
+/// state and printing one would invent a claim. `σ` is the population's own
+/// spread and names itself the same way it does in `fmt_reading` — that shared
+/// symbol is the whole point: one meaning, `σ` = spread of what is being
+/// averaged, everywhere in the output.
+pub fn fmt_census(mean: f32, sigma: f32, style: ReadingStyle) -> String {
+    let f = scalar(style);
+    format!("μ{} ±σ{}", f(mean), f(sigma))
+}
+
 /// RFC4180-quote a CSV field holding a delimiter, quote, or newline — lineage
 /// strings contain commas, so this is not optional.
 pub(crate) fn csv_field(s: &str) -> String {
@@ -152,7 +228,10 @@ pub(crate) fn csv_field(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{csv_field, fmt_cell, fmt_cell_smt, fmt_cfg, fmt_line, fmt_line_opt, fmt_line_smt};
+    use super::{
+        ReadingStyle, csv_field, fmt_cell, fmt_cell_smt, fmt_census, fmt_cfg, fmt_line,
+        fmt_line_opt, fmt_line_smt, fmt_reading,
+    };
 
     // ── the line rule: 1dp, floored so a real value never reads as zero ─────
 
@@ -249,6 +328,46 @@ mod tests {
     fn optional_forms_render_unset_as_dash() {
         assert_eq!(fmt_line_opt(&None), "—");
         assert_eq!(fmt_line_opt(&Some(0.02)), "0.02");
+    }
+
+    // ── the one reading spelling: both σ and SE, always labelled ────────────
+
+    #[test]
+    fn reading_states_spread_and_standard_error_together() {
+        // n = 4 so SE = σ/2 exactly — no rounding ambiguity in the assertion.
+        assert_eq!(
+            fmt_reading(Some(100.0), Some(10.0), 4, ReadingStyle::Line),
+            "μ100.0 ±σ10.0 (SE 5.0, n=4)"
+        );
+        assert_eq!(
+            fmt_reading(Some(100.0), Some(10.0), 4, ReadingStyle::Cell),
+            "μ100.0000 ±σ10.0000 (SE 5.0000, n=4)"
+        );
+        assert_eq!(
+            fmt_reading(Some(100.0), Some(10.0), 4, ReadingStyle::Doc),
+            "μ100.00 ±σ10.00 (SE 5.00, n=4)"
+        );
+    }
+
+    #[test]
+    fn reading_does_not_invent_a_spread_for_one_sample() {
+        assert_eq!(
+            fmt_reading(Some(327.8), None, 1, ReadingStyle::Line),
+            "μ327.8 (n=1, no spread yet)"
+        );
+        assert_eq!(fmt_reading(None, None, 0, ReadingStyle::Line), "—");
+    }
+
+    #[test]
+    fn census_omits_se_because_a_population_has_none() {
+        assert_eq!(
+            fmt_census(100.0, 10.0, ReadingStyle::Line),
+            "μ100.0 ±σ10.0"
+        );
+        assert_eq!(
+            fmt_census(100.0, 10.0, ReadingStyle::Doc),
+            "μ100.00 ±σ10.00"
+        );
     }
 
     // ── untouched neighbours ───────────────────────────────────────────────

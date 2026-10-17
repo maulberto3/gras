@@ -438,7 +438,7 @@ impl CoreEngine {
             // when/why this net left the population, not just a dead snapshot.
             state.culled_at_step = Some(clock);
             state.cull_reason = Some(reason.to_string());
-            state.final_smoothed_fitness = Some(smoothed);
+            state.final_fitness_mean = Some(smoothed);
             state.final_fitness_std = smoothed_std;
             state.final_risk_score = risk_score;
             state.final_fitness_samples = samples;
