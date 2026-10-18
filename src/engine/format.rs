@@ -4,17 +4,23 @@
 //! one-line build identity stamp. Nothing here is persisted through the
 //! rounded formatters — artifacts always serialize the raw `f32`.
 //!
-//! Three display contexts, three precision rules, one core:
+//! **One rule for every measured number — its own magnitude picks the
+//! precision** ([`fmt_band`], shared by [`fmt_line`] and [`fmt_cell`]):
 //!
-//! | context | rule | helper |
+//! | value | decimals | example |
 //! |---|---|---|
-//! | a console log LINE | 1 decimal, widened only when 1dp would erase the value | [`fmt_line`] |
-//! | a CFY TABLE cell | 4 decimals, widened only below 5e-5 | [`fmt_cell`] |
-//! | a config/knob echo | flat 2 decimals | [`fmt_cfg`] |
+//! | `\|v\| > 10` | 1 | `117.6` |
+//! | `1 ≤ \|v\| ≤ 10` | 2 | `3.25` |
+//! | `\|v\| < 1` | 4 | `0.6348` |
 //!
-//! Widening is not decoration: `0.02` at 1dp prints `0.0`, and a `train_loss`
-//! that reads as zero is worse than a wider column. The floor is capped, so a
-//! value small enough to vanish even at the cap still prints honestly.
+//! The sink no longer changes the precision: a `0.6348` accuracy and a `117.6`
+//! score print the same in a log line and in a table cell, so a reader never has
+//! to learn which writer produced the digits. Knob echoes stay flat 2dp
+//! ([`fmt_cfg`]) — a setting is not a measurement.
+//!
+//! Widening is not decoration: at 4dp a `0.00004` still prints as `0.0000`, and
+//! a `train_loss` that reads as zero is worse than a wider column. The floor is
+//! capped, so a value small enough to vanish even at the cap prints honestly.
 
 /// One-line description of the RUNNING binary: crate version, profile, and the
 /// exe's build mtime — so "stale process, not stale logic" is one glance.
@@ -72,6 +78,13 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// scientific holds at 7-8 chars at any scale.
 const SCI_AT: f32 = 1.0e9;
 
+/// The band boundary between 1dp and 2dp: values from here up print 1 decimal.
+/// The boundary value itself belongs to the wide band, so `10.0` prints `10.0`
+/// and not `10.00` — a column of tens never sprouts a second decimal.
+const BAND_WIDE: f32 = 10.0;
+/// The band boundary between 2dp and 4dp: values below this print 4 decimals.
+const BAND_SMALL: f32 = 1.0;
+
 /// The shared core: at least `min` decimals, widening up to `max` while the
 /// result still READS as zero for a non-zero value.
 ///
@@ -93,21 +106,38 @@ fn fmt_span(v: f32, min: usize, max: usize) -> String {
     s
 }
 
-/// A console log LINE: 1 decimal, widened only when 1dp would erase the value.
+/// **The scalar display rule**: the number's own magnitude picks its precision.
 ///
-/// `0.02` stays `0.02` rather than collapsing to `0.0`, and `0.5` stays `0.5`
-/// rather than being padded to `0.50` — the widening only fires when needed.
-pub(crate) fn fmt_line(v: f32) -> String {
-    fmt_span(v, 1, 4)
+/// `|v| > 10` → 1 decimal, `1 ≤ |v| ≤ 10` → 2, `|v| < 1` → 4. Every measured
+/// value in the output goes through here, so the same quantity is spelled the
+/// same way wherever it appears, and the reader can compare two numbers by
+/// their digit count alone. Above the decimal bands the scientific threshold
+/// still wins ([`SCI_AT`]).
+///
+/// The widening floor survives at every band: a real value never prints as
+/// `0`, which is what keeps a small `train_loss` from reading as exactly zero.
+fn fmt_band(v: f32) -> String {
+    if v.is_finite() && v.abs() >= SCI_AT {
+        return format!("{v:.3e}");
+    }
+    let a = v.abs();
+    if a >= BAND_WIDE {
+        fmt_span(v, 1, 2)
+    } else if a >= BAND_SMALL {
+        fmt_span(v, 2, 4)
+    } else {
+        fmt_span(v, 4, 6)
+    }
 }
 
-/// A CFY TABLE cell: 4 decimals, widened only below `5e-5`.
-///
-/// Flat 4dp would render `0.00004` as `0.0000` — the same erasure the line
-/// rule exists to prevent, at the cell's threshold. Normal values are exactly
-/// 4 decimals; only values too small to show are given more room.
+/// A console log LINE. Same band rule as a table cell — see [`fmt_band`].
+pub(crate) fn fmt_line(v: f32) -> String {
+    fmt_band(v)
+}
+
+/// A CFY TABLE cell. Same band rule as a log line — see [`fmt_band`].
 pub(crate) fn fmt_cell(v: f32) -> String {
-    fmt_span(v, 4, 6)
+    fmt_band(v)
 }
 
 /// A config / knob echo: flat 2 decimals. These are settings rather than
@@ -117,16 +147,10 @@ pub(crate) fn fmt_cfg(v: f32) -> String {
     format!("{v:.2}")
 }
 
-/// Value-unit tag for a ranking score: `smt` = the risk-adjusted score the
-/// race decides on. The log-line form.
-pub(crate) fn fmt_line_smt(v: f32) -> String {
-    format!("smt{}", fmt_line(v))
-}
-
-/// Value-unit tag for a ranking score: `smt` = the risk-adjusted score the
-/// race decides on. The table-cell form.
+/// Value-unit tag for a ranking score in a TABLE cell: `score` = the
+/// risk-adjusted value the race decides on. The CSV column keeps `smt`.
 pub(crate) fn fmt_cell_smt(v: f32) -> String {
-    format!("smt{}", fmt_cell(v))
+    format!("score {}", fmt_cell(v))
 }
 
 /// Optional float, log-line form — plain `—` when unset (never `Some(...)` in
@@ -140,14 +164,14 @@ pub(crate) fn fmt_cell_opt(v: &Option<f32>) -> String {
     v.as_ref().map_or_else(|| "—".into(), |x| fmt_cell(*x))
 }
 
-/// Which sink a reading is rendered for — the ONLY difference between the
-/// sanctioned spellings: a console line rounds to 1dp, a table cell to 4dp, a
-/// document header to a flat 2dp.
+/// Which sink a reading is rendered for — a console line and a table cell share
+/// one rule (the value's magnitude, [`fmt_band`]); only a document header still
+/// differs, at a flat 2dp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadingStyle {
-    /// A console/log LINE ([`fmt_line`] precision).
+    /// A console/log LINE ([`fmt_line`]).
     Line,
-    /// A CFY TABLE cell ([`fmt_cell`] precision).
+    /// A CFY TABLE cell ([`fmt_cell`] — the same band rule as [`ReadingStyle::Line`]).
     Cell,
     /// A markdown/document header ([`fmt_cfg`] precision, flat 2dp).
     Doc,
@@ -163,22 +187,25 @@ fn scalar(style: ReadingStyle) -> fn(f32) -> String {
     }
 }
 
-/// **The ONE way a sampled mean is spelled** — `μ327.8 ±σ107.8 (SE 34.1, n=10)`.
+/// **The ONE way a sampled mean is spelled** —
+/// `avg 327.8 (spread 107.8; SE 34.1 = spread/√10, n=10)`.
 ///
-/// The two symbols answer different questions and are therefore ALWAYS both
-/// printed, each labelled:
-/// - `σ` is the spread of the samples behind the mean — how variable the thing
-///   being measured is. This is what the ranking charges (`smt = μ − λσ`).
-/// - `SE = σ/√n` is the uncertainty OF that mean — how well we know it. This is
-///   what a comparison between two means has to use (the guardrail's band).
+/// The two quantities answer different questions and are therefore ALWAYS both
+/// printed, each labelled with a word rather than a Greek letter:
+/// - `spread` is the spread of the samples behind the mean — how variable the
+///   thing being measured is. This is what the ranking charges
+///   (`score = avg − λ·spread`).
+/// - `SE = spread/√n` is the uncertainty OF that mean — how well we know it.
+///   This is what a comparison between two means has to use (the guardrail's
+///   band), and the equation is printed so the reader can check the division.
 ///
 /// `n` rides along because it is what turns one into the other. A bare `±` used
 /// to mean either of the two depending on the line, which is exactly the
 /// confusion this function removes — callers should not hand-roll one.
 ///
 /// A population CENSUS (every net, not a sample) is the one sanctioned shorter
-/// form — [`fmt_census`]: `μ… ±σ…` with no `SE`, since there is no sampling
-/// error to state.
+/// form — [`fmt_census`]: `avg … (spread …)` with no `SE`, since there is no
+/// sampling error to state.
 pub fn fmt_reading(
     mean: Option<f32>,
     sigma: Option<f32>,
@@ -191,29 +218,29 @@ pub fn fmt_reading(
     };
     match sigma {
         Some(s) if n > 0 => format!(
-            "μ{} ±σ{} (SE {}, n={n})",
+            "avg {} (spread {}; SE {} = spread/√{n}, n={n})",
             f(mean),
             f(s),
             f(s / (n as f32).sqrt())
         ),
             // No observable spread yet (one reading) or none recorded: say so rather
-            // than print `±σ0`, which would read as "perfectly steady".
-        _ => format!("μ{} (n={n}, no spread yet)", f(mean)),
+            // than print `spread 0`, which would read as "perfectly steady".
+        _ => format!("avg {} (n={n}, no spread yet)", f(mean)),
     }
 }
 
-/// **The census spelling**: `μ… ±σ…` — a mean over the whole population of
-/// nets, not a sample of readings.
+/// **The census spelling**: `avg … (spread …)` — a mean over the whole
+/// population of nets, not a sample of readings.
 ///
-/// [`fmt_reading`] states `SE = σ/√n` because a sample's mean is itself an
+/// [`fmt_reading`] states `SE = spread/√n` because a sample's mean is itself an
 /// estimate; a census *is* the population, so there is no sampling error to
-/// state and printing one would invent a claim. `σ` is the population's own
-/// spread and names itself the same way it does in `fmt_reading` — that shared
-/// symbol is the whole point: one meaning, `σ` = spread of what is being
+/// state and printing one would invent a claim. `spread` is the population's
+/// own spread and names itself the same way it does in `fmt_reading` — that
+/// shared word is the whole point: one meaning, spread of what is being
 /// averaged, everywhere in the output.
 pub fn fmt_census(mean: f32, sigma: f32, style: ReadingStyle) -> String {
     let f = scalar(style);
-    format!("μ{} ±σ{}", f(mean), f(sigma))
+    format!("avg {} (spread {})", f(mean), f(sigma))
 }
 
 /// RFC4180-quote a CSV field holding a delimiter, quote, or newline — lineage
@@ -230,42 +257,53 @@ pub(crate) fn csv_field(s: &str) -> String {
 mod tests {
     use super::{
         ReadingStyle, csv_field, fmt_cell, fmt_cell_smt, fmt_census, fmt_cfg, fmt_line,
-        fmt_line_opt, fmt_line_smt, fmt_reading,
+        fmt_line_opt, fmt_reading,
     };
 
-    // ── the line rule: 1dp, floored so a real value never reads as zero ─────
+    // ── the band rule: magnitude picks the precision ──────────────────────
 
     #[test]
-    fn line_is_one_decimal_at_normal_magnitudes() {
+    fn band_above_ten_is_one_decimal() {
         assert_eq!(fmt_line(117.55), "117.6");
         assert_eq!(fmt_line(97.1), "97.1");
         assert_eq!(fmt_line(20.5), "20.5");
         assert_eq!(fmt_line(214.6), "214.6");
-        assert_eq!(fmt_line(1.0), "1.0");
+        // f32 is exact here, and `{:.1}` rounds half to even: 42.25 -> 42.2.
+        assert_eq!(fmt_line(-42.25), "-42.2");
         assert_eq!(fmt_line(999_999.0), "999999.0");
+        // The boundary value belongs to the wide band.
+        assert_eq!(fmt_line(10.0), "10.0");
     }
 
     #[test]
-    fn line_floor_keeps_small_values_visible() {
-        // The case the floor exists for: 1dp would print 0.0.
-        assert_eq!(fmt_line(0.02), "0.02");
-        assert_eq!(fmt_line(0.004), "0.004");
-        assert_eq!(fmt_line(-0.02), "-0.02");
-        // 1dp is already enough, so no widening — and no "0.50" padding.
-        assert_eq!(fmt_line(0.5), "0.5");
+    fn band_one_up_to_ten_is_two_decimals() {
+        assert_eq!(fmt_line(1.0), "1.00");
+        assert_eq!(fmt_line(3.25), "3.25");
+        assert_eq!(fmt_line(9.99), "9.99");
+        assert_eq!(fmt_line(-5.5), "-5.50");
     }
 
     #[test]
-    fn line_floor_is_capped_and_true_zero_is_not_widened() {
-        assert_eq!(fmt_line(0.0), "0.0");
-        assert_eq!(fmt_line(-0.0), "-0.0");
-        // Too small to show even at the 4dp cap: prints honestly, not "0.0".
-        assert_eq!(fmt_line(0.000_04), "0.0000");
-        assert_eq!(fmt_line(1e-8), "0.0000");
+    fn band_below_one_is_four_decimals() {
+        // The case the band exists for: a sub-1 reading keeps its precision
+        // (1dp would print this accuracy as `0.6`).
+        assert_eq!(fmt_line(0.6348), "0.6348");
+        assert_eq!(fmt_line(0.02), "0.0200");
+        assert_eq!(fmt_line(-0.02), "-0.0200");
+        assert_eq!(fmt_line(0.5), "0.5000");
     }
 
     #[test]
-    fn line_uses_scientific_notation_only_at_scale() {
+    fn band_floor_is_capped_and_true_zero_is_not_widened() {
+        assert_eq!(fmt_line(0.0), "0.0000");
+        assert_eq!(fmt_line(-0.0), "-0.0000");
+        // Too small to show even at the 6dp cap: prints honestly, not "0.0000".
+        assert_eq!(fmt_line(0.000_04), "0.00004");
+        assert_eq!(fmt_line(1e-8), "0.000000");
+    }
+
+    #[test]
+    fn band_uses_scientific_notation_only_at_scale() {
         assert_eq!(fmt_line(1e9), "1.000e9");
         assert_eq!(fmt_line(1.5e38), "1.500e38");
         assert_eq!(fmt_line(-1.5e38), "-1.500e38");
@@ -277,25 +315,24 @@ mod tests {
     }
 
     #[test]
-    fn line_passes_non_finite_through_without_widening() {
+    fn non_finite_passes_through_without_widening() {
         // "NaN".parse() is Ok(NaN) which is != 0.0, so the widen loop cannot fire.
         assert_eq!(fmt_line(f32::NAN), "NaN");
         assert_eq!(fmt_line(f32::INFINITY), "inf");
         assert_eq!(fmt_line(f32::NEG_INFINITY), "-inf");
     }
 
-    // ── the cell rule: 4dp, same floor at the cell's threshold ──────────────
+    // ── the same rule in a table cell ─────────────────────────────────────
 
     #[test]
-    fn cell_is_four_decimals_at_normal_magnitudes() {
-        assert_eq!(fmt_cell(117.55), "117.5500");
-        assert_eq!(fmt_cell(97.1), "97.1000");
-        assert_eq!(fmt_cell(0.0), "0.0000");
-        assert_eq!(fmt_cell(999_999.0), "999999.0000");
+    fn cell_and_line_agree_by_construction() {
+        for v in [117.55, 97.1, 3.25, 1.0, 0.6348, 0.5, 0.000_04, 1e-8, 0.0, -42.25] {
+            assert_eq!(fmt_cell(v), fmt_line(v), "{v} spelled differently in a cell");
+        }
     }
 
     #[test]
-    fn cell_widens_only_below_its_floor() {
+    fn cell_widens_below_its_floor_like_the_line_rule() {
         assert_eq!(fmt_cell(0.5), "0.5000");
         assert_eq!(fmt_cell(0.000_04), "0.00004");
         assert_eq!(fmt_cell(1e-8), "0.000000");
@@ -316,36 +353,39 @@ mod tests {
         assert_eq!(fmt_cfg(1.0), "1.00");
     }
 
-    // ── tagged + optional forms ────────────────────────────────────────────
+    // ── tagged + optional forms ───────────────────────────────────────────
 
     #[test]
-    fn smt_variants_carry_the_unit_tag() {
-        assert_eq!(fmt_line_smt(117.55), "smt117.6");
-        assert_eq!(fmt_cell_smt(117.55), "smt117.5500");
+    fn score_cell_carries_the_unit_tag() {
+        assert_eq!(fmt_cell_smt(117.55), "score 117.6");
     }
+
 
     #[test]
     fn optional_forms_render_unset_as_dash() {
         assert_eq!(fmt_line_opt(&None), "—");
-        assert_eq!(fmt_line_opt(&Some(0.02)), "0.02");
+        assert_eq!(fmt_line_opt(&Some(0.02)), "0.0200");
     }
 
-    // ── the one reading spelling: both σ and SE, always labelled ────────────
+    // ── the one reading spelling: spread and SE, always labelled ──────────
 
     #[test]
     fn reading_states_spread_and_standard_error_together() {
-        // n = 4 so SE = σ/2 exactly — no rounding ambiguity in the assertion.
+        // n = 4 so SE = spread/2 exactly — no rounding ambiguity in the
+        // assertion. Each number takes its OWN band: spread is 10.0 (1dp)
+        // while SE = 5.0 lands in the 1..10 band (2dp). Rule working, not a slip.
         assert_eq!(
             fmt_reading(Some(100.0), Some(10.0), 4, ReadingStyle::Line),
-            "μ100.0 ±σ10.0 (SE 5.0, n=4)"
+            "avg 100.0 (spread 10.0; SE 5.00 = spread/√4, n=4)"
         );
+        // A cell now spells a reading exactly as a line does.
         assert_eq!(
             fmt_reading(Some(100.0), Some(10.0), 4, ReadingStyle::Cell),
-            "μ100.0000 ±σ10.0000 (SE 5.0000, n=4)"
+            "avg 100.0 (spread 10.0; SE 5.00 = spread/√4, n=4)"
         );
         assert_eq!(
             fmt_reading(Some(100.0), Some(10.0), 4, ReadingStyle::Doc),
-            "μ100.00 ±σ10.00 (SE 5.00, n=4)"
+            "avg 100.00 (spread 10.00; SE 5.00 = spread/√4, n=4)"
         );
     }
 
@@ -353,7 +393,7 @@ mod tests {
     fn reading_does_not_invent_a_spread_for_one_sample() {
         assert_eq!(
             fmt_reading(Some(327.8), None, 1, ReadingStyle::Line),
-            "μ327.8 (n=1, no spread yet)"
+            "avg 327.8 (n=1, no spread yet)"
         );
         assert_eq!(fmt_reading(None, None, 0, ReadingStyle::Line), "—");
     }
@@ -362,11 +402,11 @@ mod tests {
     fn census_omits_se_because_a_population_has_none() {
         assert_eq!(
             fmt_census(100.0, 10.0, ReadingStyle::Line),
-            "μ100.0 ±σ10.0"
+            "avg 100.0 (spread 10.0)"
         );
         assert_eq!(
             fmt_census(100.0, 10.0, ReadingStyle::Doc),
-            "μ100.00 ±σ10.00"
+            "avg 100.00 (spread 10.00)"
         );
     }
 

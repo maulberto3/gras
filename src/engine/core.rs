@@ -69,7 +69,7 @@ use crate::trainer::stream::{BatchStream, PoolSplit};
 
 use super::config::{RaceConfig, StopReason};
 use super::format::{
-    ReadingStyle, build_stamp, csv_field, fmt_cell, fmt_cell_opt, fmt_cfg, fmt_line, fmt_line_smt,
+    ReadingStyle, build_stamp, csv_field, fmt_cell, fmt_cell_opt, fmt_cfg, fmt_line,
     fmt_reading,
 };
 use super::smoothing::{RollingBuffer, WindowStats, rolling_stats};
@@ -255,11 +255,13 @@ impl RlVolume {
         self.train_turns + self.eval_turns
     }
 
-    /// The RL middle column of the rollup: train/eval turn split, mean turns/match and
-    /// per-turn wall cost — `took` alone cannot answer "did the engine get slower?".
+    /// The RL middle column of the rollup: the episode count, the turn identity
+    /// `turns = train + eval`, the mean turns per episode, and the per-turn wall
+    /// cost — `took` alone cannot answer "did the engine get slower?".
     pub(crate) fn label(&self, step_secs: f32) -> String {
         if self.nets == 0 || self.matches == 0 {
-            return "matches — │ train — │ eval — │ turns/match — │ ms/turn —".to_string();
+            return "episodes — │ turns — = train — + eval — │ turns/episode — │ ms/turn —"
+                .to_string();
         }
         let turns = self.turns();
         let per_turn = if turns == 0 {
@@ -268,11 +270,12 @@ impl RlVolume {
             fmt_line(step_secs * 1000.0 / turns as f32)
         };
         format!(
-            "matches {} │ train {} │ eval {} │ turns/match {:.0} │ ms/turn {}",
+            "episodes {} │ turns {} = train {} + eval {} │ turns/episode {} │ {} ms/turn",
             self.matches,
+            turns,
             self.train_turns,
             self.eval_turns,
-            turns as f32 / self.matches as f32,
+            fmt_line(turns as f32 / self.matches as f32),
             per_turn
         )
     }
@@ -780,16 +783,17 @@ impl CoreEngine {
             )).into());
         }
         // The training lottery decides WHICH clocks were act-only, and those clocks are
-        // persisted per net (`frozen_spans`) for replay. A resume at a different setting
-        // would disagree with that ledger, so it is refused like K and λ.
-        if self.config.evolution_train_lottery != self.header.config.evolution_train_lottery {
+        // persisted per net (`idle_spans`) for replay. A resume at a different Ω would
+        // disagree with that ledger, so it is refused like K and λ — by the value, not
+        // merely by "on/off": Ω = 0.5 idles a different set from Ω = 1.
+        if (self.config.train_merit - self.header.config.train_merit).abs() > 1e-6 {
             return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume: evolution_train_lottery mismatch — run recorded {} but the resume \
-                 config sets {} — which nets received a weight update would change; call \
-                 set_run_train_merit({}) (or omit it) to resume",
-                self.header.config.evolution_train_lottery,
-                self.config.evolution_train_lottery,
-                self.header.config.evolution_train_lottery
+                "resume: train_merit (Ω) mismatch — run recorded Ω={} but the resume \
+                 config sets Ω={} — which nets received a train-eval ticket would change; \
+                 call set_run_train_merit({}) (or omit it) to resume",
+                fmt_cfg(self.header.config.train_merit),
+                fmt_cfg(self.config.train_merit),
+                fmt_cfg(self.header.config.train_merit)
             ))
             .into());
         }
@@ -1116,8 +1120,8 @@ impl CoreEngine {
                     self.config.freeze_elites.to_string(),
                 ),
                 (
-                    "evolution_train_lottery".to_string(),
-                    self.config.evolution_train_lottery.to_string(),
+                    "train_merit (Ω)".to_string(),
+                    fmt_cfg(self.config.train_merit),
                 ),
                 (
                     "guardrail_matches".to_string(),
@@ -1171,15 +1175,56 @@ impl CoreEngine {
             ] {
                 manifest.push((k.to_string(), v));
             }
-            let legend = format!(
-                "fitness = mean over the `matches` played that clock │ μ = rolling mean of the last K={} fitnesses │ σ = spread of those readings (what the rank charges) │ SE = σ/√n = uncertainty of μ (what a comparison uses; n = readings behind it) │ smt = risk-adjusted score used to rank (μ ∓ λσ, λ={}; λ=0 ⇒ smt = μ) │ ★ = elite rank + seat tenure │ trained n/m = optimizer updates over clocks lived",
-                self.config.smoothing_window, fmt_cfg(self.config.risk_aversion),
-            );
             crate::utils::cfy::emit(&crate::utils::cfy::card(
                 "Run manifest",
                 &crate::utils::cfy::kv(&manifest),
-                Some(&legend),
+                None,
             ));
+            // The legend: every word and symbol the step lines use, defined ONCE
+            // next to the arithmetic it names. Later lines can stay short because
+            // the reader met the identities here.
+            let sign = match self.fitness.direction() {
+                crate::utils::fitness::Direction::Maximize => "−",
+                crate::utils::fitness::Direction::Minimize => "+",
+            };
+            let legend = crate::utils::cfy::kv(&[
+                (
+                    "numbers".to_string(),
+                    "|v| ≥ 10 → 1 decimal · 1 ≤ |v| < 10 → 2 · |v| < 1 → 4".to_string(),
+                ),
+                (
+                    "reading".to_string(),
+                    format!(
+                        "avg = mean of the last K={} readings · spread = how variable those readings are · SE = spread/√n = how well the mean is known · n = readings behind it",
+                        self.config.smoothing_window
+                    ),
+                ),
+                (
+                    "score".to_string(),
+                    format!(
+                        "score{} = window avg {} λ × window spread (what the ranking sorts on) · λ={}",
+                        self.fitness.direction().arrow(),
+                        sign,
+                        fmt_cfg(self.config.risk_aversion)
+                    ),
+                ),
+                (
+                    "counts".to_string(),
+                    "ran = ticketed + crown · ticketed = won + exempt · graded = won + idled · live = ran + held back · expected = graded × avg ticket chance, drawn = won · ★ = elite rank + seat term"
+                        .to_string(),
+                ),
+                (
+                    "seats".to_string(),
+                    "seat = an elite reserve · wait = clocks to serve before sitting · term = clocks a seat may be held; a completed term is a scheduled rotation, not a loss"
+                        .to_string(),
+                ),
+                (
+                    "words".to_string(),
+                    "idled = the lottery withheld this clock's train+eval · exempt = crown or born shield, always runs · ticket = one clock of train+eval · trained n of m = optimizer updates over clocks lived"
+                        .to_string(),
+                ),
+            ]);
+            crate::utils::cfy::emit(&crate::utils::cfy::card("Legend", &legend, None));
 
             let search = crate::utils::cfy::kv(&[
                 ("crossover_ops".to_string(), ops),
@@ -1276,7 +1321,7 @@ impl CoreEngine {
                 if !evolve_allowed {
                     self.accounting.deferred_clocks += 1;
                     info!(
-                        "step {} │ evolution deferred: no cull-eligible net — every non-elite net is inside its cull shield window or elite ({} crossover + {} mutation roll(s) forgone; nothing culled/inserted)",
+                        "step {} │ evolution deferred: no cull-eligible net — every non-elite net is inside its cull shield window or elite ({} crossover + {} immigrant roll(s) forgone; nothing culled/inserted)",
                         clock,
                         cross_total,
                         mutate_total,
@@ -1303,13 +1348,18 @@ impl CoreEngine {
                 self.accounting.crossover_rolls += cross_total;
                 self.accounting.mutation_rolls += mutate_total;
                 // 3a. crossover rolls: recombined children.
+                // Non-firing rolls are the NORMAL case (p < 1). Collected here and
+                // reported as ONE summary line per clock, so a reader does not mistake
+                // `1/5, 3/5, 5/5` for lost output.
+                let mut cross_missed: Vec<usize> = Vec::new();
+                let mut mutate_missed: Vec<usize> = Vec::new();
                 for roll in 0..cross_total {
                     if !evolve_allowed {
                         break; // nobody to cull: the whole batch is forgone
                     }
                     if self.state.live_count() < 2 {
                         info!(
-                            "step {} │ crossover {}/{} skipped (pop < 2)",
+                            "step {} │ crossover slot {} of {} skipped (pop < 2)",
                             clock,
                             roll + 1,
                             cross_total,
@@ -1321,8 +1371,9 @@ impl CoreEngine {
                     } else {
                         // debug: a roll that did not fire is the NORMAL case (p < 1), so it is per-roll
                         // detail, not a per-clock event; `--log-level debug` shows them all.
+                        cross_missed.push(roll + 1);
                         debug!(
-                            "step {} │ crossover {}/{} did not fire (p={})",
+                            "step {} │ crossover slot {} of {} did not fire (p={})",
                             clock,
                             roll + 1,
                             cross_total,
@@ -1360,17 +1411,21 @@ impl CoreEngine {
                     // A roll that BUILT a child is a real event (info); one that paid its attempts
                     // and produced nothing is per-roll detail, already carrying its counters.
                     if outcome.survived {
+                        let draws = if attempt == 1 {
+                            "1 parent draw".to_string()
+                        } else {
+                            format!("{attempt} parent draws")
+                        };
                         info!(
-                            "step {} │ crossover {}/{} ({} attempt(s)): {}",
+                            "step {} │ crossover slot {} of {} → {} ({draws})",
                             clock,
                             roll + 1,
                             cross_total,
-                            attempt,
                             outcome.detail,
                         );
                     } else {
                         debug!(
-                            "step {} │ crossover {}/{}: {}",
+                            "step {} │ crossover slot {} of {}: {}",
                             clock,
                             roll + 1,
                             cross_total,
@@ -1385,7 +1440,7 @@ impl CoreEngine {
                     }
                     if self.state.live_count() == 0 {
                         info!(
-                            "step {} │ mutation {}/{} skipped (pop empty)",
+                            "step {} │ immigrant slot {} of {} skipped (pop empty)",
                             clock,
                             roll + 1,
                             mutate_total,
@@ -1394,8 +1449,9 @@ impl CoreEngine {
                     }
                     if !self.roll_fires(RollKind::Mutation, clock, roll) {
                         // Same as the crossover no-fire line: per-roll detail.
+                        mutate_missed.push(roll + 1);
                         debug!(
-                            "step {} │ mutation {}/{} did not fire (p={})",
+                            "step {} │ immigrant slot {} of {} did not fire (p={})",
                             clock,
                             roll + 1,
                             mutate_total,
@@ -1407,7 +1463,7 @@ impl CoreEngine {
                         Some(detail) => {
                             mutate_fired += 1;
                             info!(
-                                "step {} │ mutation {}/{}: {}",
+                                "step {} │ immigrant slot {} of {} → {}",
                                 clock,
                                 roll + 1,
                                 mutate_total,
@@ -1421,7 +1477,7 @@ impl CoreEngine {
                             // Same shape as the crossover shield's line — one
                             // fact, one spelling (`{group} n/N: detail`).
                             debug!(
-                                "step {} │ mutation {}/{}: {}",
+                                "step {} │ immigrant slot {} of {}: {}",
                                 clock,
                                 roll + 1,
                                 mutate_total,
@@ -1429,6 +1485,35 @@ impl CoreEngine {
                             )
                         }
                     }
+                }
+                // The rolls that did NOT fire, named in one line: their absence is
+                // the probability working, not dropped output.
+                if self.verbose_detail() && (!cross_missed.is_empty() || !mutate_missed.is_empty()) {
+                    let list = |v: &[usize]| {
+                        v.iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    let mut bits = Vec::new();
+                    let plural = |v: &[usize]| if v.len() == 1 { "" } else { "s" };
+                    if !cross_missed.is_empty() {
+                        bits.push(format!(
+                            "crossover slot{} {} did not fire (p={})",
+                            plural(&cross_missed),
+                            list(&cross_missed),
+                            fmt_cfg(self.config.crossover_prob)
+                        ));
+                    }
+                    if !mutate_missed.is_empty() {
+                        bits.push(format!(
+                            "immigrant slot{} {} did not fire (p={})",
+                            plural(&mutate_missed),
+                            list(&mutate_missed),
+                            fmt_cfg(self.config.mutate_prob)
+                        ));
+                    }
+                    info!("step {} │ {}", clock, bits.join(" │ "));
                 }
                 // The run's accounting rides the same counters the step
                 // summary uses — one place to update, no second bookkeeping.
@@ -1504,11 +1589,12 @@ impl CoreEngine {
             // O(n) sums only run when a line will actually be printed.
             let rollup_on =
                 self.log_level == crate::engine::config::LogLevel::Summ && self.config.freeze_elites;
-                // The lottery's own tally for this clock: a per-net snapshot of the skip
-                // counters, so after the loop the rollup can say how many updates it
-                // withheld AND WHICH nets they were (the delta, not the cumulative total).
+                // The lottery's own tally for this clock: a per-net snapshot of the IDLE
+                // counters (clocks it has left the net untrained and unmeasured), so
+                // after the loop the rollup can say how many tickets it denied AND WHICH
+                // nets got none (the delta, not the cumulative total).
                 // Gated on the LOTTERY's own line, not the rollup's: `freeze_elites` off
-                // silences the crown rollup, never the training-budget report.
+                // silences the crown rollup, never the train-budget report.
             let lottery_line_on = self.lottery_line_on(lottery.is_some());
                 // The lottery's per-net card, printed BEFORE anyone steps: every number in
                 // it is an input to this clock's coin — the same `frame` handed to
@@ -1517,13 +1603,18 @@ impl CoreEngine {
                 // What the clock actually skipped is the who-line, after the loop.
             if lottery_line_on {
                 if let Some(frame) = lottery {
-                    self.log_lottery_card(clock, frame);
+                    // The per-net card is the DEBUG view: at Summ a population of 88 would
+                    // redraw 88 rows every clock. Debug/trace still gets it in full; Summ
+                    // gets the one aggregate line after the loop.
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        self.log_lottery_card(clock, frame);
+                    }
                 }
             }
-            let skips_before: Vec<usize> = if lottery_line_on {
+            let idle_before: Vec<usize> = if lottery_line_on {
                 hashes
                     .iter()
-                    .map(|h| self.state.net(h).map(|s| s.budget_skips).unwrap_or(0))
+                    .map(|h| self.state.net(h).map(|s| s.idle_clocks()).unwrap_or(0))
                     .collect()
             } else {
                 Vec::new()
@@ -1571,10 +1662,10 @@ impl CoreEngine {
 
             // One line per GROUP step, printed LAST so it lands at the bottom of the
             // terminal; what each field means is documented once on `step_rollup_line`.
-                // Per-net skip deltas: ONE read, consumed by BOTH the rollup (as a count)
+                // Per-net idle deltas: ONE read, consumed by BOTH the rollup (as a count)
                 // and the who-line (as hashes). Independent of the rollup's gate, so a
-                // crown-less run still reports who the budget withheld.
-            let (trained, withheld) = self.lottery_clock_report(&hashes, &skips_before);
+                // crown-less run still reports who the budget denied.
+            let (trained, withheld) = self.lottery_clock_report(&hashes, &idle_before);
             let lottery_skips = withheld.len();
 
             if rollup_on {
@@ -1582,17 +1673,26 @@ impl CoreEngine {
                 info!("step {} │ {}", clock, step_rollup_line(&vitals));
             }
                 // The who-line rides the LOTTERY's gate, not the rollup's: a run with the
-                // elite crown off (`freeze_elites = false`) still reports which nets the
-                // budget withheld. Printed only when something actually was.
-            if lottery_line_on && lottery_skips > 0 {
-                let (mut trained, mut withheld) = (trained, withheld);
-                withheld.sort();
-                trained.sort();
-                info!(
-                    "step {} │ lottery │ {}",
-                    clock,
-                    lottery_who_line(&trained, &withheld)
-                );
+                // elite crown off (`freeze_elites = false`) still reports which nets got no
+                // ticket. Printed only when something actually did not.
+            if lottery_line_on {
+                if let Some(frame) = lottery {
+                    // The Summ view is the aggregate: `p̄` vs the realized `won`, the
+                    // field, and the budget means. One line, whatever the population size.
+                    self.log_lottery_summary(clock, frame, trained.len(), withheld.len());
+                    // WHO got the tickets is DEBUG: a Summ terminal cannot carry a
+                    // wrapped hash list per clock.
+                    if lottery_skips > 0 {
+                        let (mut trained, mut withheld) = (trained, withheld);
+                        trained.sort();
+                        withheld.sort();
+                        tracing::debug!(
+                            "step {} │ lottery │ {}",
+                            clock,
+                            lottery_who_line(&trained, &withheld)
+                        );
+                    }
+                }
             }
 
             // ── 2. durability tick (every `checkpoint_every` steps) ─────────
@@ -1617,8 +1717,15 @@ impl CoreEngine {
                     tracing::warn!("checkpoint CSV flush failed: {e}");
                 }
                 if self.verbose_detail() {
+                    // Name the files, not the internals: "frontier" and "flushed"
+                    // are engine vocabulary a reader cannot map to a path.
+                    let elite = if self.config.elite_checkpoint_weights {
+                        " + elite weights (checkpoint-elite-*.safetensors)"
+                    } else {
+                        ""
+                    };
                     info!(
-                        "step {} │ checkpoint │ frontier + elite weights snapshotted, CSVs flushed",
+                        "step {} │ checkpoint │ saved: live net states (nets/*.json){elite} + CSV buffers written",
                         clock
                     );
                 }
@@ -1820,9 +1927,6 @@ impl CoreEngine {
             // against this net's LATEST reading, which the window mean lags. Both read
             // the same `race`, so a row can never pair one net's window with another's
             // numbers.
-            let window_cell = race
-                .map(|r| format!("{}..{}", fmt_cell(r.min), fmt_cell(r.max)))
-                .unwrap_or_else(|| "—".to_string());
             let latest_tag = crate::engine::guardrail::latest_agreement_grade(
                 race.map(|r| r.latest),
                 race.map(|r| r.std),
@@ -1831,10 +1935,6 @@ impl CoreEngine {
                 v.scores.len(),
                 direction,
             );
-            let latest_cell = match latest_tag {
-                Some(tag) => format!("{} ({})", fmt_cell_opt(&v.race_latest), tag.tag()),
-                None => fmt_cell_opt(&v.race_latest),
-            };
             // ONE grading for the table and the sentence (`agreement_grade`), so a row
             // can never contradict its own verdict text.
             let grade = crate::engine::guardrail::agreement_grade(
@@ -1858,20 +1958,17 @@ impl CoreEngine {
             if v.hash == verdict.hash {
                 champion_line = line.clone();
             }
+                // GUARDRAIL DATA ONLY. The race side (`race μ`, its n, its SE, the
+                // window, the latest reading) is ALREADY in the `Final elites` table
+                // above, in the same rank order and under the same hash — repeating it
+                // here made this table a wide restatement of that one. Every row below
+                // is a number the exam itself produced (plus its verdict tag); the
+                // elite table's `reading` cell is this row's race reference.
             rows.push(vec![
                 (rank0 + 1).to_string(),
                 v.hash[..8.min(v.hash.len())].to_string(),
-                fmt_cell_opt(&v.race_smoothed),
-                // The race side's sample size: how many step readings the window
-                // mean averages (`0` = no window recorded).
-                match v.race_samples {
-                    0 => "—".to_string(),
-                    n => n.to_string(),
-                },
-                fmt_cell_opt(&v.race_se),
-                window_cell,
-                latest_cell,
                 fmt_cell_opt(&v.mean()),
+                fmt_cell_opt(&v.std()),
                 fmt_cell_opt(&v.se()),
                 // `scored/played`: `score_net` skips a game whose scorer errors, so
                 // a degraded exam must be visible next to the full one.
@@ -1914,14 +2011,11 @@ impl CoreEngine {
             "{}\n{}",
             crate::utils::cfy::kv(&[(
                 "columns".to_string(),
-                "race n = step readings behind the race μ · window = their min..max · games = holdout games scored/played"
+                "exam avg = mean unseen-game score · spread = per-game spread · exam SE = spread/√games · games = scored/played · status = graded against this net's race reading (the `Final elites` table above, same ranks and hashes)"
                     .to_string(),
             )]),
             crate::utils::cfy::table(
-                &[
-                    "#", "net", "race μ", "race n", "race SE", "window", "latest (vs exam)",
-                    "exam μ", "exam SE", "games", "status",
-                ],
+                &["#", "hash", "exam avg", "exam spread", "exam SE", "games", "status"],
                 &rows,
             ),
         );
@@ -2104,14 +2198,17 @@ impl CoreEngine {
         let mut exit_reason: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for h in &leaving {
-            if let Some(s) = self.state.net(h) {
+            if let Some(s) = self.state.net(h) {                let short = &h[..8.min(h.len())];
                 let reason = if lifetime > 0 && s.elite_seat_age >= lifetime {
+                    // A rotation, not a defeat: the seat term simply ran out.
                     format!(
-                        "seat lifetime reached at peak ({}/{})",
+                        "seat term complete → {short} turned over after {} of {} clocks",
                         s.elite_seat_age, lifetime
                     )
                 } else {
-                    "outranked among the eligible nets".to_string()
+                    format!(
+                        "seat term complete → {short} turned over, outranked among the eligible nets"
+                    )
                 };
                 exit_reason.insert(h.clone(), reason);
             }
@@ -2154,14 +2251,20 @@ impl CoreEngine {
             // training count but was the age of the WEIGHTS (children inherit it).
             let trainings = self.state.net(h).map(|s| s.step).unwrap_or(0);
             let age_now = age.unwrap_or(0);
-            let gate = match self.state.net(h) {
-                Some(s) => crate::engine::reporting::elite_gate_note(
-                    s.elite_probation_age,
-                    s.elite_seat_age,
-                    self.config.elite_join_probation_steps,
-                    self.config.elite_crown_lifetime_steps,
-                ),
-                None => String::new(),
+            // The two counters that both look like `n/5` get their own names: the
+            // join window (`wait`) and the seat lifetime (`this seat held`).
+            let (join_age, seat_age) = self
+                .state
+                .net(h)
+                .map(|s| (s.elite_probation_age, s.elite_seat_age))
+                .unwrap_or((0, 0));
+            let join_k = self.config.elite_join_probation_steps;
+            let lifetime = self.config.elite_crown_lifetime_steps;
+            let wait = format!("wait served {} of {join_k}", join_age.min(join_k));
+            let held = if lifetime == 0 {
+                format!("this seat held {seat_age} clocks (lifetime off)")
+            } else {
+                format!("this seat held {seat_age} of {lifetime} clocks")
             };
                 // The reading behind the rank: `smt` on the line is the risk-adjusted
                 // score (FIT); this is `μ ±σ (SE, n)` — the level it was charged from, the
@@ -2178,23 +2281,35 @@ impl CoreEngine {
                     )
                 },
             );
-            let details = format!(
-                "{reading_txt} · age {age_now} · {} · {} params{gate}",
-                crate::engine::reporting::trained_note(trainings, age_now),
-                params.map(|p| p.to_string()).unwrap_or_else(|| "—".into()),
-            );
-            // One line: the verdict, then the bookkeeping joined by ` · `. A seat event is
-            // never split across two log lines (the old form wrapped it onto an indent).
-            let tail = crate::engine::reporting::detail_inline(&details);
+            let params_txt = params
+                .map(|p| format!("{p} parameters"))
+                .unwrap_or_else(|| "parameters —".to_string());
+            // The score, with the arithmetic that produced it: `score = avg ∓ λ·spread`.
+            let score_cell = match (fit, reading) {
+                (Some(s), Some(r)) => format!(
+                    "score {} = {} {} λ·{}",
+                    fmt_line(s),
+                    fmt_line(r.mean),
+                    match self.fitness.direction() {
+                        crate::utils::fitness::Direction::Maximize => "−",
+                        crate::utils::fitness::Direction::Minimize => "+",
+                    },
+                    fmt_line(r.std)
+                ),
+                (Some(s), None) => format!("score {}", fmt_line(s)),
+                _ => "score —".to_string(),
+            };
             info!(
-                "step {} │ freeze │ elite seat {}/{seat}: {} seated{} — fitness{} {}{}",
+                "step {} │ seat {} of {seat} → {}{} │ {} │ reading {} │ age {} clocks │ {} │ {} │ {wait} │ {held}",
                 clock,
                 idx + 1,
                 &h[..8.min(h.len())],
                 rank_note,
-                self.fitness.direction().arrow(),
-                fit.map(fmt_line_smt).unwrap_or_else(|| "—".into()),
-                tail,
+                score_cell,
+                reading_txt,
+                age_now,
+                crate::engine::reporting::trained_note(trainings, age_now),
+                params_txt,
             );
         }
         for h in &leaving {
@@ -2213,18 +2328,20 @@ impl CoreEngine {
                 } else {
                     self.smoothed_fitness_of(&taker)
                 };
+                // The scores themselves; the line's `score = …` cell already names
+                // the quantity, so repeating the tag here would read twice.
                 let gap_txt = match (fit, taker_fit) {
                     (Some(a), Some(b)) => format!(
-                        " (fitness {} {} → {} {})",
+                        " ({}{} → {}{})",
                         self.fitness.direction().arrow(),
-                        fmt_line_smt(a),
+                        fmt_line(a),
                         self.fitness.direction().arrow(),
-                        fmt_line_smt(b)
+                        fmt_line(b)
                     ),
                     (Some(a), None) => format!(
-                        " (fitness{} {})",
+                        " ({}{})",
                         self.fitness.direction().arrow(),
-                        fmt_line_smt(a)
+                        fmt_line(a)
                     ),
                     _ => String::new(),
                 };
@@ -2262,19 +2379,15 @@ impl CoreEngine {
             // The ex-elite just re-entered the JOIN WINDOW: it trains like any
             // non-elite until it has re-served the k-clock window.
             info!(
-                "step {} │ freeze │ {} dethroned: {}{}{} — resumes with updates (optimizer state intact){}",
+                "step {} │ {}{}{} │ {} │ seat wait restarts at 0 of {} │ weights and optimizer kept, next step resumes │ crown {}/{}",
                 clock,
-                &h[..8.min(h.len())],
                 reason,
                 rank_note,
                 detail,
-                crate::engine::reporting::detail_inline(&format!(
-                    "{} · join window restarts at 0 (serves {} to sit again) · crown {}/{}",
-                    crate::engine::reporting::trained_note(trainings, age),
-                    self.config.elite_join_probation_steps,
-                    self.frozen_crown.len(),
-                    capacity,
-                )),
+                crate::engine::reporting::trained_note(trainings, age),
+                self.config.elite_join_probation_steps,
+                self.frozen_crown.len(),
+                capacity,
             );
         }
         // 5b. Why the elite RANKING and the crown disagree, said on the clocks that
@@ -2367,25 +2480,28 @@ impl CoreEngine {
         armed && self.log_level == crate::engine::config::LogLevel::Summ
     }
 
-        /// Split one clock's nets into `(trained, withheld)` from the skip-counter
-        /// snapshot taken BEFORE the clock stepped: a net whose `budget_skips` grew is
-        /// withheld, everyone else in the group trained. Crown members land in NEITHER
-        /// list — they sat out for the elite freeze, which the rollup names separately.
+        /// Split one clock's nets into `(trained, idled)` from the IDLE-ledger snapshot
+        /// taken BEFORE the clock ran: a net whose `idle_clocks` grew got no ticket,
+        /// everyone else in the group ran the trainer. Crown members land in NEITHER
+        /// list — they acted for the elite freeze, which the rollup names separately.
+        ///
+        /// Reads the ledger, not a counter: `idle_spans` is what replay obeys, so the
+        /// report and the resume plan cannot disagree about which clocks were idle.
         ///
         /// Returns two empty vectors when there was no snapshot (lottery off, or the
         /// line off), so the caller's `lottery_skips` is 0 and nothing is reported.
     pub(crate) fn lottery_clock_report(
         &self,
         group: &[String],
-        skips_before: &[usize],
+        idle_before: &[usize],
     ) -> (Vec<String>, Vec<String>) {
         let mut trained: Vec<String> = Vec::new();
         let mut withheld: Vec<String> = Vec::new();
         for (i, h) in group.iter().enumerate() {
-            let Some(&before) = skips_before.get(i) else {
+            let Some(&before) = idle_before.get(i) else {
                 continue;
             };
-            let now = self.state.net(h).map(|s| s.budget_skips).unwrap_or(0);
+            let now = self.state.net(h).map(|s| s.idle_clocks()).unwrap_or(0);
             if now > before {
                 withheld.push(h[..8.min(h.len())].to_string());
             } else if !self.frozen_crown.contains(h) {
@@ -2397,8 +2513,9 @@ impl CoreEngine {
 
     /// Every count the per-step rollup needs, from ONE walk of the live population
     /// plus the seats the crown knows: `newborn = live − group.len()` (a net born this
-    /// clock sits the clock out entirely), `would_train = group − crown` and
-    /// `stepped = would_train − lottery skips`.
+    /// clock sits the clock out entirely), `would_train = group − crown`,
+    /// `stepped = group − lottery skips` (idle nets did nothing) and
+    /// `trained = would_train − lottery skips`.
     pub(crate) fn step_vitals(
         &self,
         clock: usize,
@@ -2413,7 +2530,9 @@ impl CoreEngine {
         let would_train = group.len().saturating_sub(frozen);
         let (eligible, probation, age_blocked) = self.elite_gate_counts(clock);
         StepVitals {
-            stepped: group.len(),
+            // An idle net did not step at all (no train, no eval): `stepped` counts the
+            // updaters plus the crown's act-and-measure passes only.
+            stepped: group.len().saturating_sub(lottery_skips),
             trained: would_train.saturating_sub(lottery_skips),
             live,
             frozen,
@@ -2488,8 +2607,10 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Append a step's metrics for all live nets to the history buffer.
-    /// `history.csv` carries ONLY these rows — evolution events live in `attempts.csv`.
+        /// Append a step's metrics for the live nets that were trained and scored this
+        /// clock to the history buffer (idle nets contribute no row: nothing happened to
+        /// them). `history.csv` carries ONLY these rows — evolution events live in
+        /// `attempts.csv`.
     pub(crate) fn append_metrics_csv(&mut self, step: usize) -> Result<()> {
         if !self.config.csv_export {
             return Ok(());
@@ -2497,6 +2618,13 @@ impl CoreEngine {
         for hash in &self.state.live_hashes() {
             if let Some(net_state) = self.state.net(hash) {
                 if let Some(m) = &net_state.last_metrics {
+                        // Only a clock that was TRAINED AND SCORED owns a row. An idle
+                        // lottery clock (or a newborn's birth clock) has no metrics for
+                        // THIS step, and repeating the last measurement under a new step
+                        // label would fabricate one — so the row is simply absent.
+                    if m.step != step {
+                        continue;
+                    }
                     let origin = net_state.created_from.clone().unwrap_or_default();
                     let mut row = format!(
                         "{},{},{},{},{},{},{},{}",
@@ -2665,8 +2793,8 @@ const CROSSOVER_ATTEMPTS: usize = 5;
 /// function of this clock's counts — named fields, so the wording is testable.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StepVitals {
-    /// Nets that STEPPED this clock — acted and were measured (`group.len()`); the
-    /// crown and the lottery's skips are inside this number, not outside it.
+    /// Nets that RAN the trainer this clock: an update, or the crown's act-and-measure
+    /// pass. Nets the lottery denied a ticket are NOT in here — they idled.
     pub stepped: usize,
     /// Nets that got a REAL weight update (`would_train - lottery_skips`).
     pub trained: usize,
@@ -2696,10 +2824,10 @@ pub(crate) struct StepVitals {
     pub lifetime_j: usize,
 }
 
-/// WHO the training lottery graded this clock, in one compact line: both counts are
+/// WHO the ticket lottery graded this clock, in one compact line: both counts are
 /// always stated, and the SMALLER side is listed in full (capped at
 /// [`LOTTERY_LIST_MAX`]) so the other side is the explicit complement — a clock where
-/// 4 of 28 updated names the 4; a clock where 24 of 28 were withheld names the 24.
+/// 4 of 28 trained names the 4; a clock where 24 of 28 idled names the 24.
 fn lottery_who_line(trained: &[String], withheld: &[String]) -> String {
     /// Hashes listed before the `+N` tail.
     const LOTTERY_LIST_MAX: usize = 12;
@@ -2717,14 +2845,14 @@ fn lottery_who_line(trained: &[String], withheld: &[String]) -> String {
     };
     if withheld.len() <= trained.len() {
         format!(
-            "{} trained · {} withheld: {}",
+            "{} trained · {} idled: {}",
             trained.len(),
             withheld.len(),
             list(withheld)
         )
     } else {
         format!(
-            "{} trained: {} · {} withheld",
+            "{} trained: {} · {} idled",
             trained.len(),
             list(trained),
             withheld.len()
@@ -2732,56 +2860,72 @@ fn lottery_who_line(trained: &[String], withheld: &[String]) -> String {
     }
 }
 
-/// The per-step rollup in words: `stepped A/B`, `X frozen` and `Y newborn`,
-/// then `crown H/C seats` with its gate tally. Invariant: `stepped + sat out = live`.
+/// The per-step participation line, every composite printed with the arithmetic
+/// that produced it: `ran A of L = T ticketed + C crown`, `held back H = …`,
+/// `L = A + H`, the seat gate as a partition of the live count, and the lottery's
+/// `would-train` budget.
+///
+/// Invariant: `stepped + held = live`. The crown is INSIDE `ran` (it ran the
+/// trainer) and never in the held-back list, so the two counts cannot overshoot
+/// `live`.
 fn step_rollup_line(v: &StepVitals) -> String {
-        // The lottery case names the subset explicitly: how many DID update, how many
-        // would have without it, and how many it withheld.
-    let head = if v.lottery_skips > 0 {
+    let mut parts = Vec::new();
+    // `ticketed` and `updating` are the same number: the nets that got a real
+    // weight update. The word changes with the lottery, the count does not.
+    let update_word = if v.lottery_skips > 0 {
+        "ticketed"
+    } else {
+        "updating"
+    };
+    let head = if v.frozen > 0 {
         format!(
-            "stepped {}/{} live nets ({} weights updated of {} that would have — {} withheld by the train lottery)",
-            v.stepped, v.live, v.trained, v.would_train, v.lottery_skips
+            "ran {} of {} = {} {} + {} crown",
+            v.stepped, v.live, v.trained, update_word, v.frozen
         )
     } else {
         format!(
-            "stepped {}/{} live nets (weights updated)",
-            v.stepped, v.live
+            "ran {} of {} = {} {}",
+            v.stepped, v.live, v.trained, update_word
         )
     };
-    let mut parts = vec![head];
-    // `sat out` names every live net that got NO weight update this step,
-    // split by cause so the two populations stay distinguishable.
-    let mut sat_out = Vec::new();
-    if v.frozen > 0 {
-        sat_out.push(format!(
-            "{} elite frozen (act+measure, no update)",
-            v.frozen
-        ));
+    parts.push(head);
+    // Nets that did not RUN at all: the lottery's idle clocks and the newborns
+    // sitting their birth clock out. The crown is absent by construction (it acted).
+    let mut not_run = Vec::new();
+    if v.lottery_skips > 0 {
+        not_run.push(format!("{} idled (no train, no eval)", v.lottery_skips));
     }
     if v.newborn > 0 {
-        sat_out.push(format!(
-            "{} newborn (born this clock, first step next clock)",
+        not_run.push(format!(
+            "{} newborn (first step next clock)",
             v.newborn
         ));
     }
-    if !sat_out.is_empty() {
+    let held = v.lottery_skips + v.newborn;
+    if !not_run.is_empty() {
+        parts.push(format!("held back {} = {}", held, not_run.join(" + ")));
+    }
+    parts.push(format!("{} = {} + {}", v.live, v.stepped, held));
+    parts.push(format!("seats {} of {}", v.seats_held, v.seats_capacity));
+    // The seat gates partition the live count: eligible + join window/cull shield
+    // + age-blocked = live. Printing the subtraction lets a reader check it.
+    let lifetime = if v.lifetime_j == 0 {
+        "age block off".to_string()
+    } else {
+        format!("{}-clock lifetime", v.lifetime_j)
+    };
+    parts.push(format!(
+        "seat gates, over all {} nets: {} may sit = {} − {} in a join window or cull shield ({} clocks) − {} age-blocked ({})",
+        v.live, v.eligible, v.live, v.probation, v.join_k, v.age_blocked, lifetime
+    ));
+    if v.lottery_skips > 0 {
+        // The lottery's budget, in its own units: the ticketed plus the idled are
+        // exactly the nets that would have trained without it.
         parts.push(format!(
-            "{} sat out: {}",
-            v.frozen + v.newborn,
-            sat_out.join(" + ")
+            "would-train {} = {} ticketed + {} idled",
+            v.would_train, v.trained, v.lottery_skips
         ));
     }
-    // The gate tally rides the same line as the seat count — a step rollup is never
-    // split across lines, so the split detail follows the count after ` · `.
-    parts.push(format!(
-        "crown {}/{} seats{}",
-        v.seats_held,
-        v.seats_capacity,
-        crate::engine::reporting::detail_inline(&format!(
-            "{} eligible · {} gated (join window or cull shield, k={}) · {} age-blocked (j={})",
-            v.eligible, v.probation, v.join_k, v.age_blocked, v.lifetime_j
-        ))
-    ));
     parts.join(" │ ")
 }
 
@@ -2867,8 +3011,9 @@ mod tests {
 
     use crate::engine::config::DEFAULT_CHECKPOINT_EVERY;
 
-    /// The RL volume label — the RL middle column of the rollup: train/eval turn
-    /// split, mean turns/match, per-turn cost. Nothing reported reads as `—`, not 0.
+    /// The RL volume label — the RL middle column of the rollup: the episode
+    /// count, `turns = train + eval`, turns/episode, per-turn cost. An unmeasured
+    /// cell reads `—`, never a fake 0.
     #[test]
     fn rl_volume_label_formats_and_never_lies() {
         let empty = RlVolume::default();
@@ -2879,10 +3024,11 @@ mod tests {
             train_turns: 432,
             eval_turns: 108,
         };
-        // 540 turns in 1.0s ⇒ 1000/540 = 1.85… ⇒ `1.9` ms/turn.
+        // 540 turns in 1.0s ⇒ 1000/540 = 1.85… ⇒ `1.85` ms/turn (the 1..10 band
+        // prints 2 decimals). 540/3 = 180.0 turns per episode.
         assert_eq!(
             pop.label(1.0),
-            "matches 3 │ train 432 │ eval 108 │ turns/match 180 │ ms/turn 1.9"
+            "episodes 3 │ turns 540 = train 432 + eval 108 │ turns/episode 180.0 │ 1.85 ms/turn"
         );
         // Matches with zero turns is still a real report (every match died on turn 0) —
         // it reads as a mean of 0, with the cost cell `—` rather than an infinity.
@@ -2894,7 +3040,7 @@ mod tests {
         };
         assert_eq!(
             zero_turns.label(1.0),
-            "matches 1 │ train 0 │ eval 0 │ turns/match 0 │ ms/turn —"
+            "episodes 1 │ turns 0 = train 0 + eval 0 │ turns/episode 0.0000 │ — ms/turn"
         );
     }
 
@@ -5009,11 +5155,11 @@ mod tests {
     }
 
         /// The lottery is OFF by default, stays DISARMED until the starting population
-        /// has served its born shield, then grades each net by level-per-CLOCK-LIVED
+        /// has served its born shield, then grades each net by level-per-TICKET
         /// relative to the clock's field. The coin itself is deterministic per (net,
         /// clock), and a net inside its shield always trains no matter how it grades.
     #[test]
-    fn train_lottery_arms_after_the_born_shield_and_grades_level_per_clock() {
+    fn train_lottery_arms_after_the_born_shield_and_grades_level_per_ticket() {
         let dir = std::env::temp_dir().join("gras-train-lottery");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 21).unwrap();
@@ -5026,15 +5172,18 @@ mod tests {
 
         // OFF (the default): no field, everybody trains.
         assert!(eng.lottery_frame(50).is_none());
-        eng.config.evolution_train_lottery = true;
+        eng.config.train_merit = 1.0;
 
-        // Means 100 / 200 / 300 over the SAME age (all three founders): the shared
-        // divisor cannot change the ORDER, only the scale — merits are 100/age …300/age.
+        // Means 100 / 200 / 300 over the SAME budget (each net has spent one ticket):
+        // the shared divisor cannot change the ORDER, only the scale — merits are
+        // 100/1 … 300/1. A reading with no ticket would be ungradable, so the fixture
+        // stamps the clock the reading came from.
         for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
             let h = &hashes[i];
             let mut buf = RollingBuffer::new(eng.config.smoothing_window);
             buf.push(mean);
             *eng.rolling_fitness.get_mut(h).unwrap() = buf;
+            eng.state.net_mut(h).unwrap().step = 1;
         }
 
         // ON: still disarmed while the founders are inside their born shield (same data,
@@ -5047,7 +5196,7 @@ mod tests {
         );
         // …and armed once every founder is out of it.
         let frame = eng.lottery_frame(5).expect("armed at clock 5");
-        // The fixture fitness is Minimize: the LOWEST level-per-clock is the best.
+        // The fixture fitness is Minimize: the LOWEST level-per-ticket is the best.
         let p = |eng: &CoreEngine, h: &str| eng.train_lottery_p(h, 5, Some(frame));
         assert!((p(&eng, &hashes[0]) - 1.0).abs() < 1e-6);
         assert!((p(&eng, &hashes[1]) - 0.5).abs() < 1e-6);
@@ -5062,6 +5211,16 @@ mod tests {
             eng.train_lottery_draws(&hashes[1], 5, Some(frame))
         );
 
+        // The routing contract: a denied ticket IDLES the net — no trainer call, so no
+        // metric row, no update and no reading (p = 0 above is this clock's coin).
+        eng.step_one_net_in_frame(&hashes[2], 5, Some(frame))
+            .expect("idle step");
+        let worst = eng.state.net(&hashes[2]).unwrap();
+        assert_eq!(worst.step, 1, "idle does not advance the training clock");
+        assert!(worst.last_metrics.is_none(), "idle records no metric row");
+        assert_eq!(worst.idle_clocks(), 1, "the clock lands in the idle ledger");
+        assert!(worst.idle_spans.contains(&(5, 5)), "as this clock's span");
+
         // A newborn keeps its own shield: it trains regardless of how it grades.
         eng.state.net_mut(&hashes[2]).unwrap().entered_at_step = 5;
         assert_eq!(eng.train_lottery_p(&hashes[2], 5, Some(frame)), 1.0);
@@ -5069,23 +5228,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-        /// The denominator is CLOCKS LIVED, not updates: two nets with the SAME score
-        /// divide by `clock − entered + 1`, so the older one grades worse. Under the old
-        /// `state.step` divisor the comparison flipped (the net that trained 10 times
-        /// looked 10× cheaper) — this test pins the change.
+        /// Ω is a dial on the WITHHOLDING, not a scale on the merit: `p_eff = 1 − Ω(1 − p)`.
+        /// The endpoints are exact — `0` is fully off (no field is even built, so the
+        /// engine never consults the lottery) and `1` is the full merit tilt — and the
+        /// middle sits linearly between them, which is what makes `0.5` mean "half the
+        /// idling" instead of behaving like `1`. Scaling the merits could not do that:
+        /// `p` is a min-max FRACTION of the field, so a common factor cancels.
     #[test]
-    fn lottery_merit_divides_by_clocks_lived_not_updates() {
-        let dir = std::env::temp_dir().join("gras-lottery-clocks-lived");
+    fn train_merit_omega_blends_the_withholding_linearly() {
+        let dir = std::env::temp_dir().join("gras-train-merit-omega");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 21).unwrap();
-        eng.config.evolution_train_lottery = true;
+        eng.config.mutation_probation_steps = 0;
+        eng.config.crossover_probation_steps = 0;
+        eng.seed_population_internal(
+            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+            Some(0.5),
+        )
+        .unwrap();
+        let hashes = eng.state.live_hashes();
+        for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
+            let h = &hashes[i];
+            let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+            buf.push(mean);
+            *eng.rolling_fitness.get_mut(h).unwrap() = buf;
+            eng.state.net_mut(h).unwrap().step = 1;
+        }
+
+        // OFF: no field at all, so every net trains and no draw is consumed.
+        eng.config.train_merit = 0.0;
+        assert!(eng.lottery_frame(5).is_none(), "Ω = 0 must not build a field");
+        for h in &hashes {
+            assert_eq!(eng.train_lottery_p_eff(h, 5, None), 1.0);
+            assert!(eng.train_lottery_draws(h, 5, None));
+        }
+
+        // Fixture fitness is Minimize with merits 100/200/300 per ticket: raw fractions
+        // are 1, 0.5 and 0 — the best, the middle and the worst.
+        eng.config.train_merit = 1.0;
+        let frame = eng.lottery_frame(5).expect("armed at clock 5");
+        let raw: Vec<f32> = hashes
+            .iter()
+            .map(|h| eng.train_lottery_p(h, 5, Some(frame)))
+            .collect();
+        assert!((raw[0] - 1.0).abs() < 1e-6);
+        assert!((raw[1] - 0.5).abs() < 1e-6);
+        assert!((raw[2] - 0.0).abs() < 1e-6);
+        let eff = |eng: &CoreEngine, i: usize| eng.train_lottery_p_eff(&hashes[i], 5, Some(frame));
+
+        // Ω = 1 is exactly the raw fraction — today's behavior, unchanged.
+        for i in 0..3 {
+            assert!((eff(&eng, i) - raw[i]).abs() < 1e-6);
+        }
+        // Half strength: the middle net withholds half as often (0.75, not 0.5), and the
+        // worst keeps a standing 0.5 chance instead of the permanent p = 0.
+        eng.config.train_merit = 0.5;
+        assert!((eff(&eng, 0) - 1.0).abs() < 1e-6, "the best always trains");
+        assert!((eff(&eng, 1) - 0.75).abs() < 1e-6);
+        assert!((eff(&eng, 2) - 0.5).abs() < 1e-6);
+        // A quarter strength is a quarter of the withholding.
+        eng.config.train_merit = 0.25;
+        assert!((eff(&eng, 1) - 0.875).abs() < 1e-6);
+        assert!((eff(&eng, 2) - 0.75).abs() < 1e-6);
+        // The dial does not make a coin flip at p_eff = 1: the best net consumes none.
+        eng.config.train_merit = 0.5;
+        assert!(eng.train_lottery_draws(&hashes[0], 5, Some(frame)));
+        // Out-of-range strengths are clamped, so a bad flag cannot invert the dial.
+        eng.config.train_merit = 4.0;
+        assert!((eff(&eng, 2) - 0.0).abs() < 1e-6, "Ω clamps to 1");
+        eng.config.train_merit = -1.0;
+        assert!((eff(&eng, 2) - 1.0).abs() < 1e-6, "Ω clamps to 0");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+        /// The denominator is TICKETS, not clocks lived: two nets with the SAME score
+        /// divide by the clocks that actually ran the trainer and scored them, so the
+        /// net that spent 10 tickets grades better than the one that spent 1. This is
+        /// also what keeps an idle clock free — it is not a ticket, so the ratio can
+        /// never decay while the numerator stands still.
+    #[test]
+    fn lottery_merit_divides_by_tickets_not_clocks_lived() {
+        let dir = std::env::temp_dir().join("gras-lottery-tickets");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 21).unwrap();
+        eng.config.train_merit = 1.0;
         // No shields: this test is about the divisor, not the born gate.
         eng.config.mutation_probation_steps = 0;
         eng.config.crossover_probation_steps = 0;
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
         let hashes = eng.state.live_hashes();
-        // Identical score, different age AND different training count.
+        // Identical score, different age AND different budget spent.
         for h in &hashes {
             let mut buf = RollingBuffer::new(eng.config.smoothing_window);
             buf.push(100.0);
@@ -5095,25 +5329,30 @@ mod tests {
         eng.state.net_mut(&hashes[1]).unwrap().entered_at_step = 3;
         eng.state.net_mut(&hashes[1]).unwrap().step = 10;
 
+        // Same reading, different budget: 100/1 vs 100/10. Age plays no part.
+        assert_eq!(eng.merit_per_ticket(&hashes[0]), Some(100.0));
+        assert_eq!(eng.merit_per_ticket(&hashes[1]), Some(10.0));
+
         let frame = eng.lottery_frame(5).expect("armed at clock 5");
-        // Minimize: age 6 (born 0) ⇒ merit 100/6; age 3 (born 3) ⇒ merit 100/3. The
-        // YOUNGER net's merit is LARGER, i.e. worse in a Minimize run.
-        assert!((eng.train_lottery_p(&hashes[0], 5, Some(frame)) - 1.0).abs() < 1e-6);
-        assert!((eng.train_lottery_p(&hashes[1], 5, Some(frame)) - 0.0).abs() < 1e-6);
+        // Minimize: the LOWEST merit is best, so the net that spent 10 tickets takes
+        // p = 1.0 and the one that spent 1 takes p = 0.0 — the clock-lived divisor
+        // inverted this, which is why it went.
+        assert!((eng.train_lottery_p(&hashes[0], 5, Some(frame)) - 0.0).abs() < 1e-6);
+        assert!((eng.train_lottery_p(&hashes[1], 5, Some(frame)) - 1.0).abs() < 1e-6);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-        /// Sitting out must never improve a net's standing: with UNCHANGED readings, a net
-        /// that trains and a net the lottery skips keep the same merit, because their
-        /// clocks lived advance together. Under the old divisor the skipped net's frozen
-        /// `state.step` handed it p = 1.0 while the trained peer fell to 0.0.
+        /// An idle clock moves NOTHING the lottery grades: with the ticket divisor the
+        /// reading and the denominator both stand still, so `smt/tkt` is bit-identical
+        /// and only the idle ledger grows. (The clock-lived divisor this replaced made
+        /// the ratio decay for idling — a penalty for a decision the net did not make.)
     #[test]
-    fn a_skipped_clock_does_not_lift_a_net_over_a_trained_peer() {
-        let dir = std::env::temp_dir().join("gras-lottery-skip-no-climb");
+    fn an_idle_clock_leaves_the_merit_bit_identical() {
+        let dir = std::env::temp_dir().join("gras-lottery-idle-invariant");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 21).unwrap();
-        eng.config.evolution_train_lottery = true;
+        eng.config.train_merit = 1.0;
         eng.config.mutation_probation_steps = 0;
         eng.config.crossover_probation_steps = 0;
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
@@ -5125,32 +5364,141 @@ mod tests {
             *eng.rolling_fitness.get_mut(h).unwrap() = buf;
             eng.state.net_mut(h).unwrap().step = 5;
         }
-        // Flat field: identical readings and identical ages ⇒ the lottery abstains.
-        let frame5 = eng.lottery_frame(5).expect("armed at 5");
-        assert!((eng.train_lottery_p(&hashes[0], 5, Some(frame5)) - 1.0).abs() < 1e-6);
+        let before = eng.merit_per_ticket(&hashes[1]).expect("graded");
+        assert_eq!(before, 20.0, "5 tickets spent, 100 scored");
 
-        // One clock later: hashes[0] trained, hashes[1] was skipped. Readings unchanged.
+        // One clock later: hashes[0] trained, hashes[1] idled. Readings unchanged.
         eng.state.net_mut(&hashes[0]).unwrap().step += 1;
-        eng.state.net_mut(&hashes[1]).unwrap().budget_skips += 1;
-        let frame6 = eng.lottery_frame(6).expect("armed at 6");
-        let (a, b) = (
-            eng.train_lottery_p(&hashes[0], 6, Some(frame6)),
-            eng.train_lottery_p(&hashes[1], 6, Some(frame6)),
+        eng.idle_step(&hashes[1], 6).unwrap();
+        assert_eq!(
+            eng.merit_per_ticket(&hashes[1]),
+            Some(before),
+            "an idle clock changes neither the score nor the ticket count"
         );
-        assert!(
-            (a - b).abs() < 1e-6,
-            "a skipped clock must not separate equal readings (trained {a}, skipped {b})"
-        );
-        assert!((a - 1.0).abs() < 1e-6, "a flat field abstains: {a}");
+        let idled = eng.state.net(&hashes[1]).unwrap();
+        assert_eq!(idled.step, 5, "no weight update");
+        assert!(idled.last_metrics.is_none(), "no metric row");
+        assert_eq!(idled.idle_clocks(), 1);
+        assert_eq!(idled.idle_spans, vec![(6, 6)]);
+        // The trained peer's denominator grew, so the field CAN separate them — that
+        // is the budget rotating, not the idle net climbing.
+        let peer = eng.merit_per_ticket(&hashes[0]).expect("graded");
+        assert!((peer - 100.0 / 6.0).abs() < 1e-5, "6 tickets spent: {peer}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-        /// The who-line's gate is `Summ` + an ARMED lottery, nothing else: switching the
-        /// elite crown off (`freeze_elites = false`, which suppresses the step rollup)
-        /// must not silence the training-budget report, and `Minimal`/`None` stay quiet.
+        /// A run can end on idle clocks (the lottery withheld the last tickets). Resume
+        /// must skip them: they have no update and no draw, so replaying one would train
+        /// a net the run never trained — a different `state.step` and different weights,
+        /// with only the recorded row standing between it and silent drift.
     #[test]
-    fn lottery_who_line_prints_at_summ_without_the_elite_rollup() {
+    fn resume_does_not_replay_idle_clocks() {
+        let dir = std::env::temp_dir().join("race_resume_idle");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut engine = engine(&dir, 99).unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+            .unwrap();
+        let h = engine.state.live_hashes()[0].clone();
+        for clock in 0..3 {
+            engine.step_one_net(&h, clock).unwrap();
+        }
+        // Two trailing idle clocks, exactly what two denied tickets record.
+        engine.idle_step(&h, 3).unwrap();
+        engine.idle_step(&h, 4).unwrap();
+        let trained = engine.state.net(&h).unwrap().step;
+        let last = engine.state.net(&h).unwrap().last_metrics.clone();
+        assert_eq!(trained, 3, "three tickets, two idles");
+        assert_eq!(last.as_ref().map(|m| m.step), Some(2));
+        let state = engine.state.net(&h).cloned().unwrap();
+        crate::state::write_net_state(&dir, &state).unwrap();
+        drop(engine);
+
+        // Metric parity is asserted INSIDE resume: replaying an idle clock would move
+        // the recorded row (and `state.step` to 5 instead of 3) and fail there.
+        let mut resumed = crate::engine::TabularEngine::resume(
+            dir.clone(),
+            tiny_dataset_dir("resume_idle"),
+            {
+                let mut c = RaceConfig::defaults();
+                c.pop_size = 1;
+                c
+            },
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        )
+        .unwrap();
+        let restored = resumed.state.net(&h).unwrap();
+        assert_eq!(restored.step, 3, "idle clocks are not replayed as trainings");
+        assert_eq!(restored.last_metrics, last, "the last ticket's row survived");
+        assert_eq!(restored.idle_clocks(), 2, "the ledger round-trips");
+        // The next clock is a normal training step again.
+        resumed.step_one_net(&h, 5).unwrap();
+        assert_eq!(resumed.state.net(&h).unwrap().step, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+        /// `history.csv` carries one row per clock a net was TRAINED AND SCORED on. An
+        /// idle net has no metrics for the new step, and writing its carried snapshot
+        /// under the loop's step would fabricate a measurement.
+    #[test]
+    fn history_csv_writes_only_scored_clocks() {
+        let dir = std::env::temp_dir().join("gras-history-idle");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 21).unwrap();
+        eng.config.csv_export = true;
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        let hashes = eng.state.live_hashes();
+        // Clock 4: both nets were trained and scored.
+        for h in &hashes {
+            let m = crate::state::NetMetrics {
+                step: 4,
+                train_loss: 1.0,
+                eval_loss: Some(2.0),
+                fitness: 3.0,
+                informative: vec![],
+                frozen: false,
+            };
+            eng.state.record_step(h, m).unwrap();
+        }
+        eng.append_metrics_csv(4).unwrap();
+        assert_eq!(eng.history_csv_buffer.lines().count(), 2, "one row per scored net");
+
+        // Clock 5: hashes[0] idles (no metrics), hashes[1] is scored.
+        eng.idle_step(&hashes[0], 5).unwrap();
+        let m = crate::state::NetMetrics {
+            step: 5,
+            train_loss: 1.0,
+            eval_loss: Some(2.0),
+            fitness: 3.0,
+            informative: vec![],
+            frozen: false,
+        };
+        eng.state.record_step(&hashes[1], m).unwrap();
+        eng.append_metrics_csv(5).unwrap();
+        let rows: Vec<&str> = eng.history_csv_buffer.lines().collect();
+        assert_eq!(rows.len(), 3, "exactly one new row");
+        let new = rows.last().unwrap();
+        assert!(
+            new.starts_with(&format!("5,{}", hashes[1])),
+            "the scored net owns the row: {new}"
+        );
+        assert!(
+            !eng.history_csv_buffer
+                .contains(&format!("5,{}", hashes[0])),
+            "an idle net must not repeat its last measurement under the new step"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+        /// The lottery line's gate is `Summ` + an ARMED lottery, nothing else: switching
+        /// the elite crown off (`freeze_elites = false`, which suppresses the step
+        /// rollup) must not silence the train-budget report, and `Minimal`/`None` stay
+        /// quiet.
+    #[test]
+    fn lottery_line_prints_at_summ_without_the_elite_rollup() {
         let dir = std::env::temp_dir().join("gras-lottery-line-gate");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 21).unwrap();
@@ -5171,13 +5519,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-        /// The clock's split comes from the skip counters alone: a net that skipped
-        /// appears under `withheld`, the rest of the group under `trained`, and a crown
-        /// member under NEITHER (it sat out for the elite freeze, a different cause the
-        /// rollup names by itself). No snapshot ⇒ no report, which is how the lottery's
-        /// OFF path stays silent without a second flag.
+        /// The clock's split comes from the IDLE ledger alone: a net whose idle clocks
+        /// grew appears under `withheld` (idled), the rest of the group under `trained`,
+        /// and a crown member under NEITHER (it acted for the elite freeze, a different
+        /// cause the rollup names by itself). No snapshot ⇒ no report, which is how the
+        /// lottery's OFF path stays silent without a second flag.
     #[test]
-    fn lottery_clock_report_splits_by_skip_delta_and_excludes_the_crown() {
+    fn lottery_clock_report_splits_by_idle_delta_and_excludes_the_crown() {
         let dir = std::env::temp_dir().join("gras-lottery-clock-report");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 21).unwrap();
@@ -5191,11 +5539,14 @@ mod tests {
         // No snapshot (lottery off / line off): nothing is claimed either way.
         let (t, w) = eng.lottery_clock_report(&hashes, &[]);
         assert!(t.is_empty() && w.is_empty());
-        // hashes[1] had already been skipped twice; this clock it skips again and
-        // hashes[2] skips for the first time. hashes[0] trains.
-        eng.state.net_mut(&hashes[1]).unwrap().budget_skips = 3;
-        eng.state.net_mut(&hashes[2]).unwrap().budget_skips = 1;
-        let before = [0usize, 2, 0];
+        // hashes[1] had already idled twice; this clock it idles again and hashes[2]
+        // idles for the first time. hashes[0] trains.
+        let before = [0usize, 2, 1];
+        eng.state.net_mut(&hashes[1]).unwrap().record_idle_step(0);
+        eng.state.net_mut(&hashes[1]).unwrap().record_idle_step(1);
+        eng.state.net_mut(&hashes[2]).unwrap().record_idle_step(0);
+        eng.state.net_mut(&hashes[1]).unwrap().record_idle_step(6);
+        eng.state.net_mut(&hashes[2]).unwrap().record_idle_step(6);
         let (t, w) = eng.lottery_clock_report(&hashes, &before);
         assert_eq!(t, vec![short(&hashes[0])], "the non-skipping net trained");
         assert_eq!(w, vec![short(&hashes[1]), short(&hashes[2])]);
@@ -5218,7 +5569,7 @@ mod tests {
         let dir = std::env::temp_dir().join("gras-lottery-coin-seed");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 21).unwrap();
-        eng.config.evolution_train_lottery = true;
+        eng.config.train_merit = 1.0;
         eng.config.mutation_probation_steps = 5;
         eng.config.crossover_probation_steps = 5;
         eng.seed_population_internal(
@@ -5227,7 +5578,7 @@ mod tests {
         )
         .unwrap();
         let hashes = eng.state.live_hashes();
-        // Merits 10 / 20 / 30 per update ⇒ the middle net grades at p = 0.5, the only
+        // Merits 10 / 20 / 30 per ticket ⇒ the middle net grades at p = 0.5, the only
         // interesting point of the interval (0 and 1 short-circuit without a draw).
         for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
             let h = &hashes[i];
@@ -5272,15 +5623,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-        /// The training lottery decides which clocks were act-only, and those clocks are
-        /// the replay ledger: a run that trained under the lottery cannot be resumed with
-        /// it off (or vice versa), and the refusal names the recorded setting.
+        /// The training lottery's strength Ω decides which clocks were idle, and those
+        /// clocks are the replay ledger: a run recorded at one Ω cannot be resumed at
+        /// another (including on/off), and the refusal names the recorded value. Ω is a
+        /// DIAL, not a switch, so 0.5 vs 1.0 must be refused too — they idle a
+        /// different set of nets.
     #[test]
-    fn resume_refuses_a_train_lottery_mismatch() {
-        let dir = std::env::temp_dir().join("race_resume_train_lottery");
+    fn resume_refuses_a_train_merit_mismatch() {
+        let dir = std::env::temp_dir().join("race_resume_train_merit");
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = engine(&dir, 99).unwrap();
-        engine.config.evolution_train_lottery = true;
+        engine.config.train_merit = 0.5;
         engine
             .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
@@ -5288,18 +5641,18 @@ mod tests {
             let state = engine.state.net(&h).cloned().unwrap();
             crate::state::write_net_state(&dir, &state).unwrap();
         }
-        // Record the lottery in the header (the engine wrote the default at construction,
-        // before the knob was flipped for this test).
+        // Record the strength in the header (the engine wrote the default at construction,
+        // before the knob was set for this test).
         let raw = std::fs::read_to_string(dir.join("engine.json")).unwrap();
         let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        json["config"]["evolution_train_lottery"] = serde_json::json!(true);
+        json["config"]["train_merit"] = serde_json::json!(0.5);
         std::fs::write(dir.join("engine.json"), json.to_string()).unwrap();
         drop(engine);
 
         let resume = |config: RaceConfig| {
             crate::engine::TabularEngine::resume(
                 dir.clone(),
-                tiny_dataset_dir("train_lottery"),
+                tiny_dataset_dir("train_merit"),
                 config,
                 fitness(),
                 crate::trainer::TabularTrainer::new(loss_fn()),
@@ -5311,17 +5664,58 @@ mod tests {
             .err()
             .expect("a lottery mismatch must be refused, not patched")
             .to_string();
-        assert!(err.contains("evolution_train_lottery mismatch"), "{err}");
+        assert!(err.contains("train_merit (\u{3a9}) mismatch"), "{err}");
         assert!(
-            err.contains("set_run_train_merit(true)"),
-            "the refusal must name the recorded setting: {err}"
+            err.contains("set_run_train_merit(0.50)"),
+            "the refusal must name the recorded strength: {err}"
         );
-        let mut on = RaceConfig::defaults();
-        on.pop_size = 2;
-        on.evolution_train_lottery = true;
-        assert!(resume(on).is_ok(), "the recorded setting must resume");
+        // On/off is not the only mismatch a dial can have: the neighbouring strength
+        // idles a DIFFERENT set of nets, so it is refused on the same terms.
+        let mut full = RaceConfig::defaults();
+        full.pop_size = 2;
+        full.train_merit = 1.0;
+        assert!(resume(full).is_err(), "0.5 vs 1.0 must be refused");
+        let mut recorded = RaceConfig::defaults();
+        recorded.pop_size = 2;
+        recorded.train_merit = 0.5;
+        assert!(
+            resume(recorded).is_ok(),
+            "the recorded setting must resume"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+        /// A header written before Ω recorded the knob as the bool
+        /// `evolution_train_lottery`: `true` ran at the full merit weighting, so it must
+        /// normalize to Ω = 1.0 (and stay resumable at that strength), while `false` —
+        /// and a header with no key at all — normalize to Ω = 0.0, the plain path.
+    #[test]
+    fn a_legacy_bool_lottery_header_normalizes_to_omega() {
+        let snap = |json: &str| {
+            let header: crate::state::RunHeader = crate::state::RunHeader::from_json(json)
+                .expect("legacy header loads");
+            header.config.train_merit
+        };
+        assert_eq!(
+            snap(r#"{"config":{"evolution_train_lottery":true}}"#),
+            1.0,
+            "a run recorded as ON trained at the full merit weighting"
+        );
+        assert_eq!(
+            snap(r#"{"config":{"evolution_train_lottery":false}}"#),
+            0.0
+        );
+        assert_eq!(snap(r#"{"config":{}}"#), 0.0, "pre-knob = always train");
+        // One truth per header: the legacy key is consumed, not carried forward.
+        let header = crate::state::RunHeader::from_json(
+            r#"{"config":{"evolution_train_lottery":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(header.config.legacy_train_lottery, None);
+        let written = header.to_json().unwrap();
+        assert!(!written.contains("evolution_train_lottery"), "{written}");
+        assert!(written.contains("\"train_merit\""), "{written}");
     }
 
         /// A resume at a different cull policy would evict different nets from the very
@@ -6802,34 +7196,34 @@ mod tests {
             "crossover window expires after k clocks"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-        /// The lottery's per-clock who-line: both counts always stated, and the side the
-        /// reader needs (the smaller one) listed in full — the other is its complement.
+    }    /// The lottery's DEBUG who-line: both counts always stated, and the side the
+    /// reader needs (the smaller one) listed in full — the other is its complement.
+    /// The Summ view is the aggregate line (`log_lottery_summary`), not this list.
     #[test]
     fn lottery_who_line_names_the_smaller_side_and_caps_the_list() {
         let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // Few trained, many withheld → name the trained ones.
+        // Few trained, many idled → name the trained ones.
         assert_eq!(
             lottery_who_line(&owned(&["a", "b"]), &owned(&["c", "d", "e"])),
-            "2 trained: a b · 3 withheld"
+            "2 trained: a b · 3 idled"
         );
-        // Few withheld → name those instead.
+        // Few idled → name those instead.
         assert_eq!(
             lottery_who_line(&owned(&["a", "b", "c", "d", "e"]), &owned(&["z"])),
-            "5 trained · 1 withheld: z"
+            "5 trained · 1 idled: z"
         );
         // Long lists are capped with a `+N` tail on the named side only.
         let trained: Vec<String> = (0..13).map(|i| format!("t{i}")).collect();
         let withheld: Vec<String> = (0..20).map(|i| format!("w{i}")).collect();
         let line = lottery_who_line(&trained, &withheld);
         assert!(line.starts_with("13 trained: t0 t1 "), "{line}");
-        assert!(line.ends_with(" +1 · 20 withheld"), "{line}");
+        assert!(line.ends_with(" +1 · 20 idled"), "{line}");
     }
 
-    /// The rollup wording contract: `trained + sat out = live` always holds (`stepped`
-    /// counts everyone who acted, crown included), the sat-out causes stay
-    /// distinguishable, and all-trained carries no sat-out segment.
+    /// The rollup wording contract: `trained + frozen + idled + newborn = live` always
+    /// holds, `stepped` counts updaters + crown act-and-measure passes (an idle net did
+    /// not act at all), the sat-out causes stay distinguishable, and an all-trained
+    /// clock carries no sat-out segment.
     #[test]
     fn step_rollup_line_accounts_for_every_live_net() {
         // Test shorthand for the eleven vitals, in the old positional order: these
@@ -6854,37 +7248,46 @@ mod tests {
             })
         }
 
-        // 84 acted (74 updated + 10 crown), 16 newborn, 100 live.
+        // 84 ran (74 updated + 10 crown), 16 newborn, 100 live.
         let line = rollup([84, 100, 10, 16, 74, 26, 0, 10, 10, 5, 5]);
         assert_eq!(
             line,
-            "stepped 84/100 live nets (weights updated) │ 26 sat out: 10 elite frozen (act+measure, no update) + 16 newborn (born this clock, first step next clock) │ crown 10/10 seats · 74 eligible · 26 gated (join window or cull shield, k=5) · 0 age-blocked (j=5)"
+            "ran 84 of 100 = 74 updating + 10 crown │ held back 16 = 16 newborn (first step next clock) │ 100 = 84 + 16 │ seats 10 of 10 │ seat gates, over all 100 nets: 74 may sit = 100 − 26 in a join window or cull shield (5 clocks) − 0 age-blocked (5-clock lifetime)"
         );
         // The rollup is ONE log line: the crown tally rides inline, never an indent.
         assert!(!line.contains('\n'), "rollup stays one line: {line}");
-        // `trained + crown + newborn = live` — the invariant the format upholds.
-        assert!(74 + 10 + 16 == 100);
+        // The identities the format now PRINTS, not just upholds: 74 + 10 = 84,
+        // 84 + 16 = 100, and 74 + 26 + 0 = 100.
+        assert!(74 + 10 == 84 && 84 + 16 == 100 && 74 + 26 + 0 == 100);
 
-        // Newborns only (no crown yet): one sat-out cause, no stray '+'.
+        // Newborns only (no crown yet): one held-back cause, no stray '+'.
         let newborn_only = rollup([4, 6, 0, 2, 0, 6, 0, 0, 1, 5, 5]);
         assert!(
-            newborn_only.contains("stepped 4/6 live nets (weights updated) │ 2 sat out: 2 newborn"),
+            newborn_only.contains(
+                "ran 4 of 6 = 4 updating │ held back 2 = 2 newborn (first step next clock)"
+            ),
             "{newborn_only}"
         );
-        assert!(!newborn_only.contains("elite frozen"), "{newborn_only}");
+        assert!(!newborn_only.contains("crown"), "{newborn_only}");
 
-        // Frozen only: likewise (every live net acted, one of them was the crown).
+        // Frozen only: every live net RAN (one of them was the crown), so there is no
+        // held-back segment at all — the crown rides the `ran` identity.
         let frozen_only = rollup([6, 6, 1, 0, 5, 1, 0, 1, 1, 5, 5]);
         assert!(
-            frozen_only
-                .contains("stepped 6/6 live nets (weights updated) │ 1 sat out: 1 elite frozen"),
+            frozen_only.contains("ran 6 of 6 = 5 updating + 1 crown"),
             "{frozen_only}"
         );
         assert!(!frozen_only.contains("newborn"), "{frozen_only}");
+        assert!(
+            !frozen_only.contains("held back"),
+            "a crown that acted is not a held-back net: {frozen_only}"
+        );
 
-        // The lottery names its subset explicitly: trained / would-have / withheld.
+        // The lottery names its budget explicitly: tickets / eligible / idled. An idle
+        // net did not run at all, so `stepped` is the tickets plus the crown (5 + 1) —
+        // never the group.
         let lottery = step_rollup_line(&StepVitals {
-            stepped: 10,
+            stepped: 6,
             trained: 5,
             live: 10,
             frozen: 1,
@@ -6900,18 +7303,27 @@ mod tests {
             lifetime_j: 5,
         });
         assert!(
-            lottery.contains(
-                "stepped 10/10 live nets (5 weights updated of 9 that would have — 4 withheld by the train lottery)"
-            ),
+            lottery.contains("ran 6 of 10 = 5 ticketed + 1 crown"),
             "{lottery}"
         );
+        assert!(
+            lottery.contains("held back 4 = 4 idled (no train, no eval)"),
+            "{lottery}"
+        );
+        assert!(lottery.contains("10 = 6 + 4"), "{lottery}");
+        assert!(
+            lottery.contains("would-train 9 = 5 ticketed + 4 idled"),
+            "{lottery}"
+        );
+        // `ran 6` = 5 tickets + 1 crown, and 6 + 4 idled = 10 live — the head and
+        // the held-back list account for every net exactly once.
 
-        // All trained: NO sat-out segment at all (byte-identical to a run
-        // with no births and an empty crown).
+        // All trained: NO did-not-run segment at all (no births, no idles), and no crown
+        // note either — a zero would be noise.
         let clean = rollup([4, 4, 0, 0, 0, 4, 0, 0, 1, 5, 5]);
         assert_eq!(
             clean,
-            "stepped 4/4 live nets (weights updated) │ crown 0/1 seats · 0 eligible · 4 gated (join window or cull shield, k=5) · 0 age-blocked (j=5)"
+            "ran 4 of 4 = 4 updating │ 4 = 4 + 0 │ seats 0 of 1 │ seat gates, over all 4 nets: 0 may sit = 4 − 4 in a join window or cull shield (5 clocks) − 0 age-blocked (5-clock lifetime)"
         );
     }
 }

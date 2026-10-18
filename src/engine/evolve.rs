@@ -54,6 +54,31 @@ impl RollKind {
     }
 }
 
+/// The crossover line's parent note: the operator kind plus the parents at the
+/// same 8-hex width as every other identity on the line, so a child can be
+/// matched to its parents by eye. Lineage strings look like
+/// `crossover-one-point:parents=<h1>,<h2>[+mut]` or `clone:parents=<h1>`.
+fn lineage_note(created_from: &str) -> String {
+    let (head, mutated) = match created_from.strip_suffix("+mut") {
+        Some(h) => (h, true),
+        None => (created_from, false),
+    };
+    let (origin, parents) = head.split_once(":parents=").unwrap_or((head, ""));
+    let kind = origin.strip_prefix("crossover-").unwrap_or(origin);
+    let parents = parents
+        .split(',')
+        .filter(|p| !p.is_empty())
+        .map(|p| &p[..8.min(p.len())])
+        .collect::<Vec<_>>()
+        .join(" ");
+    let suffix = if mutated { "+mut" } else { "" };
+    if parents.is_empty() {
+        format!("{kind}{suffix}")
+    } else {
+        format!("{kind}; parents {parents}{suffix}")
+    }
+}
+
 impl CoreEngine {
         /// Fresh empty rolling buffer for a net about to be inserted, so its per-step
         /// pushes land somewhere.
@@ -198,6 +223,9 @@ impl CoreEngine {
                 victim_for_log.as_deref(),
                 victim_net_seed,
             );
+            // The population the victim was the worst OF — read before the cull,
+            // because `cull_net` shrinks it.
+            let live_before = self.state.live_count();
             match self.config.crossover_cull_policy {
                 crate::engine::config::CrossCullPolicy::Worst => {
                     if let Some(victim) = &victim_for_log {
@@ -211,18 +239,20 @@ impl CoreEngine {
                 }
             }
             self.insert_child(child, clock, "crossover");
+            let victim_note = match self.config.crossover_cull_policy {
+                crate::engine::config::CrossCullPolicy::Worst => {
+                    format!("lowest score of {live_before}")
+                }
+                crate::engine::config::CrossCullPolicy::Random => "random draw".to_string(),
+            };
             return Ok(RollOutcome::survived(format!(
-                "child {} ({}) inserted (fresh, trains from step {clock}), victim {} culled ({})",
+                "child {} ({}) │ culled {} ({victim_note}) │ first step at {clock}",
                 inserted_hash,
-                lineage,
+                lineage_note(&lineage),
                 victim_for_log
                     .as_deref()
                     .map(|v| v[..8.min(v.len())].to_string())
                     .unwrap_or_else(|| "none".into()),
-                match self.config.crossover_cull_policy {
-                    crate::engine::config::CrossCullPolicy::Worst => "worst",
-                    crate::engine::config::CrossCullPolicy::Random => "random",
-                },
             )));
         }
     }
@@ -384,7 +414,7 @@ impl CoreEngine {
         child.state.step = 0;
         child.state.last_metrics = None;
         let detail = format!(
-            "victim {} culled (immigrant-slot), immigrant {} inserted (fresh, trains from step {clock})",
+            "victim {} culled (immigrant slot) │ immigrant {} inserted (fresh, first step at {clock})",
             &victim[..8.min(victim.len())],
             &child.state.hash[..8.min(child.state.hash.len())],
         );

@@ -548,17 +548,50 @@ impl CoreEngine {
 }
 
 /// The clocks a reconstructed net must replay, as contiguous `(from, to)` segments for
-/// [`CoreEngine::replay_range`]: `recorded = step + acts`, and the gap tells the shape.
+/// [`CoreEngine::replay_range`].
+///
+/// The LEDGER wins when it closes: every clock from the net's first recorded one to its
+/// last is exactly one of a training, a crown act-and-measure pass or an idle clock, so
+/// the plan is that range minus `idle_spans`. This is what makes a train-eval lottery
+/// resumable — an idle clock has no update and no draw, so replaying it would train a
+/// net that never trained (silently, if the metrics row happened to match).
+///
+/// A record whose ledgers do not close (written before the idle ledger existed, or an
+/// aborted write) falls back to the shape heuristic below, which infers the gaps from
+/// counts; `recorded = step + acts` and the gap tells the shape.
 fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
-    // Clocks with a recorded metrics row: trainings + act-and-measure acts.
-    let recorded = state.step + frozen_act_count(state);
-    if recorded == 0 {
-        return Vec::new(); // nothing recorded yet
-    }
-    // No recorded clock (legacy/aborted nets): the pre-existing contiguous walk.
+    // No recorded clock at all (legacy/aborted nets): the pre-existing contiguous walk.
     let Some(end) = state.last_metrics.as_ref().map(|m| m.step) else {
-        return vec![(0, state.step)];
+        return if state.step > 0 {
+            vec![(0, state.step)]
+        } else {
+            Vec::new()
+        };
     };
+    // Clocks with a recorded metrics row: trainings + act-and-measure acts.
+    let recorded = state.measured_clocks();
+        // A mid-run joiner sits its birth clock out (the group filters it), so its first
+        // recorded clock is the next one; a founder starts at 0.
+    let start = if state.entered_at_step == 0 {
+        0
+    } else {
+        state.entered_at_step + 1
+    };
+        // The ledger can reach PAST the last measurement: a run may end on idle clocks,
+        // which record nothing. Counting only up to `end` would leave them unexplained
+        // and fall back to the heuristic, which would try to train them.
+    let hi = state
+        .frozen_spans
+        .last()
+        .map(|&(_, e)| e)
+        .into_iter()
+        .chain(state.idle_spans.last().map(|&(_, e)| e))
+        .max()
+        .unwrap_or(end)
+        .max(end);
+    if recorded + state.idle_clocks() == (hi + 1).saturating_sub(start) {
+        return plan_skipping_idle(start, hi, &state.idle_spans);
+    }
     let unrecorded = (end + 1).saturating_sub(recorded);
     let birth = state.entered_at_step;
     if unrecorded == 0 {
@@ -596,14 +629,33 @@ fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
     out
 }
 
-/// How many clocks sit inside `frozen_spans` — the act-and-measure passes. Shared with the
-/// stop-time elite table's `frozen` column, so the log and traceback cannot disagree.
+/// How many clocks sit inside `frozen_spans` — the crown's act-and-measure passes. Shared
+/// with the stop-time elite table's `frozen` column, so log and ledger cannot disagree.
 pub(crate) fn frozen_act_count(state: &NetState) -> usize {
-    state
-        .frozen_spans
-        .iter()
-        .map(|&(s, e)| e.saturating_sub(s) + 1)
-        .sum()
+    state.frozen_clocks()
+}
+
+/// `start..=end` minus the idle clocks, as half-open segments for [`CoreEngine::replay_range`].
+/// An idle clock is never replayed: the net did nothing, so there is no optimizer state,
+/// no RNG draw and no batch read to reproduce.
+fn plan_skipping_idle(start: usize, end: usize, idle: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut cursor = start;
+    for &(s, e) in idle {
+        // Clip the span to the replayed range (a span may reach past the last ticket).
+        let (s, e) = (s.max(start), e.min(end));
+        if s > e {
+            continue;
+        }
+        if s > cursor {
+            out.push((cursor, s));
+        }
+        cursor = cursor.max(e + 1);
+    }
+    if cursor <= end {
+        out.push((cursor, end + 1));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -695,5 +747,54 @@ mod tests {
         for (i, r) in mixed.iter().enumerate() {
             assert_ne!(r, &row([0, 0]), "port {i} fell back to an empty row");
         }
+    }
+
+    /// A persisted `NetState` from its JSON shape, so a resume plan can be exercised
+    /// without building a topology or a network.
+    fn ledger_state(step: usize, entered: usize, end: usize, idle: &[(usize, usize)]) -> NetState {
+        serde_json::from_value(serde_json::json!({
+            "hash": "0000000000000000",
+            "topology": "{}",
+            "net_seed": 7,
+            "step": step,
+            "entered_at_step": entered,
+            "last_metrics": {
+                "step": end,
+                "train_loss": 0.0,
+                "eval_loss": null,
+                "fitness": 0.0,
+                "informative": []
+            },
+            "idle_spans": idle,
+        }))
+        .expect("fixture state")
+    }
+
+    /// The replay plan obeys the idle ledger: a clock the lottery withheld is never
+    /// replayed (no update, no draw), mid-life holes AND trailing idle clocks included.
+    #[test]
+    fn replay_skips_idle_clocks_in_the_middle_and_at_the_tail() {
+        // Founder trained 0,1,3,4 and idled 2 → the hole is skipped, both runs kept.
+        assert_eq!(
+            replay_segments(&ledger_state(4, 0, 4, &[(2, 2)])),
+            vec![(0, 2), (3, 5)]
+        );
+        // The run stopped while idling: 3 tickets, then 2 idle clocks. Replaying
+        // 0..=4 would train the net twice past its last measurement — the drift this
+        // ledger exists to prevent.
+        assert_eq!(
+            replay_segments(&ledger_state(3, 0, 2, &[(3, 4)])),
+            vec![(0, 3)]
+        );
+        // A mid-run joiner: born at 5, trained 6,7, idled 8 → replay 6..=7 only.
+        assert_eq!(
+            replay_segments(&ledger_state(2, 5, 7, &[(8, 8)])),
+            vec![(6, 8)]
+        );
+        // A contiguous idle span inside a joiner's life: trained 6,9; idled 7,8.
+        assert_eq!(
+            replay_segments(&ledger_state(2, 5, 9, &[(7, 8)])),
+            vec![(6, 7), (9, 10)]
+        );
     }
 }

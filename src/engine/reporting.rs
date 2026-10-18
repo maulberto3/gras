@@ -66,7 +66,6 @@ impl CoreEngine {
             .iter()
             .map(|r| r.risk_adjusted(direction, lambda))
             .collect();
-        let fit_stats = stats(&fits);
         let windows: Vec<f32> = readings.iter().map(|r| r.mean).collect();
         let spreads: Vec<f32> = readings.iter().map(|r| r.std).collect();
         // A plain average (not `stats`): these are single population aggregates, not a
@@ -105,25 +104,45 @@ impl CoreEngine {
                 format!(" │ ★ {}", names.join(" "))
             }
         };
+        // The score identity, printed with its own arithmetic: the mean of the
+        // per-net `avg ∓ λ·spread` equals `window avg ∓ λ·window spread` because λ
+        // is a constant. Without the two legs and the operator, `score 37.4` beside
+        // `window avg 48.9` reads as a contradiction instead of a charge for spread.
+        let window_avg = avg(&windows);
+        let window_spread = avg(&spreads);
+        let sign = match direction {
+            crate::utils::fitness::Direction::Maximize => "−",
+            crate::utils::fitness::Direction::Minimize => "+",
+        };
+        let score_cell = if readings.is_empty() {
+            format!(
+                "score{} avg — (no reading yet) │ window avg —",
+                direction.arrow()
+            )
+        } else {
+            format!(
+                "score{} avg {} = window avg {} {} {} × window spread {} (λ={}) │ window avg {} (spread {})",
+                direction.arrow(),
+                fmt_line(avg(&fits)),
+                fmt_line(window_avg),
+                sign,
+                fmt_cfg(lambda),
+                fmt_line(window_spread),
+                fmt_cfg(lambda),
+                fmt_line(window_avg),
+                fmt_line(window_spread),
+            )
+        };
         if self.log_level == crate::engine::config::LogLevel::Minimal {
-            self.log_minimal_table(&trains, &evals, &fits, avg(&windows), avg(&spreads), step_secs);
+            self.log_minimal_table(&trains, &evals, &fits, window_avg, window_spread, step_secs);
         } else {
             info!(
-                // The score cell is tagged `smt` (not `fitness`): it is the
-                // risk-adjusted value `μ ∓ λσ` the ranking used, so the legend's
-                // equation and this line name the same quantity.
-                "step {} │ pop {} │ train_loss↓ {} │ {} │ smt{} {} │ window {} │ took {}s{}",
+                "step {} │ nets {} │ loss↓ {} │ {} │ {} │ {}s{}",
                 clock,
                 self.state.live_count(),
                 stats(&trains),
                 mid,
-                self.fitness.direction().arrow(),
-                fit_stats,
-                // The population's window level and spread, in the same `μ… ±σ…`
-                // census spelling as the loss columns beside it. Tagged `window` because
-                // the `smt` cell to its left carries a σ of its OWN (the spread of the
-                // scores, not of the means they were charged from).
-                fmt_census(avg(&windows), avg(&spreads), ReadingStyle::Line),
+                score_cell,
                 fmt_line(step_secs),
                 freeze_badge,
             );
@@ -194,21 +213,26 @@ impl CoreEngine {
                     self.step_rl.label(step_secs),
                 )
             },
-                // `smt` tag: this cell is the population MEAN of smoothed per-net fitness,
-                // never confused with the per-net raw values.
-                // `smt` is the risk-adjusted score (FIT); `μ`/`σ` are the window level and
-                // spread behind it, so the readable value is never lost.
+                // The population MEAN of smoothed per-net scores, printed with the
+                // arithmetic the Summ line uses — the two sinks must not disagree.
+                // The window census is not repeated: it is the identity's own legs.
             format!(
-                "fitness{} smt{}{} │ window {} │ culls {} │ inserts {}",
+                "score{} {} = window avg {} {} {} × window spread {}{} │ culls {} │ inserts {}",
                 self.fitness.direction().arrow(),
                 fmt_line(fit_m),
+                fmt_line(window_mean),
+                match self.fitness.direction() {
+                    crate::utils::fitness::Direction::Maximize => "−",
+                    crate::utils::fitness::Direction::Minimize => "+",
+                },
+                fmt_cfg(self.config.risk_aversion),
+                fmt_line(window_std),
                 delta(fit_m, Some(pf)),
-                fmt_census(window_mean, window_std, ReadingStyle::Line),
                 e.culls,
                 e.inserts,
             ),
             format!(
-                "crossover fired {} ({} inserted, {} spent) │ mutation rolled {} ({} immigrant(s))",
+                "crossover fired {} ({} inserted, {} spent) │ immigrant rolled {} ({} inserted)",
                 e.cross_fired, e.cross_survived, e.cross_discarded, e.mutate_fired, e.mutate_fired,
             ),
             format!("step took {}s", fmt_line(step_secs)),
@@ -223,7 +247,11 @@ impl CoreEngine {
                 .map(|h| h[..8.min(h.len())].to_string())
                 .collect();
             names.sort();
-            guard_cells.push(format!("elite: {}", names.join(" ")));
+            // An armed crown with no members (pop too small for a seat) must not print
+            // a labelled empty row.
+            if !names.is_empty() {
+                guard_cells.push(format!("elite: {}", names.join(" ")));
+            }
         }
         if !guard_cells.is_empty() {
             rows.push(guard_cells.join(" │ "));
@@ -352,8 +380,8 @@ impl CoreEngine {
             // meaningful with the n it came from, so `μ ±σ (SE, n)` is rendered whole
             // from `format::fmt_reading` — the same spelling the logs use.
         let mut header = vec![
-            "#", "hash", "smt", "reading", "smt/clk", "step", "seat age", "trained", "frozen",
-            "budget", "params", "origin",
+            "#", "hash", "score", "reading", "score/tkt", "step", "seat age", "trained",
+            "frozen", "idle", "params", "origin",
         ];
         if has_eval {
             header.push("eval");
@@ -371,20 +399,20 @@ impl CoreEngine {
             let reading_cell = fmt_reading(*mean, *std, *n, ReadingStyle::Cell);
             let short = &h[..8.min(h.len())];
             let state = self.state.net(h);
-                // The training lottery's number, readable: window level per CLOCK LIVED
-                // (`smt / (clock − entered + 1)`) — what the lottery grades. Clocks, not
-                // updates: a skipped clock ages the net, so sitting out cannot freeze the
-                // divisor and hand it a climb. `—` for a net with no reading.
+                // The ticket lottery's number, readable: window level per TICKET — the
+                // clocks that actually ran the trainer and scored it. An idle clock is
+                // not a ticket, so it cannot dilute the divisor, and sitting out leaves
+                // both legs untouched. `—` for a net with no reading yet.
             let born_num = state.map(|ns| ns.entered_at_step).unwrap_or(0);
             let age = dealt_clock.saturating_sub(born_num) + 1;
-            let per_clock = self
-                .merit_per_clock(h, dealt_clock)
+            let per_ticket = self
+                .merit_per_ticket(h)
                 .map(fmt_cfg)
                 .unwrap_or_else(|| "—".to_string());
-                // Clocks the lottery skipped (act-and-measure, no update). `frozen` stays
-                // the crown's own count, so the two causes never hide inside one number.
-            let budget = state
-                .map(|s| s.budget_skips.to_string())
+                // Clocks the lottery left IDLE (no train, no eval). `frozen` stays the
+                // crown's own count, so the two causes never hide inside one number.
+            let idle = state
+                .map(|s| s.idle_clocks().to_string())
                 .unwrap_or_else(|| "—".to_string());
             let on_crown = self.config.freeze_elites && self.frozen_crown.contains(h);
             let seat = if on_crown {
@@ -404,7 +432,7 @@ impl CoreEngine {
                 .unwrap_or_else(|| "?".to_string());
                 // Clocks lived INCLUSIVE of the birth clock and the last run — same
                 // convention the freeze lines use (`clock − entered_at_step`); `age` is
-                // computed above, where `smt/clk` needs it too.
+                // computed above, where the `smt/tkt` divisor needs it too.
             // `trained n/m` as two cells: optimizer updates over clocks lived.
             let trained = state
                 .map(|ns| format!("{}/{age}", ns.step))
@@ -417,12 +445,12 @@ impl CoreEngine {
                 short.to_string(),
                 smt,
                 reading_cell,
-                per_clock,
+                per_ticket,
                 step.to_string(),
                 seat,
                 trained,
                 frozen,
-                budget,
+                idle,
                 params_label,
                 origin_label,
             ];
@@ -445,12 +473,17 @@ impl CoreEngine {
             table.add_row(row);
         }
         // CFY: the elite report is a card — the same comfy table, now with the gate
-        // tally and the smt/μ/σ legend as its footnote (they were a trailing prose line).
+        // tally and the score/reading legend as its footnote (they were a trailing prose line).
+        let sign = match self.fitness.direction() {
+            crate::utils::fitness::Direction::Maximize => "−",
+            crate::utils::fitness::Direction::Minimize => "+",
+        };
         crate::utils::cfy::emit(&crate::utils::cfy::card(
             &format!("Final elites (top-{k}, ranked by fitness{arrow})"),
             &table.to_string(),
             Some(&format!(
-                "smt = risk-adjusted score (μ − λσ, λ={}) · reading = μ window level ±σ its step-to-step spread (SE = σ/√n, the uncertainty of that mean, over n readings) · rank charges σ, comparisons need SE · smt/clk = risk-adjusted score per CLOCK LIVED (what the training lottery grades; — until the net has a reading) · budget = clocks the lottery skipped (act-only) · crown {}/{} seats · {} eligible · {} gated (join window or cull shield, k={}) · {} age-blocked (j={})",
+                "score = risk-adjusted score (window avg {} λ × window spread, λ={}) · reading = the window level and its step-to-step spread (SE = spread/√n, the uncertainty of that mean, over n readings) · rank charges spread, comparisons need SE · score/tkt = risk-adjusted score per TICKET (one clock trained and scored; what the ticket lottery grades — until the first ticket) · idle = clocks the lottery gave no ticket (no train, no eval, so nothing above moved) · crown {}/{} seats · {} eligible · {} gated (join window or cull shield, {} clocks) · {} age-blocked ({} clocks)",
+                sign,
                 fmt_cfg(self.config.risk_aversion),
                 self.frozen_crown.len(),
                 self.config
@@ -467,17 +500,19 @@ impl CoreEngine {
         Ok(())
     }
 
-        /// The training lottery's card for ONE clock — printed at the START of the
-        /// clock's step (`Summ`), not once at stop, so the numbers are the coin's own
-        /// INPUTS and `p(train)` can be checked against the field it was mapped from.
+        /// The training lottery's per-net card for ONE clock — the DEBUG view (the caller
+        /// gates it on the debug filter), printed at the START of the clock's step, not
+        /// once at stop, so the numbers are the coin's own INPUTS and `p(ticket)` can be
+        /// checked against the field it was mapped from. The `Summ` view is the single
+        /// aggregate line from `log_lottery_summary`.
         ///
         /// `frame` is the field `lottery_frame(clock)` built for this clock, passed in
         /// by the caller that also hands it to `train_lottery_draws` — never a
         /// recomputation: after the nets step, their readings have already moved on, so
         /// a field rebuilt here would grade a clock that never happened.
         ///
-        /// `withheld` is therefore the count BEFORE this clock draws; the who-line
-        /// printed after the loop names what this clock itself skipped.
+        /// `idle` is therefore the count BEFORE this clock draws; the `Summ` lottery line
+        /// after the loop states what this clock itself idled (`won`/`idled`).
         ///
         /// Silent when the knob is off or the field is not armed yet (the caller checks
         /// both: an unarmed clock grades nobody, so there is no card to print).
@@ -494,7 +529,9 @@ impl CoreEngine {
             .into_iter()
             .map(|h| {
                 let state = self.state.net(&h);
-                let p = self.train_lottery_p(&h, clock, Some(frame));
+                // The BLENDED probability — the one the coin compares against —
+                // so `p` and the `ticket?` column beside it cannot disagree.
+                let p = self.train_lottery_p_eff(&h, clock, Some(frame));
                     // Why a net is outside the lottery's reach, in one word: the
                     // crown and the born shield always train (p = 1.00).
                 let exempt = if self.frozen_crown.contains(&h) {
@@ -504,10 +541,10 @@ impl CoreEngine {
                 } else {
                     "—"
                 };
-                    // `smt / upd` is ONE quantity, so it prints as its two legs and the
-                    // ratio between them: the numerator here, the denominator
-                    // (`state.step`) and the quotient beside each other, left to right.
-                    // A reader can redo the division.
+                    // `smt / tkt` is ONE quantity, so it prints as its two legs and the
+                    // ratio between them: the numerator here, the divisor (`measured
+                    // clocks` — real updates plus crown act passes) and the quotient
+                    // beside each other, left to right. A reader can redo the division.
                     // The numerator takes the CELL precision (4dp, widened below 5e-5) so
                     // a small loss-based smt never rounds to `0.00` while the ratio
                     // beside it is plainly non-zero.
@@ -516,9 +553,9 @@ impl CoreEngine {
                     // `train_lottery_draws` is a pure function of (run seed, clock, hash,
                     // frame) and consumes nothing, so calling it here returns the answer
                     // the step is about to act on — not a second draw that could differ.
-                    // The crown is forced `no`: the elite freeze takes the optimizer step
+                    // The crown is forced `no`: the elite freeze takes the trainer step
                     // for its OWN reason, so its `p = 1.00` means "the lottery is not what
-                    // withheld it", never "it updates this clock".
+                    // denied it", never "it misses this clock's ticket".
                 let trains = !self.frozen_crown.contains(&h)
                     && self.train_lottery_draws(&h, clock, Some(frame));
                 let row = vec![
@@ -526,15 +563,15 @@ impl CoreEngine {
                     exempt.to_string(),
                     smt.map(fmt_cell).unwrap_or_else(|| "—".to_string()),
                     state
-                        .map(|s| s.step.to_string())
+                        .map(|s| s.measured_clocks().to_string())
                         .unwrap_or_else(|| "—".to_string()),
-                    self.merit_per_clock(&h, clock)
+                    self.merit_per_ticket(&h)
                         .map(fmt_cfg)
                         .unwrap_or_else(|| "—".to_string()),
                     fmt_cfg(p),
                     if trains { "yes" } else { "no" }.to_string(),
                     state
-                        .map(|s| s.budget_skips.to_string())
+                        .map(|s| s.idle_clocks().to_string())
                         .unwrap_or_else(|| "—".to_string()),
                 ];
                 (exempt != "—", p, row)
@@ -544,12 +581,12 @@ impl CoreEngine {
             a.0.cmp(&b.0)
                 .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
         });
-        let withheld: usize = self
+        let idled: usize = self
             .state
             .live_hashes()
             .iter()
             .filter_map(|h| self.state.net(h))
-            .map(|s| s.budget_skips)
+            .map(|s| s.idle_clocks())
             .sum();
             // The field's own bounds, converted back into the COLUMN's units (the frame
             // is stored direction-adjusted): `best` is the value `p = 1` earns in either
@@ -559,26 +596,143 @@ impl CoreEngine {
             crate::utils::fitness::Direction::Minimize => (-frame.best, -frame.worst),
         };
         crate::utils::cfy::emit(&crate::utils::cfy::card(
-            &format!("Training lottery (experimental) — step {clock}"),
-            &crate::utils::cfy::table(
-                &[
+            &format!(
+                "Training lottery (experimental, Ω {}) — step {clock}",
+                fmt_cfg(self.train_merit_omega())
+            ),
+            &crate::utils::cfy::table(                    &[
                     "net",
                     "exempt",
-                    "smt",
-                    "upd",
-                    "smt/clk",
-                    "p(train)",
-                    "train?",
-                    "withheld",
+                    "score",
+                    "tickets",
+                    "score/ticket",
+                    "p(ticket)",
+                    "ticket?",
+                    "idle",
                 ],
                 &rows.into_iter().map(|(_, _, row)| row).collect::<Vec<_>>(),
             ),
             Some(&format!(
-                "smt = the net's smoothed risk-adjusted score (K-reading mean of μ ∓ λσ, the ranking's number) · upd = WEIGHT updates it actually spent (informational — NOT the divisor) · smt/clk = smt ÷ clocks lived (`clock − entered + 1`, 2dp, so a redo from the two legs can miss in the last digit): the window level per clock since birth, so the divisor grows every clock even when the net is skipped and sitting out buys no climb · field THIS clock drew from: best {} worst {} · p(train) = where the net's smt/clk sits between those two bounds (1 = best, 0 = worst) · train? = yes if THIS clock gives it the optimizer step, no if it only acts-and-measures · exempt nets (crown, born shield) are never withheld by the lottery, so they grade 1.00 — but a crown reads no, because the elite freeze outranks the lottery · withheld = act-only clocks skipped BEFORE this clock ({withheld} across the run); the who-line after the loop names this clock's",
+                "score = the net's smoothed risk-adjusted score (K-reading mean of window avg ∓ λ × window spread, the ranking's number) · tickets = clocks that got a TRAIN-EVAL TICKET — it ran the trainer and was scored (real updates + crown passes); score is the numerator and tickets the divisor · score/ticket = score ÷ tickets (2dp, so a redo from the two legs can miss in the last digit): the window level per ticket spent, so idling leaves it untouched · field THIS clock drew from: best {} worst {} · p(ticket) = where the net's score/ticket sits between those two bounds (1 = best, 0 = worst), then blended by Ω: `1 − Ω·(1 − p)`, so Ω < 1 lifts every net toward 1 = always train · ticket? = yes if THIS clock sells it the step (train + eval), no if it IDLES instead (no train, no eval, nothing measured) · exempt nets (crown, born shield) always run and grade 1.00 — but a crown reads no, because the elite freeze outranks the lottery · idle = clocks the lottery left it idle BEFORE this clock ({} across the run); the step's lottery line names this clock's count",
                 fmt_cfg(best),
                 fmt_cfg(worst),
+                idled,
             )),
         ));
+    }
+}
+
+impl CoreEngine {
+        /// The clock's ONE-LINE lottery report, printed after the group loop: what the
+        /// coin did in aggregate, never who it happened to (the per-net list is DEBUG).
+        ///
+        /// Two tenses on one line, deliberately: `graded`, `p̄` and `field` are this
+        /// clock's INPUTS (the pre-clock frame the draws used, so `p̄` can be checked
+        /// against `won`), while `won`, `exempt`, `upd̄`, `tkt̄` and `idled` are the
+        /// OUTCOME read after the nets stepped. `p̄` is the mean of the BLENDED
+        /// probability the coin actually compared against — `p_eff = 1 − Ω·(1 − p)`,
+        /// not the raw fraction — so `won ≈ graded · p̄` holds at every Ω.
+        ///
+        /// Two identities close on this line, and printing `exempt` is what makes the
+        /// second one visible:
+        ///
+        /// - `graded = won + idled` — every net the field graded either got the ticket
+        ///   or idled.
+        /// - `ticketed = won + exempt` — the rollup's ticket count also covers the nets
+        ///   that always run without being graded (the born shield, and a net with no
+        ///   reading yet). Without `exempt` a reader compares `won` against the rollup's
+        ///   `tickets` and sees two numbers that cannot both be right.
+        ///
+        /// `idled`/`ticketed` come from the idle-ledger delta and the group split.
+    pub(crate) fn log_lottery_summary(
+        &self,
+        clock: usize,
+        frame: super::step::LotteryFrame,
+        ticketed: usize,
+        idled: usize,
+    ) {
+        // The field the coin graded: live, non-crown, out of the born shield, with a
+        // reading — exactly `lottery_frame`'s filter, re-asked through the same helpers.
+        let mut graded = 0usize;
+        let mut p_sum = 0.0f32;
+        for h in self.state.live_hashes() {
+            if self.frozen_crown.contains(&h) || self.on_probation(&h, clock) {
+                continue;
+            }
+            if self.merit_per_ticket(&h).is_some() {
+                graded += 1;
+                    // The BLENDED probability, not the raw fraction: this line's
+                    // `won` is a draw against `p_eff`, so printing the raw p would
+                    // make `won ≈ graded · p̄` look violated whenever Ω < 1.
+                p_sum += self.train_lottery_p_eff(&h, clock, Some(frame));
+            }
+        }
+        // Budget spent: means over the nets that have ever had a ticket (a newborn's
+        // zeros would otherwise drag the averages).
+        let (mut upd_sum, mut tkt_sum, mut budgeted) = (0.0f32, 0.0f32, 0usize);
+        for h in self.state.live_hashes() {
+            let Some(s) = self.state.net(&h) else {
+                continue;
+            };
+            if s.measured_clocks() == 0 {
+                continue;
+            }
+            budgeted += 1;
+            upd_sum += s.step as f32;
+            tkt_sum += s.measured_clocks() as f32;
+        }
+        let mean = |sum: f32, n: usize| {
+            if n == 0 {
+                "—".to_string()
+            } else {
+                fmt_line(sum / n as f32)
+            }
+        };
+            // The frame is stored on the direction-adjusted (higher-is-better) scale;
+            // print it back in the row's own units so ↑ and ↓ read alike.
+        let (best, worst) = match self.fitness.direction() {
+            crate::utils::fitness::Direction::Maximize => (frame.best, frame.worst),
+            crate::utils::fitness::Direction::Minimize => (-frame.best, -frame.worst),
+        };
+        let won = graded.saturating_sub(idled);
+            // Runners the lottery did not grade: the born shield and the no-reading yet
+            // nets always take the ticket, so the rollup's `tickets` is this much larger
+            // than `won`.
+        let exempt = ticketed.saturating_sub(won);
+        let p_bar = (graded > 0).then(|| p_sum / graded as f32);
+        // The band rule, not 2dp: `expected` is computed from the same value, so a
+        // reader multiplying the PRINTED chance by `graded` must land on the
+        // printed expectation (2dp could miss by a tenth).
+        let p_txt = p_bar.map_or_else(|| "—".to_string(), fmt_line);
+        // Expected vs drawn, side by side: `p̄ × graded` is what the coin was worth,
+        // `won` is what it actually produced. The gap is the coin, not a bug.
+        let expected = p_bar.map_or_else(|| "—".to_string(), |p| fmt_line(p * graded as f32));
+        let omega = self.config.train_merit;
+        let body = format!(
+            "graded {} = won {} + idled {} │ ticketed {} = won {} + exempt {} │ avg ticket chance {} over the {} graded → expected {}, drawn {} │ field: best {} worst {} │ avg updates {} and avg tickets {} over the {} measured nets │ exempt = crown or born shield (always run)",
+            graded,
+            won,
+            idled,
+            ticketed,
+            won,
+            exempt,
+            p_txt,
+            graded,
+            expected,
+            won,
+            fmt_cfg(best),
+            fmt_cfg(worst),
+            mean(upd_sum, budgeted),
+            mean(tkt_sum, budgeted),
+            budgeted,
+        );
+        info!(
+            "step {} │ lottery (Ω {}, so p(ticket) = 1 − {} × (1 − p)) │ {}",
+            clock,
+            fmt_cfg(omega),
+            fmt_cfg(omega),
+            body,
+        );
     }
 }
 
@@ -759,107 +913,50 @@ pub(crate) fn elite_badge_entry(short: &str, seat_age: usize, j: usize) -> Strin
     if seat_age == 0 {
         format!("{short}(no seat)")
     } else if j == 0 {
-        format!("{short}(tenure {seat_age})")
+        format!("{short}(term {seat_age})")
     } else {
-        format!("{short}(tenure {seat_age}/{j})")
+        format!("{short}(term {seat_age}/{j})")
     }
 }
 
-/// `trained n/m` for the freeze lines: real optimizer updates over the clocks the net
-/// has LIVED (`entered_at_step` → now) — not the old absolute-clock delta.
+/// `trained n of m clocks` for the seat lines: real optimizer updates over the
+/// clocks the net has LIVED (`entered_at_step` → now) — not the old absolute-clock
+/// delta. The remainder is named too, so `20 of 45` does not leave the reader to
+/// work out where the other 25 went.
 pub(crate) fn trained_note(trainings: usize, age: usize) -> String {
-    format!("trained {trainings}/{age} clocks")
-}
-
-/// Append an event's detail on the SAME line, separated by ` · ` so an event is always
-/// one log line. Empty detail returns "" (no dangling separator).
-pub(crate) fn detail_inline(detail: &str) -> String {
-    if detail.is_empty() {
-        String::new()
+    if age > trainings {
+        format!(
+            "trained {trainings} of {age} clocks ({} no update)",
+            age - trainings
+        )
     } else {
-        format!(" · {detail}")
+        format!("trained {trainings} of {age} clocks")
     }
-}
-
-/// The elite gate in words for the freeze lines: the **join window** is the
-/// k-clock window a net must serve before it may hold a seat (it restarts at 0
-/// on every seat exit); `tenure` is the seat-age countdown against `j`.
-///
-/// Deliberately NOT a bare `probation`: the born **cull shield** is a different
-/// clock under a different rule — it never resets, and `unseated_reason` already
-/// prints `cull shield` for it. Naming both "probation" made the two
-/// indistinguishable in the log.
-pub(crate) fn elite_gate_note(join_age: usize, seat_age: usize, k: usize, j: usize) -> String {
-    let join = if join_age >= k {
-        format!("join window served ({join_age}≥{k})")
-    } else {
-        format!("join window {join_age}/{k}")
-    };
-    let tenure = if j == 0 {
-        format!("tenure {seat_age}")
-    } else {
-        format!("tenure {seat_age}/{j}")
-    };
-    format!(", {join}, {tenure}")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{detail_inline, elite_badge_entry, elite_gate_note, origin_cell, trained_note};
+    use super::{elite_badge_entry, origin_cell, trained_note};
 
     #[test]
     fn elite_badge_entry_says_whether_the_net_holds_a_seat() {
         // Seated: tenure out of the armed lifetime.
-        assert_eq!(elite_badge_entry("abc12345", 3, 5), "abc12345(tenure 3/5)");
+        assert_eq!(elite_badge_entry("abc12345", 3, 5), "abc12345(term 3/5)");
         // Elite but NOT seated (barred by the gate, or aged out) — the case
         // that used to print `(0/5)`, indistinguishable from a fresh seat.
         assert_eq!(elite_badge_entry("abc12345", 0, 5), "abc12345(no seat)");
         // Lifetime disarmed: no denominator invented.
-        assert_eq!(elite_badge_entry("abc12345", 4, 0), "abc12345(tenure 4)");
+        assert_eq!(elite_badge_entry("abc12345", 4, 0), "abc12345(term 4)");
     }
     #[test]
     fn trained_note_is_trainings_over_clocks_lived() {
-        // A net born at step 7 that trained 5 of its 12 lived clocks.
-        assert_eq!(trained_note(5, 12), "trained 5/12 clocks");
-            // The two counters can only agree when nothing was frozen, and
-            // `trainings ≤ age` always holds.
-        assert_eq!(trained_note(0, 0), "trained 0/0 clocks");
-    }
-
-    #[test]
-    fn detail_inline_keeps_an_event_on_one_line() {
-        // The seat line's bookkeeping: inline joins mid-line, never a wrap.
-        let tail = detail_inline(
-            "age 5 · trained 5/5 clocks · 10850 params, join window served (5≥5), tenure 0/5",
-        );
-        assert_eq!(
-            tail,
-            " · age 5 · trained 5/5 clocks · 10850 params, join window served (5≥5), tenure 0/5"
-        );
-        assert!(!tail.contains('\n'), "the seat line stays one log line: {tail}");
-        // Empty detail adds nothing — no dangling separator.
-        assert_eq!(detail_inline(""), "");
-    }
-
-    #[test]
-    fn elite_gate_note_never_prints_a_bar_that_was_overshot() {
-        // Still serving: numerator < k, plain fraction. Never a bare "probation" —
-        // this is the ELITE join window, not the born cull shield.
-        assert_eq!(elite_gate_note(3, 0, 5, 5), ", join window 3/5, tenure 0/5");
-        // Served and ticking on: reported as served, never `16/5`.
-        assert_eq!(
-            elite_gate_note(16, 2, 5, 5),
-            ", join window served (16≥5), tenure 2/5"
-        );
-        // Exactly at the bar is served, not "5/5 of the window remaining".
-        assert_eq!(
-            elite_gate_note(5, 5, 5, 5),
-            ", join window served (5≥5), tenure 5/5"
-        );
-        // k = 0: every net is served at once (the window is off).
-        assert_eq!(elite_gate_note(0, 0, 0, 5), ", join window served (0≥0), tenure 0/5");
-        // j = 0: no lifetime armed, so no denominator is invented.
-        assert_eq!(elite_gate_note(7, 0, 5, 0), ", join window served (7≥5), tenure 0");
+        // A net born at step 7 that trained 5 of its 12 lived clocks: the other
+        // 7 are named, not left for the reader to subtract.
+        assert_eq!(trained_note(5, 12), "trained 5 of 12 clocks (7 no update)");
+        // The two counters can only agree when nothing was withheld, and
+        // `trainings ≤ age` always holds.
+        assert_eq!(trained_note(0, 0), "trained 0 of 0 clocks");
+        assert_eq!(trained_note(12, 12), "trained 12 of 12 clocks");
     }
 
     use super::{accounting_population, accounting_rolls, summarize_rows};

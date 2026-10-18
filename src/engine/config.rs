@@ -224,16 +224,27 @@ pub struct RaceConfig {
     /// Anti-devolution A: the top-k nets act-and-measure without weight
     /// updates (see [`RaceConfigBuilder::set_elite_freeze`]). Default `true`.
     pub freeze_elites: bool,
-        /// EXPERIMENTAL training lottery. When ON, every clock each non-crown net
-        /// draws whether it earns a weight update this clock from its FINAL fitness per
-        /// training (`smt / state.step` — the risk-adjusted score, so λ is already paid),
-        /// as a fraction of the population's spread. A
-        /// skipped net still ACTS and is measured (same act-and-measure path as the
-        /// crown freeze), so ranking, culling and the guardrail see a fresh reading.
-        /// Default `false` = every non-frozen net trains every clock, as before.
-        /// Replay-relevant: which clocks were act-only is persisted per net
-        /// (`frozen_spans`), so a resumed run must use the same setting.
-    pub evolution_train_lottery: bool,
+        /// EXPERIMENTAL train-eval lottery strength, Ω (`set_run_train_merit`): how much
+        /// of this clock's budget the merit decides. `0.0` (default) = OFF — no coin is
+        /// drawn and every non-crown net runs, as before; `1.0` = full merit weighting;
+        /// `0.5` = half the withholding. NOT the merit's scale: `p` is a min-max
+        /// FRACTION of the field, so scaling every merit by Ω would cancel out and only
+        /// `0` would differ. Ω blends what the lottery actually applies — the
+        /// withholding: `p_eff = 1 − Ω·(1 − p)`, which is λ-shaped (one scalar, `0` is
+        /// "no effect"), keeps the two endpoints exact, and gives the worst net a
+        /// standing `1 − Ω` chance instead of the permanent `p = 0` starvation.
+        ///
+        /// When it is above 0, each non-crown net's clock is a merit-weighted coin for a
+        /// TRAIN-EVAL TICKET — the whole step, the optimizer update AND the evaluation
+        /// that follows it — graded by its FINAL fitness per ticket
+        /// (`smt / measured clocks`; the risk-adjusted score, so λ is already paid)
+        /// against the population's own spread. A net that loses the coin IDLES: no
+        /// train batch, no eval batch, no metric row, no weight update, so nothing it is
+        /// ranked on moves and no compute is spent measuring it.
+        ///
+        /// Replay-relevant: the idle clocks are persisted per net (`idle_spans`), the
+        /// resume replays that ledger, and a resume at a different Ω is refused by name.
+    pub train_merit: f32,
         /// Per-net smoothed-fitness rolling window (K) — how many recent step fitnesses every
         /// ranking decision averages over. Defaults to [`SMOOTHING_WINDOW`].
     pub smoothing_window: usize,
@@ -293,8 +304,9 @@ pub struct RaceConfig {
     pub metrics: Vec<Metric>,
     /// The training paradigm / problem space target.
     pub mode: RunMode,
-        /// Whether to write `history.csv` (per live net per step) and `attempts.csv` (per
-        /// evolution attempt) — separate files, separate headers. No `options.csv`.
+        /// Whether to write `history.csv` (one row per live net per clock it was TRAINED
+        /// AND SCORED on — an idle lottery clock has nothing to record) and `attempts.csv`
+        /// (per evolution attempt) — separate files, separate headers. No `options.csv`.
     pub csv_export: bool,
         /// Flush `history.csv` after EVERY step instead of at checkpoint/stop boundaries.
         /// Default false; true = zero-loss history at a file write per step.
@@ -504,7 +516,7 @@ impl RaceConfig {
             mutation_cull_policy: MutationCullPolicy::Worst,
             elite_count: 1,
             freeze_elites: true,
-            evolution_train_lottery: false,
+            train_merit: 0.0,
             elite_join_probation_steps: 5,
             elite_crown_lifetime_steps: 5,
             smoothing_window: SMOOTHING_WINDOW,
@@ -608,6 +620,17 @@ impl RaceConfigBuilder {
         self.cfg.checkpoint_every = n;
         self
     }
+        /// Flush `history.csv` / `attempts.csv` on every clock instead of only at the
+        /// checkpoint tick (`set_run_checkpoint_every`). Durability cadence, not replay
+        /// semantics: default `false` loses at most `checkpoint_every` clocks of history
+        /// to a `kill -9`, `true` loses none and pays one file write per clock.
+        ///
+        /// It was an engine field with no setter (and an example flag the overlay
+        /// parsed and dropped), so "flush every step" was unreachable from the builder.
+    pub fn set_run_history_flush_each(mut self, each: bool) -> Self {
+        self.cfg.history_flush_each = each;
+        self
+    }
     /// Set crossover rolls per step.
     pub fn set_crossover_rolls(mut self, n: usize) -> Self {
         self.cfg.crossover_rolls = n;
@@ -642,29 +665,38 @@ impl RaceConfigBuilder {
         self.cfg.freeze_elites = yes;
         self
     }
-        /// EXPERIMENTAL: the training lottery (default `false` = off, every non-frozen
-        /// net trains every clock).
+        /// EXPERIMENTAL: the train-eval lottery's strength Ω (default `0.0` = OFF, every
+        /// non-frozen net runs every clock).
         ///
-        /// When ON, each non-crown net's clock is a weighted coin: with probability
-        /// `p` it takes the real optimizer step, otherwise it takes the same
-        /// act-and-measure pass the crown freeze uses (fresh batch, fresh reading, no
-        /// weight change). `p` is the net's **merit** — its FINAL fitness (the same
-        /// risk-adjusted score `smt = μ − λσ` the ranking uses, so a risky net already
-        /// paid for its spread) divided by the trainings it has spent (`state.step`,
-        /// not the clock) — mapped onto `[0, 1]` against the population's own spread,
-        /// so 1 is the best score-per-update and 0 the worst. Training a net grows its
-        /// denominator, so
-        /// its merit decays and the budget rotates: this is a self-limiting allocation,
-        /// not a leader lock-in.
+        /// Ω is an ALLOCATION dial, not a merit scale, and it is λ-shaped: `0.0` means
+        /// the engine may as well not know about the lottery (no coin, no idle clocks,
+        /// no ledger entries), `1.0` is the full merit weighting, and anything between
+        /// withholds that fraction of the tickets the field would have withheld. It is
+        /// implemented on `p` itself — `p_eff = 1 − Ω·(1 − p)` — because `p` is a min-max
+        /// FRACTION of the field: multiplying the merits by Ω would cancel in that
+        /// fraction and leave no middle. Scaling the withholding does not: at `Ω = 0.5`
+        /// the worst net keeps a 0.5 chance rather than a permanent 0.
+        ///
+        /// With Ω > 0, each non-crown net's clock is a weighted coin for a TRAIN-EVAL
+        /// TICKET — it runs the trainer (optimizer update AND the evaluation after it,
+        /// which live in one `train_step`) or it IDLES, doing neither, so its reading,
+        /// its update count and its merit are unchanged. `p` is the net's **merit** —
+        /// its FINAL fitness (the same risk-adjusted `smt = μ − λσ` the ranking uses, so
+        /// a risky net already paid for its spread) divided by the clocks that actually
+        /// trained and scored it (`state.step` plus its crown act-and-measure passes; an
+        /// idle clock is not in there) — mapped onto `[0, 1]` against the population's
+        /// own spread, so 1 is the best score-per-ticket and 0 the worst. Spending a
+        /// ticket grows a net's denominator, so its merit decays and the budget rotates:
+        /// a self-limiting allocation, not a leader lock-in.
         ///
         /// Two floors by design: a net inside its born shield (`on_probation`) and a
-        /// crown member always take the real path, and a net with no trainings yet has
-        /// no ratio to grade. The draw is deterministic in `(run_seed, clock, net hash)`
-        /// — never the loop order — so a resume replays the same decisions. Replay-relevant:
-        /// the act-only clocks are persisted (`frozen_spans`) and a resume at a different
-        /// setting is refused by name.
-    pub fn set_run_train_merit(mut self, enabled: bool) -> Self {
-        self.cfg.evolution_train_lottery = enabled;
+        /// crown member always get the ticket, and a net with no ticket yet has no ratio
+        /// to grade. The draw is deterministic in `(run_seed, clock, net hash)` at a
+        /// FIXED Ω — never the loop order — so a resume replays the same decisions; a
+        /// resume at a different Ω is refused by name (the idle ledger describes a
+        /// different search).
+    pub fn set_run_train_merit(mut self, omega: f32) -> Self {
+        self.cfg.train_merit = omega.clamp(0.0, 1.0);
         self
     }
         /// Per-net smoothed-fitness rolling window (K). Default [`SMOOTHING_WINDOW`] = 10.

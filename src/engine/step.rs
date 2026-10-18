@@ -5,6 +5,7 @@
 //! ```text
 //! step_one_net(hash, clock)
 //!   ├─ elite freeze check (ANTI-DEVOLUTION A) → act-and-measure pass (NoopOptimizer)
+//!   ├─ train-eval lottery denies the ticket   → idle pass (no train, no eval)
 //!   └─ run_trainer_step_with_real_optimizer(hash, clock)
 //!        └─ run_trainer_step(hash, clock, optimizer)
 //!             ├─ seed_step_randomness(net_seed, clock)   (fastrand + libtorch)
@@ -48,10 +49,11 @@ impl CoreEngine {
         /// [`Self::step_one_net_in_frame`], so every net in a clock is graded against the
         /// same pre-clock snapshot (and the population walk happens once, not per net).
         ///
-        /// Two rules can turn the clock into an act-and-measure pass instead of an
-        /// update, and both use the SAME path ([`Self::act_only_step`]): the crown
-        /// freeze (anti-devolution, unconditional) and the training lottery
-        /// (`evolution_train_lottery`, a merit-weighted coin).
+        /// Three outcomes per clock. The crown freeze (anti-devolution,
+        /// unconditional) still ACTS AND MEASURES without the optimizer step. The
+        /// training lottery (`train_merit` Ω > 0, a merit-weighted coin) sells a
+        /// TRAIN-EVAL TICKET: no ticket means the net idles — no batch, no forward, no
+        /// eval, no metrics, so nothing it is ranked on moves. Everyone else updates.
     #[cfg(test)]
     pub(crate) fn step_one_net(&mut self, hash: &str, clock: usize) -> Result<()> {
         let frame = self.lottery_frame(clock);
@@ -68,13 +70,14 @@ impl CoreEngine {
             // ANTI-DEVOLUTION A — elite freeze: the crown holds the nets that skip
             // the trainer update this step; scoring proceeds off carried metrics.
         if self.frozen_crown.contains(hash) {
-            return self.act_only_step(hash, clock, "FROZEN (elite)", false);
+            return self.act_only_step(hash, clock, "FROZEN (elite)");
         }
-            // TRAINING LOTTERY (experimental, off by default): a non-crown net may sit
-            // this clock out. It still acts and is measured, so the ranking is fresh and
-            // the cull still sees it — only the optimizer step is withheld.
+            // TRAIN-EVAL LOTTERY (experimental, off by default): a non-crown net may be
+            // denied this clock's ticket. It then IDLES — no train batch, no eval batch,
+            // no weight update — so its reading, its update count and every number
+            // derived from them stay exactly where its last ticket left them.
         if !self.train_lottery_draws(hash, clock, frame) {
-            return self.act_only_step(hash, clock, "ACT-ONLY (train lottery)", true);
+            return self.idle_step(hash, clock);
         }
             // One step = whatever the caller's training scheme does; the engine only
             // consumes the report. Challenges are the trainer's business.
@@ -128,20 +131,16 @@ impl CoreEngine {
         Ok(())
     }
 
-        /// The shared ACT-AND-MEASURE pass: the net plays a real step (fresh batch,
+        /// The CROWN's act-and-measure pass: the net plays a real step (fresh batch,
         /// honest standing) and its weight update is DISCARDED (no-op optimizer).
         ///
-        /// `why` names the cause for the debug line. `budget_skip` marks the lottery's
-        /// flavour so its own counter (`NetState::budget_skips`) can be kept apart from
-        /// crown freezes — the REPLAY ledger (`frozen_spans`) is the same for both, since
-        /// a resume must re-run either through the no-op optimizer.
-    fn act_only_step(
-        &mut self,
-        hash: &str,
-        clock: usize,
-        why: &str,
-        budget_skip: bool,
-    ) -> Result<()> {
+        /// It is measured on purpose — a frozen champion must still be ranked and
+        /// culled on current data — and the clock is recorded in `frozen_spans`, so a
+        /// resume re-runs it through the no-op optimizer. The lottery no longer takes
+        /// this path: a denied ticket means a fully idle clock (`idle_step`).
+        ///
+        /// `why` names the cause for the debug line (currently always the crown).
+    fn act_only_step(&mut self, hash: &str, clock: usize, why: &str) -> Result<()> {
         let mut noop = NoopOptimizer;
         let report = self.run_trainer_step(hash, clock, &mut noop)?;
         let metrics = NetMetrics {
@@ -166,11 +165,6 @@ impl CoreEngine {
             // Act-and-measure records WITHOUT advancing the clock: `state.step` counts
             // trainings, and `last_update_step` must not rotate.
         self.state.record_frozen_act(hash, metrics.clone())?;
-        if budget_skip {
-            if let Some(state) = self.state.net_mut(hash) {
-                state.budget_skips += 1;
-            }
-        }
         tracing::debug!(
             "step {} │ net {} │ {why} — acted+measured fitness{} {} (no weight update)",
             clock,
@@ -181,42 +175,78 @@ impl CoreEngine {
         Ok(())
     }
 
-    // ── The training lottery ────────────────────────────────────────────────
+        /// The IDLE pass: the lottery denied this clock's train-eval ticket, so the net
+        /// does NOTHING — no train batch, no forward/backward, no eval batch, no metrics
+        /// row, no weight update, no RNG reseed.
+        ///
+        /// Recording nothing is the point: `last_metrics`, `state.step` and the rolling
+        /// windows keep the values of the net's last ticket, so `smt`, its rank and its
+        /// merit are bit-identical across an idle clock. Only the idle ledger and its
+        /// count move, and `history.csv` writes no row (nothing was measured).
+        ///
+        /// The clock still ages the net elsewhere (`refresh_crown` ticks the probation /
+        /// seat counters for every live net): an idle net is untrained, not frozen in the
+        /// race.
+    pub(crate) fn idle_step(&mut self, hash: &str, clock: usize) -> Result<()> {
+        let state = self.state.net_mut(hash).ok_or_else(|| {
+            crate::utils::error::EngineError::InvalidOptions(format!(
+                "race: net {hash} not live (no NetState in memory)"
+            ))
+        })?;
+        state.record_idle_step(clock);
+        tracing::debug!(
+            "step {} │ net {} │ IDLE (train lottery) — no train, no eval",
+            clock,
+            &hash[..8.min(hash.len())],
+        );
+        Ok(())
+    }
 
-        /// A net's MERIT under the lottery: its FINAL fitness per CLOCK LIVED — the
-        /// same risk-adjusted score (`smt = μ ∓ λσ`) the ranking decides on, divided by
-        /// `clock − entered_at_step + 1`. With λ = 0 that is the window mean per clock;
-        /// with λ > 0 the spread it is charged for is already paid, so the lottery and
-        /// the ranking never disagree about which net is ahead.
+    // ── The train-eval lottery ──────────────────────────────────────────────
+
+        /// A net's MERIT under the lottery: its FINAL fitness per TICKET — the same
+        /// risk-adjusted score (`smt = μ ∓ λσ`) the ranking decides on, divided by the
+        /// clocks that actually ran the trainer and scored it (`measured_clocks` = real
+        /// updates + crown act-and-measure passes). With λ = 0 that is the window mean
+        /// per ticket; with λ > 0 the spread it is charged for is already paid, so the
+        /// lottery and the ranking never disagree about which net is ahead.
         ///
-        /// The denominator is CLOCKS, not trainings. A skipped clock still ages the net
-        /// (`budget_skips` grows, `state.step` does not), so counting updates would let
-        /// sitting out freeze the divisor while every trained peer's grew — being skipped
-        /// would itself be a way to climb the field. Clocks lived grows for everyone every
-        /// clock, skipped or not, so the ratio can only improve by actually scoring better.
+        /// The denominator is TICKETS, not clocks lived, and that is what makes the
+        /// ticket an honest cost unit: a clock the net was denied costs it nothing (no
+        /// train batch, no eval batch, no measurement), so charging it there would
+        /// penalise the net twice for one decision and make its metric decay while the
+        /// numerator stood still. Idling therefore leaves the ratio untouched, and the
+        /// budget rotates on the merits themselves.
         ///
-        /// The cost, accepted: the metric no longer says how EFFICIENTLY a net spent its
-        /// updates (two nets born together divide by the same number however many updates
-        /// each bought); it says how well the net scored per clock of life.
+        /// The budget consequence, accepted: a net that idles keeps its ratio while a
+        /// trained peer's denominator grows, so it can climb back into the field. That is
+        /// the allocation working — a permanently worst net can still sit at p = 0 until
+        /// its merits move or it is culled, which is the cull's job, not decay's.
         ///
-        /// `None` when it has no reading yet (a newborn, also inside its born shield).
-        /// The divisor is at least 1 (`saturating_sub` + 1), so there is no zero guard.
-    pub(crate) fn merit_per_clock(&self, hash: &str, clock: usize) -> Option<f32> {
+        /// `None` when there is no reading or no ticket yet (a newborn, also inside its
+        /// born shield). Zero tickets cannot happen for a net the field grades — a
+        /// reading comes from a recorded clock — but a test fixture can seed a buffer
+        /// directly, so the guard keeps ∞ out of the field rather than trusting that.
+    pub(crate) fn merit_per_ticket(&self, hash: &str) -> Option<f32> {
         let state = self.state.net(hash)?;
-        let lived = clock.saturating_sub(state.entered_at_step) + 1;
-        let merit = self.smoothed_fitness_of(hash)? / lived as f32;
+        let tickets = state.measured_clocks();
+        if tickets == 0 {
+            return None;
+        }
+        let merit = self.smoothed_fitness_of(hash)? / tickets as f32;
         merit.is_finite().then_some(merit)
     }
 
         /// The clock's lottery field: the best/worst merit among the nets the lottery
         /// actually grades (live, non-crown, out of their born shield, with a ratio).
-        /// `None` when the lottery is off or nobody qualifies (no spread ⇒ abstain).
+        /// `None` when the lottery is off (`Ω = 0`), the field is not armed yet, or
+        /// nobody qualifies (no spread ⇒ abstain).
         ///
         /// The merits come from data the engine already carries — each net's K-reading
-        /// rolling window (`race_reading_of`) and its training count (`state.step`) — so
-        /// the field costs ONE walk per clock and no new per-step bookkeeping.
+        /// rolling window (`race_reading_of`) and its ticket count (`measured_clocks`) —
+        /// so the field costs ONE walk per clock and no new per-step bookkeeping.
     pub(crate) fn lottery_frame(&self, clock: usize) -> Option<LotteryFrame> {
-        if !self.config.evolution_train_lottery || !self.lottery_armed(clock) {
+        if self.train_merit_omega() <= 0.0 || !self.lottery_armed(clock) {
             return None;
         }
         let direction = self.fitness.direction();
@@ -230,7 +260,7 @@ impl CoreEngine {
             if self.frozen_crown.contains(&h) || self.on_probation(&h, clock) {
                 continue;
             }
-            if let Some(m) = self.merit_per_clock(&h, clock) {
+            if let Some(m) = self.merit_per_ticket(&h) {
                 let q = quality(m);
                 best = best.max(q);
                 worst = worst.min(q);
@@ -249,7 +279,7 @@ impl CoreEngine {
         /// but do not re-disarm the field: otherwise a run with live mutation/crossover
         /// would never reach a shield-free clock and the lottery would never engage.
         /// Crossover, mutation and the elite rules are untouched by this: they operate as
-        /// before, the lottery only decides who spends a weight update.
+        /// before, the lottery only decides who gets this clock's train-eval ticket.
     fn lottery_armed(&self, clock: usize) -> bool {
         self.state.live_hashes().iter().all(|h| {
             // Only the STARTING population gates the arming; `entered_at_step == 0` is
@@ -263,10 +293,14 @@ impl CoreEngine {
         })
     }
 
-        /// `p(train)` for this clock: the net's merit (final fitness per clock lived) as a
+        /// `p(ticket)` for this clock: the net's merit (final fitness per ticket) as a
         /// FRACTION of the clock's field — 1 = the best, 0 = the worst. `1.0` (always
         /// train) for the crown, a net inside its born shield, a net with no ratio yet,
         /// and a flat field (no spread = no signal, so the lottery abstains).
+        ///
+        /// This is the RAW fraction at `Ω = 1`. The coin, and every log line that
+        /// claims what it will do, read [`Self::train_lottery_p_eff`], which blends it
+        /// toward "always train" by Ω.
     pub(crate) fn train_lottery_p(
         &self,
         hash: &str,
@@ -279,7 +313,7 @@ impl CoreEngine {
         if self.frozen_crown.contains(hash) || self.on_probation(hash, clock) {
             return 1.0;
         }
-        let Some(mine) = self.merit_per_clock(hash, clock) else {
+        let Some(mine) = self.merit_per_ticket(hash) else {
             return 1.0;
         };
             // Higher-is-better scale: Maximize keeps the merit, Minimize negates it, so
@@ -292,7 +326,40 @@ impl CoreEngine {
         Self::merit_fraction(q, frame.best, frame.worst)
     }
 
-        /// The lottery's coin: did this net EARN a weight update this clock?
+        /// The lottery's strength Ω (`set_run_train_merit`), clamped to `[0, 1]`.
+        ///
+        /// Ω scales what the lottery actually APPLIES — the withholding — never the
+        /// merit itself: `p_eff = 1 − Ω·(1 − p)`. Scaling the merits would cancel out,
+        /// because `p` is a min-max FRACTION of the field (`Ω·m ÷ Ω·best` = `m ÷ best`),
+        /// so only `Ω = 0` would change anything. This form keeps both endpoints exact
+        /// (`0` ⇒ `p_eff = 1` ⇒ no draws at all; `1` ⇒ the full merit weighting) and is
+        /// linear in between, λ-style, with the worst net keeping a standing `1 − Ω`
+        /// chance instead of the permanent `p = 0` starvation.
+    pub(crate) fn train_merit_omega(&self) -> f32 {
+        self.config.train_merit.clamp(0.0, 1.0)
+    }
+
+        /// [`Self::train_lottery_p`] with the clock's Ω blend applied — the number the
+        /// coin actually compares against, and the one the logs print.
+        ///
+        /// `Ω = 0` returns `1.0` for everyone without consulting the field, i.e. the
+        /// lottery is fully off and the engine works on the metric alone.
+    pub(crate) fn train_lottery_p_eff(
+        &self,
+        hash: &str,
+        clock: usize,
+        frame: Option<LotteryFrame>,
+    ) -> f32 {
+        let omega = self.train_merit_omega();
+        let p = self.train_lottery_p(hash, clock, frame);
+        1.0 - omega * (1.0 - p)
+    }
+
+        /// The lottery's coin: did this net EARN a train-eval ticket this clock?
+        ///
+        /// A ticket is the whole step — weight update AND the measurement that follows
+        /// it — because every trainer runs the two inside one `train_step` call. A `true`
+        /// means train + eval; a `false` means idle (neither), never "eval only".
         ///
         /// Deterministic in `(run_seed, clock, hash)` — never the loop order and never a
         /// shared RNG — so a resume replays exactly the same decisions, and a reordered
@@ -304,7 +371,7 @@ impl CoreEngine {
         clock: usize,
         frame: Option<LotteryFrame>,
     ) -> bool {
-        let p = self.train_lottery_p(hash, clock, frame);
+        let p = self.train_lottery_p_eff(hash, clock, frame);
         if p >= 1.0 {
             return true;
         }
@@ -317,7 +384,7 @@ impl CoreEngine {
     }
 
     /// Map a merit onto `[0, 1]` against the population's own spread, on a
-    /// higher-is-better scale: `1.0` = the best level-per-clock, `0.0` = the worst.
+    /// higher-is-better scale: `1.0` = the best level-per-ticket, `0.0` = the worst.
     ///
     /// A flat population (`best <= worst`) has no signal, and a non-finite merit
     /// (NaN/∞) cannot be graded — both return `1.0`, i.e. the lottery abstains and
@@ -326,8 +393,10 @@ impl CoreEngine {
     /// Why min-max rather than `merit / best`: this form is bounded for BOTH
     /// directions and for negative readings (a Minimize loss, a shaped reward), and it
     /// needs no divide-by-zero guard. The cost is that the current worst net gets
-    /// exactly 0 — self-correcting, because a skipped net's denominator stays put while
-    /// every trained net's grows, so its merit climbs back above the field.
+    /// exactly 0 — self-correcting, because an idle net's ticket count stays put while
+    /// every trained peer's grows, so its ratio climbs back into the field. Ω also puts
+    /// a standing floor under it: the coin sees `1 − Ω·(1 − 0) = 1 − Ω`, so the worst
+    /// net still runs a share of clocks unless Ω is 1.
     pub(crate) fn merit_fraction(q: f32, best: f32, worst: f32) -> f32 {
         if !q.is_finite() || !best.is_finite() || !worst.is_finite() || best <= worst {
             return 1.0;

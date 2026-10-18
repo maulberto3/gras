@@ -297,7 +297,7 @@ pub fn agreement_verdict_noisy(
             .unwrap_or_else(|| "an undeclared number of readings".to_string());
         let exam = format!("{matches_scored} unseen game(s)");
         let exam_note = exam_se
-            .map(|e| format!(", ±2·SE {} of its own", fmt_line(2.0 * e)))
+            .map(|e| format!(", a 2 × SE band of {} around its own mean", fmt_line(2.0 * e)))
             .unwrap_or_default();
                 // Freshness clause (only when worth stating): a LATEST reading far from the
                 // window mean disambiguates a "collapsed" verdict. Phrased neutrally.
@@ -323,7 +323,7 @@ pub fn agreement_verdict_noisy(
         }
         if a.grade == AgreementGrade::Borderline {
             return format!(
-                "borderline ⚠️ — the exam ({exam}{exam_note}) is {} under the race reading ({:.0}% of it), just outside the {} band of combined sampling error ({}×, race SE {} over {race_n}). The two readings disagree but barely: quote the exam (it is the tighter estimate — {race_n} cannot resolve better than ±2·SE {}) and re-run with a longer smoothing window before calling it a collapse. The forecast from a short window is what is failing here, not necessarily the policy.{latest_note}",
+                "borderline ⚠️ — the exam ({exam}{exam_note}) is {} under the race reading ({:.0}% of it), just outside the {} band of combined sampling error ({}×, race SE {} over {race_n}). The two readings disagree but barely: quote the exam (it is the tighter estimate — {race_n} cannot resolve better than a 2 × SE band of {}) and re-run with a longer smoothing window before calling it a collapse. The forecast from a short window is what is failing here, not necessarily the policy.{latest_note}",
                 fmt_line(shortfall),
                 rel * 100.0,
                 fmt_line(band),
