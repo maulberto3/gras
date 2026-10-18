@@ -66,7 +66,7 @@ impl Serialize for Topology {
 impl<'de> Deserialize<'de> for Topology {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let spec = Spec::deserialize(deserializer)?;
-        Ok(Topology {
+        let mut topology = Topology {
             id: spec.id,
             nodes: spec.nodes,
             options: spec.options,
@@ -76,7 +76,14 @@ impl<'de> Deserialize<'de> for Topology {
             // Reproducibility: the RNG is re-seeded from options.topology_seed, so
             // a loaded graph regenerates wiring identically to a fresh one.
             rng: Rng::with_seed(spec.options.topology_seed as u64),
-        })
+        };
+            // Reading is the ONE place old wiring enters the process, and a run recorded
+            // before the one-wire-per-port refactor may stack wires on a port. Split them
+            // here so every in-memory graph satisfies the invariant `validate` enforces —
+            // the engine's inheritance path loads the previous run's `nets/*.json`
+            // automatically, so a raw loaded graph must never be unusable.
+        topology.unstack_input_ports();
+        Ok(topology)
     }
 }
 

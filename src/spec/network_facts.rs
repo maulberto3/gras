@@ -69,7 +69,6 @@ impl NetworkFacts {
                 .port_projections
                 .iter()
                 .flatten()
-                .flatten()
                 .filter(|p| p.is_some())
                 .count(),
             node_dims: net.node_dims.clone(),
