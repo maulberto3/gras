@@ -1,10 +1,12 @@
 //! Reference tabular trainer — the classic recipe, now EXAMPLE-OWNED.
 //!
 //! The library ships the [`TabularStep`] contract only; a concrete scheme is
-//! the caller's to own and edit. This module is the shared copy the examples
-//! and benches use, so they don't each re-derive Adam + batch + eval plumbing.
-//! `examples/mnist.rs` instead hand-rolls its own trainer from scratch, which
-//! is the recommended path when you want to change anything.
+//! the caller's to own and edit. This module is the copy the benches include
+//! (there is no `main` here — it is not an example binary), mirroring the
+//! `#[cfg(test)]`-only `src/trainer/supervised.rs`, so a benchmark run does not
+//! re-derive Adam + batch + eval plumbing. `examples/mnist.rs` instead
+//! hand-rolls its own trainer from scratch, which is the recommended path when
+//! you want to change anything.
 //!
 //! Recipe: one `deterministic_train_step` on the step's shared train batch,
 //! then one `eval_one_step` on the step's shared eval batch.

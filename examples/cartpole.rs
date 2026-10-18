@@ -22,7 +22,8 @@ use fastrand::Rng;
 // Not in the prelude: the engine's own durability-tick default, cited by the config
 // chain below so the showcased value can't drift from the engine's.
 use gras::engine::config::DEFAULT_CHECKPOINT_EVERY;
-// The one sanctioned spelling of a sampled mean — `μ… ±σ… (SE …, n=…)`.
+// The one sanctioned spelling of a sampled mean —
+// `avg … (spread …; SE … = spread/√n, n=…)`.
 use gras::engine::format::{ReadingStyle, fmt_reading};
 use gras::prelude::*;
 /// One played turn: the observation, and the action taken from it.
@@ -483,10 +484,10 @@ fn report_guardrail(engine: &mut RlEngine, baseline: f64) {
     let smoothed_note = match v.race_smoothed {
         Some(s) => match v.race_se {
             Some(se) if v.race_samples > 0 => format!(
-                " (race smoothed {s:.1} ±{se:.1} SE over {} step reading(s))",
+                " (race smoothed avg {s:.1} with SE {se:.1} over {} step readings)",
                 v.race_samples
             ),
-            _ => format!(" (race smoothed {s:.1}, no window spread recorded)"),
+            _ => format!(" (race smoothed avg {s:.1}, no window spread recorded)"),
         },
         None => String::new(),
     };
@@ -495,7 +496,10 @@ fn report_guardrail(engine: &mut RlEngine, baseline: f64) {
     } else if holdout > 4.0 * baseline as f32 {
         "well above random baseline 👍"
     } else {
-        "weak — REINFORCE may have collapsed ❌"
+            // "Weak" here is the POLICY's absolute level, not a disagreement with the
+            // race reading — say which, so it cannot be read as contradicting the
+            // guardrail card's `status` (that grades exam-vs-race, a different question).
+        "far below the 500-turn target — REINFORCE may have collapsed ❌"
     };
     println!(
         "guardrail: holdout survival {exam} of {MAX_TURNS_PER_MATCH} turns{smoothed_note} — {verdict}"
@@ -521,8 +525,8 @@ const EVAL_MATCHES_PER_STEP: usize = 5;
 const RISK_AVERSION: f32 = 0.0;
 
 /// The smoke-test CLI: `--pop`, `--max-steps`, `--seed`, `--log-level`,
-/// `--risk-aversion`, `--train-lottery`. Everything else is a const above — clap
-/// rejects any other flag at the usage line.
+/// `--risk-aversion`, `--train-lottery [OMEGA]`. Everything else is a const above —
+/// clap rejects any other flag at the usage line.
 #[derive(clap::Parser, Debug)]
 #[command(
     name = "cartpole",
@@ -546,12 +550,14 @@ struct Cli {
     /// the `RISK_AVERSION` const).
     #[arg(long, value_name = "F32", visible_alias = "risk-based")]
     risk_aversion: Option<f32>,
-    /// EXPERIMENTAL train-eval lottery: a seeded, merit-weighted coin decides which
-    /// non-crown nets get this clock's ticket (train + eval, scored per clock spent).
-    /// A denied net IDLES: no train, no eval, no reading — nothing it is ranked on
-    /// moves. Off by default.
-    #[arg(long)]
-    train_lottery: bool,
+    /// EXPERIMENTAL train-eval lottery strength Ω: a seeded, merit-weighted coin
+    /// decides which non-crown nets get this clock's ticket (train + eval, scored
+    /// per clock spent). A denied net IDLES: no train, no eval, no reading — nothing
+    /// it is ranked on moves. Ω = 1 is the full merit tilt, 0.5 half the withholding,
+    /// 0 (or omitting the flag) is OFF — the plain metric path. `--train-lottery`
+    /// with no value means 1.0, so the old switch still works.
+    #[arg(long, value_name = "OMEGA", num_args = 0..=1, default_missing_value = "1.0")]
+    train_lottery: Option<f32>,
     /// Log level (default: the `LOG_LEVEL` const). `none`/`summ`/`minimal` pick
     /// the shape; `debug`/`trace` add the engine's per-roll detail.
     #[arg(
@@ -601,7 +607,7 @@ fn main() {
         .set_run_pop_size(cli.pop.unwrap_or(POP))
         .set_run_smoothing_window(10)
         .set_run_risk_aversion(cli.risk_aversion.unwrap_or(RISK_AVERSION))
-        .set_run_train_merit(cli.train_lottery)
+        .set_run_train_merit(cli.train_lottery.unwrap_or(0.0))
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra history.csv column
         // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
         // .set_run_topologies(vec![])

@@ -17,7 +17,10 @@ loaded (see the note at the bottom for why):
   node<N>.weight / node<N>.bias              — one Linear per graph node
   proj<N>_<port>_<src>.weight / .bias        — one Linear per cross-dim bridge
                                                (a wire whose source and target
-                                               node dims differ)
+                                               node dims differ). `<src>` is the
+                                               wire's index within the port, and
+                                               gras wires ONE wire per input port,
+                                               so it is always 0.
 
 Requirements: `pip install safetensors torch` (numpy optional). Test:
 

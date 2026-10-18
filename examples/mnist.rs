@@ -271,14 +271,46 @@ const CHECKPOINT_EVERY: usize = 5;
 const CHALLENGE_PROB: f32 = 0.15;
 const MUTATE_PROB: f32 = 0.5;
 const LOG_LEVEL: LogLevel = LogLevel::Summ;
+/// FIT risk aversion λ: window σs an accuracy pays for its own spread, so a net
+/// that is steadily 0.90 outranks one alternating 0.80 and 1.00. `0.0` ranks on
+/// the plain window mean.
+const RISK_AVERSION: f32 = 0.5;
+
+// ── Evolution knobs ────────────────────────────────────────────────────
+/// Top-k cull immunity AND the exported elite pair count.
+const ELITE_COUNT: usize = 5;
+/// Clocks a fresh net must train before it may hold a crown seat.
+const ELITE_JOIN_PROBATION: usize = 3;
+/// Clocks a net may sit at peak before the crown rotates it (`0` = never).
+const ELITE_CROWN_LIFETIME: usize = 0;
+/// Cull-immunity for a crossover child / an immigrant before it is ranked.
+const CROSSOVER_PROBATION: usize = 5;
+const MUTATION_PROBATION: usize = 5;
+/// Parent draw for crossover. Tournament is the steadier of the two pools:
+/// it resists one lucky reading the way roulette does not.
+const CROSSOVER_TOURNAMENT_SIZE: usize = 3;
+
+// ── Search-space pools ─────────────────────────────────────────────────
+/// The OP pools the topology draw samples from. An empty pool = the engine's
+/// full set; naming them is how an example keeps a search focused (and how a
+/// run stays comparable with an earlier one after the engine grows an op).
+/// Every label is validated at run start — a typo fails loudly, never silently.
+const COMBINE_OPS: [&str; 3] = ["add", "mean", "mul"];
+const ACTIVATIONS: [&str; 5] = ["relu", "gelu", "silu", "tanh", "leaky_relu"];
+const STANDARDIZE_OPS: [&str; 3] = ["identity", "layernorm", "rmsnorm"];
+/// Input-port split. `Exclusive` is a true partition: no two branches can see
+/// the same feature, so no net can double-count a pixel.
+const FEATURE_SPLIT: FeatureSplitPolicy = FeatureSplitPolicy::Exclusive;
 
 /// The CLI is an OVERLAY on the consts, never a second source of truth: the
-/// shared two-flag smoke surface, plus the one real input (where the data is).
+/// shared engine surface ([`cli::EngineArgs`] — pop/steps/seed/λ/Ω/founders,
+/// the evolution knobs and `--history-flush`), plus the one real input (where
+/// the data is). Anything left unset falls back to the const panel above.
 #[derive(Parser, Debug)]
 #[command(name = "mnist", about = "Hand-rolled tabular trainer on MNIST.")]
 struct Cli {
     #[command(flatten)]
-    smoke: cli::SmokeArgs,
+    engine: cli::EngineArgs,
 
     /// Dataset directory (any gras-format dataset works).
     #[arg(long, value_name = "DIR")]
@@ -287,7 +319,7 @@ struct Cli {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    cli::init_logger(LOG_LEVEL, cli.smoke.log_level.as_deref());
+    cli.engine.init_logger(LOG_LEVEL);
 
     // ── STEP A — data: generate if missing so the example runs out of the box.
     let data_dir_arg = cli
@@ -359,8 +391,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trainer = MnistTrainer::new(LABEL_SMOOTHING).with_holdout(holdout, HOLDOUT_ROWS);
 
     // ── STEP C — the config surface.
-    let pop = cli.smoke.pop.unwrap_or(POP_SIZE);
-    let max_steps = cli.smoke.max_steps.or(MAX_STEPS);
+    let pop = cli.engine.pop.unwrap_or(POP_SIZE);
+    let max_steps = cli.engine.max_steps.or(MAX_STEPS);
     let metrics = vec![
         // Informative (non-ranking) custom metric: mean gap between the top-1
         // and runner-up logit — one extra history.csv column. There are no
@@ -385,17 +417,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_run_metrics(metrics)
         .set_stop_max_steps(max_steps)
         .set_run_checkpoint_every(CHECKPOINT_EVERY)
-        .set_elite_count(5)
-        .set_elite_freeze(true)
+        // --- Ranking (FIT): the metric is accuracy, λ decides how much of a
+        // net's rank is steadiness rather than level. Ω is the budget dial:
+        // 0 = every net trains on every clock (the plain metric path), 1 = the
+        // full merit-weighted train-eval lottery. Both endpoints are exact, so
+        // turning Ω on never changes what evolution RANKS on — only who gets
+        // to spend a clock, and how stale a selector's reading can be.
+        .set_run_risk_aversion(RISK_AVERSION)
+        .set_run_train_merit(0.0)
         .set_run_smoothing_window(5)
+        // --- Evolution: the elite/founder rules (mode-agnostic) ---
+        .set_elite_count(ELITE_COUNT)
+        .set_elite_freeze(true)
+        .set_elite_join_probation_steps(ELITE_JOIN_PROBATION)
+        .set_elite_crown_lifetime_steps(ELITE_CROWN_LIFETIME)
         .set_crossover_prob(0.5)
         .set_crossover_rolls(pop / 2)
-        // --- Challenge (anti-plateau): TRAINER-owned since 2026-10-10 —
-        // `CHALLENGE_PROB` lives on the trainer and rolls inside `train_step`
-        // via `gras::trainer::effective_challenge_prob`. No engine knob.
+        .set_crossover_selection(SelectionMethod::Tournament {
+            tournament_size: CROSSOVER_TOURNAMENT_SIZE,
+        })
+        .set_crossover_probation_steps(CROSSOVER_PROBATION)
         // --- Mutation (both modes) ---
         .set_mutate_prob(MUTATE_PROB) // per-roll chance a random immigrant is inserted
         .set_mutate_rolls(pop / 5)
+        .set_mutation_probation_steps(MUTATION_PROBATION)
+        // --- Challenge (anti-plateau): TRAINER-owned since 2026-10-10 —
+        // `CHALLENGE_PROB` lives on the trainer and rolls inside `train_step`
+        // via `gras::trainer::effective_challenge_prob`. No engine knob.
         // --- Guardrail (post-race honesty check) ---
         .set_elite_guardrail_matches(HOLDOUT_MATCHES) // fresh holdout draws behind the champion verdict
         // --- Topology & network search boundaries ---
@@ -408,6 +456,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_topology_hidden_dim_range(16, 128)
         .set_topology_hidden_dim_stride(16)
         .set_topology_dropout_prob(0.25)
+        .set_topology_combine_op_pool(COMBINE_OPS)
+        .set_topology_activation_pool(ACTIVATIONS)
+        .set_topology_standardize_op_pool(STANDARDIZE_OPS)
+        .set_topology_feature_split(FEATURE_SPLIT)
         // --- Exports ---
         .set_run_csv_export(true)
         .set_elite_save_topology(true)
@@ -415,7 +467,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_worst_save_topology(true)
         .set_worst_save_safetensors(true)
         .set_elite_checkpoint_weights(true);
-    let config = builder.build();
+    // Every CLI flag is an OVERLAY: a user-passed value wins, anything unset
+    // keeps the const above. This is also where `--history-flush`, `--train-merit`
+    // and `--founders-from` become engine config instead of being silently dropped.
+    let config = cli.engine.apply(builder).build();
 
     // ── STEP D — run, then the guardrail.
     let mut engine = TabularEngine::from_spec(gras::engine::RunSpec::tabular(
@@ -423,8 +478,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         fitness,
         trainer,
-        RUN_SEED,
-        None::<&str>, // run dir: the engine picks results/<timestamp>
+        cli.engine.seed_or(RUN_SEED),
+        cli.engine.run_dir_or(None), // engine picks results/<timestamp> when unset
     ))?;
     println!("Run Dir: {}", engine.run_dir().display());
     match engine.run() {
@@ -434,23 +489,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match engine.guardrail() {
         Some(v) => {
-            let holdout = v.mean().unwrap_or(0.0);
             // σ (how mixed the holdout pool was) and SE (how well the mean is
             // pinned down) are different claims; print both, labelled.
             let exam = fmt_reading(v.mean(), v.std(), v.scores.len(), ReadingStyle::Line);
             let smoothed = v
                 .race_smoothed
-                .map(|s| format!(" (race smoothed {s:.3})"))
+                .map(|s| format!(" (race smoothed avg {s:.3})"))
                 .unwrap_or_default();
             // The honest question is not "is 0.8 a good number" but "does the
-            // holdout agree with the race signal". A big gap means the pool was
-            // memorized; agreement means the ranking is trustworthy.
-            let verdict = match v.race_smoothed {
-                Some(race) if race - holdout > 0.05 => "weak — the race overfit the eval pool ❌",
-                Some(_) => "consistent with the race signal ✅",
-                None => "no race-smoothed reference",
-            };
-            println!("guardrail: holdout accuracy {exam}{smoothed} — {verdict}");
+            // holdout agree with the race signal". The grade comes from the ENGINE
+            // (`agreement_grade` — the same function behind the card's `status` cell
+            // and its sentence), so this line cannot reach a different verdict than
+            // the table printed above it. Re-grading here with a local threshold is
+            // exactly how an example ends up contradicting its own engine.
+            let status = gras::engine::guardrail::agreement_grade(
+                v.race_smoothed,
+                v.race_se,
+                v.mean(),
+                v.se(),
+                v.scores.len(),
+                Direction::Maximize,
+            );
+            println!(
+                "guardrail: holdout accuracy {exam}{smoothed} — status {}",
+                status.tag()
+            );
         }
         None => println!("guardrail: no champion exported — skipped"),
     }

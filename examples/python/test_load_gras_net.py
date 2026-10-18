@@ -11,9 +11,15 @@ RNG or the draw order fails here instead of silently perturbing every load.
 Run: `python examples/python/test_load_gras_net.py` (needs `torch`).
 
 The reference doubles as a real cross-dim case: node 1 outs node 0's 128 hidden
-into a 32-wide node 1, and node 2's port 0 receives node 0 (same 128) then node 1
-(32) — so `proj2_0_1` is a genuine projection built at source-index 1, exactly the
-multi-source-port path a randomized gras topology exercises.
+into a 32-wide node 1, and node 2 has ONE WIRE PER INPUT PORT — port 0 receives
+node 0 (same 128, no bridge), port 1 receives node 1 (32 into 128) — so
+`proj2_1_0` is a genuine projection, named `<node>_<port>_0` because a port never
+carries more than one wire (the trailing index is the wire's position within its
+port, so it is always 0).
+
+The numbers did not change when the fixture was reshaped from the old stacked
+single-port form (`proj2_0_1`): the draw order walks node → port → wire, and the
+one bridge is still the one draw at the same position, so only its name moved.
 """
 
 import hashlib
@@ -37,12 +43,12 @@ TOPOLOGY = {
     "nodes": [
         loader.Node(id=0, kind="Input", num_inputs=0, num_outputs=2, hidden_dim=128),
         loader.Node(id=1, kind="Hidden", num_inputs=1, num_outputs=1, hidden_dim=32),
-        loader.Node(id=2, kind="Output", num_inputs=1, num_outputs=1, hidden_dim=1),
+        loader.Node(id=2, kind="Output", num_inputs=2, num_outputs=1, hidden_dim=1),
     ],
     "connections": [
         {"from": {"node": 0, "index": 0}, "to": {"node": 2, "index": 0}},
         {"from": {"node": 0, "index": 1}, "to": {"node": 1, "index": 0}},
-        {"from": {"node": 1, "index": 0}, "to": {"node": 2, "index": 0}},
+        {"from": {"node": 1, "index": 0}, "to": {"node": 2, "index": 1}},
     ],
 }
 
@@ -54,8 +60,8 @@ EXPECTED_HASHES = {
     "node1.weight": "a790c2ceb29adb8d",
     "node2.bias": "589c46ceb4d930c1",
     "node2.weight": "b87d8d7532ff982a",
-    "proj2_0_1.bias": "82d4622f98e35b9e",
-    "proj2_0_1.weight": "b55945cfcfa3a265",
+    "proj2_1_0.bias": "82d4622f98e35b9e",
+    "proj2_1_0.weight": "b55945cfcfa3a265",
 }
 
 # A few literal values, so a hash mismatch is debuggable without re-running Rust.
@@ -64,8 +70,8 @@ EXPECTED_SAMPLES = {
     ("node0.bias", 3): 0.480536401,
     ("node1.weight", 0, 0): -0.004696516,
     ("node1.weight", 0, 2): 0.057575166,
-    ("proj2_0_1.weight", 0, 1): -0.146411985,
-    ("proj2_0_1.bias", 2): -0.079962678,
+    ("proj2_1_0.weight", 0, 1): -0.146411985,
+    ("proj2_1_0.bias", 2): -0.079962678,
 }
 
 

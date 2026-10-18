@@ -1,18 +1,10 @@
-//! Shared CLI surface for the examples.
+//! Shared CLI surface for the two long-running examples.
 //!
-//! Two surfaces live here:
-//!
-//! - [`SmokeArgs`] — the smoke surface the examples flatten (`--pop`,
-//!   `--max-steps`, and `--log-level` for the one axis a reader of a log
-//!   actually needs to change mid-investigation). Every other knob is a
-//!   `const` at the top of the example, visible in the source rather than
-//!   behind a flag. Used by categorical, continuous, custom_trainer and mnist
-//!   (which adds its own `--data-dir`); cartpole and mountaincar declare the
-//!   same flags on their own `Cli` structs.
-//! - [`EngineArgs`] / [`RlEngineArgs`] — the fuller engine surface
-//!   (`--log-level`, `--seed`, `--resume`, the evolution knobs, …), kept for
-//!   the one example whose runs are long enough to need it:
-//!   `kaggle_kagiculture`.
+//! [`EngineArgs`] / [`RlEngineArgs`] carry the fuller engine surface
+//! (`--log-level`, `--seed`, `--risk-aversion`, `--train-merit`,
+//! `--founders-from`, the evolution knobs, …) for `kaggle_kagiculture` and
+//! `mnist`. `cartpole` declares its own `Cli` struct and does not include this
+//! module, and `print_topology` takes a run dir + hash only.
 //!
 //! ```text
 //! cargo run --release --example cartpole -- --pop 32 --max-steps 20
@@ -26,68 +18,14 @@
 //! This directory has no `main.rs`, so Cargo does not treat it as an example
 //! binary — examples pull it in with `#[path = "cli/mod.rs"] mod cli;`.
 //!
-//! `dead_code` is allowed module-wide: every includer uses a different subset
-//! of this module, so an unused helper is expected rather than a smell.
+//! `dead_code` is allowed module-wide: `mnist` is tabular and `kaggle` is RL, so
+//! each includer leaves the other mode's wrapper unused. That is expected.
 #![allow(dead_code)]
 
 use std::path::PathBuf;
 
 use clap::Parser;
 use gras::prelude::*;
-
-/// The two-flag smoke surface the examples share: population size and the step
-/// budget, nothing else.
-///
-/// `--pop 8 --max-steps 2` is all a quick smoke test needs. Every other knob
-/// lives in the example's own consts and builder chain, where it is visible in
-/// the source rather than behind another flag. An example with a genuine extra
-/// input (mnist's dataset directory) declares that one flag itself.
-#[derive(Parser, Debug)]
-pub struct SmokeArgs {
-    /// Population size (default: the example's own const).
-    #[arg(long, value_name = "N")]
-    pub pop: Option<usize>,
-    /// Stop after this many engine steps (default: the example's own const).
-    #[arg(long = "max-steps", value_name = "N")]
-    pub max_steps: Option<usize>,
-    /// Log level (default: the example's own `LOG_LEVEL` const). `none` /
-    /// `summ` / `minimal` pick the reporting SHAPE; `debug` / `trace` keep
-    /// `summ` and additionally let the engine's per-roll detail through (rolls
-    /// that did not fire, shield-blocked rolls), which the default view hides.
-    #[arg(
-        long,
-        value_name = "LEVEL",
-        value_parser = ["none", "summ", "minimal", "debug", "trace"]
-    )]
-    pub log_level: Option<String>,
-}
-
-/// Turn on the engine logger: `raw` is the `--log-level` flag when the user
-/// passed one, `default` the example's own const.
-///
-/// The two axes stay separate because they mean different things: the engine
-/// level is the reporting SHAPE (and is recorded in `engine.json`), the
-/// verbosity is how much detail reaches this console. A run that needs the
-/// per-roll trail does not have to change what it reports.
-pub fn init_logger(default: LogLevel, raw: Option<&str>) -> bool {
-    let (level, verbosity) = raw
-        .and_then(LogLevel::parse_verbose)
-        .unwrap_or((default, None));
-    gras::engine::logging::init(level, verbosity)
-}
-
-/// Parse an engine log level (`none` | `summ` | `minimal`) on the CLI.
-///
-/// Reuses the engine's own vocabulary (`LogLevel::parse`) instead of inventing
-/// a second set of names: `--log-level summ` is exactly what `engine.json`
-/// records, and [`Self::init_logger`] translates it into the console sink's
-/// filter — typing `summ` straight into a filter string would be read as a
-/// *module* name and mute everything.
-fn parse_log_level(raw: &str) -> Result<LogLevel, String> {
-    LogLevel::parse(raw).ok_or_else(|| {
-        format!("unknown log level \"{raw}\" — expected one of: none, summ, minimal")
-    })
-}
 
 /// The engine-level flags every example shares.
 #[derive(Parser, Debug, Clone, Default)]
@@ -107,6 +45,23 @@ pub struct EngineArgs {
     /// Elites kept safe from culls AND exported at stop.
     #[arg(long, value_name = "N")]
     pub elite_count: Option<usize>,
+
+    /// FIT risk aversion λ: window-σs a net pays for its own spread before it is
+    /// ranked (0 = rank on the plain window mean). Replay-relevant.
+    #[arg(long, value_name = "LAMBDA", visible_alias = "risk-based")]
+    pub risk_aversion: Option<f32>,
+
+    /// Train-eval lottery strength Ω: `0` (default) = off, every net trains;
+    /// `1` = the full merit tilt; between = that fraction of the withholding.
+    /// Replay-relevant — a resume must use the recorded value.
+    #[arg(long, value_name = "OMEGA")]
+    pub train_merit: Option<f32>,
+
+    /// Seed the founder batch from the newest compatible previous experiment's
+    /// elites instead of drawing fresh topologies. Bare flag = look in
+    /// `results/`; with a value, that run dir (or a dir of run dirs).
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "results")]
+    pub founders_from: Option<String>,
 
     /// Steps between crossover-gate checkpoint bars.
     #[arg(long, value_name = "N")]
@@ -128,9 +83,12 @@ pub struct EngineArgs {
     #[arg(long, value_name = "N")]
     pub mutate_rolls: Option<usize>,
 
-    /// Log level: `none`, `summ`, or `minimal`.
-    #[arg(long, value_name = "LEVEL", value_parser = parse_log_level)]
-    pub log_level: Option<LogLevel>,
+    /// Log level: `none`, `summ`, `minimal`, or `debug`/`trace` (which keep the
+    /// `summ` shape and additionally let the engine's per-roll detail through).
+    /// The same vocabulary `engine.json` records, so a flag and a persisted run
+    /// agree on what `summ` means.
+    #[arg(long, value_name = "LEVEL")]
+    pub log_level: Option<String>,
 
     /// Run name recorded in `engine.json` (informational).
     #[arg(long, value_name = "NAME")]
@@ -242,6 +200,32 @@ impl EngineArgs {
         if let Some(n) = self.checkpoint_every {
             b = b.set_run_checkpoint_every(n);
         }
+        if let Some(lambda) = self.risk_aversion {
+            b = b.set_run_risk_aversion(lambda);
+        }
+        if let Some(omega) = self.train_merit {
+            b = b.set_run_train_merit(omega);
+        }
+        if let Some(dir) = &self.founders_from {
+            b = b
+                .set_elite_previous_load(true)
+                .set_elite_previous_dir(dir.clone());
+        }
+            // `--history-flush` is a MODE, not a bool: `each` flushes every clock what
+            // the engine's flag asks for, `checkpoint` (and anything unset) keeps the
+            // cadence the checkpoint tick already gives. Anything else is a typo, not a
+            // silent fallback — the run must not quietly pick a durability it did not
+            // ask for.
+        if let Some(mode) = self.history_flush.as_deref() {
+            match mode.trim().to_ascii_lowercase().as_str() {
+                "each" => b = b.set_run_history_flush_each(true),
+                "checkpoint" => b = b.set_run_history_flush_each(false),
+                other => {
+                    eprintln!("--history-flush {other}: expected `each` or `checkpoint`");
+                    std::process::exit(2);
+                }
+            }
+        }
         if let Some(p) = self.crossover_prob {
             b = b.set_crossover_prob(p);
         }
@@ -254,7 +238,15 @@ impl EngineArgs {
         if let Some(n) = self.mutate_rolls {
             b = b.set_mutate_rolls(n);
         }
-        if let Some(level) = self.log_level {
+        if let Some(raw) = &self.log_level {
+            let level = LogLevel::parse(raw)
+                .or_else(|| LogLevel::parse_verbose(raw).map(|(l, _)| l))
+                .unwrap_or_else(|| {
+                    eprintln!(
+                        "--log-level {raw}: expected `none`, `summ`, `minimal`, `debug` or `trace`"
+                    );
+                    std::process::exit(2);
+                });
             b = b.set_run_log_level(level);
         }
         if let Some(name) = &self.run_name {
@@ -317,6 +309,11 @@ impl EngineArgs {
     /// `--log-level` overrides `default_level`; RUST_LOG still wins over both,
     /// so power users keep the fine-grained `module=level` filtering.
     pub fn init_logger(&self, default_level: LogLevel) -> bool {
-        gras::engine::logging::init(default_level, self.log_level.map(LogLevel::env_filter))
+        let (level, verbosity) = self
+            .log_level
+            .as_deref()
+            .and_then(LogLevel::parse_verbose)
+            .unwrap_or((default_level, None));
+        gras::engine::logging::init(level, verbosity)
     }
 }
