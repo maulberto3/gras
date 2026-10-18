@@ -89,12 +89,15 @@ pub struct Network {
     pub nodes: Vec<Node>,
     /// Per-node `(in_dim, out_dim)`, computed once at build.
     pub node_dims: Vec<(usize, usize)>,
-    /// Precomputed wiring: per node, per port, list of source ports.
-    pub(crate) node_sources: Vec<Vec<Vec<Port>>>,
+        /// Precomputed wiring: per node, per port, the ONE source port feeding it.
+        /// `finalize` guarantees every port has exactly one wire, so a port is a socket
+        /// and not a bucket, and every entry here is `Some` — fan-in is extra ports.
+    pub(crate) node_sources: Vec<Vec<Option<Port>>>,
     /// Which node's output is the network output.
     pub output_node: usize,
-    /// Per-node, per-port, per-source projections (when dims mismatch).
-    pub(crate) port_projections: Vec<Vec<Vec<Option<Linear>>>>,
+        /// Per-node, per-port projection (allocated only when the source's out_dim differs
+        /// from the node's in_dim).
+    pub(crate) port_projections: Vec<Vec<Option<Linear>>>,
     /// Per-node dropout layer (None when dropout_prob == 0 or non-hidden node).
     pub(crate) dropout_layers: Vec<Option<flodl::nn::Dropout>>,
     /// Per-node, per-port feature masks (the feature split), as constant 0/1
@@ -104,10 +107,10 @@ pub struct Network {
 }
 
 /// Intermediate build state from `prepare_build`: the seeded RNG plus the
-/// wiring table (per-node, per-port, per-source ports) and per-node dims.
+/// wiring table (per-node, per-port source) and per-node dims.
 struct BuildPlan {
     rng: Option<fastrand::Rng>,
-    node_sources: Vec<Vec<Vec<crate::graph::topology::Port>>>,
+    node_sources: Vec<Vec<Option<crate::graph::topology::Port>>>,
     node_dims: Vec<(usize, usize)>,
 }
 
@@ -134,7 +137,8 @@ impl Network {
         graph: &Topology,
         opts: &NetworkOptions,
     ) -> flodl::tensor::Result<Self> {
-        // Step 0: Validate
+        // Step 0: Validate (`validate` also refuses a port with several wires, so the
+        // one-source-per-port wiring table below can never be handed a stack to lose).
         graph.validate().map_err(NetworkError::InvalidTopology)?;
 
         // Step 1: Seed RNG, compute wiring table + per-node dims
@@ -216,14 +220,15 @@ impl Network {
             .collect()
     }
 
-    /// Step 4: Cross-dim bridges for wired sources.
+        /// Step 4: Cross-dim bridges — one optional projection per input port, allocated
+        /// only when that port's single source disagrees with the node's `in_dim`.
     fn bridge_diff_dims(
-        node_sources: &[Vec<Vec<Port>>],
+        node_sources: &[Vec<Option<Port>>],
         node_dims: &[(usize, usize)],
         device: Device,
         dtype: DType,
         mut rng: Option<&mut fastrand::Rng>,
-    ) -> flodl::tensor::Result<Vec<Vec<Vec<Option<Linear>>>>> {
+    ) -> flodl::tensor::Result<Vec<Vec<Option<Linear>>>> {
         node_sources
             .iter()
             .enumerate()
@@ -231,30 +236,22 @@ impl Network {
                 let in_dim = node_dims[node_id].0;
                 ports
                     .iter()
-                    .map(|sources| {
-                        // All ports are wired after topology finalize.
-                        // not here — return empty vec for them.
-                        if sources.is_empty() {
-                            return Ok(vec![]);
+                    .map(|source| {
+                        let Some(source) = source else {
+                            return Ok(None);
+                        };
+                        let src_dim = node_dims[source.node].1;
+                        if src_dim == in_dim {
+                            Ok(None)
+                        } else {
+                            Ok(Some(Self::create_linear_with_seed(
+                                src_dim as i64,
+                                in_dim as i64,
+                                device,
+                                dtype,
+                                rng.as_deref_mut(),
+                            )?))
                         }
-                        // One projection per source on this port.
-                        sources
-                            .iter()
-                            .map(|port| {
-                                let src_dim = node_dims[port.node].1;
-                                if src_dim == in_dim {
-                                    Ok(None)
-                                } else {
-                                    Ok(Some(Self::create_linear_with_seed(
-                                        src_dim as i64,
-                                        in_dim as i64,
-                                        device,
-                                        dtype,
-                                        rng.as_deref_mut(),
-                                    )?))
-                                }
-                            })
-                            .collect()
                     })
                     .collect()
             })
@@ -325,9 +322,9 @@ impl Network {
     fn assemble(
         graph: &Topology,
         node_dims: &[(usize, usize)],
-        node_sources: &[Vec<Vec<crate::graph::topology::Port>>],
+        node_sources: &[Vec<Option<crate::graph::topology::Port>>],
         layers: Vec<Linear>,
-        port_projections: Vec<Vec<Vec<Option<Linear>>>>,
+        port_projections: Vec<Vec<Option<Linear>>>,
         dropout_layers: Vec<Option<flodl::nn::Dropout>>,
         port_masks: Vec<Vec<Option<Tensor>>>,
     ) -> flodl::tensor::Result<Network> {
@@ -408,150 +405,79 @@ impl Network {
 // Forward pass — gather → combine → standardize (LayerNorm) → activate → dropout ───────────────────────
 
 impl Network {
-        /// Step 1: Gather -- collect wired source tensors per port, looked up by exact
-        /// `(node, port)` so each wire carries its source port's OWN activated tensor.
-    fn gather_inputs(
-        &self,
-        port_outputs: &HashMap<(usize, usize), Variable>,
-        node_id: usize,
-    ) -> flodl::tensor::Result<Option<Variable>> {
-        let mut combined: Option<Variable> = None;
-        for (port_idx, sources) in self.node_sources[node_id].iter().enumerate() {
-            let port_tensors: Vec<Variable> = sources
-                .iter()
-                .map(|p| {
-                    port_outputs
-                        .get(&(p.node, p.index))
-                        .cloned()
-                        .ok_or_else(|| {
-                            flodl::tensor::TensorError::new(&format!(
-                                "forward: source n{}o{} not yet computed (topological order violated?)",
-                                p.node, p.index
-                            ))
-                        })
-                })
-                .collect::<flodl::tensor::Result<Vec<_>>>()?;
-            let projs = &self.port_projections[node_id][port_idx];
-            for (src_idx, mut t) in port_tensors.into_iter().enumerate() {
-                if let Some(proj) = projs.get(src_idx).and_then(|p| p.as_ref()) {
-                    t = proj.forward(&t)?;
-                }
-                combined = Some(match combined {
-                    None => t,
-                    Some(prev) => prev.add(&t)?,
-                });
-            }
-        }
-        Ok(combined)
-    }
-
-    /// Step 2: Combine -- merge ports via the node's CombineOp.
-    fn combine_inputs(
-        &self,
-        combined: Option<Variable>,
-        port_outputs: &HashMap<(usize, usize), Variable>,
-        node_id: usize,
-    ) -> flodl::tensor::Result<Variable> {
-        let combined = match combined {
-            Some(c) => c,
-            None => {
-                // All ports deduped away — return zero tensor with node's output dim.
-                let dim = self.node_dims[node_id].1 as i64;
-                let opts = flodl::TensorOptions {
-                    dtype: flodl::DType::Float32,
-                    device: Device::CPU,
-                };
-                return Ok(Variable::new(
-                    flodl::Tensor::zeros(&[1, dim], opts).unwrap(),
-                    false,
-                ));
-            }
-        };
-        let op = self.nodes[node_id].combine_op.unwrap_or(CombineOp::Add);
-        match op {
-            CombineOp::Add => Ok(combined),
-            CombineOp::Mean => {
-                let n = self.input_source_count(node_id);
-                if n > 1 {
-                    combined.mul_scalar(1.0 / n as f64)
-                } else {
-                    Ok(combined)
-                }
-            }
-            CombineOp::Multiply
-            | CombineOp::Subtract
-            | CombineOp::Divide
-            | CombineOp::Max
-            | CombineOp::Min => {
-                let port_tensors = self.gather_port_tensors(port_outputs, node_id);
-                if port_tensors.is_empty() {
-                    return Ok(combined);
-                }
-                let mut iter = port_tensors.into_iter();
-                let mut result = iter.next().unwrap();
-                for t in iter {
-                    result = match op {
-                        CombineOp::Multiply => result.mul(&t)?,
-                        CombineOp::Subtract => result.sub(&t)?,
-                            // Divide-safe: dropout zeroes denominator elements and raw
-                            // div by 0.0 is inf → NaN poison. Same guard as CombineOp::apply.
-                        CombineOp::Divide => crate::graph::node::safe_divide(&result, &t)?,
-                        CombineOp::Max => result.maximum(&t)?,
-                        CombineOp::Min => result.minimum(&t)?,
-                        _ => unreachable!(),
-                    };
-                }
-                Ok(result)
-            }
-        }
-    }
-
-    /// Gather per-port tensors for Max/Min combine.
+        /// Step 1: Gather -- one tensor per wired input port, looked up by the exact
+        /// `(node, port)` its single wire comes from, then bridged if the dims differ.
     fn gather_port_tensors(
         &self,
         port_outputs: &HashMap<(usize, usize), Variable>,
         node_id: usize,
-    ) -> Vec<Variable> {
-        self.node_sources[node_id]
-            .iter()
-            .enumerate()
-            .filter_map(|(port_idx, sources)| {
-                if sources.is_empty() {
-                    return None;
-                }
-                let tensors: Vec<Variable> = sources
-                    .iter()
-                    .filter_map(|p| port_outputs.get(&(p.node, p.index)).cloned())
-                    .collect();
-                let projs = &self.port_projections[node_id][port_idx];
-                let projected: Vec<Variable> = tensors
-                    .into_iter()
-                    .enumerate()
-                    .map(|(src_idx, mut t)| {
-                        if let Some(proj) = projs.get(src_idx).and_then(|p| p.as_ref()) {
-                            t = proj.forward(&t).unwrap();
-                        }
-                        t
-                    })
-                    .collect();
-                if projected.is_empty() {
-                    return None;
-                }
-                let mut result = projected[0].clone();
-                for t in &projected[1..] {
-                    result = result.add(t).unwrap();
-                }
-                Some(result)
-            })
-            .collect()
+    ) -> flodl::tensor::Result<Vec<Variable>> {
+        let mut out = Vec::new();
+        for (port_idx, source) in self.node_sources[node_id].iter().enumerate() {
+            let Some(p) = source else {
+                    // An unwired port contributes nothing (finalize never leaves one).
+                continue;
+            };
+            let mut t = port_outputs.get(&(p.node, p.index)).cloned().ok_or_else(|| {
+                flodl::tensor::TensorError::new(&format!(
+                    "forward: source n{}o{} not yet computed (topological order violated?)",
+                    p.node, p.index
+                ))
+            })?;
+            if let Some(proj) = self.port_projections[node_id]
+                .get(port_idx)
+                .and_then(|p| p.as_ref())
+            {
+                t = proj.forward(&t)?;
+            }
+            out.push(t);
+        }
+        Ok(out)
     }
 
-    /// How many tensors feed a node's input ports.
-    fn input_source_count(&self, node_id: usize) -> usize {
-        self.node_sources[node_id]
-            .iter()
-            .map(|sources| sources.len())
-            .sum()
+    /// Step 2: Combine -- merge the per-port tensors via the node's CombineOp.
+    ///
+    /// With one wire per port the operands ARE the ports: Add/Multiply/Subtract/…
+    /// fold them left to right, lowest port first, and Mean divides by the port
+    /// count. (Before the wiring refactor Add/Mean were flat over wires and the
+    /// folding ops folded port *sums* — identical whenever each port had one wire.)
+    fn combine_inputs(
+        &self,
+        ports: Vec<Variable>,
+        node_id: usize,
+    ) -> flodl::tensor::Result<Variable> {
+        let n = ports.len();
+        let mut iter = ports.into_iter();
+        let Some(mut result) = iter.next() else {
+            // No wired ports (a hand-built or legacy graph) — a zero tensor with the
+            // node's output dim keeps the forward pass shaped.
+            let dim = self.node_dims[node_id].1 as i64;
+            let opts = flodl::TensorOptions {
+                dtype: flodl::DType::Float32,
+                device: Device::CPU,
+            };
+            return Ok(Variable::new(
+                flodl::Tensor::zeros(&[1, dim], opts).unwrap(),
+                false,
+            ));
+        };
+        let op = self.nodes[node_id].combine_op.unwrap_or(CombineOp::Add);
+        for t in iter {
+            result = match op {
+                CombineOp::Add | CombineOp::Mean => result.add(&t)?,
+                CombineOp::Multiply => result.mul(&t)?,
+                CombineOp::Subtract => result.sub(&t)?,
+                    // Divide-safe: dropout zeroes denominator elements and raw
+                    // div by 0.0 is inf → NaN poison. Same guard as CombineOp::apply.
+                CombineOp::Divide => crate::graph::node::safe_divide(&result, &t)?,
+                CombineOp::Max => result.maximum(&t)?,
+                CombineOp::Min => result.minimum(&t)?,
+            };
+        }
+        match op {
+            CombineOp::Mean if n > 1 => result.mul_scalar(1.0 / n as f64),
+            _ => Ok(result),
+        }
     }
 
     /// Step 5: Apply the node's standardize op (LayerNorm or identity).
@@ -633,31 +559,29 @@ impl Network {
             .iter_mut()
             .zip(other.port_projections.iter())
         {
-            for (dst_list, src_list) in dst_ports.iter_mut().zip(src_ports.iter()) {
-                for (dst_proj, src_proj) in dst_list.iter_mut().zip(src_list.iter()) {
-                    match (dst_proj, src_proj) {
-                        (Some(dp), Some(sp)) => {
-                            let sw = sp.weight.variable.data();
-                            dp.weight.variable.set_data(sw.clone());
-                            match (&mut dp.bias, &sp.bias) {
-                                (Some(db), Some(sb)) => {
-                                    let sbt = sb.variable.data();
-                                    db.variable.set_data(sbt.clone());
-                                }
-                                (None, None) => {}
-                                _ => {
-                                    return Err(flodl::tensor::TensorError::new(
-                                        "clone_weights_from: projection bias mismatch",
-                                    ));
-                                }
+            for (dst_proj, src_proj) in dst_ports.iter_mut().zip(src_ports.iter()) {
+                match (dst_proj, src_proj) {
+                    (Some(dp), Some(sp)) => {
+                        let sw = sp.weight.variable.data();
+                        dp.weight.variable.set_data(sw.clone());
+                        match (&mut dp.bias, &sp.bias) {
+                            (Some(db), Some(sb)) => {
+                                let sbt = sb.variable.data();
+                                db.variable.set_data(sbt.clone());
+                            }
+                            (None, None) => {}
+                            _ => {
+                                return Err(flodl::tensor::TensorError::new(
+                                    "clone_weights_from: projection bias mismatch",
+                                ));
                             }
                         }
-                        (None, None) => {}
-                        _ => {
-                            return Err(flodl::tensor::TensorError::new(
-                                "clone_weights_from: projection presence mismatch",
-                            ));
-                        }
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(flodl::tensor::TensorError::new(
+                            "clone_weights_from: projection presence mismatch",
+                        ));
                     }
                 }
             }
@@ -685,12 +609,10 @@ impl Network {
             }
         }
         for ports in &self.port_projections {
-            for port_projs in ports {
-                for p in port_projs.iter().flatten() {
-                    push_tensor(&p.weight.variable.data(), &mut out, &mut count)?;
-                    if let Some(b) = &p.bias {
-                        push_tensor(&b.variable.data(), &mut out, &mut count)?;
-                    }
+            for p in ports.iter().flatten() {
+                push_tensor(&p.weight.variable.data(), &mut out, &mut count)?;
+                if let Some(b) = &p.bias {
+                    push_tensor(&b.variable.data(), &mut out, &mut count)?;
                 }
             }
         }
@@ -743,12 +665,10 @@ impl Network {
             }
         }
         for ports in &self.port_projections {
-            for port_projs in ports {
-                for p in port_projs.iter().flatten() {
-                    load(&p.weight.variable, blob, &mut cursor, &mut seen)?;
-                    if let Some(b) = &p.bias {
-                        load(&b.variable, blob, &mut cursor, &mut seen)?;
-                    }
+            for p in ports.iter().flatten() {
+                load(&p.weight.variable, blob, &mut cursor, &mut seen)?;
+                if let Some(b) = &p.bias {
+                    load(&b.variable, blob, &mut cursor, &mut seen)?;
                 }
             }
         }
@@ -778,8 +698,8 @@ impl Module for Network {
                     // through every port (Identity — Input ports stay raw).
                 self.layers[node_id].forward(input)?
             } else {
-                let gathered = self.gather_inputs(&port_outputs, node_id)?;
-                let combined = self.combine_inputs(gathered, &port_outputs, node_id)?;
+                let ports = self.gather_port_tensors(&port_outputs, node_id)?;
+                let combined = self.combine_inputs(ports, node_id)?;
                 let projected = self.layers[node_id].forward(&combined)?;
                     // Standardize + dropout BEFORE the port split, so every port sees
                     // the same tensor and the mask draw is one-per-node.
@@ -827,10 +747,8 @@ impl Module for Network {
             params.extend(layer.parameters());
         }
         for ports in &self.port_projections {
-            for port_projs in ports {
-                for p in port_projs.iter().flatten() {
-                    params.extend(p.parameters());
-                }
+            for p in ports.iter().flatten() {
+                params.extend(p.parameters());
             }
         }
         params
@@ -1090,6 +1008,69 @@ mod tests {
     }
 
     #[test]
+    fn legacy_stacked_blueprint_runs_identically_to_a_native_one_wire_graph() {
+            // The same graph written both ways: the old shape (two wires on one input port)
+            // and the new one (one wire per port). Loading the old blueprint splits the port,
+            // dims are unchanged, and both build from the same `topology_seed` — so identical
+            // outputs prove the migration kept the wire set and its order. This is the path a
+            // run takes when the engine seeds itself from a previous run's blueprints.
+        let opts = crate::graph::topology::TopologyOptions {
+            input_dim: Some(2),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+
+        let mut native = Topology::new(9, Some(opts));
+        native.nodes.push(Node::new_input(0, 2));
+        native.nodes.push(Node::new_hidden(1, 2, 1));
+        native.nodes.push(Node::new_output(2, 1, 1));
+        native.connections = vec![
+            Connection {
+                from: Port { node: 0, index: 0 },
+                to: Port { node: 1, index: 0 },
+            },
+            Connection {
+                from: Port { node: 0, index: 1 },
+                to: Port { node: 1, index: 1 },
+            },
+            Connection {
+                from: Port { node: 1, index: 0 },
+                to: Port { node: 2, index: 0 },
+            },
+        ];
+
+        let mut legacy = Topology::new(9, Some(opts));
+        legacy.nodes.push(Node::new_input(0, 2));
+        legacy.nodes.push(Node::new_hidden(1, 1, 1)); // one port, two wires
+        legacy.nodes.push(Node::new_output(2, 1, 1));
+        legacy.connections = vec![
+            Connection {
+                from: Port { node: 0, index: 0 },
+                to: Port { node: 1, index: 0 },
+            },
+            Connection {
+                from: Port { node: 0, index: 1 },
+                to: Port { node: 1, index: 0 },
+            },
+            Connection {
+                from: Port { node: 1, index: 0 },
+                to: Port { node: 2, index: 0 },
+            },
+        ];
+        let legacy = Topology::from_json(&legacy.to_json().unwrap()).unwrap();
+
+        let a = Network::build(&native, Device::CPU).unwrap();
+        let b = Network::build(&legacy, Device::CPU).unwrap();
+        let input = Variable::new(
+            Tensor::from_f32(&[0.5, -1.5], &[1, 2], Device::CPU).unwrap(),
+            false,
+        );
+        let out_a = a.forward(&input).unwrap().data().to_f32_vec().unwrap();
+        let out_b = b.forward(&input).unwrap().data().to_f32_vec().unwrap();
+        assert_eq!(out_a, out_b);
+    }
+
+    #[test]
     fn test_per_port_activations_give_distinct_signals() {
             // n1 has port 0 ReLU, port 1 Tanh; n2 receives those two DIFFERENT tensors on
             // i0/i1 even though both leave the same node.
@@ -1109,12 +1090,11 @@ mod tests {
         g.nodes.push(Node::new_output(2, 2, 1));
         // finalize trims ports BEFORE we stamp per-port activations (the
         // port count is only final after trim) — mirrors the engine flow.
-        g.finalize();
-            // Force the 2-port wiring deterministically: random finalize may orphan a
-            // port and trim it, so re-stamp both ports and wire n2's inputs by hand.
+        g.finalize();        // Force the 2-port wiring deterministically: random finalize may orphan a
+        // port and trim it, so re-stamp both ports and wire n2's inputs by hand —
+        // one wire per input port, so n2's own wires go first.
         g.nodes[1].num_outputs = 2;
-        g.connections
-            .retain(|c| !(c.from.node == 1 && c.to.node == 2));
+        g.connections.retain(|c| c.to.node != 2);
         g.connections.push(Connection {
             from: Port { node: 1, index: 0 },
             to: Port { node: 2, index: 0 },

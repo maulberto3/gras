@@ -8,7 +8,7 @@
 
 use fastrand::Rng;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::utils::error::TopologyError;
 
@@ -386,20 +386,17 @@ impl Topology {
         // Step 6: connect_orphans — wire orphaned inputs to the input node (cycle ports)
         self.rewire_orphaned_inputs();
 
-        // Step 6b: clean_wiring — dedup input node connections (one wire per source_port, target_node)
+        // Step 6b: clean_wiring — one Input wire per target (the Input node fans out)
         self.dedup_input_connections();
 
-        // Step 7: rescue_outputs — wire orphaned outputs to later nodes (dedup inline)
+        // Step 7: rescue_outputs — wire orphaned outputs into a free input port, or grow
+        // one. Inline de-dup: a rescue never repeats a source→target pair.
         self.rewire_orphaned_outputs();
 
-            // Step 7b: dedup_value_wires — collapse same-(source→target) wires with identical
-            // source activations. MUST run BEFORE trim_orphaned_ports (dedup can strand ports).
-        self.dedup_value_wires();
-
-        // Step 7c: trim_ports — remove orphaned input/output ports from the topology
+        // Step 8: trim_ports — drop ports nothing uses and renumber the rest
         self.trim_orphaned_ports();
 
-        // Step 8: verify — validate the final wiring
+        // Step 9: verify — validate the final wiring
         if let Err(e) = self.validate() {
             panic!("finalize validation failed: {e}\n{self:?}");
         }
@@ -465,6 +462,11 @@ impl Topology {
 
     /// Step 5: Set input node output count = number of hidden nodes (at least).
     /// Never shrinks — if the node already has more ports, keep them.
+    ///
+    /// The Input node is the one deliberate fan-out node: its ports are the features
+    /// (one per port, see the feature split), and each port may feed several targets —
+    /// that is what `validate`'s Input exemption and `dedup_input_connections` below
+    /// are for. Every other node stays 1:1 on both sides.
     fn set_input_fanout(&mut self) {
         let n_hidden = self
             .nodes
@@ -515,8 +517,15 @@ impl Topology {
         }
     }
 
-    /// Remove duplicate connections from the input node: keep at most one
-    /// wire per (source_port, target_node) pair.
+        /// The Input node is the one deliberate fan-out node (its ports are the features,
+        /// and each may feed several targets), so ONE target must not be fed by two Input
+        /// ports: every Input port is Identity, which would make the second wire a value
+        /// duplicate of the first — twice the same signal, straight into the combine op.
+        ///
+        /// This is the whole of the old `dedup_value_wires` for the only case that could
+        /// still arise: `wire_ports` and `rewire_orphaned_outputs` both refuse to feed one
+        /// target twice from the same source node, so a same-source duplicate can only come
+        /// from here. Keeping the first wire is what the old pass did, decided once.
     fn dedup_input_connections(&mut self) {
         let input_id = self
             .nodes
@@ -524,16 +533,15 @@ impl Topology {
             .find(|n| n.kind == NodeKind::Input)
             .map(|n| n.id);
         if let Some(id) = input_id {
-            let mut seen: Vec<(usize, usize)> = Vec::new();
+            let mut seen: Vec<usize> = Vec::new();
             self.connections.retain(|c| {
                 if c.from.node != id {
                     return true;
                 }
-                let key = (c.from.index, c.to.node);
-                if seen.contains(&key) {
+                if seen.contains(&c.to.node) {
                     false
                 } else {
-                    seen.push(key);
+                    seen.push(c.to.node);
                     true
                 }
             });
@@ -639,9 +647,11 @@ impl Topology {
             ));
         }
 
-            // 3. Connections: forward-only, known nodes, in-range ports, and 1:1 on the
-            // OUTPUT side. Input ports may receive several wires (the node combines them).
+            // 3. Connections: forward-only, known nodes, in-range ports, and 1:1 on BOTH
+            // sides — one wire per input port (fan-in is extra ports, see `rewire_orphaned_outputs`)
+            // and one wire per non-Input output port.
         let mut used_sources: Vec<Port> = Vec::new();
+        let mut used_targets: Vec<Port> = Vec::new();
         for conn in &self.connections {
             if conn.from.node >= conn.to.node {
                 return Err(TopologyError::BackwardConnection(conn.clone()));
@@ -669,6 +679,10 @@ impl Topology {
                 return Err(TopologyError::DoubleUsedOutput(conn.from));
             }
             used_sources.push(conn.from);
+            if used_targets.contains(&conn.to) {
+                return Err(TopologyError::MultiWiredInputPort(conn.to));
+            }
+            used_targets.push(conn.to);
         }
 
             // 4. Feature-dim consistency per node: with per-node hidden_dim + port
@@ -744,8 +758,88 @@ impl Topology {
         (ins, outs)
     }
 
+        /// Every input port that carries more than one wire, with its wire count —
+        /// `[]` is the healthy answer. The wiring model in one sentence: **a port is a
+        /// socket, not a bucket**; fan-in is extra input ports.
+    pub fn input_ports_with_multiple_wires(&self) -> Vec<(Port, usize)> {
+        let mut counts: Vec<(Port, usize)> = Vec::new();
+        for c in &self.connections {
+            match counts.iter_mut().find(|(p, _)| *p == c.to) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((c.to, 1)),
+            }
+        }
+        counts.retain(|(_, n)| *n > 1);
+        counts
+    }
+
+        /// Give a blueprint the one-wire-per-port shape: every input port that carries
+        /// several wires is split into that many ports. Called on load
+        /// ([`Topology::from_json`]) — a run recorded before the wiring refactor is
+        /// otherwise unloadable, and the engine's inheritance path reads the previous
+        /// run's `nets/*.json` automatically.
+        ///
+        /// Values: wire order within a port is preserved, so **Add and Mean are
+        /// unchanged** (the old port sum / count equals the new wire sum / port count).
+        /// The folding ops (`Max/Min/Mul/Sub/Div`) now see one operand per wire instead
+        /// of one per port sum — that is the point of the refactor, not a side effect.
+        /// No-op on a current blueprint, and announced at info level when it fires: a
+        /// rewritten blueprint is something the log should admit to.
+    pub(crate) fn unstack_input_ports(&mut self) {
+        let stacked = self.input_ports_with_multiple_wires();
+        if stacked.is_empty() {
+            return;
+        }
+        let wires: usize = stacked.iter().map(|(_, n)| n).sum();
+        let mut reshaped: Vec<Connection> = Vec::with_capacity(self.connections.len());
+        for conn in &self.connections {
+            let taken = reshaped.iter().any(|c| c.to == conn.to);
+            let to = if taken {
+                let node = &mut self.nodes[conn.to.node];
+                let index = node.num_inputs;
+                node.num_inputs += 1;
+                Port {
+                    node: conn.to.node,
+                    index,
+                }
+            } else {
+                conn.to
+            };
+            reshaped.push(Connection {
+                from: conn.from,
+                to,
+            });
+        }
+        self.connections = reshaped;
+        info!(
+            "legacy blueprint: {} input port(s) carried {wires} wires — split into one port per wire",
+            stacked.len()
+        );
+    }
+
+        /// Panic unless the wiring invariant holds: every input port has exactly one
+        /// wire (test helper — `validate` enforces the same rule).
+    pub fn assert_one_wire_per_port(&self) {
+        let multi = self.input_ports_with_multiple_wires();
+        assert!(multi.is_empty(), "input ports with >1 wire: {multi:?}");
+        for node in &self.nodes {
+            for i in 0..node.num_inputs {
+                let port = Port {
+                    node: node.id,
+                    index: i,
+                };
+                assert!(
+                    self.connections.iter().any(|c| c.to == port),
+                    "input port n{}_i{} has no wire",
+                    node.id,
+                    i
+                );
+            }
+        }
+    }
+
     /// Wired degrees `(in_degree, out_degree)` per node, indexed by node id
-    /// — one count per *wire* (a port with several wires counts several).
+    /// — one count per *wire*.
     pub fn degrees(&self) -> Vec<(usize, usize)> {
         node_degrees(&self.nodes, &self.connections)
     }
@@ -797,6 +891,8 @@ impl Topology {
 
             // 2. Exactly one Output node: append the projection (`hidden_dim → output_dim`);
             // with auto-detected output_dim there's no need for multiple Output nodes.
+            // It starts with ONE input socket and gains the rest in
+            // `rewire_orphaned_outputs` — its fan-in is its port count, like any node.
         let has_output = self.nodes.iter().any(|n| n.kind == NodeKind::Output);
         if !has_output {
             let mut out = Node::new_output(self.nodes.len(), 1, 1);
@@ -807,6 +903,11 @@ impl Topology {
 
         /// Re-wire orphaned output ports into random *later* nodes — the de-orphaning rule,
         /// called at the end of `finalize`. Deterministic per `options.topology_seed`.
+        ///
+        /// **One wire per input port:** the rescued wire takes a socket that is still
+        /// free; only when every socket of every candidate is taken does the target
+        /// grow a new input port. This is the single place fan-in is created, and it
+        /// now creates it in the only shape the runtime understands.
     pub fn rewire_orphaned_outputs(&mut self) -> usize {
         // Collect the orphaned output ports (graph-output node excluded).
         // The Output node is always the last node (created by ensure_scaffold).
@@ -847,10 +948,42 @@ impl Topology {
             if targets.is_empty() {
                 continue;
             }
-            let target = targets[self.rng.usize(0..targets.len())];
-            // Even an already-wired input port can take another wire: the
-            // node combines all incoming tensors (Add/Mean) anyway.
-            let port = self.rng.usize(0..self.nodes[target].num_inputs);
+            // Target choice, in order of preference:
+            //   1. a node with a free socket — port counts stay exactly as born;
+            //   2. a node allowed to grow (a Hidden node still under
+            //      `max_hidden_inputs_per_node`, or the Output node, whose fan-in *is*
+            //      its port count);
+            //   3. nobody — leave the wire unplaced rather than break the invariant.
+            let free: Vec<usize> = targets
+                .iter()
+                .copied()
+                .filter(|&t| self.free_input_port(t).is_some())
+                .collect();
+            let target = if !free.is_empty() {
+                free[self.rng.usize(0..free.len())]
+            } else {
+                let growable: Vec<usize> = targets
+                    .iter()
+                    .copied()
+                    .filter(|&t| self.may_grow_inputs(t))
+                    .collect();
+                if growable.is_empty() {
+                    continue;
+                }
+                growable[self.rng.usize(0..growable.len())]
+            };
+            let port = match self.free_input_port(target) {
+                Some(i) => i,
+                None => {
+                        // Every socket is taken: add one. The wire count and the port
+                        // count stay equal, which is what lets the runtime keep one
+                        // source per port instead of a list per port.
+                    let node = &mut self.nodes[target];
+                    let i = node.num_inputs;
+                    node.num_inputs += 1;
+                    i
+                }
+            };
             self.connections.push(Connection {
                 from: src,
                 to: Port {
@@ -863,8 +996,36 @@ impl Topology {
         added
     }
 
-    /// Remove orphaned input/output ports and renumber connections to close
-    /// gaps. The Output node keeps all its ports (network output).
+        /// Whether `node` may take another input port. Hidden nodes stay inside the
+        /// birth band (`max_hidden_inputs_per_node`); the Output node has no ceiling —
+        /// its fan-in is whatever reaches it, one socket per wire.
+    fn may_grow_inputs(&self, node: usize) -> bool {
+        match self.nodes[node].kind {
+            NodeKind::Hidden => {
+                self.nodes[node].num_inputs < self.options.max_hidden_inputs_per_node
+            }
+            _ => true,
+        }
+    }
+
+    /// The lowest input port of `node` that nothing feeds yet.
+    fn free_input_port(&self, node: usize) -> Option<usize> {
+        (0..self.nodes[node].num_inputs).find(|&i| {
+            !self
+                .connections
+                .iter()
+                .any(|c| c.to == Port { node, index: i })
+        })
+    }
+
+    /// Remove orphaned ports and renumber connections to close gaps. The Output node
+    /// keeps all of its output ports (they are the network output).
+    ///
+    /// The input side is compacted too, and for one reason only: `dedup_input_connections`
+    /// DROPS a wire (the second Input wire into a target), which empties the port it used,
+    /// and an empty input port may not survive (`validate` wants every one wired). Nothing
+    /// else can empty an input port — `wire_ports` and `rewire_orphaned_inputs` fill them
+    /// all, and `rewire_orphaned_outputs` adds ports as it needs them.
     fn trim_orphaned_ports(&mut self) {
         let output_id = self
             .nodes
@@ -872,7 +1033,7 @@ impl Topology {
             .find(|n| n.kind == NodeKind::Output)
             .map(|n| n.id);
 
-        // Build remap tables: for each node, old index -> compact new index.
+        // Remap tables: for each node, old port index -> compact new index.
         let out_remap: Vec<Vec<usize>> = self
             .nodes
             .iter()
@@ -914,14 +1075,14 @@ impl Topology {
                         map[i] = next;
                         next += 1;
                     } else {
-                        map[i] = usize::MAX;
+                        map[i] = usize::MAX; // empty after dedup — dropped
                     }
                 }
                 map
             })
             .collect();
 
-        // Renumber connections, dropping orphans.
+        // Renumber connections, dropping the ones whose source or target port died.
         self.connections.retain(|c| {
             let from_map = &out_remap[c.from.node];
             let to_map = &in_remap[c.to.node];
@@ -966,22 +1127,6 @@ impl Topology {
                 node.num_inputs = connected_in;
             }
         }
-    }
-
-        /// Collapse value-duplicate wires: within each (from.node → to.node) group keep the
-        /// first wire per distinct source-port activation. Runs after trim_orphaned_ports.
-    fn dedup_value_wires(&mut self) {
-        let mut kept: Vec<(usize, usize, crate::graph::node::Activation)> = Vec::new();
-        self.connections.retain(|c| {
-            let act = self.nodes[c.from.node].port_activation(c.from.index);
-            let key = (c.from.node, c.to.node, act);
-            if kept.contains(&key) {
-                false
-            } else {
-                kept.push(key);
-                true
-            }
-        });
     }
 
         /// Serialize the whole blueprint (options, nodes, labels, connections) to JSON
@@ -1281,98 +1426,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_value_wires_collapses_same_activation() {
-            // Two hidden nodes: with equal per-port activations the second wire is a
-            // value-duplicate and must be dropped; with different activations both survive.
-        let build = |port_acts: Option<Vec<Activation>>| {
-            let mut g = Topology::new(0, Some(TopologyOptions::default()));
-            g.nodes.push(Node::new_input(0, 1));
-            let mut n1 = Node::new_hidden(1, 1, 2);
-            n1.activation = Activation::ReLU;
-            n1.port_activations = port_acts;
-            g.nodes.push(n1);
-            g.nodes.push(Node::new_hidden(2, 2, 1));
-            g.nodes.push(Node::new_output(3, 1, 1));
-            g.connections.push(Connection {
-                from: Port { node: 0, index: 0 },
-                to: Port { node: 1, index: 0 },
-            });
-            g.connections.push(Connection {
-                from: Port { node: 1, index: 0 },
-                to: Port { node: 2, index: 0 },
-            });
-            g.connections.push(Connection {
-                from: Port { node: 1, index: 1 },
-                to: Port { node: 2, index: 1 },
-            });
-            g
-        };
-        // Ports 0 and 1 BOTH carry ReLU ⇒ duplicate value ⇒ dedup to 1 wire.
-        let mut dup = build(Some(vec![Activation::ReLU, Activation::ReLU]));
-        dup.dedup_value_wires();
-        let n1_to_n2 = dup
-            .connections
-            .iter()
-            .filter(|c| c.from.node == 1 && c.to.node == 2)
-            .count();
-        assert_eq!(
-            n1_to_n2, 1,
-            "same-activation wires into one target must dedup"
-        );
-        // Port 0 ReLU, port 1 Tanh ⇒ distinct values ⇒ both survive.
-        let mut distinct = build(Some(vec![Activation::ReLU, Activation::Tanh]));
-        distinct.dedup_value_wires();
-        let n1_to_n2 = distinct
-            .connections
-            .iter()
-            .filter(|c| c.from.node == 1 && c.to.node == 2)
-            .count();
-        assert_eq!(n1_to_n2, 2, "distinct-activation wires must survive");
-    }
-
-    #[test]
-    fn test_dedup_value_wires_collapses_input_duplicates() {
-            // All Input ports are Identity ⇒ two Input wires into the SAME target are
-            // value-duplicates and must collapse; different targets survive.
-        let mut g = Topology::new(0, Some(TopologyOptions::default()));
-        g.nodes.push(Node::new_input(0, 2));
-        g.nodes.push(Node::new_hidden(1, 2, 1));
-        g.nodes.push(Node::new_hidden(2, 1, 1));
-        g.nodes.push(Node::new_output(3, 1, 1));
-        g.connections.push(Connection {
-            from: Port { node: 0, index: 0 },
-            to: Port { node: 1, index: 0 },
-        });
-        g.connections.push(Connection {
-            from: Port { node: 0, index: 1 },
-            to: Port { node: 1, index: 1 },
-        });
-        g.connections.push(Connection {
-            from: Port { node: 0, index: 0 },
-            to: Port { node: 2, index: 0 },
-        });
-        g.dedup_value_wires();
-        let into_n1 = g
-            .connections
-            .iter()
-            .filter(|c| c.from.node == 0 && c.to.node == 1)
-            .count();
-        let into_n2 = g
-            .connections
-            .iter()
-            .filter(|c| c.from.node == 0 && c.to.node == 2)
-            .count();
-        assert_eq!(
-            into_n1, 1,
-            "two Identity Input wires into one target must dedup"
-        );
-        assert_eq!(
-            into_n2, 1,
-            "Input wire into a different target must survive"
-        );
-    }
-
-    #[test]
     fn test_trim_orphaned_ports_compacts_port_activations() {
             // An orphaned output port must compact port_activations along with num_outputs,
             // or finalize's validate() rejects the length mismatch.
@@ -1566,10 +1619,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_validate_allows_multi_wired_input_port() {
-            // De-orphaning stacks extra wires into already-wired input ports (the node
-            // combines all incoming tensors), so wiring one input port twice stays valid.
+    /// Two Input ports into one Hidden port — the shape that used to be legal.
+    fn stacked_input_port_graph() -> Topology {
         let mut graph = Topology::new(1, None);
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_hidden(1, 1, 1));
@@ -1579,15 +1630,65 @@ mod tests {
         });
         graph.connections.push(Connection {
             from: Port { node: 0, index: 1 },
-            to: Port { node: 1, index: 0 }, // second wire into the same port
+            to: Port { node: 1, index: 0 }, // a second wire into the same port
         });
-        assert_eq!(graph.validate(), Ok(()));
+        graph
+    }
 
-        let module = Network::build(&graph, Device::CPU).unwrap();
-        let batch = 2i64;
-        let input = rand_input(batch, graph.options.input_dim.unwrap_or(1));
-        let output = module.forward(&input).unwrap();
-        assert_eq!(output.shape(), &[batch, 8]);
+    #[test]
+    fn test_validate_rejects_multi_wired_input_port() {
+            // A port is a socket, not a bucket: fan-in is expressed as extra ports, so a
+            // freshly built graph may not stack two wires on one input port.
+        let graph = stacked_input_port_graph();
+        assert_eq!(
+            graph.validate(),
+            Err(TopologyError::MultiWiredInputPort(Port {
+                node: 1,
+                index: 0
+            }))
+        );
+    }
+
+    #[test]
+    fn legacy_stacked_blueprint_loads_as_one_port_per_wire() {
+            // A run recorded before the refactor can stack wires on one input port, and
+            // LOADING is the only way such wiring re-enters the process (engine inheritance
+            // reads the previous run's `nets/*.json` automatically). It must be usable:
+            // the port is split, no wire is dropped, and the result validates.
+        let mut graph = Topology::new(
+            9,
+            Some(TopologyOptions {
+                input_dim: Some(2),
+                output_dim: Some(1),
+                ..Default::default()
+            }),
+        );
+        graph.nodes.push(Node::new_input(0, 2));
+        graph.nodes.push(Node::new_hidden(1, 1, 1)); // ONE port, two wires
+        graph.nodes.push(Node::new_output(2, 1, 1));
+        graph.connections.push(Connection {
+            from: Port { node: 0, index: 0 },
+            to: Port { node: 1, index: 0 },
+        });
+        graph.connections.push(Connection {
+            from: Port { node: 0, index: 1 },
+            to: Port { node: 1, index: 0 },
+        });
+        graph.connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 0 },
+        });
+        assert_eq!(graph.input_ports_with_multiple_wires().len(), 1);
+
+        let loaded = Topology::from_json(&graph.to_json().unwrap()).unwrap();
+        assert!(
+            loaded.input_ports_with_multiple_wires().is_empty(),
+            "loading must spread a stacked port over one port per wire"
+        );
+        assert_eq!(loaded.connections.len(), 3, "no wire may be dropped");
+        assert_eq!(loaded.nodes[1].num_inputs, 2, "the stacked port became two");
+        loaded.assert_one_wire_per_port();
+        assert_eq!(loaded.validate(), Ok(()));
     }
 
     #[test]
@@ -1947,6 +2048,13 @@ mod tests {
         fn prop_wiring_invariants(graph in topology_strategy()) {
             let mut seen: Vec<Port> = Vec::new();
             let input_id = graph.nodes.iter().find(|n| n.kind == NodeKind::Input).map(|n| n.id);
+                // One wire per input port — the invariant that lets the runtime keep a
+                // single source per port instead of a list per port.
+            prop_assert!(
+                graph.input_ports_with_multiple_wires().is_empty(),
+                "stacked input ports: {:?}",
+                graph.input_ports_with_multiple_wires()
+            );
             for conn in &graph.connections {
                 prop_assert!(conn.from.node < conn.to.node, "backward connection: {conn}");
                 // Input node's output ports can fan out.
@@ -2082,9 +2190,94 @@ mod finalize_order_tests {
     }
 
     #[test]
+    fn finalize_wires_every_input_port_exactly_once() {
+            // The wiring model: a port is a socket, not a bucket. After `finalize` every
+            // input port carries exactly one wire — including crossover children, whose
+            // parents were both finalized from a different (possibly richer) shape.
+        for seed in 0..40 {
+            let opts = TopologyOptions {
+                topology_seed: seed,
+                input_dim: Some(4),
+                output_dim: Some(1),
+                ..Default::default()
+            };
+            let mut a = Topology::new(seed, Some(opts));
+            a.create_random_hidden_nodes(4);
+            a.finalize();
+            a.assert_one_wire_per_port();
+                // The Input node is the one fan-out node, but it may not feed one target
+                // twice: every Input port is Identity, so the second wire would be the
+                // same signal twice, straight into the combine op.
+            let input_id = a
+                .nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Input)
+                .unwrap()
+                .id;
+            for target in &a.nodes {
+                let from_input = a
+                    .connections
+                    .iter()
+                    .filter(|c| c.from.node == input_id && c.to.node == target.id)
+                    .count();
+                assert!(from_input <= 1, "n{} fed {from_input}× by Input", target.id);
+            }
+
+            let mut b = Topology::new(seed + 1000, Some(opts));
+            b.create_random_hidden_nodes(4);
+            b.finalize();
+            b.assert_one_wire_per_port();
+
+            let mut rng = Rng::with_seed(seed as u64);
+            if Topology::cx_one_point(&mut a, &mut b, &mut rng) {
+                a.assert_one_wire_per_port();
+                b.assert_one_wire_per_port();
+            }
+        }
+    }
+
+    #[test]
+    fn orphan_rescue_grows_a_port_rather_than_stacking() {
+            // Every candidate socket is taken, so the rescue has exactly one legal move:
+            // give the target another input port. Stacking on the taken one is now refused
+            // by `validate`.
+        let mut graph = Topology::new(3, Some(TopologyOptions::default()));
+        graph.nodes.push(Node::new_input(0, 1));
+        graph.nodes.push(Node::new_hidden(1, 1, 2));
+        graph.nodes.push(Node::new_hidden(2, 1, 1));
+        graph.nodes.push(Node::new_output(3, 1, 1));
+        graph.connections = vec![
+            Connection {
+                from: Port { node: 0, index: 0 },
+                to: Port { node: 1, index: 0 },
+            },
+            Connection {
+                from: Port { node: 1, index: 0 },
+                to: Port { node: 2, index: 0 },
+            },
+            Connection {
+                from: Port { node: 2, index: 0 },
+                to: Port { node: 3, index: 0 },
+            },
+        ];
+
+        assert_eq!(graph.rewire_orphaned_outputs(), 1, "n1_o1 is the only orphan");
+
+        assert!(
+            graph.input_ports_with_multiple_wires().is_empty(),
+            "the rescue must not stack a second wire on a taken port"
+        );
+        assert!(
+            graph.nodes.iter().any(|n| n.num_inputs == 2),
+            "the rescue must give the target a new input port"
+        );
+    }
+
+    #[test]
     fn finalize_leaves_no_orphaned_input_output_ports() {
-            // Regression: dedup_value_wires used to run AFTER trim_orphaned_ports, stranding
-            // ports whose only wire got value-deduped (mermaid `identity (orphan)` stubs).
+            // Regression: dedup used to run AFTER trim_orphaned_ports, stranding ports whose
+            // only wire got dropped (mermaid `identity (orphan)` stubs). The order still
+            // matters for the same reason: dedup DROPS a wire, trim removes the emptied port.
         for seed in 0..40 {
             let mut g = Topology::new(seed, Some(TopologyOptions::default()));
             g.finalize();
