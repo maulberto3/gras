@@ -103,12 +103,19 @@ pub struct ConfigSnapshot {
         /// Replay-relevant, so it must match on resume.
     #[serde(default)]
     pub freeze_elites: bool,
-        /// Training lottery (`set_run_train_merit`): each non-crown net's clock
-        /// is a merit-weighted coin between a real update and act-and-measure. Decides
-        /// which clocks were act-only, so it is replay-relevant; `#[serde(default)]`
-        /// (⇒ `false`) keeps every pre-knob header on the old always-train path.
+        /// Training lottery strength Ω (`set_run_train_merit`): how much of the merit
+        /// tilt the coin applies — `p_eff = 1 − Ω·(1 − p)`. `0.0` (default, and what
+        /// every pre-knob header means) is the old always-train path; `1.0` is the full
+        /// merit weighting; between is a partial dial. Decides which clocks were idle,
+        /// so it is replay-relevant and a resume must match it exactly.
     #[serde(default)]
-    pub evolution_train_lottery: bool,
+    pub train_merit: f32,
+        /// LEGACY, read-only: before Ω this knob was the bool `evolution_train_lottery`
+        /// (`true` = the run trained under the full lottery, i.e. Ω = 1.0). Normalized
+        /// into `train_merit` on load by [`ConfigSnapshot::normalize_legacy`] and never
+        /// written back — one truth per file.
+    #[serde(default, rename = "evolution_train_lottery", skip_serializing)]
+    pub legacy_train_lottery: Option<bool>,
         /// How many initial slots were user-supplied run topologies. Informational (lineage
         /// reads: ordinals below this are imports).
     #[serde(default)]
@@ -212,7 +219,8 @@ impl ConfigSnapshot {
             csv_export: cfg.csv_export,
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
-            evolution_train_lottery: cfg.evolution_train_lottery,
+            train_merit: cfg.train_merit,
+            legacy_train_lottery: None,
             run_topology_count: cfg.run_topologies.len(),
             elite_previous_load: cfg.elite_previous_load,
             elite_previous_dir: cfg
@@ -233,6 +241,21 @@ impl ConfigSnapshot {
             guardrail_matches: cfg.guardrail_matches,
             build: crate::engine::format::build_stamp(),
         }
+    }
+
+        /// Fold a pre-Ω header's `evolution_train_lottery` bool into `train_merit`.
+        ///
+        /// Those runs had exactly two settings, so the mapping is lossless: `true` ran
+        /// at the full merit weighting (`Ω = 1.0`), `false` at the old always-train path
+        /// (`Ω = 0.0`, which is also the serde default). Called on every header load, so
+        /// no reader has to know the old spelling existed — a resume compares the
+        /// normalized value and an old run stays resumable at its recorded strength.
+    pub fn normalize_legacy(&mut self) {
+        if self.train_merit == 0.0 && self.legacy_train_lottery == Some(true) {
+            self.train_merit = 1.0;
+        }
+        // Consumed: one truth per snapshot from here on.
+        self.legacy_train_lottery = None;
     }
 }
 
@@ -729,11 +752,12 @@ impl RunHeader {
             })
             .unwrap_or_default();
         // Missing on legacy engine.json files ⇒ Default (all-zero snapshot).
-        let config: ConfigSnapshot = v
+        let mut config: ConfigSnapshot = v
             .get("config")
             .cloned()
             .and_then(|c| serde_json::from_value(c).ok())
             .unwrap_or_default();
+        config.normalize_legacy();
         // Trainer self-description (see `Trainer::describe`). Absent on legacy
         // files and on trainers that don't implement the hook.
         let trainer = v.get("trainer").cloned();
@@ -833,8 +857,9 @@ pub struct NetState {
     pub topology: String,
         /// Weight-init seed, stored redundantly so a reader needn't re-parse the topology.
     pub net_seed: usize,
-        /// The step this net has trained/evaluated through; a resume replays up to it, then
-        /// continues.
+        /// Clocks this net actually TRAINED through (real optimizer updates). Crown
+        /// act-and-measure passes live in `frozen_spans`, lottery idles in `idle_spans`;
+        /// a resume replays the recorded clocks, then continues.
     pub step: usize,
     /// Whether this net is currently alive in the active population. Culled nets
     /// are written as final tombstones to disk with `is_alive: false`.
@@ -879,6 +904,14 @@ pub struct NetState {
         /// relevant: resume re-runs them through a no-op optimizer. Run-length, disjoint.
     #[serde(default)]
     pub frozen_spans: Vec<(usize, usize)>,
+        /// Inclusive clock ranges this net spent IDLE: the training lottery gave it no
+        /// train-eval ticket, so no train batch, no eval batch, no metric row and no
+        /// weight update happened. Disjoint from `frozen_spans` (the crown's
+        /// act-and-measure passes, which DO measure). Replay-relevant: resume skips
+        /// these clocks entirely — there is no update and no RNG draw to reproduce.
+        /// Run-length, disjoint.
+    #[serde(default)]
+    pub idle_spans: Vec<(usize, usize)>,
         /// Rich per-individual metadata (params, dims, regime, run context). Missing on
         /// legacy JSONs; backfilled on first rewrite.
     #[serde(default)]
@@ -895,14 +928,28 @@ pub struct NetState {
         /// `elite_crown_lifetime_steps` the net ages out (`0` disables).
     #[serde(default)]
     pub elite_seat_age: usize,
-        /// Clocks this net ACTED but the training lottery skipped its weight update.
-        /// A subset of the act-and-measure clocks in `frozen_spans` (which stay the
-        /// replay ledger: both reasons replay through a no-op optimizer); kept apart so
-        /// the elite table's `frozen` column still means "crown freeze" and the budget
-        /// skips get their own number. `0` on legacy records and whenever the lottery
-        /// is off.
+        /// LEGACY: clocks an older lottery ACTED but did not update (they sit in
+        /// `frozen_spans`, because that era re-ran them through a no-op optimizer).
+        /// Since the ticket lottery a skipped clock is fully idle and is recorded in
+        /// `idle_spans` instead; nothing writes this field any more. Kept (with a
+        /// default) so records from the act-only era still load, and so their own
+        /// numbers are not re-read as idle clocks. `0` on new runs.
     #[serde(default)]
     pub budget_skips: usize,
+}
+
+/// Extend `spans` with `step`, merging into the previous span when contiguous.
+/// Shared by the frozen and idle ledgers so both stay run-length and disjoint.
+fn push_span(spans: &mut Vec<(usize, usize)>, step: usize) {
+    match spans.last_mut() {
+        Some((_, end)) if *end + 1 == step => *end = step,
+        _ => spans.push((step, step)),
+    }
+}
+
+/// Total clocks covered by run-length `spans`.
+fn span_len(spans: &[(usize, usize)]) -> usize {
+    spans.iter().map(|&(s, e)| e.saturating_sub(s) + 1).sum()
 }
 
 /// Rich metadata for one individual (embedded in `nets/<hash>.json` under `meta`) — enough
@@ -961,8 +1008,9 @@ pub struct NetMetrics {
     pub fitness: f32,
     /// Informative-only metric values, in the same order the run configured them.
     pub informative: Vec<f32>,
-        /// True when this step was an ACT-AND-MEASURE pass (frozen elite). Replay-relevant:
-        /// resume re-runs it through a no-op optimizer.
+        /// True when this step was the CROWN's act-and-measure pass (frozen elite).
+        /// Replay-relevant: resume re-runs it through a no-op optimizer. A lottery-idled
+        /// clock records no metrics at all, so it never reaches this field.
     #[serde(default)]
     pub frozen: bool,
 }
@@ -1015,6 +1063,7 @@ impl NetState {
             created_from,
             last_metrics: None,
             frozen_spans: Vec::new(),
+            idle_spans: Vec::new(),
             meta: NetMeta::default(),
             last_update_step: step,
             elite_probation_age: 0,
@@ -1026,10 +1075,33 @@ impl NetState {
         /// Record clock `step` as an act-and-measure (frozen) step, extending the last span
         /// when contiguous. Does NOT advance `last_update_step`.
     pub fn record_frozen_step(&mut self, step: usize) {
-        match self.frozen_spans.last_mut() {
-            Some((_, end)) if *end + 1 == step => *end = step,
-            _ => self.frozen_spans.push((step, step)),
-        }
+        push_span(&mut self.frozen_spans, step);
+    }
+
+        /// Record clock `step` as an IDLE clock (the lottery gave no train-eval ticket:
+        /// no train, no eval, no metrics), extending the last span when contiguous.
+        /// Kept apart from `frozen_spans` because only the crown's pass replays.
+    pub fn record_idle_step(&mut self, step: usize) {
+        push_span(&mut self.idle_spans, step);
+    }
+
+    /// Clocks this net spent ACTING without updating (the crown freeze): the length of
+    /// `frozen_spans`. One implementation for the replay ledger and the `frozen` column.
+    pub fn frozen_clocks(&self) -> usize {
+        span_len(&self.frozen_spans)
+    }
+
+    /// Clocks the lottery left this net idle (no train, no eval): the length of
+    /// `idle_spans`.
+    pub fn idle_clocks(&self) -> usize {
+        span_len(&self.idle_spans)
+    }
+
+        /// Clocks this net actually ran the trainer and was scored: its real updates plus
+        /// its crown act-and-measure passes. The ticket lottery's merit divisor — an idle
+        /// clock is not in here, so idling can never lower a net's score-per-ticket.
+    pub fn measured_clocks(&self) -> usize {
+        self.step + self.frozen_clocks()
     }
 
     /// Whether `step` lies inside a recorded frozen span.
