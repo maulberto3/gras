@@ -18,11 +18,11 @@ pub(crate) struct AsciiNode {
     pub num_outputs: usize,
     /// Output dimension (from node_dims), shown in parentheses.
     pub out_dim: Option<usize>,
-    /// Wires ARRIVING at this node (may exceed num_inputs: several wires can
-    /// share one input port — the combine op merges them).
+    /// Wires ARRIVING at this node — equals `num_inputs` on a finalized graph
+    /// (one wire per input port; a port is a socket, not a bucket).
     pub in_wires: usize,
-    /// Wires LEAVING this node (may exceed num_outputs: the Input node's
-    /// single port fans out to many targets by design).
+    /// Wires LEAVING this node (may exceed `num_outputs`: the Input node's ports
+    /// fan out to many targets by design — it is the only fan-out node).
     pub out_wires: usize,
 }
 
@@ -42,8 +42,8 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
     let labels: Vec<String> = nodes
         .iter()
         .map(|n| {
-                // Wires vs ports on both sides: `in: 2 wires → 1 port` — the
-                // wire counts make the box match the arrows.
+                // Wires vs ports on both sides. In = Out on the input side (`2w→2i`:
+                // one wire per port); the output side can fan out (`1o→5w`).
             let in_part = format!("{}w→{}i", n.in_wires.max(n.num_inputs), n.num_inputs);
             let out_part = format!("{}o→{}w", n.num_outputs, n.out_wires.max(n.num_outputs));
             match n.out_dim {
@@ -69,7 +69,9 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         .collect();
 
         // ── Port slots: ONE PER WIRE, so each wire is drawn one-to-one. ──
-        // A shared port's label simply repeats (`o1 o1`); no wires → one orphan slot.
+        // On the input side that is one slot per port (one wire each); on the output
+        // side the Input node's fan-out makes a label repeat (`o1 o1`). No wires →
+        // one orphan slot.
     let mut out_slots: Vec<Vec<(usize, Option<usize>)>> = Vec::with_capacity(nodes.len());
     let mut in_slots: Vec<Vec<(usize, Option<usize>)>> = Vec::with_capacity(nodes.len());
     let mut src_slot = vec![0usize; connections.len()];
@@ -108,8 +110,8 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         }
         in_slots.push(slots);
     }
-        // Each wire is labelled with its PORT index, so a port carrying several
-        // wires shows its label repeated (`o1 o1` = fan-out).
+        // Each wire is labelled with its PORT index; where one port feeds several
+        // wires (Input only) the label repeats (`o1 o1` = fan-out).
     let slot_labels = |prefix: char, ports: &[usize]| -> Vec<String> {
         ports.iter().map(|p| format!("{prefix}{p}")).collect()
     };
@@ -260,14 +262,14 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         for (k, ch) in labels[i].chars().enumerate() {
             put(&mut canvas, r0, indent + k, ch);
         }
-        // One label per incoming WIRE (`i0 i0` when the port is shared).
+        // One label per incoming wire — one per input port on a finalized graph.
         for (q, label) in in_labels[i].iter().enumerate() {
             let c = in_col(q);
             for (k, ch) in label.chars().enumerate() {
                 put(&mut canvas, r0 + 1, c + k, ch);
             }
         }
-        // One label per outgoing WIRE (`o1 o1` when the port is shared).
+        // One label per outgoing wire (`o1 o1` where the Input node fans out).
         for (q, label) in out_labels[i].iter().enumerate() {
             let c = out_col(q);
             for (k, ch) in label.chars().enumerate() {

@@ -155,7 +155,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("```\n");
     out.push_str("\n> **Legend**:\n");
     out.push_str("> - I=input  H=hidden  O=output\n");
-    out.push_str("> - `4w→2i/1o→5w` = wires→input ports / output ports→wires; a port with several wires is drawn once per wire (its label repeats, `o1 o1`), so every marker maps to exactly one wire\n");
+    out.push_str("> - `2w→2i/1o→5w` = wires→input ports / output ports→wires. An input port carries exactly ONE wire (fan-in is extra ports), so `w == i`; only the Input node fans out, which is why its labels can repeat (`o1 o1`). Every marker maps to exactly one wire\n");
     out.push_str("> - ->dim = output dimension\n");
     out.push_str("> - ▶ connected output  ◀ connected input  * orphaned port\n");
 
@@ -175,10 +175,64 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("\n| **Arrow label (Graph)** | the wire's own activation — per-port, so one node can emit `mish` to one neighbor and `tanh` to another. Equal labels from the same node = same signal; duplicates are impossible (dedup collapses them). |");
     out.push_str("\n| **Dashed stub `selu (input)` / `mish (orphan)`** | orphaned port — an input nothing feeds / an output nothing reads (mermaid's counterpart of the ASCII `*`). |");
     out.push_str("\n| **`in <n>` / `out <n>`** | dataset shape (fixed by the problem). |");
-    out.push_str("\n| **Nodes table → `Sources`** | which output ports feed this node (`n1_o2` = output 2 of node 1); `*` = orphaned. |");
+    out.push_str("\n| **Nodes table → `Sources`** | which output port feeds each input port (`n1_o2` = output 2 of node 1), one entry per port in port order — the `k`-th entry feeds `i<k>`; `*` = an unwired port (never left behind by `finalize`). |");
     out.push_str("\n| **Nodes table → `Combine` / `Std`** | how multiple inputs are merged / whether they're normalized first. |");
     out.push_str("\n| **Edge list & wiring diagram** | one line per wire, exact ports (`n0_o1 → n2_i0`); `<<<<` = long jump; `▶ ◀ *` = wired out / wired in / orphaned. |");
     out.push('\n');
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::topology::TopologyOptions;
+
+    fn sample() -> Topology {
+        let mut g = Topology::new(
+            7,
+            Some(TopologyOptions {
+                input_dim: Some(3),
+                output_dim: Some(1),
+                ..Default::default()
+            }),
+        );
+        g.create_random_hidden_nodes(3);
+        g.finalize();
+        g
+    }
+
+    #[test]
+    fn markdown_legend_describes_one_wire_per_port() {
+        // The old caveat ("a port with several wires is drawn once per wire") described
+        // the wiring model that no longer exists; the legend must say what replaced it.
+        let md = topology_markdown(&sample(), None);
+        assert!(
+            md.contains("An input port carries exactly ONE wire"),
+            "legend must state the one-wire rule:\n{md}"
+        );
+        assert!(
+            !md.contains("a port with several wires is drawn once per wire"),
+            "stale wire-per-port caveat still in the legend:\n{md}"
+        );
+    }
+
+    #[test]
+    fn wiring_diagram_wire_count_equals_port_count() {
+        // `Nw→Mi` on the input side of every box: with one wire per port the two numbers
+        // are the same, which is the visual statement of the invariant.
+        let g = sample();
+        let md = topology_markdown(&g, None);
+        for node in &g.nodes {
+            let in_wires = g.connections.iter().filter(|c| c.to.node == node.id).count();
+            assert_eq!(in_wires, node.num_inputs, "n{}", node.id);
+            assert!(
+                md.contains(&format!("{}w→{}i", node.num_inputs, node.num_inputs)),
+                "n{} should be labelled {}w→{}i:\n{md}",
+                node.id,
+                node.num_inputs,
+                node.num_inputs
+            );
+        }
+    }
 }

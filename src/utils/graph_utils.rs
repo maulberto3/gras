@@ -3,18 +3,20 @@
 use crate::graph::node::{Activation, Node, NodeKind};
 use crate::graph::topology::{Connection, KindCounts, Port};
 
-/// Per node, per input port, the list of source ports in CONNECTION order —
-/// the order the safetensors exporter and the Python loader both count by.
+/// Per node, per input port, the ONE source port feeding it — the wiring model is
+/// one wire per port, so a port without a wire reads `None`.
+///
+/// Two wires into one port cannot reach here: `Topology::validate` refuses them
+/// (`MultiWiredInputPort`). The map is nonetheless built defensively, keeping the
+/// first wire of a port if one ever did, so a lookup can never lose a port.
 pub(crate) fn build_node_sources(
     connections: &[Connection],
     num_inputs: &[usize],
-) -> Vec<Vec<Vec<Port>>> {
-    // (node, port) → sources, appended in connection order; BTreeMap so
-    // iteration (never the per-key Vec order) is deterministic.
-    let mut input_map: std::collections::BTreeMap<Port, Vec<Port>> =
-        std::collections::BTreeMap::new();
+) -> Vec<Vec<Option<Port>>> {
+    // (node, port) → its source; BTreeMap so iteration is deterministic.
+    let mut input_map: std::collections::BTreeMap<Port, Port> = std::collections::BTreeMap::new();
     for c in connections {
-        input_map.entry(c.to).or_default().push(c.from);
+        input_map.entry(c.to).or_insert(c.from);
     }
     num_inputs
         .iter()
@@ -27,8 +29,7 @@ pub(crate) fn build_node_sources(
                             node: node_id,
                             index: i,
                         })
-                        .cloned()
-                        .unwrap_or_default()
+                        .copied()
                 })
                 .collect()
         })

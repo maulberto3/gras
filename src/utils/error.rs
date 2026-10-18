@@ -46,6 +46,10 @@ pub enum TopologyError {
     PortOutOfBounds { port: Port, num_ports: usize },
     /// An output port feeds two inputs (violates 1:1 pairing).
     DoubleUsedOutput(Port),
+    /// An input port receives more than one wire. A port is a socket, not a
+    /// bucket: fan-in is extra input ports (`rewire_orphaned_outputs` grows
+    /// one when every socket is taken).
+    MultiWiredInputPort(Port),
 }
 
 impl Display for TopologyError {
@@ -74,6 +78,12 @@ impl Display for TopologyError {
             TopologyError::DoubleUsedOutput(p) => {
                 write!(f, "output port n{}_o{} is used twice", p.node, p.index)
             }
+            TopologyError::MultiWiredInputPort(p) => write!(
+                f,
+                "input port n{}_i{} carries more than one wire (one wire per port: \
+                 give the node another input port instead)",
+                p.node, p.index
+            ),
         }
     }
 }

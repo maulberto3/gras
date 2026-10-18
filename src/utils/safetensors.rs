@@ -51,12 +51,13 @@ fn collect_tensors(net: &Network) -> Result<Vec<TensorBlob>> {
     for (idx, layer) in net.layers.iter().enumerate() {
         push_linear(&mut blobs, &format!("node{idx}"), layer)?;
     }
+        // `proj<N>_<port>_0`: one bridge per input port, so the trailing source index is
+        // always 0 — kept because the Python loader builds the same name the same way
+        // (`proj<node>_<port>_<wire index within the port>`).
     for (node, ports) in net.port_projections.iter().enumerate() {
-        for (port, sources) in ports.iter().enumerate() {
-            for (src, proj) in sources.iter().enumerate() {
-                if let Some(linear) = proj {
-                    push_linear(&mut blobs, &format!("proj{node}_{port}_{src}"), linear)?;
-                }
+        for (port, proj) in ports.iter().enumerate() {
+            if let Some(linear) = proj {
+                push_linear(&mut blobs, &format!("proj{node}_{port}_0"), linear)?;
             }
         }
     }
@@ -158,16 +159,14 @@ pub fn load_safetensors(net: &mut Network, path: &Path) -> Result<()> {
         copied += load_linear(&header, &raw[data_start..], &format!("node{idx}"), layer)?;
     }
     for (node, ports) in net.port_projections.iter_mut().enumerate() {
-        for (port, sources) in ports.iter_mut().enumerate() {
-            for (src, proj) in sources.iter_mut().enumerate() {
-                if let Some(linear) = proj {
-                    copied += load_linear(
-                        &header,
-                        &raw[data_start..],
-                        &format!("proj{node}_{port}_{src}"),
-                        linear,
-                    )?;
-                }
+        for (port, proj) in ports.iter_mut().enumerate() {
+            if let Some(linear) = proj {
+                copied += load_linear(
+                    &header,
+                    &raw[data_start..],
+                    &format!("proj{node}_{port}_0"),
+                    linear,
+                )?;
             }
         }
     }
