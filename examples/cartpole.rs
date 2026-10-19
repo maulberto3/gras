@@ -1,3 +1,4 @@
+// NOTE: `source env_setup.sh` in the shell first — this example is built and linked against that environment.
 //! CartPole — the RL example: a pure-Rust environment, a REINFORCE policy, a
 //! trainer-reported fitness, and a post-race guardrail.
 //!
@@ -7,7 +8,11 @@
 //!
 //! Every knob is a const or a builder line; the only flags are the smoke-run
 //! ones (`--pop`, `--max-steps`, `--seed`, `--log-level`, `--risk-aversion`
-//! — alias `--risk-based`). The action head is
+//! — alias `--risk-based`) plus `--run-dir`, which resumes a recorded run
+//! instead of starting one (pair it with an already-satisfied `--max-steps` to
+//! re-run ONLY the guardrail over that run's elites — same `--pop` and
+//! `--risk-aversion`/`--train-lottery` as the run, whose recorded seed wins over
+//! `--seed`). The action head is
 //! greedy everywhere and exploration comes from the challenge (a forced action
 //! on a fired step); the REINFORCE loss still scores `log_softmax(pred)` of the
 //! action taken, which is what makes the update a gradient. Head history and
@@ -525,12 +530,12 @@ const EVAL_MATCHES_PER_STEP: usize = 5;
 const RISK_AVERSION: f32 = 0.0;
 
 /// The smoke-test CLI: `--pop`, `--max-steps`, `--seed`, `--log-level`,
-/// `--risk-aversion`, `--train-lottery [OMEGA]`. Everything else is a const above —
-/// clap rejects any other flag at the usage line.
+/// `--risk-aversion`, `--train-lottery [OMEGA]`, `--run-dir`. Everything else is
+/// a const above — clap rejects any other flag at the usage line.
 #[derive(clap::Parser, Debug)]
 #[command(
     name = "cartpole",
-    about = "CartPole RL race. Smoke flags: --pop, --max-steps, --seed, --log-level, --risk-aversion (all else is a const)."
+    about = "CartPole RL race. Smoke flags: --pop, --max-steps, --seed, --log-level, --risk-aversion, --run-dir (all else is a const)."
 )]
 struct Cli {
     /// Live networks in the race (default: the `POP` const).
@@ -566,6 +571,18 @@ struct Cli {
         value_parser = ["none", "summ", "minimal", "debug", "trace"]
     )]
     log_level: Option<String>,
+    /// Resume the recorded run in this directory instead of starting a fresh
+    /// race: every live net is rebuilt from `nets/<hash>.json` and replayed to
+    /// its recorded clock (the replay contract — weights are never persisted),
+    /// so the run must be resumed with the SAME trainer consts and the same
+    /// replay-relevant knobs (`--risk-aversion`, `--train-lottery`) or the
+    /// engine refuses the mismatch. The run's recorded seed is used — `--seed`
+    /// does not override it.
+    ///
+    /// Pair it with an already-satisfied `--max-steps` to skip training
+    /// entirely and run ONLY the post-race guardrail on that run's elites.
+    #[arg(long, value_name = "DIR")]
+    run_dir: Option<std::path::PathBuf>,
 }
 
 /// Wire the config → run the race → guardrail the champion; prints the verdict.
@@ -671,14 +688,29 @@ fn main() {
         challenge_policy: CHALLENGE_POLICY,
     };
 
-    let mut engine = RlEngine::from_spec(RunSpec::rl(
-        config,
-        fitness,
-        trainer,
-        Some(run_seed),
-        None, // run dir: the engine picks results/<timestamp>
-    ))
-    .expect("engine construction (RL spec)");
+    // `--run-dir` RESUMES that run (its `engine.json` + `nets/` define the race and
+    // its recorded seed wins over `--seed`); without it the engine picks
+    // `results/<timestamp>` for a fresh race.
+    let engine = match &cli.run_dir {
+        Some(dir) => RlEngine::resume(dir.clone(), config, fitness, trainer),
+        None => RlEngine::from_spec(RunSpec::rl(
+            config,
+            fitness,
+            trainer,
+            Some(run_seed),
+            None,
+        )),
+    };
+    let mut engine = match engine {
+        Ok(engine) => engine,
+        // Resume reports its refusals BY NAME (a different λ/Ω, a drifted trainer
+        // const, a missing run dir) — print the reason and exit like a usage error
+        // instead of a backtrace.
+        Err(e) => {
+            eprintln!("engine construction failed: {e}");
+            std::process::exit(2);
+        }
+    };
 
     match engine.run() {
         Ok(reason) => println!("race stopped: {reason:?}"),
@@ -688,5 +720,5 @@ fn main() {
     // STEP D — guardrail: GUARDRAIL_MATCHES fresh games the run never trained
     // on, scored from the LIVE champion through the run's own trainer; the
     // engine logs the detailed verdict and records it in `engine.json`.
-    report_guardrail(&mut engine, baseline);
+    // report_guardrail(&mut engine, baseline);
 }

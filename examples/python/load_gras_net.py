@@ -375,8 +375,8 @@ def load_gras_net(
     net.build_modules()
 
     short = state["hash"][:8]
-    # Elites export elite-<short>.safetensors; the worst net (when worst_save
-    # is on) exports worst-<short>.safetensors. Try both.
+    # Elites export elite-<short>.safetensors; the worst nets (when worst_save
+    # is on) export worst-<short>.safetensors, one file per net. Try both.
     weights_path = None
     if not force_init:
         for prefix in ("elite-", "worst-"):

@@ -119,7 +119,8 @@ pub struct EngineArgs {
     pub grace_periods: Option<usize>,
 
     /// Also write `worst-<hash>.md` + `.safetensors` at stop — the
-    /// anti-champion the search avoided.
+    /// anti-champions the search avoided. One per elite_count, so both ends of
+    /// the ranking keep the same number of nets.
     #[arg(long)]
     pub worst_save: bool,
 
