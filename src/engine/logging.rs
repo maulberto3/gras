@@ -2,10 +2,16 @@
 //! the three sinks its single event stream fans out to.
 //!
 //! ```text
-//! engine event ─┬─ console (stderr)  the human lines, filtered by `LogLevel`
+//! engine event ─┬─ console (stdout)  the human lines, filtered by `LogLevel`
 //!               ├─ frame   (stdout)  the `Minimal` vitals table, redrawn
 //!               └─ telemetry (file)  <run_dir>/telemetry.jsonl, opt-in
 //! ```
+//!
+//! The console writes to STDOUT, the same stream the frame, the CFY receipts and
+//! the log legend use: `cargo run > run.log` therefore captures the WHOLE run.
+//! Warning the user means writing to the terminal, not writing to a different
+//! file descriptor — a split stream silently saved a run with everything except
+//! the engine's own lines.
 //!
 //! The file sink can't be aimed at `init` — the run dir does not exist yet — so
 //! it BUFFERS the start-up block (race init / search space / build stamp) and
@@ -51,15 +57,26 @@ const MAX_STARTUP_BYTES: usize = 1 << 20;
 /// Install the subscriber for a run: console + frame, plus the telemetry sink
 /// (inert until [`settle_run_dir`] decides). Returns false if already installed.
 pub fn init(level: LogLevel, filter_override: Option<&str>) -> bool {
+    // The LEVEL is authoritative, and `RUST_LOG` does not silently outrank it: an
+    // inherited env var used to override the flag the example was run with, which made
+    // "I set `--log-level minimal` and still got info lines" a real (and invisible)
+    // failure. The env var is now reported as ignored instead, once, on the same stream.
     let base = filter_override.unwrap_or_else(|| level.env_filter());
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| base.to_string());
+    if let Ok(env) = std::env::var("RUST_LOG")
+        && env != base
+    {
+        // Same stream as every other line (see the module header): a redirected run
+        // captures the notice too, instead of losing it to an empty stderr.
+        println!("log: RUST_LOG={env} ignored (the configured log level, `{base}`, wins)");
+    }
+    let filter = base.to_string();
 
     PENDING.store(true, Ordering::Relaxed);
 
         // `Minimal` mutes info lines (its `env_filter` is `warn`); the frame rides
         // a different target, so it still gets through.
     let console = fmt::layer()
-        .with_writer(io::stderr)
+        .with_writer(io::stdout)
         .with_ansi(false)
         .without_time()
         .with_target(false)

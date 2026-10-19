@@ -81,8 +81,12 @@ impl LogLevel {
         }
     }
 
-        /// The `env_logger` verbosity under which this level's lines are visible: `Summ`
-        /// prints through `info!`; `Minimal`/`None` via `println!`.
+        /// The `tracing` verbosity the console layer is built with: `Summ` prints the
+        /// engine's `info!` lines; `Minimal`/`None` mute them (`warn`) — the framed vitals
+        /// table rides its own target, so it renders at `Minimal` regardless.
+        ///
+        /// This is the ONLY filter (see `logging::init`): `RUST_LOG` is deliberately not
+        /// consulted, so the level the caller asked for is the level the run gets.
     pub fn env_filter(self) -> &'static str {
         match self {
             LogLevel::Summ => "info",
@@ -317,11 +321,13 @@ pub struct RaceConfig {
     /// At stop, save the elite's weights as safetensors
     /// (`elite-<hash>.safetensors`). Default true.
     pub elite_save_safetensors: bool,
-        /// At stop, additionally save the WORST live net's artifacts. Default false — the
-        /// anti-champion is a debugging artifact.
+        /// At stop, additionally save the `elite_count` WORST live nets' topology markdown
+        /// (`worst-<hash>.md`, one per net). Default false — the anti-champion is a
+        /// debugging artifact. The COUNT is `elite_count`: [elite_count] is how many the
+        /// elite writers keep, so both ends of the ranking save the same number of nets.
     pub worst_save_topology: bool,
-    /// At stop, additionally save the worst net's weights
-    /// (`worst-<hash>.safetensors`). Default false.
+    /// At stop, additionally save those same worst nets' weights
+    /// (`worst-<hash>.safetensors`, one per net, `elite_count` of them). Default false.
     pub worst_save_safetensors: bool,
         /// Human label for the experiment, recorded verbatim in `engine.json` as
         /// `"run_name"`. Informational — does not affect the results folder name.
@@ -1004,14 +1010,17 @@ impl RaceConfigBuilder {
         self.cfg.elite_save_safetensors = enabled;
         self
     }
-        /// At stop, ALSO save the WORST live net's topology markdown. Useful for diffing what
-        /// the search avoided. Default false.
+        /// At stop, ALSO save the `elite_count` WORST live nets' topology markdown, one
+        /// `worst-<hash>.md` per net. Useful for diffing what the search avoided. Default
+        /// false. The count mirrors `set_elite_count` (both ends of the ranking keep the
+        /// same number of nets), and no net is saved as both an elite and a worst.
     pub fn set_worst_save_topology(mut self, enabled: bool) -> Self {
         self.cfg.worst_save_topology = enabled;
         self
     }
-    /// At stop, ALSO save the worst net's weights as safetensors
-    /// (`worst-<hash>.safetensors`). Default false.
+    /// At stop, ALSO save those same worst nets' weights as safetensors
+    /// (`worst-<hash>.safetensors`, `elite_count` of them). Default false. Like
+    /// [`RaceConfigBuilder::set_worst_save_topology`] the count is `elite_count`.
     pub fn set_worst_save_safetensors(mut self, enabled: bool) -> Self {
         self.cfg.worst_save_safetensors = enabled;
         self
@@ -1120,8 +1129,9 @@ impl RaceConfig {
 mod tests {
     use super::{LogLevel, RISK_AVERSION, RaceConfig};
 
-        /// The examples' `--log-level` vocabulary must parse: handed to env_logger verbatim,
-        /// `summ` is read as a module name and mutes the whole run — this mapping is load-bearing.
+        /// The examples' `--log-level` vocabulary must parse: handed to an `EnvFilter`
+        /// verbatim, `summ` would be read as a module name and mute the whole run — this
+        /// mapping is load-bearing.
     #[test]
     fn log_level_names_parse_to_a_visible_verbosity() {
         assert_eq!(LogLevel::parse("summ"), Some(LogLevel::Summ));
@@ -1131,7 +1141,7 @@ mod tests {
         assert_eq!(
             LogLevel::parse("debug"),
             None,
-            "env_logger levels pass through"
+            "tracing levels pass through"
         );
         assert_eq!(LogLevel::Summ.env_filter(), "info");
         assert_eq!(LogLevel::Minimal.env_filter(), "warn");

@@ -118,15 +118,34 @@ impl CoreEngine {
         }
         // Per-net detail is debug-only (Plan A: the user log shows one rollup
         // line per step — see `run`). All values remain in nets/<hash>.json.
+        //
+        // The hash is spelled at the SAME width every table and card uses (8 hex), so a
+        // DEBUG line and a stop-time row name the same net identically. The run's custom
+        // informative metrics ride here too: the Summ rollup carries their population
+        // MEAN, and the per-net value belongs beside the loss that produced it.
+        let extra: String = self
+            .metrics
+            .iter()
+            .enumerate()
+            .map(|(i, metric)| {
+                let value = metrics.informative.get(i).copied();
+                format!(
+                    " │ {} {}",
+                    metric.label(),
+                    value.map(fmt_line).unwrap_or_else(|| "—".to_string())
+                )
+            })
+            .collect();
         let dir = self.fitness.direction().arrow();
         tracing::debug!(
-            "step {} │ net {} │ train_loss↓ {} │ eval_loss↓ {} │ fitness{} {}",
+            "step {} │ net {} │ train_loss↓ {} │ eval_loss↓ {} │ fitness{} {}{}",
             clock,
-            hash,
+            &hash[..8.min(hash.len())],
             fmt_line(metrics.train_loss),
             fmt_line_opt(&metrics.eval_loss),
             dir,
             fmt_line(metrics.fitness),
+            extra,
         );
         Ok(())
     }

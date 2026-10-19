@@ -143,7 +143,7 @@ impl CoreEngine {
             // HARD SHIELD before any work: with no cull-eligible slot the child would
             // have nowhere to go, so the roll is spent up front.
         if !self.has_cull_eligible() {
-            return Ok(RollOutcome::no_slot(self.no_cull_slot_detail("crossover")));
+            return Ok(RollOutcome::no_slot(self.no_cull_roll_detail("crossover")));
         }
         let idx = self.next_child_ordinal(clock);
         // Ok(spent) = spent roll (crossover produced nothing viable or a
@@ -205,7 +205,7 @@ impl CoreEngine {
                 self.rolling_fitness.remove(&child.state.hash);
                 self.rolling_train.remove(&child.state.hash);
                 self.rolling_eval.remove(&child.state.hash);
-                return Ok(RollOutcome::no_slot(self.no_cull_slot_detail("crossover")));
+                return Ok(RollOutcome::no_slot(self.no_cull_roll_detail("crossover")));
             }
             let victim_net_seed = victim_for_log
                 .as_ref()
@@ -338,14 +338,14 @@ impl CoreEngine {
 
     /// The one-line detail for a roll skipped by the hard shield — shared by
     /// both channels so the log reads identically.
-    pub(crate) fn no_cull_slot_detail(&self, branch: &str) -> String {
+    pub(crate) fn no_cull_roll_detail(&self, branch: &str) -> String {
         let k = if branch == "crossover" {
             self.config.crossover_probation_steps
         } else {
             self.config.mutation_probation_steps
         };
         format!(
-            "no cull-eligible victim — every non-elite net is inside its {branch} cull shield window (k={k}) or elite; roll spent, nothing culled/inserted"
+            "no cull-eligible net — every non-elite net is inside its {branch} cull shield window (k={k}) or elite; roll spent, nothing culled/born"
         )
     }
 
@@ -414,7 +414,7 @@ impl CoreEngine {
         child.state.step = 0;
         child.state.last_metrics = None;
         let detail = format!(
-            "victim {} culled (immigrant slot) │ immigrant {} inserted (fresh, first step at {clock})",
+            "culled {} │ mutation {} born (fresh, first step at {clock})",
             &victim[..8.min(victim.len())],
             &child.state.hash[..8.min(child.state.hash.len())],
         );

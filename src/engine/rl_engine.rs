@@ -157,6 +157,8 @@ impl RlEngine {
             minimal_prev_means: None,
             log_level,
             interrupt_flag: None,
+            // Frontier + clock came from disk: `run` checks the stop before clock one.
+            resumed: true,
             trainer,
         };
         engine.load_live_frontier()?;

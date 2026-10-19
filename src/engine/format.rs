@@ -140,17 +140,41 @@ pub(crate) fn fmt_cell(v: f32) -> String {
     fmt_band(v)
 }
 
+/// A COUNT in human units: `402`, `40.2K`, `1.5M`, `2.0B`.
+///
+/// Parameter counts run into the hundreds of thousands, and a bare `145214521`
+/// in a table cell is a number nobody reads at a glance. Hundreds print as-is (a
+/// `402` needs no suffix — the suffix would cost a column and add nothing);
+/// thousands and above take `K`/`M`/`B` with one decimal. The exact value is not
+/// lost: it stays in `nets/<hash>.json` and `engine.json`, and this formatter is
+/// display-only.
+///
+/// Rounding can carry a value into the next unit (`999_950` → `999.95K`), so the
+/// promotion is applied AFTER rounding rather than printed as `1000.0K`.
+pub(crate) fn fmt_units(n: i64) -> String {
+    const UNITS: [&str; 3] = ["K", "M", "B"];
+    let mut value = n as f64;
+    let mut idx = 0usize;
+    while value.abs() >= 1000.0 && idx < UNITS.len() {
+        value /= 1000.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        return n.to_string();
+    }
+    // `{:.1}` on `999.95` would print `1000.0`: take the next unit instead.
+    if (value * 10.0).round().abs() >= 10_000.0 && idx < UNITS.len() {
+        value /= 1000.0;
+        idx += 1;
+    }
+    format!("{value:.1}{}", UNITS[idx - 1])
+}
+
 /// A config / knob echo: flat 2 decimals. These are settings rather than
 /// measurements, so a fourth decimal would claim precision that isn't there
 /// (`λ=0.7000` says nothing `λ=0.70` doesn't).
 pub(crate) fn fmt_cfg(v: f32) -> String {
     format!("{v:.2}")
-}
-
-/// Value-unit tag for a ranking score in a TABLE cell: `score` = the
-/// risk-adjusted value the race decides on. The CSV column keeps `smt`.
-pub(crate) fn fmt_cell_smt(v: f32) -> String {
-    format!("score {}", fmt_cell(v))
 }
 
 /// Optional float, log-line form — plain `—` when unset (never `Some(...)` in
@@ -253,11 +277,34 @@ pub(crate) fn csv_field(s: &str) -> String {
     }
 }
 
+/// Split one CSV row written by [`csv_field`]: commas inside a quoted field are
+/// field text, and `""` is an escaped quote (it toggles twice, so it is harmless
+/// here). Fields stay as they stand in the row — quoted ones keep their quotes.
+/// Used to read `history.csv` back on resume (see `CoreEngine::load_history_windows`).
+pub(crate) fn csv_split_line(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                out.push(&line[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&line[start..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ReadingStyle, csv_field, fmt_cell, fmt_cell_smt, fmt_census, fmt_cfg, fmt_line,
-        fmt_line_opt, fmt_reading,
+        ReadingStyle, csv_field, fmt_cell, fmt_census, fmt_cfg, fmt_line,
+        fmt_line_opt, fmt_reading, fmt_units,
     };
 
     // ── the band rule: magnitude picks the precision ──────────────────────
@@ -324,22 +371,18 @@ mod tests {
 
     // ── the same rule in a table cell ─────────────────────────────────────
 
+    /// `fmt_cell` and `fmt_line` are ONE rule (`fmt_band`), so this test is the
+    /// tripwire for that being true and the band's edges being the ones asserted
+    /// above — a cell that starts spelling a value differently is a regression.
     #[test]
-    fn cell_and_line_agree_by_construction() {
+    fn cell_shares_the_line_band_rule_at_every_edge() {
         for v in [117.55, 97.1, 3.25, 1.0, 0.6348, 0.5, 0.000_04, 1e-8, 0.0, -42.25] {
             assert_eq!(fmt_cell(v), fmt_line(v), "{v} spelled differently in a cell");
         }
-    }
-
-    #[test]
-    fn cell_widens_below_its_floor_like_the_line_rule() {
+        // The widening floor and the scientific threshold, through the CELL form.
         assert_eq!(fmt_cell(0.5), "0.5000");
         assert_eq!(fmt_cell(0.000_04), "0.00004");
         assert_eq!(fmt_cell(1e-8), "0.000000");
-    }
-
-    #[test]
-    fn cell_uses_scientific_notation_at_scale() {
         assert_eq!(fmt_cell(1e9), "1.000e9");
         assert_eq!(fmt_cell(1.5e38), "1.500e38");
     }
@@ -353,13 +396,31 @@ mod tests {
         assert_eq!(fmt_cfg(1.0), "1.00");
     }
 
-    // ── tagged + optional forms ───────────────────────────────────────────
+    // ── counts in human units ─────────────────────────────────────────────
 
     #[test]
-    fn score_cell_carries_the_unit_tag() {
-        assert_eq!(fmt_cell_smt(117.55), "score 117.6");
+    fn units_suffix_thousands_and_promote_on_rounding() {
+        // Hundreds stay bare: the suffix would cost a column and add nothing.
+        assert_eq!(fmt_units(0), "0");
+        assert_eq!(fmt_units(402), "402");
+        assert_eq!(fmt_units(999), "999");
+        // Thousands and up take K/M/B with one decimal.
+        assert_eq!(fmt_units(1_000), "1.0K");
+        assert_eq!(fmt_units(6_218), "6.2K");
+        assert_eq!(fmt_units(40_242), "40.2K");
+        assert_eq!(fmt_units(142_946), "142.9K");
+        assert_eq!(fmt_units(1_500_000), "1.5M");
+        assert_eq!(fmt_units(2_000_000_000), "2.0B");
+        // Rounding must not print `1000.0K`: the unit is promoted instead.
+        assert_eq!(fmt_units(999_950), "1.0M");
+        assert_eq!(fmt_units(999_999_999), "1.0B");
+        // Beyond B there is no unit left to promote to; the number stays honest.
+        assert_eq!(fmt_units(5_000_000_000_000), "5000.0B");
+        // Signed counts (a deficit is still a count) keep their sign.
+        assert_eq!(fmt_units(-40_242), "-40.2K");
     }
 
+    // ── optional forms ────────────────────────────────────────────────────
 
     #[test]
     fn optional_forms_render_unset_as_dash() {

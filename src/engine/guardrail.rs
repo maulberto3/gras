@@ -282,7 +282,7 @@ pub fn agreement_verdict_noisy(
         direction,
     );
     if a.grade == AgreementGrade::Unscored {
-        return "unscored (no race reference or no holdout games)".to_string();
+        return "unscored (no race reference or no holdout draws)".to_string();
     }
     // A grade implies BOTH readings exist — `evaluate_agreement` is the one
     // place that decides so.
@@ -295,7 +295,9 @@ pub fn agreement_verdict_noisy(
             .filter(|n| *n > 0)
             .map(|n| format!("{n} step reading(s)"))
             .unwrap_or_else(|| "an undeclared number of readings".to_string());
-        let exam = format!("{matches_scored} unseen game(s)");
+        // Mode-neutral, like the card around it: one exam unit is a DRAW (a holdout
+        // batch in a tabular run, an episode in an RL one).
+        let exam = format!("{matches_scored} unseen draw(s)");
         let exam_note = exam_se
             .map(|e| format!(", a 2 × SE band of {} around its own mean", fmt_line(2.0 * e)))
             .unwrap_or_default();

@@ -102,6 +102,12 @@ pub struct CoreEngine {
     /// Graceful Ctrl+C flag (set by `run`'s signal handler, consumed by
     /// `check_stop`). `None` outside `run` — tests construct without it.
     pub(crate) interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// True when the frontier and clock came from DISK (`resume` / `resume_with`).
+    /// `run` then checks the stop BEFORE its first clock: a budget the recorded run
+    /// already spent must re-examine the frontier as recorded, not advance it one
+    /// clock further. A fresh race keeps the bottom-of-loop check, so its clock
+    /// numbering is unchanged.
+    pub(crate) resumed: bool,
 
     /// Per-step step-log counters captured during the evolve phase and consumed by
     /// the SAME step's rollup line / `Minimal` table (both render after the evolve).
@@ -684,6 +690,7 @@ impl CoreEngine {
             minimal_prev_means: None,
             log_level,
             interrupt_flag: None,
+            resumed: false,
             trainer,
         };
 
@@ -846,6 +853,12 @@ impl CoreEngine {
         })?;
         // CFY: per-net replay rows collected here, emitted as one table after the load.
         let mut replayed: Vec<Vec<String>> = Vec::new();
+        // The smoothing windows themselves are not persisted per net (only its LAST
+        // reading is), but `history.csv` holds every reading the run took. Replaying it
+        // keeps each window warm, so the ranking score, the elite set and the guardrail's
+        // race-reading baseline resume where the recorded run stopped instead of
+        // restarting from a single cold reading.
+        let history = Self::load_history_windows(&run_dir, self.config.smoothing_window);
         for entry in entries {
             let path = entry
                 .map_err(|source| crate::utils::error::EngineError::Io {
@@ -899,16 +912,32 @@ impl CoreEngine {
             self.networks.insert(child.state.hash.clone(), child.net);
             self.optimizers
                 .insert(child.state.hash.clone(), child.optimizer);
-            // Rolling buffers seeded from the replayed trajectory — the smoothed stats are
-            // warm on resume, not cold; ranking resumes where it left off.
+            // Rolling buffers seeded from the run's own recorded readings — the smoothed
+            // stats are warm on resume, not cold; ranking resumes where it left off.
             let mut buf = RollingBuffer::new(self.config.smoothing_window);
             let mut train_buf = RollingBuffer::new(self.config.smoothing_window);
             let mut eval_buf = RollingBuffer::new(self.config.smoothing_window);
-            if let Some(m) = self.state.net(&hash).and_then(|s| s.last_metrics.as_ref()) {
-                buf.push(m.fitness);
-                train_buf.push(m.train_loss);
-                if let Some(e) = m.eval_loss {
-                    eval_buf.push(e);
+            match history.get(&hash) {
+                // The recorded runway, oldest → newest: the same window the live run held.
+                Some(rows) if !rows.is_empty() => {
+                    for (fitness, train_loss, eval_loss) in rows {
+                        buf.push(*fitness);
+                        train_buf.push(*train_loss);
+                        if let Some(eval) = eval_loss {
+                            eval_buf.push(*eval);
+                        }
+                    }
+                }
+                // No `history.csv` (csv_export off, or a run recorded before it): fall back
+                // to the single last reading, which is all the net state carries.
+                _ => {
+                    if let Some(m) = self.state.net(&hash).and_then(|s| s.last_metrics.as_ref()) {
+                        buf.push(m.fitness);
+                        train_buf.push(m.train_loss);
+                        if let Some(e) = m.eval_loss {
+                            eval_buf.push(e);
+                        }
+                    }
                 }
             }
             self.rolling_fitness.insert(hash.clone(), buf);
@@ -929,6 +958,56 @@ impl CoreEngine {
             Some(&format!("loaded {loaded} nets from {}", run_dir.display())),
         ));
         Ok(())
+    }
+
+    /// The last `window` readings per net, oldest → newest, read back from
+    /// `<run_dir>/history.csv` (`fitness`, `train_loss`, `eval_loss` columns, located
+    /// by the header so appended FIT/informative columns cannot shift them). Empty
+    /// when the run exported no CSV — the caller then falls back to the one reading
+    /// the net state carries.
+    fn load_history_windows(
+        run_dir: &std::path::Path,
+        window: usize,
+    ) -> HashMap<String, Vec<(f32, f32, Option<f32>)>> {
+        let Ok(raw) = std::fs::read_to_string(run_dir.join("history.csv")) else {
+            return HashMap::new();
+        };
+        let mut lines = raw.lines();
+        let header = lines.next().unwrap_or_default();
+        let cols = crate::engine::format::csv_split_line(header);
+        let find = |name: &str| cols.iter().position(|c| *c == name);
+        let (Some(hash_i), Some(train_i), Some(eval_i), Some(fit_i)) = (
+            find("hash"),
+            find("train_loss"),
+            find("eval_loss"),
+            find("fitness"),
+        ) else {
+            return HashMap::new();
+        };
+        let mut out: HashMap<String, std::collections::VecDeque<(f32, f32, Option<f32>)>> =
+            HashMap::new();
+        for line in lines {
+            let fields = crate::engine::format::csv_split_line(line);
+            let needed = hash_i.max(train_i).max(eval_i).max(fit_i);
+            if fields.len() <= needed {
+                continue;
+            }
+            let Ok(train_loss) = fields[train_i].parse::<f32>() else {
+                continue;
+            };
+            let Ok(fitness) = fields[fit_i].parse::<f32>() else {
+                continue;
+            };
+            let eval_loss = fields[eval_i].parse::<f32>().ok();
+            let q = out.entry(fields[hash_i].to_string()).or_default();
+            q.push_back((fitness, train_loss, eval_loss));
+            if q.len() > window {
+                q.pop_front();
+            }
+        }
+        out.into_iter()
+            .map(|(hash, queue)| (hash, queue.into_iter().collect()))
+            .collect()
     }
 
     // ── Population setup ────────────────────────────────────────────
@@ -1293,6 +1372,16 @@ impl CoreEngine {
 
         loop {
             let clock = self.step_clock();
+            // Pre-flight stop for a RESUMED race: the clock came from disk, so the budget
+            // may ALREADY be spent (`--max-steps` at or under the recorded clock). Checking
+            // here keeps a guardrail-only re-exam looking at the frontier as RECORDED — no
+            // clock is trained, evolved or re-ranked before the check. A fresh race starts
+            // at clock 0 and never takes this branch, so its numbering is unchanged.
+            if self.resumed {
+                if let Some(reason) = self.check_stop(clock) {
+                    return self.finish_race(reason, clock.saturating_sub(1));
+                }
+            }
             self.step_started_at_wall = std::time::Instant::now();
             // Per-step accumulators start empty; the rollup at the END of this
             // step reads them (it is the last line printed for the step).
@@ -1320,11 +1409,24 @@ impl CoreEngine {
                 let evolve_allowed = self.has_cull_eligible();
                 if !evolve_allowed {
                     self.accounting.deferred_clocks += 1;
+                    // The windows are NAMED, with their lengths: "no cull-eligible net"
+                    // alone reads as a stuck engine, while `k=5` at clock 3 makes it
+                    // arithmetic — the shield is per-child and outlives a short run, so
+                    // every clock of it defers by construction.
+                    let shielded = self.config.crossover_probation_steps >= clock
+                        || self.config.mutation_probation_steps >= clock;
                     info!(
-                        "step {} │ evolution deferred: no cull-eligible net — every non-elite net is inside its cull shield window or elite ({} crossover + {} immigrant roll(s) forgone; nothing culled/inserted)",
+                        "step {} │ evolution deferred: no cull-eligible net — every non-elite net is inside its cull shield window (crossover k={}, mutation k={}) or elite ({} crossover + {} mutation roll(s) forgone; nothing culled/born){}",
                         clock,
+                        self.config.crossover_probation_steps,
+                        self.config.mutation_probation_steps,
                         cross_total,
                         mutate_total,
+                        if shielded {
+                            " · a window is at least as long as the run so far, so no clock could evolve yet"
+                        } else {
+                            ""
+                        },
                     );
                 }
                 // The initial batch is whatever is alive at the FIRST evolve clock — nothing is
@@ -1359,7 +1461,7 @@ impl CoreEngine {
                     }
                     if self.state.live_count() < 2 {
                         info!(
-                            "step {} │ crossover slot {} of {} skipped (pop < 2)",
+                            "step {} │ crossover roll {} of {} skipped (pop < 2)",
                             clock,
                             roll + 1,
                             cross_total,
@@ -1369,11 +1471,11 @@ impl CoreEngine {
                     if self.roll_fires(RollKind::Crossover, clock, roll) {
                         // roll fired — fall through to the attempt loop
                     } else {
-                        // debug: a roll that did not fire is the NORMAL case (p < 1), so it is per-roll
+                        // debug: a roll that missed is the NORMAL case (p < 1), so it is per-roll
                         // detail, not a per-clock event; `--log-level debug` shows them all.
                         cross_missed.push(roll + 1);
                         debug!(
-                            "step {} │ crossover slot {} of {} did not fire (p={})",
+                            "step {} │ crossover roll {} of {} missed (p={})",
                             clock,
                             roll + 1,
                             cross_total,
@@ -1417,7 +1519,7 @@ impl CoreEngine {
                             format!("{attempt} parent draws")
                         };
                         info!(
-                            "step {} │ crossover slot {} of {} → {} ({draws})",
+                            "step {} │ crossover roll {} of {} → {} ({draws})",
                             clock,
                             roll + 1,
                             cross_total,
@@ -1425,7 +1527,7 @@ impl CoreEngine {
                         );
                     } else {
                         debug!(
-                            "step {} │ crossover slot {} of {}: {}",
+                            "step {} │ crossover roll {} of {}: {}",
                             clock,
                             roll + 1,
                             cross_total,
@@ -1440,7 +1542,7 @@ impl CoreEngine {
                     }
                     if self.state.live_count() == 0 {
                         info!(
-                            "step {} │ immigrant slot {} of {} skipped (pop empty)",
+                            "step {} │ mutation roll {} of {} skipped (pop empty)",
                             clock,
                             roll + 1,
                             mutate_total,
@@ -1451,7 +1553,7 @@ impl CoreEngine {
                         // Same as the crossover no-fire line: per-roll detail.
                         mutate_missed.push(roll + 1);
                         debug!(
-                            "step {} │ immigrant slot {} of {} did not fire (p={})",
+                            "step {} │ mutation roll {} of {} missed (p={})",
                             clock,
                             roll + 1,
                             mutate_total,
@@ -1463,7 +1565,7 @@ impl CoreEngine {
                         Some(detail) => {
                             mutate_fired += 1;
                             info!(
-                                "step {} │ immigrant slot {} of {} → {}",
+                                "step {} │ mutation roll {} of {} → {}",
                                 clock,
                                 roll + 1,
                                 mutate_total,
@@ -1477,11 +1579,11 @@ impl CoreEngine {
                             // Same shape as the crossover shield's line — one
                             // fact, one spelling (`{group} n/N: detail`).
                             debug!(
-                                "step {} │ immigrant slot {} of {}: {}",
+                                "step {} │ mutation roll {} of {}: {}",
                                 clock,
                                 roll + 1,
                                 mutate_total,
-                                self.no_cull_slot_detail("mutation"),
+                                self.no_cull_roll_detail("mutation"),
                             )
                         }
                     }
@@ -1499,7 +1601,7 @@ impl CoreEngine {
                     let plural = |v: &[usize]| if v.len() == 1 { "" } else { "s" };
                     if !cross_missed.is_empty() {
                         bits.push(format!(
-                            "crossover slot{} {} did not fire (p={})",
+                            "crossover roll{} {} missed (p={})",
                             plural(&cross_missed),
                             list(&cross_missed),
                             fmt_cfg(self.config.crossover_prob)
@@ -1507,7 +1609,7 @@ impl CoreEngine {
                     }
                     if !mutate_missed.is_empty() {
                         bits.push(format!(
-                            "immigrant slot{} {} did not fire (p={})",
+                            "mutation roll{} {} missed (p={})",
                             plural(&mutate_missed),
                             list(&mutate_missed),
                             fmt_cfg(self.config.mutate_prob)
@@ -1587,8 +1689,12 @@ impl CoreEngine {
             let lottery = self.lottery_frame(clock);
             // The rollup is the only consumer of the skipped-update tally, so its two
             // O(n) sums only run when a line will actually be printed.
-            let rollup_on =
-                self.log_level == crate::engine::config::LogLevel::Summ && self.config.freeze_elites;
+            //
+            // It does NOT ride the crown's switch: the line also carries the training
+            // budget (ran / ticketed / idled) and the population identity, which a run with
+            // `freeze_elites = false` needs just as much. The seat legs render themselves
+            // off instead (`crown_armed`), so silencing the crown never silences the budget.
+            let rollup_on = self.log_level == crate::engine::config::LogLevel::Summ;
                 // The lottery's own tally for this clock: a per-net snapshot of the IDLE
                 // counters (clocks it has left the net untrained and unmeasured), so
                 // after the loop the rollup can say how many tickets it denied AND WHICH
@@ -1735,6 +1841,9 @@ impl CoreEngine {
 
             // Ordered evolve → crown → train → checkpoint → rollup so the summary always
             // sits at the bottom; `took` covers the whole step. `Minimal` renders the table.
+            // Diversity rides the checkpoint cadence, ABOVE the rollup (the rollup stays
+            // the clock's last line).
+            self.log_diversity(clock);
             if self.log_level != crate::engine::config::LogLevel::None {
                 self.log_step_rollup(clock);
             }
@@ -1825,8 +1934,9 @@ impl CoreEngine {
     }
 
     /// The post-race holdout guardrail: score EVERY elite (rank 1 = the champion) on
-    /// fresh unseen games through the run's own trainer — `elite_count` nets ×
-    /// `guardrail_matches` games each. Returns the champion's verdict; the rest are
+    /// fresh unseen draws through the run's own trainer — `elite_count` nets ×
+    /// `guardrail_matches` draws each (the core's mode-neutral word for one exam unit:
+    /// a holdout batch here, an episode in an RL run). Returns the champion's verdict; the rest are
     /// printed in the card's table and recorded in `engine.json`.
     /// `None` = no champion (each case logs a warning), the champion produced no
     /// verdict, or the exam is switched off (`guardrail_matches = 0`).
@@ -1959,7 +2069,7 @@ impl CoreEngine {
                 champion_line = line.clone();
             }
                 // GUARDRAIL DATA ONLY. The race side (`race μ`, its n, its SE, the
-                // window, the latest reading) is ALREADY in the `Final elites` table
+                // window, the latest reading) is ALREADY in the `Final field` table
                 // above, in the same rank order and under the same hash — repeating it
                 // here made this table a wide restatement of that one. Every row below
                 // is a number the exam itself produced (plus its verdict tag); the
@@ -2002,27 +2112,27 @@ impl CoreEngine {
         // that can contradict that (a lower-ranked elite can out-score it). The
         // champion's numbers stay in the footnote AND in `engine.json`; the identifiers
         // the old block carried (hash, rank 1 of N) lead the footnote instead.
+            // The core engine's wording stays MODE-NEUTRAL: one exam unit is a DRAW here
+            // (a holdout batch in a tabular run, an episode in an RL one), and the RL
+            // examples describe their own units (`turns`, `games`) in their own prose.
+            // Naming the core's unit "game" made every tabular run read as if it had a
+            // simulator somewhere in it.
         let title = format!(
-            "Guardrail (elite set on fresh unseen games — {} net(s) × {} game(s) each)",
+            "Guardrail (elite set on fresh unseen draws — {} net(s) × {} draw(s) each)",
             exams.len(),
             matches
         );
-        let body = format!(
-            "{}\n{}",
-            crate::utils::cfy::kv(&[(
-                "columns".to_string(),
-                "exam avg = mean unseen-game score · spread = per-game spread · exam SE = spread/√games · games = scored/played · status = graded against this net's race reading (the `Final elites` table above, same ranks and hashes)"
-                    .to_string(),
-            )]),
-            crate::utils::cfy::table(
-                &["#", "hash", "exam avg", "exam spread", "exam SE", "games", "status"],
-                &rows,
-            ),
-        );
+        let body = crate::utils::cfy::table(
+            &["rank", "hash", "exam avg", "exam spread", "exam SE", "draws", "status"],
+            &rows,
+        )
+        .to_string();
         // The footnote names WHICH net it certifies — the rank-1 identity the dropped
-        // context block used to carry, at no layout cost.
+        // context block used to carry, at no layout cost — and carries the column legend.
+        // It is the SAME place every other card puts its legend; the old one-cell
+        // `columns` table above the data was the only card in the log shaped that way.
         let champion_note = format!(
-            "{} (rank 1 of {}) — {champion_line}",
+            "{} (rank 1 of {}) — {champion_line} · exam avg = mean unseen-draw score · exam spread = per-draw spread · exam SE = spread/√draws · draws = scored/played · status = the exam graded against this net's race reading (`Final field` above, same ranks and hashes)",
             &verdict.hash[..8.min(verdict.hash.len())],
             self.champions.len().max(1)
         );
@@ -2031,7 +2141,7 @@ impl CoreEngine {
             &body,
             Some(&champion_note),
         ));
-        // Record it: the guardrail is a run OUTPUT (the only reading on unseen games), so
+        // Record it: the guardrail is a run OUTPUT (the only reading on unseen draws), so
         // it lives in engine.json and the next experiment inherits its champion. Rank 1
         // keeps the top-level block (the seeding contract); every exam is in `elites`.
         let record = crate::state::GuardrailRecord {
@@ -2063,7 +2173,7 @@ impl CoreEngine {
     }
 
         /// The net the guardrail certifies: the HEAD of the recorded champion ranking —
-        /// the same order the `Final elites` table prints, so the table's rank 1 and the
+        /// the same order the `Final field` table prints, so the table's rank 1 and the
         /// certified champion cannot disagree (they did: the guardrail used to re-rank
         /// the ties by fewest parameters while the table kept the sort's own order, so a
         /// 500.0000/500.0000 pair could show rank 1 in one card and rank 2 in the other).
@@ -2285,20 +2395,11 @@ impl CoreEngine {
                 .map(|p| format!("{p} parameters"))
                 .unwrap_or_else(|| "parameters —".to_string());
             // The score, with the arithmetic that produced it: `score = avg ∓ λ·spread`.
-            let score_cell = match (fit, reading) {
-                (Some(s), Some(r)) => format!(
-                    "score {} = {} {} λ·{}",
-                    fmt_line(s),
-                    fmt_line(r.mean),
-                    match self.fitness.direction() {
-                        crate::utils::fitness::Direction::Maximize => "−",
-                        crate::utils::fitness::Direction::Minimize => "+",
-                    },
-                    fmt_line(r.std)
-                ),
-                (Some(s), None) => format!("score {}", fmt_line(s)),
-                _ => "score —".to_string(),
-            };
+            let score_cell = crate::engine::reporting::seat_score_cell(
+                fit,
+                reading.as_ref(),
+                self.fitness.direction(),
+            );
             info!(
                 "step {} │ seat {} of {seat} → {}{} │ {} │ reading {} │ age {} clocks │ {} │ {} │ {wait} │ {held}",
                 clock,
@@ -2547,6 +2648,7 @@ impl CoreEngine {
             seats_capacity: self.config.elite_count.min(live.saturating_sub(1)),
             join_k: self.config.elite_join_probation_steps,
             lifetime_j: self.config.elite_crown_lifetime_steps,
+            crown_armed: self.config.freeze_elites,
         }
     }
 
@@ -2822,6 +2924,10 @@ pub(crate) struct StepVitals {
     pub join_k: usize,
     /// The crown lifetime `j` this clock was graded against (`0` = disarmed).
     pub lifetime_j: usize,
+    /// Whether the crown is armed at all (`freeze_elites`). When it is not, the seat and
+    /// gate legs are meaningless — every live net is seat-eligible and no seat can be
+    /// dealt — so the line says so instead of printing a gate tally nobody is subject to.
+    pub crown_armed: bool,
 }
 
 /// WHO the ticket lottery graded this clock, in one compact line: both counts are
@@ -2906,18 +3012,27 @@ fn step_rollup_line(v: &StepVitals) -> String {
         parts.push(format!("held back {} = {}", held, not_run.join(" + ")));
     }
     parts.push(format!("{} = {} + {}", v.live, v.stepped, held));
-    parts.push(format!("seats {} of {}", v.seats_held, v.seats_capacity));
-    // The seat gates partition the live count: eligible + join window/cull shield
-    // + age-blocked = live. Printing the subtraction lets a reader check it.
-    let lifetime = if v.lifetime_j == 0 {
-        "age block off".to_string()
+    if !v.crown_armed {
+        // No crown ⇒ no seats and no gates: the two legs below would print a tally for a
+        // restriction that is not in force (and a `seats 0 of k` that reads like a bug).
+        parts.push(format!(
+            "crown off (freeze_elites = false): 0 of {} seats, no gate — every live net is seat-eligible",
+            v.live
+        ));
     } else {
-        format!("{}-clock lifetime", v.lifetime_j)
-    };
-    parts.push(format!(
-        "seat gates, over all {} nets: {} may sit = {} − {} in a join window or cull shield ({} clocks) − {} age-blocked ({})",
-        v.live, v.eligible, v.live, v.probation, v.join_k, v.age_blocked, lifetime
-    ));
+        parts.push(format!("seats {} of {}", v.seats_held, v.seats_capacity));
+        // The seat gates partition the live count: eligible + join window/cull shield
+        // + age-blocked = live. Printing the subtraction lets a reader check it.
+        let lifetime = if v.lifetime_j == 0 {
+            "age block off".to_string()
+        } else {
+            format!("{}-clock lifetime", v.lifetime_j)
+        };
+        parts.push(format!(
+            "seat gates, over all {} nets: {} may sit = {} − {} in a join window or cull shield ({} clocks) − {} age-blocked ({})",
+            v.live, v.eligible, v.live, v.probation, v.join_k, v.age_blocked, lifetime
+        ));
+    }
     if v.lottery_skips > 0 {
         // The lottery's budget, in its own units: the ticketed plus the idled are
         // exactly the nets that would have trained without it.
@@ -3504,22 +3619,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The clock reads 0 before anything ran AND stays 0 after a populate that has not
+    /// stepped: it comes from the live nets' RECORDED clocks, not from a counter a
+    /// population change could move (the joiner test below is the other half).
     #[test]
-    fn step_clock_is_zero_when_empty() {
+    fn step_clock_is_zero_until_a_net_actually_steps() {
         let dir = std::env::temp_dir().join("race_clock_empty_test");
-        let engine = engine(&dir, 42).unwrap();
-        assert_eq!(engine.step_clock(), 0);
-    }
-
-    #[test]
-    fn step_clock_reads_from_live_net_after_populate() {
-        let dir = std::env::temp_dir().join("race_clock_pop_test");
         let mut engine = engine(&dir, 42).unwrap();
+        assert_eq!(engine.step_clock(), 0, "nothing populated yet");
         engine
             .seed_population_internal(vec![tiny_topology(7)], None)
             .unwrap();
-        // After populate, all nets are at step 0.
-        assert_eq!(engine.step_clock(), 0);
+        assert_eq!(engine.step_clock(), 0, "populated, nobody has stepped");
     }
 
     /// The clock must come from the RECORDED clock, not the training count: a net
@@ -3840,6 +3951,79 @@ mod tests {
             "Maximize: lowest score is worst"
         );
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both ends of the ranking keep the SAME number of nets: `elite_count` drives the
+    /// worst writers too, the order is the probe's own rule (spent × gap, hash as the
+    /// tie-break), a champion is never also written as a worst, and a topology-only run
+    /// still lands its files.
+    #[test]
+    fn worst_artifacts_mirror_the_elite_count() {
+        let dir = std::env::temp_dir().join("race_worst_artifacts_count");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut e = engine(&dir, 11).unwrap();
+        let topos: Vec<_> = (7..=12).map(tiny_topology).collect();
+        e.seed_population_internal(topos, Some(0.5)).unwrap();
+        let mut hs = e.state.live_hashes();
+        hs.sort();
+        let n = hs.len();
+        assert!(n >= 3, "fixture needs a few nets, got {n}");
+        // Index the field: `hs[i]` scores `1.0 + i` (Minimize fixture) and trained `i`
+        // clocks — so BOTH legs of `spent × gap` rise with the index and the worst-first
+        // order is exactly the reverse of the sorted hash order, with no ties.
+        for (h, s) in e.state.live_mut() {
+            s.step = hs.iter().position(|x| x == h).unwrap();
+        }
+        for (i, h) in hs.iter().enumerate() {
+            e.rolling_fitness.get_mut(h).unwrap().push(1.0 + i as f32);
+        }
+
+        // k = 2: the two worst by the probe ranking, worst first — and NOT the top-2
+        // champions, which the pick excludes.
+        e.config.elite_count = 2;
+        let picks = e.worst_ranked();
+        assert_eq!(picks.len(), 2, "the bottom end keeps elite_count nets");
+        assert_eq!(picks[0].hash, hs[n - 1], "worst first");
+        assert_eq!(picks[1].hash, hs[n - 2]);
+        assert!(
+            picks[0].spent * picks[0].gap > picks[1].spent * picks[1].gap,
+            "the ranking is spent × gap descending"
+        );
+        e.record_champions();
+        for pick in &picks {
+            assert!(
+                !e.champions.contains(&pick.hash),
+                "a net saved as an elite must not also be saved as a worst"
+            );
+        }
+
+        // k = 1 keeps the same WORST net (the count changes how many, never which is
+        // worst), and `elite_count` is the only knob: the flags decide whether, not how
+        // many.
+        e.config.elite_count = 1;
+        let one = e.worst_ranked();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].hash, picks[0].hash, "same worst, fewer files");
+
+        // Topology-only saving still writes one `worst-<hash>.md` per pick (and used to
+        // print nothing at all — the card lived inside the safetensors branch).
+        e.config.elite_count = 2;
+        e.config.worst_save_topology = true;
+        e.write_worst_artifacts().unwrap();
+        let mut written: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with("worst-"))
+            .collect();
+        written.sort();
+        let mut expected: Vec<String> = picks
+            .iter()
+            .map(|p| format!("worst-{}.md", &p.hash[..8]))
+            .collect();
+        expected.sort();
+        assert_eq!(written, expected, "one file per pick, named by hash");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5498,16 +5682,18 @@ mod tests {
         /// rollup) must not silence the train-budget report, and `Minimal`/`None` stay
         /// quiet.
     #[test]
-    fn lottery_line_prints_at_summ_without_the_elite_rollup() {
+    fn lottery_line_prints_at_summ_without_the_crown() {
         let dir = std::env::temp_dir().join("gras-lottery-line-gate");
         let _ = std::fs::remove_dir_all(&dir);
         let mut eng = engine(&dir, 21).unwrap();
         eng.log_level = crate::engine::config::LogLevel::Summ;
-        // The rollup's own gate — turned OFF here to prove it is not the who-line's.
+        // The crown OFF — the who-line's gate must not ride it. (The ROLLUP's gate no
+        // longer rides it either: the rollup prints `crown off …` on the same line, so
+        // this flag only silences the seat legs, never a report.)
         eng.config.freeze_elites = false;
         assert!(
             eng.lottery_line_on(true),
-            "a summ run without the crown rollup still reports the lottery"
+            "a summ run without the crown still reports the lottery's budget"
         );
         // Not armed yet (the field is `None` until the founders clear their shield).
         assert!(!eng.lottery_line_on(false));
@@ -7245,6 +7431,7 @@ mod tests {
                 seats_capacity: s[8],
                 join_k: s[9],
                 lifetime_j: s[10],
+                crown_armed: true,
             })
         }
 
@@ -7301,6 +7488,7 @@ mod tests {
             seats_capacity: 1,
             join_k: 5,
             lifetime_j: 5,
+            crown_armed: true,
         });
         assert!(
             lottery.contains("ran 6 of 10 = 5 ticketed + 1 crown"),
@@ -7324,6 +7512,41 @@ mod tests {
         assert_eq!(
             clean,
             "ran 4 of 4 = 4 updating │ 4 = 4 + 0 │ seats 0 of 1 │ seat gates, over all 4 nets: 0 may sit = 4 − 4 in a join window or cull shield (5 clocks) − 0 age-blocked (5-clock lifetime)"
+        );
+
+        // Crown OFF: the line still prints — the budget and the population identity are
+        // not the crown's business — but the seat and gate legs are replaced by one
+        // statement of the fact, never a `seats 0 of 5` that reads like a broken crown.
+        let crownless = step_rollup_line(&StepVitals {
+            stepped: 20,
+            trained: 20,
+            live: 24,
+            frozen: 0,
+            would_train: 20,
+            lottery_skips: 0,
+            newborn: 4,
+            eligible: 24,
+            probation: 0,
+            age_blocked: 0,
+            seats_held: 0,
+            seats_capacity: 5,
+            join_k: 5,
+            lifetime_j: 5,
+            crown_armed: false,
+        });
+        assert!(
+            crownless.contains("ran 20 of 24 = 20 updating"),
+            "a crown-less run still reports its training budget: {crownless}"
+        );
+        assert!(
+            crownless.contains(
+                "crown off (freeze_elites = false): 0 of 24 seats, no gate — every live net is seat-eligible"
+            ),
+            "{crownless}"
+        );
+        assert!(
+            !crownless.contains("seat gates") && !crownless.contains("seats 0 of 5"),
+            "{crownless}"
         );
     }
 }

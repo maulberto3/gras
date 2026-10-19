@@ -630,8 +630,8 @@ fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
 }
 
 /// How many clocks sit inside `frozen_spans` — the crown's act-and-measure passes. Shared
-/// with the stop-time elite table's `frozen` column, so log and ledger cannot disagree.
-pub(crate) fn frozen_act_count(state: &NetState) -> usize {
+/// with the stop-time table's `act` column, so log and ledger cannot disagree.
+pub(crate) fn crown_act_count(state: &NetState) -> usize {
     state.frozen_clocks()
 }
 

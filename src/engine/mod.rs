@@ -12,6 +12,8 @@
 //! - [`child`] — child generation (roulette → crossover → mutate) + resume replay
 //! - [`smoothing`] — the rolling fitness buffer + the window's mean/spread and the
 //!   risk-adjusted score the rankings read
+//! - [`diversity`] — how different the live nets still are (structural distance +
+//!   distinct-blueprint share), the anti-collapse reading
 //! - [`core`] — the `CoreEngine` itself: construction, the run loop,
 //!   per-net stepping, culling, persistence hooks
 //! - [`logging`] — the `tracing` subscriber + its three sinks (console,
@@ -35,6 +37,7 @@ pub mod artifacts;
 pub mod child;
 pub mod config;
 pub mod core;
+pub mod diversity;
 pub mod evolve;
 pub mod format;
 pub mod guardrail;
