@@ -1,3 +1,4 @@
+// NOTE: `source env_setup.sh` in the shell first — this example is built and linked against that environment.
 //! MNIST — the tabular showcase for the full user-owned surface.
 //!
 //! The library ships CONTRACTS, not recipes. This file supplies everything

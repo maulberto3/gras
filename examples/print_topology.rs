@@ -1,3 +1,4 @@
+// NOTE: `source env_setup.sh` in the shell first — this example is built and linked against that environment.
 //! Print the markdown topology of any net — live, tombstoned, or elite —
 //! given a run directory and the net's EXACT hash.
 //!
