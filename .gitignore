@@ -25,6 +25,12 @@ results/
 # example run output (datasets live in the ignored /data root above)
 /examples/*/run/
 
+# bench scratch dirs — the benches delete and recreate these on every run
+/benches/*/run/
+
+# dhat's default heap dump, written to cwd by `cargo bench --bench memgraph`
+/dhat-heap.json
+
 trash/
 proptest-regressions/
 proptest-regressions/topology.txt
@@ -50,3 +56,7 @@ AGENTS.md
 __pycache__/
 
 1789503022765/
+
+# Local Smart Buildings starter-kit checkout (simulator experiments, venv)
+/examples/smart_buildings/
+/examples/smart_buildings.rs
