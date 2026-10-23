@@ -35,9 +35,8 @@ comfy-table = { version = "7.2", default-features = false }
 proptest = "1.11.0"
 dhat = "0.3"
 clap = { version = "4.6.7", features = ["derive"] }
-# examples/mnist_data.rs (the MNIST data producer) — HTTP download only,
-# so it stays out of the lib's dependency tree.
-ureq = "3"
+# No HTTP dev-dep: the MNIST producer (`data/mnist/mnist_data.rs`) is not a
+# cargo target, so `ureq` would sit in the manifest with nothing to compile it.
 
 [profile.dev]
 opt-level = 0

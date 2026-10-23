@@ -1,0 +1,28 @@
+[project]
+name = "gras"
+version = "0.1.0"
+description = "Python package for gras: dev/test scaffold, target for the upcoming PyO3 bindings"
+readme = "README.md"
+authors = [
+    { name = "Mauricio Maroto", email = "maulberto3@hotmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "kaggle>=2.2.4",
+    "kagglehub>=1.0.2",
+]
+
+[project.scripts]
+gras = "gras:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+# The package lives in python/gras/, not src/gras/: this repo's src/ is the Rust
+# module tree, and `uv init` defaulted to src/. Keeping the Python tree under
+# python/ also matches where PyO3 bindings look for it later
+# (`[tool.maturin] python-source = "python"`, module `gras._core`).
+[tool.uv.build-backend]
+module-name = "gras"
+module-root = "python"
