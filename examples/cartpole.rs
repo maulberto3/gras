@@ -35,7 +35,7 @@ use gras::prelude::*;
 type Transition = ([f32; 4], usize);
 
 /// One RL train step: forward + `pred`-only loss + backward + optimizer step.
-/// Local to the example — a recipe, not a crate primitive (AGENTS.md §7).
+/// Local to the example — a recipe, not a crate primitive (ARCHITECTURE.md §4).
 fn train_one_step_pred_only(
     net: &mut Network,
     optimizer: &mut dyn Optimizer,
