@@ -47,16 +47,27 @@ kaggle_guide.rs
 
 Makefile
 kaggle_ev_s6e9.rs
-kaggle_kagiculture/
-kaggle_kagiculture.rs
 examples/main.rs
 
+# agent-facing notes (the AGENTS/ARCHITECTURE/CONVENTIONS split) — local, not shipped
 AGENTS.md
+ARCHITECTURE.md
+CONVENTIONS.md
 
 __pycache__/
 
+# `uv build` output
+dist/
+
 1789503022765/
 
-# Local Smart Buildings starter-kit checkout (simulator experiments, venv)
-/examples/smart_buildings/
-/examples/smart_buildings.rs
+# Only the canonical examples are tracked. Anything else under examples/ is a
+# local scratch checkout — the bridge/smart-buildings/kagiculture examples that
+# lived here moved to the sibling `kaggle_exper` repo. Re-included below: the
+# examples that are already tracked, so none of them becomes invisible to
+# `git status` by this rule.
+/examples/*
+!/examples/cartpole/
+!/examples/cartpole.rs
+!/examples/mnist.rs
+!/examples/python/
