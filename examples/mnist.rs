@@ -9,8 +9,9 @@
 //!   4 RUN       — consts → config → spec → run → guardrail.
 //!
 //! Run: `source env_setup.sh && cargo run --release --example mnist`
-//! (`cargo run --release --example mnist_data` first to fetch real MNIST —
-//! without `data/mnist/` this generates random-label synthetic data, which is
+//! (`data/mnist` already holding real MNIST — the producer is the non-cargo
+//! helper `data/mnist/mnist_data.rs` — without that this generates
+//! random-label synthetic data, which is
 //! a smoke test only: nothing generalizes to random labels).
 //! After a run, delete the generated `results/<timestamp>` folder yourself.
 
@@ -20,8 +21,7 @@ mod cli {
 //! [`EngineArgs`] / [`RlEngineArgs`] carry the fuller engine surface
 //! (`--log-level`, `--seed`, `--risk-aversion`, `--train-merit`,
 //! `--founders-from`, the evolution knobs, …) for `mnist`. `cartpole`
-//! declares its own `Cli` struct and does not include this module, and
-//! `print_topology` takes a run dir + hash only.
+//! declares its own `Cli` struct and does not include this module.
 //!
 //! ```text
 //! cargo run --release --example cartpole -- --pop 32 --max-steps 20
@@ -349,7 +349,7 @@ use gras::utils::{score, tabular_data};
 // ═══ 1. DATA ════════════════════════════════════════════════════════════
 
 /// Any gras-format dataset works — dims are auto-peeked. Real MNIST lives
-/// here after `cargo run --example mnist_data`.
+/// here once `data/mnist/mnist_data.rs` has produced it.
 ///
 /// EXPLICIT TRAIN/TEST LAYOUT: point the engine at the PARENT dir
 /// (`data/mnist`) and it resolves `train/` + `test/` through
@@ -649,7 +649,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| PathBuf::from(DATA_DIR));
     let data_dir: &Path = &data_dir_arg;
     // The engine accepts BOTH layouts at this path: a parent dir holding
-    // `train/` + `test/` (real MNIST after mnist_data) — the explicit
+    // `train/` + `test/` (real MNIST, if fetched) — the explicit
     // two-dataset mode — or a single-pool dataset dir (synthetic fallback
     // below) — the classic seeded split.
     let explicit_layout = data_dir.join("train").exists() && data_dir.join("test").exists();
