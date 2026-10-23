@@ -36,7 +36,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use gras::prelude::*;
 use gras::utils::{score, tabular_data};
 
-#[path = "../examples/ref_trainer/mod.rs"]
+#[path = "ref_trainer.rs"]
 mod ref_trainer;
 
 const SEED: u64 = 42;
