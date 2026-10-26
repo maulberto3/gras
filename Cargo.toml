@@ -24,7 +24,6 @@ fastrand = "2.5.0"
 # still on `env_logger`/`RUST_LOG` keeps seeing the same lines with no change.
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
-rayon = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
