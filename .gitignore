@@ -54,6 +54,12 @@ AGENTS.md
 ARCHITECTURE.md
 CONVENTIONS.md
 
+# The local reading shelf: explainers, design plans and measurements that are
+# NOT shipped and must not turn up in `git status` or ride into a commit via
+# `git add -A`. Tracked docs describe the code; anything in here is the context
+# around it. `notes/README.md` indexes the shelf.
+/notes/
+
 __pycache__/
 
 # `uv build` output
@@ -71,3 +77,7 @@ dist/
 !/examples/cartpole.rs
 !/examples/mnist.rs
 !/examples/python/
+
+.serena/
+
+.agents/
