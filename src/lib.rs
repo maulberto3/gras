@@ -54,11 +54,18 @@ pub use evolution::selection::SelectionMethod;
 
 // ── trainer — shared deterministic batching ──────────────────────────
 pub use trainer::stream::{BatchStream, PoolSplit};
-// NOTE: no concrete tabular scheme is re-exported — the library ships the
-// contract; copy a reference recipe from `examples/` if you want one.
+// The library ships the CONTRACT (`TabularStep`/`RlStep`) *and* one reference
+// tabular scheme (`TabularTrainer`): the classic recipe every consumer used to
+// copy. Anything more specific — an environment, an exotic scheme — stays yours.
 pub use trainer::{
     AnyTrainer, LossFn, RlContext, RlStep, RlStepMeta, RunData, StepEnv, StepReport, StreamShape,
-    TabularContext, TabularStep,
+    TabularContext, TabularStep, TabularTrainer,
+};
+
+// The name→recipe tables: which LOSS trains, which FITNESS ranks, which METRIC
+// is merely informative. One spelling each, shared with the Python binding.
+pub use trainer::menu::{
+    FITNESS_NAMES, Loss, METRIC_NAMES, TargetKind, fitness_for, metric_for, metrics_for,
 };
 
 // ── data ─────────────────────────────────────────────────────────────
@@ -113,10 +120,10 @@ pub mod prelude {
 
     // Trainer contracts + report types.
     pub use crate::trainer::{
-        AnyTrainer, BoxedLossFn, ChallengeDecay, ChallengePolicy, ForcedAction, LossFn, RlContext,
-        RlStep, RlStepMeta, RlStepReport, RunData, StepEnv, StepReport, StreamShape,
-        TabularContext, TabularStep, TabularStepReport, challenge_fires,
-        effective_challenge_prob, forced_action, least_action,
+        AnyTrainer, BoxedLossFn, ChallengeDecay, ChallengePolicy, ForcedAction, Loss, LossFn,
+        RlContext, RlStep, RlStepMeta, RlStepReport, RunData, StepEnv, StepReport, StreamShape,
+        TabularContext, TabularStep, TabularStepReport, TabularTrainer, TargetKind, challenge_fires,
+        effective_challenge_prob, fitness_for, forced_action, least_action, metric_for, metrics_for,
     };
 
     // Shared deterministic batching.
