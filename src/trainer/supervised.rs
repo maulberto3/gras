@@ -152,11 +152,16 @@ impl TabularStep for TabularTrainer {
     fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> Result<f32> {
         match &self.holdout {
             Some(scorer) => scorer(net, game_i),
-            None => unimplemented!(
-                "holdout_score is not implemented for this trainer — install a scorer via \
-                 with_holdout_scorer (one fresh game, same units as the reported fitness) to \
-                 use engine.guardrail()"
-            ),
+            // A PUBLIC type must not panic: "no scorer installed" is a caller error,
+            // so it is reported as one. (The trait's own default still panics — that
+            // is a separate call, tracked in TODO.md.)
+            None => Err(crate::utils::error::EngineError::InvalidOptions(
+                "holdout_score: this trainer has no holdout scorer — install one via \
+                 with_holdout_scorer (one fresh game, in the run's fitness units) to use \
+                 engine.guardrail()"
+                    .to_string(),
+            )
+            .into()),
         }
     }
 

@@ -6,13 +6,13 @@
 pub mod challenge;
 pub mod core;
 pub mod decision_lag;
+pub mod menu;
 pub mod stream;
 
-// Test scaffolding, not shipped surface: the engine knows only the `TabularStep`
-// contract, so this compiles under `cfg(test)` to give its tests a trainer.
-#[cfg(test)]
+/// The crate's reference tabular scheme — SHIPPED surface, not test scaffolding:
+/// the engine knows only the `TabularStep` contract, and `TabularTrainer` is the
+/// ready-made implementation of it (and the template to copy for a custom scheme).
 pub mod supervised;
-#[cfg(test)]
 pub use supervised::TabularTrainer;
 
 pub use challenge::{
@@ -24,6 +24,7 @@ pub use core::{
     StreamShape, TabularContext, TabularStep, TabularStepReport,
 };
 pub use decision_lag::DecisionLagTrainer;
+pub use menu::{FITNESS_NAMES, Loss, METRIC_NAMES, TargetKind, fitness_for, metric_for, metrics_for};
 pub use flodl::Variable;
 
 /// The loss-function signature, aliased for readability in the trait and
