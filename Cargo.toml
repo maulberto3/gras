@@ -1,3 +1,9 @@
+# The Python bindings live in their own member so `gras` stays a pure rlib (no
+# pyo3 in its feature graph): see TODO.md → "Priority 1 — Python bindings".
+[workspace]
+members = ["gras-py"]
+resolver = "2"
+
 [package]
 name = "gras"
 version = "1.1.7"
@@ -20,8 +26,6 @@ cuda = ["flodl/cuda"]
 [dependencies]
 flodl = "0.8.0"
 fastrand = "2.5.0"
-# `features = ["log"]` mirrors every gras event into `log` too, so a consumer
-# still on `env_logger`/`RUST_LOG` keeps seeing the same lines with no change.
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -34,8 +38,6 @@ comfy-table = { version = "7.2", default-features = false }
 proptest = "1.11.0"
 dhat = "0.3"
 clap = { version = "4.6.7", features = ["derive"] }
-# No HTTP dev-dep: the MNIST producer (`data/mnist/mnist_data.rs`) is not a
-# cargo target, so `ureq` would sit in the manifest with nothing to compile it.
 
 [profile.dev]
 opt-level = 0
