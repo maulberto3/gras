@@ -111,7 +111,9 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
 }
 
 // Deliberately no engine-side "default trainer": a run without a trainer is a type
-// error, and reference recipes live in `examples/` for the caller to own.
+// error, and this stays true now that one reference scheme ships
+// (`trainer::TabularTrainer`) — a spec still names its trainer explicitly. Mode
+// specific recipes (an environment, an exotic scheme) live in `examples/`.
 
 /// Stream shape request — what the trainer wants the shared batch stream to look
 /// like (returned from `TabularStep::stream_shape`); the engine applies it.
