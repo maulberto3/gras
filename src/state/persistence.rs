@@ -828,8 +828,8 @@ fn default_alive() -> bool {
 
 /// Serde default: `true`.
 /// Legacy default for [`ConfigSnapshot::mutation_cull_policy`]: the policy every run
-/// written before the field existed culled with — `RaceConfig::defaults()` sets
-/// `MutationCullPolicy::Worst`, so that (not the enum's `#[default]` `InverseFitness`).
+/// written before the field existed culled with — `RaceConfig::defaults()` and the
+/// enum's `#[default]` both say `MutationCullPolicy::Worst`.
 fn default_mutation_cull_policy() -> String {
     "worst".to_string()
 }
@@ -865,19 +865,23 @@ pub struct NetState {
     /// are written as final tombstones to disk with `is_alive: false`.
     #[serde(default = "default_alive")]
     pub is_alive: bool,
-        /// Step this net was culled (`None` while alive). With `cull_reason` and
-        /// `final_fitness_mean` it makes a complete tombstone.
+    /// Step this net was culled (`None` while alive). With `cull_reason` and
+    /// `final_fitness_mean` it makes a complete tombstone. Live nets also carry
+    /// the `final_*` block in their last-state file, stamped by the stop sequence
+    /// (`finish_race` → `stamp_live_final_scores`), so a finished run's frontier
+    /// alone ranks its seeding
     #[serde(default)]
     pub culled_at_step: Option<usize>,
     /// Why it left (`"crossover"` | `"immigrant-slot"`).
     #[serde(default)]
     pub cull_reason: Option<String>,
-        /// Its window fitness MEAN at the moment of culling (e.g. the turns it survived) —
-        /// the readable level, NOT the risk-adjusted score that ranked it (that is
-        /// `final_risk_score`). Named `*_mean` on purpose: "smoothed" means risk-adjusted
-        /// everywhere else in the engine, so the old `final_smoothed_fitness` read like the
-        /// ranking value while holding the plain average. `alias` keeps every tombstone
-        /// written before the rename loadable.
+    /// Its window fitness MEAN at culling (or at stop for a live net — same three
+    /// legs, same row of the run's history): the readable level, NOT the
+    /// risk-adjusted score that ranked it (that is `final_risk_score`). Named
+    /// `*_mean` on purpose: "smoothed" means risk-adjusted everywhere else in the
+    /// engine, so the old `final_smoothed_fitness` read like the ranking value while
+    /// holding the plain average. `alias` keeps every tombstone written before the
+    /// rename loadable.
     #[serde(default, alias = "final_smoothed_fitness")]
     pub final_fitness_mean: Option<f32>,
         /// Spread of that window (population std of the step readings). With the mean it tells
