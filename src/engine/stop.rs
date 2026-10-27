@@ -27,9 +27,13 @@ impl CoreEngine {
                 return Some(StopReason::Interrupted);
             }
         }
-        // 1. Explicit step budget (fires only if set).
+        // 1. Explicit step budget (fires only if set). Budget = clocks RUN:
+        // `step` counts clocks COMPLETED (0-based), and the check runs at the
+        // END of each clock, so `step + 1 >= max` fires after exactly N clocks
+        // for `max_steps = N`. The pre-1.1.8 arithmetic (`step >= max`) ran
+        // N+1 clocks — see TODO.md history and DONE.md's stop line.
         if let Some(max) = self.config.max_steps {
-            if step >= max {
+            if step + 1 >= max {
                 return Some(StopReason::MaxSteps);
             }
         }

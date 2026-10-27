@@ -123,13 +123,14 @@ impl std::fmt::Display for CrossCullPolicy {
     /// **Mutation-only** — the crossover channel has its own policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MutationCullPolicy {
-        /// **InverseFitness** (default) — a fitness-inverse roulette over non-elite nets:
-        /// the worst net weighs most, the best is never drawn. Chance is kept.
+        /// **Worst** (default) — evict the worst net by smoothed fitness, deterministically
+        /// (mirrors [`CrossCullPolicy::Worst`]; this is what `RaceConfig::defaults()`
+        /// and the recorded-run legacy default mean).
     #[default]
-    InverseFitness,
-        /// **Worst** — evict the worst net by smoothed fitness, deterministically (mirrors
-        /// [`CrossCullPolicy::Worst`]).
     Worst,
+        /// **InverseFitness** — a fitness-inverse roulette over non-elite nets (an opt-in:
+        /// the worst net weighs most, the best is never drawn; chance is kept).
+    InverseFitness,
         /// **Random** — evict a uniformly random live net, at the cost of occasionally
         /// losing a good one.
     Random,
@@ -348,7 +349,8 @@ pub struct RaceConfig {
         /// overwritten each checkpoint). Default true — a hard kill loses at most one interval.
     pub elite_checkpoint_weights: bool,
         /// Mutation probation: a random immigrant is cull-IMMUNE for its first
-        /// `mutation_probation_steps` clocks. `0` (default) = only the empty-buffer step-0 immunity.
+        /// `mutation_probation_steps` clocks. Default 5 (set in `defaults()`);
+        /// `0` = only the empty-buffer step-0 immunity.
     pub mutation_probation_steps: usize,
         /// Crossover probation: a crossover-born net is cull-IMMUNE for its first
         /// `crossover_probation_steps` clocks. `0` (default) = only step-0 immunity.
@@ -654,7 +656,8 @@ impl RaceConfigBuilder {
         self
     }
         /// Mutation replacement policy: who a firing mutation roll evicts before inserting its
-        /// immigrant. Defaults to `InverseFitness`. Mutation-only.
+        /// immigrant. Defaults to `Worst` (the enum default and the legacy
+        /// recorded default agree). Mutation-only.
     pub fn set_mutation_cull_policy(mut self, policy: MutationCullPolicy) -> Self {
         self.cfg.mutation_cull_policy = policy;
         self
@@ -769,7 +772,8 @@ impl RaceConfigBuilder {
         self
     }
         /// Explicit step budget — the only built-in stop criterion. Accepts a bare value or an
-        /// `Option`; `None` (default) = run until externally stopped.
+        /// `Option`; `None` (default) = run until externally stopped. Budget = clocks RUN:
+        /// `set_stop_max_steps(n)` runs exactly `n` clocks (0..n) before stopping.
     pub fn set_stop_max_steps(mut self, n: impl Into<Option<usize>>) -> Self {
         self.cfg.max_steps = n.into();
         self

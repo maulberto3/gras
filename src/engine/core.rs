@@ -1877,6 +1877,9 @@ impl CoreEngine {
             ));
             self.log_stop_summary(clock)?;
         }
+        // Stamp the live nets' final readings first: the frontier write below
+        // then carries `final_*` on every net file, culled or not.
+        self.stamp_live_final_scores();
         self.write_live_frontier_states()?;
         self.flush_csv_exports()?;
         self.persist_run_counters();
@@ -2707,6 +2710,30 @@ impl CoreEngine {
             }
         }
         Ok(())
+    }
+
+    /// Stamp the tombstone fields onto LIVE nets at stop: `final_fitness_mean`,
+    /// `final_fitness_std`, `final_fitness_samples` from the net's race reading and
+    /// `final_risk_score` from the FIT score it ranked by — the same three legs a
+    /// cull records. Without this a net still alive at stop carries `None`, and
+    /// [`crate::engine::population::run_topologies_from_run_dir`]'s seeding cannot
+    /// rank it (it would fall to file order). Called from [`Self::finish_race`]
+    /// BEFORE the frontier write, so one write carries the stamped fields;
+    /// durability ticks during the run stay unstamped (the fields mean "final").
+    pub(crate) fn stamp_live_final_scores(&mut self) {
+        for h in self.state.live_hashes() {
+            let reading = self.race_reading_of(&h);
+            let smoothed = reading.map(|r| r.mean).unwrap_or(f32::NAN);
+            let smoothed_std = reading.map(|r| r.std);
+            let risk_score = self.smoothed_fitness_of(&h);
+            let samples = reading.map(|r| r.n).unwrap_or(0);
+            if let Some(state) = self.state.net_mut(&h) {
+                state.final_fitness_mean = Some(smoothed);
+                state.final_fitness_std = smoothed_std;
+                state.final_risk_score = risk_score;
+                state.final_fitness_samples = samples;
+            }
+        }
     }
 
         /// Append a step's metrics for the live nets that were trained and scored this
@@ -4063,6 +4090,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A stop stamps the tombstone fields onto LIVE nets too: the frontier alone
+    /// ranks a finished run's seeding (seeding previously fell to file order for
+    /// any net still alive at stop).
+    #[test]
+    fn stop_stamps_final_scores_on_live_nets() {
+        let dir = std::env::temp_dir().join("race_final_stamp_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut engine = engine(&dir, 42).unwrap();
+        engine.config.crossover_prob = 0.0;
+        engine.config.mutate_prob = 0.0;
+        engine
+            .seed_population_internal(vec![tiny_topology(7)], Some(0.0))
+            .unwrap();
+        for clock in 0..3 {
+            let hashes = engine.state.live_hashes();
+            for h in &hashes {
+                engine.step_one_net(h, clock).unwrap();
+            }
+        }
+        let hashes = engine.state.live_hashes();
+        engine.stamp_live_final_scores();
+        for h in &hashes {
+            let state = engine.state.net(h).unwrap();
+            assert!(state.final_fitness_mean.is_some(), "mean stamped: {h}");
+            assert!(state.final_risk_score.is_some(), "FIT score stamped: {h}");
+            assert!(state.final_fitness_samples > 0, "samples stamped: {h}");
+        }
+        // What a stop writes: the stamped fields end up in nets/<hash>.json.
+        engine.write_live_frontier_states().unwrap();
+        let raw = std::fs::read_to_string(
+            dir.join("nets").join(format!("{}.json", hashes[0])),
+        )
+        .unwrap();
+        let loaded: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            loaded["final_risk_score"].is_number(),
+            "stamped score must be a number, not null/absent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn replay_range_replays_steps_zero_to_clock() {
         let dir = std::env::temp_dir().join("race_catchup_test");
@@ -5092,6 +5160,92 @@ mod tests {
     }
 
     #[test]
+    fn run_culls_continue_across_a_resume_boundary() {
+        // The loop-level shape the step-level resume tests cannot see: culls born
+        // INSIDE run()'s evolve phase, on a race that stops mid-run and resumes,
+        // must leave the frontier exactly where an uninterrupted twin lands.
+        let cfg = |max_steps: Option<usize>, stop_after_clock_zero: bool| {
+            let mut c = RaceConfig::defaults();
+            c.pop_size = 2;
+            c.mutate_rolls = 1;
+            c.mutate_prob = 1.0; // every step's mutation roll fires → a cull per clock
+            // defaults() shields founders for 5 clocks; the twin must be able to cull.
+            c.mutation_probation_steps = 0;
+            c.crossover_probation_steps = 0;
+            c.checkpoint_every = 1; // frontier survives the stop without a manual flush
+            c.max_steps = max_steps;
+            if stop_after_clock_zero {
+                c.custom_stop = Some(Box::new(|_| true)); // fires at the FIRST check
+            }
+            c
+        };
+
+        // Uninterrupted twin: 4 clocks in one sitting (budget = clocks RUN).
+        let dir_a = std::env::temp_dir().join("race_run_boundary_twin");
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let mut twin = engine(&dir_a, 123).unwrap();
+        twin.config = cfg(Some(4), false);
+        twin.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        let reason_twin = twin.run().unwrap();
+        assert_eq!(reason_twin, StopReason::MaxSteps);
+        assert!(
+            twin.culls >= 2,
+            "the twin must have actually evolved (got {} culls)",
+            twin.culls
+        );
+        let twin_final: Vec<(String, Option<crate::state::NetMetrics>)> = twin
+            .state
+            .live_hashes()
+            .iter()
+            .map(|h| (h.clone(), twin.state.net(h).unwrap().last_metrics.clone()))
+            .collect();
+        let twin_culls = twin.culls;
+        drop(twin);
+
+        // Interrupted twin: run() stops via custom_stop after clock 0, and the
+        // STOP writes the frontier (finish_race → write_live_frontier_states).
+        let dir_b = std::env::temp_dir().join("race_run_boundary_split");
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let mut part = engine(&dir_b, 123).unwrap();
+        part.config = cfg(Some(4), true);
+        part.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        let reason_part = part.run().unwrap();
+        assert_eq!(reason_part, StopReason::CustomStop);
+        drop(part);
+
+        // Resume through run() with the SAME config (the budget stays 4; the
+        // recorded clock is 0, so the pre-flight stop does not fire) — the
+        // remainder runs the remaining 3 clocks and their evolution.
+        let mut resumed = crate::engine::TabularEngine::resume(
+            dir_b.clone(),
+            tiny_dataset_dir("run_boundary_resume"),
+            cfg(Some(4), false),
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        )
+        .unwrap();
+        assert_eq!(resumed.run().unwrap(), StopReason::MaxSteps);
+        assert_eq!(
+            resumed.culls, twin_culls,
+            "the cull budget continues, not resets, and evolution replays identically"
+        );
+        let split_final: Vec<(String, Option<crate::state::NetMetrics>)> = resumed
+            .state
+            .live_hashes()
+            .iter()
+            .map(|h| (h.clone(), resumed.state.net(h).unwrap().last_metrics.clone()))
+            .collect();
+        assert_eq!(
+            split_final, twin_final,
+            "interrupt+resume == uninterrupted twin (bit-identical frontier)"
+        );
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
     fn immigrant_evolution_keeps_pop_constant() {
         let dir = std::env::temp_dir().join("race_immigrant_pop");
         let _ = std::fs::remove_dir_all(&dir);
@@ -6108,8 +6262,8 @@ mod tests {
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
         seed_raw_fitness(&mut eng, 0.5);
-        assert_eq!(eng.check_stop(6), None);
-        assert_eq!(eng.check_stop(7), Some(StopReason::MaxSteps));
+        assert_eq!(eng.check_stop(5), None);
+        assert_eq!(eng.check_stop(6), Some(StopReason::MaxSteps));
     }
 
     // ── Elite crown fixtures ──────────────────────────────────────────────

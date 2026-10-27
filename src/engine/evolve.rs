@@ -400,8 +400,9 @@ impl CoreEngine {
         if !self.has_cull_eligible() {
             return Ok(None);
         }
-            // Pick a victim per the mutation cull policy (InverseFitness default, `Worst`,
-            // `Random`); the elite guard and probation shield apply in every arm.
+            // Pick a victim per the mutation cull policy (`Worst` default,
+            // `InverseFitness`, `Random`); the elite guard and probation shield apply in
+            // every arm.
         let Some(victim) = self.select_mutation_victim(clock, roll)? else {
             return Ok(None);
         };
