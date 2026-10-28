@@ -4420,6 +4420,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_b);
     }
 
+    /// The crate's own RL trainer, under the engine: same seed ⇒ the same run.
+    ///
+    /// This is the replay contract end to end — the trainer's episode seeds, the
+    /// env's draws, the update, the exam and the recorded metrics — so it is what
+    /// a `history.csv` digest compares, only in structured form. (`history.csv` is
+    /// flushed on the durability checkpoint, which three clocks do not reach.)
+    #[test]
+    fn reinforce_replays_identically_under_the_engine() {
+        fn run(dir: &std::path::Path) -> Vec<(String, Option<crate::state::NetMetrics>)> {
+            let _ = std::fs::remove_dir_all(dir);
+            let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
+                rl_config(0),
+                crate::utils::fitness::Fitness::reported(
+                    crate::utils::fitness::Direction::Maximize,
+                    "turns",
+                ),
+                // The world contract's toy world: 2 actions, 5-turn cap, and every
+                // draw derived from the seed it is handed.
+                crate::trainer::Reinforce::new(
+                    crate::trainer::env::toy::ToyEnv::new(2, 5),
+                    crate::auto_device(),
+                ),
+                Some(2026),
+                Some(dir.to_path_buf()),
+            ))
+            .unwrap();
+            eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+                .unwrap();
+            let hashes = eng.state.live_hashes();
+            for clock in 0..3 {
+                for h in &hashes {
+                    eng.step_one_net(h, clock).unwrap();
+                }
+            }
+            hashes
+                .iter()
+                .map(|h| (h.clone(), eng.state.net(h).unwrap().last_metrics.clone()))
+                .collect()
+        }
+
+        let dir_a = std::env::temp_dir().join("gras-reinforce-replay-a");
+        let dir_b = std::env::temp_dir().join("gras-reinforce-replay-b");
+        let a = run(&dir_a);
+        let b = run(&dir_b);
+
+        assert_eq!(a.len(), 2, "two seeded nets");
+        for ((hash_a, metrics_a), (hash_b, metrics_b)) in a.iter().zip(&b) {
+            assert_eq!(hash_a, hash_b, "the same seed builds the same nets");
+            assert_eq!(
+                metrics_a, metrics_b,
+                "net {hash_a} replayed differently under the same seed"
+            );
+            // The recorded metrics are a real RL step's, not an empty placeholder:
+            // 6 matches (1 train + 5 exam) of a world that pays 1.0 per turn.
+            let metrics = metrics_a.as_ref().expect("a stepped net has metrics");
+            assert!(metrics.fitness > 0.0 && metrics.fitness <= 5.0, "{metrics:?}");
+            assert!(metrics.train_loss.is_finite() && metrics.eval_loss.is_none());
+        }
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
     /// The trainer-owned challenge trigger: knob 1.0 fires every step, so its
     /// sentinel lands on every step — the engine never sees the knob.
     #[test]
