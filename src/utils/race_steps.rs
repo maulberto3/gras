@@ -133,6 +133,40 @@ pub fn train_one_step(
     Ok(loss_val)
 }
 
+/// One train step whose loss is built OUTSIDE the forward — the RL shape.
+///
+/// Same mechanics as [`train_one_step`] (forward → backward → clip → step), but
+/// the loss closure receives only the prediction, because an RL update derives
+/// its objective from the trajectory it just played (returns, advantages) rather
+/// than from a `(pred, target)` batch. `inputs` is what the forward runs on: a
+/// caller that already built its graph from an earlier forward passes a dummy row
+/// and lets that graph carry the gradients, which is why the closure may ignore
+/// `pred`.
+///
+/// The graph must be differentiable in the network's parameters — for a policy
+/// gradient that means a **normalized** log-probability (`log_softmax`), never
+/// raw logits or an argmax indicator, which carry no gradient at all.
+pub fn train_one_step_pred_only(
+    net: &mut Network,
+    optimizer: &mut dyn Optimizer,
+    loss_fn: &dyn Fn(&Variable) -> Result<Variable>,
+    inputs: &Tensor,
+    grad_clip: f32,
+) -> Result<f32> {
+    let x = Variable::new(inputs.clone(), true);
+    let pred = net.forward(&x)?;
+    let loss = loss_fn(&pred)?;
+    let loss_val = loss.item().unwrap_or(0.0) as f32;
+    loss.set_requires_grad(true)?;
+    optimizer.zero_grad();
+    loss.backward()?;
+    if grad_clip > 0.0 {
+        flodl::clip_grad_norm(&net.parameters(), grad_clip as f64)?;
+    }
+    optimizer.step()?;
+    Ok(loss_val)
+}
+
 /// What one eval step reports: loss, ranking fitness, and the informative
 /// metric values (same order as the run's `Vec<Metric>`).
 pub struct EvalReport {
