@@ -11,6 +11,40 @@ impl CoreEngine {
     /// Check the stop criteria at this step: `Some(reason)` if one fires, `None`
     /// to continue. `custom_stop` is independent and runs after the built-ins.
     pub(crate) fn check_stop(&mut self, step: usize) -> Option<StopReason> {
+        // 1. Explicit step budget (fires only if set). Budget = clocks RUN:
+        // `step` counts clocks COMPLETED (0-based), and the check runs at the
+        // END of each clock, so `step + 1 >= max` fires after exactly N clocks
+        // for `max_steps = N`. The pre-1.1.8 arithmetic (`step >= max`) ran
+        // N+1 clocks — see TODO.md history and DONE.md's stop line.
+        if let Some(max) = self.config.max_steps {
+            if step + 1 >= max {
+                return Some(StopReason::MaxSteps);
+            }
+        }
+        self.check_stop_outside_the_budget(step)
+    }
+
+    /// The same criteria at the TOP of a clock, for a RESUMED race whose clock
+    /// came from disk: `next` is the clock ABOUT to run, so the budget is spent
+    /// when `next >= max` — not `next + 1 >= max`.
+    ///
+    /// One clock is the whole difference, and it is not cosmetic: reusing
+    /// [`Self::check_stop`] here made `max_steps = 4` on a run resumed at clock 2
+    /// end at clock 2 (three clocks total) instead of clock 3, because the
+    /// pre-flight consumed the last allowed clock without running it. Ctrl+C and
+    /// `custom_stop` keep their meaning across the boundary.
+    pub(crate) fn check_stop_before_clock(&mut self, next: usize) -> Option<StopReason> {
+        if let Some(max) = self.config.max_steps {
+            if next >= max {
+                return Some(StopReason::MaxSteps);
+            }
+        }
+        self.check_stop_outside_the_budget(next)
+    }
+
+    /// Ctrl+C, then the user's `custom_stop` — the criteria that do not count
+    /// clocks and so read the same from either end of one.
+    fn check_stop_outside_the_budget(&mut self, step: usize) -> Option<StopReason> {
         // 0. Ctrl+C first — the user's intent outranks every bar, and abandoning
         // flows through the same artifact path as a natural stop (step included).
         if let Some(flag) = &self.interrupt_flag {
@@ -27,16 +61,6 @@ impl CoreEngine {
                 return Some(StopReason::Interrupted);
             }
         }
-        // 1. Explicit step budget (fires only if set). Budget = clocks RUN:
-        // `step` counts clocks COMPLETED (0-based), and the check runs at the
-        // END of each clock, so `step + 1 >= max` fires after exactly N clocks
-        // for `max_steps = N`. The pre-1.1.8 arithmetic (`step >= max`) ran
-        // N+1 clocks — see TODO.md history and DONE.md's stop line.
-        if let Some(max) = self.config.max_steps {
-            if step + 1 >= max {
-                return Some(StopReason::MaxSteps);
-            }
-        }
         // 2. Custom stop: joins the race IN ADDITION to the built-ins, for
         // criteria they don't model.
         if let Some(stop) = self.config.custom_stop.as_ref() {
@@ -47,7 +71,7 @@ impl CoreEngine {
         None
     }
 
-    /// Build the read-only `RaceSnapshot` for a custom stop: `best`/`worst` are
+    /// Build the read-only [`RaceSnapshot`] for a custom stop: `best`/`worst` are
     /// direction-aware, `mean` is the plain arithmetic mean.
     pub(crate) fn snapshot(&self, step: usize) -> RaceSnapshot {
         let smoothed = self.smoothed_fitness_values();
