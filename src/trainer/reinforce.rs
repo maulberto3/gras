@@ -952,4 +952,49 @@ mod tests {
         let mut net = tiny_net(2, 0.0);
         assert_eq!(returned.holdout_score(&mut net, 3).unwrap(), 15.0, "1 + 2 + 3 + 4 + 5");
     }
+
+    /// The guardrail exam must be games the run NEVER trained on: its seeds come
+    /// from the fixed guardrail base and must land outside both the TRAIN
+    /// namespace (`net_seed ^ run_seed`) and the EVAL one (`run_seed + 1000`).
+    ///
+    /// Honest scope: this is a collision CHECK over a grid, not a proof. The
+    /// guardrail base lives in the same u64 space as a train base, so a net whose
+    /// `net_seed ^ run_seed` lands exactly on [`GUARDRAIL_SEED`] would train on
+    /// the exam at step 0 — ~2^-64 per net, and unreachable for the seeds below.
+    /// What the grid DOES catch is a guardrail constant in the common range (0 or
+    /// 1), which `net_seed == run_seed` reaches instantly.
+    #[test]
+    fn holdout_games_are_outside_the_train_and_eval_namespaces() {
+        let holdout: Vec<u64> = (0..4u64)
+            .map(|i| episode_start_seed(GUARDRAIL_SEED, 0, i))
+            .collect();
+        // Distinct games, so a 100-game exam is 100 different episodes rather
+        // than the same episode scored again.
+        let unique: std::collections::HashSet<u64> = holdout.iter().copied().collect();
+        assert_eq!(unique.len(), holdout.len(), "each game index is its own episode");
+
+        for run_seed in [0u64, 7, 42, 1 << 63] {
+            let eval_base = eval_seed_base(run_seed);
+            for net_seed in [0u64, 7, 12_345] {
+                // The TRAIN base this net actually uses (see `train_step`).
+                let train_base = net_seed ^ run_seed;
+                for step in 0..4usize {
+                    for (game_i, hold) in holdout.iter().enumerate() {
+                        assert_ne!(
+                            *hold,
+                            episode_start_seed(train_base, step, game_i as u64),
+                            "run {run_seed} net {net_seed} step {step} game {game_i}: \
+                             the exam seed is a TRAIN episode"
+                        );
+                        assert_ne!(
+                            *hold,
+                            episode_start_seed(eval_base, step, game_i as u64),
+                            "run {run_seed} step {step} game {game_i}: \
+                             the exam seed collides with an EVAL episode"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
