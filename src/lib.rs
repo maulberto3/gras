@@ -58,7 +58,7 @@ pub use trainer::stream::{BatchStream, PoolSplit};
 // tabular scheme (`TabularTrainer`): the classic recipe every consumer used to
 // copy. Anything more specific — an environment, an exotic scheme — stays yours.
 pub use trainer::{
-    AnyTrainer, LossFn, RlContext, RlStep, RlStepMeta, RunData, StepEnv, StepReport, StreamShape,
+    AnyTrainer, Env, LossFn, RlContext, RlStep, RlStepMeta, RunData, StepEnv, StepReport, StreamShape,
     TabularContext, TabularStep, TabularTrainer,
 };
 
@@ -85,7 +85,7 @@ pub use utils::score::{
 // ── step primitives ──────────────────────────────────────────────────
 pub use utils::race_steps::{
     deterministic_train_step, deterministic_train_step_fn, eval_one_step, eval_one_step_fn,
-    seed_step_randomness, train_one_step, train_one_step_fn,
+    seed_step_randomness, train_one_step, train_one_step_fn, train_one_step_pred_only,
 };
 
 // ── flodl — the tensor backend ───────────────────────────────────────
@@ -120,7 +120,7 @@ pub mod prelude {
 
     // Trainer contracts + report types.
     pub use crate::trainer::{
-        AnyTrainer, BoxedLossFn, ChallengeDecay, ChallengePolicy, ForcedAction, Loss, LossFn,
+        AnyTrainer, BoxedLossFn, ChallengeDecay, ChallengePolicy, Env, ForcedAction, Loss, LossFn,
         RlContext, RlStep, RlStepMeta, RlStepReport, RunData, StepEnv, StepReport, StreamShape,
         TabularContext, TabularStep, TabularStepReport, TabularTrainer, TargetKind, challenge_fires,
         effective_challenge_prob, fitness_for, forced_action, least_action, metric_for, metrics_for,
