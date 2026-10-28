@@ -92,8 +92,47 @@ The first argument is a **dataset directory**: `inputs.bin` + `targets.bin` (the
 native format `save_dataset` writes) or `inputs.csv` + `targets.csv` with one-hot
 target rows, converted once and cached inside the directory. `data/mnist/train`
 is already in that form, so `RaceEngine("data/mnist/train", ...)` is the whole
-MNIST recipe. Real-valued reinforcement-learning runs (`RunSpec::rl`, e.g.
-CartPole) are Rust-only for now: they need an `RlStep` trainer compiled in.
+MNIST recipe.
+
+Reinforcement learning takes a gym/gymnasium environment instead of a dataset —
+the algorithm is the crate's `Reinforce`, so nothing about the environment is
+compiled in:
+
+```python
+import gymnasium
+
+race = RaceEngine.gym(
+    gymnasium.make("CartPole-v1"),
+    RaceConfig(pop_size=8, max_steps=20),
+    seed=42,
+    lr=1e-3,
+)
+race.run()
+```
+
+**Discrete action spaces only** — a `Box` space is refused by name, because it
+needs a different policy head rather than a flag. `algo=` (`gras.algos()`),
+`discount=` (rank on episode return instead of survival turns) and
+`challenge_prob=` (the anti-plateau knob; `0` turns it off) are the rest of the
+surface.
+
+In-memory arrays are a source too — `from_arrays` writes the SAME native pair,
+with no CSV in between, and then builds the engine exactly as the directory form
+does, so the run resumes like any other:
+
+```python
+import numpy as np
+
+X = np.random.rand(512, 8).astype(np.float32)
+Y = np.eye(3)[np.random.randint(0, 3, 512)]
+
+cfg = RaceConfig(pop_size=8, max_steps=20)
+engine = RaceEngine.from_arrays(X, Y, "data/mine", cfg, seed=42)
+engine.run()
+```
+
+`float32` and `float64` are both accepted; any other dtype is refused by name
+rather than reinterpreted.
 
 The training recipe is chosen by name and defaults to what v1 always ran. The
 trainer itself lives in the crate, so a recipe named here is the same code a Rust
@@ -110,8 +149,10 @@ race = RaceEngine("data/blobs", RaceConfig(pop_size=8, max_steps=20), seed=42,
                   loss="mse", fitness="mae", metrics=["r2"], lr=2e-3)
 ```
 
-`gras.metrics()` and `gras.fitnesses()` list the rest; an unknown name is refused
-at construction with the valid set spelled out. Cross-entropy is the only loss
+`gras.metrics()`, `gras.fitnesses()` and `gras.tasks()` list the rest; an unknown
+name is refused at construction with the valid set spelled out. A `task=` preset
+is just a shortcut for the loss (and therefore the fitness) it names —
+`task="regression"` is `loss="mse"`, and either can still be overridden alone. Cross-entropy is the only loss
 that wants one-hot target rows — `mse`, `l1` and `bce_with_logits` take the shape
 you hand them, so a single label column is fine when the loss expects one.
 
