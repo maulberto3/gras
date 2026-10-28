@@ -12,17 +12,16 @@ dependencies = [
     "kagglehub>=1.0.2",
 ]
 
-[project.scripts]
-gras = "gras:main"
-
+# Built by maturin: the module is the Rust extension `gras._core`
+# (`gras-py/src/lib.rs`), re-exported by the pure-Python `python/gras/__init__.py`.
 [build-system]
-requires = ["uv_build>=0.12.5,<0.13.0"]
-build-backend = "uv_build"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 # The package lives in python/gras/, not src/gras/: this repo's src/ is the Rust
-# module tree, and `uv init` defaulted to src/. Keeping the Python tree under
-# python/ also matches where PyO3 bindings look for it later
-# (`[tool.maturin] python-source = "python"`, module `gras._core`).
-[tool.uv.build-backend]
-module-name = "gras"
-module-root = "python"
+# module tree. maturin compiles the workspace member and drops the shared
+# library into that package as `gras/_core.so`.
+[tool.maturin]
+python-source = "python"
+module-name = "gras._core"
+manifest-path = "gras-py/Cargo.toml"
