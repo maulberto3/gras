@@ -1378,7 +1378,11 @@ impl CoreEngine {
             // clock is trained, evolved or re-ranked before the check. A fresh race starts
             // at clock 0 and never takes this branch, so its numbering is unchanged.
             if self.resumed {
-                if let Some(reason) = self.check_stop(clock) {
+                // `check_stop_before_clock`, not `check_stop`: at the TOP of a
+                // clock the budget predicate is `clock >= max`, one clock apart
+                // from the bottom-of-loop form. Sharing the bottom form here
+                // silently ate the last allowed clock of every top-up.
+                if let Some(reason) = self.check_stop_before_clock(clock) {
                     return self.finish_race(reason, clock.saturating_sub(1));
                 }
             }
@@ -5306,6 +5310,92 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// `max_steps = N` is an ABSOLUTE clock budget, so resuming must TOP UP: a run
+    /// stopped after 2 clocks and resumed with 4 must end at clock 3 (four clocks
+    /// total), not at 2. The pre-flight check exists so a resume whose budget is
+    /// already spent trains nothing; it must not spend one clock of the top-up.
+    #[test]
+    fn resume_tops_up_to_the_requested_budget() {
+        let dir = std::env::temp_dir().join("race_resume_budget");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = |max_steps: usize| {
+            let mut c = RaceConfig::defaults();
+            c.pop_size = 1;
+            c.max_steps = Some(max_steps);
+            c.checkpoint_every = 1; // the frontier survives the stop
+            c
+        };
+
+        let mut first = engine(&dir, 123).unwrap();
+        first.config = cfg(2);
+        first
+            .seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+            .unwrap();
+        assert_eq!(first.run().unwrap(), StopReason::MaxSteps);
+        let h = first.state.live_hashes()[0].clone();
+        assert_eq!(
+            first.state.net(&h).unwrap().last_metrics.as_ref().unwrap().step,
+            1,
+            "two clocks ran (0, 1)"
+        );
+        drop(first);
+
+        let mut resumed = crate::engine::TabularEngine::resume(
+            dir.clone(),
+            tiny_dataset_dir("resume_budget"),
+            cfg(4),
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.step_clock(),
+            2,
+            "the clock continues past the last RECORDED clock"
+        );
+        assert_eq!(resumed.run().unwrap(), StopReason::MaxSteps);
+        let last = resumed
+            .state
+            .net(&h)
+            .unwrap()
+            .last_metrics
+            .as_ref()
+            .unwrap()
+            .step;
+        assert_eq!(
+            last, 3,
+            "budget 4 = clocks 0..=3: the resume must run 2 AND 3"
+        );
+        drop(resumed);
+
+        // The other side of the same predicate: a resume whose budget is ALREADY
+        // spent must train nothing at all — that is what the pre-flight is for,
+        // and the fix above must not turn it into "one clock anyway".
+        let mut again = crate::engine::TabularEngine::resume(
+            dir.clone(),
+            tiny_dataset_dir("resume_budget2"),
+            cfg(4),
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        )
+        .unwrap();
+        assert_eq!(again.step_clock(), 4, "the frontier sits past clock 3");
+        assert_eq!(again.run().unwrap(), StopReason::MaxSteps);
+        assert_eq!(
+            again
+                .state
+                .net(&h)
+                .unwrap()
+                .last_metrics
+                .as_ref()
+                .unwrap()
+                .step,
+            3,
+            "a spent budget resumes to zero clocks"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
