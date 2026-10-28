@@ -94,6 +94,9 @@ pub(crate) mod toy {
         turns: usize,
         /// The action this seed makes fatal on arrival.
         fatal: usize,
+        /// The seed of the last `reset`, recorded so a caller's seed contract is
+        /// observable rather than merely promised.
+        seed: u64,
     }
 
     impl ToyEnv {
@@ -104,12 +107,19 @@ pub(crate) mod toy {
                 max_turns,
                 turns: 0,
                 fatal: 0,
+                seed: 0,
             }
         }
 
         /// Turns played since the last `reset`.
         pub fn turns(&self) -> usize {
             self.turns
+        }
+
+        /// The seed the LAST `reset` was given — a test's window into what its
+        /// caller fed this world, since the seed itself is otherwise invisible.
+        pub fn last_seed(&self) -> u64 {
+            self.seed
         }
     }
 
@@ -118,6 +128,7 @@ pub(crate) mod toy {
             // Every draw comes from the seed — the contract this env exists to
             // demonstrate, and the one its tests pin.
             let mut rng = fastrand::Rng::with_seed(seed);
+            self.seed = seed;
             self.turns = 0;
             self.fatal = rng.usize(..self.actions);
             Ok(vec![rng.f32(), rng.f32()])
