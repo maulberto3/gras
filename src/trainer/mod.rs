@@ -6,6 +6,7 @@
 pub mod challenge;
 pub mod core;
 pub mod decision_lag;
+pub mod env;
 pub mod menu;
 pub mod stream;
 
@@ -24,6 +25,7 @@ pub use core::{
     StreamShape, TabularContext, TabularStep, TabularStepReport,
 };
 pub use decision_lag::DecisionLagTrainer;
+pub use env::Env;
 pub use menu::{FITNESS_NAMES, Loss, METRIC_NAMES, TargetKind, fitness_for, metric_for, metrics_for};
 pub use flodl::Variable;
 
