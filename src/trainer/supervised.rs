@@ -6,8 +6,9 @@
 //! the internals (multi-minibatch steps, curriculum, custom eval cadence, …).
 //! The engine only consumes the [`TabularStep`] contract — it never trains.
 //!
-//! For the RL counterpart see `examples/cartpole.rs` (the canonical
-//! [`RlStep`] implementation; kagiculture shows the bridge-flavored one).
+//! For the RL counterpart see [`crate::trainer::reinforce`]: `Reinforce<E: Env>`
+//! is the shipped [`RlStep`](crate::trainer::RlStep), and a scheme that does not
+//! fit it (kagiculture's bridge, decision lag) implements the trait directly.
 
 use crate::graph::network::Network;
 use crate::trainer::{TabularContext, TabularStep};
