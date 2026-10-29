@@ -480,6 +480,10 @@ impl CoreEngine {
                 .as_secs()
                 .to_string(),
         );
+        // R3b: the eval-permutation era is `checkpoint_every` at birth, and from then on
+        // it is whatever THIS file says. A resume may change the tick cadence; it may not
+        // change the clocks at which the eval batches were drawn.
+        header.eval_era_every = Some(config.checkpoint_every);
         write_engine_json(&run_dir, &header)?;
         // Settle the log sinks now that the run dir exists: `trace_file` opens the sidecar
         // and flushes the buffered start-up block into it; the default closes that buffer.
@@ -699,6 +703,18 @@ impl CoreEngine {
     /// The run seed back to the caller.
     pub fn run_seed(&self) -> u64 {
         self.header.run_seed
+    }
+
+    /// The eval-permutation era length this engine's stream was built with (R3b).
+    ///
+    /// On a fresh run it equals `checkpoint_every`; on a resume it is whatever
+    /// `engine.json` recorded, so a caller who changes the tick cadence still draws the
+    /// eval batches the first half drew. `0` = one eternal era, or no stream (RL).
+    pub fn eval_era_every(&self) -> usize {
+        self.stream
+            .as_ref()
+            .map(|s| s.checkpoint_every())
+            .unwrap_or(0)
     }
 
     /// The current step clock — read from any live net's recorded step (after the
@@ -1209,9 +1225,23 @@ impl CoreEngine {
     pub fn run(&mut self) -> Result<StopReason> {
         self.apply_eval_defaults();
         // Keep the stream's eval-rotation cadence in lockstep with the checkpoint cadence —
-        // a post-construction config edit must not desync era numbering.
-        if let Some(stream) = self.stream.as_mut() {
-            stream.set_run_checkpoint_every(self.config.checkpoint_every);
+        // a post-construction config edit must not desync era numbering — but ONLY on a
+        // fresh run. On a resume the era is the RECORD: `TabularEngine::resume` built the
+        // stream from `header.eval_era_every`, and overwriting it here would rotate the eval
+        // permutation at this call's cadence instead of the one the first half used (R3b).
+        if !self.resumed {
+            if let Some(stream) = self.stream.as_mut() {
+                stream.set_run_checkpoint_every(self.config.checkpoint_every);
+            }
+            // The record follows the run that is actually starting: a config edit between
+            // construction and `run` would otherwise leave `engine.json` naming an era this
+            // run never used, and a later resume would draw the wrong eval batches.
+            if self.header.eval_era_every != Some(self.config.checkpoint_every) {
+                self.header.eval_era_every = Some(self.config.checkpoint_every);
+                if let Err(e) = crate::state::write_engine_json(&self.run_dir, &self.header) {
+                    tracing::warn!("engine.json eval-era record failed: {e}");
+                }
+            }
         }
         // CFY: the whole start-up block is comfy tables — a run manifest (B), a
         // search-space section (A), a trainer section, and the log legend as a
@@ -1859,12 +1889,6 @@ impl CoreEngine {
                 }
             }
             self.append_metrics_csv(clock)?;
-                // `history_flush_each`: push the CSV buffers to disk every clock instead of
-                // waiting for the checkpoint tick. Off by default — buffering is the fast
-                // path, this is the "a kill -9 must not lose the last step" knob.
-            if self.config.history_flush_each {
-                self.flush_csv_exports()?;
-            }
 
             // ── 1b. per-step rollup: trained / frozen / newborn + elite gate ──
 
@@ -1916,13 +1940,13 @@ impl CoreEngine {
                 if let Err(e) = self.write_live_frontier_states() {
                     tracing::warn!("checkpoint live states write failed: {e}");
                 }
-                // Elite weight snapshot (hard-kill durability): the frontier states carry
-                // topology + counters every tick; this adds the top-k WEIGHTS.
-                if self.config.elite_checkpoint_weights {
-                    if let Err(e) = self.write_checkpoint_elite_safetensors() {
-                        tracing::warn!("checkpoint elite snapshot failed: {e}");
-                    }
+                // EVERY live net's WEIGHTS — the frontier states above carry topology and
+                // counters, this completes them (R4). Stale files are swept here, never on
+                // cull: see `sweep_stale_net_weights`.
+                if let Err(e) = self.write_live_net_weights() {
+                    tracing::warn!("checkpoint net weights write failed: {e}");
                 }
+                self.sweep_stale_net_weights();
                 // The frontier as a SET, after the files it names: until this lands, a
                 // kill leaves `nets/` as the only record, and a net culled after the
                 // tick has already overwritten its own file with a tombstone. Written
@@ -1939,13 +1963,8 @@ impl CoreEngine {
                 if self.verbose_detail() {
                     // Name the files, not the internals: "frontier" and "flushed"
                     // are engine vocabulary a reader cannot map to a path.
-                    let elite = if self.config.elite_checkpoint_weights {
-                        " + elite weights (checkpoint-elite-*.safetensors)"
-                    } else {
-                        ""
-                    };
                     info!(
-                        "step {} │ checkpoint │ saved: live net states (nets/*.json){elite} + CSV buffers written",
+                        "step {} │ checkpoint │ saved: live net states + weights (nets/*.json, nets/*.safetensors) + CSV buffers written",
                         clock
                     );
                 }
@@ -1976,7 +1995,6 @@ impl CoreEngine {
         // it must land on disk at every log level, even `None`.
         self.write_elite_index()?;
         self.write_champion_markdown()?;
-        self.write_champion_safetensors()?;
         self.write_worst_artifacts()?;
         // `None` mode stays silent until the caller's final stop print.
         if self.verbose_detail() {
@@ -1995,6 +2013,9 @@ impl CoreEngine {
         // then carries `final_*` on every net file, culled or not.
         self.stamp_live_final_scores();
         self.write_live_frontier_states()?;
+        // …and their weights, so the stop-time frontier is as loadable as a tick's.
+        self.write_live_net_weights()?;
+        self.sweep_stale_net_weights();
         // The same point-in-time set at the stop clock, so a finished (or Ctrl+C'd)
         // dir resumes from exactly here — its manifest and its CSV agree.
         self.write_frontier_manifest(clock + 1)?;
@@ -2876,9 +2897,10 @@ impl CoreEngine {
 
     /// Rewind the run's CSVs to the last checkpoint before a resume appends to them.
     ///
-    /// `history_flush_each` writes a row per clock while the frontier moves every
-    /// `checkpoint_every`, so a hard kill leaves rows for clocks the snapshot never
-    /// reached; appending after a resume from the older frontier would duplicate them.
+    /// A dir written before the one-cadence change flushed a row per clock while the
+    /// frontier moved every `checkpoint_every`, so a hard kill left rows for clocks the
+    /// snapshot never reached; appending after a resume from the older frontier would
+    /// duplicate them.
     /// No manifest = nothing to rewind against (legacy dir): do nothing, as before.
     pub(crate) fn rewind_csvs_to_manifest(run_dir: &std::path::Path) -> Result<()> {
         let Some(manifest) = crate::state::load_frontier_manifest(run_dir)? else {
@@ -5357,6 +5379,73 @@ mod tests {
     }
 
     #[test]
+    fn resume_keeps_the_recorded_eval_era_when_the_tick_cadence_changes() {
+        // R3b: `checkpoint_every` is two numbers in one key — how often the durability tick
+        // fires, and how often the eval permutation rotates. A resume may change the first;
+        // the second comes from the record, or the resumed half draws different eval
+        // batches than the run it claims to continue.
+        let dir = std::env::temp_dir().join("race_eval_era_recorded");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut part = engine(&dir, 4242).unwrap();
+        part.config.checkpoint_every = 10;
+        part.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+            .unwrap();
+        let h = part.state.live_hashes()[0].clone();
+        for clock in 0..3 {
+            part.step_one_net(&h, clock).unwrap();
+        }
+        let state = part.state.net(&h).cloned().unwrap();
+        crate::state::write_net_state(&dir, &state).unwrap();
+        part.write_frontier_manifest(3).unwrap();
+        drop(part);
+
+        let header = crate::state::load_engine_json(&dir).unwrap();
+        assert_eq!(header.eval_era_every, Some(10), "the era is recorded at launch");
+
+        let resumed = crate::engine::TabularEngine::resume(
+            dir.clone(),
+            tiny_dataset_dir("resume-era"),
+            {
+                let mut c = RaceConfig::defaults();
+                c.pop_size = 1;
+                c.checkpoint_every = 7; // the caller's NEW tick cadence
+                c
+            },
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.eval_era_every(),
+            10,
+            "the eval era follows the record, not this call's cadence"
+        );
+
+        // …and the recorded value is not a constant: a fresh engine uses its own cadence.
+        let fresh_dir = std::env::temp_dir().join("race_eval_era_fresh");
+        let _ = std::fs::remove_dir_all(&fresh_dir);
+        let fresh = crate::engine::TabularEngine::from_spec(
+            crate::engine::run_spec::RunSpec::tabular(
+                tiny_dataset_dir("fresh-era"),
+                {
+                    let mut c = RaceConfig::defaults();
+                    c.pop_size = 0;
+                    c.checkpoint_every = 7;
+                    c
+                },
+                fitness(),
+                crate::trainer::TabularTrainer::new(loss_fn()),
+                Some(4242),
+                Some(fresh_dir.clone()),
+            ),
+        )
+        .unwrap();
+        assert_eq!(fresh.eval_era_every(), 7);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&fresh_dir);
+    }
+
+    #[test]
     fn resume_then_continue_matches_uninterrupted_twin() {
         // Tier C exit proof: run 3 steps → drop → resume → run 2 more must
         // land exactly where an uninterrupted 5-step twin lands.
@@ -5620,6 +5709,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .set_run_checkpoint_every(ckpt_every);
+        // R3b: `run()` is what normally writes the era into `engine.json`; this test drives
+        // the loop by hand, so it owns that record. Without this line the header would still
+        // name the construction-time cadence (10) while the run drew at 2 — and the resume
+        // would follow the record into the wrong eval batches.
+        engine.header.eval_era_every = Some(ckpt_every);
+        crate::state::write_engine_json(&dir, &engine.header).unwrap();
         engine
             .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
@@ -6964,8 +7059,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&prior);
     }
 
-    /// Certification needs no weight file: the live champion is scored in memory
-    /// and recorded in `engine.json`, so `elite_save_safetensors` can stay off.
+    /// Certification reads the LIVE champion in memory, never a weights file: the exam
+    /// still works on a run whose `nets/` is the only place its coefficients exist.
     #[test]
     fn guardrail_certifies_a_live_champion_without_weight_files() {
         let dir = std::env::temp_dir().join("gras-guardrail-live");
@@ -6977,9 +7072,6 @@ mod tests {
             pop_size: 0,
             max_steps: Some(2),
             guardrail_matches: 3,
-            // The point of the test: NO weight export at all.
-            elite_save_safetensors: false,
-            elite_checkpoint_weights: false,
             ..RaceConfig::defaults()
         };
         let trainer = crate::trainer::TabularTrainer::new(loss_fn())
@@ -7337,50 +7429,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&empty_dir);
     }
 
-    // ── Checkpoint elite weight snapshot ────────────────────────────────
+    // ── Live net weights: the checkpoint's other half (R4) ──────────────
 
     #[test]
-    fn checkpoint_elite_snapshot_lands_and_flag_off_skips() {
-        for (enabled, expect_file) in [(true, true), (false, false)] {
-            let dir = std::env::temp_dir().join(format!("gras-ckpt-elite-{enabled}"));
-            let _ = std::fs::remove_dir_all(&dir);
-            let mut eng = engine(&dir, 7).unwrap();
-            eng.config.checkpoint_every = 2;
-            eng.config.max_steps = Some(4);
-            eng.config.elite_checkpoint_weights = enabled;
-            eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-                .unwrap();
-            eng.run().unwrap();
-            // The ledger was removed: the tick writes durability snapshots, never
-            // a checkpoints.json diagnostic.
+    fn every_live_net_gets_weights_at_every_tick_and_at_stop() {
+        let dir = std::env::temp_dir().join("gras-net-weights");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 7).unwrap();
+        eng.config.checkpoint_every = 2;
+        eng.config.max_steps = Some(4);
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        eng.run().unwrap();
+        // Files are OVERWRITTEN in place, so the count is the population, never the run
+        // length — the cost bound R4 promises.
+        let weights: Vec<String> = std::fs::read_dir(dir.join("nets"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".safetensors"))
+            .collect();
+        assert_eq!(
+            weights.len(),
+            eng.state.live_count(),
+            "one weights file per live net, got {weights:?}"
+        );
+        // The manifest (schema 2) names exactly that set, and every name has its file:
+        // this is the property a weights-based resume rests on.
+        let manifest = crate::state::load_frontier_manifest(&dir).unwrap().unwrap();
+        assert_eq!(manifest.nets.len(), weights.len());
+        for entry in &manifest.nets {
             assert!(
-                !dir.join("checkpoints.json").exists(),
-                "the removed checkpoint ledger must not be written"
+                dir.join("nets")
+                    .join(format!("{}.safetensors", entry.hash))
+                    .exists(),
+                "manifest names {} but its weights are missing",
+                entry.hash
             );
-            if expect_file {
-                // Champion hash from the engine — the same source the
-                // snapshot writer used.
-                let champ = eng.champion_hashes()[0].clone();
-                let short = &champ[..8];
-                let snap = dir.join(format!("checkpoint-elite-{short}.safetensors"));
-                assert!(
-                    snap.exists(),
-                    "checkpoint snapshot missing for champion {short}"
-                );
-            } else {
-                let snaps = std::fs::read_dir(&dir)
-                    .unwrap()
-                    .flatten()
-                    .filter(|e| {
-                        e.file_name()
-                            .to_string_lossy()
-                            .starts_with("checkpoint-elite-")
-                    })
-                    .count();
-                assert_eq!(snaps, 0, "flag off ⇒ no checkpoint elite files");
-            }
-            let _ = std::fs::remove_dir_all(&dir);
         }
+        // The retired writers left no WEIGHTS behind under their old names (the topology
+        // markdown `elite-<hash>.md` stays — that flag is untouched).
+        assert!(dir.join("elites.json").exists());
+        for stale in std::fs::read_dir(&dir).unwrap().flatten() {
+            let name = stale.file_name().to_string_lossy().to_string();
+            let retired_weights = name.ends_with(".safetensors")
+                && (name.starts_with("elite-") || name.starts_with("worst-"));
+            assert!(
+                !name.starts_with("checkpoint-elite-") && !retired_weights,
+                "retired weight artifact still written: {name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
         /// `checkpoint_every = 0` is the OFF switch for the durability tick: no
@@ -7393,7 +7492,6 @@ mod tests {
         let mut eng = engine(&dir, 7).unwrap();
         eng.config.checkpoint_every = 0;
         eng.config.max_steps = Some(4);
-        eng.config.elite_checkpoint_weights = true; // would snapshot on any tick
         // Both OFF switches at once, through a REAL completed run: the exam skip must
         // also survive the run path (not just a hand-built engine).
         eng.config.guardrail_matches = 0;
@@ -7404,15 +7502,17 @@ mod tests {
             eng.guardrail().is_none(),
             "guardrail_matches = 0 must skip after a real run too"
         );
-        let snaps: Vec<String> = std::fs::read_dir(&dir)
+        // No tick ⇒ no per-tick write; the STOP writer still completes the run, so every
+        // live net has its weights exactly once (R4: there is no flag to turn that off).
+        let weights = std::fs::read_dir(dir.join("nets"))
             .unwrap()
             .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with("checkpoint-elite-"))
-            .collect();
-        assert!(
-            snaps.is_empty(),
-            "0 cadence must write no durability snapshots, got {snaps:?}"
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
+            .count();
+        assert_eq!(
+            weights,
+            eng.state.live_count(),
+            "stop writes every live net's weights even with 0 cadence"
         );
         // …and the stop-time writers still ran: the run is complete, not truncated.
         assert!(dir.join("elites.json").exists(), "elite index is a stop artifact");
@@ -7553,7 +7653,6 @@ mod tests {
         assert_eq!(header.config.crossover_probation_steps, 6);
         assert_eq!(header.config.elite_join_probation_steps, 5);
         assert_eq!(header.config.elite_crown_lifetime_steps, 5);
-        assert!(header.config.elite_checkpoint_weights);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
