@@ -828,6 +828,15 @@ impl CoreEngine {
         let run_dir = self.run_dir.clone();
         let nets_dir = run_dir.join("nets");
         let mut loaded = 0usize;
+        // The frontier as a SET, when the run recorded one (`ckpt.json`). Handled and
+        // returned first, so the scan below stays exactly the pre-manifest path.
+        if let Some(manifest) = crate::state::load_frontier_manifest(&run_dir)? {
+            let history = Self::load_history_windows(&run_dir, self.config.smoothing_window);
+            let mut replayed: Vec<Vec<String>> = Vec::new();
+            let loaded = self.replay_manifest_frontier(&manifest, &history, &mut replayed)?;
+            self.report_resume(loaded, &replayed, &nets_dir, &run_dir)?;
+            return Ok(());
+        }
         let entries = std::fs::read_dir(&nets_dir).map_err(|source| {
             crate::utils::error::EngineError::Io {
                 path: nets_dir.display().to_string(),
@@ -882,62 +891,168 @@ impl CoreEngine {
                     }
                 }
             }
-            let hash = state.hash.clone();
-            let step = state.step;
             let child = self.replay_loaded_net(state)?;
+            let (hash, step) = self.insert_replayed(child, &history);
+            loaded += 1;
+            replayed.push(vec![hash, step.to_string()]);
+        }
+        self.report_resume(loaded, &replayed, &nets_dir, &run_dir)?;
+        Ok(())
+    }
 
-            // Insert the replayed net into the live maps, its rolling buffers seeded from the
-            // replayed trajectory so the smoothed stats are warm on resume, not cold.
-            let mut state = child.state.clone();
-            state.elite_probation_age = child.state.elite_probation_age;
-            state.elite_seat_age = child.state.elite_seat_age;
-            self.state.insert(state, None);
-            self.networks.insert(child.state.hash.clone(), child.net);
-            self.optimizers
-                .insert(child.state.hash.clone(), child.optimizer);
-            // Rolling buffers seeded from the run's own recorded readings — the smoothed
-            // stats are warm on resume, not cold; ranking resumes where it left off.
-            let mut buf = RollingBuffer::new(self.config.smoothing_window);
-            let mut train_buf = RollingBuffer::new(self.config.smoothing_window);
-            let mut eval_buf = RollingBuffer::new(self.config.smoothing_window);
-            match history.get(&hash) {
-                // The recorded runway, oldest → newest: the same window the live run held.
-                Some(rows) if !rows.is_empty() => {
-                    for (fitness, train_loss, eval_loss) in rows {
-                        buf.push(*fitness);
-                        train_buf.push(*train_loss);
-                        if let Some(eval) = eval_loss {
-                            eval_buf.push(*eval);
-                        }
-                    }
-                }
-                // No `history.csv` (csv_export off, or a run recorded before it): fall back
-                // to the single last reading, which is all the net state carries.
-                _ => {
-                    if let Some(m) = self.state.net(&hash).and_then(|s| s.last_metrics.as_ref()) {
-                        buf.push(m.fitness);
-                        train_buf.push(m.train_loss);
-                        if let Some(e) = m.eval_loss {
-                            eval_buf.push(e);
-                        }
+    /// The frontier exactly as `ckpt.json` recorded it: those hashes, at the clocks they
+    /// had reached, whatever the directory has said since.
+    ///
+    /// Two differences from the scan: a file may have moved on (a cull or the stop
+    /// rewrote it), so it is rewound to the manifest's clock rather than trusted; and
+    /// `is_alive` is IGNORED, because a net culled after the tick is a tombstone now but
+    /// was live at the tick. That is the defect this file exists to fix — measured: 8
+    /// live nets became 2, and the resume refused as a `pop_size` mismatch.
+    fn replay_manifest_frontier(
+        &mut self,
+        manifest: &crate::state::FrontierManifest,
+        history: &HashMap<String, Vec<(f32, f32, Option<f32>)>>,
+        replayed: &mut Vec<Vec<String>>,
+    ) -> Result<usize> {
+        if manifest.run_seed != self.header.run_seed {
+            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                "resume: ckpt.json belongs to run seed {} but engine.json records {} — the run \
+                 dir mixes two runs",
+                manifest.run_seed, self.header.run_seed
+            ))
+            .into());
+        }
+        let nets_dir = self.run_dir.join("nets");
+        let mut loaded = 0usize;
+        for entry in &manifest.nets {
+            let path = nets_dir.join(format!("{}.json", entry.hash));
+            let raw = std::fs::read_to_string(&path).map_err(|source| {
+                crate::utils::error::EngineError::InvalidOptions(format!(
+                    "resume: ckpt.json lists net {} at clock {} but {} is unreadable ({source}) — \
+                     the frontier snapshot is incomplete",
+                    entry.hash,
+                    entry.step,
+                    path.display()
+                ))
+            })?;
+            let mut state = NetState::from_json(&raw)?;
+            if state.hash != entry.hash {
+                return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                    "resume: {} holds net {} but ckpt.json lists it as {} — the files and the \
+                     manifest disagree",
+                    path.display(),
+                    state.hash,
+                    entry.hash
+                ))
+                .into());
+            }
+            // How far the file has moved since the tick. NEWER is normal (a cull or the
+            // stop rewrote it) and is rewound; OLDER means the net files predate the
+            // manifest — a checkpoint write that failed — and cannot be repaired.
+            let file_clock = state
+                .last_metrics
+                .as_ref()
+                .map(|m| m.step)
+                .unwrap_or(state.step);
+            if file_clock < entry.step {
+                return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                    "resume: net {} is recorded at clock {file_clock} but ckpt.json says the \
+                     frontier was at {} — the net files predate the manifest (a checkpoint \
+                     write failed?); this run cannot be resumed exactly",
+                    entry.hash, entry.step
+                ))
+                .into());
+            }
+            if file_clock > entry.step {
+                debug!(
+                    "resume: net {} moved on to clock {file_clock} after the tick at {} — \
+                     rewinding it to the manifest",
+                    entry.hash, entry.step
+                );
+            }
+            state.is_alive = true;
+            let child = self.replay_loaded_net_at(state, Some(entry.step))?;
+            let (hash, step) = self.insert_replayed(child, history);
+            replayed.push(vec![hash, format!("{step} (manifest {})", entry.step)]);
+            loaded += 1;
+        }
+        Ok(loaded)
+    }
+
+    /// Insert a replayed net into the live maps, with its rolling windows seeded from the
+    /// run's own recorded readings so the smoothed stats are warm on resume, not cold.
+    /// Returns `(hash, clock)` for the resume card.
+    fn insert_replayed(
+        &mut self,
+        child: crate::engine::child::RaceChild,
+        history: &HashMap<String, Vec<(f32, f32, Option<f32>)>>,
+    ) -> (String, usize) {
+        let hash = child.state.hash.clone();
+        let step = child
+            .state
+            .last_metrics
+            .as_ref()
+            .map(|m| m.step)
+            .unwrap_or(child.state.step);
+        let mut state = child.state.clone();
+        state.elite_probation_age = child.state.elite_probation_age;
+        state.elite_seat_age = child.state.elite_seat_age;
+        self.state.insert(state, None);
+        self.networks.insert(hash.clone(), child.net);
+        self.optimizers.insert(hash.clone(), child.optimizer);
+        let mut buf = RollingBuffer::new(self.config.smoothing_window);
+        let mut train_buf = RollingBuffer::new(self.config.smoothing_window);
+        let mut eval_buf = RollingBuffer::new(self.config.smoothing_window);
+        match history.get(&hash) {
+            // The recorded runway, oldest → newest: the same window the live run held.
+            Some(rows) if !rows.is_empty() => {
+                for (fitness, train_loss, eval_loss) in rows {
+                    buf.push(*fitness);
+                    train_buf.push(*train_loss);
+                    if let Some(eval) = eval_loss {
+                        eval_buf.push(*eval);
                     }
                 }
             }
-            self.rolling_fitness.insert(hash.clone(), buf);
-            self.rolling_train.insert(hash.clone(), train_buf);
-            self.rolling_eval.insert(hash.clone(), eval_buf);
-            loaded += 1;
-            replayed.push(vec![hash.clone(), step.to_string()]);
+            // No `history.csv` (csv_export off, or a run recorded before it): fall back
+            // to the single last reading, which is all the net state carries.
+            _ => {
+                if let Some(m) = self.state.net(&hash).and_then(|s| s.last_metrics.as_ref()) {
+                    buf.push(m.fitness);
+                    train_buf.push(m.train_loss);
+                    if let Some(e) = m.eval_loss {
+                        eval_buf.push(e);
+                    }
+                }
+            }
         }
+        self.rolling_fitness.insert(hash.clone(), buf);
+        self.rolling_train.insert(hash.clone(), train_buf);
+        self.rolling_eval.insert(hash.clone(), eval_buf);
+        (hash, step)
+    }
+
+    /// The one pop guard + resume card both frontiers end with.
+    fn report_resume(
+        &self,
+        loaded: usize,
+        replayed: &[Vec<String>],
+        _nets_dir: &std::path::Path,
+        run_dir: &std::path::Path,
+    ) -> Result<()> {
         if loaded != self.config.pop_size {
             return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume: expected {} live nets in population (per config.pop_size), but found {} live nets in {}",
-                self.config.pop_size, loaded, nets_dir.display()
-            )).into());
+                "resume: expected {} live nets in population (per config.pop_size), but found \
+                 {} live nets in {}",
+                self.config.pop_size,
+                loaded,
+                run_dir.display()
+            ))
+            .into());
         }
         crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Race resume",
-            &crate::utils::cfy::table(&["hash", "replayed step"], &replayed),
+            &crate::utils::cfy::table(&["hash", "replayed step"], replayed),
             Some(&format!("loaded {loaded} nets from {}", run_dir.display())),
         ));
         Ok(())
@@ -1808,6 +1923,14 @@ impl CoreEngine {
                         tracing::warn!("checkpoint elite snapshot failed: {e}");
                     }
                 }
+                // The frontier as a SET, after the files it names: until this lands, a
+                // kill leaves `nets/` as the only record, and a net culled after the
+                // tick has already overwritten its own file with a tombstone. Written
+                // here — nets first, manifest second — so a manifest that lags is safe
+                // (replay to its step) and one that leads them never happens.
+                if let Err(e) = self.write_frontier_manifest(clock + 1) {
+                    tracing::warn!("checkpoint frontier manifest write failed: {e}");
+                }
                 // Flush metrics at the tick too, so an interrupted run keeps per-step
                 // history up to its last tick instead of the whole in-memory buffer.
                 if let Err(e) = self.flush_csv_exports() {
@@ -1872,6 +1995,9 @@ impl CoreEngine {
         // then carries `final_*` on every net file, culled or not.
         self.stamp_live_final_scores();
         self.write_live_frontier_states()?;
+        // The same point-in-time set at the stop clock, so a finished (or Ctrl+C'd)
+        // dir resumes from exactly here — its manifest and its CSV agree.
+        self.write_frontier_manifest(clock + 1)?;
         self.flush_csv_exports()?;
         self.persist_run_counters();
         Ok(reason)
@@ -2699,6 +2825,73 @@ impl CoreEngine {
             if let Some(state) = self.state.net(h) {
                 write_net_state(&self.run_dir, state)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Write `<run_dir>/ckpt.json` — the frontier as a point-in-time SET (which nets
+    /// were live at this tick, and the clock each had MEASURED). See
+    /// [`crate::state::FrontierManifest`] for why the set, not just the files, has to be
+    /// recorded: `nets/<hash>.json` is rewritten by later culls, so after a hard kill the
+    /// directory alone no longer says who was alive at the checkpoint.
+    pub(crate) fn write_frontier_manifest(&self, next_clock: usize) -> Result<()> {
+        // No entry may claim the clock that has not FINISHED. A frozen crown records an
+        // act-and-measure reading at the clock it is on (`record_frozen_act` sets
+        // `last_metrics.step` without advancing the race clock), so at a stop taken
+        // between phases the crown can sit one clock ahead of the last completed one.
+        // Replaying that act would resume at `next_clock + 1` and skip a whole clock; the
+        // unfinished clock is replayed from its start instead.
+        let last_clock = next_clock.saturating_sub(1);
+        let mut nets: Vec<crate::state::FrontierNet> = self
+            .state
+            .live_hashes()
+            .into_iter()
+            .filter_map(|hash| {
+                let state = self.state.net(&hash)?;
+                Some(crate::state::FrontierNet {
+                    hash: state.hash.clone(),
+                    // The replay target: last MEASURED clock (frozen act passes count; an
+                    // idle clock records nothing, which is why `step` is only the fallback).
+                    step: state
+                        .last_metrics
+                        .as_ref()
+                        .map(|m| m.step.min(last_clock))
+                        .unwrap_or(state.step.min(last_clock)),
+                })
+            })
+            .collect();
+        // Sorted so the file's bytes are deterministic — a manifest is a record, and
+        // two runs of the same race must produce the same bytes.
+        nets.sort_by(|a, b| a.hash.cmp(&b.hash));
+        crate::state::write_frontier_manifest(
+            &self.run_dir,
+            &crate::state::FrontierManifest {
+                schema: crate::state::FRONTIER_MANIFEST_SCHEMA,
+                next_clock,
+                run_seed: self.header.run_seed,
+                nets,
+            },
+        )
+    }
+
+    /// Rewind the run's CSVs to the last checkpoint before a resume appends to them.
+    ///
+    /// `history_flush_each` writes a row per clock while the frontier moves every
+    /// `checkpoint_every`, so a hard kill leaves rows for clocks the snapshot never
+    /// reached; appending after a resume from the older frontier would duplicate them.
+    /// No manifest = nothing to rewind against (legacy dir): do nothing, as before.
+    pub(crate) fn rewind_csvs_to_manifest(run_dir: &std::path::Path) -> Result<()> {
+        let Some(manifest) = crate::state::load_frontier_manifest(run_dir)? else {
+            return Ok(());
+        };
+        let next = manifest.next_clock;
+        let history = crate::state::truncate_csv_to_clock(run_dir, "history.csv", next)?;
+        let attempts = crate::state::truncate_csv_to_clock(run_dir, "attempts.csv", next)?;
+        if history + attempts > 0 {
+            tracing::info!(
+                "resume: rewound the CSVs to clock {next} — dropped {history} history row(s) \
+                 and {attempts} attempt row(s) written after the last checkpoint"
+            );
         }
         Ok(())
     }
