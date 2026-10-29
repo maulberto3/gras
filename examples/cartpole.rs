@@ -446,15 +446,12 @@ fn main() {
         // ELITES
         .set_elite_count(pop / 20)
         .set_elite_previous_load(true) // on by default
-        .set_elite_save_safetensors(false)
-        .set_elite_checkpoint_weights(false)
         .set_elite_guardrail_matches(GUARDRAIL_MATCHES)
         .set_elite_freeze(true) // frozen elites still score, rank and sire
         .set_elite_join_probation_steps(5) // age before a net may join the elite set (A/B re-checked 2026-10-26: 5 wins both fast seeds — see DONE.md)
         .set_elite_crown_lifetime_steps(5) // how long the frozen crown may sit at peak
         .set_elite_save_topology(true) // elite-<hash>.md at stop
         .set_worst_save_topology(true)
-        .set_worst_save_safetensors(false) // worst-<hash>.safetensors at stop
         // .set_elite_previous_dir("assets/1790920031289_500")
         // The mins are `TopologyOptions::default`; the max_* twins above are raised by
         // this example, so the sampler still varies topology width.

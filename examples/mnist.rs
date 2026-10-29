@@ -275,14 +275,10 @@ impl EngineArgs {
             });
         }
         if self.worst_save {
-            b = b
-                .set_worst_save_topology(true)
-                .set_worst_save_safetensors(true);
+            b = b.set_worst_save_topology(true);
         }
         if self.no_elite_save {
-            b = b
-                .set_elite_save_topology(false)
-                .set_elite_save_safetensors(false);
+            b = b.set_elite_save_topology(false);
         }
         b
     }
@@ -762,10 +758,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // --- Exports ---
         .set_run_csv_export(true)
         .set_elite_save_topology(true)
-        .set_elite_save_safetensors(true)
-        .set_worst_save_topology(true)
-        .set_worst_save_safetensors(true)
-        .set_elite_checkpoint_weights(true);
+        .set_worst_save_topology(true);
     // Every CLI flag is an OVERLAY: a user-passed value wins, anything unset
     // keeps the const above. This is also where `--history-flush`, `--train-merit`
     // and `--founders-from` become engine config instead of being silently dropped.
