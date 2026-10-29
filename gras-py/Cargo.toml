@@ -1,0 +1,26 @@
+[package]
+name = "gras-py"
+version = "0.1.0"
+edition = "2024"
+description = "Python bindings for gras (PyO3 extension module `gras._core`)"
+license = "MIT"
+publish = false
+
+# The shared library must be named after the extension module (`_core`);
+# `[tool.maturin] module-name = "gras._core"` places it inside the package.
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[features]
+# Same switch as the crate's: `maturin develop --features cuda` builds an
+# extension whose `auto_device()` is CUDA, and the notebook's `CUDA` flag then
+# matches the build. Off by default so the plain build stays CPU-only.
+cuda = ["gras/cuda"]
+
+[dependencies]
+gras = { path = "..", version = "=1.1.7" }
+# 0.30 is the first line that accepts Python 3.14 interpreters; the venv here
+# runs 3.12, so the wheel is built for whatever `maturin` is pointed at.
+pyo3 = { version = "0.30", features = ["extension-module"] }
+serde_json = "1.0"

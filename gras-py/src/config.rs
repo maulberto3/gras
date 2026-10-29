@@ -8,7 +8,9 @@
 
 use std::path::PathBuf;
 
-use gras::engine::config::{DEFAULT_GUARDRAIL_MATCHES, SMOOTHING_WINDOW};
+use gras::engine::config::{
+    CrossoverOp, DEFAULT_CHECKPOINT_EVERY, DEFAULT_GUARDRAIL_MATCHES, SMOOTHING_WINDOW,
+};
 use gras::evolution::selection::SelectionMethod;
 use gras::graph::topology::FeatureSplitPolicy;
 use gras::prelude::*;
@@ -26,6 +28,16 @@ const DEFAULT_CROSSOVER_PROB: f32 = 0.5;
 const DEFAULT_MUTATE_PROB: f32 = 0.5;
 const DEFAULT_HIDDEN_DIM_STRIDE: usize = 16;
 const DEFAULT_TOURNAMENT_SIZE: usize = 2;
+
+/// Dropout the crate builds nets with (`TopologyOptions::default().dropout_prob`).
+/// `0.0` keeps regularization opt-in per run rather than on by inheritance.
+const DEFAULT_DROPOUT_PROB: f32 = 0.0;
+
+/// Cull immunity for every newcomer, in clocks. The crate's shipped value, mirrored
+/// here so the signature can name it. Unlike λ and Ω this is not a "neutral at
+/// zero" knob: `0` removes a protection rather than switching off an effect on the
+/// ranking, so a Python caller inherits the crate's 5 instead of starting bare.
+const DEFAULT_PROBATION_STEPS: usize = 5;
 
 /// λ and Ω default to the values that change NOTHING about a ranking: the plain
 /// window mean (λ = 0) and the plain step (Ω = 0). The crate's λ default is 1.0
@@ -98,6 +110,36 @@ pub struct PyRaceConfig {
     /// K for `crossover_selection="tournament"`; small K is mild pressure.
     #[pyo3(get, set)]
     pub tournament_size: usize,
+    /// Which mixing methods a crossover attempt draws from: `"one_point"` and/or
+    /// `"uniform"`. Empty (the default) means both, drawn uniformly.
+    #[pyo3(get, set)]
+    pub crossover_ops_pool: Vec<String>,
+
+    // ── durability ──────────────────────────────────────────────────────
+    /// Steps between population checkpoints (the era rotation and the `history.csv`
+    /// flush cadence key off this). **`0` = no durability tick** and one eternal era.
+    #[pyo3(get, set)]
+    pub checkpoint_every: usize,
+    /// Include the top nets' weights in each checkpoint file. Off means weights are
+    /// written only at stop, so a hard kill mid-run loses all of them.
+    #[pyo3(get, set)]
+    pub elite_checkpoint_weights: bool,
+
+    // ── probation (cull immunity for newcomers) ─────────────────────────
+    /// A random immigrant is cull-immune for its first k clocks; `0` = only the
+    /// empty-buffer step-0 immunity.
+    #[pyo3(get, set)]
+    pub mutation_probation_steps: usize,
+    /// A crossover-born net is cull-immune for its first k clocks; `0` = only step-0.
+    #[pyo3(get, set)]
+    pub crossover_probation_steps: usize,
+    /// A net cannot become an elite until it has aged k clocks since arrival.
+    #[pyo3(get, set)]
+    pub elite_join_probation_steps: usize,
+    /// How long a net may stay at peak on the frozen crown before age-elimination;
+    /// `0` = permanent until its rank moves.
+    #[pyo3(get, set)]
+    pub elite_crown_lifetime_steps: usize,
 
     // ── search space ────────────────────────────────────────────────────
     /// Hidden-dim sampling range as `(min, max)` inclusive. `None` keeps the
@@ -107,6 +149,23 @@ pub struct PyRaceConfig {
     /// Stride within `hidden_dim_pool` when sampling node dimensions.
     #[pyo3(get, set)]
     pub hidden_dim_stride: usize,
+    /// How many hidden NODES a sampled net gets, as `(min, max)` inclusive.
+    /// `None` keeps the crate's `2..=5`. Distinct from `hidden_dim_pool`, which
+    /// is how WIDE each of those nodes is.
+    #[pyo3(get, set)]
+    pub hidden_nodes_pool: Option<(usize, usize)>,
+    /// Wires INTO each hidden node, `(min, max)` inclusive; `None` keeps the
+    /// crate's `2..=5` (`set_topology_min/max_inputs_per_node`).
+    #[pyo3(get, set)]
+    pub hidden_inputs_pool: Option<(usize, usize)>,
+    /// Wires OUT of each hidden node, `(min, max)` inclusive; `None` keeps the
+    /// crate's `2..=5` (`set_topology_min/max_outputs_per_node`).
+    #[pyo3(get, set)]
+    pub hidden_outputs_pool: Option<(usize, usize)>,
+    /// Dropout baked into each net at build; `0.0` (default) is off. TRAIN path
+    /// only, so a replay does not depend on a random mask.
+    #[pyo3(get, set)]
+    pub dropout_prob: f32,
     /// Activation pool; empty means all known activations.
     #[pyo3(get, set)]
     pub activation_pool: Vec<String>,
@@ -183,9 +242,21 @@ impl PyRaceConfig {
         mutation_cull_policy = String::from("worst"),
         crossover_selection = String::from("roulette"),
         tournament_size = DEFAULT_TOURNAMENT_SIZE,
+        crossover_ops_pool = Vec::new(),
+        // durability + probation
+        checkpoint_every = DEFAULT_CHECKPOINT_EVERY,
+        elite_checkpoint_weights = true,
+        mutation_probation_steps = DEFAULT_PROBATION_STEPS,
+        crossover_probation_steps = DEFAULT_PROBATION_STEPS,
+        elite_join_probation_steps = DEFAULT_PROBATION_STEPS,
+        elite_crown_lifetime_steps = DEFAULT_PROBATION_STEPS,
         // search space
         hidden_dim_pool = None,
         hidden_dim_stride = DEFAULT_HIDDEN_DIM_STRIDE,
+        hidden_nodes_pool = None,
+        hidden_inputs_pool = None,
+        hidden_outputs_pool = None,
+        dropout_prob = DEFAULT_DROPOUT_PROB,
         activation_pool = Vec::new(),
         combine_op_pool = Vec::new(),
         standardize_op_pool = Vec::new(),
@@ -225,8 +296,19 @@ impl PyRaceConfig {
         mutation_cull_policy: String,
         crossover_selection: String,
         tournament_size: usize,
+        crossover_ops_pool: Vec<String>,
+        checkpoint_every: usize,
+        elite_checkpoint_weights: bool,
+        mutation_probation_steps: usize,
+        crossover_probation_steps: usize,
+        elite_join_probation_steps: usize,
+        elite_crown_lifetime_steps: usize,
         hidden_dim_pool: Option<(usize, usize)>,
         hidden_dim_stride: usize,
+        hidden_nodes_pool: Option<(usize, usize)>,
+        hidden_inputs_pool: Option<(usize, usize)>,
+        hidden_outputs_pool: Option<(usize, usize)>,
+        dropout_prob: f32,
         activation_pool: Vec<String>,
         combine_op_pool: Vec<String>,
         standardize_op_pool: Vec<String>,
@@ -264,8 +346,19 @@ impl PyRaceConfig {
             mutation_cull_policy,
             crossover_selection,
             tournament_size,
+            crossover_ops_pool,
+            checkpoint_every,
+            elite_checkpoint_weights,
+            mutation_probation_steps,
+            crossover_probation_steps,
+            elite_join_probation_steps,
+            elite_crown_lifetime_steps,
             hidden_dim_pool,
             hidden_dim_stride,
+            hidden_nodes_pool,
+            hidden_inputs_pool,
+            hidden_outputs_pool,
+            dropout_prob,
             activation_pool,
             combine_op_pool,
             standardize_op_pool,
@@ -284,7 +377,7 @@ impl PyRaceConfig {
     }
 
     /// The headline knobs. The remaining fields are reachable by name and land in
-    /// `engine.json`; printing 32 of them would bury the ones people change.
+    /// `engine.json`; printing 39 of them would bury the ones people change.
     fn __repr__(&self) -> String {
         format!(
             "RaceConfig(pop_size={}, elite_count={}, max_steps={:?}, smoothing_window={}, \
@@ -297,6 +390,23 @@ impl PyRaceConfig {
             self.elite_previous_load,
             self.log_level
         )
+    }
+}
+
+/// A `(min, max)` inclusive pair → a range, or a `ValueError` naming the field.
+///
+/// Shared by every sampled range: an empty or inverted pair would panic the
+/// sampler (`end - start`), so it is refused before a single net is drawn.
+fn parse_range_pool(
+    name: &str,
+    pair: Option<(usize, usize)>,
+) -> PyResult<Option<std::ops::RangeInclusive<usize>>> {
+    match pair {
+        Some((lo, hi)) if lo == 0 || lo > hi => Err(PyValueError::new_err(format!(
+            "{name} ({lo}, {hi}): expected 1 <= min <= max"
+        ))),
+        Some((lo, hi)) => Ok(Some(lo..=hi)),
+        None => Ok(None),
     }
 }
 
@@ -371,7 +481,7 @@ impl PyRaceConfig {
             other => {
                 return Err(PyValueError::new_err(format!(
                     "crossover_selection {other:?}: expected one of roulette, tournament"
-                )))
+                )));
             }
         };
         let feature_split = match &self.feature_split {
@@ -384,15 +494,26 @@ impl PyRaceConfig {
         };
         // An empty or inverted range would panic the sampler (`end - start`), so
         // refuse it by name here rather than crash mid-race.
-        let hidden_dim_pool = match self.hidden_dim_pool {
-            Some((lo, hi)) if lo == 0 || lo > hi => {
-                return Err(PyValueError::new_err(format!(
-                    "hidden_dim_pool ({lo}, {hi}): expected 1 <= min <= max"
-                )))
-            }
-            Some((lo, hi)) => Some(lo..=hi),
-            None => None,
-        };
+        let hidden_dim_pool = parse_range_pool("hidden_dim_pool", self.hidden_dim_pool)?;
+        let hidden_nodes_pool = parse_range_pool("hidden_nodes_pool", self.hidden_nodes_pool)?;
+        let hidden_inputs_pool = parse_range_pool("hidden_inputs_pool", self.hidden_inputs_pool)?;
+        let hidden_outputs_pool =
+            parse_range_pool("hidden_outputs_pool", self.hidden_outputs_pool)?;
+        // Outside 0..=1 a probability is not a probability; the crate would take
+        // it and train on nonsense, so the boundary is drawn here.
+        if !(0.0..=1.0).contains(&self.dropout_prob) {
+            return Err(PyValueError::new_err(format!(
+                "dropout_prob {}: expected 0.0 <= p <= 1.0",
+                self.dropout_prob
+            )));
+        }
+
+        // The crate owns the spelling of an op name too; letting IT reject a typo keeps
+        // the message and the accepted set identical between Rust and Python.
+        for op in &self.crossover_ops_pool {
+            CrossoverOp::try_from(op.as_str())
+                .map_err(|e| PyValueError::new_err(format!("crossover_ops_pool: {e}")))?;
+        }
 
         let mut cfg = gras::RaceConfig::defaults();
         cfg.pop_size = self.pop_size;
@@ -411,10 +532,33 @@ impl PyRaceConfig {
         cfg.crossover_cull_policy = crossover_cull_policy;
         cfg.mutation_cull_policy = mutation_cull_policy;
         cfg.crossover_selection = crossover_selection;
+        cfg.crossover_ops_pool = self.crossover_ops_pool;
+        cfg.checkpoint_every = self.checkpoint_every;
+        cfg.elite_checkpoint_weights = self.elite_checkpoint_weights;
+        cfg.mutation_probation_steps = self.mutation_probation_steps;
+        cfg.crossover_probation_steps = self.crossover_probation_steps;
+        cfg.elite_join_probation_steps = self.elite_join_probation_steps;
+        cfg.elite_crown_lifetime_steps = self.elite_crown_lifetime_steps;
         if let Some(pool) = hidden_dim_pool {
             cfg.hidden_dim_pool = Some(pool);
         }
         cfg.hidden_dim_stride = self.hidden_dim_stride;
+        // The node-count / fan-in / fan-out ranges live on `topology_options`, which
+        // the run header already records whole — so setting them here is enough for
+        // `engine.json` to describe the search space a run actually sampled.
+        if let Some(pool) = hidden_nodes_pool {
+            cfg.topology_options.min_hidden_num_nodes = *pool.start();
+            cfg.topology_options.max_hidden_num_nodes = *pool.end();
+        }
+        if let Some(pool) = hidden_inputs_pool {
+            cfg.topology_options.min_hidden_inputs_per_node = *pool.start();
+            cfg.topology_options.max_hidden_inputs_per_node = *pool.end();
+        }
+        if let Some(pool) = hidden_outputs_pool {
+            cfg.topology_options.min_hidden_outputs_per_node = *pool.start();
+            cfg.topology_options.max_hidden_outputs_per_node = *pool.end();
+        }
+        cfg.topology_options.dropout_prob = self.dropout_prob;
         cfg.activation_pool = self.activation_pool;
         cfg.combine_op_pool = self.combine_op_pool;
         cfg.standardize_op_pool = self.standardize_op_pool;
@@ -443,4 +587,3 @@ impl PyRaceConfig {
         Ok((cfg, verbosity))
     }
 }
-
