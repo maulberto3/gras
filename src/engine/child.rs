@@ -479,13 +479,46 @@ impl CoreEngine {
         /// Rebuild a net from its persisted `NetState` and replay steps `0..step`, asserting
         /// **metric parity** with the recorded `last_metrics` — resume = replay, fail loudly.
     pub(crate) fn replay_loaded_net(&mut self, state: NetState) -> Result<RaceChild> {
-        let clock = state
-            .last_metrics
-            .as_ref()
-            .map(|m| m.step)
-            .unwrap_or(state.step);
-        let recorded = state.last_metrics.clone();
-        let segments = replay_segments(&state);
+        self.replay_loaded_net_at(state, None)
+    }
+
+    /// Replay to `target` when the FRONTIER MANIFEST says the frontier was there,
+    /// regardless of how far the net's file has moved since.
+    ///
+    /// A file that has moved past the target is rewound with [`NetState::truncated_at`]
+    /// (ledgers clamped, reading dropped), so the replay reproduces the net AT the
+    /// tick; its `last_metrics` no longer describes that clock, so the parity assert is
+    /// skipped — the manifest is the authority, and the record we would compare against
+    /// is from a clock the snapshot never claimed.
+    pub(crate) fn replay_loaded_net_at(
+        &mut self,
+        state: NetState,
+        target: Option<usize>,
+    ) -> Result<RaceChild> {
+        let truncated = target.is_some();
+        let state = match target {
+            Some(target) => state.truncated_at(target),
+            None => state,
+        };
+        let clock = match (truncated, target) {
+            // A rewound record may have lost its reading, and `state.step` counts TRAINED
+            // clocks (a frozen crown trains less than it measures): the manifest's clock is
+            // the only correct target after a rewind.
+            (true, Some(target)) => target,
+            _ => state
+                .last_metrics
+                .as_ref()
+                .map(|m| m.step)
+                .unwrap_or(state.step),
+        };
+        // A truncated record has no reading for `clock`; `clock` is then the manifest's
+        // step, and the ledger (clamped above) is what plans the replay.
+        let recorded = state.last_metrics.clone().filter(|m| m.step == clock);
+        let segments = if truncated {
+            replay_segments_to(&state, clock)
+        } else {
+            replay_segments(&state)
+        };
         let mut child = self.build_child_from_state(state)?;
             // Replay the clocks this net ACTUALLY trained, not a naive `0..clock`: a mid-run
             // joiner never trains at its birth clock, while a founder trained every clock.
@@ -559,15 +592,15 @@ impl CoreEngine {
 /// A record whose ledgers do not close (written before the idle ledger existed, or an
 /// aborted write) falls back to the shape heuristic below, which infers the gaps from
 /// counts; `recorded = step + acts` and the gap tells the shape.
-fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
-    // No recorded clock at all (legacy/aborted nets): the pre-existing contiguous walk.
-    let Some(end) = state.last_metrics.as_ref().map(|m| m.step) else {
-        return if state.step > 0 {
-            vec![(0, state.step)]
-        } else {
-            Vec::new()
-        };
-    };
+///
+/// `end` is explicit so a record rewound to an earlier tick (frontier manifest) can be
+/// planned over the window the manifest claims, not over clocks the file reached later.
+fn replay_segments_to(state: &NetState, end: usize) -> Vec<(usize, usize)> {
+    // No recorded clock at all (legacy/aborted nets, or a record rewound to an
+    // earlier tick): the pre-existing contiguous walk.
+    if state.last_metrics.is_none() && state.measured_clocks() == 0 && end > 0 {
+        return vec![(0, end)];
+    }
     // Clocks with a recorded metrics row: trainings + act-and-measure acts.
     let recorded = state.measured_clocks();
         // A mid-run joiner sits its birth clock out (the group filters it), so its first
@@ -627,6 +660,17 @@ fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
         out.push((after, end + 1));
     }
     out
+}
+
+/// Plan the replay to the net's OWN recorded clock — the wrapper every caller but the
+/// frontier-manifest path uses.
+fn replay_segments(state: &NetState) -> Vec<(usize, usize)> {
+    let end = state
+        .last_metrics
+        .as_ref()
+        .map(|m| m.step)
+        .unwrap_or(state.step);
+    replay_segments_to(state, end)
 }
 
 /// How many clocks sit inside `frozen_spans` — the crown's act-and-measure passes. Shared
