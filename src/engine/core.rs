@@ -485,27 +485,11 @@ impl CoreEngine {
         // and flushes the buffered start-up block into it; the default closes that buffer.
         super::logging::settle_run_dir(&run_dir, config.trace_file);
 
-        // Seed the initial population internally — [imported champion?] + run-topologies +
-        // random draws — deduped and re-rolled so the population always lands at `pop_size`.
-        let run_topology_count = config.run_topologies.len();
-        let mut founders: Vec<crate::graph::topology::Topology> =
-            Vec::with_capacity(run_topology_count + 1);
+        // Seed the initial population internally — [imported elites?] + random draws —
+        // deduped and re-rolled so the population always lands at `pop_size`.
+        let mut founders: Vec<crate::graph::topology::Topology> = Vec::with_capacity(1);
         let mut seed_source: Option<crate::state::SeedSourceRecord> = None;
-        // Manual founders WIN: `set_run_topologies` is the user naming the batch, so the
-        // engine must not inject a net they did not ask for (or shift every ordinal).
-        let manual_founders = !config.run_topologies.is_empty();
-        if config.elite_previous_load && manual_founders {
-            // CFY + always-visible: the inheritance receipt is a table that must show at
-            // any log level (it is a fact about what the run INHERITED).
-            crate::utils::cfy::emit_always(&crate::utils::cfy::card(
-                "Inheritance",
-                &crate::utils::cfy::kv(&[(
-                    "founder blueprints".to_string(),
-                    config.run_topologies.len().to_string(),
-                )]),
-                Some("elite_previous_load skipped — manual founders win (set_run_topologies)"),
-            ));
-        } else if config.elite_previous_load {
+        if config.elite_previous_load {
             // The compatibility gate reads the candidate's engine.json header,
             // so this run's own header (mode, dims, trainer name) is the input.
             let trainer_name = header
@@ -599,7 +583,6 @@ impl CoreEngine {
                 }
             }
         }
-        founders.extend(config.run_topologies.clone());
         let initial_topologies =
             super::population::fill_unique(&config, run_seed, founders, config.pop_size);
         // Every seeded slot is labeled by origin, so `nets/*.json` and `attempts.csv` say
@@ -2719,11 +2702,14 @@ impl CoreEngine {
     /// Stamp the tombstone fields onto LIVE nets at stop: `final_fitness_mean`,
     /// `final_fitness_std`, `final_fitness_samples` from the net's race reading and
     /// `final_risk_score` from the FIT score it ranked by — the same three legs a
-    /// cull records. Without this a net still alive at stop carries `None`, and
-    /// [`crate::engine::population::run_topologies_from_run_dir`]'s seeding cannot
-    /// rank it (it would fall to file order). Called from [`Self::finish_race`]
-    /// BEFORE the frontier write, so one write carries the stamped fields;
-    /// durability ticks during the run stay unstamped (the fields mean "final").
+    /// cull records. Without this, a net still alive at stop carries `None` and
+    /// `nets/<hash>.json` mixes censored and complete records: a culled net could
+    /// be read back but a survivor could not, which is exactly backwards. The
+    /// fields mean "final", so they are stamped at stop, not at durability ticks.
+    /// Called from [`Self::finish_race`] BEFORE the frontier write, so one write
+    /// carries them. This is now a record rather than an input: the only reader
+    /// that ever ranked by it (`run_topologies_from_run_dir`) was retired with
+    /// `set_run_topologies`, and founder batches come from `elite_previous_load`.
     pub(crate) fn stamp_live_final_scores(&mut self) {
         for h in self.state.live_hashes() {
             let reading = self.race_reading_of(&h);
@@ -6618,68 +6604,6 @@ mod tests {
     // ── Founder topologies ──────────────────────────────────────────────
 
     #[test]
-    fn founders_fill_slots_first_and_random_fills_the_rest() {
-        let dir = std::env::temp_dir().join("gras-runtopos-mix");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut eng = engine(&dir, 7).unwrap();
-        eng.config.pop_size = 3;
-        eng.config.run_topologies = vec![tiny_topology(101), tiny_topology(102)];
-        // Rebuild the population the way from_spec mixes founders: founders
-        // first, random batch after, truncated to pop_size.
-        let random_batch =
-            crate::engine::population::initial_population(&eng.config, eng.run_seed());
-        let mut mixed = eng.config.run_topologies.clone();
-        mixed.extend(random_batch);
-        mixed.truncate(eng.config.pop_size);
-        eng.seed_population_internal(mixed, Some(0.5)).unwrap();
-        assert_eq!(eng.state.live_count(), 3);
-        // The first two slots carry the founders' exact topology JSON.
-        let founder_json: Vec<String> = eng
-            .config
-            .run_topologies
-            .iter()
-            .map(|t| t.to_json().unwrap())
-            .collect();
-        let live: Vec<String> = eng
-            .state
-            .live_hashes()
-            .iter()
-            .filter_map(|h| eng.state.net(h).map(|s| s.topology.clone()))
-            .collect();
-        assert!(
-            live.contains(&founder_json[0]) && live.contains(&founder_json[1]),
-            "both founder blueprints must be in the population"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn run_topology_count_is_recorded_in_engine_json() {
-        let dir = std::env::temp_dir().join("gras-runtopos-count");
-        let _ = std::fs::remove_dir_all(&dir);
-        let data_dir = tiny_dataset_dir("runtopos-count");
-        let config = RaceConfig {
-            run_topologies: vec![tiny_topology(11)],
-            ..RaceConfig::defaults()
-        };
-        let eng =
-            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
-                data_dir,
-                config,
-                fitness(),
-                crate::trainer::TabularTrainer::new(loss_fn()),
-                Some(7),
-                Some(dir.clone()),
-            ))
-            .unwrap();
-        let header = crate::state::load_engine_json(&dir).unwrap();
-        assert_eq!(header.config.run_topology_count, 1);
-        // Founder labels: the ordinal order of seeding is founders-first.
-        assert_eq!(eng.step_clock(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn founder_topology_loader_reads_netstate_json() {
         // Round-trip: a net state written by the engine's own persistence
         // must be loadable back as a founder blueprint.
@@ -6702,9 +6626,6 @@ mod tests {
             tiny_topology(7).to_json().unwrap(),
             "loader must reproduce the exact blueprint"
         );
-        // Run-dir loader: one ranked founder from the same run.
-        let found = crate::engine::population::run_topologies_from_run_dir(&dir, 1).unwrap();
-        assert_eq!(found.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6799,8 +6720,7 @@ mod tests {
         let origin = eng.state.net(&seeded[0]).unwrap().created_from.clone();
         assert_eq!(origin.as_deref(), Some("seed:1000:feedface"));
 
-        // 3. Receipt: the header names the inherited experiment, and the run-topology
-        //    count stays user-only (the import is not a `run_topologies` entry).
+        // 3. Receipt: the header names the inherited experiment.
         let header = crate::state::load_engine_json(&dir).unwrap();
         let source = header
             .run_topology_source
@@ -6809,7 +6729,6 @@ mod tests {
         assert_eq!(source.champion_hash, "feedfacefeedface");
         assert_eq!(source.champion_params, Some(4242));
         assert_eq!(source.guardrail_mean, Some(0.30));
-        assert_eq!(header.config.run_topology_count, 0);
         assert!(header.config.elite_previous_load);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -7025,72 +6944,6 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// `set_run_topologies` takes precedence: no extra net is injected above the
-    /// user's list, ordinals do not shift, and nothing is recorded as inherited.
-    #[test]
-    fn manual_founders_win_over_the_previous_run_seed() {
-        let prior = std::env::temp_dir().join("gras-seedprior-manual");
-        let _ = std::fs::remove_dir_all(&prior);
-        std::fs::create_dir_all(&prior).unwrap();
-        let champion = write_prior_run(&prior.join("1000"), "1000", true);
-
-        let dir = std::env::temp_dir().join("gras-seedprior-manual-run");
-        let _ = std::fs::remove_dir_all(&dir);
-        let data_dir = tiny_dataset_dir("seeded-manual");
-        let manual = tiny_topology(11);
-        let config = RaceConfig {
-            pop_size: 3,
-            elite_previous_load: true,
-            elite_previous_dir: Some(prior.clone()),
-            run_topologies: vec![manual.clone()],
-            ..RaceConfig::defaults()
-        };
-        let eng =
-            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
-                data_dir,
-                config,
-                fitness(),
-                crate::trainer::TabularTrainer::new(loss_fn()),
-                Some(7),
-                Some(dir.clone()),
-            ))
-            .unwrap();
-
-        assert_eq!(eng.state.live_count(), 3, "the batch stays pop_size strong");
-        let contains = |topo: &Topology| {
-            let json = topo.to_json().unwrap();
-            eng.state.live_hashes().iter().any(|h| {
-                eng.state
-                    .net(h)
-                    .map(|s| s.topology == json)
-                    .unwrap_or(false)
-            })
-        };
-        assert!(
-            contains(&manual),
-            "the manual blueprint must be in the batch"
-        );
-        assert!(
-            !contains(&champion),
-            "the auto seed must NOT be injected when founders are named manually"
-        );
-        assert!(
-            crate::state::load_engine_json(&dir)
-                .unwrap()
-                .run_topology_source
-                .is_none(),
-            "a skipped auto seed must not be recorded as an inheritance"
-        );
-        // The manual blueprint is slot 0 / `founder-0`, unshifted.
-        assert_eq!(
-            eng.champions.len(),
-            0,
-            "no champions recorded before any step"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&prior);
     }
 
     /// Inheritance is AUTOMATIC and ON by default: an unconfigured run looks for a
