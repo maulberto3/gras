@@ -1,83 +1,74 @@
+# ── Build output ────────────────────────────────────────────────────────────
 /target
 /target_cpu
 /target_cuda
-/libtorch
-/saved
-1789787353879/
+dist/
+__pycache__/
 .vscode
+
+# The extension module is BUILD output: `maturin develop` writes a `.so` tagged
+# with the platform AND the interpreter (cpython-312-x86_64-linux-gnu), so a
+# tracked one is one machine's binary shipped to everyone else — and every
+# rebuild is a 42 MB diff. Build it locally; it is never source.
+python/gras/*.so
+python/gras/*.pyd
+
+# ── Vendored libtorch, datasets and saved models ────────────────────────────
+/libtorch
 *.safetensors*
+/data
+assets/
+/saved
+saved/
+
+# ── Run output and scratch dirs ─────────────────────────────────────────────
+results/
+logs/
+trash/
+/examples/*/run/
+/benches/*/run/
+proptest-regressions/
+
+# ── Profiling intermediates (written to cwd by cargo flamegraph / benches) ──
+/flamegraph.svg
+/perf.data
+/perf.data.old
+/dhat-heap.json
+
+# ── Local-only docs and agent context ───────────────────────────────────────
+# Tracked docs describe the code; this is the local shelf around it. `/notes/`
+# holds the explainers, design plans and measurements, indexed by
+# `notes/README.md`. Ignore rules never affect an already-tracked file.
+/notes/
+AGENTS.md
+ARCHITECTURE.md
+CONVENTIONS.md
+TODO.md
+DONE.md
 GEMINI.md
 NOTES.md
 NAS_GUIDE.md
 WORKFLOW.md
 PROD_REFACTOR_WINS.md
 RACE_REVAMP.md
-assets/
-/data
-logs/
-TODO.md
-DONE.md
-logs/*
-saved/
+.agents/
+.serena/
 
-results/
-
-# example run output (datasets live in the ignored /data root above)
-/examples/*/run/
-
-# bench scratch dirs — the benches delete and recreate these on every run
-/benches/*/run/
-
-# dhat's default heap dump, written to cwd by `cargo bench --bench memgraph`
-/dhat-heap.json
-
-trash/
-proptest-regressions/
-proptest-regressions/topology.txt
-
-# flamegraph output (cargo flamegraph writes to cwd by default)
-/flamegraph.svg
-
-# perf intermediates from cargo flamegraph (written in cwd)
-/perf.data
-/perf.data.old
-
-# Untracked user-specific files
-kaggle_guide.rs
-
+# ── Local scratch files and stale run dirs ──────────────────────────────────
 Makefile
+kaggle_guide.rs
 kaggle_ev_s6e9.rs
 examples/main.rs
-
-# agent-facing notes (the AGENTS/ARCHITECTURE/CONVENTIONS split) — local, not shipped
-AGENTS.md
-ARCHITECTURE.md
-CONVENTIONS.md
-
-# The local reading shelf: explainers, design plans and measurements that are
-# NOT shipped and must not turn up in `git status` or ride into a commit via
-# `git add -A`. Tracked docs describe the code; anything in here is the context
-# around it. `notes/README.md` indexes the shelf.
-/notes/
-
-__pycache__/
-
-# `uv build` output
-dist/
-
+1789787353879/
 1789503022765/
 
-# Only the canonical examples are tracked. Anything else under examples/ is a
-# local scratch checkout — the bridge/smart-buildings/kagiculture examples that
-# lived here moved to the sibling `kaggle_exper` repo. Re-included below: the
-# examples that are already tracked, so none of them becomes invisible to
-# `git status` by this rule.
+# ── Only the canonical examples are tracked ─────────────────────────────────
+# Anything else under examples/ is a local scratch checkout — the
+# bridge/smart-buildings/kagiculture examples moved to the sibling
+# `kaggle_exper` repo. The re-includes keep the tracked examples visible to
+# `git status`, so they must stay AFTER `/examples/*`.
 /examples/*
 !/examples/cartpole/
 !/examples/cartpole.rs
 !/examples/mnist.rs
 !/examples/python/
-
-.serena/
-
-.agents/
