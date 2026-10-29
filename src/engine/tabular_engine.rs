@@ -120,8 +120,8 @@ impl TabularEngine {
             }
         }
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume")?;
-        // A hard kill can leave CSV rows for clocks the last checkpoint never reached
-        // (`history_flush_each` writes per clock, the frontier per interval). Rewind to the
+        // A legacy dir can hold CSV rows for clocks the last checkpoint never reached
+        // (pre-R3 runs flushed per clock, the frontier per interval). Rewind to the
         // frontier BEFORE anything reads the windows or appends to the files — otherwise
         // the resumed run re-emits rows that are already on disk.
         CoreEngine::rewind_csvs_to_manifest(&run_dir)?;
@@ -164,10 +164,27 @@ impl TabularEngine {
         };
         // Resume is Tabular-only today (a persisted run carries a dataset);
         // both fields are wrapped in Some to satisfy the Option'd struct.
+        // R3b: the EVAL ERA comes from the record, not from this call's cadence. The
+        // caller's `checkpoint_every` decides only how often the durability tick fires;
+        // deriving the era from it would rotate the eval permutation at different clocks
+        // than the first half of the run did, and every parity assertion after that would
+        // be measuring a different experiment. Legacy dirs (no recorded era) fall back to
+        // the caller's value — what those runs used for both roles.
+        let eval_era_every = header.eval_era_every.unwrap_or(config.checkpoint_every);
+        if header
+            .eval_era_every
+            .is_some_and(|recorded| recorded != config.checkpoint_every)
+        {
+            tracing::info!(
+                "resume: eval-permutation era from the record = {eval_era_every} clock(s); \
+                 this call's checkpoint_every is {} (the tick cadence, not the era)",
+                config.checkpoint_every
+            );
+        }
         let stream = Some(
             BatchStream::new(run_seed, batch_size, split)
                 .with_eval_batch_size(eval_batch_size)
-                .with_checkpoint_every(config.checkpoint_every),
+                .with_checkpoint_every(eval_era_every),
         );
         let dataset = Some(dataset);
 
