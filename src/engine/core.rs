@@ -1793,7 +1793,11 @@ impl CoreEngine {
             // (no tick, no era rotation) and `clock % 0` would panic.
             if self.config.checkpoint_every > 0 && clock > 0 && clock % self.config.checkpoint_every == 0
             {
-                // Snapshot the live frontier so a hard kill loses at most one tick.
+                // Snapshot the live frontier. NOTE: this is not a point-in-time SET — a
+                // net culled after this tick overwrites its own file with a tombstone, so a
+                // hard kill can leave a frontier that no longer resumes (measured: 2 live of
+                // 8, refused as a pop_size mismatch). notes/RESUME.md §4 has the numbers and
+                // §6 the fix (an atomic `ckpt.json` manifest).
                 if let Err(e) = self.write_live_frontier_states() {
                     tracing::warn!("checkpoint live states write failed: {e}");
                 }
