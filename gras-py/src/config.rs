@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use gras::engine::config::{
-    CrossoverOp, DEFAULT_CHECKPOINT_EVERY, DEFAULT_GUARDRAIL_MATCHES, SMOOTHING_WINDOW,
+    CrossoverOp, DEFAULT_CHECKPOINT_EVERY, SMOOTHING_WINDOW,
 };
 use gras::evolution::selection::SelectionMethod;
 use gras::graph::topology::FeatureSplitPolicy;
@@ -193,8 +193,7 @@ pub struct PyRaceConfig {
     #[pyo3(get, set)]
     pub run_name: Option<String>,
 
-    // ── run-to-run inheritance + guardrail ──────────────────────────────
-    /// Load the newest compatible previous run's guardrail elites as topologies.
+    /// Load the newest compatible previous run's final-table elites as topologies.
     /// **Off here, unlike the crate** (`true`), so a Python run is all-random
     /// unless the caller asks: the crate's default looks in `results/` relative
     /// to the cwd, which for a notebook is whatever the kernel was started in.
@@ -203,9 +202,6 @@ pub struct PyRaceConfig {
     /// Where `elite_previous_load` looks: a run dir or a dir of run dirs.
     #[pyo3(get, set)]
     pub elite_previous_dir: Option<PathBuf>,
-    /// Fresh holdout games the post-race guardrail plays per elite; `0` skips it.
-    #[pyo3(get, set)]
-    pub guardrail_matches: usize,
 }
 
 #[pymethods]
@@ -255,9 +251,7 @@ impl PyRaceConfig {
         elite_save_topology = true,
         worst_save_topology = false,
         run_name = None,
-        // inheritance + guardrail
         elite_previous_dir = None,
-        guardrail_matches = DEFAULT_GUARDRAIL_MATCHES,
     ))]
     // A config's kwargs ARE its API: bundling them into an object would buy the
     // lint nothing and cost the caller a line per knob. Explicitly out of scope
@@ -303,7 +297,6 @@ impl PyRaceConfig {
         worst_save_topology: bool,
         run_name: Option<String>,
         elite_previous_dir: Option<PathBuf>,
-        guardrail_matches: usize,
     ) -> Self {
         Self {
             pop_size,
@@ -349,7 +342,6 @@ impl PyRaceConfig {
             worst_save_topology,
             run_name,
             elite_previous_dir,
-            guardrail_matches,
         }
     }
 
@@ -545,7 +537,6 @@ impl PyRaceConfig {
         cfg.worst_save_topology = self.worst_save_topology;
         cfg.run_name = self.run_name;
         cfg.elite_previous_dir = self.elite_previous_dir;
-        cfg.guardrail_matches = self.guardrail_matches;
 
         // The crate resolves pool names; let IT name a typo, so the message and
         // the accepted set are the ones the engine would have used. (Left to the
