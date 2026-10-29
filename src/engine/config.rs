@@ -40,9 +40,6 @@ pub const DEFAULT_CHECKPOINT_EVERY: usize = 10;
 // (the reference trainer and the example both do), so it belongs below both
 // layers rather than in the engine's config surface.
 
-/// Default number of fresh holdout games the post-race guardrail plays PER ELITE
-/// ([`RaceConfigBuilder::set_elite_guardrail_matches`]).
-pub const DEFAULT_GUARDRAIL_MATCHES: usize = 16;
 
 /// Per-step log verbosity for the race engine.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -347,11 +344,6 @@ pub struct RaceConfig {
         /// Elite crown lifetime: a net on the frozen crown is culled out after
         /// `elite_crown_lifetime_steps` clocks. Default `5`; zero = permanent until rank moves.
     pub elite_crown_lifetime_steps: usize,
-        /// Fresh holdout games the post-race guardrail plays PER ELITE (`elite_count` nets
-        /// take the exam, so the cost is `elite_count × guardrail_matches` games).
-        /// Diagnostic only — never touches a step's dynamics. **`0` = skip the exam**
-        /// (no games, no verdict recorded). Default [`DEFAULT_GUARDRAIL_MATCHES`].
-    pub guardrail_matches: usize,
 }
 
 // `run_progress` and `DEFAULT_LR` live in `crate::utils::training` — the run
@@ -541,7 +533,6 @@ impl RaceConfig {
             elite_previous_dir: None,
             mutation_probation_steps: 5,
             crossover_probation_steps: 5,
-            guardrail_matches: DEFAULT_GUARDRAIL_MATCHES,
         }
     }
 
@@ -911,18 +902,6 @@ impl RaceConfigBuilder {
         /// age-elimination. Default `5`.
     pub fn set_elite_crown_lifetime_steps(mut self, k: usize) -> Self {
         self.cfg.elite_crown_lifetime_steps = k;
-        self
-    }
-        /// Fresh holdout games the post-race guardrail plays per elite
-        /// ([`DEFAULT_GUARDRAIL_MATCHES`] = 16; every elite takes the exam, so the run plays
-        /// `elite_count × n` games). Diagnostic only. (Challenges moved to the TRAINER
-        /// side — roll `trainer::challenge_fires`.)
-        /// **`0` = skip the exam entirely**: no holdout game is played, no verdict is recorded,
-        /// and `engine.guardrail(..)` returns `None`. Nothing else changes — the run still ranks,
-        /// stops and writes its artifacts, and the next run still inherits via `elites.json`
-        /// (which never depended on the verdict).
-    pub fn set_elite_guardrail_matches(mut self, n: usize) -> Self {
-        self.cfg.guardrail_matches = n;
         self
     }
     /// At stop, save the elite's topology markdown (`elite-<hash>.md`).
