@@ -313,23 +313,14 @@ pub struct RaceConfig {
         /// AND SCORED on — an idle lottery clock has nothing to record) and `attempts.csv`
         /// (per evolution attempt) — separate files, separate headers. No `options.csv`.
     pub csv_export: bool,
-        /// Flush `history.csv` after EVERY step instead of at checkpoint/stop boundaries.
-        /// Default false; true = zero-loss history at a file write per step.
-    pub history_flush_each: bool,
     /// At stop, save the elite's topology markdown (`elite-<hash>.md`).
     /// Default true — the champion's blueprint is the run's headline artifact.
     pub elite_save_topology: bool,
-    /// At stop, save the elite's weights as safetensors
-    /// (`elite-<hash>.safetensors`). Default true.
-    pub elite_save_safetensors: bool,
         /// At stop, additionally save the `elite_count` WORST live nets' topology markdown
         /// (`worst-<hash>.md`, one per net). Default false — the anti-champion is a
         /// debugging artifact. The COUNT is `elite_count`: [elite_count] is how many the
         /// elite writers keep, so both ends of the ranking save the same number of nets.
     pub worst_save_topology: bool,
-    /// At stop, additionally save those same worst nets' weights
-    /// (`worst-<hash>.safetensors`, one per net, `elite_count` of them). Default false.
-    pub worst_save_safetensors: bool,
         /// Human label for the experiment, recorded verbatim in `engine.json` as
         /// `"run_name"`. Informational — does not affect the results folder name.
     pub run_name: Option<String>,
@@ -342,11 +333,6 @@ pub struct RaceConfig {
         /// Where `elite_previous_load` looks: a run dir or a dir of run dirs (newest run id
         /// wins). `None` ⇒ the default `results/` folder.
     pub elite_previous_dir: Option<std::path::PathBuf>,
-        /// Per-checkpoint elite weight snapshot (`checkpoint-elite-<hash>.safetensors`,
-        /// overwritten each checkpoint). Default true — a hard kill loses at most one
-        /// interval of READINGS, and the champion's weights survive it. It is not a
-        /// resume checkpoint: nothing reads these files back (see notes/RESUME.md §3-5).
-    pub elite_checkpoint_weights: bool,
         /// Mutation probation: a random immigrant is cull-IMMUNE for its first
         /// `mutation_probation_steps` clocks. Default 5 (set in `defaults()`);
         /// `0` = only the empty-buffer step-0 immunity.
@@ -548,15 +534,11 @@ impl RaceConfig {
             trace_file: false,
             mode: RunMode::Tabular,
             csv_export: true,
-            history_flush_each: false,
             elite_save_topology: true,
-            elite_save_safetensors: true,
             worst_save_topology: false,
-            worst_save_safetensors: false,
             run_name: None,
             elite_previous_load: true,
             elite_previous_dir: None,
-            elite_checkpoint_weights: true,
             mutation_probation_steps: 5,
             crossover_probation_steps: 5,
             guardrail_matches: DEFAULT_GUARDRAIL_MATCHES,
@@ -625,17 +607,6 @@ impl RaceConfigBuilder {
         /// land, so a 0-cadence run is still a complete run.
     pub fn set_run_checkpoint_every(mut self, n: usize) -> Self {
         self.cfg.checkpoint_every = n;
-        self
-    }
-        /// Flush `history.csv` / `attempts.csv` on every clock instead of only at the
-        /// checkpoint tick (`set_run_checkpoint_every`). Durability cadence, not replay
-        /// semantics: default `false` loses at most `checkpoint_every` clocks of history
-        /// to a `kill -9`, `true` loses none and pays one file write per clock.
-        ///
-        /// It was an engine field with no setter (and an example flag the overlay
-        /// parsed and dropped), so "flush every step" was unreachable from the builder.
-    pub fn set_run_history_flush_each(mut self, each: bool) -> Self {
-        self.cfg.history_flush_each = each;
         self
     }
     /// Set crossover rolls per step.
@@ -918,31 +889,6 @@ impl RaceConfigBuilder {
         self.cfg.elite_previous_dir = Some(dir.into());
         self
     }
-    /// Per-checkpoint elite weight snapshot (overwritten each checkpoint). Default true —
-    /// pass false to only write weights at stop.
-    ///
-    /// Writes `checkpoint-elite-<hash>.safetensors` for the top-`elite_count` nets
-    /// once per durability tick ([`Self::set_run_checkpoint_every`]); with
-    /// `checkpoint_every = 0` there is no tick, so no snapshot either. Every write
-    /// overwrites the previous one — latest wins.
-    ///
-    /// **Independent of the stop export.** This flag alone decides the checkpoint
-    /// file; it never consults [`Self::set_elite_save_safetensors`]. The four
-    /// combinations a caller has to be able to reason about:
-    ///
-    /// | `save_safetensors` | `checkpoint_weights` | What lands on disk |
-    /// |---|---|---|
-    /// | `true` | `true` | Weights at every checkpoint (`checkpoint-elite-<hash>.safetensors`, overwritten) **and** at stop (`elite-<hash>.safetensors`) — full durability |
-    /// | `true` | `false` | Weights only at stop — a `kill -9` mid-run loses ALL weights |
-    /// | `false` | `true` | Checkpoint weights exist, no stop export — the stop-time `elite-<hash>.safetensors` is simply absent, so the checkpoint file is the only weights on disk |
-    /// | `false` | `false` | No weights anywhere — a topology-only run (no weight file to load later; nothing in the engine reads one today) |
-    ///
-    /// Neither flag touches the guardrail: it scores the LIVE champion in memory,
-    /// never a safetensors file. (cartpole runs the last case.)
-    pub fn set_elite_checkpoint_weights(mut self, enabled: bool) -> Self {
-        self.cfg.elite_checkpoint_weights = enabled;
-        self
-    }
     /// Mutation probation steps: cull-immunity for a random immigrant's first
     /// `k` clocks (see [`RaceConfig::mutation_probation_steps`]). Default 5.
     pub fn set_mutation_probation_steps(mut self, k: usize) -> Self {
@@ -985,41 +931,12 @@ impl RaceConfigBuilder {
         self.cfg.elite_save_topology = enabled;
         self
     }
-    /// At stop, save the elite's weights as safetensors
-    /// (`elite-<hash>.safetensors`). Default true.
-    ///
-    /// **STOP artifact, not a checkpoint one.** This flag and
-    /// [`Self::set_elite_checkpoint_weights`] look alike but answer different
-    /// questions — weights at the end of the run vs weights at every durability
-    /// tick — and they are independent: a checkpoint snapshot is written even when
-    /// this flag is `false`. The four combinations:
-    ///
-    /// | this flag | `checkpoint_weights` | What lands on disk |
-    /// |---|---|---|
-    /// | `true` | `true` | Weights at every checkpoint (`checkpoint-elite-<hash>.safetensors`, overwritten) **and** at stop (`elite-<hash>.safetensors`) — full durability |
-    /// | `true` | `false` | Weights only at stop — a `kill -9` mid-run loses ALL weights |
-    /// | `false` | `true` | Checkpoint weights exist, no stop export — the stop-time `elite-<hash>.safetensors` is simply absent, so the checkpoint file is the only weights on disk |
-    /// | `false` | `false` | No weights anywhere — a topology-only run (no weight file to load later; nothing in the engine reads one today) |
-    ///
-    /// Neither flag touches the guardrail: it scores the LIVE champion in memory,
-    /// never a safetensors file. (cartpole runs the last case.)
-    pub fn set_elite_save_safetensors(mut self, enabled: bool) -> Self {
-        self.cfg.elite_save_safetensors = enabled;
-        self
-    }
         /// At stop, ALSO save the `elite_count` WORST live nets' topology markdown, one
         /// `worst-<hash>.md` per net. Useful for diffing what the search avoided. Default
         /// false. The count mirrors `set_elite_count` (both ends of the ranking keep the
         /// same number of nets), and no net is saved as both an elite and a worst.
     pub fn set_worst_save_topology(mut self, enabled: bool) -> Self {
         self.cfg.worst_save_topology = enabled;
-        self
-    }
-    /// At stop, ALSO save those same worst nets' weights as safetensors
-    /// (`worst-<hash>.safetensors`, `elite_count` of them). Default false. Like
-    /// [`RaceConfigBuilder::set_worst_save_topology`] the count is `elite_count`.
-    pub fn set_worst_save_safetensors(mut self, enabled: bool) -> Self {
-        self.cfg.worst_save_safetensors = enabled;
         self
     }
     /// Finish and return the configured [`RaceConfig`].
