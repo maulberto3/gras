@@ -14,9 +14,9 @@
 //!
 //! WHICH elites: the source run writes `elites.json` at stop
 //! (`write_elite_index`) — `[{rank, hash, fitness, params, born}]`, best first,
-//! k = its `elite_count`. That is the list this module reads. A source that
-//! predates the file (or wrote an empty one) falls back to the single
-//! guardrail-certified champion, which is exactly the old behavior.
+//! k = its `elite_count`. That list IS the final table, ranked by the
+//! risk-adjusted fitness the run itself printed, so there is no second exam
+//! between "the table says rank 1" and "this run inherits rank 1".
 //!
 //! Resolution (deterministic, and every failure is survivable):
 //! 1. root = `set_elite_previous_dir(path)`, else [`DEFAULT_RESULTS_ROOT`].
@@ -25,7 +25,7 @@
 //!    `run_id` prefix, so both the timestamped `results/<id>` layout and the
 //!    archived `assets/<id>_<label>` layout order correctly. The RUN'S OWN
 //!    directory is excluded: its header is written before the lookup happens,
-//!    so without the exclusion every run would "find" itself (empty guardrail)
+//!    so without the exclusion every run would "find" itself (empty table)
 //!    and never inherit anything.
 //! 2. a compatibility gate read from the candidate's `engine.json` header
 //!    ALONE (no net is loaded to decide it): same `engine_mode`, same
@@ -33,16 +33,14 @@
 //!    declare one (`engine.json` → `trainer.trainer`). Mode + dims alone can't
 //!    separate two environments that happen to share dims while measuring
 //!    different units (survival turns vs solve score).
-//! 3. the GUARDRAIL gate: the header's `guardrail` block must exist (the run
-//!    had a champion the holdout certified). Rank 1 is that champion, so a run
-//!    whose champion was never verified inherits nothing at all — the gate is
-//!    about the source run's honesty, not about which net it ranked first.
-//! 4. the ranked list is then read from `elites.json` (fallback: the champion
-//!    alone), and each entry's topology from `nets/<hash>.json`.
+//! 3. the ranked list is read from `elites.json` — the source's FINAL TABLE,
+//!    in the risk-adjusted-fitness order it printed. Rank 1 is the net that table
+//!    called best; the table is the verdict, so there is no separate exam.
+//! 4. each entry's topology comes from `nets/<hash>.json`.
 //!
-//! There is deliberately NO fallback chain: "no guardrail champion" means
-//! "nothing here was proven", not "use the runner-up". The caller prints the
-//! reason and runs with an all-random population.
+//! There is deliberately NO fallback chain: a source with no `elites.json`
+//! inherits nothing at all. The caller prints the reason and runs with an
+//! all-random population.
 
 use std::path::{Path, PathBuf};
 
@@ -62,13 +60,10 @@ pub struct SeedPick {
     pub source_run_id: String,
     /// The directory the source was read from.
     pub source_dir: PathBuf,
-    /// Full hash of the net at this rank (rank 1 = the certified champion).
+    /// Full hash of the net at this rank (rank 1 = the source table's best).
     pub champion_hash: String,
     /// Its parameter count (the ranking tie-break key).
     pub champion_params: Option<i64>,
-    /// Its holdout mean, carried for the record's readability. Only the
-    /// rank-1 pick has one (only the champion was holdout-scored).
-    pub guardrail_mean: Option<f32>,
     /// The blueprint to seed into this rank's slot.
     pub topology: Topology,
 }
@@ -192,23 +187,19 @@ pub fn resolve_plan(
             ));
         }
     }
-    // ── 3. the guardrail champion ──────────────────────────────────────────
-    let Some(record) = header.guardrail.as_ref() else {
-        return SeedOutcome::Skipped(format!(
-            "run {source_run_id} has no recorded guardrail champion (its guardrail was skipped, \
-             or it predates the record)"
-        ));
-    };
-    if record.champion_hash.is_empty() {
-        return SeedOutcome::Skipped(format!(
-            "run {source_run_id} recorded an empty guardrail champion hash"
-        ));
-    }
-        // ── 4. the ranked list: `elites.json`, else the champion alone ─────────
-        // The champion stays rank 1 either way, so old and new sources agree.
+    // ── 3. the ranked list: the source's FINAL TABLE ───────────────────────
+    // `elites.json` is written at stop in risk-adjusted-fitness order — the same
+    // ranking the `Final field` card printed. There is no certification step: the
+    // table IS the verdict, so rank 1 here is the net the source run itself called
+    // best, and the new run inherits exactly what that table listed.
     let ranked: Vec<(usize, String)> = match read_elite_index(dir) {
         Some(entries) if !entries.is_empty() => entries,
-        _ => vec![(1, record.champion_hash.clone())],
+        _ => {
+            return SeedOutcome::Skipped(format!(
+                "run {source_run_id} has no elites.json (its final table was not recorded, or it \
+                 predates the index)"
+            ))
+        }
     };
     let cap = max_seeds.max(1);
     let mut picks: Vec<SeedPick> = Vec::new();
@@ -245,10 +236,9 @@ pub fn resolve_plan(
             source_run_id: source_run_id.clone(),
             source_dir: dir.clone(),
             champion_hash: hash,
-            // Only the certified champion carries a holdout mean and the
-            // champion's param count; the rest are the source's own ranking.
-            champion_params: (rank == 1).then_some(record.champion_params).flatten(),
-            guardrail_mean: (rank == 1).then_some(record.holdout_mean).flatten(),
+            // The parameter count stays a record-only field; the ranking itself is
+            // the source's own table order (no second measurement exists any more).
+            champion_params: None,
             topology,
         });
     }
@@ -398,13 +388,7 @@ mod tests {
 
         /// Write a minimal but realistic prior-run directory: an `engine.json`
         /// header, a `nets/<hash>.json` state carrying the blueprint.
-    fn write_run(
-        dir: &Path,
-        run_id: &str,
-        mode: &str,
-        trainer: &str,
-        with_guardrail: bool,
-    ) -> Topology {
+    fn write_run(dir: &Path, run_id: &str, mode: &str, trainer: &str, with_index: bool) -> Topology {
         std::fs::create_dir_all(dir.join("nets")).unwrap();
         let topo = toy_topology();
         let hash = "abcd1234abcd1234";
@@ -425,16 +409,15 @@ mod tests {
             "config": { "mode": mode },
             "trainer": { "trainer": trainer },
         });
-        if with_guardrail {
-            header["guardrail"] = serde_json::json!({
-                "champion_hash": hash,
-                "champion_params": 123,
-                "race_smoothed": 0.25,
-                "holdout_mean": 0.30,
-                "holdout_std": 0.01,
-                "matches_scored": 100,
-                "verdict": "consistent with the race signal ✅",
-            });
+        if with_index {
+            // The FINAL TABLE is what inheritance reads now: rank 1 is the net the
+            // source run's own `Final field` card printed first.
+            std::fs::write(
+                dir.join("elites.json"),
+                serde_json::json!([{ "rank": 1, "hash": hash, "fitness": 0.25, "params": 123 }])
+                    .to_string(),
+            )
+            .unwrap();
         }
         std::fs::write(dir.join("engine.json"), header.to_string()).unwrap();
         topo
@@ -457,12 +440,12 @@ mod tests {
         let out = resolve(Some(&root), None, "tabular", 2, 2, Some("toy"));
         let plan = out.seeded().expect("newest run dir must be picked");
         assert_eq!(plan.source_run_id, "2000_labelled");
-        assert_eq!(plan.picks.len(), 1, "no index ⇒ the champion alone");
+        assert_eq!(plan.picks.len(), 1, "a one-entry final table ⇒ one pick");
         let pick = plan.champion();
         assert_eq!(pick.rank, 1);
         assert_eq!(pick.champion_hash, "abcd1234abcd1234");
-        assert_eq!(pick.champion_params, Some(123));
-        assert_eq!(pick.guardrail_mean, Some(0.30));
+        // `elites.json` carries rank + hash; the parameter count is not read back.
+        assert_eq!(pick.champion_params, None);
     }
 
     #[test]
@@ -518,17 +501,14 @@ mod tests {
     }
 
     #[test]
-    fn no_guardrail_record_is_skipped() {
-        let root = tmp("no-guardrail");
+    fn a_source_without_a_final_table_is_skipped() {
+        let root = tmp("no-elite-index");
         write_run(&root.join("1000"), "1000", "tabular", "toy", false);
         let reason = match resolve(Some(&root), None, "tabular", 2, 2, Some("toy")) {
             SeedOutcome::Skipped(r) => r,
-            SeedOutcome::Seeded(_) => panic!("a run with no guardrail champion must be skipped"),
+            SeedOutcome::Seeded(_) => panic!("a run with no elites.json must be skipped"),
         };
-        assert!(
-            reason.contains("no recorded guardrail champion"),
-            "{reason}"
-        );
+        assert!(reason.contains("no elites.json"), "{reason}");
     }
 
     #[test]
@@ -566,7 +546,7 @@ mod tests {
         let root = tmp("self-exclude");
         // Older, usable prior run…
         write_run(&root.join("1000"), "1000", "tabular", "toy", true);
-        // …and the current run, newest, with no guardrail yet.
+        // …and the current run, newest, with no final table yet.
         let current = root.join("2000");
         write_run(&current, "2000", "tabular", "toy", false);
         let out = resolve(Some(&root), Some(&current), "tabular", 2, 2, Some("toy"));
@@ -657,10 +637,6 @@ mod tests {
                 .map(|p| p.champion_hash.as_str())
                 .collect::<Vec<_>>(),
             vec!["abcd1234abcd1234", extra[0].1, extra[1].1]
-        );
-        assert!(
-            plan.picks[1].guardrail_mean.is_none(),
-            "only rank 1 is certified"
         );
         assert_eq!(
             plan.picks[1].topology.options.topology_seed, 11,
