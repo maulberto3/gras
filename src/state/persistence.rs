@@ -149,9 +149,6 @@ pub struct ConfigSnapshot {
         /// drawn, so a finished run can say what produced it.
     #[serde(default)]
     pub feature_split: Option<String>,
-        /// Fresh holdout games the post-race guardrail plays. Diagnostic — no resume guard.
-    #[serde(default = "default_guardrail_matches")]
-    pub guardrail_matches: usize,
         /// Load the newest compatible previous experiment's elites as the first
         /// founders. Recorded because it decides what the founder batch IS. Default
         /// false. `alias` reads headers written before the rename.
@@ -219,7 +216,6 @@ impl ConfigSnapshot {
             elite_join_probation_steps: cfg.elite_join_probation_steps,
             elite_crown_lifetime_steps: cfg.elite_crown_lifetime_steps,
             feature_split: cfg.feature_split.map(|p| p.to_string()),
-            guardrail_matches: cfg.guardrail_matches,
             build: crate::engine::format::build_stamp(),
         }
     }
@@ -240,127 +236,7 @@ impl ConfigSnapshot {
     }
 }
 
-/// The post-race guardrail's record of the run's certified champion — the one field
-/// of `engine.json` that is not launch config, and what makes seeding possible.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct GuardrailRecord {
-    /// Full hash of the champion that was scored.
-    pub champion_hash: String,
-        /// Trainable parameter count of that net (elements) — the tie-break key: on equal
-        /// fitness the SMALLEST champion is scored and recorded.
-    #[serde(default)]
-    pub champion_params: Option<i64>,
-        /// The champion's smoothed race fitness — the READABLE window mean, kept in the
-        /// fitness's own units so it stays directly comparable with `holdout_mean`. `None` if
-        /// the run recorded no verdict.
-    #[serde(default)]
-    pub race_smoothed: Option<f32>,
-        /// Spread of the champion's race window (σ). The holdout's own `holdout_std` is the
-        /// same quantity measured on fresh games, so the two spreads are comparable.
-    #[serde(default)]
-    pub race_std: Option<f32>,
-        /// The RISK-ADJUSTED score (FIT) that ranked the champion first — `race_smoothed`
-        /// penalized by `λ · race_std` in the run's direction. Recorded so a reader can see
-        /// how much of the champion's rank came from steadiness rather than raw level.
-    #[serde(default)]
-    pub race_score: Option<f32>,
-        /// Standard error of `race_smoothed`; `None` when the scoring path could not see the
-        /// champion's rolling window (saved-run scoring).
-    #[serde(default)]
-    pub race_se: Option<f32>,
-    /// Step readings behind `race_smoothed` (the smoothing window's length).
-    /// `0` = unknown; `1` means the spread could not be observed at all.
-    #[serde(default)]
-    pub race_samples: usize,
-        /// The champion's MOST RECENT step reading; the smoothed reference lags it by up to
-        /// the window length, so the verdict quotes both when they disagree.
-    #[serde(default)]
-    pub race_latest: Option<f32>,
-    /// Mean holdout score over the games that actually produced one.
-    #[serde(default)]
-    pub holdout_mean: Option<f32>,
-    /// Population std of those scores.
-    #[serde(default)]
-    pub holdout_std: Option<f32>,
-    /// Games that produced a score (per-game failures are skipped, so this can
-    /// be less than `config.guardrail_matches`).
-    #[serde(default)]
-    pub matches_scored: usize,
-        /// Unit-free agreement between the race reading and the holdout — which reading to
-        /// trust and why. Informational.
-    #[serde(default)]
-    pub verdict: String,
-        /// Every net that took the exam, rank 1 (the champion above) first. Empty on
-        /// records written before the exam covered the whole elite set.
-    #[serde(default)]
-    pub elites: Vec<GuardrailElite>,
-}
 
-/// One elite's line in the guardrail record — the same readings as the champion
-/// block, for a net that is not the champion. The champion's numbers stay in
-/// [`GuardrailRecord`]'s top-level fields (the seeding contract reads those).
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct GuardrailElite {
-    /// 1-based rank in the exam order (the same ranking that picked the elites).
-    #[serde(default)]
-    pub rank: usize,
-    /// Full hash of the net scored.
-    pub hash: String,
-    /// Trainable parameter count (elements) — the champion's tie-break key.
-    #[serde(default)]
-    pub params: Option<i64>,
-    /// The net's smoothed race fitness (the readable window mean).
-    #[serde(default)]
-    pub race_mean: Option<f32>,
-    /// Spread of that net's race window (σ).
-    #[serde(default)]
-    pub race_std: Option<f32>,
-    /// The risk-adjusted score (FIT) that placed this net in the elite set.
-    #[serde(default)]
-    pub race_score: Option<f32>,
-    /// Standard error of `race_mean`; `None` when no window was recorded.
-    #[serde(default)]
-    pub race_se: Option<f32>,
-    /// Step readings behind `race_mean` (`0` = unknown).
-    #[serde(default)]
-    pub race_samples: usize,
-    /// The net's most recent step reading (the window mean lags it).
-    #[serde(default)]
-    pub race_latest: Option<f32>,
-        /// Smallest reading in that net's race window — the readable form of `race_std`
-        /// (e.g. one 500 among fizzles), per elite. `None` = no window recorded.
-    #[serde(default)]
-    pub race_min: Option<f32>,
-    /// Largest reading in that net's race window.
-    #[serde(default)]
-    pub race_max: Option<f32>,
-        /// The exam graded against `race_latest` instead of the window mean — the SECOND
-        /// reference line's tag (same vocabulary as `agreement`). `None` = no latest
-        /// reading or no scored game, so nothing was graded.
-    #[serde(default)]
-    pub latest_agreement: Option<String>,
-    /// Mean holdout score over the games that actually produced one.
-    #[serde(default)]
-    pub holdout_mean: Option<f32>,
-    /// Population std of those scores.
-    #[serde(default)]
-    pub holdout_std: Option<f32>,
-    /// Games that produced a score (per-game failures are skipped).
-    #[serde(default)]
-    pub matches_scored: usize,
-        /// Games the exam PLAYED (`config.guardrail_matches`) — the denominator of the
-        /// console card's `games` cell, so `matches_scored < matches_attempted` reads as
-        /// a degraded exam without consulting the run's config.
-    #[serde(default)]
-    pub matches_attempted: usize,
-    /// The one-word grade: `consistent` / `within noise` / `≤10% below` /
-    /// `borderline` / `weak` / `not scored`.
-    #[serde(default)]
-    pub agreement: String,
-    /// The full verdict sentence (what the console card prints for rank 1).
-    #[serde(default)]
-    pub verdict: String,
-}
 
 /// Which previous experiment this run's founder batch was seeded from — the inheritance
 /// receipt (informational; the copied topology is recorded per net like any founder).
@@ -370,14 +246,11 @@ pub struct SeedSourceRecord {
     pub source_run_id: String,
     /// Directory the source was read from (as resolved).
     pub source_dir: String,
-    /// The guardrail-certified champion that was copied.
+    /// The source run's rank-1 net at its final table — the one copied first.
     pub champion_hash: String,
     /// That champion's parameter count (the tie-break key).
     #[serde(default)]
     pub champion_params: Option<i64>,
-    /// Its holdout mean, carried for readability (the champion's pedigree).
-    #[serde(default)]
-    pub guardrail_mean: Option<f32>,
         /// Every elite reinstated here, ranked (best first, `[0]` == `champion_hash`);
         /// one entry when the source predates `elites.json`, empty if nothing inherited.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -385,7 +258,7 @@ pub struct SeedSourceRecord {
 }
 
 /// The reproducible run header, serialized as `engine.json`. Overwritten when the
-/// reproducibility-affecting config changes; the post-race guardrail record is preserved.
+/// reproducibility-affecting config changes; the seed receipt is preserved.
 #[derive(Clone, Debug, Serialize)]
 pub struct RunHeader {
     /// User-visible run id (directory name or CLI-chosen label).
@@ -461,10 +334,6 @@ pub struct RunHeader {
         /// verbatim, never interpreted. `None` on legacy files.
     #[serde(default)]
     pub trainer: Option<serde_json::Value>,
-        /// The post-race guardrail's certified champion. Written after the race; preserved by
-        /// `refresh_header`/resume.
-    #[serde(default)]
-    pub guardrail: Option<GuardrailRecord>,
     /// The previous experiment this run's founder batch was seeded from (see
     /// [`SeedSourceRecord`]). `None` = an all-random batch: nothing was inherited.
     #[serde(default)]
@@ -623,19 +492,13 @@ impl RunHeader {
             children_born_at_clock,
             config,
             trainer,
-                // Both are post-construction facts: the guardrail hasn't run at launch, and
-                // the seed source is stamped in right after the population is resolved.
-            guardrail: None,
+                // A post-construction fact: the seed source is stamped in right after the
+                // population is resolved.
             run_topology_source: None,
             accounting: None,
         }
     }
 
-        /// Record the guardrail's certified champion — called by `CoreEngine::guardrail` so
-        /// every later header rewrite keeps it.
-    pub fn set_guardrail(&mut self, record: Option<GuardrailRecord>) {
-        self.guardrail = record;
-    }
 
     /// Like `from_race_options`, but also stamps `started_at`.
     pub fn from_race_options_at(cfg: RunConfig, started_at: String) -> Self {
@@ -754,12 +617,6 @@ impl RunHeader {
         // Trainer self-description (see `Trainer::describe`). Absent on legacy
         // files and on trainers that don't implement the hook.
         let trainer = v.get("trainer").cloned();
-        // Post-race facts. Absent on a running run, on legacy files, and on
-        // runs whose guardrail never scored a champion.
-        let guardrail: Option<GuardrailRecord> = v
-            .get("guardrail")
-            .cloned()
-            .and_then(|g| serde_json::from_value(g).ok());
         let run_topology_source: Option<SeedSourceRecord> = v
             .get("run_topology_source")
             .cloned()
@@ -808,7 +665,6 @@ impl RunHeader {
             children_born_at_clock,
             config,
             trainer,
-            guardrail,
             run_topology_source,
             accounting: v
                 .get("accounting")
@@ -833,12 +689,6 @@ fn default_mutation_cull_policy() -> String {
 
 fn default_true() -> bool {
     true
-}
-
-    /// Pre-knob headers carry no `guardrail_matches`; anchor the serde fallback on the
-    /// config's own default rather than 0.
-fn default_guardrail_matches() -> usize {
-    crate::engine::config::DEFAULT_GUARDRAIL_MATCHES
 }
 
 // ── Per-net state (nets/<hash>.json) ──────────────────────────────────────
@@ -1403,16 +1253,6 @@ pub fn write_engine_json(dir: &Path, header: &RunHeader) -> Result<()> {
     write_atomic(&path, json.as_bytes(), true)
 }
 
-/// Stamp the post-race guardrail record into an EXISTING `engine.json` via raw read-modify-
-/// write, so unmodeled fields and hand-edited notes survive. Missing file errors.
-pub fn write_guardrail_record(dir: &Path, record: &GuardrailRecord) -> Result<()> {
-    stamp_engine_json_key(
-        dir,
-        "guardrail",
-        serde_json::to_value(record)
-            .map_err(|e| EngineError::Json(format!("guardrail record serialize: {e}")))?,
-    )
-}
 
 /// Insert/replace one key in `engine.json`, preserving everything else
 /// verbatim. Shared by the post-race stamps.
