@@ -150,13 +150,6 @@ pub struct EngineArgs {
     /// keep training.
     #[arg(long = "no-freeze-elites", action = clap::ArgAction::SetFalse)]
     pub freeze_elites: bool,
-
-    /// How often buffered history.csv rows hit disk: `checkpoint` (default,
-    /// every `--checkpoint-every` steps and at stop — a `kill -9` loses at
-    /// most that many steps of history) or `each` (every step, zero-loss
-    /// history at the cost of a file write per step).
-    #[arg(long, value_name = "MODE")]
-    pub history_flush: Option<String>,
 }
 
 /// RL-only engine flags — the mode-specific twin of [`EngineArgs`]. No RL-only
@@ -228,21 +221,6 @@ impl EngineArgs {
             b = b
                 .set_elite_previous_load(true)
                 .set_elite_previous_dir(dir.clone());
-        }
-            // `--history-flush` is a MODE, not a bool: `each` flushes every clock what
-            // the engine's flag asks for, `checkpoint` (and anything unset) keeps the
-            // cadence the checkpoint tick already gives. Anything else is a typo, not a
-            // silent fallback — the run must not quietly pick a durability it did not
-            // ask for.
-        if let Some(mode) = self.history_flush.as_deref() {
-            match mode.trim().to_ascii_lowercase().as_str() {
-                "each" => b = b.set_run_history_flush_each(true),
-                "checkpoint" => b = b.set_run_history_flush_each(false),
-                other => {
-                    eprintln!("--history-flush {other}: expected `each` or `checkpoint`");
-                    std::process::exit(2);
-                }
-            }
         }
         if let Some(p) = self.crossover_prob {
             b = b.set_crossover_prob(p);
