@@ -333,9 +333,6 @@ pub struct RaceConfig {
         /// Human label for the experiment, recorded verbatim in `engine.json` as
         /// `"run_name"`. Informational — does not affect the results folder name.
     pub run_name: Option<String>,
-        /// User-supplied run topologies (blueprint-only, fresh weights) seeded BEFORE the
-        /// random draws; duplicates are re-rolled. Recorded as `run_topology_count`.
-    pub run_topologies: Vec<crate::graph::topology::Topology>,
         /// AUTOMATIC inheritance: load the newest compatible PREVIOUS experiment's
         /// elites into the first founder slots (topology-only). "Compatible" is read
         /// from the header (same mode, dims and trainer); a different experiment, or
@@ -353,7 +350,8 @@ pub struct RaceConfig {
         /// `0` = only the empty-buffer step-0 immunity.
     pub mutation_probation_steps: usize,
         /// Crossover probation: a crossover-born net is cull-IMMUNE for its first
-        /// `crossover_probation_steps` clocks. `0` (default) = only step-0 immunity.
+        /// `crossover_probation_steps` clocks. Default 5 (set in `defaults()`);
+        /// `0` = only the empty-buffer step-0 immunity.
     pub crossover_probation_steps: usize,
         /// Elite join probation: a net cannot join the elite set until it has aged
         /// `elite_join_probation_steps` clocks since arrival. Default `5`.
@@ -554,7 +552,6 @@ impl RaceConfig {
             worst_save_topology: false,
             worst_save_safetensors: false,
             run_name: None,
-            run_topologies: Vec::new(),
             elite_previous_load: true,
             elite_previous_dir: None,
             elite_checkpoint_weights: true,
@@ -906,12 +903,6 @@ impl RaceConfigBuilder {
         self.cfg.csv_export = enabled;
         self
     }
-        /// Seed the population with user-supplied run topologies (blueprint-only, fresh
-        /// weights), filling the FIRST slots; the rest stay random. Colliders are re-rolled.
-    pub fn set_run_topologies(mut self, topos: Vec<crate::graph::topology::Topology>) -> Self {
-        self.cfg.run_topologies = topos;
-        self
-    }
         /// Opt in/out of the automatic inheritance of the newest compatible previous
         /// experiment's elites (topology-only). ON by default; `false` forces a fresh,
         /// all-random founder batch.
@@ -951,13 +942,13 @@ impl RaceConfigBuilder {
         self
     }
     /// Mutation probation steps: cull-immunity for a random immigrant's first
-    /// `k` clocks (see [`RaceConfig::mutation_probation_steps`]). Default 0.
+    /// `k` clocks (see [`RaceConfig::mutation_probation_steps`]). Default 5.
     pub fn set_mutation_probation_steps(mut self, k: usize) -> Self {
         self.cfg.mutation_probation_steps = k;
         self
     }
     /// Crossover probation steps: cull-immunity for a crossover child's first
-    /// `k` clocks (see [`RaceConfig::crossover_probation_steps`]). Default 0.
+    /// `k` clocks (see [`RaceConfig::crossover_probation_steps`]). Default 5.
     pub fn set_crossover_probation_steps(mut self, k: usize) -> Self {
         self.cfg.crossover_probation_steps = k;
         self
