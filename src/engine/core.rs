@@ -530,13 +530,6 @@ impl CoreEngine {
                             ),
                             ("champion".to_string(), short.to_string()),
                             (
-                                "champion holdout".to_string(),
-                                champ
-                                    .guardrail_mean
-                                    .map(fmt_cell)
-                                    .unwrap_or_else(|| "—".to_string()),
-                            ),
-                            (
                                 "ranks inherited".to_string(),
                                 if n == 1 {
                                     "rank 1".to_string()
@@ -553,11 +546,7 @@ impl CoreEngine {
                                 },
                             ),
                         ]),
-                        Some(if n == 1 {
-                            "champion certified by the guardrail"
-                        } else {
-                            "champion rank 1 certified by the guardrail; the rest by the source run's own elite ranking"
-                        }),
+                        Some("rank 1 of the source run's final table; the rest follow that table's order"),
                     ));
                     let elite_hashes: Vec<String> =
                         plan.picks.iter().map(|p| p.champion_hash.clone()).collect();
@@ -569,7 +558,6 @@ impl CoreEngine {
                         source_dir: plan.source_dir.display().to_string(),
                         champion_hash: champ.champion_hash.clone(),
                         champion_params: champ.champion_params,
-                        guardrail_mean: champ.guardrail_mean,
                         elite_hashes,
                     });
                 }
@@ -1202,9 +1190,6 @@ impl CoreEngine {
                     format!("ranks 1..{seeded_slots}")
                 },
             ));
-            if let Some(m) = src.guardrail_mean {
-                rows.push(("champion holdout".to_string(), fmt_cell(m)));
-            }
         }
         crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Race init",
@@ -1329,10 +1314,6 @@ impl CoreEngine {
                 (
                     "train_merit (Ω)".to_string(),
                     fmt_cfg(self.config.train_merit),
-                ),
-                (
-                    "guardrail_matches".to_string(),
-                    self.config.guardrail_matches.to_string(),
                 ),
                 (
                     "fitness".to_string(),
@@ -2074,256 +2055,13 @@ impl CoreEngine {
         self.rolling_fitness.get(hash).and_then(rolling_stats)
     }
 
-    /// The post-race holdout guardrail: score EVERY elite (rank 1 = the champion) on
-    /// fresh unseen draws through the run's own trainer — `elite_count` nets ×
-    /// `guardrail_matches` draws each (the core's mode-neutral word for one exam unit:
-    /// a holdout batch here, an episode in an RL run). Returns the champion's verdict; the rest are
-    /// printed in the card's table and recorded in `engine.json`.
-    /// `None` = no champion (each case logs a warning), the champion produced no
-    /// verdict, or the exam is switched off (`guardrail_matches = 0`).
-    pub fn guardrail(&mut self) -> Option<crate::engine::guardrail::GuardrailVerdict> {
-        // `0` matches = the exam is OFF (see `set_elite_guardrail_matches`): return
-        // BEFORE anything expensive or observable — no champion lookup, no holdout
-        // game, no verdict. `engine.json` keeps any earlier record, and the
-        // next run's inheritance never depended on the verdict (`elites.json`).
-        if self.config.guardrail_matches == 0 {
-            crate::utils::cfy::emit(&crate::utils::cfy::card(
-                "Guardrail",
-                &crate::utils::cfy::kv(&[(
-                    "guardrail_matches".to_string(),
-                    "0".to_string(),
-                )]),
-                Some("skipped — no holdout exam configured; nothing recorded"),
-            ));
-            return None;
-        }
-        // The champion set is written by the stop-time writers; recompute it when empty
-        // so the guardrail never depends on whether a writer happened to run.
-        if self.champions.is_empty() {
-            self.record_champions();
-        }
-        let champion = self.champion_for_guardrail()?;
-        let matches = self.config.guardrail_matches;
-        // EVERY elite takes the exam, not just rank 1: `champions` is the stop-time
-        // elite snapshot (top `elite_count`), i.e. exactly the nets the run exported.
-        // The champion leads, so its verdict is the one that certifies the run.
-        let mut exam_set: Vec<String> = Vec::with_capacity(self.champions.len() + 1);
-        exam_set.push(champion.clone());
-        for hash in &self.champions {
-            if !exam_set.contains(hash) {
-                exam_set.push(hash.clone());
-            }
-        }
-        let mut exams: Vec<crate::engine::guardrail::GuardrailVerdict> =
-            Vec::with_capacity(exam_set.len());
-        for hash in &exam_set {
-            // The race reading AND its error bar, read from the LIVE rolling buffer
-            // before scoring: the spread is what separates "collapsed" from "an
-            // unresolvable mean".
-            let race = self.race_reading_of(hash);
-            let Some(net) = self.networks.get_mut(hash.as_str()) else {
-                // Not in memory (already gone from the population): there is nothing
-                // honest to score, so this net's exam is skipped rather than run on a
-                // net rebuilt from disk — a fresh-init net measures like noise.
-                tracing::warn!(
-                    "guardrail: elite {} is not one of the live nets — exam skipped",
-                    &hash[..8.min(hash.len())]
-                );
-                continue;
-            };
-            // `eval()` first: the resting state a reloaded net would get for free, and the
-            // state the holdout MUST be measured in (dropout would sample a random policy).
-            flodl::Module::eval(net);
-            let Some(mut verdict) = crate::engine::guardrail::score_net(
-                net,
-                hash,
-                race.map(|r| r.mean),
-                matches,
-                &mut self.trainer,
-                |t, net, game_i| t.holdout_score(net, game_i),
-            ) else {
-                tracing::warn!(
-                    "guardrail: no holdout game scored on elite {} — exam skipped",
-                    &hash[..8.min(hash.len())]
-                );
-                continue;
-            };
-            // Carry the race side's noise onto the verdict, so the example's print
-            // and this module's own table quote the same error bar.
-            verdict.race_se = race.and_then(|r| r.se());
-            verdict.race_samples = race.map(|r| r.n).unwrap_or(0);
-            verdict.race_latest = race.map(|r| r.latest);
-            exams.push(verdict);
-        }
-        // Rank 1 IS the certification: with no champion verdict nothing is recorded,
-        // exactly like the old single-champion exam.
-        let Some(verdict) = exams.iter().find(|v| v.hash == champion).cloned() else {
-            tracing::warn!(
-                "guardrail: the champion produced no holdout verdict — nothing recorded"
-            );
-            return None;
-        };
-        let direction = self.fitness.direction();
-        let champion_race = self.race_reading_of(&verdict.hash);
-        // One row per examined elite, in exam (rank) order: the race reading on the
-        // left, the fresh-game exam on the right, the graded tag last. The champion's
-        // full sentence — which carries the mechanism — rides as the card's footnote.
-        let mut rows: Vec<Vec<String>> = Vec::with_capacity(exams.len());
-        let mut elite_records: Vec<crate::state::GuardrailElite> = Vec::with_capacity(exams.len());
-        let mut champion_line = String::new();
-        for (rank0, v) in exams.iter().enumerate() {
-            let race = self.race_reading_of(&v.hash);
-            // The per-elite window context (the champion's context line, for EVERY
-            // elite): its min..max, and the SECOND reference line — the exam graded
-            // against this net's LATEST reading, which the window mean lags. Both read
-            // the same `race`, so a row can never pair one net's window with another's
-            // numbers.
-            let latest_tag = crate::engine::guardrail::latest_agreement_grade(
-                race.map(|r| r.latest),
-                race.map(|r| r.std),
-                v.mean(),
-                v.se(),
-                v.scores.len(),
-                direction,
-            );
-            // ONE grading for the table and the sentence (`agreement_grade`), so a row
-            // can never contradict its own verdict text.
-            let grade = crate::engine::guardrail::agreement_grade(
-                v.race_smoothed,
-                v.race_se,
-                v.mean(),
-                v.se(),
-                v.scores.len(),
-                direction,
-            );
-            let line = crate::engine::guardrail::agreement_verdict_noisy(
-                v.race_smoothed,
-                v.race_se,
-                Some(v.race_samples).filter(|n| *n > 0),
-                v.race_latest,
-                v.mean(),
-                v.se(),
-                v.scores.len(),
-                direction,
-            );
-            if v.hash == verdict.hash {
-                champion_line = line.clone();
-            }
-                // GUARDRAIL DATA ONLY. The race side (`race μ`, its n, its SE, the
-                // window, the latest reading) is ALREADY in the `Final field` table
-                // above, in the same rank order and under the same hash — repeating it
-                // here made this table a wide restatement of that one. Every row below
-                // is a number the exam itself produced (plus its verdict tag); the
-                // elite table's `reading` cell is this row's race reference.
-            rows.push(vec![
-                (rank0 + 1).to_string(),
-                v.hash[..8.min(v.hash.len())].to_string(),
-                fmt_cell_opt(&v.mean()),
-                fmt_cell_opt(&v.std()),
-                fmt_cell_opt(&v.se()),
-                // `scored/played`: `score_net` skips a game whose scorer errors, so
-                // a degraded exam must be visible next to the full one.
-                format!("{}/{}", v.scores.len(), matches),
-                grade.tag().to_string(),
-            ]);
-            elite_records.push(crate::state::GuardrailElite {
-                rank: rank0 + 1,
-                hash: v.hash.clone(),
-                params: self.net_params(&v.hash),
-                race_mean: v.race_smoothed,
-                race_std: race.map(|r| r.std),
-                race_score: self.smoothed_fitness_of(&v.hash),
-                race_se: v.race_se,
-                race_samples: v.race_samples,
-                race_latest: v.race_latest,
-                race_min: race.map(|r| r.min),
-                race_max: race.map(|r| r.max),
-                latest_agreement: latest_tag.map(|t| t.tag().to_string()),
-                holdout_mean: v.mean(),
-                holdout_std: v.std(),
-                matches_scored: v.scores.len(),
-            matches_attempted: matches,
-                agreement: grade.tag().to_string(),
-                verdict: line,
-            });
-        }
-        // NO champion-context block above the table. Every elite now carries its own
-        // window and its own exam grade in the rows below, so a champion-only block
-        // read as if rank 1 were the best net — and the exam is exactly the measurement
-        // that can contradict that (a lower-ranked elite can out-score it). The
-        // champion's numbers stay in the footnote AND in `engine.json`; the identifiers
-        // the old block carried (hash, rank 1 of N) lead the footnote instead.
-            // The core engine's wording stays MODE-NEUTRAL: one exam unit is a DRAW here
-            // (a holdout batch in a tabular run, an episode in an RL one), and the RL
-            // examples describe their own units (`turns`, `games`) in their own prose.
-            // Naming the core's unit "game" made every tabular run read as if it had a
-            // simulator somewhere in it.
-        let title = format!(
-            "Guardrail (elite set on fresh unseen draws — {} net(s) × {} draw(s) each)",
-            exams.len(),
-            matches
-        );
-        let body = crate::utils::cfy::table(
-            &["rank", "hash", "exam avg", "exam spread", "exam SE", "draws", "status"],
-            &rows,
-        )
-        .to_string();
-        // The footnote names WHICH net it certifies — the rank-1 identity the dropped
-        // context block used to carry, at no layout cost — and carries the column legend.
-        // It is the SAME place every other card puts its legend; the old one-cell
-        // `columns` table above the data was the only card in the log shaped that way.
-        let champion_note = format!(
-            "{} (rank 1 of {}) — {champion_line} · exam avg = mean unseen-draw score · exam spread = per-draw spread · exam SE = spread/√draws · draws = scored/played · status = the exam graded against this net's race reading (`Final field` above, same ranks and hashes)",
-            &verdict.hash[..8.min(verdict.hash.len())],
-            self.champions.len().max(1)
-        );
-        crate::utils::cfy::emit(&crate::utils::cfy::card(
-            &title,
-            &body,
-            Some(&champion_note),
-        ));
-        // Record it: the guardrail is a run OUTPUT (the only reading on unseen draws), so
-        // it lives in engine.json and the next experiment inherits its champion. Rank 1
-        // keeps the top-level block (the seeding contract); every exam is in `elites`.
-        let record = crate::state::GuardrailRecord {
-            champion_hash: verdict.hash.clone(),
-            champion_params: self.net_params(&verdict.hash),
-            race_smoothed: verdict.race_smoothed,
-            race_std: champion_race.map(|r| r.std),
-            race_score: self.smoothed_fitness_of(&verdict.hash),
-            race_se: verdict.race_se,
-            race_samples: verdict.race_samples,
-            race_latest: verdict.race_latest,
-            holdout_mean: verdict.mean(),
-            holdout_std: verdict.std(),
-            matches_scored: verdict.scores.len(),
-            verdict: champion_line,
-            elites: elite_records,
-        };
-        self.header.set_guardrail(Some(record.clone()));
-        if let Err(e) = crate::state::write_guardrail_record(&self.run_dir, &record) {
-            tracing::warn!("engine.json guardrail record failed: {e}");
-        }
-        Some(verdict)
-    }
 
-    /// A live net's parameter count (`NetMeta::params`) — the guardrail
+    /// A live net's parameter count (`NetMeta::params`) — the ranking
     /// tie-break key.
     fn net_params(&self, hash: &str) -> Option<i64> {
         self.state.net(hash).and_then(|s| s.meta.params)
     }
 
-        /// The net the guardrail certifies: the HEAD of the recorded champion ranking —
-        /// the same order the `Final field` table prints, so the table's rank 1 and the
-        /// certified champion cannot disagree (they did: the guardrail used to re-rank
-        /// the ties by fewest parameters while the table kept the sort's own order, so a
-        /// 500.0000/500.0000 pair could show rank 1 in one card and rank 2 in the other).
-        ///
-        /// The tie-break itself lives in [`Self::ranked_live_impl`], which owns the one
-        /// order every card reads.
-    fn champion_for_guardrail(&self) -> Option<String> {
-        self.champions.first().cloned()
-    }
 
     /// THE ranking primitive: live nets paired with smoothed fitness, ordered
     /// best-first. `require_measured` is the eligibility contract (true = ranked_live).
@@ -3116,9 +2854,8 @@ impl CoreEngine {
             trainer: self.trainer.describe(),
         };
         let mut header = RunHeader::from_race_options(cfg);
-        // Post-race facts are NOT launch config: re-deriving the header must never wipe
-        // the recorded guardrail champion or the seed receipt.
-        header.guardrail = self.header.guardrail.clone();
+        // A post-race fact is NOT launch config: re-deriving the header must never wipe
+        // the seed receipt.
         header.run_topology_source = self.header.run_topology_source.clone();
         write_engine_json(&self.run_dir, &header)
     }
@@ -6921,11 +6658,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── Seed from a previous run's guardrail champion ───────────────────
+    // ── Seed from a previous run's final table ──────────────────────────
 
-    /// Write a prior-run fixture (`engine.json` + champion `nets/<hash>.json`,
-    /// optionally with a `guardrail` block); no `trainer` blob, so that check skips.
-    fn write_prior_run(dir: &std::path::Path, run_id: &str, with_guardrail: bool) -> Topology {
+    /// Write a prior-run fixture (`engine.json` + `nets/<hash>.json`, optionally its
+    /// final table `elites.json`); no `trainer` blob, so that check skips.
+    fn write_prior_run(dir: &std::path::Path, run_id: &str, with_index: bool) -> Topology {
         std::fs::create_dir_all(dir.join("nets")).unwrap();
         let topo = tiny_topology(999);
         let hash = "feedfacefeedface";
@@ -6944,14 +6681,13 @@ mod tests {
             "output_dim": 2,
             "config": { "mode": "tabular" },
         });
-        if with_guardrail {
-            header["guardrail"] = serde_json::json!({
-                "champion_hash": hash,
-                "champion_params": 4242,
-                "race_smoothed": 0.25,
-                "holdout_mean": 0.30,
-                "matches_scored": 16,
-            });
+        if with_index {
+            std::fs::write(
+                dir.join("elites.json"),
+                serde_json::json!([{ "rank": 1, "hash": hash, "fitness": 0.25, "params": 4242 }])
+                    .to_string(),
+            )
+            .unwrap();
         }
         std::fs::write(dir.join("engine.json"), header.to_string()).unwrap();
         topo
@@ -7019,8 +6755,9 @@ mod tests {
             .expect("a seeded run must record its source");
         assert_eq!(source.source_run_id, "1000");
         assert_eq!(source.champion_hash, "feedfacefeedface");
-        assert_eq!(source.champion_params, Some(4242));
-        assert_eq!(source.guardrail_mean, Some(0.30));
+        // The final table carries the ORDER, not a parameter count: `champion_params`
+        // exists for record readability and is `None` unless a source supplies it.
+        assert_eq!(source.champion_params, None);
         assert!(header.config.elite_previous_load);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -7031,7 +6768,7 @@ mod tests {
     /// no panic, no short population, no false `run_topology_source`.
     #[test]
     fn elite_previous_load_failures_fall_back_to_random() {
-        // A prior run with NO guardrail champion recorded.
+        // A prior run with NO final table recorded.
         let prior = std::env::temp_dir().join("gras-seedprior-none");
         let _ = std::fs::remove_dir_all(&prior);
         std::fs::create_dir_all(&prior).unwrap();
@@ -7059,181 +6796,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&prior);
     }
 
-    /// Certification reads the LIVE champion in memory, never a weights file: the exam
-    /// still works on a run whose `nets/` is the only place its coefficients exist.
-    #[test]
-    fn guardrail_certifies_a_live_champion_without_weight_files() {
-        let dir = std::env::temp_dir().join("gras-guardrail-live");
-        let _ = std::fs::remove_dir_all(&dir);
-        let data_dir = tiny_dataset_dir("guardrail-live");
-        let config = RaceConfig {
-            // pop_size 0 ⇒ `from_spec` seeds nothing (the default pools draw topologies a
-            // 2-dim dataset cannot feed); the test seeds two tiny ones explicitly below.
-            pop_size: 0,
-            max_steps: Some(2),
-            guardrail_matches: 3,
-            ..RaceConfig::defaults()
-        };
-        let trainer = crate::trainer::TabularTrainer::new(loss_fn())
-            .with_holdout_scorer(|_net, game_i| -> Result<f32> { Ok(game_i as f32 + 10.0) });
-        let mut eng =
-            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
-                data_dir,
-                config,
-                fitness(),
-                trainer,
-                Some(7),
-                Some(dir.clone()),
-            ))
-            .unwrap();
-        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-            .unwrap();
-        eng.run().unwrap();
-        let exported = std::fs::read_dir(&dir).unwrap().flatten().any(|e| {
-            let n = e.file_name().to_string_lossy().to_string();
-            n.starts_with("elite-") && n.ends_with(".safetensors")
-        });
-        assert!(
-            !exported,
-            "this test must prove certification without a weight file"
-        );
 
-        let verdict = eng
-            .guardrail()
-            .expect("the live champion must be scoreable in memory");
-        assert_eq!(verdict.scores.len(), 3);
-        let record = crate::state::load_engine_json(&dir)
-            .unwrap()
-            .guardrail
-            .expect("the verdict must still be recorded");
-        assert_eq!(record.champion_hash, verdict.hash);
-        assert_eq!(record.matches_scored, 3);
-        assert_eq!(record.holdout_mean, verdict.mean());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-        /// The exam covers the WHOLE elite set, not just rank 1: every elite is scored
-        /// `guardrail_matches` times and recorded with its own grade. The champion keeps
-        /// the top-level block (the seeding contract).
-    #[test]
-    fn the_guardrail_examines_every_elite() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let dir = std::env::temp_dir().join("gras-guardrail-elites");
-        let _ = std::fs::remove_dir_all(&dir);
-        let data_dir = tiny_dataset_dir("guardrail-elites");
-        let calls = std::sync::Arc::new(AtomicUsize::new(0));
-        let counted = calls.clone();
-        let config = RaceConfig {
-            pop_size: 0,
-            max_steps: Some(2),
-            guardrail_matches: 2,
-            elite_count: 3,
-            ..RaceConfig::defaults()
-        };
-        let trainer = crate::trainer::TabularTrainer::new(loss_fn()).with_holdout_scorer(
-            move |_net, game_i| -> Result<f32> {
-                // The 6th call is the LAST elite's first game: fail it, so the test
-                // covers a DEGRADED exam (`scored < played`) beside a full one.
-                if counted.fetch_add(1, Ordering::SeqCst) == 5 {
-                    return Err(flodl::tensor::TensorError::new("holdout game failed"));
-                }
-                Ok(game_i as f32)
-            },
-        );
-        let mut eng =
-            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
-                data_dir,
-                config,
-                fitness(),
-                trainer,
-                Some(7),
-                Some(dir.clone()),
-            ))
-            .unwrap();
-        eng.seed_population_internal(
-            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
-            Some(0.5),
-        )
-        .unwrap();
-        eng.run().unwrap();
-        assert_eq!(
-            eng.champion_hashes().len(),
-            3,
-            "the run must export three elites for this test to mean anything"
-        );
-
-        let verdict = eng
-            .guardrail()
-            .expect("the champion must be scored on fresh games");
-        assert_eq!(verdict.scores.len(), 2, "the champion's own exam");
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            3 * 2,
-            "every elite × every holdout game, not just the champion's"
-        );
-
-        let header = crate::state::load_engine_json(&dir).unwrap();
-        assert_eq!(
-            header.config.feature_split, None,
-            "the run's split policy is recorded even when it is off"
-        );
-        let record = header.guardrail.expect("the exam must be recorded");
-        assert_eq!(record.champion_hash, verdict.hash);
-        assert_eq!(record.elites.len(), 3, "one record per examined elite");
-        assert_eq!(record.elites[0].rank, 1);
-        assert_eq!(record.elites[0].hash, record.champion_hash);
-        assert_eq!(record.elites[0].matches_scored, 2, "the champion's exam is full");
-        // `played` is the denominator: every elite was asked for both games…
-        assert!(
-            record.elites.iter().all(|e| e.matches_attempted == 2),
-            "each elite plays the whole exam: {:?}",
-            record.elites.iter().map(|e| e.matches_attempted).collect::<Vec<_>>()
-        );
-        // …while a scorer error shows up as `scored < played` on that one elite.
-        let degraded: Vec<usize> = record
-            .elites
-            .iter()
-            .filter(|e| e.matches_scored < e.matches_attempted)
-            .map(|e| e.rank)
-            .collect();
-        assert_eq!(
-            degraded,
-            vec![3],
-            "the failed holdout game must read as scored < played"
-        );
-        assert!(
-            record.elites.iter().all(|e| !e.agreement.is_empty()),
-            "every exam is graded, even a degraded one"
-        );
-        // Every elite carries its own window context — not just the champion: the
-        // min..max the card prints, in reading order.
-        assert!(
-            record
-                .elites
-                .iter()
-                .all(|e| matches!((e.race_min, e.race_max), (Some(lo), Some(hi)) if lo <= hi)),
-            "every elite's card row needs its window: {:?}",
-            record
-                .elites
-                .iter()
-                .map(|e| (e.race_min, e.race_max))
-                .collect::<Vec<_>>()
-        );
-        // …and the SECOND reference line is graded against that net's latest reading.
-        assert!(
-            record
-                .elites
-                .iter()
-                .all(|e| e.latest_agreement.as_deref().is_some_and(|t| !t.is_empty())),
-            "the latest-vs-exam line is graded for every examined elite: {:?}",
-            record
-                .elites
-                .iter()
-                .map(|e| e.latest_agreement.clone())
-                .collect::<Vec<_>>()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// Inheritance is AUTOMATIC and ON by default: an unconfigured run looks for a
     /// compatible previous experiment by itself, and records nothing (falls back to
@@ -7332,9 +6895,9 @@ mod tests {
         eng.config.elite_count = 1;
         eng.record_champions();
         assert_eq!(
-            eng.champion_for_guardrail().as_ref(),
+            eng.champions.first(),
             Some(&hashes[1]),
-            "the certified champion is the elite table's rank 1"
+            "the elite table's rank 1 is the champion"
         );
         // Same size as well ⇒ the hash breaks the tie, so the order is still total.
         for h in &hashes {
@@ -7350,84 +6913,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The guardrail record survives `refresh_header` (what a resume-then-stop
-    /// does): a resumed run must never erase the champion the next run inherits.
-    #[test]
-    fn guardrail_record_rides_the_header_and_survives_a_refresh() {
-        let dir = std::env::temp_dir().join("gras-guardrail-record");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut eng = engine(&dir, 7).unwrap();
-        let record = crate::state::GuardrailRecord {
-            champion_hash: "abcdefghabcdefgh".into(),
-            champion_params: Some(77),
-            race_smoothed: Some(0.5),
-            race_std: Some(0.08),
-            race_score: Some(0.42),
-            race_se: Some(0.02),
-            race_samples: 5,
-            race_latest: Some(0.52),
-            holdout_mean: Some(0.55),
-            holdout_std: Some(0.01),
-            matches_scored: 16,
-            verdict: "consistent with the race signal ✅".into(),
-            elites: vec![crate::state::GuardrailElite {
-                rank: 1,
-                hash: "abcdefghabcdefgh".into(),
-                holdout_mean: Some(0.55),
-                matches_scored: 16,
-                agreement: "consistent".into(),
-                ..Default::default()
-            }],
-        };
-        eng.header.set_guardrail(Some(record.clone()));
-        crate::state::write_guardrail_record(&dir, &record).unwrap();
 
-        // On disk…
-        let loaded = crate::state::load_engine_json(&dir).unwrap();
-        assert_eq!(loaded.guardrail, Some(record.clone()));
-        // …and still there after a header rebuild.
-        eng.refresh_header().unwrap();
-        let again = crate::state::load_engine_json(&dir).unwrap();
-        assert_eq!(again.guardrail, Some(record));
-
-        // A legacy header with no block loads as None (not as a fake champion).
-        std::fs::write(dir.join("engine.json"), r#"{"run_id":"legacy"}"#).unwrap();
-        let legacy = crate::state::load_engine_json(&dir).unwrap();
-        assert!(legacy.guardrail.is_none() && legacy.run_topology_source.is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-        /// `guardrail_matches = 0` is the OFF switch: the exam returns `None` and records
-        /// nothing. The engine's test trainer has NO holdout scorer (its default panics if
-        /// called), so a clean `None` here is proof the skip happens BEFORE any game —
-        /// a clamped-to-1 implementation would panic.
-    #[test]
-    fn zero_guardrail_matches_skips_the_exam_entirely() {
-        let dir = std::env::temp_dir().join("gras-guardrail-off");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut eng = engine(&dir, 7).unwrap();
-        eng.config.guardrail_matches = 0;
-        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-            .unwrap();
-        seed_raw_fitness(&mut eng, 0.5);
-        assert!(
-            eng.guardrail().is_none(),
-            "0 matches must skip the exam, not run one game"
-        );
-        // Nothing recorded: a later reader sees "not scored", never a fake verdict.
-        assert!(
-            eng.header.guardrail.is_none(),
-            "a skipped exam must not stamp a verdict into engine.json"
-        );
-        // And the OFF path does not even need a champion: an empty field is fine.
-        let empty_dir = std::env::temp_dir().join("gras-guardrail-off-empty");
-        let _ = std::fs::remove_dir_all(&empty_dir);
-        let mut empty = engine(&empty_dir, 8).unwrap();
-        empty.config.guardrail_matches = 0;
-        assert!(empty.guardrail().is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&empty_dir);
-    }
 
     // ── Live net weights: the checkpoint's other half (R4) ──────────────
 
@@ -7492,16 +6978,9 @@ mod tests {
         let mut eng = engine(&dir, 7).unwrap();
         eng.config.checkpoint_every = 0;
         eng.config.max_steps = Some(4);
-        // Both OFF switches at once, through a REAL completed run: the exam skip must
-        // also survive the run path (not just a hand-built engine).
-        eng.config.guardrail_matches = 0;
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
         assert_eq!(eng.run().unwrap(), StopReason::MaxSteps);
-        assert!(
-            eng.guardrail().is_none(),
-            "guardrail_matches = 0 must skip after a real run too"
-        );
         // No tick ⇒ no per-tick write; the STOP writer still completes the run, so every
         // live net has its weights exactly once (R4: there is no flag to turn that off).
         let weights = std::fs::read_dir(dir.join("nets"))
