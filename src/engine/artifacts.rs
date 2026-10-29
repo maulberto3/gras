@@ -136,39 +136,64 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Write the top-k elites' weights as `elite-<hash>.safetensors`.
-    /// UNCONDITIONAL; exports each elite's live `Network` byte-faithfully.
-    pub(crate) fn write_champion_safetensors(&mut self) -> Result<()> {
-        if !self.config.elite_save_safetensors {
-            return Ok(());
-        }
-        self.record_champions();
-        // CFY: one table for all exported weight files, emitted after the loop.
-        let mut written: Vec<Vec<String>> = Vec::new();
-        for (hash, _) in self.champion_ranked() {
-            let short = &hash[..8.min(hash.len())];
-            let path = self.run_dir.join(format!("elite-{short}.safetensors"));
-            // The elite's live Network is still in memory at stop — export it
-            // directly; its coefficients are exactly what the race left.
-            match self.networks.get(hash.as_str()) {
-                Some(net) => {
-                    if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
-                        tracing::warn!("elite safetensors export failed: {e}");
-                    } else {
-                        written.push(vec![short.to_string(), path.display().to_string()]);
-                    }
-                }
-                None => tracing::warn!("elite safetensors export failed: live network missing"),
+    /// Write EVERY live net's weights to `nets/<hash>.safetensors`.
+    ///
+    /// The weights half of a checkpoint (R4): `nets/<hash>.json` carries the genome, the
+    /// counters and the ledger; this carries the coefficients — so `nets/` alone describes
+    /// the frontier and a resume can LOAD instead of replaying. Called at the durability
+    /// tick BEFORE the manifest, so a manifest never names a net whose weights are absent,
+    /// and again at stop. Unconditional: there is no flag, because a checkpoint without
+    /// weights is exactly the gap this replaced.
+    ///
+    /// Cost is bounded by the POPULATION, not the run: one file per live net, overwritten
+    /// in place (measured 2.83 MB/net ⇒ pop 8 = 22.6 MB, constant).
+    pub(crate) fn write_live_net_weights(&self) -> Result<()> {
+        let dir = self.run_dir.join("nets");
+        std::fs::create_dir_all(&dir).map_err(|source| crate::utils::error::EngineError::Io {
+            path: dir.display().to_string(),
+            source,
+        })?;
+        for hash in self.state.live_hashes() {
+            let Some(net) = self.networks.get(hash.as_str()) else {
+                tracing::warn!("net weights: live hash {hash} has no network in memory");
+                continue;
+            };
+            let path = dir.join(format!("{hash}.safetensors"));
+            if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
+                tracing::warn!("net weights export failed for {hash}: {e}");
             }
         }
-        if self.verbose_detail() && !written.is_empty() {
-            crate::utils::cfy::emit(&crate::utils::cfy::card(
-                "Elite weights (safetensors)",
-                &crate::utils::cfy::table(&["hash", "file"], &written),
-                None,
-            ));
-        }
         Ok(())
+    }
+
+    /// Delete `nets/*.safetensors` whose hash is not live.
+    ///
+    /// Deliberately NOT "delete on cull": a cull can land AFTER a tick, and that tick's
+    /// file is the snapshot a resume needs — removing it then would recreate the hole
+    /// `ckpt.json` closed for the STATES (`notes/RESUME.md` §4, where 8 live nets became
+    /// 2 after a kill). Sweeping at the tick instead keeps disk bounded by the population,
+    /// and a crash between a cull and the next tick can only leave files the manifest
+    /// ignores.
+    pub(crate) fn sweep_stale_net_weights(&self) {
+        let live: std::collections::HashSet<String> = self.state.live_hashes().into_iter().collect();
+        let dir = self.run_dir.join("nets");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !live.contains(stem) {
+                if let Err(source) = std::fs::remove_file(&path) {
+                    tracing::warn!("net weights sweep failed for {}: {source}", path.display());
+                }
+            }
+        }
     }
 
     /// Write the stop-time `Final field` table as `final-field.csv`: the SAME header and
@@ -202,29 +227,6 @@ impl CoreEngine {
         }
     }
 
-    /// Per-checkpoint elite weight snapshot (hard-kill durability):
-    /// `checkpoint-elite-<hash>.safetensors`, OVERWRITTEN every checkpoint.
-    pub(crate) fn write_checkpoint_elite_safetensors(&mut self) -> Result<()> {
-        self.record_champions();
-        for (hash, _) in self.champion_ranked() {
-            let short = &hash[..8.min(hash.len())];
-            let path = self
-                .run_dir
-                .join(format!("checkpoint-elite-{short}.safetensors"));
-            match self.networks.get(hash.as_str()) {
-                Some(net) => {
-                    if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
-                        tracing::warn!("checkpoint elite snapshot failed: {e}");
-                    } else if self.verbose_detail() {
-                        tracing::debug!("  checkpoint elite weights → {}", path.display());
-                    }
-                }
-                None => tracing::warn!("checkpoint elite snapshot: live network missing"),
-            }
-        }
-        Ok(())
-    }
-
     /// Full hashes of the elite set exported at stop — the single source of
     /// truth for "which nets are the champions" (never file mtimes/glob order).
     pub fn champion_hashes(&self) -> &[String] {
@@ -254,7 +256,7 @@ impl CoreEngine {
     /// used to write `worst-<hash>.md` and say nothing at all (the old card lived inside
     /// the safetensors branch), which left the file unexplained in the log.
     pub(crate) fn write_worst_artifacts(&self) -> Result<()> {
-        if !self.config.worst_save_topology && !self.config.worst_save_safetensors {
+        if !self.config.worst_save_topology {
             return Ok(());
         }
         // The "truly worst" set — see `worst_ranked`: spent × gap, not just the lowest
@@ -321,21 +323,6 @@ impl CoreEngine {
                     }
                 }
             }
-            if self.config.worst_save_safetensors {
-                let path = self.run_dir.join(format!("worst-{short}.safetensors"));
-                match self.networks.get(pick.hash.as_str()) {
-                    Some(net) => {
-                        if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
-                            tracing::warn!("worst safetensors export failed: {e}");
-                        } else {
-                            files.push(format!("worst-{short}.safetensors"));
-                        }
-                    }
-                    None => {
-                        tracing::warn!("worst safetensors export failed: live network missing")
-                    }
-                }
-            }
             written.push(vec![
                 (rank + 1).to_string(),
                 short.to_string(),
@@ -360,7 +347,7 @@ impl CoreEngine {
                     &written,
                 ),
                 Some(&format!(
-                    "the top-{} of the inefficiency column (`E = (D) prop × (A) rescaled`): (D) prop = trained / the field's {} (its most-trained net), (A) rescaled = |best − score| / |best − worst|, so a newborn cannot win either leg · the count is `elite_count` ({}), the same k the elite writers save — both ends of the ranking keep the same number of nets (set_worst_save_topology / set_worst_save_safetensors decide WHETHER, never how many) · a net saved as an elite is never also saved as a worst · `—` = not written (no readable blueprint, or a failed export)",
+                    "the top-{} of the inefficiency column (`E = (D) prop × (A) rescaled`): (D) prop = trained / the field's {} (its most-trained net), (A) rescaled = |best − score| / |best − worst|, so a newborn cannot win either leg · the count is `elite_count` ({}), the same k the elite writers save — both ends of the ranking keep the same number of nets (set_worst_save_topology decides WHETHER, never how many) · a net saved as an elite is never also saved as a worst · `—` = not written (no readable blueprint, or a failed export)",
                     picks.len(),
                     picks.first().map(|p| p.max_trained).unwrap_or(0),
                     self.config.elite_count.max(1),
