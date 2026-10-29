@@ -188,10 +188,11 @@ pub fn fill_unique(
     out
 }
 
-// ── Run topology (founding batch) loading ──────────────────────────────
+// ── Seed blueprint loading ─────────────────────────────────────────────
 
-/// Load a run topology from a saved artifact (a topology JSON, or a
-/// `nets/<hash>.json` state's `topology` field). Blueprint-only, fresh weights.
+/// Load a blueprint from a saved artifact (a topology JSON, or a
+/// `nets/<hash>.json` state's `topology` field). Blueprint-only, fresh weights;
+/// this is how `elite_previous_load` reads a source run's ranked elites.
 pub fn run_topology_from_json_file(path: &std::path::Path) -> Result<Topology, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("run-topology {}: {e}", path.display()))?;
@@ -211,64 +212,6 @@ pub fn run_topology_from_json_file(path: &std::path::Path) -> Result<Topology, S
         .ok_or_else(|| format!("run-topology {}: no `topology` field", path.display()))?;
     Topology::from_json(topo_json)
         .map_err(|e| format!("run-topology {}: bad topology: {e}", path.display()))
-}
-
-/// Load topologies from a PRIOR RUN's dir: every `nets/<hash>.json`, ranked by
-/// final smoothed fitness (champion first), up to `max`. Fails only if none parse.
-pub fn run_topologies_from_run_dir(
-    dir: &std::path::Path,
-    max: usize,
-) -> Result<Vec<Topology>, String> {
-    let nets_dir = dir.join("nets");
-    let mut scored: Vec<(Option<f32>, Topology)> = Vec::new();
-    let entries =
-        std::fs::read_dir(&nets_dir).map_err(|e| format!("{}: {e}", nets_dir.display()))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(state) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        let Some(topo_json) = state.get("topology").and_then(|t| t.as_str()) else {
-            continue;
-        };
-        let Ok(topo) = Topology::from_json(topo_json) else {
-            continue;
-        };    // The tombstone's score (renamed from `final_smoothed_fitness`; both keys are
-    // read so runs written before the rename still seed). This orders the prior
-    // run's topologies — it does not feed any ranking inside the new run.
-        let fitness = state
-            .get("final_risk_score")
-            .and_then(|f| f.as_f64())
-            .map(|f| f as f32)
-            .or_else(|| {
-                state
-                    .get("final_fitness_mean")
-                    .or_else(|| state.get("final_smoothed_fitness"))
-                    .and_then(|f| f.as_f64())
-                    .map(|f| f as f32)
-            });
-        scored.push((fitness, topo));
-    }
-    if scored.is_empty() {
-        return Err(format!("{}: no parsable net states", nets_dir.display()));
-    }
-    // Ranked best-first by the risk-adjusted score the race ranked by;
-    // `final_fitness_mean` is the fallback (pre-FIT runs, or λ = 0 where the two
-    // are identical). Nets that never scored keep their (deterministic) file
-    // order at the end.
-    scored.sort_by(|a, b| match (b.0, a.0) {
-        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    });
-    Ok(scored.into_iter().take(max).map(|(_, t)| t).collect())
 }
 
 #[cfg(test)]
@@ -365,45 +308,6 @@ mod tests {
             .map(|t| t.to_json().unwrap())
             .collect();
         assert_eq!(a, b, "same seed ⇒ bit-identical population");
-    }
-
-    /// Seeding order reads the FIT score (`final_risk_score`) the race ranked by;
-    /// `final_fitness_mean` is the fallback for legacy files, and a net with
-    /// neither keeps deterministic file order.
-    #[test]
-    fn run_topologies_from_run_dir_orders_by_risk_score_mean_fallback() {
-        let dir = std::env::temp_dir().join("gras-seed-order-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("nets")).unwrap();
-        let cfg = tiny_config(3);
-        let topos = initial_population(&cfg, 42);
-        let write = |name: &str, body: serde_json::Value| {
-            std::fs::write(
-                dir.join("nets").join(format!("{name}.json")),
-                body.to_string(),
-            )
-            .unwrap();
-        };
-        let body = |i: usize, risk: serde_json::Value, mean: serde_json::Value| {
-            serde_json::json!({
-                "topology": topos[i].to_json().unwrap(),
-                "final_risk_score": risk,
-                "final_fitness_mean": mean,
-            })
-        };
-        // b ranks first (0.9 risk score), c second (mean fallback 0.6), a last (0.3).
-        write("a", body(0, serde_json::json!(0.3), serde_json::json!(0.3)));
-        write("b", body(1, serde_json::json!(0.9), serde_json::json!(0.9)));
-        write("c", body(2, serde_json::Value::Null, serde_json::json!(0.6)));
-        let found = run_topologies_from_run_dir(&dir, 3).unwrap();
-        let got: Vec<String> = found.iter().map(|t| t.to_json().unwrap()).collect();
-        let want = vec![
-            topos[1].to_json().unwrap(),
-            topos[2].to_json().unwrap(),
-            topos[0].to_json().unwrap(),
-        ];
-        assert_eq!(got, want, "risk score first, then the mean fallback");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
