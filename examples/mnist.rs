@@ -794,6 +794,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = cli.engine.apply(builder).build();
 
     // ── STEP D — run, then the guardrail.
+    // NOTE: `--run-dir` is an OUTPUT path here, not a resume request. Resuming this
+    // example is blocked by `MnistTrainer::last_accuracy`: the challenge jitter's
+    // strength is scaled by it, it is not persisted per net, and a replay would
+    // therefore take a different step (measured: `race resume parity failure: net
+    // … at step 1`, TODO.md). Cartpole resumes because `Reinforce` carries no such
+    // cross-step trainer state.
     let mut engine = TabularEngine::from_spec(gras::engine::RunSpec::tabular(
         data_dir,
         config,

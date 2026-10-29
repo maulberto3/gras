@@ -301,7 +301,12 @@ const MATCHES_PER_STEP: usize = 1;
 const EVAL_MATCHES_PER_STEP: usize = 5;
 /// FIT risk aversion λ (default; `--risk-aversion` overrides). Window-σs a net
 /// pays for its own spread; 0.0 ranks on the plain window mean.
-const RISK_AVERSION: f32 = 0.0;
+const RISK_AVERSION: f32 = 0.5;
+/// Train lottery parameter (default; `--train-lottery` overrides). Determines 
+// the probability of a net being selected for training in each step.
+/// A value between 0.0 and 1.0, where 1.0 means every net has a chance to be
+//  selected for training, and 0.0 means no net is selected.
+const TRAIN_LOTTERY: f32 = 0.75;
 
 /// The smoke-test CLI: `--pop`, `--max-steps`, `--seed`, `--log-level`,
 /// `--risk-aversion`, `--train-lottery [OMEGA]`, `--run-dir`. Everything else is
@@ -402,7 +407,7 @@ fn main() {
         .set_run_pop_size(cli.pop.unwrap_or(POP))
         .set_run_smoothing_window(10)
         .set_run_risk_aversion(cli.risk_aversion.unwrap_or(RISK_AVERSION))
-        .set_run_train_merit(cli.train_lottery.unwrap_or(0.0))
+        .set_run_train_merit(cli.train_lottery.unwrap_or(TRAIN_LOTTERY))
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra history.csv column
         // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
         // STOP
