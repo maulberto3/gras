@@ -676,7 +676,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if !holdout_exists {
         println!(
-            "  ⚠ no {} — the guardrail will score SYNTHETIC random labels (chance by construction)",
+            "  ⚠ no {} — the trainer's holdout rows are SYNTHETIC random labels (chance by construction)",
             HOLDOUT_DIR
         );
     }
@@ -740,7 +740,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `CHALLENGE_PROB` lives on the trainer and rolls inside `train_step`
         // via `gras::trainer::effective_challenge_prob`. No engine knob.
         // --- Guardrail (post-race honesty check) ---
-        .set_elite_guardrail_matches(HOLDOUT_MATCHES) // fresh holdout draws behind the champion verdict
         // --- Topology & network search boundaries ---
         .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(15)
@@ -764,7 +763,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // and `--founders-from` become engine config instead of being silently dropped.
     let config = cli.engine.apply(builder).build();
 
-    // ── STEP D — run, then the guardrail.
+    // ── STEP D — run. The `Final field` table is the report; there is no exam after it.
     // NOTE: `--run-dir` is an OUTPUT path here, not a resume request. Resuming this
     // example is blocked by `MnistTrainer::last_accuracy`: the challenge jitter's
     // strength is scaled by it, it is not persisted per net, and a replay would
@@ -785,35 +784,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => eprintln!("Race encountered an error: {e}"),
     }
 
-    match engine.guardrail() {
-        Some(v) => {
-            // σ (how mixed the holdout pool was) and SE (how well the mean is
-            // pinned down) are different claims; print both, labelled.
-            let exam = fmt_reading(v.mean(), v.std(), v.scores.len(), ReadingStyle::Line);
-            let smoothed = v
-                .race_smoothed
-                .map(|s| format!(" (race smoothed avg {s:.3})"))
-                .unwrap_or_default();
-            // The honest question is not "is 0.8 a good number" but "does the
-            // holdout agree with the race signal". The grade comes from the ENGINE
-            // (`agreement_grade` — the same function behind the card's `status` cell
-            // and its sentence), so this line cannot reach a different verdict than
-            // the table printed above it. Re-grading here with a local threshold is
-            // exactly how an example ends up contradicting its own engine.
-            let status = gras::engine::guardrail::agreement_grade(
-                v.race_smoothed,
-                v.race_se,
-                v.mean(),
-                v.se(),
-                v.scores.len(),
-                Direction::Maximize,
-            );
-            println!(
-                "guardrail: holdout accuracy {exam}{smoothed} — status {}",
-                status.tag()
-            );
-        }
-        None => println!("guardrail: no champion exported — skipped"),
-    }
     Ok(())
 }

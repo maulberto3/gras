@@ -239,50 +239,7 @@ fn trainer(device: Device) -> Reinforce<CartPole> {
 
 // ═══ SECTION 3 — THE GUARDRAIL (fresh unseen games) ════════════════════
 /// Fresh unseen games the champion is re-scored on at stop.
-const GUARDRAIL_MATCHES: usize = 100;
 
-/// Score the champion on fresh unseen games and print the domain gloss.
-///
-/// The engine's `guardrail()` already scores through this run's trainer
-/// (`RlStep::holdout_score`) and logs the detailed verdict; this wrapper adds the
-/// cartpole-specific reading (turns survived vs the random baseline) so `main`
-/// ends with one clean call.
-fn report_guardrail(engine: &mut RlEngine, baseline: f64) {
-    let Some(v) = engine.guardrail() else {
-        println!("guardrail: no champion to score — skipped");
-        return;
-    };
-    let holdout = v.mean().unwrap_or(0.0);
-    // The honest reading of the exam: its mean, the spread of the games behind
-    // it, AND the SE of that mean — a 100-game mean is far better pinned down
-    // than the race's 7-reading window, and the line has to say so.
-    let exam = fmt_reading(v.mean(), v.std(), v.scores.len(), ReadingStyle::Line);
-    // The race side carries its own error bar — a swinging window can't resolve
-    // better than ±80, so a holdout below its mean isn't damning.
-    let smoothed_note = match v.race_smoothed {
-        Some(s) => match v.race_se {
-            Some(se) if v.race_samples > 0 => format!(
-                " (race smoothed avg {s:.1} with SE {se:.1} over {} step readings)",
-                v.race_samples
-            ),
-            _ => format!(" (race smoothed avg {s:.1}, no window spread recorded)"),
-        },
-        None => String::new(),
-    };
-    let verdict = if holdout >= MAX_TURNS_PER_MATCH as f32 {
-        "SOLVED ✅"
-    } else if holdout > 4.0 * baseline as f32 {
-        "well above random baseline 👍"
-    } else {
-            // "Weak" here is the POLICY's absolute level, not a disagreement with the
-            // race reading — say which, so it cannot be read as contradicting the
-            // guardrail card's `status` (that grades exam-vs-race, a different question).
-        "far below the 500-turn target — REINFORCE may have collapsed ❌"
-    };
-    println!(
-        "guardrail: holdout survival {exam} of {MAX_TURNS_PER_MATCH} turns{smoothed_note} — {verdict}"
-    );
-}
 
 // ═══ SECTION 4 — main(): config → spec → run → guardrail ═══════════════
 
@@ -446,7 +403,6 @@ fn main() {
         // ELITES
         .set_elite_count(pop / 20)
         .set_elite_previous_load(true) // on by default
-        .set_elite_guardrail_matches(GUARDRAIL_MATCHES)
         .set_elite_freeze(true) // frozen elites still score, rank and sire
         .set_elite_join_probation_steps(5) // age before a net may join the elite set (A/B re-checked 2026-10-26: 5 wins both fast seeds — see DONE.md)
         .set_elite_crown_lifetime_steps(5) // how long the frozen crown may sit at peak
