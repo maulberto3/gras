@@ -343,7 +343,9 @@ pub struct RaceConfig {
         /// wins). `None` ⇒ the default `results/` folder.
     pub elite_previous_dir: Option<std::path::PathBuf>,
         /// Per-checkpoint elite weight snapshot (`checkpoint-elite-<hash>.safetensors`,
-        /// overwritten each checkpoint). Default true — a hard kill loses at most one interval.
+        /// overwritten each checkpoint). Default true — a hard kill loses at most one
+        /// interval of READINGS, and the champion's weights survive it. It is not a
+        /// resume checkpoint: nothing reads these files back (see notes/RESUME.md §3-5).
     pub elite_checkpoint_weights: bool,
         /// Mutation probation: a random immigrant is cull-IMMUNE for its first
         /// `mutation_probation_steps` clocks. Default 5 (set in `defaults()`);
