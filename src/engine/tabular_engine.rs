@@ -120,6 +120,11 @@ impl TabularEngine {
             }
         }
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume")?;
+        // A hard kill can leave CSV rows for clocks the last checkpoint never reached
+        // (`history_flush_each` writes per clock, the frontier per interval). Rewind to the
+        // frontier BEFORE anything reads the windows or appends to the files — otherwise
+        // the resumed run re-emits rows that are already on disk.
+        CoreEngine::rewind_csvs_to_manifest(&run_dir)?;
         // Data layout comes from the HEADER (`explicit_test_rows`), not from
         // re-detecting the directory — the same pools replay after a rename.
         let explicit_test_rows = header.explicit_test_rows;
