@@ -111,6 +111,8 @@ impl RlEngine {
             ))
             .into());
         }
+        // Same rewind as the tabular flavor: the CSV may run ahead of the checkpoint.
+        CoreEngine::rewind_csvs_to_manifest(&run_dir)?;
         let metrics = config.metrics.clone();
         let run_seed = header.run_seed;
         let log_level = config.log_level;
