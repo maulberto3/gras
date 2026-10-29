@@ -120,10 +120,6 @@ pub struct PyRaceConfig {
     /// flush cadence key off this). **`0` = no durability tick** and one eternal era.
     #[pyo3(get, set)]
     pub checkpoint_every: usize,
-    /// Include the top nets' weights in each checkpoint file. Off means weights are
-    /// written only at stop, so a hard kill mid-run loses all of them.
-    #[pyo3(get, set)]
-    pub elite_checkpoint_weights: bool,
 
     // ── probation (cull immunity for newcomers) ─────────────────────────
     /// A random immigrant is cull-immune for its first k clocks; `0` = only the
@@ -188,18 +184,11 @@ pub struct PyRaceConfig {
     /// Write `telemetry.jsonl` (one JSON record per event, full fidelity).
     #[pyo3(get, set)]
     pub trace_file: bool,
-    /// Flush `history.csv` after every step instead of at checkpoints.
-    #[pyo3(get, set)]
-    pub history_flush_each: bool,
     #[pyo3(get, set)]
     pub elite_save_topology: bool,
-    #[pyo3(get, set)]
-    pub elite_save_safetensors: bool,
-    /// Also save the bottom `elite_count` nets (the anti-champion).
+    /// Also save the bottom `elite_count` nets' topologies (the anti-champion).
     #[pyo3(get, set)]
     pub worst_save_topology: bool,
-    #[pyo3(get, set)]
-    pub worst_save_safetensors: bool,
     /// Human label recorded in `engine.json` as `"run_name"`.
     #[pyo3(get, set)]
     pub run_name: Option<String>,
@@ -245,7 +234,6 @@ impl PyRaceConfig {
         crossover_ops_pool = Vec::new(),
         // durability + probation
         checkpoint_every = DEFAULT_CHECKPOINT_EVERY,
-        elite_checkpoint_weights = true,
         mutation_probation_steps = DEFAULT_PROBATION_STEPS,
         crossover_probation_steps = DEFAULT_PROBATION_STEPS,
         elite_join_probation_steps = DEFAULT_PROBATION_STEPS,
@@ -264,11 +252,8 @@ impl PyRaceConfig {
         // artifacts
         csv_export = true,
         trace_file = false,
-        history_flush_each = false,
         elite_save_topology = true,
-        elite_save_safetensors = true,
         worst_save_topology = false,
-        worst_save_safetensors = false,
         run_name = None,
         // inheritance + guardrail
         elite_previous_dir = None,
@@ -298,7 +283,6 @@ impl PyRaceConfig {
         tournament_size: usize,
         crossover_ops_pool: Vec<String>,
         checkpoint_every: usize,
-        elite_checkpoint_weights: bool,
         mutation_probation_steps: usize,
         crossover_probation_steps: usize,
         elite_join_probation_steps: usize,
@@ -315,11 +299,8 @@ impl PyRaceConfig {
         feature_split: Option<String>,
         csv_export: bool,
         trace_file: bool,
-        history_flush_each: bool,
         elite_save_topology: bool,
-        elite_save_safetensors: bool,
         worst_save_topology: bool,
-        worst_save_safetensors: bool,
         run_name: Option<String>,
         elite_previous_dir: Option<PathBuf>,
         guardrail_matches: usize,
@@ -348,7 +329,6 @@ impl PyRaceConfig {
             tournament_size,
             crossover_ops_pool,
             checkpoint_every,
-            elite_checkpoint_weights,
             mutation_probation_steps,
             crossover_probation_steps,
             elite_join_probation_steps,
@@ -365,11 +345,8 @@ impl PyRaceConfig {
             feature_split,
             csv_export,
             trace_file,
-            history_flush_each,
             elite_save_topology,
-            elite_save_safetensors,
             worst_save_topology,
-            worst_save_safetensors,
             run_name,
             elite_previous_dir,
             guardrail_matches,
@@ -534,7 +511,6 @@ impl PyRaceConfig {
         cfg.crossover_selection = crossover_selection;
         cfg.crossover_ops_pool = self.crossover_ops_pool;
         cfg.checkpoint_every = self.checkpoint_every;
-        cfg.elite_checkpoint_weights = self.elite_checkpoint_weights;
         cfg.mutation_probation_steps = self.mutation_probation_steps;
         cfg.crossover_probation_steps = self.crossover_probation_steps;
         cfg.elite_join_probation_steps = self.elite_join_probation_steps;
@@ -565,11 +541,8 @@ impl PyRaceConfig {
         cfg.feature_split = feature_split;
         cfg.csv_export = self.csv_export;
         cfg.trace_file = self.trace_file;
-        cfg.history_flush_each = self.history_flush_each;
         cfg.elite_save_topology = self.elite_save_topology;
-        cfg.elite_save_safetensors = self.elite_save_safetensors;
         cfg.worst_save_topology = self.worst_save_topology;
-        cfg.worst_save_safetensors = self.worst_save_safetensors;
         cfg.run_name = self.run_name;
         cfg.elite_previous_dir = self.elite_previous_dir;
         cfg.guardrail_matches = self.guardrail_matches;
