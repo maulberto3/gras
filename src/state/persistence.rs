@@ -116,27 +116,17 @@ pub struct ConfigSnapshot {
         /// written back — one truth per file.
     #[serde(default, rename = "evolution_train_lottery", skip_serializing)]
     pub legacy_train_lottery: Option<bool>,
-        /// Per-checkpoint elite weight snapshot flag. Informational — describes artifact
-        /// cadence, not replay semantics.
-    #[serde(default = "default_true")]
-    pub elite_checkpoint_weights: bool,
-        /// The four end-of-run artifact switches (`*_save_topology` / `*_save_safetensors`).
+        /// The two end-of-run TOPOLOGY switches (`*_save_topology`).
         /// Informational — they decide what exists on disk, never how the search ran — but
         /// an artifact trail with no record of what was asked for is unreadable.
-        /// `default_true` on the elite pair and `false` on the worst pair mirror
+        /// `default_true` on the elite and `false` on the worst mirrors
         /// `RaceConfig::defaults()`, so a legacy header reads what those runs did.
+        /// The WEIGHTS switches are gone with R4: `nets/<hash>.safetensors` is written for
+        /// every live net unconditionally, so there is nothing left to opt out of.
     #[serde(default = "default_true")]
     pub elite_save_topology: bool,
-    #[serde(default = "default_true")]
-    pub elite_save_safetensors: bool,
     #[serde(default)]
     pub worst_save_topology: bool,
-    #[serde(default)]
-    pub worst_save_safetensors: bool,
-        /// Flush `history.csv` / `attempts.csv` every clock (default `false` = at the
-        /// checkpoint tick). Durability cadence, not replay semantics.
-    #[serde(default)]
-    pub history_flush_each: bool,
         /// Mutation probation steps: cull-immunity for an immigrant's first k clocks.
         /// Replay-relevant.
     #[serde(default)]
@@ -222,12 +212,8 @@ impl ConfigSnapshot {
                 .elite_previous_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
-            elite_checkpoint_weights: cfg.elite_checkpoint_weights,
             elite_save_topology: cfg.elite_save_topology,
-            elite_save_safetensors: cfg.elite_save_safetensors,
             worst_save_topology: cfg.worst_save_topology,
-            worst_save_safetensors: cfg.worst_save_safetensors,
-            history_flush_each: cfg.history_flush_each,
             mutation_probation_steps: cfg.mutation_probation_steps,
             crossover_probation_steps: cfg.crossover_probation_steps,
             elite_join_probation_steps: cfg.elite_join_probation_steps,
@@ -442,6 +428,15 @@ pub struct RunHeader {
     pub started_at: Option<String>,
     /// Train/eval split ratio recorded for the run.
     pub train_eval_split_ratio: Option<f32>,
+        /// R3b: the EVAL-PERMUTATION era length, in clocks, as the run actually used it.
+        /// `checkpoint_every` means two things — how often the durability tick fires, and
+        /// how often the eval permutation rotates — and only the first is a caller's
+        /// choice on resume. Recorded separately so a resume at another cadence still
+        /// draws the eval batches the first half drew. `None` on legacy headers ⇒ the
+        /// resume falls back to the caller's `checkpoint_every` (which is what those runs
+        /// used for both roles).
+    #[serde(default)]
+    pub eval_era_every: Option<usize>,
         /// Cumulative culls at the last stop — restored on resume so the cull budget
         /// continues. `0` on legacy files.
     #[serde(default)]
@@ -619,6 +614,9 @@ impl RunHeader {
             max_steps,
             started_at: None,
             train_eval_split_ratio,
+            // Stamped by `CoreEngine::from_spec` right after construction (R3b): the
+            // constructor has no view of the cadence, the engine does.
+            eval_era_every: None,
             explicit_test_rows,
             culls,
             run_elapsed_secs,
@@ -800,6 +798,10 @@ impl RunHeader {
             max_steps,
             started_at,
             train_eval_split_ratio,
+            eval_era_every: v
+                .get("eval_era_every")
+                .and_then(|f| f.as_u64())
+                .map(|n| n as usize),
             explicit_test_rows,
             culls,
             run_elapsed_secs,
@@ -1103,6 +1105,39 @@ impl NetState {
         self.step + self.frozen_clocks()
     }
 
+    /// This net's record as it stood at clock `target`: the frozen/idle ledgers are
+    /// clamped to the window, `step` is recomputed for it, and `last_metrics` is
+    /// dropped when the file has moved PAST the target (its reading is then not the
+    /// one the target clock produced).
+    ///
+    /// Used only by the frontier-manifest resume: `nets/<hash>.json` is rewritten
+    /// whenever the net changes, so between ticks it can hold a LATER clock (or a
+    /// tombstone). The manifest says where the frontier actually was; this rewinds
+    /// the record to it. Clamping spans and `step` together keeps the ledger
+    /// identity (`step + frozen + idle == span`) true, which is what lets
+    /// `replay_segments` plan the window instead of guessing.
+    pub fn truncated_at(mut self, target: usize) -> Self {
+        let start = if self.entered_at_step == 0 {
+            0
+        } else {
+            self.entered_at_step + 1
+        };
+        self.frozen_spans = clamp_spans(&self.frozen_spans, target);
+        self.idle_spans = clamp_spans(&self.idle_spans, target);
+        let span = (target + 1).saturating_sub(start);
+        self.step = span
+            .saturating_sub(span_len(&self.frozen_spans))
+            .saturating_sub(span_len(&self.idle_spans));
+        if self
+            .last_metrics
+            .as_ref()
+            .is_some_and(|m| m.step > target)
+        {
+            self.last_metrics = None;
+        }
+        self
+    }
+
     /// Whether `step` lies inside a recorded frozen span.
     pub fn is_frozen_step(&self, step: usize) -> bool {
         self.frozen_spans
@@ -1363,11 +1398,9 @@ pub fn write_engine_json(dir: &Path, header: &RunHeader) -> Result<()> {
     })?;
     let path = dir.join("engine.json");
     let json = header.to_json()?;
-    std::fs::write(&path, json).map_err(|source| EngineError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
-    Ok(())
+    // Atomic: `engine.json` is what a resume reads first, so a kill mid-write
+    // must leave the previous header, never half of the new one.
+    write_atomic(&path, json.as_bytes(), true)
 }
 
 /// Stamp the post-race guardrail record into an EXISTING `engine.json` via raw read-modify-
@@ -1397,11 +1430,193 @@ fn stamp_engine_json_key(dir: &Path, key: &str, value: serde_json::Value) -> Res
     obj.insert(key.to_string(), value);
     let json = serde_json::to_string_pretty(&doc)
         .map_err(|e| EngineError::Json(format!("engine.json serialize: {e}")))?;
-    std::fs::write(&path, json).map_err(|source| EngineError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
+    write_atomic(&path, json.as_bytes(), true)
+}
+
+// ── Frontier manifest (`ckpt.json`) ────────────────────────────────────────
+
+/// Schema of [`FrontierManifest`]. Bump when the shape changes: a resume reads
+/// the schema BEFORE anything else, so an old manifest is refused by name rather
+/// than half-understood.
+///
+/// `2` (R4): every net named by the manifest also has `nets/<hash>.safetensors`, written
+/// in the same tick before this file. `1` was states-only, and this build refuses it by
+/// name — resuming one would need the retired replay path.
+pub const FRONTIER_MANIFEST_SCHEMA: u32 = 2;
+
+/// Keep the parts of each span at or before `target` (a span that crosses it is
+/// cut short; one that starts after it is dropped).
+fn clamp_spans(spans: &[(usize, usize)], target: usize) -> Vec<(usize, usize)> {
+    spans
+        .iter()
+        .filter(|(s, _)| *s <= target)
+        .map(|(s, e)| (*s, (*e).min(target)))
+        .collect()
+}
+
+/// One net's entry in the frontier manifest: its identity and the clock it had
+/// last MEASURED at the tick. That clock (not its trained-clock count) is what a
+/// replay targets, because it is what `NetState::last_metrics` records and what
+/// `step_clock` derives the next clock from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FrontierNet {
+    /// Full topology hash — the file name in `nets/`.
+    pub hash: String,
+    /// Clock this net was replayed to at the tick (`last_metrics.step`).
+    pub step: usize,
+}
+
+/// The frontier as a POINT-IN-TIME SET: which nets were live when the durability
+/// tick ran, and how far each had measured.
+///
+/// Why this file exists at all: `nets/<hash>.json` is rewritten whenever a net
+/// changes, so a net culled AFTER the tick overwrites its own file with an
+/// `is_alive: false` tombstone. A hard kill between ticks then leaves a
+/// `nets/` directory that no longer describes the tick — measured: 8 live nets
+/// became 2, and the resume refused as if the caller's `pop_size` were wrong
+/// (`notes/RESUME.md` §4). This manifest is written after the net files, so a
+/// manifest that lags is safe (replay each net to the listed step) and one that
+/// leads the files is refused.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FrontierManifest {
+    /// [`FRONTIER_MANIFEST_SCHEMA`].
+    pub schema: u32,
+    /// The clock the NEXT step will run (completed clocks + 1) — the number
+    /// `CoreEngine::step_clock` must answer after a resume, independent of any
+    /// net's own lag (a frozen crown measures without training).
+    pub next_clock: usize,
+    /// The run's seed at the tick; a resume refuses a mismatch.
+    pub run_seed: u64,
+    /// The live set, sorted by hash so the file's bytes are deterministic.
+    pub nets: Vec<FrontierNet>,
+}
+
+/// The temporary sibling a [`write_atomic`] rename goes through.
+fn tmp_sibling(path: &Path) -> std::path::PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".tmp");
+    path.with_file_name(name)
+}
+
+/// Write `bytes` to `path` via a temporary sibling + rename, so a process killed
+/// mid-write leaves the OLD file intact instead of a truncated one.
+///
+/// `sync` additionally fsyncs the file before the rename — worth it for the few
+/// small files a crash-restart depends on (`ckpt.json`, `engine.json`), not for
+/// the per-net frontier (a rename is already atomic against a process kill; only
+/// power loss needs the fsync, and one per net per tick is a real cost).
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], sync: bool) -> Result<()> {
+    use std::io::Write;
+    let tmp = tmp_sibling(path);
+    let io = |e: std::io::Error, p: &Path| EngineError::Io {
+        path: p.display().to_string(),
+        source: e,
+    };
+    {
+        let mut file = std::fs::File::create(&tmp).map_err(|e| io(e, &tmp))?;
+        file.write_all(bytes).map_err(|e| io(e, &tmp))?;
+        if sync {
+            file.sync_all().map_err(|e| io(e, &tmp))?;
+        }
+    }
+    std::fs::rename(&tmp, path).map_err(|e| io(e, path))?;
     Ok(())
+}
+
+/// Write the frontier manifest for this tick (`<run_dir>/ckpt.json`).
+pub fn write_frontier_manifest(dir: &Path, manifest: &FrontierManifest) -> Result<()> {
+    let json = serde_json::to_string_pretty(manifest)
+        .map_err(|e| EngineError::Json(format!("ckpt.json serialize: {e}")))?;
+    write_atomic(&dir.join("ckpt.json"), json.as_bytes(), true)
+}
+
+/// Read `<run_dir>/ckpt.json`. `None` = a run dir written before the manifest
+/// existed (or one that has not reached its first tick), which resumes the old
+/// way, by scanning `nets/`.
+pub fn load_frontier_manifest(dir: &Path) -> Result<Option<FrontierManifest>> {
+    let path = dir.join("ckpt.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(EngineError::Io {
+                path: path.display().to_string(),
+                source,
+            }
+            .into())
+        }
+    };
+    let manifest: FrontierManifest = serde_json::from_str(&raw)
+        .map_err(|e| EngineError::Json(format!("ckpt.json parse: {e}")))?;
+    if manifest.schema != FRONTIER_MANIFEST_SCHEMA {
+        let why = if manifest.schema == 1 {
+            "schema 1 recorded net STATES only, so resuming it would need the retired \
+             replay path — finish that run with the build that started it"
+        } else {
+            "re-run the experiment, or resume it with the build that wrote it"
+        };
+        return Err(EngineError::InvalidOptions(format!(
+            "ckpt.json reports schema {} but this build resumes schema {} only — {why}",
+            manifest.schema, FRONTIER_MANIFEST_SCHEMA
+        ))
+        .into());
+    }
+    if manifest.nets.is_empty() {
+        return Err(EngineError::InvalidOptions(
+            "ckpt.json lists no nets — the frontier snapshot is empty, so there is nothing \
+             to resume; the run dir is corrupt"
+                .to_string(),
+        )
+        .into());
+    }
+    Ok(Some(manifest))
+}
+
+/// Drop the rows of `<run_dir>/<file>` that belong to clock `next_clock` or later,
+/// returning how many went. A no-op when the file is absent.
+///
+/// The reason it exists: a dir written before the one-cadence change (R3) flushed
+/// `history.csv` at the end of every clock while the frontier moved only every
+/// `checkpoint_every`, so a hard kill left rows for clocks the frontier never
+/// reached and a resume appended them again (measured: 16 and 60 duplicate rows,
+/// `notes/RESUME.md` §4). Rewinding to the manifest's clock makes even such a
+/// legacy dir a true prefix of the race — and it stays as the safety net for any
+/// future writer that gets ahead of the frontier.
+///
+/// Rows whose `step` field does not parse are KEPT: an unreadable row is not
+/// evidence that it is in the future, and silently dropping history is worse.
+pub fn truncate_csv_to_clock(dir: &Path, file: &str, next_clock: usize) -> Result<usize> {
+    let path = dir.join(file);
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(0);
+    };
+    let mut kept = String::with_capacity(raw.len());
+    let mut dropped = 0usize;
+    for (i, line) in raw.lines().enumerate() {
+        if i == 0 {
+            kept.push_str(line);
+            kept.push('\n');
+            continue;
+        }
+        let step = line
+            .split(',')
+            .next()
+            .and_then(|s| s.trim().parse::<usize>().ok());
+        match step {
+            Some(s) if s >= next_clock => dropped += 1,
+            _ => {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+        }
+    }
+    if dropped > 0 {
+        write_atomic(&path, kept.as_bytes(), false)?;
+    }
+    Ok(dropped)
 }
 
 /// Load the run header from `engine.json` in `dir`.
@@ -1424,15 +1639,15 @@ pub fn ensure_nets_dir(dir: &Path) -> Result<()> {
 }
 
 /// Write (overwrite) one net's state to `nets/<hash>.json`.
+///
+/// Atomic via rename, so a kill mid-write cannot leave a truncated JSON that the
+/// next resume would have to refuse. No fsync: the rename survives a process
+/// kill, and a frontier snapshot of 8-500 net files must not pay 8-500 fsyncs.
 pub fn write_net_state(dir: &Path, state: &NetState) -> Result<()> {
     ensure_nets_dir(dir)?;
     let path = dir.join("nets").join(format!("{}.json", state.hash));
     let json = state.to_json()?;
-    std::fs::write(&path, json).map_err(|source| EngineError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
-    Ok(())
+    write_atomic(&path, json.as_bytes(), false)
 }
 
 /// Load one net's state from `nets/<hash>.json`.
@@ -1478,6 +1693,91 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// The manifest is the frontier as a SET: it must round-trip, and a schema bump
+    /// must be REFUSED by name rather than half-read.
+    #[test]
+    fn frontier_manifest_round_trips_and_refuses_a_newer_schema() {
+        let dir = fresh_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            load_frontier_manifest(&dir).unwrap().is_none(),
+            "no file = no manifest (a legacy dir resumes the old way)"
+        );
+        let manifest = FrontierManifest {
+            schema: FRONTIER_MANIFEST_SCHEMA,
+            next_clock: 41,
+            run_seed: 7,
+            nets: vec![
+                FrontierNet {
+                    hash: "aa".to_string(),
+                    step: 40,
+                },
+                FrontierNet {
+                    hash: "bb".to_string(),
+                    step: 39,
+                },
+            ],
+        };
+        write_frontier_manifest(&dir, &manifest).unwrap();
+        assert_eq!(load_frontier_manifest(&dir).unwrap(), Some(manifest));
+        // A rejected write leaves no `ckpt.json.tmp` behind either.
+        assert!(!dir.join("ckpt.json.tmp").exists(), "tmp file must be renamed away");
+
+        let mut newer = serde_json::to_value(load_frontier_manifest(&dir).unwrap().unwrap()).unwrap();
+        newer["schema"] = serde_json::json!(FRONTIER_MANIFEST_SCHEMA + 1);
+        std::fs::write(dir.join("ckpt.json"), newer.to_string()).unwrap();
+        let err = load_frontier_manifest(&dir).unwrap_err().to_string();
+        assert!(err.contains("schema"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rewinding keeps the header and every row before the clock; it drops the rows a
+    /// per-step flush wrote past the last checkpoint (the measured duplicate source).
+    #[test]
+    fn truncate_csv_to_clock_keeps_the_prefix_only() {
+        let dir = fresh_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("history.csv"),
+            "step,hash,fitness\n0,a,1\n1,a,2\n2,a,3\n7,b,4\n",
+        )
+        .unwrap();
+        let dropped = truncate_csv_to_clock(&dir, "history.csv", 3).unwrap();
+        assert_eq!(dropped, 1, "only clock 7 is at or past the frontier clock 3");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("history.csv")).unwrap(),
+            "step,hash,fitness\n0,a,1\n1,a,2\n2,a,3\n"
+        );
+        // A second call is a no-op — the file is already a prefix.
+        assert_eq!(truncate_csv_to_clock(&dir, "history.csv", 3).unwrap(), 0);
+        // A missing file is not an error (csv_export can be off).
+        assert_eq!(truncate_csv_to_clock(&dir, "attempts.csv", 3).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A record that has moved past the frontier is rewound consistently: spans clamped,
+    /// `step` recomputed for the window, the too-late reading dropped — so the ledger
+    /// identity (`step + frozen + idle == span`) still holds for the replay planner.
+    #[test]
+    fn net_state_truncates_to_an_earlier_frontier() {
+        // Built through the real reader, so the fixture cannot drift from the schema.
+        let state = NetState::from_json(
+            r#"{"hash":"aa","topology":"{}","net_seed":1,"step":10,
+                 "entered_at_step":0,"is_alive":true,
+                 "frozen_spans":[[8,12]],"idle_spans":[[14,15]],
+                 "last_metrics":{"step":15,"train_loss":1.0,"fitness":1.0,"informative":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(state.measured_clocks(), 15, "10 trained + 5 crown act clocks");
+        let t = state.truncated_at(9);
+        assert_eq!(t.frozen_spans, vec![(8, 9)]);
+        assert!(t.idle_spans.is_empty());
+        // Window 0..=9 is 10 clocks: 8 trained + 2 frozen.
+        assert_eq!(t.step, 8, "step must cover the window minus the clamped ledgers");
+        assert_eq!(t.measured_clocks() + t.idle_clocks(), 10);
+        assert!(t.last_metrics.is_none(), "the reading is from a later clock");
     }
 
     fn baseline_header(run_id: &str) -> RunHeader {
@@ -1551,26 +1851,21 @@ mod tests {
         /// The artifact switches and the CSV flush cadence reach `engine.json` too: they
         /// never change the search, but an artifact trail without a record of what was
         /// ASKED for cannot be read back. Legacy headers fall back to `RaceConfig::defaults()`
-        /// (elite pair on, worst pair off, flush off).
+        /// (elite pair on, worst pair off).
     #[test]
-    fn config_snapshot_records_artifact_flags_and_flush_cadence() {
+    fn config_snapshot_records_artifact_flags() {
         use crate::engine::config::RaceConfig;
         let mut cfg = RaceConfig::defaults();
         cfg.elite_save_topology = false;
-        cfg.elite_save_safetensors = false;
         cfg.worst_save_topology = true;
-        cfg.worst_save_safetensors = true;
-        cfg.history_flush_each = true;
         let snap = ConfigSnapshot::from_config(&cfg, None, None);
-        assert!(!snap.elite_save_topology && !snap.elite_save_safetensors);
-        assert!(snap.worst_save_topology && snap.worst_save_safetensors);
-        assert!(snap.history_flush_each);
+        assert!(!snap.elite_save_topology);
+        assert!(snap.worst_save_topology);
 
         // A pre-field header must read the defaults those runs actually ran with.
         let legacy: ConfigSnapshot = serde_json::from_str("{}").expect("empty snapshot loads");
-        assert!(legacy.elite_save_topology && legacy.elite_save_safetensors);
-        assert!(!legacy.worst_save_topology && !legacy.worst_save_safetensors);
-        assert!(!legacy.history_flush_each);
+        assert!(legacy.elite_save_topology);
+        assert!(!legacy.worst_save_topology);
     }
 
         /// A header written before the field existed must read as the policy those runs
