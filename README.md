@@ -66,6 +66,22 @@ cargo add gras --features cuda
 (`~/.flodl/libtorch/precompiled/...`), so a fresh kernel or venv does not need
 `LD_LIBRARY_PATH` exported by hand.
 
+## Rust
+
+Two runnable examples carry the whole driven surface — a tabular showcase
+(`mnist`) and an RL one (`cartpole`). Both link against the libtorch that
+`env_setup.sh` points at, so source it first:
+
+```bash
+source env_setup.sh
+cargo run --release --example cartpole -- --pop 32 --max-steps 20
+cargo run --release --example mnist    -- --pop 50 --max-steps 15
+```
+
+Every engine knob is a `const` at the top of each example; a flag overrides the
+const, and `--help` lists what the binary accepts. Runs write to
+`results/<timestamp>`.
+
 ## Python
 
 The bindings live in the `gras-py` workspace member and build into the `gras`
@@ -160,10 +176,20 @@ Same seed and config reproduce the same `history.csv` stream, exactly as the
 Rust replay contract promises. v1 covers a whole-race `run()` plus `Topology`
 JSON handles; per-step control and Python callbacks are still open in TODO.md.
 
+**Runs from the v0.1.0 scaffold do not resume.** Those runs record
+`"trainer": "py_cross_entropy"` in `engine.json`; the promoted trainer records
+`"trainer": "tabular"`, and resume compares the recorded recipe before the first
+step, so it refuses the old run and names the differing key rather than training
+on with a different recipe than the one that produced the population. This is
+deliberate — no compatibility bridge. Re-run from the seed, or keep the old
+directory as a read-only artifact.
+
 For the guided version — config knobs, a live race, `history.csv` charts, replay
 checks, a candidate's topology, and your own CSV or MNIST data raced through the
 same call — open
 [`notebooks/python_bindings_tour.ipynb`](notebooks/python_bindings_tour.ipynb).
+That path is the `notebooks/` folder at the repository root (a sibling of
+`python/`, `gras-py/` and `examples/`), not part of the Python package.
 
 ## Get started
 
