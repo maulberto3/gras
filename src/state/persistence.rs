@@ -116,10 +116,6 @@ pub struct ConfigSnapshot {
         /// written back — one truth per file.
     #[serde(default, rename = "evolution_train_lottery", skip_serializing)]
     pub legacy_train_lottery: Option<bool>,
-        /// How many initial slots were user-supplied run topologies. Informational (lineage
-        /// reads: ordinals below this are imports).
-    #[serde(default)]
-    pub run_topology_count: usize,
         /// Per-checkpoint elite weight snapshot flag. Informational — describes artifact
         /// cadence, not replay semantics.
     #[serde(default = "default_true")]
@@ -221,7 +217,6 @@ impl ConfigSnapshot {
             freeze_elites: cfg.freeze_elites,
             train_merit: cfg.train_merit,
             legacy_train_lottery: None,
-            run_topology_count: cfg.run_topologies.len(),
             elite_previous_load: cfg.elite_previous_load,
             elite_previous_dir: cfg
                 .elite_previous_dir
@@ -476,7 +471,7 @@ pub struct RunHeader {
     #[serde(default)]
     pub guardrail: Option<GuardrailRecord>,
     /// The previous experiment this run's founder batch was seeded from (see
-    /// [`SeedSourceRecord`]). `None` = an all-random + user-blueprint batch.
+    /// [`SeedSourceRecord`]). `None` = an all-random batch: nothing was inherited.
     #[serde(default)]
     pub run_topology_source: Option<SeedSourceRecord>,
     /// What the run DID to its population (see [`RunAccounting`]). Written at
