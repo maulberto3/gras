@@ -1,10 +1,18 @@
 // NOTE: `source env_setup.sh` in the shell first — this example is built and linked against that environment.
-//! CartPole — the RL example: a pure-Rust environment, a REINFORCE policy, a
-//! trainer-reported fitness, and a post-race guardrail.
+//! CartPole — the RL example: a pure-Rust environment behind the crate's `Env`
+//! contract, the crate's REINFORCE trainer on top of it, a trainer-reported
+//! fitness, and a post-race guardrail.
 //!
-//! Four sections: **1** the environment, **2** the trainer (the `RlStep`
-//! contract), **3** the guardrail, **4** `main()` wiring config → spec → run.
+//! Four sections: **1** the environment (an `Env`: `reset(seed)` / `step(action)`),
+//! **2** the trainer (the crate's `Reinforce`, wired at this example's knobs),
+//! **3** the guardrail, **4** `main()` wiring config → spec → run.
 //! Vocabulary: **match** = one episode, **turn** = one env step.
+//!
+//! The algorithm is deliberately NOT here: `trainer::reinforce` plays the
+//! episodes, derives the per-turn returns, the batch-mean baseline and the
+//! unit-variance advantages, and takes the masked `log_softmax` update. What the
+//! crate cannot ship is the *world* — the physics below — so the split is
+//! environment here, algorithm in the crate, knobs in this file.
 //!
 //! Every knob is a const or a builder line; the only flags are the smoke-run
 //! ones (`--pop`, `--max-steps`, `--seed`, `--log-level`, `--risk-aversion`
@@ -31,33 +39,8 @@ use gras::engine::config::DEFAULT_CHECKPOINT_EVERY;
 // `avg … (spread …; SE … = spread/√n, n=…)`.
 use gras::engine::format::{ReadingStyle, fmt_reading};
 use gras::prelude::*;
-/// One played turn: the observation, and the action taken from it.
-type Transition = ([f32; 4], usize);
 
-/// One RL train step: forward + `pred`-only loss + backward + optimizer step.
-/// Local to the example — a recipe, not a crate primitive (ARCHITECTURE.md §4).
-fn train_one_step_pred_only(
-    net: &mut Network,
-    optimizer: &mut dyn Optimizer,
-    loss_fn: &dyn Fn(&Variable) -> gras::flodl::tensor::Result<Variable>,
-    inputs: &Tensor,
-    grad_clip: f32,
-) -> gras::flodl::tensor::Result<f32> {
-    let x = Variable::new(inputs.clone(), true);
-    let pred = net.forward(&x)?;
-    let loss = loss_fn(&pred)?;
-    let loss_val = loss.item().unwrap_or(0.0) as f32;
-    loss.set_requires_grad(true)?;
-    optimizer.zero_grad();
-    loss.backward()?;
-    if grad_clip > 0.0 {
-        gras::flodl::clip_grad_norm(&net.parameters(), grad_clip as f64)?;
-    }
-    optimizer.step()?;
-    Ok(loss_val)
-}
-
-// ═══ SECTION 1 — THE ENVIRONMENT (plain Rust) ══════════════════════════
+// ═══ SECTION 1 — THE ENVIRONMENT (an `Env`) ════════════════════════════
 
 /// CartPole state: [cart_x, cart_v, pole_angle, pole_ang_vel].
 #[derive(Clone, Copy)]
@@ -94,6 +77,10 @@ const X_LIMIT: f32 = 2.4;
 const THETA_LIMIT: f32 = 12.0_f32.to_radians();
 /// Episode cap in turns — also the fitness ceiling (500 = solved).
 const MAX_TURNS_PER_MATCH: usize = 500;
+/// Reward for one survived turn. `Signal::Turns` derives the returns from the
+/// episode LENGTH instead, so this is what a `Signal::Return` reader sees —
+/// constant on purpose: in cartpole only duration carries information.
+const REWARD_PER_TURN: f32 = 1.0;
 
 impl CartPole {
     /// A fresh episode at (x, theta) at rest — the only randomized start.
@@ -116,8 +103,10 @@ impl CartPole {
         self.x.abs() > X_LIMIT || self.theta.abs() > THETA_LIMIT
     }
 
-    /// One physics step (classic CartPole semi-implicit Euler).
-    fn step(&mut self, action: usize) {
+    /// One physics step (classic CartPole semi-implicit Euler). Deliberately NOT
+    /// `Env::step`: this moves the state, and the trait's version is what hands
+    /// the trainer an observation, a reward and the done flag.
+    fn advance(&mut self, action: usize) {
         let force = if action == 1 { FORCE_MAG } else { -FORCE_MAG };
         let cos_t = self.theta.cos();
         let sin_t = self.theta.sin();
@@ -132,14 +121,80 @@ impl CartPole {
     }
 }
 
-// ═══ SECTION 2 — THE TRAINER (the RlStep contract) ═════════════════════
+impl Env for CartPole {
+    /// A fresh episode: the ONLY draw this world makes, and it comes from the
+    /// seed the trainer hands over — which is what makes the same seed replay
+    /// the same episode and a resumed run play exactly what the recorded one
+    /// played. A world that drew from a hidden global could do neither.
+    fn reset(&mut self, seed: u64) -> gras::flodl::tensor::Result<Vec<f32>> {
+        let mut rng = Rng::with_seed(seed);
+        *self = CartPole::new(rng.f32() * 0.1 - 0.05, rng.f32() * 0.1 - 0.05);
+        Ok(self.obs().to_vec())
+    }
 
-/// The guardrail's games stay on a FIXED seed forever: verdicts have to be
-/// comparable across runs even though each run draws its own race seed.
-const GUARDRAIL_SEED: u64 = 2;
+    /// One turn: move the physics, then report the observation the NEXT action
+    /// is chosen from, this turn's reward, and whether the episode ended.
+    fn step(&mut self, action: usize) -> gras::flodl::tensor::Result<(Vec<f32>, f32, bool)> {
+        self.advance(action);
+        Ok((self.obs().to_vec(), REWARD_PER_TURN, self.failed()))
+    }
+
+    fn action_count(&self) -> usize {
+        ACTIONS
+    }
+
+    fn max_turns(&self) -> usize {
+        MAX_TURNS_PER_MATCH
+    }
+
+    /// What `engine.json` records as the world this run trained: its identity,
+    /// its action/observation shapes, and every physics knob that would change
+    /// a replayed episode.
+    fn describe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "env": "CartPole-v1 physics (pure Rust)",
+            "observations": ["cart_x", "cart_v", "pole_angle", "pole_ang_vel"],
+            "actions": ACTIONS,
+            "max_turns": MAX_TURNS_PER_MATCH,
+            "start": "x, theta ~ U(-0.05, 0.05) from reset(seed), at rest",
+            "fail": {"x_limit": X_LIMIT, "theta_limit_rad": THETA_LIMIT},
+            "physics": {
+                "gravity": GRAVITY,
+                "cart_mass": CART_MASS,
+                "pole_mass": POLE_MASS,
+                "force_mag": FORCE_MAG,
+                "tau": TAU,
+            },
+            "reward_per_turn": REWARD_PER_TURN,
+        })
+    }
+}
+
+/// Mean survival of a random policy — the bar a race has to beat.
+fn random_baseline(matches: usize) -> f64 {
+    let mut total = 0.0f64;
+    let mut rng = Rng::with_seed(3);
+    for _ in 0..matches {
+        let mut env = CartPole::new(0.0, 0.0);
+        let mut turns = 0usize;
+        while turns < MAX_TURNS_PER_MATCH {
+            env.advance(rng.usize(..ACTIONS));
+            turns += 1;
+            if env.failed() {
+                break;
+            }
+        }
+        total += turns as f64;
+    }
+    total / matches as f64
+}
+
+// ═══ SECTION 2 — THE TRAINER (the crate's `Reinforce`) ═════════════════
+
 /// Adam step size for the REINFORCE update.
 const LEARNING_RATE: f32 = 1e-3;
-/// Dropout applied during the training forward pass only.
+/// Dropout the topology is built with; the trainer turns it ON for the update's
+/// forward pass and OFF for every episode it plays (see `Reinforce`'s modes).
 const DROPOUT_PROB: f32 = 0.25;
 /// Gradient-norm clip before the optimizer step; 0 disables it.
 const GRAD_CLIP: f32 = 2.0;
@@ -153,315 +208,33 @@ const CHALLENGE_POLICY: ChallengePolicy = ChallengePolicy::LeastAction;
 /// Challenge decay shape: eff = p × (1 − progress^k).
 const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 
-/// Pure fn of (net_seed, step, match_i) — the replay-determinism contract for
-/// RL resume; the caller blends the run seed in (`ctx.net_seed ^ run_seed`).
-fn episode_start_seed(net_seed: u64, step: usize, match_i: u64) -> u64 {
-    net_seed
-        ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ match_i.wrapping_mul(0xBF58_476D_1CE4_E5B9)
-}
-
-/// Eval games use run_seed + 1000 (shared, never trained on); guardrail games
-/// use GUARDRAIL_SEED — fixed forever, so verdicts stay comparable.
-fn shared_start_seed(seed_base: u64, step: usize, match_i: u64) -> u64 {
-    episode_start_seed(seed_base, step, match_i)
-}
-
-/// MEAN of the batch's survivals — one lucky match can't inflate the step.
-fn fitness_from_survivals(survivals: &[usize]) -> f32 {
-    if survivals.is_empty() {
-        return 0.0;
-    }
-    survivals.iter().copied().sum::<usize>() as f32 / survivals.len() as f32
-}
-
-/// Mean survival of a random policy — the bar a race has to beat.
-fn random_baseline(matches: usize) -> f64 {
-    let mut total = 0.0f64;
-    let mut rng = Rng::with_seed(3);
-    for _ in 0..matches {
-        let mut env = CartPole::new(0.0, 0.0);
-        let mut turns = 0usize;
-        while turns < MAX_TURNS_PER_MATCH {
-            env.step(rng.usize(..2));
-            turns += 1;
-            if env.failed() {
-                break;
-            }
-        }
-        total += turns as f64;
-    }
-    total / matches as f64
-}
-
-/// REINFORCE with per-turn credit (G_t = turns − t), batch-mean baseline,
-/// O(1) advantages — and the guardrail scorer, same type (one `RlStep` block).
-struct CartPoleTrainer {
-    /// Device every tensor and match in this trainer runs on.
-    device: Device,
-    /// Train matches per step — the learning signal (`MATCHES_PER_STEP`).
-    matches_per_step: usize,
-    /// Eval matches per step — the ranking signal (`EVAL_MATCHES_PER_STEP`).
-    eval_matches_per_step: usize,
-    /// The trainer's own anti-plateau knob (see `CHALLENGE_PROB`). Rolled
-    /// inside `train_step` — the engine never sees it.
-    challenge_prob: f32,
-    /// Which policy a fired challenge applies (see `CHALLENGE_POLICY`).
-    challenge_policy: ChallengePolicy,
-}
-
-impl CartPoleTrainer {
-    /// Play one match with the greedy head; `forced` is the challenge override —
-    /// `Exact(a)` holds one action on every turn, `Least` re-picks the argmin.
-    fn play_episode(
-        &self,
-        net: &mut Network,
-        start_seed: u64,
-        forced: Option<ForcedAction>,
-    ) -> gras::flodl::tensor::Result<(Vec<Transition>, usize)> {
-        let mut rng = Rng::with_seed(start_seed);
-        let mut env = CartPole::new(rng.f32() * 0.1 - 0.05, rng.f32() * 0.1 - 0.05);
-        let mut traj = Vec::new();
-        let mut turns = 0usize;
-        while turns < MAX_TURNS_PER_MATCH {
-            let o = env.obs();
-            let t = Tensor::from_f32(&o, &[1, 4], self.device)?;
-            let pred = net.forward(&Variable::new(t, false))?;
-            let logits = pred.data().to_f32_vec()?;
-            let action = match forced {
-                Some(f) => f.resolve(&logits),
-                None => {
-                    if logits[1] > logits[0] {
-                        1
-                    } else {
-                        0
-                    }
-                }
-            };
-            traj.push((o, action));
-            env.step(action);
-            turns += 1;
-            if env.failed() {
-                break;
-            }
-        }
-        Ok((traj, turns))
-    }
-
-    /// REINFORCE update over a batch of played matches — shared by
-    /// `train_step` and `challenge_step`. Returns the loss.
-    fn reinforce_update(
-        &self,
-        net: &mut Network,
-        optimizer: &mut dyn Optimizer,
-        all_transitions: &[Transition],
-        matches: &[(usize, usize)],
-    ) -> gras::flodl::tensor::Result<f32> {
-        let total = all_transitions.len();
-        let mut flat = Vec::with_capacity(total * 4);
-        let mut mask = vec![0.0f32; total * 2];
-        let mut returns = Vec::with_capacity(total);
-        // eli5: returns are the remaining survival steps for each transition.
-        for (offset, survival) in matches {
-            for t in 0..*survival {
-                let i = offset + t;
-                flat.extend_from_slice(&all_transitions[i].0);
-                mask[i * 2 + all_transitions[i].1] = 1.0;
-                returns.push((*survival - t) as f32);
-            }
-        }
-        // eli5: the baseline is the average return across all transitions.
-        let baseline = returns.iter().sum::<f32>() / returns.len() as f32;
-        // eli5: the advantages are the returns minus the baseline.
-        let advantages: Vec<f32> = returns.iter().map(|g| g - baseline).collect();
-        // eli5: the standard deviation of the advantages, used for scaling to unit variance.
-        let adv_std =
-            (advantages.iter().map(|a| a * a).sum::<f32>() / advantages.len() as f32).sqrt();
-        let scale = 1.0 / adv_std.max(1e-6);
-
-        net.train(); // dropout on; eval is the resting state
-        let x = Variable::new(
-            Tensor::from_f32(&flat, &[total as i64, 4], self.device)?,
-            true,
-        );
-        // x shape: [total, 4], pred shape: [total, 2]
-        let pred = net.forward(&x)?;
-        // The score function ∇log π(a|s) REQUIRES a normalized log-prob: raw logits
-        // (or an argmax indicator) are not a gradient — keep the log_softmax.
-        let logp = pred.data().log_softmax(1)?;
-        // Mask out the log probabilities of the actions not taken.
-        // shape: [total, 2] — mask for the actions taken (1 for taken, 0 for not taken).
-        let m = Tensor::from_f32(&mask, &[total as i64, 2], self.device)?;
-        // Element-wise multiply the log probabilities by the mask to zero out the actions not taken.
-        // shape: [total, 2] — log probabilities for the actions taken (0 for not taken, logp for taken).
-        let chosen = logp.mul(&m)?;
-        // eli5: advantages are the returns minus the baseline, scaled to have unit variance.
-        // shape: [total, 1] — advantages for each transition.
-        let adv = Tensor::from_f32(&advantages, &[total as i64, 1], self.device)?;
-        // eli5: multiply the log probabilities of the chosen actions by the advantages.
-        // shape: [total, 1] — weighted log probabilities for each transition.
-        let weighted = chosen
-            .sum_dims(&[1], false)?
-            .reshape(&[total as i64, 1])?
-            .mul(&adv)?;
-        // eli5: scale the weighted log probabilities by the inverse of the advantages' standard deviation.
-        // shape: [1] — the scaling factor for the weighted log probabilities.
-        let s = Tensor::from_f32(&[scale], &[1], self.device)?;
-        // eli5: multiply the weighted log probabilities by the scaling factor.
-        // shape: [1] — the final loss value after summing and scaling.
-        let loss = Variable::new(weighted.sum()?.mul(&s)?, false);
-        net.eval();
-
-        // The closure ignores `pred`: the forward here runs on a dummy obs —
-        // only the graph above carries gradients.
-        let inputs = Tensor::from_f32(&[0.0; 4], &[1, 4], self.device)?;
-        train_one_step_pred_only(
-            net,
-            optimizer,
-            &|_: &Variable| Ok(loss.clone()),
-            &inputs,
-            GRAD_CLIP,
-        )
-    }
-
-    /// Score the run's informative metrics on this step's eval survivals — RL
-    /// has no batch to score against, so the TRAINER owns the call.
-    fn score_metrics(
-        &self,
-        metrics: &[Metric],
-        survivals: &[usize],
-    ) -> gras::flodl::tensor::Result<Vec<f32>> {
-        if metrics.is_empty() {
-            return Ok(Vec::new());
-        }
-        let vals: Vec<f32> = survivals.iter().map(|s| *s as f32).collect();
-        let t = Tensor::from_f32(&vals, &[vals.len() as i64], self.device)?;
-        let (pred, target) = (Variable::new(t.clone(), false), Variable::new(t, false));
-        metrics.iter().map(|m| m.score(&pred, &target)).collect()
-    }
-}
-
-impl RlStep for CartPoleTrainer {
-    /// Adam over the net's parameters — one optimizer per net, kept across steps.
-    fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
-        Box::new(gras::flodl::nn::Adam::new(
-            &net.parameters(),
-            LEARNING_RATE as f64,
-        ))
-    }
-
-    /// The recorded trainer blob — resume diffs it, so a knob change is named.
-    fn describe(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
-            "trainer": "cartpole",
-            "env": "CartPole-v1 physics (pure Rust), 500-turn cap",
-            "update": "REINFORCE (log_softmax autodiff), baseline + per-turn returns + adv normalization",
-            "matches_per_step": self.matches_per_step,
-            "eval_matches_per_step": self.eval_matches_per_step,
-            "learning_rate": LEARNING_RATE,
-            "grad_clip": GRAD_CLIP,
-            "dropout_prob": DROPOUT_PROB,
-            // The challenge trigger is TRAINER-owned, so `describe()` is the
-            // only place a reader of the log can see it at all.
-            "challenge_prob": self.challenge_prob,
-            "challenge_policy": self.challenge_policy.to_string(),
-            "challenge_decay": format!(
-                "custom:{CHALLENGE_DECAY_EXPONENT}" // eff = p × (1 − progress^k)
-            ),
-        }))
-    }
-
-    /// Guardrail measurement half: play ONE fresh guardrail game, in the same
-    /// units as the reported fitness so ranking and the guardrail agree.
-    fn holdout_score(
-        &mut self,
-        net: &mut Network,
-        game_i: usize,
-    ) -> gras::flodl::tensor::Result<f32> {
-        let seed = shared_start_seed(GUARDRAIL_SEED, 0, game_i as u64);
-        let (_, survival) = self.play_episode(net, seed, None)?;
-        Ok(survival as f32)
-    }
-
-    /// One step: play train matches (challenge-aware), REINFORCE-update, then
-    /// measure on shared eval games — the fitness that ranks.
-    fn train_step(
-        &mut self,
-        net: &mut Network,
-        optimizer: &mut dyn Optimizer,
-        step: usize,
-        ctx: &RlContext<'_>,
-    ) -> gras::flodl::tensor::Result<RlStepReport> {
-        // Anti-plateau challenge: on a fired step the policy forces an action on
-        // every TRAIN turn — a pure fn of (run_seed, net_seed, step).
-        let challenged = gras::trainer::challenge_fires(
-            ctx.env.run_seed,
-            ctx.net_seed,
-            step,
-            self.challenge_prob,
-            ctx.env.max_steps,
+/// The trainer: the crate's REINFORCE over the world above, at this example's
+/// knobs.
+///
+/// All of this used to be local — `CartPoleTrainer` owned the greedy head, the
+/// per-turn returns, the baseline, the masked `log_softmax` loss, the eval exam
+/// and the guardrail scorer. The crate ships that update now
+/// (`trainer::reinforce`), so what is left here is the world, the knobs, and
+/// the guardrail reading.
+///
+/// The knobs are spelled out rather than defaulted on purpose: this example is
+/// the reference run, so every value that shapes a number in `history.csv` is
+/// visible in one place. They happen to equal `Reinforce::new`'s defaults — the
+/// defaults were taken from this recipe — so setting them changes no result.
+fn trainer(device: Device) -> Reinforce<CartPole> {
+    Reinforce::new(CartPole::new(0.0, 0.0), device)
+        .with_learning_rate(LEARNING_RATE)
+        .with_grad_clip(GRAD_CLIP)
+        .with_matches_per_step(MATCHES_PER_STEP)
+        .with_eval_matches_per_step(EVAL_MATCHES_PER_STEP)
+        .with_signal(Signal::Turns)
+        .with_challenge(
+            CHALLENGE_PROB,
+            CHALLENGE_POLICY,
             ChallengeDecay::Custom {
                 exponent: CHALLENGE_DECAY_EXPONENT,
             },
-        );
-        let forced =
-            challenged.then(|| forced_action(self.challenge_policy, ctx.net_seed, step, ACTIONS));
-
-        // 1. Train batch: per-net seeds, run seed blended in so an inherited
-        //    champion doesn't replay its source run's exact trajectories.
-        let mut all_transitions: Vec<Transition> = Vec::new();
-        let mut matches: Vec<(usize, usize)> = Vec::with_capacity(self.matches_per_step);
-        let mut survivals: Vec<usize> = Vec::with_capacity(self.matches_per_step);
-        let traj_seed_base = ctx.net_seed ^ ctx.env.run_seed;
-        for match_i in 0..self.matches_per_step {
-            let seed = episode_start_seed(traj_seed_base, step, match_i as u64);
-            let (traj, survival) = self.play_episode(net, seed, forced)?;
-            let offset = all_transitions.len();
-            all_transitions.extend(traj);
-            matches.push((offset, survival));
-            survivals.push(survival);
-        }
-        if all_transitions.is_empty() {
-            return Ok(RlStepReport {
-                train_loss: 0.0,
-                fitness: 0.0,
-                informative: self.score_metrics(ctx.metrics, &[])?,
-                rl: Some(RlStepMeta {
-                    matches: self.matches_per_step,
-                    train_turns: 0,
-                    eval_turns: 0,
-                }),
-            });
-        }
-
-        // 2. REINFORCE update: −Σ adv_t · log P(a_t|s_t), G_t = survival − t,
-        //    O(1) advantages so grad_clip stays meaningful; challenge data too.
-        let train_loss = self.reinforce_update(net, optimizer, &all_transitions, &matches)?;
-
-        // 3. Eval batch: AFTER the update, shared seeds, argmax — fitness is
-        //    what THIS net does on games it didn't train on (run-seed-derived).
-        let mut eval_survivals: Vec<usize> = Vec::with_capacity(self.eval_matches_per_step);
-        for match_i in 0..self.eval_matches_per_step {
-            let seed = shared_start_seed(ctx.env.run_seed + 1000, step, match_i as u64);
-            let (_, survival) = self.play_episode(net, seed, None)?;
-            eval_survivals.push(survival);
-        }
-
-        // 4. Report: fitness = eval-only, the same quantity the guardrail
-        //    measures — ranking and holdout agree by construction.
-        Ok(RlStepReport {
-            train_loss,
-            fitness: fitness_from_survivals(&eval_survivals),
-            informative: self.score_metrics(ctx.metrics, &eval_survivals)?,
-            rl: Some(RlStepMeta {
-                matches: self.matches_per_step + self.eval_matches_per_step,
-                // The split matters: a challenge (trainer-side) can only
-                // force TRAIN matches, so `turns/match` stays honest.
-                train_turns: survivals.iter().sum(),
-                eval_turns: eval_survivals.iter().sum(),
-            }),
-        })
-    }
+        )
 }
 
 // ═══ SECTION 3 — THE GUARDRAIL (fresh unseen games) ════════════════════
@@ -518,7 +291,8 @@ fn report_guardrail(engine: &mut RlEngine, baseline: f64) {
 
 /// Live nets in the race (default; `--pop` overrides).
 const POP: usize = 100;
-/// Step budget for a full run (default; `--max-steps` overrides).
+/// Step budget for a full run (default; `--max-steps` overrides). Budget =
+/// clocks RUN: `--max-steps N` runs exactly N clocks before Stop.
 const RACE_STEPS: usize = 20;
 /// Train matches each net plays per step — the learning signal.
 const MATCHES_PER_STEP: usize = 1;
@@ -581,6 +355,10 @@ struct Cli {
     ///
     /// Pair it with an already-satisfied `--max-steps` to skip training
     /// entirely and run ONLY the post-race guardrail on that run's elites.
+    ///
+    /// One migration note: runs recorded before this example moved onto the
+    /// crate's `Reinforce` wrote `"trainer": "cartpole"` and are refused rather
+    /// than replayed under a blob they were not produced with.
     #[arg(long, value_name = "DIR")]
     run_dir: Option<std::path::PathBuf>,
 }
@@ -627,7 +405,6 @@ fn main() {
         .set_run_train_merit(cli.train_lottery.unwrap_or(0.0))
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra history.csv column
         // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
-        // .set_run_topologies(vec![])
         // STOP
         .set_stop_max_steps(Some(cli.max_steps.unwrap_or(RACE_STEPS)))
         // .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
@@ -668,7 +445,7 @@ fn main() {
         .set_elite_checkpoint_weights(false)
         .set_elite_guardrail_matches(GUARDRAIL_MATCHES)
         .set_elite_freeze(true) // frozen elites still score, rank and sire
-        .set_elite_join_probation_steps(5) // age before a net may join the elite set
+        .set_elite_join_probation_steps(5) // age before a net may join the elite set (A/B re-checked 2026-10-26: 5 wins both fast seeds — see DONE.md)
         .set_elite_crown_lifetime_steps(5) // how long the frozen crown may sit at peak
         .set_elite_save_topology(true) // elite-<hash>.md at stop
         .set_worst_save_topology(true)
@@ -680,13 +457,8 @@ fn main() {
         .build();
 
     let fitness = Fitness::reported(Direction::Maximize, "match_survival");
-    let trainer = CartPoleTrainer {
-        device,
-        matches_per_step: MATCHES_PER_STEP,
-        eval_matches_per_step: EVAL_MATCHES_PER_STEP,
-        challenge_prob: CHALLENGE_PROB,
-        challenge_policy: CHALLENGE_POLICY,
-    };
+    // The world, plus the crate's trainer at this example's knobs (see `trainer`).
+    let trainer = trainer(device);
 
     // `--run-dir` RESUMES that run (its `engine.json` + `nets/` define the race and
     // its recorded seed wins over `--seed`); without it the engine picks

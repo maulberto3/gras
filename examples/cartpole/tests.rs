@@ -1,9 +1,11 @@
 //! CartPole example tests — run with `cargo test --example cartpole`.
 //!
-//! Kept in a sibling file so the example itself reads as the walkthrough. These
-//! are pure checks of the example's own logic: reward shaping, the seed
-//! namespaces (train / eval / guardrail), replay stability, the challenge draw,
-//! metric scoring, and that one REINFORCE step actually moves the weights.
+//! Kept in a sibling file so the example itself reads as the walkthrough. What
+//! is left to check here is the example's own half: the world it implements
+//! (`Env`), the knobs it hands the crate's trainer, and the seed namespaces the
+//! trainer's replay contract is fed with. The update itself moved into the
+//! crate, so its tests live with it (`trainer::reinforce`) rather than being
+//! asserted twice.
 
 // This file is `mod cartpole_tests` INSIDE cartpole.rs — `crate::*` is the
 // example's root, so every item there is directly visible.
@@ -15,35 +17,110 @@ mod tests {
     /// below only need SOME seed to compare against, so they pin one.
     const RUN_SEED: u64 = 42;
 
-    /// fitness_from_survivals is MEAN-of-batch: every match counts, one
-    /// lucky max cannot inflate the step.
+    /// `reset` is the world's only draw, and it is a pure function of its seed:
+    /// the same seed replays the same start (resume depends on it), a different
+    /// seed moves it, and an episode always starts at rest.
     #[test]
-    fn fitness_is_mean_of_batch() {
-        assert_eq!(fitness_from_survivals(&[10, 500, 42]), 552.0 / 3.0);
-        assert_eq!(fitness_from_survivals(&[0]), 0.0);
-        assert_eq!(fitness_from_survivals(&[]), 0.0);
-        // The luck case: best-of would say 500; mean says 27.5.
-        assert_eq!(
-            fitness_from_survivals(&[10, 10, 10, 500, 10, 10]),
-            550.0 / 6.0
+    fn reset_is_pure_in_its_seed() {
+        let mut a = CartPole::new(0.0, 0.0);
+        let mut b = CartPole::new(0.0, 0.0);
+        let first = a.reset(1234).unwrap();
+        assert_eq!(first, b.reset(1234).unwrap(), "same seed must replay");
+        // Restarting the SAME world on the same seed lands on the same state —
+        // a reset must not accumulate on the state it is handed.
+        a.reset(999).unwrap();
+        assert_eq!(first, a.reset(1234).unwrap(), "reset must not accumulate");
+
+        // The start is drawn from the small window around upright, at rest.
+        assert!(first[0].abs() <= 0.05 && first[2].abs() <= 0.05);
+        assert_eq!((first[1], first[3]), (0.0, 0.0), "starts at rest");
+
+        // A different seed is a different episode — the draw is not constant.
+        let mut starts = std::collections::HashSet::new();
+        let mut env = CartPole::new(0.0, 0.0);
+        for seed in 0..16u64 {
+            env.reset(seed).unwrap();
+            let o = env.obs();
+            starts.insert((o[0].to_bits(), o[2].to_bits()));
+        }
+        assert!(
+            starts.len() > 1,
+            "16 seeds must not start every episode identically"
         );
     }
 
-    /// Per-timestep credit: G_t = survival − t is positive for every action in
-    /// a completed match and strictly decreasing — early actions earn more.
+    /// `Env::step` reports exactly what the episode loop needs: the next
+    /// observation, the turn's reward, and the done flag it breaks on.
     #[test]
-    fn credit_assignment_sign() {
-        let survival = 10usize;
-        for t in 0..survival {
-            assert!(survival - t > 0);
-            if t > 0 {
-                assert!(survival - t < survival - (t - 1));
-            }
-        }
+    fn env_step_reports_obs_reward_and_done() {
+        let mut env = CartPole::new(0.0, 0.0);
+        let (obs, reward, done) = env.step(1).unwrap();
+        assert_eq!(obs.len(), 4);
+        assert_eq!(obs, env.obs().to_vec());
+        assert_eq!(reward, REWARD_PER_TURN);
+        assert!(!done, "one step from upright is still alive");
+
+        // The physics moved, in the direction the action pushes.
+        assert!(env.obs()[1] > 0.0, "action 1 is the right push");
+        let mut left = CartPole::new(0.0, 0.0);
+        left.step(0).unwrap();
+        assert!(left.obs()[1] < 0.0, "action 0 is the left push");
+
+        // Past the angle limit the episode is over, and `step` says so.
+        let mut fallen = CartPole::new(0.0, THETA_LIMIT * 2.0);
+        let (_, _, done) = fallen.step(0).unwrap();
+        assert!(done, "a pole past the limit must end the episode");
     }
 
-    /// Match starts are a pure function of (net_seed, step, match_i):
-    /// same triple ⇒ same start, any change to the triple ⇒ different start.
+    /// The shape the trainer builds against: two actions, and a 500-turn cap
+    /// that doubles as the fitness ceiling (500 = solved).
+    #[test]
+    fn env_reports_its_shape() {
+        let env = CartPole::new(0.0, 0.0);
+        assert_eq!(env.action_count(), ACTIONS);
+        assert_eq!(env.max_turns(), MAX_TURNS_PER_MATCH);
+        assert_eq!(env.max_turns(), 500, "500 turns is the solved score");
+    }
+
+    /// `describe()` is what `engine.json` records as the world this run trained.
+    #[test]
+    fn env_describes_itself_for_the_run_record() {
+        let d = CartPole::new(0.0, 0.0).describe();
+        assert!(d["env"].as_str().unwrap().contains("CartPole"));
+        assert_eq!(d["actions"], ACTIONS);
+        assert_eq!(d["max_turns"], MAX_TURNS_PER_MATCH);
+        assert_eq!(d["physics"]["tau"], TAU);
+        assert_eq!(d["reward_per_turn"], REWARD_PER_TURN);
+    }
+
+    /// The trainer is the crate's, at THIS example's knobs. A knob edited here
+    /// shows up in the recorded blob — which is exactly what resume diffs — so
+    /// the wiring is checkable without running a race.
+    #[test]
+    fn trainer_wiring_is_recorded_in_the_blob() {
+        let t = trainer(gras::auto_device());
+        let blob = t.describe().expect("Reinforce describes itself");
+        assert_eq!(blob["trainer"], "reinforce");
+        // `Signal` is a tagged enum, so the name lives one level down.
+        assert_eq!(blob["signal"]["kind"], "turns");
+        assert_eq!(blob["actions"], ACTIONS);
+        assert_eq!(blob["max_turns"], MAX_TURNS_PER_MATCH);
+        assert_eq!(blob["matches_per_step"], MATCHES_PER_STEP);
+        assert_eq!(blob["eval_matches_per_step"], EVAL_MATCHES_PER_STEP);
+        assert_eq!(blob["learning_rate"], LEARNING_RATE);
+        assert_eq!(blob["grad_clip"], GRAD_CLIP);
+        assert_eq!(blob["challenge_prob"], CHALLENGE_PROB);
+        assert_eq!(blob["challenge_policy"], "least_action");
+        assert_eq!(
+            blob["challenge_decay"],
+            format!("custom:{CHALLENGE_DECAY_EXPONENT}")
+        );
+        assert_eq!(blob["env"]["env"], "CartPole-v1 physics (pure Rust)");
+    }
+
+    /// Match starts are a pure function of (seed_base, step, match_i): same
+    /// triple ⇒ same start, any change to the triple ⇒ different start. This is
+    /// the crate's derivation; the example only picks the bases it is fed.
     #[test]
     fn match_starts_replayable() {
         let a = episode_start_seed(42, 3, 1);
@@ -58,6 +135,7 @@ mod tests {
     #[test]
     fn eval_batch_disjoint_from_train_batch() {
         let (net_seed, step) = (42u64, 3usize);
+
         for match_i in 0..8u64 {
             let train = episode_start_seed(net_seed, step, match_i);
             let eval = episode_start_seed(RUN_SEED + 1000, step, match_i);
@@ -81,234 +159,25 @@ mod tests {
         }
     }
 
-    /// The guardrail namespace (GUARDRAIL_SEED) is disjoint from both the train
-    /// namespace (any net_seed) and the eval one (RUN_SEED + 1000): fresh games.
-    #[test]
-    fn guardrail_namespace_is_fresh() {
-        for game_i in 0..8u64 {
-            let holdout = episode_start_seed(GUARDRAIL_SEED, 0, game_i);
-            assert_ne!(holdout, episode_start_seed(RUN_SEED + 1000, 0, game_i));
-            for net_seed in [42u64, 111, 999] {
-                assert_ne!(holdout, episode_start_seed(net_seed, 0, game_i));
-            }
-        }
-    }
-
     /// The challenge forced-action draw is a pure fn of (net_seed, step): replay
     /// re-forces the identical action, so a challenged step is bit-exact.
     #[test]
-    fn challenge_action_draw_is_replay_stable() {
+    fn challenge_draw_is_replay_stable() {
         let draw = |net_seed: u64, step: usize| {
-            let mut rng =
-                Rng::with_seed(net_seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            rng.usize(..2)
+            match forced_action(ChallengePolicy::Random, net_seed, step, ACTIONS) {
+                ForcedAction::Exact(a) => a,
+                ForcedAction::Least => unreachable!("the Random policy draws an index"),
+            }
         };
         for net_seed in [1u64, 42, 999] {
             for step in 0..8usize {
                 assert_eq!(draw(net_seed, step), draw(net_seed, step));
-                assert!(draw(net_seed, step) < 2);
+                assert!(draw(net_seed, step) < ACTIONS);
             }
         }
         // The draw actually varies — it is not accidentally constant.
         let draws: std::collections::HashSet<usize> = (0..16).map(|step| draw(42, step)).collect();
         assert_eq!(draws.len(), 2, "draw must hit both actions over 16 steps");
-    }
-
-    /// The informative metric is scored by the TRAINER (RL has no (pred, target)
-    /// batch): the closure sees the eval survivals as a 1-D tensor.
-    #[test]
-    fn trainer_scores_informative_metrics() -> gras::flodl::tensor::Result<()> {
-        let trainer = CartPoleTrainer {
-            device: gras::auto_device(),
-            matches_per_step: 1,
-            eval_matches_per_step: 1,
-            challenge_prob: CHALLENGE_PROB,
-            challenge_policy: CHALLENGE_POLICY,
-        };
-        let metrics = vec![Metric::custom("mean", |survivals, _| {
-            let v = survivals.data().to_f32_vec()?;
-            Ok(if v.is_empty() {
-                0.0
-            } else {
-                v.iter().sum::<f32>() / v.len() as f32
-            })
-        })];
-        assert_eq!(trainer.score_metrics(&metrics, &[10, 20, 30])?, vec![20.0]);
-        assert_eq!(trainer.score_metrics(&metrics, &[])?, vec![0.0]);
-        assert!(trainer.score_metrics(&[], &[10])?.is_empty());
-        Ok(())
-    }
-
-    /// The REINFORCE loss is a finite scalar and actually changes weights
-    /// (gradients flow) — the core learning loop works.
-    #[test]
-    fn reinforce_loss_is_finite_and_learns() -> gras::flodl::tensor::Result<()> {
-        let device = gras::auto_device();
-        // Synthetic trajectory batch: 4 matches × varying survival.
-        let mut all_transitions: Vec<Transition> = Vec::new();
-        let mut matches: Vec<(usize, usize)> = Vec::new();
-        for match_i in 0..4usize {
-            let survival = 5 + match_i * 3;
-            let offset = all_transitions.len();
-            for t in 0..survival {
-                let mut o = [0.0f32; 4];
-                o[0] = (t + match_i) as f32 * 0.01;
-                all_transitions.push((o, t % 2));
-            }
-            matches.push((offset, survival));
-        }
-        let total = all_transitions.len();
-        let mut flat = Vec::with_capacity(total * 4);
-        let mut mask = vec![0.0f32; total * 2];
-        let mut returns = Vec::with_capacity(total);
-        for (offset, survival) in &matches {
-            for t in 0..*survival {
-                let i = offset + t;
-                flat.extend_from_slice(&all_transitions[i].0);
-                mask[i * 2 + all_transitions[i].1] = 1.0;
-                returns.push((*survival - t) as f32);
-            }
-        }
-        let baseline = returns.iter().sum::<f32>() / returns.len() as f32;
-        let advantages: Vec<f32> = returns.iter().map(|g| g - baseline).collect();
-        let adv_std =
-            (advantages.iter().map(|a| a * a).sum::<f32>() / advantages.len() as f32).sqrt();
-        let scale = 1.0 / adv_std.max(1e-6);
-
-        let topo = gras::TopologyOptions {
-            input_dim: Some(4),
-            output_dim: Some(2),
-            ..Default::default()
-        };
-        let mut t = gras::graph::topology::Topology::new(1, Some(topo));
-        t.finalize();
-        let mut net = Network::build(&t, device)?;
-        let mut opt = gras::flodl::nn::Adam::new(&net.parameters(), 1e-3_f64);
-
-        let x = Variable::new(Tensor::from_f32(&flat, &[total as i64, 4], device)?, true);
-        let pred = net.forward(&x)?;
-        let logp = pred.data().log_softmax(1)?;
-        let m = Tensor::from_f32(&mask, &[total as i64, 2], device)?;
-        let chosen = logp.mul(&m)?;
-        let adv = Tensor::from_f32(&advantages, &[total as i64, 1], device)?;
-        let weighted = chosen
-            .sum_dims(&[1], false)?
-            .reshape(&[total as i64, 1])?
-            .mul(&adv)?;
-        let s = Tensor::from_f32(&[scale], &[1], device)?;
-        let loss = Variable::new(weighted.sum()?.mul(&s)?, false);
-
-        let v = loss.data().to_f32_vec()?;
-        assert_eq!(v.len(), 1, "REINFORCE loss must be scalar");
-        assert!(v[0].is_finite(), "REINFORCE loss not finite: {}", v[0]);
-
-        // One optimizer step must change the parameters (gradient flowed).
-        let before: Vec<f32> = net
-            .parameters()
-            .iter()
-            .flat_map(|p| p.variable.data().to_f32_vec().unwrap_or_default())
-            .take(16)
-            .collect();
-        let inputs = Tensor::from_f32(&[0.0; 4], &[1, 4], device)?;
-        let _ = train_one_step_pred_only(
-            &mut net,
-            &mut opt,
-            &|_: &Variable| Ok(loss.clone()),
-            &inputs,
-            1.0,
-        )?;
-        let after: Vec<f32> = net
-            .parameters()
-            .iter()
-            .flat_map(|p| p.variable.data().to_f32_vec().unwrap_or_default())
-            .take(16)
-            .collect();
-        assert_ne!(before, after, "REINFORCE step did not change weights");
-        Ok(())
-    }
-
-    /// One head: `argmax(logits)`, deterministic and replay-safe. The challenge
-    /// overrides it per turn (`Exact` holds one action, `Least` the argmin).
-    #[test]
-    fn argmax_head_plays_greedy_actions() -> gras::flodl::tensor::Result<()> {
-        let device = gras::auto_device();
-        let trainer = CartPoleTrainer {
-            device,
-            matches_per_step: 1,
-            eval_matches_per_step: 1,
-            challenge_prob: CHALLENGE_PROB,
-            challenge_policy: CHALLENGE_POLICY,
-        };
-        let topo = gras::TopologyOptions {
-            input_dim: Some(4),
-            output_dim: Some(2),
-            ..Default::default()
-        };
-        let mut t = gras::graph::topology::Topology::new(1, Some(topo));
-        t.finalize();
-        let mut net = Network::build(&t, device)?;
-
-        // Greedy head: every action is argmax of the net's own logits.
-        let seed = episode_start_seed(1234, 0, 0);
-        let (greedy_traj, _) = trainer.play_episode(&mut net, seed, None)?;
-        assert!(!greedy_traj.is_empty(), "the greedy policy must play turns");
-        for (obs, action) in &greedy_traj {
-            let x = Tensor::from_f32(obs, &[1, 4], device)?;
-            let pred = net.forward(&Variable::new(x, false))?;
-            let logits = pred.data().to_f32_vec()?;
-            let greedy = if logits[1] > logits[0] { 1 } else { 0 };
-            assert_eq!(*action, greedy, "argmax head played a non-greedy action");
-        }
-        // Same seed ⇒ same greedy trajectory (the branch is replay-safe).
-        let (again, _) = trainer.play_episode(&mut net, seed, None)?;
-        let seq = |traj: &Vec<Transition>| traj.iter().map(|(_, a)| *a).collect::<Vec<_>>();
-        assert_eq!(
-            seq(&greedy_traj),
-            seq(&again),
-            "greedy replay must be exact"
-        );
-
-        // The `Random` challenge path: one drawn index, held on EVERY turn — and
-        // it replays exactly under its seed.
-        let forced = 1 - greedy_traj[0].1;
-        let exact = Some(ForcedAction::Exact(forced));
-        let (forced_traj, _) = trainer.play_episode(&mut net, seed, exact)?;
-        assert!(
-            forced_traj.iter().all(|(_, a)| *a == forced),
-            "a challenge must force its action on every turn"
-        );
-        let (forced_again, _) = trainer.play_episode(&mut net, seed, exact)?;
-        assert_eq!(
-            seq(&forced_traj),
-            seq(&forced_again),
-            "a forced trajectory must replay exactly"
-        );
-
-        // The `LeastAction` path: no drawn action — each turn takes the argmin of
-        // its OWN logits (with 2 actions, the exact opposite of the greedy head).
-        let (least_traj, _) = trainer.play_episode(&mut net, seed, Some(ForcedAction::Least))?;
-        for (obs, action) in &least_traj {
-            let x = Tensor::from_f32(obs, &[1, 4], device)?;
-            let pred = net.forward(&Variable::new(x, false))?;
-            let logits = pred.data().to_f32_vec()?;
-            assert_eq!(
-                *action,
-                gras::trainer::least_action(&logits),
-                "LeastAction must play that turn's argmin"
-            );
-            assert_ne!(
-                *action,
-                if logits[1] > logits[0] { 1 } else { 0 },
-                "with 2 actions the argmin is the opposite of the greedy head"
-            );
-        }
-        let (least_again, _) = trainer.play_episode(&mut net, seed, Some(ForcedAction::Least))?;
-        assert_eq!(
-            seq(&least_traj),
-            seq(&least_again),
-            "a LeastAction trajectory must replay exactly"
-        );
-        Ok(())
     }
 
     /// The λ flag: both spellings write the same field, and omitting it leaves
