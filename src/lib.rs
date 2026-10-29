@@ -34,7 +34,7 @@ pub use utils::tabular_data;
 
 // ── engine — the step-race loop ──────────────────────────────────────
 pub use engine::{
-    GuardrailVerdict, RLSpec, RaceConfig, RaceSnapshot, RlConfig, RlEngine, RlRaceConfig, RunMode,
+    RLSpec, RaceConfig, RaceSnapshot, RlConfig, RlEngine, RlRaceConfig, RunMode,
     RunSpec, StopReason, TabularConfig, TabularEngine, TabularRaceConfig, TabularSpec,
     rl_race_config_builder, tabular_race_config_builder,
 };
@@ -115,7 +115,6 @@ pub mod prelude {
     };
     // Scoring vocabulary is `utils`-resident: shared with any training scheme.
     pub use crate::utils::fitness::{Direction, Fitness, FitnessLabel, Metric};
-    pub use crate::engine::guardrail::{AgreementGrade, GuardrailVerdict};
     pub use crate::engine::{RLSpec, RlEngine, RunSpec, TabularEngine, TabularSpec};
 
     // Trainer contracts + report types.
