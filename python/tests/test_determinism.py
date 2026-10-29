@@ -115,7 +115,7 @@ def check_engine_knobs() -> None:
     ) == (None, None, None, 0.0), cfg
     # Durability + probation are NOT neutral-at-zero: `0` removes a protection, so
     # these inherit the crate's shipped values instead of starting bare.
-    assert (cfg.checkpoint_every, cfg.elite_checkpoint_weights) == (10, True), cfg
+    assert cfg.checkpoint_every == 10, cfg
     assert cfg.crossover_ops_pool == [], cfg
     assert (
         cfg.mutation_probation_steps,
@@ -139,7 +139,6 @@ def check_engine_knobs() -> None:
             tournament_size=3,
             crossover_ops_pool=["uniform"],
             checkpoint_every=3,
-            elite_checkpoint_weights=False,
             mutation_probation_steps=2,
             crossover_probation_steps=3,
             elite_join_probation_steps=1,
@@ -171,7 +170,6 @@ def check_engine_knobs() -> None:
         assert sub["crossover_ops_pool"] == ["uniform"], sub
         # Durability + probation, also under `config`.
         assert sub["checkpoint_every"] == 3, sub
-        assert sub["elite_checkpoint_weights"] is False, sub
         assert sub["mutation_probation_steps"] == 2, sub
         assert sub["crossover_probation_steps"] == 3, sub
         assert sub["elite_join_probation_steps"] == 1, sub

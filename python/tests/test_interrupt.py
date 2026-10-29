@@ -6,10 +6,10 @@ Three scenarios, each a SIGKILL or SIGINT to a live writer process:
    after the last tick overwrote the frontier with tombstones: 8 live nets became 2
    and `resume` refused as a `pop_size` mismatch. The manifest is the frontier SET,
    so the resume must now accept and restore all 8.
-2. **SIGKILL with `history_flush_each`.** Rows are written every clock while the
-   frontier moves every `checkpoint_every`, so the CSV can run ahead; before the
-   rewind, resuming re-emitted those rows (measured 16 and 60 duplicates). Now the
-   CSV is truncated to the manifest clock first, so there must be none.
+2. **SIGKILL between checkpoints.** CSV rows, the frontier and the weights land on
+   the same tick (one cadence, R3), so the file can never reach past the frontier —
+   and a resume appends nothing twice. (Before R3 a per-clock flush could put rows
+   ahead, and the resume re-emitted them: measured 16 and 60 duplicates.)
 3. **SIGINT (Ctrl+C).** A graceful stop writes the frontier at the stop clock, so
    the dir is already a prefix — resume must accept, continue, and duplicate nothing.
 
@@ -123,31 +123,29 @@ def check_sigkill_with_evolution_restores_the_set() -> None:
         )
 
 
-def check_flush_ahead_has_no_duplicate_rows() -> None:
-    """P2: the CSV is rewound to the checkpoint, so nothing is written twice."""
+def check_one_cadence_has_no_rows_ahead() -> None:
+    """R3: CSV, frontier and weights share one tick, so nothing runs ahead."""
     cfg = dict(
         pop_size=4,
         elite_count=1,
         max_steps=100_000,
-        # Coarse ticks + per-clock flushes: the CSV is guaranteed to run AHEAD.
-        checkpoint_every=50,
-        history_flush_each=True,
+        checkpoint_every=5,
         log_level="none",
         crossover_rolls=0,
         mutate_rolls=0,
     )
-    with tempfile.TemporaryDirectory(prefix="gras-interrupt-flush-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="gras-interrupt-cadence-") as tmp:
         tmp = Path(tmp)
         run = tmp / "run"
         run.mkdir()
         kill_mid_run(tmp, run, cfg, signal.SIGKILL)
 
         manifest = manifest_of(run)
-        frontier = manifest["next_clock"] - 1
-        ahead = max(step for step, _ in run_rows(run)) - frontier
-        assert ahead > 0, (
-            "this scenario needs rows written after the checkpoint "
-            f"(frontier clock {frontier}, history {max(s for s, _ in run_rows(run))})"
+        rows = run_rows(run)
+        # Stricter than "no duplicates": the file cannot even reach past the frontier.
+        assert max(step for step, _ in rows) == manifest["next_clock"] - 1, (
+            manifest["next_clock"],
+            max(step for step, _ in rows),
         )
 
         resume_cfg = RaceConfig(**{**cfg, "max_steps": manifest["next_clock"] + 5})
@@ -155,12 +153,9 @@ def check_flush_ahead_has_no_duplicate_rows() -> None:
         assert engine.run() == "MaxSteps"
         rows = run_rows(run)
         duplicates = sum(c - 1 for c in Counter(rows).values() if c > 1)
-        assert duplicates == 0, (
-            f"{duplicates} duplicate (step, hash) rows — the CSV was not rewound to the "
-            f"checkpoint ({ahead} rows sat ahead of it before the resume)"
-        )
+        assert duplicates == 0, f"{duplicates} duplicate (step, hash) rows after resume"
         assert max(step for step, _ in rows) == engine.step_clock - 1, engine.step_clock
-        print(f"flush-ahead ok: {ahead} rows sat ahead of the frontier, 0 duplicates after resume")
+        print("one cadence ok: no row reaches past the frontier, 0 duplicates after resume")
 
 
 def check_sigint_is_a_graceful_prefix() -> None:
@@ -201,9 +196,9 @@ def check_sigint_is_a_graceful_prefix() -> None:
 
 def main() -> None:
     check_sigkill_with_evolution_restores_the_set()
-    check_flush_ahead_has_no_duplicate_rows()
+    check_one_cadence_has_no_rows_ahead()
     check_sigint_is_a_graceful_prefix()
-    print("interrupt ok: SIGKILL restores the frontier set, CSVs rewind, Ctrl+C is a prefix")
+    print("interrupt ok: SIGKILL restores the frontier set, one cadence, Ctrl+C is a prefix")
 
 
 if __name__ == "__main__":
