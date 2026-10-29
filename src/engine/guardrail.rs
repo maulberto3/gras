@@ -2,8 +2,8 @@
 //! Users call it through the ENGINE method [`crate::CoreEngine::guardrail`],
 //! which fills in run_dir/race smoothed automatically and scores every elite's
 //! LIVE net (still in memory at stop time) — rank 1 is the certified champion,
-//! the rest are its measured field. No weight file is involved, so a run can
-//! leave `elite_save_safetensors` off and still certify a champion.
+//! the rest are its measured field. No weight file is involved: the exam reads the
+//! net the race left, so certification never depends on what was written to `nets/`.
 //!
 //! Ownership split:
 //! - **Module** (here): play `matches` fresh games on each net ([`score_net`])
