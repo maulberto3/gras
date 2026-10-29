@@ -352,8 +352,8 @@ def load_gras_net(
 ) -> tuple[GrasNet, dict]:
     """Rebuild the net from nets/<hash>.json.
 
-    With trained weights present (elite-<short>.safetensors, else worst-) the
-    weights are loaded and any missing parameter raises — a partial load is a
+    With trained weights present (nets/<hash>.safetensors, else the older
+    elite-/worst- exports) the weights are loaded and any missing parameter raises — a partial load is a
     different network, never accepted silently. With none (or `force_init`),
     the SEEDED initial weights are rebuilt from the blueprint (see
     `init_weights`) so the net can be trained from scratch in Python."""
@@ -375,15 +375,14 @@ def load_gras_net(
     net.build_modules()
 
     short = state["hash"][:8]
-    # Elites export elite-<short>.safetensors; the worst nets (when worst_save
-    # is on) export worst-<short>.safetensors, one file per net. Try both.
+    # R4: every live net's weights live beside its state as nets/<full-hash>
+    # .safetensors. The older per-rank exports (elite-<short>, worst-<short>) are
+    # tried too, so a directory written before R4 still loads.
     weights_path = None
     if not force_init:
-        for prefix in ("elite-", "worst-"):
-            p = run_dir / f"{prefix}{short}.safetensors"
-            if p.exists():
-                weights_path = p
-                break
+        candidates = [state_path.with_suffix(".safetensors")]
+        candidates += [run_dir / f"{prefix}{short}.safetensors" for prefix in ("elite-", "worst-")]
+        weights_path = next((p for p in candidates if p.exists()), None)
 
     if weights_path is None:
         net.init_weights()  # blueprint seed → gras's exact initial weights
