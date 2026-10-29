@@ -1,17 +1,17 @@
-"""A run is inheritable only after its champion is certified.
+"""Inheritance reads the source run's FINAL TABLE.
 
-`RaceEngine.guardrail()` is the call that records the champion in `engine.json`;
-`RaceConfig(elite_previous_load=True, elite_previous_dir=<run>)` seeds the next
-run's founder batch from that record. Both halves are asserted here on the
-ARTIFACTS (no log parsing), so the test says nothing about formatting.
+Every run ends with `elites.json` — `[{rank, hash, ...}]`, best first, ranked by the
+risk-adjusted fitness the run printed. `RaceConfig(elite_previous_load=True,
+elite_previous_dir=<run>)` seeds the next run's founder slots from exactly that list,
+topology only (weights restart from the blueprint's seed). There is no exam and no
+certification step: the table is the verdict.
 
 Run with the project venv (needs the built extension and libtorch):
 
     source env_setup.sh
-    $HOME/gras/.venv/bin/python3 python/tests/test_inheritance.py
+    uv run --with pytest pytest python/tests/test_inheritance.py
 
-No pytest dependency: plain asserts, exit code 0 = pass. Every engine gets its
-own temp run dir, so nothing under `results/` is touched (AGENTS.md rule 16).
+Every engine gets its own temp run dir, so nothing under `results/` is touched.
 """
 
 from __future__ import annotations
@@ -27,11 +27,6 @@ BLOBS = REPO_ROOT / "data" / "blobs"
 
 POP = 4
 STEPS = 3
-EXAMS = 4  # guardrail_matches: draws per elite
-
-
-def header(run_dir: Path) -> dict:
-    return json.loads((run_dir / "engine.json").read_text())
 
 
 def topologies(run_dir: Path) -> dict[str, dict]:
@@ -44,110 +39,73 @@ def topologies(run_dir: Path) -> dict[str, dict]:
     return out
 
 
-def certified_run(tmp: Path) -> tuple[Path, str, str]:
-    """Run + certify; return (dir, run_id, champion hash)."""
-    run_dir = tmp / "source"
-    engine = RaceEngine(
+def make_run(run_dir: Path, seed: int, inherit_from: Path | None = None) -> RaceEngine:
+    return RaceEngine(
         BLOBS,
-        RaceConfig(pop_size=POP, elite_count=1, max_steps=STEPS,
-                   guardrail_matches=EXAMS, log_level="none"),
-        seed=11,
+        RaceConfig(
+            pop_size=POP,
+            elite_count=1,
+            max_steps=STEPS,
+            log_level="none",
+            elite_previous_load=inherit_from is not None,
+            elite_previous_dir=inherit_from,
+        ),
+        seed=seed,
         run_dir=run_dir,
     )
-    engine.run()
-    verdict = engine.guardrail()
-    assert verdict is not None, "guardrail() returned None with guardrail_matches > 0"
-    assert len(verdict["hash"]) == 16, f"champion hash is not a full hash: {verdict['hash']}"
-    assert verdict["games"] == EXAMS, (
-        f"guardrail played {verdict['games']} exams, expected {EXAMS}"
-    )
-    assert verdict["holdout_mean"] is not None
-    return run_dir, engine.run_id, verdict["hash"]
 
 
-def test_guardrail_records_the_champion() -> None:
+def test_the_final_table_is_written_and_ranked() -> None:
     with tempfile.TemporaryDirectory(prefix="gras-inherit-") as tmp:
-        run_dir, _, champion = certified_run(Path(tmp))
-        record = header(run_dir)["guardrail"]
-        assert record is not None, "engine.json has no guardrail block after guardrail()"
-        assert record["champion_hash"] == champion, "recorded champion ≠ the verdict's net"
-        assert record["matches_scored"] == EXAMS, "recorded exam count ≠ guardrail_matches"
-        assert record["holdout_mean"] is not None, "no holdout mean recorded"
-
-
-def test_guardrail_off_records_nothing() -> None:
-    with tempfile.TemporaryDirectory(prefix="gras-inherit-off-") as tmp:
-        run_dir = Path(tmp) / "off"
-        engine = RaceEngine(
-            BLOBS,
-            RaceConfig(pop_size=POP, elite_count=1, max_steps=STEPS,
-                       guardrail_matches=0, log_level="none"),
-            seed=11,
-            run_dir=run_dir,
-        )
+        run_dir = Path(tmp) / "source"
+        engine = make_run(run_dir, 11)
         engine.run()
-        assert engine.guardrail() is None, "guardrail_matches=0 must skip the exam"
-        assert header(run_dir)["guardrail"] is None, "a skipped exam must record nothing"
+        index = json.loads((run_dir / "elites.json").read_text())
+        assert index, "a finished run must write its final table"
+        assert index[0]["rank"] == 1, f"the table is not ranked: {index[:2]}"
+        assert len(index[0]["hash"]) == 16, f"not a full hash: {index[0]['hash']}"
 
 
-def test_certified_source_seeds_the_next_run() -> None:
+def test_the_table_seeds_the_next_run() -> None:
     with tempfile.TemporaryDirectory(prefix="gras-inherit-seed-") as tmp:
-        source, source_id, champion = certified_run(Path(tmp))
+        source = Path(tmp) / "source"
+        source_engine = make_run(source, 11)
+        source_engine.run()
+        source_id = source_engine.run_id
+        champion = json.loads((source / "elites.json").read_text())[0]["hash"]
         champion_topo = topologies(source)[champion]
 
         child_dir = Path(tmp) / "child"
-        child = RaceEngine(
-            BLOBS,
-            RaceConfig(pop_size=POP, elite_count=1, max_steps=STEPS,
-                       guardrail_matches=0, log_level="none",
-                       elite_previous_load=True, elite_previous_dir=source),
-            seed=12,
-            run_dir=child_dir,
-        )
-        child.run()
+        make_run(child_dir, 12, inherit_from=source).run()
 
         seeded = {h: t for h, t in topologies(child_dir).items() if t == champion_topo}
-        assert seeded, "the certified champion's blueprint did not reach the next run"
-        # Seed slots carry a `created_from` lineage: which run, which net. The
-        # crate records the SHORT hash (8 chars), the same one the log prints.
+        assert seeded, "rank 1 of the source table did not reach the next run"
         want = f"seed:{source_id}:{champion[:8]}"
         for hash in seeded:
             born = json.loads((child_dir / "nets" / f"{hash}.json").read_text())["created_from"]
             assert born == want, f"inherited net's lineage is {born!r}, expected {want!r}"
 
 
-def test_uncertified_source_seeds_nothing() -> None:
-    """The knob was always wired — the gate had nothing to pass."""
+def test_a_source_without_a_table_seeds_nothing() -> None:
     with tempfile.TemporaryDirectory(prefix="gras-inherit-none-") as tmp:
-        source = Path(tmp) / "uncertified"
-        RaceEngine(
-            BLOBS,
-            RaceConfig(pop_size=POP, elite_count=1, max_steps=STEPS,
-                       guardrail_matches=EXAMS, log_level="none"),
-            seed=11,
-            run_dir=source,
-        ).run()  # deliberately NOT certified
+        source = Path(tmp) / "no-table"
+        make_run(source, 11).run()
+        (source / "elites.json").unlink()
 
         child_dir = Path(tmp) / "child"
-        RaceEngine(
-            BLOBS,
-            RaceConfig(pop_size=POP, elite_count=1, max_steps=STEPS,
-                       guardrail_matches=0, log_level="none",
-                       elite_previous_load=True, elite_previous_dir=source),
-            seed=12,
-            run_dir=child_dir,
-        ).run()
+        make_run(child_dir, 12, inherit_from=source).run()
 
-        born = [json.loads(p.read_text())["created_from"]
-                for p in (child_dir / "nets").glob("*.json")]
+        born = [
+            json.loads(p.read_text())["created_from"]
+            for p in (child_dir / "nets").glob("*.json")
+        ]
         assert not [b for b in born if b.startswith("seed:")], (
-            "an uncertified source must inherit nothing, but the new run has seeded nets"
+            "a source with no elites.json must inherit nothing"
         )
 
 
 if __name__ == "__main__":
-    test_guardrail_records_the_champion()
-    test_guardrail_off_records_nothing()
-    test_certified_source_seeds_the_next_run()
-    test_uncertified_source_seeds_nothing()
-    print("test_inheritance: ok (4 checks)")
+    test_the_final_table_is_written_and_ranked()
+    test_the_table_seeds_the_next_run()
+    test_a_source_without_a_table_seeds_nothing()
+    print("test_inheritance: ok (3 checks)")

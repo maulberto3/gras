@@ -38,7 +38,7 @@ def run(tmp: Path, name: str, **overrides) -> tuple[RaceEngine, Path, pd.DataFra
     """One blobs race; return (engine, run dir, history)."""
     run_dir = tmp / name
     cfg = RaceConfig(pop_size=POP, elite_count=1, max_steps=STEPS,
-                     guardrail_matches=0, log_level="none", **overrides)
+                     log_level="none", **overrides)
     engine = RaceEngine(BLOBS, cfg, seed=SEED, run_dir=run_dir)
     engine.run()
     return engine, run_dir, pd.read_csv(run_dir / "history.csv")
@@ -63,7 +63,7 @@ def test_live_count_matches_the_artifacts() -> None:
         engine = RaceEngine(
             BLOBS,
             RaceConfig(pop_size=POP, elite_count=1, max_steps=STEPS,
-                       guardrail_matches=0, log_level="none"),
+                       log_level="none"),
             seed=SEED,
             run_dir=run_dir,
         )

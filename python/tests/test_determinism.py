@@ -155,7 +155,6 @@ def check_engine_knobs() -> None:
             feature_split="exclusive",
             trace_file=True,
             run_name="knob-check",
-            guardrail_matches=0,
         )
         assert RaceEngine(DATA_DIR, cfg, seed=13, run_dir=tmp).run() == "MaxSteps"
         meta = json.loads((Path(tmp) / "engine.json").read_text())
