@@ -27,7 +27,7 @@
 //! - [`stop`] — stop criteria + `RaceSnapshot`
 //! - [`tabular_engine`] — tabular-mode constructors (`resume`)
 //! - [`rl_engine`] — RL-mode constructors (`resume_rl`)
-//! - [`seed`] — founder-batch seeding from a previous run's guardrail champion
+//! - [`seed`] — founder-batch seeding from a previous run's final table
 //! - `fitness` / `cfy` — **MOVED to [`crate::utils`]**: `Fitness`, `Direction`,
 //!   `Metric`, `FitnessLabel` and the CFY log tables are vocabulary the engine
 //!   *shares* with any training scheme, so they live below both layers and a
@@ -40,7 +40,6 @@ pub mod core;
 pub mod diversity;
 pub mod evolve;
 pub mod format;
-pub mod guardrail;
 pub mod logging;
 pub mod population;
 pub mod reporting;
@@ -58,7 +57,6 @@ pub use config::{
     tabular_race_config_builder,
 };
 pub use core::CoreEngine;
-pub use guardrail::GuardrailVerdict;
 pub use rl_engine::RlEngine;
 pub use run_spec::{RLSpec, RunSpec, StreamShape, TabularSpec};
 pub use seed::{SeedOutcome, SeedPick, resolve as resolve_seed_source};
