@@ -768,6 +768,13 @@ pub struct NetState {
         /// Last-seen metrics snapshot (loss + fitness + informative metrics) — enough for a
         /// resume/time-travel read. Empty until the first persisted step.
     pub last_metrics: Option<NetMetrics>,
+        /// Trainer-owned bookkeeping for THIS net (R9), opaque to the engine: exactly what
+        /// `TabularStep::state()` returned at the checkpoint, handed back verbatim to
+        /// `restore` on a resume. It lives in the net's own envelope so it costs no new
+        /// path and cannot describe a different net. Absent (`None`) for the default no-op
+        /// scheme, which is also what keeps those files byte-identical to pre-R9 ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trainer_state: Option<serde_json::Value>,
         /// Inclusive clock ranges this net executed as FROZEN (act-and-measure). Replay-
         /// relevant: resume re-runs them through a no-op optimizer. Run-length, disjoint.
     #[serde(default)]
@@ -930,6 +937,7 @@ impl NetState {
             entered_at_step: step,
             created_from,
             last_metrics: None,
+            trainer_state: None,
             frozen_spans: Vec::new(),
             idle_spans: Vec::new(),
             meta: NetMeta::default(),
