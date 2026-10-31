@@ -16,8 +16,9 @@
 //!
 //! Every knob is a const or a builder line; the only flags are the smoke-run
 //! ones (`--pop`, `--max-steps`, `--seed`, `--log-level`, `--risk-aversion`
-//! — alias `--risk-based`) plus `--run-dir`, which resumes a recorded run
-//! instead of starting one (pair it with an already-satisfied `--max-steps` to
+//! — alias `--risk-based`) plus `--resume <dir>` (continue a recorded run) and
+//! `--run-dir` (where a NEW run writes). Both are documented at their flags
+//! (pair `--resume` with an already-satisfied `--max-steps` to
 //! re-run ONLY the guardrail over that run's elites — same `--pop` and
 //! `--risk-aversion`/`--train-lottery` as the run, whose recorded seed wins over
 //! `--seed`). The action head is
@@ -37,7 +38,6 @@ use fastrand::Rng;
 use gras::engine::config::DEFAULT_CHECKPOINT_EVERY;
 // The one sanctioned spelling of a sampled mean —
 // `avg … (spread …; SE … = spread/√n, n=…)`.
-use gras::engine::format::{ReadingStyle, fmt_reading};
 use gras::prelude::*;
 
 // ═══ SECTION 1 — THE ENVIRONMENT (an `Env`) ════════════════════════════
@@ -307,20 +307,21 @@ struct Cli {
         value_parser = ["none", "summ", "minimal", "debug", "trace"]
     )]
     log_level: Option<String>,
-    /// Resume the recorded run in this directory instead of starting a fresh
-    /// race: every live net is rebuilt from `nets/<hash>.json` and replayed to
-    /// its recorded clock (the replay contract — weights are never persisted),
-    /// so the run must be resumed with the SAME trainer consts and the same
-    /// replay-relevant knobs (`--risk-aversion`, `--train-lottery`) or the
-    /// engine refuses the mismatch. The run's recorded seed is used — `--seed`
-    /// does not override it.
-    ///
-    /// Pair it with an already-satisfied `--max-steps` to skip training
-    /// entirely and run ONLY the post-race guardrail on that run's elites.
+    /// RESUME the recorded run in this directory: every live net is rebuilt from
+    /// `nets/<hash>.json` + its weights and continued to its recorded clock, so
+    /// the run must be resumed with the SAME trainer consts and the same
+    /// replay-relevant knobs (`--risk-aversion`, `--train-lottery`) or the engine
+    /// refuses the mismatch. The run's recorded seed is used — `--seed` does not
+    /// override it. Pair it with an already-satisfied `--max-steps` to run ONLY
+    /// the post-race guardrail on that run's elites.
     ///
     /// One migration note: runs recorded before this example moved onto the
     /// crate's `Reinforce` wrote `"trainer": "cartpole"` and are refused rather
-    /// than replayed under a blob they were not produced with.
+    /// than continued under a blob they were not produced with.
+    #[arg(long, value_name = "DIR")]
+    resume: Option<std::path::PathBuf>,
+    /// Where a NEW run writes (default: `results/<timestamp>`). Output only —
+    /// continuing an existing run is `--resume`.
     #[arg(long, value_name = "DIR")]
     run_dir: Option<std::path::PathBuf>,
 }
@@ -418,24 +419,34 @@ fn main() {
     // The world, plus the crate's trainer at this example's knobs (see `trainer`).
     let trainer = trainer(device);
 
-    // `--run-dir` RESUMES that run (its `engine.json` + `nets/` define the race and
-    // its recorded seed wins over `--seed`); without it the engine picks
-    // `results/<timestamp>` for a fresh race.
-    let engine = match &cli.run_dir {
-        Some(dir) => RlEngine::resume(dir.clone(), config, fitness, trainer),
+    // `--resume <dir>` CONTINUES that run (its `engine.json` + `nets/` define the race
+    // and its recorded seed wins over `--seed`); `--run-dir` only names where a fresh
+    // race writes, and without either the engine picks `results/<timestamp>`.
+    let engine = match &cli.resume {
+        // One argument: the run dir. Pop size, λ, Ω and the search space come from the
+        // record — the resume no longer needs the `--pop` it was launched with. A
+        // `--max-steps` on the resume EXTENDS the recorded budget (it is absolute, not
+        // per-process), which is how a stopped run is given more clocks.
+        Some(dir) => RlEngine::resume_from(dir.clone(), fitness, trainer).map(|mut engine| {
+            if let Some(steps) = cli.max_steps {
+                engine.set_stop_max_steps(steps);
+            }
+            engine
+        }),
         None => RlEngine::from_spec(RunSpec::rl(
             config,
             fitness,
             trainer,
             Some(run_seed),
-            None,
+            cli.run_dir.clone(),
         )),
     };
     let mut engine = match engine {
         Ok(engine) => engine,
-        // Resume reports its refusals BY NAME (a different λ/Ω, a drifted trainer
-        // const, a missing run dir) — print the reason and exit like a usage error
-        // instead of a backtrace.
+        // Construction refuses the STRUCTURAL impossibilities by name (a drifted trainer
+        // const, a missing run dir, a mode it cannot resume) — print the reason and exit
+        // like a usage error instead of a backtrace. A different λ/Ω/k policy does not
+        // land here: R6 resumes it and warns, with both values, during the load.
         Err(e) => {
             eprintln!("engine construction failed: {e}");
             std::process::exit(2);

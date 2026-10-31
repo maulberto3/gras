@@ -5,8 +5,7 @@
 //! concrete, in four sections:
 //!   1 DATA      — a gras-format dataset (generated if absent).
 //!   2 TRAINER   — a hand-rolled `TabularStep` impl (one trait, one block).
-//!   3 GUARDRAIL — the optional holdout scorer on that same trainer.
-//!   4 RUN       — consts → config → spec → run → guardrail.
+//!   3 CONFIG    — consts → config → spec → run → the final table.
 //!
 //! Run: `source env_setup.sh && cargo run --release --example mnist`
 //! (`data/mnist` already holding real MNIST — the producer is the non-cargo
@@ -314,8 +313,7 @@ impl EngineArgs {
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use gras::engine::format::{ReadingStyle, fmt_reading};
-use gras::flodl::tensor::{Result as TensorResult, TensorError};
+use gras::flodl::tensor::Result as TensorResult;
 use gras::prelude::*;
 use gras::utils::race_steps::{deterministic_train_step, eval_one_step};
 use gras::utils::{score, tabular_data};
@@ -332,15 +330,12 @@ use gras::utils::{score, tabular_data};
 /// (no train/test subdirs) still works: the engine falls back to its
 /// seeded internal split.
 const DATA_DIR: &str = "data/mnist";
-/// The GUARDRAIL's held-out split. Real MNIST's own test set — rows no race
-/// batch ever trains on. Never point this at `DATA_DIR`.
-const HOLDOUT_DIR: &str = "data/mnist/test";
 
 // ═══ 2. TRAINER ═════════════════════════════════════════════════════════
 //
 // ONE trait (`TabularStep`), ONE impl block — the library provides no scheme,
 // so this is the real code a user writes. REQUIRED: `make_optimizer`, `loss`,
-// `train_step`. OPTIONAL: `describe`, `holdout_score`, `stream_shape`.
+// `train_step`. OPTIONAL: `describe`, `restore_optimizer`, `stream_shape`.
 // Compare `examples/cartpole.rs` (same shape, `RlStep`).
 
 const LEARNING_RATE: f32 = 1e-3;
@@ -370,10 +365,6 @@ struct MnistTrainer {
     /// gate, the element-level rolls ARE the challenge. Trainer-owned since
     /// 2026-10-10; the engine never sees it.
     challenge_prob: f32,
-    /// `(test set, deterministic stream over it)` — the guardrail half. How
-    /// many draws it makes is the RUN's knob (`set_elite_guardrail_matches`),
-    /// not this trainer's.
-    holdout: Option<(tabular_data::Dataset, BatchStream)>,
 }
 
 impl MnistTrainer {
@@ -389,19 +380,9 @@ impl MnistTrainer {
             smoothing,
             last_accuracy: 0.0,
             challenge_prob: CHALLENGE_PROB,
-            holdout: None,
         }
     }
 
-    /// Install the guardrail: score the champion on `rows` rows of `dataset`
-    /// per draw. Measurement only — it must never learn.
-    fn with_holdout(mut self, dataset: tabular_data::Dataset, rows: usize) -> Self {
-        let seed = 0xBEEF; // disjoint from the run seed's pool
-        let split = PoolSplit::of(&dataset, 0.1, seed);
-        let stream = BatchStream::new(seed, rows, split).with_eval_batch_size(rows);
-        self.holdout = Some((dataset, stream));
-        self
-    }
 }
 
 impl TabularStep for MnistTrainer {
@@ -432,19 +413,6 @@ impl TabularStep for MnistTrainer {
             "challenge_decay": "linear",
             "jitter_scale": JITTER_SCALE,
         }))
-    }
-
-    /// OPTIONAL (guardrail): score ONE holdout draw — `game_i` seeds which rows.
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> TensorResult<f32> {
-        let (dataset, stream) = self
-            .holdout
-            .as_ref()
-            .ok_or_else(|| TensorError::new("mnist: no holdout installed"))?;
-        let (x, y) = stream.train_batch(dataset, game_i as u64)?;
-        net.eval();
-        let pred = net.forward(&Variable::new(x, false))?;
-        net.train();
-        score::accuracy_score(&pred, &Variable::new(y, false))
     }
 
     // REQUIRED: the (pred, target) loss — a supervised scheme's defining choice.
@@ -547,14 +515,6 @@ fn jitter_inputs(
     Ok((Tensor::from_f32(&data, &shape, x.device())?, jittered))
 }
 
-// ═══ 3. GUARDRAIL ═══════════════════════════════════════════════════════
-//
-// Measurement only, on rows the race never touched. Exact same estimator as
-// the run's fitness (mean accuracy) — anything else hides a collapse.
-
-const HOLDOUT_ROWS: usize = 512;
-const HOLDOUT_MATCHES: usize = 5;
-
 // ═══ 4. RUN ═════════════════════════════════════════════════════════════
 
 const RUN_NAME: &str = "mnist";
@@ -655,35 +615,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // The guardrail's held-out rows. Real MNIST test split when present;
-    // otherwise synthetic noise — which is random-labeled, so a chance-level
-    // verdict is the only honest outcome (and is warned about below).
-    // EFFICIENCY NOTE (Tier 1 — `impl AsRef<Path>`): the loaders take
-    // `impl AsRef<Path>`, so the `&str` const passes directly — no
-    // `Path::new(...)` wrapper needed at any call site.
-    let holdout_exists = Path::new(HOLDOUT_DIR).exists();
-    let holdout = if holdout_exists {
-        tabular_data::resolve_dataset(HOLDOUT_DIR).unwrap()
-    } else {
-        tabular_data::synthetic_classification(
-            HOLDOUT_ROWS * HOLDOUT_MATCHES,
-            d_in,
-            d_out,
-            0xBEEF,
-            gras::auto_device(),
-        )
-        .unwrap()
-    };
-    if !holdout_exists {
-        println!(
-            "  ⚠ no {} — the trainer's holdout rows are SYNTHETIC random labels (chance by construction)",
-            HOLDOUT_DIR
-        );
-    }
-
-    // ── STEP B — fitness, trainer, guardrail.
+    // ── STEP B — fitness, trainer.
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
-    let trainer = MnistTrainer::new(LABEL_SMOOTHING).with_holdout(holdout, HOLDOUT_ROWS);
+    let trainer = MnistTrainer::new(LABEL_SMOOTHING);
 
     // ── STEP C — the config surface.
     let pop = cli.engine.pop.unwrap_or(POP_SIZE);
