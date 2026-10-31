@@ -544,6 +544,95 @@ impl RaceConfig {
         }
     }
 
+    /// The inverse of [`crate::state::ConfigSnapshot::from_config`]: rebuild the
+    /// run-level knobs a header recorded, so a resume needs only its directory.
+    ///
+    /// The SEARCH SPACE is deliberately NOT here — topology options, the pool lists and
+    /// the hidden-dim range live on `RunHeader` itself, and a caller stamps them after
+    /// this (see `TabularEngine::resume_from`).
+    ///
+    /// Never fails: an enum spelling this build cannot read falls back to the crate
+    /// default, and the resume guards still compare whatever came out, so a real
+    /// mismatch is refused loudly rather than silently patched.
+    pub fn from_snapshot(snap: &crate::state::ConfigSnapshot) -> Self {
+        let mut cfg = RaceConfig::defaults();
+        cfg.pop_size = snap.pop_size;
+        cfg.checkpoint_every = snap.checkpoint_every;
+        cfg.crossover_rolls = snap.crossover_rolls;
+        cfg.mutate_rolls = snap.mutate_rolls;
+        cfg.crossover_prob = snap.crossover_prob;
+        cfg.mutate_prob = snap.mutate_prob;
+        cfg.elite_count = snap.elite_count;
+        cfg.crossover_ops_pool = snap.crossover_ops_pool.clone();
+        cfg.max_steps = snap.max_steps;
+        cfg.log_level = LogLevel::parse(&snap.log_level).unwrap_or(cfg.log_level);
+        cfg.trace_file = snap.trace_file;
+        cfg.smoothing_window = snap.smoothing_window;
+        cfg.risk_aversion = snap.risk_aversion;
+        cfg.csv_export = snap.csv_export;
+        cfg.save_optim = snap.save_optim;
+        cfg.run_name = snap.run_name.clone();
+        cfg.freeze_elites = snap.freeze_elites;
+        cfg.train_merit = snap.train_merit;
+        cfg.elite_previous_load = snap.elite_previous_load;
+        cfg.elite_previous_dir = snap
+            .elite_previous_dir
+            .as_ref()
+            .map(std::path::PathBuf::from);
+        cfg.elite_save_topology = snap.elite_save_topology;
+        cfg.worst_save_topology = snap.worst_save_topology;
+        cfg.mutation_probation_steps = snap.mutation_probation_steps;
+        cfg.crossover_probation_steps = snap.crossover_probation_steps;
+        cfg.elite_join_probation_steps = snap.elite_join_probation_steps;
+        cfg.elite_crown_lifetime_steps = snap.elite_crown_lifetime_steps;
+        // The replay-relevant enums, matched on their recorded SPELLING — the snapshots
+        // store `Display` output (`"worst"`, `"tournament(size=2)"`, `"split_random"`),
+        // so a `contains` test survives a formatting change on either side.
+        let cull = snap.crossover_cull_policy.to_ascii_lowercase();
+        cfg.crossover_cull_policy = if cull.contains("random") {
+            CrossCullPolicy::Random
+        } else {
+            CrossCullPolicy::Worst
+        };
+        let mcull = snap.mutation_cull_policy.to_ascii_lowercase();
+        cfg.mutation_cull_policy = if mcull.contains("random") {
+            MutationCullPolicy::Random
+        } else if mcull.contains("worst") {
+            MutationCullPolicy::Worst
+        } else {
+            MutationCullPolicy::InverseFitness
+        };
+        let selection = snap.crossover_selection.to_ascii_lowercase();
+        cfg.crossover_selection = if selection.contains("tournament") {
+            let k = selection
+                .split(|c: char| !c.is_ascii_digit())
+                .filter_map(|n| n.parse::<usize>().ok())
+                .next()
+                .unwrap_or(2);
+            SelectionMethod::Tournament {
+                tournament_size: k,
+            }
+        } else {
+            SelectionMethod::Roulette
+        };
+        cfg.feature_split = snap.feature_split.as_deref().and_then(|raw| {
+            let raw = raw.to_ascii_lowercase();
+            if raw.contains("exclusive") {
+                Some(crate::graph::topology::FeatureSplitPolicy::Exclusive)
+            } else if raw.contains("random") {
+                Some(crate::graph::topology::FeatureSplitPolicy::Random)
+            } else {
+                None
+            }
+        });
+        cfg.mode = if snap.mode.eq_ignore_ascii_case("rl") {
+            RunMode::Rl
+        } else {
+            RunMode::Tabular
+        };
+        cfg
+    }
+
         /// Fluent builder for the non-CLI config surface, starting from `RaceConfig::defaults`.
         /// Starts TABULAR; for RL prefer [`RlRaceConfig::builder`].
     pub fn builder() -> RaceConfigBuilder {
