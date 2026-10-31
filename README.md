@@ -18,8 +18,9 @@ a champion you can actually trust.
   batches, and history — bit for bit.
 - **Your learning loop, our search loop.** Bring your own loss, optimizer,
   environment, and fitness; the crate owns the search around them.
-- **Results you can trust.** Champions are certified by a guardrail —
-  re-tested on data they never trained on before you rely on them.
+- **Results you can trust.** Every run ends with its final table — all nets
+  measured, ranked by risk-adjusted fitness — and that table is the record the
+  next run inherits its champions from.
 - **Effective *and* steady.** Ranking charges each candidate for its own
   spread (`mean ∓ λσ` over its recent readings), so a network that is
   reliably good outranks one that is occasionally brilliant.
@@ -34,19 +35,22 @@ and is evaluated on one shared, seeded stream, and selection happens every
 step rather than at generation boundaries. Weak candidates are culled as soon
 as they fall behind; strong ones hold their place and keep learning; new
 candidates are born continuously. Because the whole run is a pure function of
-its seed, any run replays exactly — and the surviving champion is measured
-against fresh, unseen data at the end.
+its seed, any run replays exactly — and the surviving champion heads the run's
+final table.
 
 Ranking is risk-adjusted: each candidate is scored by the mean of its recent
 readings shifted by `λ` standard deviations toward the worse side — a single
 number, no second objective to trade off. Raise `set_run_risk_aversion` to
 prefer consistency, set it to `0.0` to rank on the plain mean.
 
-Two runs chain together automatically. At stop, the champion is certified by
-the guardrail and the run's ranked elites are recorded; the next compatible
-run (same mode, dimensions, and trainer) seeds its founder batch with those
-elites before evolving, so a race picks up where the last one left off. Point
-it elsewhere or opt out of the inheritance when you want a fresh batch.
+Two runs chain together. Every run ends with its **final table** — `elites.json`,
+ranked by the same risk-adjusted fitness the race printed — and the next
+compatible run (same mode, dimensions, and trainer) seeds its founder batch with
+those top performers before evolving, so a race picks up where the last one left
+off. Point it elsewhere or opt out of the inheritance when you want a fresh
+batch. Resuming mid-run is a first-class door in both languages —
+`TabularEngine::resume` / `RlEngine::resume` in Rust, `RaceEngine.resume(dir)` in
+Python — and the directory is the recipe.
 
 ## Install
 
@@ -134,7 +138,7 @@ surface.
 
 In-memory arrays are a source too — `from_arrays` writes the SAME native pair,
 with no CSV in between, and then builds the engine exactly as the directory form
-does, so the run resumes like any other:
+does, artifacts and all:
 
 ```python
 import numpy as np
@@ -173,8 +177,49 @@ that wants one-hot target rows — `mse`, `l1` and `bce_with_logits` take the sh
 you hand them, so a single label column is fine when the loss expects one.
 
 Same seed and config reproduce the same `history.csv` stream, exactly as the
-Rust replay contract promises. v1 covers a whole-race `run()` plus `Topology`
-JSON handles; per-step control and Python callbacks are still open in TODO.md.
+Rust replay contract promises. v1 covers a whole-race `run()` with its final
+table, the inheritance it unlocks, live introspection (`live_count`,
+`smoothed_fitness_of`), plus `Topology` JSON handles; per-step control and Python
+callbacks are still open (TODO.md). Resume is Rust-side only — see below.
+The log is the crate's own: `log_level="summ"` prints the same cards the Rust
+examples print. Two caveats worth knowing before you wonder why a run is silent —
+the level is read when the engine is built (setting it afterwards does nothing),
+and the first engine in a process sets the ceiling for every engine after it, so
+a `"none"` race first means restarting the kernel to see logs again.
+
+**Runs chain through the final table.** Every run ends with it — there is no
+post-race exam. The next race, given `elite_previous_load=True` (off by default
+here, unlike the crate) and `elite_previous_dir=<that run>`, seeds its founder
+slots from `elites.json`: the source's own ranked top performers, best first —
+topology only, weights restart. A source with no `elites.json` seeds nothing, and
+the log says so.
+
+```python
+engine.run()                          # ends with the `Final field` table
+
+next_run = RaceEngine("data/mnist/train", RaceConfig(
+    pop_size=16, max_steps=6, elite_previous_load=True,
+    elite_previous_dir=engine.run_dir), seed=43)
+next_run.run()                        # Race init prints `seeded slots N`
+```
+
+Resuming is explicit in **both** languages: `TabularEngine::resume` / `RlEngine::resume`
+in Rust, and `RaceEngine.resume(run_dir)` in Python. A second engine pointed at an
+existing `run_dir` still starts a fresh race in it, so say which one you mean.
+
+```python
+more = RaceEngine.resume(engine.run_dir, max_steps=12)   # 6 → 12 clocks
+more.run()
+rl = RaceEngine.resume(rl_dir, env=gym.make("CartPole-v1"))  # RL: hand back the world
+```
+
+The directory holds seed, `run_id`, clock, live nets, dataset, search space and the
+training recipe, so a bare call replays the run's own scheme; `max_steps` is
+**absolute**, not per-process. An **RL** directory is the one case that needs an
+argument: its environment is a live object, not a number, so pass it back in `env=`
+(every other RL knob comes from the record). A run whose world draws its own
+randomness outside `reset(seed)` is not resumable in either language, and the parity
+guard says so by name.
 
 **Runs from the v0.1.0 scaffold do not resume.** Those runs record
 `"trainer": "py_cross_entropy"` in `engine.json`; the promoted trainer records
@@ -184,12 +229,52 @@ on with a different recipe than the one that produced the population. This is
 deliberate — no compatibility bridge. Re-run from the seed, or keep the old
 directory as a read-only artifact.
 
-For the guided version — config knobs, a live race, `history.csv` charts, replay
-checks, a candidate's topology, and your own CSV or MNIST data raced through the
-same call — open
-[`notebooks/python_bindings_tour.ipynb`](notebooks/python_bindings_tour.ipynb).
-That path is the `notebooks/` folder at the repository root (a sibling of
-`python/`, `gras-py/` and `examples/`), not part of the Python package.
+For a runnable version, open
+[`notebooks/python_bindings_tour.ipynb`](notebooks/python_bindings_tour.ipynb):
+six arms end to end — MNIST (16 × 6), CartPole (20 × 10), an in-memory
+regression where the loss and the fitness differ (`from_arrays`, MSE trained /
+MAE ranked / R² recorded), a chained pair (`elites.json` then
+`elite_previous_load`, so the second race starts from the first one's ranking),
+a determinism check that hashes three `history.csv` streams from three
+separate processes, and a resume that stops both arms mid-run and continues them.
+Everything but the hash check runs at `log_level="summ"`, so
+the engine's whole log is on screen. Each code cell stands alone — its imports,
+seed, sizes and paths are declared where they are used, and it reads back the
+artifacts of the run it just made — so any cell runs on its own, in any order.
+About 15 s on CPU (timed: all seven cells, each in a fresh namespace). That path is the
+`notebooks/` folder at the repository root (a sibling of `python/`, `gras-py/`
+and `examples/`), not part of the Python package.
+
+### Rust and Python, side by side
+
+One engine, two entry points. The Python binding is a *host*, not a second
+implementation: it builds the crate's `RaceConfig`, `TabularTrainer`, `Reinforce` and
+drives the same `CoreEngine`, so both languages write the same artifacts and stop
+for the same reasons. Where they differ, the difference is deliberate.
+
+| capability | Rust | Python |
+|---|---|---|
+| Start a race | `TabularEngine::from_spec(RunSpec::tabular(…))`, `RlEngine::from_rl_spec(…)` | `RaceEngine(dir, cfg)`, `RaceEngine.from_arrays(X, Y, dir, cfg)`, `RaceEngine.gym(env, cfg)` |
+| Resume a tabular run | `TabularEngine::resume_from(dir)` | `RaceEngine.resume(dir, max_steps=…)` |
+| Resume an RL run | `RlEngine::resume_from(dir, fitness, trainer)` | `RaceEngine.resume(dir, env=…)` — the world is the one thing a directory cannot hold |
+| Dataset | a dataset dir (`inputs.bin` / `targets.bin` / `meta.json`) | the same dir, NumPy arrays (written to native f32 first), or a gym env |
+| Search space / knobs | `RaceConfig` + typed setters and enums | `RaceConfig(**kwargs)`, same names; enums as validated strings |
+| Loss | any closure (`TabularTrainer::new(loss)`) — masked and weighted losses included | one of 6 names (`gras.losses()`: `cross_entropy`, `label_smoothing_ce`, `mse`, `l1`, `smooth_l1`, `bce_with_logits`) |
+| Fitness / metrics | any closure (`Fitness::new` / `minimize` / `reported`) | 8 fitness names + `metrics=[…]` (8 metric names), or the loss's natural pairing |
+| Trainer | implement `TabularStep` / `RlStep`: loss, batch shape, `describe`, `make_optimizer` / `restore_optimizer`, `state` / `restore` | the crate's `TabularTrainer` and `Reinforce`, driven by kwargs |
+| Environment | any `Env` impl — pure Rust, scripted subprocess, anything | a gym/gymnasium env with a `Discrete` action space (a `Box` space needs a different policy head in both) |
+| Per-clock control | none: `run()` is all-or-nothing | same — parity, not a gap |
+| Interrupt + resume | SIGINT/SIGKILL then `resume_from`, tested in-crate | the same door; `python/tests/test_resume.py` covers the continue-not-restart contract |
+| Weights out | `nets/<hash>.safetensors` (+ `.optim`, + `.json` blueprint) | the same files, plus `Topology.from_json()` as a handle |
+| Discovery | `Loss::NAMES`, `FITNESS_NAMES`, `METRIC_NAMES`, … | `gras.losses()`, `metrics()`, `fitnesses()`, `tasks()`, `algos()` |
+| Console | the full card vocabulary, `log_level` on the config | the same cards (one console sink per process, level from the first engine) |
+| Threads | the engine is `!Send` (one race per thread), no parallel population stepping | same, and the GIL is held for the whole `run()` |
+| Device | the `cuda` cargo feature at BUILD time | the same, checked at runtime with `gras.built_with_cuda` |
+
+What only Rust can do is write code the crate will run: a loss closure, a fitness
+function, a trainer hook, an `Env` (including one that shells out). What only Python
+can do is hand you the race as ordinary objects — NumPy in, `gym` in, `history.csv`
+and `nets/*.json` out — without a build step in between.
 
 ## Get started
 
