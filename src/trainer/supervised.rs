@@ -36,11 +36,7 @@ pub struct TabularTrainer {
         /// What objective `loss_fn` optimizes, for the run record. The engine can't
         /// see inside the closure, so replay tools refuse an unlabeled scheme.
     pub loss_label: Option<String>,
-    pub(crate) holdout: Option<HoldoutScorer>,
 }
-
-/// The installed holdout scorer (see [`TabularTrainer::with_holdout_scorer`]).
-type HoldoutScorer = Box<dyn Fn(&mut Network, usize) -> Result<f32> + Send>;
 
 impl TabularTrainer {
     /// A tabular scheme is defined by its loss — constructor takes it.
@@ -94,15 +90,6 @@ impl TabularTrainer {
         self
     }
 
-        /// Make this trainer guardrail-capable: the scorer draws ONE fresh holdout
-        /// batch and scores in the run's fitness units. Games played = the run's.
-    pub fn with_holdout_scorer(
-        mut self,
-        scorer: impl Fn(&mut Network, usize) -> Result<f32> + Send + 'static,
-    ) -> Self {
-        self.holdout = Some(Box::new(scorer));
-        self
-    }
 }
 
 impl Default for TabularTrainer {
@@ -119,12 +106,34 @@ impl Default for TabularTrainer {
             // silence is the honest record. `with_loss_label` names it.
             loss_label: None,
             lr_schedule: None,
-            holdout: None,
         }
     }
 }
 
 impl TabularStep for TabularTrainer {
+    /// Reload `nets/<hash>.optim` into a fresh Adam over this net's
+    /// parameters. `Stateful` needs the concrete type — which is exactly why this
+    /// lives in the trainer instead of the engine.
+    fn restore_optimizer(
+        &self,
+        net: &Network,
+        path: &std::path::Path,
+    ) -> Option<Box<dyn Optimizer>> {
+        use flodl::nn::optim::Stateful;
+        use flodl::nn::Module;
+        let mut opt = flodl::nn::Adam::new(&net.parameters(), self.learning_rate as f64);
+        match opt.load_state_file(&path.to_string_lossy()) {
+            Ok(()) => Some(Box::new(opt)),
+            Err(e) => {
+                tracing::warn!(
+                    "optimizer state {} could not be loaded ({e}) — restarting moments",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
         use flodl::nn::Module;
         Box::new(flodl::nn::Adam::new(
@@ -146,24 +155,6 @@ impl TabularStep for TabularTrainer {
             "eval_batch_size": self.eval_batch_size,
             "lr_schedule": self.lr_schedule.is_some(),
         }))
-    }
-
-        /// Guardrail measurement half: run the holdout scorer when installed;
-        /// without one, fail with the contract panic (loud, not silent).
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> Result<f32> {
-        match &self.holdout {
-            Some(scorer) => scorer(net, game_i),
-            // A PUBLIC type must not panic: "no scorer installed" is a caller error,
-            // so it is reported as one. (The trait's own default still panics — that
-            // is a separate call, tracked in TODO.md.)
-            None => Err(crate::utils::error::EngineError::InvalidOptions(
-                "holdout_score: this trainer has no holdout scorer — install one via \
-                 with_holdout_scorer (one fresh game, in the run's fitness units) to use \
-                 engine.guardrail()"
-                    .to_string(),
-            )
-            .into()),
-        }
     }
 
     fn loss(&self) -> crate::trainer::LossFn<'_> {
