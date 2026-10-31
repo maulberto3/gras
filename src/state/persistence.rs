@@ -271,6 +271,10 @@ pub struct RunHeader {
         /// lack it and `from_json` derives it from `config.mode`.
     #[serde(default)]
     pub engine_mode: Option<String>,
+        /// Dataset directory the run was launched from (one-argument resume). `None` on
+        /// RL runs and on headers written before this field existed.
+    #[serde(default)]
+    pub data_dir: Option<String>,
         /// Single deterministic root for the whole run; generated and recorded when no seed
         /// is given, so an interrupted run can be resumed exactly.
     pub run_seed: u64,
@@ -395,6 +399,9 @@ pub struct RunAccounting {
 pub struct RunConfig {
     /// Timestamped run id (also the run dir name).
     pub run_id: String,
+    /// The dataset directory a TABULAR run was launched from — recorded so a resume
+    /// can find its data with no second argument. `None` for RL runs.
+    pub data_dir: Option<String>,
     /// Mode discriminator (`"tabular"` | `"rl"`) — see [`RunHeader::engine_mode`].
     pub engine_mode: Option<String>,
     /// Deterministic seed for the whole run.
@@ -444,6 +451,7 @@ impl RunHeader {
     pub fn from_race_options(cfg: RunConfig) -> Self {
         let RunConfig {
             run_id,
+            data_dir,
             engine_mode,
             run_seed,
             fitness_label,
@@ -468,6 +476,7 @@ impl RunHeader {
         } = cfg;
         RunHeader {
             run_id,
+            data_dir,
             engine_mode,
             run_seed,
             fitness_label,
@@ -643,6 +652,10 @@ impl RunHeader {
                 .and_then(|f| f.as_str())
                 .unwrap_or("unknown")
                 .to_string(),
+            data_dir: v
+                .get("data_dir")
+                .and_then(|f| f.as_str())
+                .map(|s| s.to_string()),
             engine_mode,
             run_seed: v.get("run_seed").and_then(|f| f.as_u64()).unwrap_or(0),
             fitness_label,
@@ -1607,6 +1620,7 @@ mod tests {
 
     fn baseline_header(run_id: &str) -> RunHeader {
         RunHeader::from_race_options(RunConfig {
+            data_dir: None,
             explicit_test_rows: None,
             run_id: run_id.to_string(),
             engine_mode: Some("tabular".into()),
