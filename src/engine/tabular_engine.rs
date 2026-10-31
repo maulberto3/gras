@@ -8,20 +8,25 @@
 //! engine.
 //!
 //! ## Resume semantics — what must match vs what's yours to change
-//! Every live net is replayed from step 0 to its recorded step (no weights are
-//! persisted — topology + weight seed + the deterministic stream reproduce them),
-//! asserting metric parity with the recorded values.
+//! Every live net is LOADED from `nets/<hash>.safetensors` at the step the frontier
+//! manifest names (R4/R5; the replay path is gone), with `nets/<hash>.optim` restored
+//! when `save_optim` recorded it.
 //!
-//! **Frozen** (construction hard-errors, or the first replayed step fails parity):
-//! `pop_size` (checked against the live frontier), the trainer scheme (loss,
-//! update recipe, `stream_shape()` batch sizes), the fitness function, the dataset
-//! at `data_dir`, the metric set, dims, and `run_seed` / `train_eval_split_ratio`
-//! / eval-row counts — those come from the persisted header, not your config.
+//! **Refused** — what cannot be rebuilt at all: `pop_size` (checked against the live
+//! frontier), the trainer scheme (loss, update recipe, `stream_shape()` batch sizes),
+//! the fitness function, the dataset at `data_dir`, the metric set, dims, and
+//! `run_seed` / `train_eval_split_ratio` / eval-row counts, which come from the
+//! persisted header rather than your config.
 //!
-//! **Yours to change** (budget/log surface only — never a step's dynamics): the
-//! stop criterion (the `max_steps` budget is **absolute**, not per-process:
-//! interrupt at 17 with `max_steps: 20` and the resumed run does 3 more steps),
-//! `log_level`, and `checkpoint_every`.
+//! **Warned, not refused (R6)** — everything BEHAVIOURAL, i.e. it changes the draws
+//! from here on without making the record untrue: K, λ, Ω, the parent draw, both cull
+//! policies, the probation windows, the crown lifetime. `CoreEngine::behavioural_drift()`
+//! names each one with both values and the setter that reproduces the record.
+//!
+//! **Yours freely** (surface only): the stop criterion (the `max_steps` budget is
+//! **absolute**, not per-process: interrupt at 17 with `max_steps: 20` and the resumed
+//! run does 3 more steps), `log_level`, and `checkpoint_every` (the recorded eval era
+//! still governs the stream — R3b).
 //!
 //! Also: `step_clock()` reads the max step across live nets, so a trailing
 //! crossover child can never repeat an iteration; replayed nets' rolling buffers
