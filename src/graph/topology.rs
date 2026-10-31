@@ -167,6 +167,28 @@ impl Connection {
     // ── graph diagnostics ─────────────────────────────────────────────────
     // Free functions live in `crate::utils::graph_utils`; methods delegate to them.
 
+/// What one crossover operator actually exchanged — the operator's own answer,
+/// carried so the birth can say how much of the child came from the other parent.
+///
+/// `pairs` is the number of ALIGNED genes the operator could have flipped (for
+/// uniform: the hidden-node count, both parents walk in lock-step), `swaps` is how
+/// many coins said "take the other parent". A birth always has `swaps ≥ 1`: zero
+/// flips means the operator declined and no child is inserted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CxReport {
+    /// Genes taken from the other parent.
+    pub swaps: usize,
+    /// Genes the operator compared (the denominator of `3/6`).
+    pub pairs: usize,
+}
+
+impl CxReport {
+    /// `3/6` — the spelling the log line, the origin cell and the lineage string use.
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.swaps, self.pairs)
+    }
+}
+
     /// The blueprint of a gras network: pure data, no tensors — **who exists**
     /// (`nodes`) and **who feeds whom** (`connections`). Inert until validated/built.
 #[derive(Clone, Debug, PartialEq)]
@@ -1228,8 +1250,18 @@ impl Topology {
     }
 
         /// Uniform crossover: per-node independent swap, requiring equal hidden counts.
-        /// Returns true if at least one swap happened.
-    pub fn cx_uniform(a: &mut Topology, b: &mut Topology, swap_prob: f32, rng: &mut Rng) -> bool {
+        ///
+        /// `Some(CxReport)` when at least one gene moved (the child is `a`), `None`
+        /// when the operator declined — mismatched hidden counts, or every coin said
+        /// "keep". The REPORT is what makes `3/6` printable: the count used to exist
+        /// only inside a `debug!` line, so nothing downstream could say how much of
+        /// the child actually came from the other parent.
+    pub fn cx_uniform(
+        a: &mut Topology,
+        b: &mut Topology,
+        swap_prob: f32,
+        rng: &mut Rng,
+    ) -> Option<CxReport> {
         let ha: Vec<usize> = a
             .nodes
             .iter()
@@ -1252,7 +1284,7 @@ impl Topology {
                 ha.len(),
                 hb.len()
             );
-            return false;
+            return None;
         }
 
         let mut swaps = 0usize;
@@ -1263,14 +1295,18 @@ impl Topology {
             }
         }
 
-        if swaps > 0 {
-            a.renumber_ids();
-            a.finalize();
-            b.renumber_ids();
-            b.finalize();
-            debug!("cx_uniform: swapped {swaps}/{} hidden nodes", ha.len());
+        if swaps == 0 {
+            return None;
         }
-        swaps > 0
+        a.renumber_ids();
+        a.finalize();
+        b.renumber_ids();
+        b.finalize();
+        debug!("cx_uniform: swapped {swaps}/{} hidden nodes", ha.len());
+        Some(CxReport {
+            swaps,
+            pairs: ha.len(),
+        })
     }
 }
 
@@ -2234,6 +2270,44 @@ mod finalize_order_tests {
                 b.assert_one_wire_per_port();
             }
         }
+    }
+
+    /// The uniform operator REPORTS what it exchanged: every coin at 1.0 flips every
+    /// aligned gene, every coin at 0.0 flips none and is a declined pairing (no child),
+    /// and the denominator is the hidden count both parents share.
+    #[test]
+    fn cx_uniform_reports_the_genes_it_exchanged() {
+        let opts = TopologyOptions::default();
+        let pair = || {
+            let mut a = Topology::new(11, Some(opts.clone()));
+            a.create_random_hidden_nodes(4);
+            a.finalize();
+            let mut b = Topology::new(12, Some(opts.clone()));
+            b.create_random_hidden_nodes(4);
+            b.finalize();
+            (a, b)
+        };
+
+        let (mut a, mut b) = pair();
+        let all = Topology::cx_uniform(&mut a, &mut b, 1.0, &mut Rng::with_seed(5))
+            .expect("every coin flips, so the operator reports");
+        assert_eq!((all.swaps, all.pairs), (4, 4));
+        assert_eq!(all.label(), "4/4");
+
+        let (mut a, mut b) = pair();
+        assert!(
+            Topology::cx_uniform(&mut a, &mut b, 0.0, &mut Rng::with_seed(5)).is_none(),
+            "no flips ⇒ no child ⇒ nothing to report"
+        );
+
+        // Mismatched hidden counts never pair up, so there is no denominator to print.
+        let mut a = Topology::new(13, Some(opts.clone()));
+        a.create_random_hidden_nodes(3);
+        a.finalize();
+        let mut b = Topology::new(14, Some(opts));
+        b.create_random_hidden_nodes(5);
+        b.finalize();
+        assert!(Topology::cx_uniform(&mut a, &mut b, 1.0, &mut Rng::with_seed(5)).is_none());
     }
 
     #[test]
