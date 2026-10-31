@@ -378,7 +378,7 @@ impl CoreEngine {
         crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Artifacts & resume",
             &crate::utils::cfy::kv(&artifact_rows),
-            Some("resume parity: replay-relevant knobs come from engine.json — a mismatch is refused, not patched"),
+            Some("resume parity: the one-argument resume takes every knob from engine.json — a STRUCTURAL mismatch (mode, pop_size, dataset, trainer blob) is refused, a BEHAVIOURAL one (K, λ, Ω, parent draw, cull policies, probation) resumes and warns with BOTH values, so a caller who wants a different race passes its own config (TabularEngine::resume(dir, data_dir, config, …)) and reads the warning"),
         ));
 
             // What the run DID comes before what it produced: a population tally and a
@@ -589,7 +589,7 @@ impl CoreEngine {
             ),
             &lines.join("\n"),
             Some(&format!(
-                "read downward, oldest first: each bracketed group sits directly above the net it made (a crossover group is `p1`/`p2`), so the reported net closes its own ancestry at the bottom · `Δfit` = the child's fit minus this parent's, signed so `+` means the child scored better (the ranking's own direction); `Δparams` = child − parent · `†<clock> <channel>` = culled at that clock, `live` = still in the population at stop · `↺` = this ancestor's own ancestry is already drawn above · `…` = ancestry stops at the depth cap of {LINEAGE_MAX_DEPTH} generations (the parent's own `nets/<hash>.json` still carries the rest) · edges are each net's recorded `created_from`, and a dead parent's numbers come from its tombstone, so the tree outlives the cull · a reported net with no recorded parents prints as ONE row (`· root`) — the group above the next `#N` belongs to that net, never to the row above it"
+                "read downward in birth order: oldest ancestors at the top, the reported net on the `▼` line at the bottom · `g<N>` = generation above the net (`g1` = its own parents), so depth is a printed number instead of indentation · `g<N> ┌ parents of <hash>` introduces ONE child's parent set: the `│`/`└` lines under it are the nets that made that child, and `p1`/`p2` are the crossover slots (`p` when it has a single parent) · `fit` = the risk-adjusted score the net ranked on · `Δfit` = the child's fit minus this parent's, signed so `+` means the child scored better (the ranking's own direction) · `Δparams` = child − parent · `†<clock> <channel>` = culled at that clock, `live` = still in the population at stop · `↺ shown above` = this hash is already drawn as a deeper ancestor, i.e. the two branches share it · `…` = the chain continues past the {LINEAGE_MAX_DEPTH}-generation cap · edges are each net's recorded `created_from`, and a dead parent's numbers come from its tombstone · `▼ … root (no recorded parents)` = this net entered as a founder — a random draw, an inherited `seed:` blueprint, or the initial batch — so it has no ancestry to draw"
             )),
         ));
     }
@@ -609,7 +609,11 @@ impl CoreEngine {
             // the table's own value when the net carries no stored reading.
             tree.root_fit = Some(*fit);
             tree.root_mark = marks.get(hash).copied().unwrap_or("·");
-            tree.render_node(hash, &format!("#{}", rank + 1), None, 0, "", &mut out);
+            // `↺ shown above` is per NOMINEE: each reported net gets its own chain, so an
+            // ancestor shared with the previous net is drawn again rather than pointing at a
+            // card the reader has already scrolled past.
+            tree.shown.clear();
+            tree.render_chain(hash, rank + 1, &mut out);
             // A VISIBLE divider between reported nets, not a blank line: the card body is a
             // single reflowed block, so an empty line is swallowed and the next net's parent
             // group then reads as the previous net's ancestry (measured: a `random` champion
@@ -1716,9 +1720,13 @@ fn mermaid_node_label(hash: &str, facts: Option<&LineageFacts>, root: bool) -> S
 }
 
 /// One net's ancestry facts, whether it is LIVE or a culled tombstone. One shape for
-/// both is what lets the tree cross a cull: the numbers a dead parent needs
-/// (`final_risk_score` / `final_fitness_mean` / `final_fitness_std` / `final_fitness_samples`)
-/// are the same three legs a live net reads from its window.
+/// both is what lets the tree cross a cull (`final_risk_score` for a tombstone is the
+/// same ranking value a live net reads from its window).
+///
+/// Only what a lineage question needs: identity, ranking fit, the param count the `Δparams`
+/// leg measures against, and how the net left the race. The window mean/spread stay in
+/// `nets/<hash>.json` — they are the TABLE's business, and carrying them here made every
+/// ancestry line twice as long as it needed to be.
 #[derive(Clone, Debug)]
 struct LineageFacts {
     /// The recorded lineage string (`created_from`), kept verbatim for [`origin_cell`].
@@ -1727,9 +1735,6 @@ struct LineageFacts {
     born: usize,
     /// The ranking value (risk-adjusted fit); `None` when it never measured.
     fit: Option<f32>,
-    mean: Option<f32>,
-    std: Option<f32>,
-    n: usize,
     params: Option<i64>,
     alive: bool,
     culled_at: Option<usize>,
@@ -1776,16 +1781,10 @@ impl<'a> LineageTree<'a> {
         }
         let engine = self.engine;
         let facts = if let Some(state) = engine.state.net(hash) {
-            let reading = engine.race_reading_of(hash);
             Some(LineageFacts {
                 origin: state.created_from.clone(),
                 born: state.entered_at_step,
                 fit: engine.smoothed_fitness_of(hash),
-                mean: reading.map(|r| r.mean),
-                // `n = 1` has no observable spread, the same rule the table's `spread` cell
-                // follows — a printed `0` would claim a steadiness nobody measured.
-                std: reading.and_then(|r| (r.n > 1).then_some(r.std)),
-                n: reading.map(|r| r.n).unwrap_or(0),
                 params: state.meta.params,
                 alive: true,
                 culled_at: None,
@@ -1803,12 +1802,6 @@ impl<'a> LineageTree<'a> {
                         .final_risk_score
                         .filter(|v| v.is_finite())
                         .or_else(|| state.final_fitness_mean.filter(|v| v.is_finite())),
-                    mean: state.final_fitness_mean.filter(|v| v.is_finite()),
-                    std: state
-                        .final_fitness_std
-                        .filter(|v| v.is_finite())
-                        .filter(|_| state.final_fitness_samples > 1),
-                    n: state.final_fitness_samples,
                     params: state.meta.params,
                     alive: state.is_alive,
                     culled_at: state.culled_at_step,
@@ -1866,11 +1859,27 @@ impl<'a> LineageTree<'a> {
             crate::utils::fitness::Direction::Maximize => v,
             crate::utils::fitness::Direction::Minimize => -v,
         };
-        let mut out = String::from("```mermaid\ngraph TB\n");
+        // The diagram carries its OWN palette AND a base theme. Measured on a rendered
+        // `elite-<hash>.md` in a dark-themed viewer: light fills plus a `color:` in
+        // `classDef` produced near-white labels on a near-white box — the label colour was
+        // ignored, the theme's own text colour won, and the prose was unreadable.
+        //
+        // So every fill is DARK and every class states a white label: a renderer that honours
+        // `color` gets white-on-dark, and one that overrides it with the theme's near-white
+        // text gets the same readable result by construction. The `init` directive pins the
+        // rest (canvas, edges, edge-label background) so the graph does not half-inherit a
+        // dark theme.
+        let mut out = String::from("```mermaid\n");
+        out.push_str(
+            "%%{init: {\"theme\": \"base\", \"themeVariables\": {\"background\": \"#ffffff\", \"primaryColor\": \"#1f4f7a\", \"primaryTextColor\": \"#ffffff\", \"primaryBorderColor\": \"#7fb3d5\", \"lineColor\": \"#5a8fbf\", \"textColor\": \"#1b1b1b\", \"edgeLabelBackground\": \"#ffffff\", \"fontSize\": \"14px\"}}}%%\n",
+        );
+        out.push_str("graph TB\n");
         // Classes first, so a viewer never renders an unstyled node while reading down.
-        out.push_str("    classDef elite fill:#ffe9a8,stroke:#a87b00,stroke-width:2px\n");
-        out.push_str("    classDef culled fill:#f2f2f2,stroke:#9a9a9a,color:#555\n");
-        out.push_str("    classDef ancestor fill:#eaf4ff,stroke:#5a8fbf\n");
+        out.push_str(
+            "    classDef elite fill:#8a5a00,stroke:#ffd166,stroke-width:2px,color:#ffffff\n",
+        );
+        out.push_str("    classDef culled fill:#4a4a4a,stroke:#9a9a9a,color:#ffffff\n");
+        out.push_str("    classDef ancestor fill:#1f4f7a,stroke:#7fb3d5,color:#ffffff\n");
         for hash in &nodes {
             let facts = self.facts(hash);
             out.push_str(&format!(
@@ -1924,146 +1933,187 @@ impl<'a> LineageTree<'a> {
         (out, cut)
     }
 
-        /// Draw one node and, depth permitting, its parents ABOVE it. `label` is the
-        /// root's `#<rank>` or a parent slot `p1`/`p2`; `child` is the net this node
-        /// parented, which is what the `Δ` columns are measured against. Ancestors print
-        /// first, so the card reads downward in birth order: parents, then the net they
-        /// made, ending at the reported net.
-    fn render_node(
-        &mut self,
-        hash: &str,
-        label: &str,
-        child: Option<&LineageFacts>,
-        depth: usize,
-        connector: &str,
-        out: &mut Vec<String>,
-    ) {
-        let indent = "   ".repeat(depth);
+    /// ONE reported net's ancestry, generation by generation: oldest ancestors at the
+    /// TOP and the reported net on the LAST line, so the card reads downward in the order
+    /// the nets were born.
+    ///
+    /// Depth is a printed `g<N>` tag (1 = the net's own parents), NOT indentation. The old
+    /// drawing deepened the `│` rail for every generation, which put the OLDEST ancestors
+    /// in the widest column and the reported net back at the margin — the eye had to walk a
+    /// staircase inward to find the net, and a parent group could only be tied to its child
+    /// by counting indents. Here every group is introduced by the child it explains, so no
+    /// line has to be matched against a line further down.
+    ///
+    /// A shared ancestor therefore prints ONCE per generation (each level is de-duplicated,
+    /// and `↺ shown above` marks a hash already drawn deeper) instead of the same block
+    /// appearing twice under two different parents.
+    fn render_chain(&mut self, root: &str, rank: usize, out: &mut Vec<String>) {
+        /// One child's parent set — what a `g<N> ┌ parents of …` header introduces.
+        struct Group {
+            child: String,
+            /// `(parent hash, crossover slot, how many parents the child has)`
+            parents: Vec<(String, usize, usize)>,
+        }
+        // `levels[0]` = the reported net's parents, `levels[1]` = THEIR parents, ...
+        let mut levels: Vec<Vec<Group>> = Vec::new();
+        let mut frontier: Vec<String> = vec![root.to_string()];
+        for _ in 1..LINEAGE_MAX_DEPTH {
+            let mut groups: Vec<Group> = Vec::new();
+            for child in &frontier {
+                let Some(facts) = self.facts(child) else {
+                    continue;
+                };
+                if facts.parents.is_empty() {
+                    continue;
+                }
+                let n = facts.parents.len();
+                groups.push(Group {
+                    child: child.clone(),
+                    parents: facts
+                        .parents
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| (p.clone(), i + 1, n))
+                        .collect(),
+                });
+            }
+            if groups.is_empty() {
+                break;
+            }
+            let mut next: Vec<String> = groups
+                .iter()
+                .flat_map(|g| g.parents.iter().map(|p| p.0.clone()))
+                .collect();
+            next.sort();
+            next.dedup();
+            frontier = next;
+            levels.push(groups);
+        }
+        // Deepest level FIRST: the oldest ancestors lead, the reported net closes the card.
+        for (idx, groups) in levels.iter().enumerate().rev() {
+            let generation = idx + 1;
+            let deepest = idx + 1 == levels.len();
+            for group in groups {
+                let child = if group.child == root {
+                    format!("#{rank} {}", short_hash(&group.child))
+                } else {
+                    short_hash(&group.child)
+                };
+                if self.budget == 0 {
+                    self.truncated = true;
+                    out.push("   …".to_string());
+                    return;
+                }
+                self.budget -= 1;
+                out.push(format!("   g{generation} ┌ parents of {child}"));
+                let n = group.parents.len();
+                for (i, (parent, slot, total)) in group.parents.iter().enumerate() {
+                    if self.budget == 0 {
+                        self.truncated = true;
+                        out.push(format!("      └ … {} more parent(s)", n - i));
+                        break;
+                    }
+                    self.budget -= 1;
+                    let mut body = short_hash(parent);
+                    match self.facts(parent) {
+                        None => body.push_str(" · no `nets/<hash>.json` — ancestry unknown"),
+                        Some(f) => {
+                            body.push_str(&format!(
+                                " · {}",
+                                origin_cell(f.origin.as_deref(), f.born)
+                            ));
+                            if let Some(v) = f.fit {
+                                body.push_str(&format!(" · fit {}", fmt_cell(v)));
+                            }
+                            if !f.alive {
+                                match (f.culled_at, f.cull_reason.as_deref()) {
+                                    (Some(clock), Some(reason)) => {
+                                        body.push_str(&format!(" · †{clock} {reason}"))
+                                    }
+                                    (Some(clock), None) => body.push_str(&format!(" · †{clock}")),
+                                    _ => body.push_str(" · dead"),
+                                }
+                            } else {
+                                body.push_str(" · live");
+                            }
+                            // The `Δ` legs measure THIS parent against the child the group
+                            // explains, in the ranking's own direction.
+                            if let Some(child_facts) = self.facts(&group.child) {
+                                let direction = self.engine.fitness.direction();
+                                let adjusted = |v: f32| match direction {
+                                    crate::utils::fitness::Direction::Maximize => v,
+                                    crate::utils::fitness::Direction::Minimize => -v,
+                                };
+                                if let (Some(child_fit), Some(parent_fit)) =
+                                    (child_facts.fit, f.fit)
+                                {
+                                    let gain = adjusted(child_fit) - adjusted(parent_fit);
+                                    body.push_str(&format!(
+                                        " · Δfit {}{}",
+                                        if gain >= 0.0 { "+" } else { "−" },
+                                        fmt_cell(gain.abs())
+                                    ));
+                                }
+                                if let (Some(child_params), Some(parent_params)) =
+                                    (child_facts.params, f.params)
+                                {
+                                    let delta = child_params - parent_params;
+                                    body.push_str(&format!(
+                                        " · Δparams {}{}",
+                                        if delta >= 0 { "+" } else { "−" },
+                                        fmt_units(delta.abs())
+                                    ));
+                                }
+                            }
+                            if self.shown.contains(parent) {
+                                body.push_str(" · ↺ shown above");
+                            }
+                        }
+                    }
+                    self.shown.insert(parent.clone());
+                    let branch = if i + 1 == n { "└" } else { "│" };
+                    let slot = if *total == 1 {
+                        "p".to_string()
+                    } else {
+                        format!("p{slot}")
+                    };
+                    out.push(format!("      {branch} {slot} {body}"));
+                }
+                // The cap is named where the chain is cut: these parents may have parents of
+                // their own, and without this line they would read as roots.
+                if deepest && generation + 1 >= LINEAGE_MAX_DEPTH {
+                    let deeper = group
+                        .parents
+                        .iter()
+                        .any(|(p, _, _)| self.facts(p).map(|f| !f.parents.is_empty()).unwrap_or(false));
+                    if deeper {
+                        out.push(format!(
+                            "      └ … beyond the {LINEAGE_MAX_DEPTH}-generation cap"
+                        ));
+                        self.truncated = true;
+                    }
+                }
+            }
+        }
+        // The reported net closes its own chain, at the margin so the eye lands on it.
         if self.budget == 0 {
             self.truncated = true;
-            out.push(format!("{indent}…"));
             return;
         }
         self.budget -= 1;
-        let Some(facts) = self.facts(hash) else {
-            out.push(format!(
-                "{indent}{connector}{label} {} · no `nets/{}.json` — ancestry unknown",
-                short_hash(hash),
-                short_hash(hash),
-            ));
-            return;
-        };
-        let repeated = child.is_some() && self.shown.contains(hash);
-        // Parents FIRST: each generation sits one indent deeper, and the bracketed group
-        // directly above a net is that net's parent set. That is the natural reading order
-        // (oldest ancestor at the top, the reported net at the bottom).
-        if !repeated && depth + 1 < LINEAGE_MAX_DEPTH {
-            let n = facts.parents.len();
-            for (i, parent) in facts.parents.iter().enumerate() {
-                let next_label = if n == 1 {
-                    "p".to_string()
-                } else {
-                    format!("p{}", i + 1)
-                };
-                // A single parent is the group's only line and closes it.
-                let next_connector = if n == 1 || i + 1 == n {
-                    "└─ "
-                } else if i == 0 {
-                    "┌─ "
-                } else {
-                    "├─ "
-                };
-                self.render_node(
-                    parent,
-                    &next_label,
-                    Some(&facts),
-                    depth + 1,
-                    next_connector,
-                    out,
-                );
+        let mut line = format!("▼ #{rank} {}", short_hash(root));
+        match self.facts(root) {
+            None => line.push_str(" · no `nets/<hash>.json` — ancestry unknown"),
+            Some(f) => {
+                line.push_str(&format!(" · {}", origin_cell(f.origin.as_deref(), f.born)));
+                if let Some(v) = f.fit.or(self.root_fit) {
+                    line.push_str(&format!(" · fit {}", fmt_cell(v)));
+                }
+                line.push_str(&format!(" · {}", self.root_mark));
+                if f.parents.is_empty() {
+                    line.push_str(" · root (no recorded parents)");
+                }
             }
-        }
-        self.shown.insert(hash.to_string());
-        let mut line = format!(
-            "{indent}{connector}{label} {} · {}",
-            short_hash(hash),
-            origin_cell(facts.origin.as_deref(), facts.born),
-        );
-        // The ranking value. A root falls back to the table's own cell when the net has no
-        // stored reading; an ancestor prints only what its record carries.
-        let fit = if child.is_none() {
-            facts.fit.or(self.root_fit)
-        } else {
-            facts.fit
-        };
-        if let Some(v) = fit {
-            line.push_str(&format!(" · fit {}", fmt_cell(v)));
-        }
-        if let (Some(mean), true) = (facts.mean, facts.n > 0) {
-            line.push_str(&format!(" · μ {}", fmt_cell(mean)));
-            if let Some(std) = facts.std {
-                line.push_str(&format!(" σ {}", fmt_cell(std)));
-            }
-            line.push_str(&format!(" n {}", facts.n));
-        }
-        if let Some(params) = facts.params {
-            line.push_str(&format!(" · {}", fmt_units(params)));
-        }
-        if !facts.alive {
-            match (facts.culled_at, facts.cull_reason.as_deref()) {
-                (Some(clock), Some(reason)) => line.push_str(&format!(" · †{clock} {reason}")),
-                (Some(clock), None) => line.push_str(&format!(" · †{clock}")),
-                _ => line.push_str(" · dead"),
-            }
-        } else if child.is_some() {
-            line.push_str(" · live");
-        }
-        // The `Δ` leg, read parent-against-child in the RANKING's own direction, so `+`
-        // always means "the child scored better than this parent" — printing a raw `fit`
-        // difference would flip meaning on a minimize run.
-        if let Some(child) = child {
-            let direction = self.engine.fitness.direction();
-            let adjusted = |v: f32| match direction {
-                crate::utils::fitness::Direction::Maximize => v,
-                crate::utils::fitness::Direction::Minimize => -v,
-            };
-            if let (Some(child_fit), Some(parent_fit)) = (child.fit, facts.fit) {
-                let gain = adjusted(child_fit) - adjusted(parent_fit);
-                line.push_str(&format!(
-                    " · Δfit {}{}",
-                    if gain >= 0.0 { "+" } else { "−" },
-                    fmt_cell(gain.abs())
-                ));
-            }
-            if let (Some(child_params), Some(parent_params)) = (child.params, facts.params) {
-                let delta = child_params - parent_params;
-                line.push_str(&format!(
-                    " · Δparams {}{}",
-                    if delta >= 0 { "+" } else { "−" },
-                    fmt_units(delta.abs())
-                ));
-            }
-        }
-        if child.is_none() {
-            line.push_str(&format!(" · {}", self.root_mark));
-            // A reported net with NO group above it is a founder (random draw, inherited
-            // blueprint, initial batch). Saying so on the row is what stops the NEXT net's
-            // ancestry from being read as this one's.
-            if facts.parents.is_empty() {
-                line.push_str(" · root (no recorded parents)");
-            }
-        }
-        if repeated {
-            line.push_str(" · ↺ shown above");
-        }
-        // Depth cap: the parents could not be drawn above, so the cut is named on the net
-        // they belong to rather than inventing a line with no net behind it.
-        if !repeated && depth + 1 >= LINEAGE_MAX_DEPTH && !facts.parents.is_empty() {
-            line.push_str(&format!(
-                " · … {} parent(s), depth cap {LINEAGE_MAX_DEPTH}",
-                facts.parents.len()
-            ));
-            self.truncated = true;
         }
         out.push(line);
     }
