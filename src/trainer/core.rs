@@ -278,6 +278,31 @@ pub trait TabularStep: Send {
         None
     }
 
+        /// Per-net bookkeeping to persist with this net's checkpoint (R9).
+        ///
+        /// The engine calls this once per LIVE net at every checkpoint and stores the
+        /// result in that net's `nets/<hash>.json` envelope (field `trainer_state`), so it
+        /// travels with the net instead of guessing which state belongs to which hash.
+        /// Return whatever the scheme must remember about `net_hash` that the WEIGHTS do
+        /// not hold — the example is `last_accuracy` in `examples/mnist.rs`, which decides
+        /// whether the model is still improving. Default `None`: no state, no field, and
+        /// the file stays byte-identical to a pre-R9 run.
+        ///
+        /// Keep it small and JSON-only: it is rewritten at every tick and read back by
+        /// [`Self::restore`] after a resume, possibly in a different build.
+        fn state(&self, _net_hash: &str) -> Option<serde_json::Value> {
+            None
+        }
+
+        /// Hand back what [`Self::state`] recorded for this net, once, when a run resumes.
+        ///
+        /// Called AFTER the net's weights (and optimizer, when saved) are loaded and BEFORE
+        /// the next step, so a decision at the resumed clock sees what the uninterrupted run
+        /// would have seen. The default does nothing; a scheme that returns `Some` from
+        /// `state` and ignores the value here diverges from its twin — the two hooks are a
+        /// pair.
+        fn restore(&mut self, _net_hash: &str, _state: &serde_json::Value) {}
+
         /// Optional self-description of this scheme's hyperparameters, recorded in
         /// `engine.json` under `"trainer"`. The engine never interprets the contents.
     fn describe(&self) -> Option<serde_json::Value> {
@@ -416,6 +441,23 @@ impl AnyTrainer {
         match self {
             Self::Tabular(t) => t.describe(),
             Self::Rl(t) => t.describe(),
+        }
+    }
+
+    /// R9 — this net's trainer bookkeeping for a checkpoint. The RL arm has no state hook:
+    /// its per-episode bookkeeping is the environment's, and an env that draws its own
+    /// randomness is already documented as non-resumable.
+    pub fn trainer_state(&self, net_hash: &str) -> Option<serde_json::Value> {
+        match self {
+            Self::Tabular(t) => t.state(net_hash),
+            Self::Rl(_) => None,
+        }
+    }
+
+    /// R9 — hand a resumed net's bookkeeping back to the scheme before its next step.
+    pub fn restore_trainer_state(&mut self, net_hash: &str, state: &serde_json::Value) {
+        if let Self::Tabular(t) = self {
+            t.restore(net_hash, state);
         }
     }
 
