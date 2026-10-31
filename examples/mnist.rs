@@ -415,6 +415,24 @@ impl TabularStep for MnistTrainer {
         }))
     }
 
+    /// R9: the challenge jitter is scaled by `1 − last_accuracy`, so a value produced by
+    /// the PREVIOUS clocks decides what the next one does — exactly the state the weights
+    /// do not hold. It rides each net's `nets/<hash>.json` envelope, so a resume picks it
+    /// up before the first continued step instead of restarting the decay at 0.0.
+    ///
+    /// One run-level scalar stamped into every net: restoring it from any of them is
+    /// idempotent, and the last write at a checkpoint is the run's own value.
+    fn state(&self, _net_hash: &str) -> Option<serde_json::Value> {
+        Some(serde_json::json!({ "last_accuracy": self.last_accuracy }))
+    }
+
+    /// R9: read it back on resume (called per loaded net, before its next step).
+    fn restore(&mut self, _net_hash: &str, state: &serde_json::Value) {
+        if let Some(v) = state.get("last_accuracy").and_then(|v| v.as_f64()) {
+            self.last_accuracy = v as f32;
+        }
+    }
+
     // REQUIRED: the (pred, target) loss — a supervised scheme's defining choice.
     fn loss(&self) -> gras::trainer::LossFn<'_> {
         &*self.loss_fn
@@ -570,6 +588,12 @@ struct Cli {
     /// Dataset directory (any gras-format dataset works).
     #[arg(long, value_name = "DIR")]
     data_dir: Option<PathBuf>,
+
+    /// Continue an existing run from its directory: everything but the trainer code
+    /// comes from that run's `engine.json`. `--max-steps` then EXTENDS the recorded
+    /// budget (it is absolute, not per-process).
+    #[arg(long, value_name = "DIR")]
+    resume: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -698,20 +722,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = cli.engine.apply(builder).build();
 
     // ── STEP D — run. The `Final field` table is the report; there is no exam after it.
-    // NOTE: `--run-dir` is an OUTPUT path here, not a resume request. Resuming this
-    // example is blocked by `MnistTrainer::last_accuracy`: the challenge jitter's
-    // strength is scaled by it, it is not persisted per net, and a replay would
-    // therefore take a different step (measured: `race resume parity failure: net
-    // … at step 1`, TODO.md). Cartpole resumes because `Reinforce` carries no such
-    // cross-step trainer state.
-    let mut engine = TabularEngine::from_spec(gras::engine::RunSpec::tabular(
-        data_dir,
-        config,
-        fitness,
-        trainer,
-        cli.engine.seed_or(RUN_SEED),
-        cli.engine.run_dir_or(None), // engine picks results/<timestamp> when unset
-    ))?;
+    // `--run-dir` stays an OUTPUT path; continuing a run is `--resume <dir>`, which is
+    // possible again since R9: `MnistTrainer` now reports `last_accuracy` through
+    // `TabularStep::state()` (it rides `nets/<hash>.json`) and reads it back through
+    // `restore()`, so the resumed jitter strength is the one the previous clocks
+    // produced instead of 0.0. Before R9 this example failed its parity check at step 1.
+    let mut engine = match &cli.resume {
+        Some(dir) => {
+            let mut engine = TabularEngine::resume_from(dir.clone(), fitness, trainer)?;
+            // The budget is absolute: on a 20-clock run resumed at 30, 10 clocks run.
+            if let Some(steps) = cli.engine.max_steps {
+                engine.set_stop_max_steps(steps);
+            }
+            engine
+        }
+        None => TabularEngine::from_spec(gras::engine::RunSpec::tabular(
+            data_dir,
+            config,
+            fitness,
+            trainer,
+            cli.engine.seed_or(RUN_SEED),
+            cli.engine.run_dir_or(None), // engine picks results/<timestamp> when unset
+        ))?,
+    };
     println!("Run Dir: {}", engine.run_dir().display());
     match engine.run() {
         Ok(reason) => println!("Race stopped successfully: {reason:?}"),
