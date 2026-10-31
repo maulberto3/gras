@@ -1,14 +1,11 @@
 //! `RaceEngine`: one live race, whichever arm its source of experience picks.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
 
 use gras::engine::CoreEngine;
 use gras::prelude::*;
-use gras::state::load_engine_json;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 
 use crate::arrays::write_arrays;
 use crate::gym::GymEnv;
@@ -34,12 +31,6 @@ impl Arm {
 
     // `guardrail()` mutates the engine (it scores live nets and records the
     // verdict), so this arm needs the mutable deref as well as the shared one.
-    fn core_mut(&mut self) -> &mut CoreEngine {
-        match self {
-            Arm::Tabular(engine) => engine,
-            Arm::Rl(engine) => engine,
-        }
-    }
 
     fn run(&mut self) -> gras::flodl::tensor::Result<StopReason> {
         match self {
@@ -50,27 +41,32 @@ impl Arm {
 }
 
 
-/// One knob from the recorded trainer blob (`engine.json` → `"trainer"`).
-///
-/// `None` for a missing key, a JSON `null` (the blob records an unset `grad_clip`
-/// that way) or a value of another type, so a knob the run never carried keeps
-/// the crate's default instead of being invented here.
-fn blob_f32(blob: &serde_json::Value, key: &str) -> Option<f32> {
-    blob.get(key)
+// ── recorded-recipe knobs ──────────────────────────────────────────────
+//
+// The trainer blob is the scheme's own `describe()` output, persisted verbatim
+// in `engine.json` → `"trainer"`. A resume reads its recipe back through these
+// instead of the binding's defaults, so "resume with nothing named" replays the
+// scheme the run actually trained with.
+
+/// A string knob from the recorded trainer blob (`loss`, ...).
+fn blob_str(blob: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    blob.and_then(|b| b.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// An `f32` knob from the recorded trainer blob (`learning_rate`, `grad_clip`).
+fn blob_f32(blob: Option<&serde_json::Value>, key: &str) -> Option<f32> {
+    blob.and_then(|b| b.get(key))
         .and_then(serde_json::Value::as_f64)
         .map(|v| v as f32)
 }
 
-/// A whole-number knob from the recorded trainer blob (see [`blob_f32`]).
-fn blob_usize(blob: &serde_json::Value, key: &str) -> Option<usize> {
-    blob.get(key)
+/// A count knob from the recorded trainer blob (`batch_size`, ...).
+fn blob_usize(blob: Option<&serde_json::Value>, key: &str) -> Option<usize> {
+    blob.and_then(|b| b.get(key))
         .and_then(serde_json::Value::as_u64)
         .map(|v| v as usize)
-}
-
-/// A string knob from the recorded trainer blob (see [`blob_f32`]).
-fn blob_str<'a>(blob: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    blob.get(key).and_then(serde_json::Value::as_str)
 }
 
 /// A step-race. Construct from a dataset dir (`inputs.bin` / `targets.bin` /
@@ -290,6 +286,119 @@ impl PyRaceEngine {
             batch_size,
             eval_batch_size,
         )
+    }
+
+    /// Resume a TABULAR race from its run directory alone — the Python twin of
+    /// `TabularEngine::resume_from`.
+    ///
+    /// Everything a replay cannot re-derive is read from the record: the dataset
+    /// (`engine.json` → `data_dir`), the search space and pools, the metric set, the
+    /// run seed and the training recipe (`loss`, `learning_rate`, `grad_clip`,
+    /// `batch_size`, `eval_batch_size`). Every keyword below is an OVERRIDE of a
+    /// recorded value — pass one only when you mean something different. The crate
+    /// refuses a different training recipe by name (a replay under another scheme is
+    /// not the same experiment), and population geometry is data-integrity frozen.
+    ///
+    /// `max_steps` is the one budget knob that is genuinely yours, and it is
+    /// ABSOLUTE, not per-process: a run that stopped at clock 17 resumed with
+    /// `max_steps=20` does 3 more steps.
+    ///
+    /// RL runs are refused by name: their resume needs the environment instance,
+    /// which only Python holds, so that arm stays Rust-only for now.
+    ///
+    /// ```python
+    /// engine = RaceEngine.resume("results/1793336713882", max_steps=120)
+    /// engine.run()
+    /// ```
+    #[staticmethod]
+    #[pyo3(signature = (
+        run_dir,
+        max_steps = None,
+        loss = None,
+        fitness = None,
+        lr = None,
+        grad_clip = None,
+        batch_size = None,
+        eval_batch_size = None,
+    ))]
+    // Same reason as `new`: a constructor's kwargs ARE its API.
+    #[allow(clippy::too_many_arguments)]
+    fn resume(
+        run_dir: PathBuf,
+        max_steps: Option<usize>,
+        loss: Option<String>,
+        fitness: Option<String>,
+        lr: Option<f32>,
+        grad_clip: Option<f32>,
+        batch_size: Option<usize>,
+        eval_batch_size: Option<usize>,
+    ) -> PyResult<Self> {
+        let header = gras::state::load_engine_json(&run_dir)
+            .map_err(|e| PyRuntimeError::new_err(format!("resume {}: {e}", run_dir.display())))?;
+        // The ARM first: the header says which race this directory holds, and an RL
+        // run has no dataset geometry a tabular replay could be rebuilt from.
+        match header.engine_mode.as_deref() {
+            Some("tabular") | None => {}
+            Some(other) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "resume: {} was recorded as mode {other:?}, not \"tabular\" — an RL \
+                     resume needs the environment instance, so that arm is Rust-only \
+                     (RlEngine::resume_from)",
+                    run_dir.display()
+                )))
+            }
+        }
+        let blob = header.trainer.as_ref();
+        // Nothing named ⇒ the run's OWN recipe, read back from its `describe()` blob:
+        // any other scheme the parity guard refuses anyway, so falling back to the
+        // binding's default here would only move that error one step later.
+        let loss = match loss.or_else(|| blob_str(blob, "loss")) {
+            Some(name) => Loss::parse(&name).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "loss {name:?} recorded in {}: expected one of {}",
+                    run_dir.join("engine.json").display(),
+                    Loss::NAMES.join(", ")
+                ))
+            })?,
+            None => Loss::CrossEntropyOnehot,
+        };
+        let fitness_name = fitness.unwrap_or_else(|| header.fitness_label.0.clone());
+        let fitness = fitness_for(&fitness_name).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "fitness {fitness_name:?}: expected one of {}",
+                gras::FITNESS_NAMES.join(", ")
+            ))
+        })?;
+        let mut trainer = TabularTrainer::new(loss.build()).with_loss_label(loss.label());
+        if let Some(value) = lr.or_else(|| blob_f32(blob, "learning_rate")) {
+            trainer = trainer.with_learning_rate(value);
+        }
+        if let Some(value) = grad_clip.or_else(|| blob_f32(blob, "grad_clip")) {
+            trainer = trainer.with_grad_clip(value);
+        }
+        if let Some(value) = batch_size.or_else(|| blob_usize(blob, "batch_size")) {
+            trainer = trainer.with_batch_size(value);
+        }
+        if let Some(value) = eval_batch_size.or_else(|| blob_usize(blob, "eval_batch_size")) {
+            trainer = trainer.with_eval_batch_size(value);
+        }
+        // Install the sink at the RECORDED level before construction can emit: in a
+        // fresh process a resume would otherwise be silent (the subscriber is
+        // process-wide, so an earlier engine's ceiling still wins).
+        LOGGING.call_once(|| {
+            gras::engine::logging::init(
+                gras::RaceConfig::from_snapshot(&header.config).log_level,
+                None,
+            );
+        });
+        let mut engine = TabularEngine::resume_from(run_dir.clone(), fitness, trainer)
+            .map_err(|e| PyRuntimeError::new_err(format!("resume {}: {e}", run_dir.display())))?;
+        if let Some(steps) = max_steps {
+            engine.set_stop_max_steps(steps);
+        }
+        Ok(Self {
+            engine: Some(Arm::Tabular(engine)),
+        })
     }
 
     /// Build an RL race on a Python gym/gymnasium environment.
