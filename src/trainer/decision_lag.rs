@@ -143,12 +143,6 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
         })
     }
 
-    /// Guardrail forwarding: the inner trainer owns the environment, so the
-    /// relay must not swallow the measurement half.
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
-        self.inner.holdout_score(net, game_i)
-    }
-
     fn train_step(
         &mut self,
         net: &mut Network,
