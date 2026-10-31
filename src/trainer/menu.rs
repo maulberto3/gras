@@ -40,6 +40,10 @@ pub const DEFAULT_LABEL_SMOOTHING: f32 = 0.1;
 /// The default `beta` for [`Loss::SmoothL1`] — Huber at the L1/L2 crossover.
 pub const DEFAULT_HUBER_BETA: f64 = 1.0;
 
+/// The default `γ` for [`Loss::Focal`] — how hard the easy rows are down-weighted
+/// (the value the focal-loss paper settled on).
+pub const DEFAULT_FOCAL_GAMMA: f32 = 2.0;
+
 /// What a loss expects `target` to look like. Used to explain a mismatch (and to
 /// pick a sensible default fitness), never to reshape anyone's data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,13 +60,17 @@ pub enum TargetKind {
 /// caller lists with `gras.metrics()`.
 pub const METRIC_NAMES: &[&str] = &[
     "accuracy",
+    "balanced_accuracy",
     "f1",
     "precision",
+    "recall",
     "cross_entropy",
     "mse",
     "mae",
     "rmse",
+    "mape",
     "r2",
+    "explained_variance",
 ];
 
 /// Every fitness name [`fitness_for`] accepts. Same scorers as the metrics, but
@@ -70,12 +78,16 @@ pub const METRIC_NAMES: &[&str] = &[
 pub const FITNESS_NAMES: &[&str] = &[
     "cross_entropy",
     "accuracy",
+    "balanced_accuracy",
     "f1",
     "precision",
+    "recall",
     "mse",
     "mae",
     "rmse",
+    "mape",
     "r2",
+    "explained_variance",
 ];
 
 /// A training loss, by name. `parse` and `label` round-trip, so the value
@@ -95,6 +107,25 @@ pub enum Loss {
     SmoothL1 { beta: f64 },
     /// Binary cross-entropy on raw logits — no sigmoid needed before it.
     BceWithLogits,
+    /// Focal loss — softmax cross-entropy re-weighted toward the HARD rows by
+    /// `(1 − p_t)^γ`. `γ = 0` is plain cross-entropy. Use it when a few easy rows
+    /// dominate the gradient.
+    ///
+    /// There is deliberately no `α`: in the focal paper it weights the POSITIVE
+    /// class under a sigmoid head, while this crate's classification head is
+    /// softmax over one-hot rows, where a scalar `α` would multiply every row
+    /// equally — a pure rescale that Adam cancels, i.e. a knob that lies. Class
+    /// imbalance here is a DATA problem (resample, or reweight the dataset), and
+    /// saying so is more useful than accepting `alpha=` and doing nothing.
+    Focal { gamma: f32 },
+    /// Kullback-Leibler divergence between the net's log-softmax and a target
+    /// DISTRIBUTION (soft labels, a teacher's output). One-hot targets make it
+    /// identical to cross-entropy.
+    KlDiv,
+    /// Poisson negative log-likelihood for COUNT targets: the net outputs a
+    /// log-rate and the loss is `exp(pred) − target · pred`. Always the log-input
+    /// form, so a negative prediction cannot turn the loss into NaN.
+    PoissonNll,
 }
 
 impl Loss {
@@ -110,6 +141,11 @@ impl Loss {
             beta: DEFAULT_HUBER_BETA,
         },
         Loss::BceWithLogits,
+        Loss::Focal {
+            gamma: DEFAULT_FOCAL_GAMMA,
+        },
+        Loss::KlDiv,
+        Loss::PoissonNll,
     ];
 
     /// The bare (parameterless) spellings `parse` accepts — what a Python
@@ -121,6 +157,9 @@ impl Loss {
         "l1",
         "smooth_l1",
         "bce_with_logits",
+        "focal",
+        "kl_div",
+        "poisson_nll",
     ];
 
     /// Parse a name, with or without parameters. Bare names take the defaults;
@@ -138,6 +177,9 @@ impl Loss {
                 "smooth_l1" => Some(Self::SmoothL1 {
                     beta: arg.parse().ok()?,
                 }),
+                "focal" => Some(Self::Focal {
+                    gamma: arg.parse().ok()?,
+                }),
                 _ => None,
             };
         }
@@ -153,6 +195,11 @@ impl Loss {
                 beta: DEFAULT_HUBER_BETA,
             }),
             "bce_with_logits" | "bce" => Some(Self::BceWithLogits),
+            "focal" | "focal_loss" => Some(Self::Focal {
+                gamma: DEFAULT_FOCAL_GAMMA,
+            }),
+            "kl_div" | "kl" | "kldiv" => Some(Self::KlDiv),
+            "poisson_nll" | "poisson" => Some(Self::PoissonNll),
             _ => None,
         }
     }
@@ -167,6 +214,9 @@ impl Loss {
             Self::L1 => "l1".to_string(),
             Self::SmoothL1 { beta } => format!("smooth_l1({beta})"),
             Self::BceWithLogits => "bce_with_logits".to_string(),
+            Self::Focal { gamma } => format!("focal({gamma})"),
+            Self::KlDiv => "kl_div".to_string(),
+            Self::PoissonNll => "poisson_nll".to_string(),
         }
     }
 
@@ -186,6 +236,21 @@ impl Loss {
                 flodl::nn::loss::smooth_l1_loss(pred, y, beta)
             }),
             Self::BceWithLogits => Box::new(flodl::nn::loss::bce_with_logits_loss),
+            Self::Focal { gamma } => Box::new(move |pred: &Variable, y: &Variable| {
+                crate::utils::score::focal_loss_onehot(pred, y, gamma)
+            }),
+            // KL divergence is defined on LOG-probabilities, so the net's output is
+            // passed through the same `log_softmax` cross-entropy uses — a raw-logit
+            // net and a log-softmax one are the same function under this loss.
+            Self::KlDiv => Box::new(|pred: &Variable, y: &Variable| {
+                let log_p = pred.data().log_softmax(1)?;
+                flodl::nn::loss::kl_div_loss(&Variable::new(log_p, false), y)
+            }),
+            // `log_input = true` unconditionally: `exp(pred)` is always positive, so a
+            // net that drifts negative stays finite instead of taking `log(<0)`.
+            Self::PoissonNll => Box::new(|pred: &Variable, y: &Variable| {
+                flodl::nn::loss::poisson_nll_loss(pred, y, true)
+            }),
         }
     }
 
@@ -193,9 +258,14 @@ impl Loss {
     /// `task=` presets — never for reshaping.
     pub fn target_kind(&self) -> TargetKind {
         match self {
-            Self::CrossEntropyOnehot | Self::LabelSmoothingCe { .. } => TargetKind::OneHot,
+            Self::CrossEntropyOnehot
+            | Self::LabelSmoothingCe { .. }
+            | Self::Focal { .. }
+            | Self::KlDiv => TargetKind::OneHot,
             Self::BceWithLogits => TargetKind::Binary,
-            Self::Mse | Self::L1 | Self::SmoothL1 { .. } => TargetKind::Regression,
+            Self::Mse | Self::L1 | Self::SmoothL1 { .. } | Self::PoissonNll => {
+                TargetKind::Regression
+            }
         }
     }
 
@@ -203,8 +273,15 @@ impl Loss {
     /// net trains; this decides WHICH net wins.
     pub fn natural_fitness(&self) -> Fitness {
         match self {
-            // A classification loss ranks on how well the classes come out.
-            Self::CrossEntropyOnehot | Self::LabelSmoothingCe { .. } => {
+            // A classification loss ranks on how well the classes come out. Focal and
+            // KL rank on PLAIN cross-entropy on purpose: the re-weighting is what
+            // trains, but ranking on the re-weighted number would compare nets on a
+            // curve the winner has to beat — CE is the unbiased exam. (For a one-hot
+            // target KL IS CE, so the three agree there by construction.)
+            Self::CrossEntropyOnehot
+            | Self::LabelSmoothingCe { .. }
+            | Self::Focal { .. }
+            | Self::KlDiv => {
                 Fitness::minimize("cross_entropy", crate::utils::score::cross_entropy_onehot)
             }
             // Binary: the loss is not comparable across shapes, so rank on hits.
@@ -214,6 +291,9 @@ impl Loss {
             Self::L1 | Self::SmoothL1 { .. } => {
                 Fitness::minimize("mae", crate::utils::score::l1_loss_score)
             }
+            // Counts are ranked on squared error: the same unit the deviance penalises,
+            // and a score that exists for every target shape.
+            Self::PoissonNll => Fitness::minimize("mse", crate::utils::score::mse_loss_score),
         }
     }
 }
@@ -242,8 +322,13 @@ pub fn metric_for(name: &str) -> Option<Metric> {
     type ScoreBox = Box<dyn Fn(&Variable, &Variable) -> flodl::tensor::Result<f32> + Send + Sync>;
     let (label, f): (&'static str, ScoreBox) = match name.trim() {
         "accuracy" => ("accuracy", Box::new(crate::utils::score::accuracy_score)),
+        "balanced_accuracy" => (
+            "balanced_accuracy",
+            Box::new(crate::utils::score::balanced_accuracy_score),
+        ),
         "f1" => ("f1", Box::new(crate::utils::score::f1_score)),
         "precision" => ("precision", Box::new(crate::utils::score::precision_score)),
+        "recall" => ("recall", Box::new(crate::utils::score::recall_score)),
         "cross_entropy" => (
             "cross_entropy",
             Box::new(crate::utils::score::cross_entropy_onehot),
@@ -251,7 +336,12 @@ pub fn metric_for(name: &str) -> Option<Metric> {
         "mse" => ("mse", Box::new(crate::utils::score::mse_loss_score)),
         "mae" | "l1" => ("mae", Box::new(crate::utils::score::l1_loss_score)),
         "rmse" => ("rmse", Box::new(crate::utils::score::rmse_score)),
+        "mape" => ("mape", Box::new(crate::utils::score::mape_score)),
         "r2" => ("r2", Box::new(crate::utils::score::r2_score)),
+        "explained_variance" => (
+            "explained_variance",
+            Box::new(crate::utils::score::explained_variance_score),
+        ),
         _ => return None,
     };
     Some(Metric::custom(label, f))
@@ -281,12 +371,22 @@ pub fn fitness_for(name: &str) -> Option<Fitness> {
     Some(match name.trim() {
         "cross_entropy" => Fitness::minimize("cross_entropy", crate::utils::score::cross_entropy_onehot),
         "accuracy" => Fitness::maximize("accuracy", crate::utils::score::accuracy_score),
+        "balanced_accuracy" => Fitness::maximize(
+            "balanced_accuracy",
+            crate::utils::score::balanced_accuracy_score,
+        ),
         "f1" => Fitness::maximize("f1", crate::utils::score::f1_score),
         "precision" => Fitness::maximize("precision", crate::utils::score::precision_score),
+        "recall" => Fitness::maximize("recall", crate::utils::score::recall_score),
         "mse" => Fitness::minimize("mse", crate::utils::score::mse_loss_score),
         "mae" | "l1" => Fitness::minimize("mae", crate::utils::score::l1_loss_score),
         "rmse" => Fitness::minimize("rmse", crate::utils::score::rmse_score),
+        "mape" => Fitness::minimize("mape", crate::utils::score::mape_score),
         "r2" => Fitness::maximize("r2", crate::utils::score::r2_score),
+        "explained_variance" => Fitness::maximize(
+            "explained_variance",
+            crate::utils::score::explained_variance_score,
+        ),
         _ => return None,
     })
 }
@@ -346,6 +446,16 @@ mod tests {
         );
         assert_eq!(Loss::parse("huber").unwrap().label(), "smooth_l1(1)");
         assert_eq!(Loss::parse("mae").unwrap().label(), "l1");
+        assert_eq!(Loss::parse("kl").unwrap().label(), "kl_div");
+        assert_eq!(Loss::parse("poisson").unwrap().label(), "poisson_nll");
+        assert_eq!(Loss::parse("focal_loss").unwrap().label(), "focal(2)");
+        // The parameterised form round-trips at a non-default value.
+        let focal = Loss::parse("focal(1)").unwrap();
+        assert_eq!(focal.label(), "focal(1)");
+        assert_eq!(Loss::parse(&focal.label()), Some(focal));
+        // A focal `α` is not accepted, because it would do nothing: a two-arg form
+        // is a typo that has to be caught, not silently halved.
+        assert!(Loss::parse("focal(0.25,2)").is_none());
     }
 
     #[test]
@@ -373,6 +483,38 @@ mod tests {
         }
     }
 
+    /// The claimed identities, measured rather than asserted in prose: at
+    /// `α = 1, γ = 0` focal IS cross-entropy, and KL against a one-hot target IS
+    /// cross-entropy. If either drifts, the docs above are lying.
+    #[test]
+    fn focal_and_kl_reduce_to_cross_entropy_at_their_degenerate_settings() {
+        let pred = var(&[1.0, -2.0, 0.5, -1.0, 2.0, 0.0], &[2, 3]);
+        let y = var(&[1.0, 0.0, 0.0, 0.0, 0.0, 1.0], &[2, 3]);
+        let value = |loss: &Loss| loss.build()(&pred, &y).unwrap().item().unwrap() as f32;
+
+        let ce = value(&Loss::CrossEntropyOnehot);
+        let focal = value(&Loss::Focal { gamma: 0.0 });
+        assert!((ce - focal).abs() < 1e-5, "focal {focal} vs ce {ce}");
+        let kl = value(&Loss::KlDiv);
+        assert!((ce - kl).abs() < 1e-5, "kl_div {kl} vs ce {ce}");
+
+        // And the knob actually moves it: γ > 0 can only LOWER the loss on a net
+        // that is already confident, which is the whole point of the modulating
+        // factor.
+        let focused = value(&Loss::Focal { gamma: 2.0 });
+        assert!(focused < ce, "focal(2) {focused} should be below ce {ce}");
+    }
+
+    #[test]
+    fn poisson_stays_finite_for_a_net_that_predicts_negative_log_rates() {
+        // `log_input = true` is not a default here, it is the only form: a raw rate
+        // would take `log(<0)` on this prediction and report NaN as a fitness.
+        let pred = var(&[-3.0, 4.0, 0.0], &[3, 1]);
+        let y = var(&[0.0, 9.0, 2.0], &[3, 1]);
+        let x = Loss::PoissonNll.build()(&pred, &y).unwrap().item().unwrap() as f32;
+        assert!(x.is_finite() && x > 0.0, "poisson_nll produced {x}");
+    }
+
     #[test]
     fn natural_fitness_follows_the_loss_family() {
         assert_eq!(
@@ -387,6 +529,13 @@ mod tests {
         );
         assert_eq!(Loss::BceWithLogits.natural_fitness().label(), "accuracy");
         assert_eq!(Loss::Mse.natural_fitness().label(), "mse");
+        // Focal and KL rank on the UNWEIGHTED exam, not on their own curve.
+        assert_eq!(
+            Loss::Focal { gamma: 2.0 }.natural_fitness().label(),
+            "cross_entropy"
+        );
+        assert_eq!(Loss::KlDiv.natural_fitness().label(), "cross_entropy");
+        assert_eq!(Loss::PoissonNll.natural_fitness().label(), "mse");
         assert_eq!(Loss::L1.natural_fitness().label(), "mae");
         assert_eq!(
             Loss::SmoothL1 { beta: 1.0 }.natural_fitness().label(),

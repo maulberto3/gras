@@ -314,7 +314,11 @@ pub trait TabularStep: Send {
 
         /// Optional LR schedule for `step` (`None` = the optimizer's fixed LR), applied
         /// by the trainer. MUST be a pure function of `step` (replay contract).
-    fn scheduled_lr(&self, _step: usize) -> Option<f64> {
+        ///
+        /// `max_steps` is the run's budget, so a progress-shaped schedule
+        /// (`cosine`, `onecycle`) can be a pure function of the clock instead of
+        /// keeping a private horizon — `None` means an unbounded run.
+    fn scheduled_lr(&self, _step: usize, _max_steps: Option<usize>) -> Option<f64> {
         None
     }
 

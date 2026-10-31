@@ -33,6 +33,14 @@ pub struct TabularTrainer {
         /// Optional LR schedule: pure function of the step clock (`None` = fixed LR);
         /// MUST be deterministic in `step` alone — see `TabularStep::scheduled_lr`.
     pub lr_schedule: Option<Box<dyn Fn(usize) -> f64 + Send + Sync>>,
+        /// A NAMED schedule (`cosine`, `onecycle`, …), which wins over the closure
+        /// above when set. Named, so `engine.json` records what actually ran and a
+        /// resume can refuse a different curve instead of silently switching it.
+    pub lr_schedule_name: Option<crate::trainer::LrSchedule>,
+        /// Which update the optimizer makes (`adam` by default). Recorded, because a
+        /// resumed run must load the RIGHT moments — `nets/<hash>.optim` is written
+        /// by one optimizer and cannot be read by another.
+    pub optimizer: crate::trainer::OptimizerKind,
         /// What objective `loss_fn` optimizes, for the run record. The engine can't
         /// see inside the closure, so replay tools refuse an unlabeled scheme.
     pub loss_label: Option<String>,
@@ -90,6 +98,23 @@ impl TabularTrainer {
         self
     }
 
+        /// Set a NAMED schedule — the one a config file, a CLI flag or a Python
+        /// keyword can spell. It scales [`Self::learning_rate`], so `lr=` and
+        /// `lr_schedule=` compose, and it takes precedence over
+        /// [`Self::with_lr_schedule`].
+    pub fn with_named_lr_schedule(mut self, schedule: crate::trainer::LrSchedule) -> Self {
+        self.lr_schedule_name = Some(schedule);
+        self
+    }
+
+        /// Choose the update by name (`adam` is the default). The choice is recorded
+        /// in `engine.json`, so a resume either reloads the same optimizer's moments or
+        /// refuses — it cannot continue one run's state under another optimizer.
+    pub fn with_optimizer(mut self, optimizer: crate::trainer::OptimizerKind) -> Self {
+        self.optimizer = optimizer;
+        self
+    }
+
 }
 
 impl Default for TabularTrainer {
@@ -106,63 +131,64 @@ impl Default for TabularTrainer {
             // silence is the honest record. `with_loss_label` names it.
             loss_label: None,
             lr_schedule: None,
+            lr_schedule_name: None,
+            optimizer: crate::trainer::OptimizerKind::default(),
         }
     }
 }
 
 impl TabularStep for TabularTrainer {
-    /// Reload `nets/<hash>.optim` into a fresh Adam over this net's
-    /// parameters. `Stateful` needs the concrete type — which is exactly why this
+    /// Reload `nets/<hash>.optim` into a fresh optimizer of the KIND this scheme
+    /// trains with. `Stateful` needs the concrete type — which is exactly why this
     /// lives in the trainer instead of the engine.
     fn restore_optimizer(
         &self,
         net: &Network,
         path: &std::path::Path,
     ) -> Option<Box<dyn Optimizer>> {
-        use flodl::nn::optim::Stateful;
-        use flodl::nn::Module;
-        let mut opt = flodl::nn::Adam::new(&net.parameters(), self.learning_rate as f64);
-        match opt.load_state_file(&path.to_string_lossy()) {
-            Ok(()) => Some(Box::new(opt)),
-            Err(e) => {
-                tracing::warn!(
-                    "optimizer state {} could not be loaded ({e}) — restarting moments",
-                    path.display()
-                );
-                None
-            }
-        }
+        self.optimizer.load(net, self.learning_rate, path)
     }
 
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
-        use flodl::nn::Module;
-        Box::new(flodl::nn::Adam::new(
-            &net.parameters(),
-            self.learning_rate as f64,
-        ))
+        self.optimizer.make(net, self.learning_rate)
     }
 
     /// Record this scheme's training recipe in `engine.json` (see
     /// [`TabularStep::describe`]).
     fn describe(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
+        let mut blob = serde_json::json!({
             "trainer": "tabular",
-            "optimizer": "adam",
+            "optimizer": self.optimizer.label(),
             "loss": self.loss_label,
             "learning_rate": self.learning_rate,
             "grad_clip": self.grad_clip,
             "batch_size": self.batch_size,
             "eval_batch_size": self.eval_batch_size,
-            "lr_schedule": self.lr_schedule.is_some(),
-        }))
+            // The BOOLEAN stays for compatibility: runs recorded before named
+            // schedules compare this key on resume, so changing it to a string
+            // would refuse every one of them.
+            "lr_schedule": self.lr_schedule.is_some() || self.lr_schedule_name.is_some(),
+        });
+        // Only a NAMED schedule gets a label, and only when one is set — so a run
+        // with no schedule writes exactly the blob it wrote before this existed.
+        if let Some(named) = &self.lr_schedule_name {
+            blob["lr_schedule_name"] = serde_json::Value::String(named.label());
+        }
+        Some(blob)
     }
 
     fn loss(&self) -> crate::trainer::LossFn<'_> {
         &*self.loss_fn
     }
 
-    fn scheduled_lr(&self, step: usize) -> Option<f64> {
-        self.lr_schedule.as_ref().map(|f| f(step))
+    /// A NAMED schedule scales the base rate; an anonymous closure is taken at its
+    /// word. Named wins, because it is the one that can be recorded and checked.
+    fn scheduled_lr(&self, step: usize, max_steps: Option<usize>) -> Option<f64> {
+        match (&self.lr_schedule_name, &self.lr_schedule) {
+            (Some(named), _) => Some(named.lr(self.learning_rate, step, max_steps) as f64),
+            (None, Some(anonymous)) => Some(anonymous(step)),
+            (None, None) => None,
+        }
     }
 
     fn stream_shape(&self) -> Option<crate::trainer::StreamShape> {
@@ -193,7 +219,7 @@ impl TabularStep for TabularTrainer {
         let batch: (Tensor, Tensor) = ctx.data.train_batch(step as u64)?;
         // LR schedule first (pure function of step — replay-safe), then the
         // deterministic train step (seeds the RNG, then forward/backward).
-        if let Some(lr) = self.scheduled_lr(step) {
+        if let Some(lr) = self.scheduled_lr(step, ctx.env.max_steps) {
             optimizer.set_lr(lr);
         }
         let train_loss = deterministic_train_step(

@@ -143,6 +143,13 @@ pub struct Reinforce<E: Env> {
     challenge_policy: ChallengePolicy,
     /// How the challenge knob decays over the step budget.
     challenge_decay: ChallengeDecay,
+    /// A NAMED LR schedule scaling [`Self::learning_rate`] over the run (`None` =
+    /// the rate stays put). Recorded in `describe()`, so a resume cannot swap it.
+    lr_schedule: Option<crate::trainer::LrSchedule>,
+    /// Which update the optimizer makes (`adam`, the reference recipe). Recorded
+    /// when it is not the default, so a resume either reloads those moments or
+    /// refuses — `nets/<hash>.optim` belongs to one optimizer.
+    optimizer: crate::trainer::OptimizerKind,
 }
 
 impl<E: Env> Reinforce<E> {
@@ -163,7 +170,26 @@ impl<E: Env> Reinforce<E> {
             challenge_prob: DEFAULT_CHALLENGE_PROB,
             challenge_policy: ChallengePolicy::LeastAction,
             challenge_decay: DEFAULT_CHALLENGE_DECAY,
+            lr_schedule: None,
+            optimizer: crate::trainer::OptimizerKind::default(),
         }
+    }
+
+    /// Choose the update by name (`adam` is the reference recipe).
+    pub fn with_optimizer(mut self, optimizer: crate::trainer::OptimizerKind) -> Self {
+        self.optimizer = optimizer;
+        self
+    }
+
+    /// Set a NAMED LR schedule (`cosine`, `onecycle`, …), scaling the base rate
+    /// over the run's budget. Pure in `(step, max_steps)`, so a resumed run applies
+    /// exactly the rate the uninterrupted one would have.
+    pub fn with_named_lr_schedule(
+        mut self,
+        schedule: crate::trainer::LrSchedule,
+    ) -> Self {
+        self.lr_schedule = Some(schedule);
+        self
     }
 
     /// Set the TRAIN episodes per step (default 1). The learning signal: more
@@ -369,34 +395,18 @@ impl<E: Env> Reinforce<E> {
 
 impl<E: Env> RlStep for Reinforce<E> {
     /// Adam over the net's parameters — one optimizer per net, kept across steps.
-    /// Reload `nets/<hash>.optim` into a fresh Adam over this net's
-    /// parameters. `Stateful` needs the concrete type — which is exactly why this
-    /// lives in the trainer instead of the engine.
+    /// Reload `nets/<hash>.optim` into a fresh optimizer of the KIND this scheme
+    /// trains with — `Stateful` needs the concrete type, which only the trainer knows.
     fn restore_optimizer(
         &self,
         net: &Network,
         path: &std::path::Path,
     ) -> Option<Box<dyn Optimizer>> {
-        use flodl::nn::optim::Stateful;
-        use flodl::nn::Module;
-        let mut opt = flodl::nn::Adam::new(&net.parameters(), self.learning_rate as f64);
-        match opt.load_state_file(&path.to_string_lossy()) {
-            Ok(()) => Some(Box::new(opt)),
-            Err(e) => {
-                tracing::warn!(
-                    "optimizer state {} could not be loaded ({e}) — restarting moments",
-                    path.display()
-                );
-                None
-            }
-        }
+        self.optimizer.load(net, self.learning_rate, path)
     }
 
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
-        Box::new(flodl::nn::Adam::new(
-            &net.parameters(),
-            self.learning_rate as f64,
-        ))
+        self.optimizer.make(net, self.learning_rate)
     }
 
     /// The recorded trainer blob — `engine.json`'s record of WHAT trained, so a
@@ -404,7 +414,7 @@ impl<E: Env> RlStep for Reinforce<E> {
     /// else. The world describes itself (id/class, its own knobs) and the trainer
     /// records the caps it enforces on top.
     fn describe(&self) -> Option<serde_json::Value> {
-        Some(serde_json::json!({
+        let mut blob = serde_json::json!({
             "trainer": "reinforce",
             "update": "REINFORCE (log_softmax autodiff; per-turn returns, batch-mean baseline, advantage normalization)",
             "env": self.env.describe(),
@@ -420,7 +430,18 @@ impl<E: Env> RlStep for Reinforce<E> {
             "challenge_prob": self.challenge_prob,
             "challenge_policy": self.challenge_policy.to_string(),
             "challenge_decay": self.challenge_decay.to_string(),
-        }))
+        });
+        // Only when set: an RL run with no schedule keeps the exact blob (and
+        // therefore the resume compatibility) it had before schedules existed.
+        if let Some(named) = &self.lr_schedule {
+            blob["lr_schedule"] = serde_json::Value::String(named.label());
+        }
+        // Same rule for the optimizer: only when it is not the reference recipe, so
+        // an RL run that never named one keeps the blob (and resume) it had before.
+        if self.optimizer != crate::trainer::OptimizerKind::default() {
+            blob["optimizer"] = serde_json::Value::String(self.optimizer.label().to_string());
+        }
+        Some(blob)
     }
 
     /// One step: play the TRAIN episodes (challenge-aware), update, then measure
@@ -445,6 +466,12 @@ impl<E: Env> RlStep for Reinforce<E> {
         );
         let forced =
             challenged.then(|| forced_action(self.challenge_policy, ctx.net_seed, step, actions));
+
+        // The rate for THIS clock, before any gradient flows: a pure function of
+        // the clock and the budget, so a replay sets the identical value.
+        if let Some(named) = &self.lr_schedule {
+            optimizer.set_lr(named.lr(self.learning_rate, step, ctx.env.max_steps) as f64);
+        }
 
         // 1. TRAIN episodes: per-net seeds, run seed blended in so an inherited
         //    champion does not replay its source run's exact trajectories.

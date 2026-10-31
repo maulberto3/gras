@@ -8,7 +8,9 @@ pub mod core;
 pub mod decision_lag;
 pub mod env;
 pub mod menu;
+pub mod optimizer;
 pub mod reinforce;
+pub mod schedule;
 pub mod stream;
 
 /// The crate's reference tabular scheme — SHIPPED surface, not test scaffolding:
@@ -28,6 +30,10 @@ pub use core::{
 pub use decision_lag::DecisionLagTrainer;
 pub use env::Env;
 pub use menu::{FITNESS_NAMES, Loss, METRIC_NAMES, TargetKind, fitness_for, metric_for, metrics_for};
+/// Named LR schedules — the spellable half of `TabularStep::scheduled_lr`.
+pub use schedule::LrSchedule;
+/// Named optimizers — what `make_optimizer` / `restore_optimizer` build.
+pub use optimizer::OptimizerKind;
 /// The crate's reference RL scheme — SHIPPED surface, like [`TabularTrainer`]:
 /// `Reinforce::new(world, device)` trains any [`Env`], and `Signal` chooses what
 /// the returns and the fitness are derived from.
