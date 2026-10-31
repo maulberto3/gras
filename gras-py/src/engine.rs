@@ -69,6 +69,154 @@ fn blob_usize(blob: Option<&serde_json::Value>, key: &str) -> Option<usize> {
         .map(|v| v as usize)
 }
 
+/// Resume an **RL** directory: hand back the environment, take every other knob
+/// from the record.
+///
+/// The recipe a resume cannot invent is the world (`reset(seed)` / `step(action)` /
+/// `action_space.n`) — the caller holds it, so `env=` is required. Everything the
+/// crate can read back out of `engine.json` → `"trainer"` IS read back: `signal`
+/// (turns vs discounted return), both episode counts, `challenge_prob` / policy /
+/// decay, the learning rate, the clip and the episode cap. Nothing falls back to a
+/// default: a default that disagrees with the record is a silent second experiment,
+/// and the crate's blob guard would refuse it one step later anyway.
+fn resume_rl(
+    run_dir: PathBuf,
+    header: gras::state::RunHeader,
+    env: Option<Py<PyAny>>,
+    max_steps: Option<usize>,
+    loss: Option<String>,
+    fitness: Option<String>,
+    lr: Option<f32>,
+    grad_clip: Option<f32>,
+    batch_size: Option<usize>,
+    eval_batch_size: Option<usize>,
+) -> PyResult<PyRaceEngine> {
+    let Some(env) = env else {
+        return Err(PyValueError::new_err(format!(
+            "resume: {} was recorded as mode \"rl\", so it needs env= — the environment it \
+             trained on is not on disk (the rest of the recipe is: signal, both episode \
+             counts, the challenge knobs, lr and grad clip)",
+            run_dir.display()
+        )));
+    };
+    // The tabular recipe kwargs name a DIFFERENT scheme than the one recorded here:
+    // the RL blob holds those knobs itself, so accepting one would be accepted-then-
+    // refused by the parity guard. Name the mistake at the call site.
+    let mut tabular_only: Vec<&str> = Vec::new();
+    for (name, given) in [
+        ("loss", loss.is_some()),
+        ("lr", lr.is_some()),
+        ("grad_clip", grad_clip.is_some()),
+        ("batch_size", batch_size.is_some()),
+        ("eval_batch_size", eval_batch_size.is_some()),
+    ] {
+        if given {
+            tabular_only.push(name);
+        }
+    }
+    if !tabular_only.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "resume: {} is an RL run — {} name(s) the TABULAR recipe, and an RL run's \
+             recipe (signal, episode counts, challenge, lr, clip) is read from its record \
+             and refused if it differs. Pass only run_dir, env= and max_steps=.",
+            run_dir.display(),
+            tabular_only.join(", ")
+        )));
+    }
+    if let Some(name) = fitness {
+        return Err(PyValueError::new_err(format!(
+            "fitness {name:?}: an RL run ranks on the signal it trained with, which is \
+             recorded — the fitness cannot be swapped on a resume"
+        )));
+    }
+
+    let engine_json = run_dir.join("engine.json");
+    let blob = header.trainer.as_ref().ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "resume: {} has no `trainer` record, so the RL recipe it trained with is lost \
+             — this directory cannot be rebuilt",
+            engine_json.display()
+        ))
+    })?;
+    let read = |key: &str| -> PyResult<&serde_json::Value> {
+        blob.get(key).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "resume: {}.trainer.{key} is missing — the run did not record the knob a \
+                 replay needs",
+                engine_json.display()
+            ))
+        })
+    };
+    let text = |key: &str| -> PyResult<String> {
+        read(key)?.as_str().map(str::to_owned).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "resume: {}.trainer.{key} is not a string",
+                engine_json.display()
+            ))
+        })
+    };
+    let number = |key: &str| -> PyResult<f64> {
+        read(key)?.as_f64().ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "resume: {}.trainer.{key} is not a number",
+                engine_json.display()
+            ))
+        })
+    };
+    let count = |key: &str| -> PyResult<usize> { Ok(number(key)? as usize) };
+
+    // `signal` is the one structured knob: `{"kind": "turns"}` or
+    // `{"kind": "return", "discount": 0.99}` — the same serde shape the record
+    // holds, so there is no second decoder to drift.
+    let signal: Signal = serde_json::from_value(read("signal")?.clone()).map_err(|e| {
+        PyValueError::new_err(format!(
+            "resume: {}.trainer.signal: {e}",
+            engine_json.display()
+        ))
+    })?;
+    let policy = ChallengePolicy::try_from(text("challenge_policy")?.as_str())
+        .map_err(PyValueError::new_err)?;
+    let decay = ChallengeDecay::try_from(text("challenge_decay")?.as_str())
+        .map_err(PyValueError::new_err)?;
+    let max_turns = count("max_turns")?;
+    let challenge_prob = number("challenge_prob")? as f32;
+    let learning_rate = number("learning_rate")? as f32;
+    let clip = number("grad_clip")? as f32;
+    let matches = count("matches_per_step")?;
+    let eval_matches = count("eval_matches_per_step")?;
+
+    // Install the sink at the RECORDED level before construction can emit — a fresh
+    // process would otherwise resume silently (the subscriber is process-wide).
+    LOGGING.call_once(|| {
+        gras::engine::logging::init(
+            gras::RaceConfig::from_snapshot(&header.config).log_level,
+            None,
+        );
+    });
+    // The recorded cap is the FALLBACK: an environment that publishes its own
+    // `spec.max_episode_steps` still wins, exactly as it did when the run started —
+    // and a mismatch there is the blob guard's to report.
+    let world = Python::attach(|py| GymEnv::new(py, env, Some(max_turns)))?;
+    let trainer = Reinforce::new(world, gras::auto_device())
+        .with_signal(signal)
+        .with_learning_rate(learning_rate)
+        .with_grad_clip(clip)
+        .with_matches_per_step(matches)
+        .with_eval_matches_per_step(eval_matches)
+        .with_challenge(challenge_prob, policy, decay);
+    // The fitness is the record's, not a guess: `gym()` pairs it with the signal, so
+    // re-deriving it from the same record keeps ranking and exam identical.
+    let fitness = Fitness::reported(header.fitness_direction, &header.fitness_label.0);
+    let mut engine = RlEngine::resume_from(run_dir.clone(), fitness, trainer)
+        .map_err(|e| PyRuntimeError::new_err(format!("resume {}: {e}", run_dir.display())))?;
+    if let Some(steps) = max_steps {
+        engine.set_stop_max_steps(steps);
+    }
+    Ok(PyRaceEngine {
+        engine: Some(Arm::Rl(engine)),
+    })
+}
+
 /// A step-race. Construct from a dataset dir (`inputs.bin` / `targets.bin` /
 /// optional `meta.json`), in-memory arrays, or a gym environment — a
 /// [`RaceConfig`](crate::config::PyRaceConfig) and an optional seed in every
@@ -288,27 +436,38 @@ impl PyRaceEngine {
         )
     }
 
-    /// Resume a TABULAR race from its run directory alone — the Python twin of
-    /// `TabularEngine::resume_from`.
+    /// Resume a race from its run directory — the Python twin of
+    /// `TabularEngine::resume_from` / `RlEngine::resume_from`, for BOTH arms.
     ///
     /// Everything a replay cannot re-derive is read from the record: the dataset
     /// (`engine.json` → `data_dir`), the search space and pools, the metric set, the
     /// run seed and the training recipe (`loss`, `learning_rate`, `grad_clip`,
-    /// `batch_size`, `eval_batch_size`). Every keyword below is an OVERRIDE of a
-    /// recorded value — pass one only when you mean something different. The crate
-    /// refuses a different training recipe by name (a replay under another scheme is
-    /// not the same experiment), and population geometry is data-integrity frozen.
+    /// `batch_size`, `eval_batch_size`) — or, for an RL dir, the recorded
+    /// `Reinforce` recipe (`signal`, episode counts, both challenge knobs, LR, clip).
+    ///
+    /// The keyword that decides the arm is `env`: a TABULAR dir needs none (the
+    /// dataset is in the record), and an RL dir needs nothing else — its recipe IS
+    /// the environment plus the knobs the record already holds. So `env` is
+    /// REQUIRED for an RL directory and REFUSED for a tabular one, and the mode comes
+    /// from `engine.json` rather than from the caller.
+    ///
+    /// Every other keyword below is an OVERRIDE of a recorded value — pass one only
+    /// when you mean something different. The crate refuses a different training
+    /// recipe by name (a replay under another scheme is not the same experiment), and
+    /// population geometry is data-integrity frozen.
     ///
     /// `max_steps` is the one budget knob that is genuinely yours, and it is
     /// ABSOLUTE, not per-process: a run that stopped at clock 17 resumed with
     /// `max_steps=20` does 3 more steps.
     ///
-    /// RL runs are refused by name: their resume needs the environment instance,
-    /// which only Python holds, so that arm stays Rust-only for now.
+    /// A Python RL directory is resumable only when its environment is: the replay
+    /// contract requires `reset(seed)` to make the episode a pure function of the
+    /// seed, which a gym/gymnasium env does and a world that draws its own randomness
+    /// does not (the crate's parity guard says so by name).
     ///
     /// ```python
     /// engine = RaceEngine.resume("results/1793336713882", max_steps=120)
-    /// engine.run()
+    /// rl = RaceEngine.resume("results/1793336713883", env=gym.make("CartPole-v1"))
     /// ```
     #[staticmethod]
     #[pyo3(signature = (
@@ -320,6 +479,7 @@ impl PyRaceEngine {
         grad_clip = None,
         batch_size = None,
         eval_batch_size = None,
+        env = None,
     ))]
     // Same reason as `new`: a constructor's kwargs ARE its API.
     #[allow(clippy::too_many_arguments)]
@@ -332,21 +492,32 @@ impl PyRaceEngine {
         grad_clip: Option<f32>,
         batch_size: Option<usize>,
         eval_batch_size: Option<usize>,
+        env: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let header = gras::state::load_engine_json(&run_dir)
             .map_err(|e| PyRuntimeError::new_err(format!("resume {}: {e}", run_dir.display())))?;
-        // The ARM first: the header says which race this directory holds, and an RL
-        // run has no dataset geometry a tabular replay could be rebuilt from.
-        match header.engine_mode.as_deref() {
-            Some("tabular") | None => {}
-            Some(other) => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "resume: {} was recorded as mode {other:?}, not \"tabular\" — an RL \
-                     resume needs the environment instance, so that arm is Rust-only \
-                     (RlEngine::resume_from)",
-                    run_dir.display()
-                )))
-            }
+        // The ARM first: the header says which race this directory holds, and only
+        // the caller can hand back the environment an RL run trained against.
+        if header.engine_mode.as_deref() == Some("rl") {
+            return resume_rl(
+                run_dir,
+                header,
+                env,
+                max_steps,
+                loss,
+                fitness,
+                lr,
+                grad_clip,
+                batch_size,
+                eval_batch_size,
+            );
+        }
+        if env.is_some() {
+            return Err(PyValueError::new_err(format!(
+                "resume: {} was recorded as mode \"tabular\", so env= does not apply — \
+                 it belongs to an RL directory (whose environment is not on disk)",
+                run_dir.display()
+            )));
         }
         let blob = header.trainer.as_ref();
         // Nothing named ⇒ the run's OWN recipe, read back from its `describe()` blob:
