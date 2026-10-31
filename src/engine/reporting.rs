@@ -589,7 +589,7 @@ impl CoreEngine {
             ),
             &lines.join("\n"),
             Some(&format!(
-                "read downward, oldest first: each bracketed group sits directly above the net it made (a crossover group is `p1`/`p2`), so the reported net closes its own ancestry at the bottom · `Δfit` = the child's fit minus this parent's, signed so `+` means the child scored better (the ranking's own direction); `Δparams` = child − parent · `†<clock> <channel>` = culled at that clock, `live` = still in the population at stop · `↺` = this ancestor's own ancestry is already drawn above · `…` = ancestry stops at the depth cap of {LINEAGE_MAX_DEPTH} generations (the parent's own `nets/<hash>.json` still carries the rest) · edges are each net's recorded `created_from`, and a dead parent's numbers come from its tombstone, so the tree outlives the cull"
+                "read downward, oldest first: each bracketed group sits directly above the net it made (a crossover group is `p1`/`p2`), so the reported net closes its own ancestry at the bottom · `Δfit` = the child's fit minus this parent's, signed so `+` means the child scored better (the ranking's own direction); `Δparams` = child − parent · `†<clock> <channel>` = culled at that clock, `live` = still in the population at stop · `↺` = this ancestor's own ancestry is already drawn above · `…` = ancestry stops at the depth cap of {LINEAGE_MAX_DEPTH} generations (the parent's own `nets/<hash>.json` still carries the rest) · edges are each net's recorded `created_from`, and a dead parent's numbers come from its tombstone, so the tree outlives the cull · a reported net with no recorded parents prints as ONE row (`· root`) — the group above the next `#N` belongs to that net, never to the row above it"
             )),
         ));
     }
@@ -610,10 +610,12 @@ impl CoreEngine {
             tree.root_fit = Some(*fit);
             tree.root_mark = marks.get(hash).copied().unwrap_or("·");
             tree.render_node(hash, &format!("#{}", rank + 1), None, 0, "", &mut out);
-            // One blank line between reported nets: each root closes a tree, and the next
-            // root must not read as the same net's child.
+            // A VISIBLE divider between reported nets, not a blank line: the card body is a
+            // single reflowed block, so an empty line is swallowed and the next net's parent
+            // group then reads as the previous net's ancestry (measured: a `random` champion
+            // looked like it had four generations of parents). The divider cannot be eaten.
             if rank + 1 < top.len() {
-                out.push(String::new());
+                out.push("   ⋯".to_string());
             }
         }
         if tree.truncated {
@@ -2044,6 +2046,12 @@ impl<'a> LineageTree<'a> {
         }
         if child.is_none() {
             line.push_str(&format!(" · {}", self.root_mark));
+            // A reported net with NO group above it is a founder (random draw, inherited
+            // blueprint, initial batch). Saying so on the row is what stops the NEXT net's
+            // ancestry from being read as this one's.
+            if facts.parents.is_empty() {
+                line.push_str(" · root (no recorded parents)");
+            }
         }
         if repeated {
             line.push_str(" · ↺ shown above");
