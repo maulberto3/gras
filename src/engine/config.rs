@@ -301,6 +301,13 @@ pub struct RaceConfig {
         /// Write `<run_dir>/telemetry.jsonl`: one JSON record per event at full fidelity.
         /// Off by default — the console is the view, this is the record.
     pub trace_file: bool,
+    /// Write each live net's OPTIMIZER state beside its weights
+    /// (`nets/<hash>.optim`) at every checkpoint, so a resume restores Adam's
+    /// moments instead of restarting them. `true` = exact resume (option C);
+    /// `false` = weights only (option A): the first update after a resume starts
+    /// from `m = v = 0`, a visible one-time restart. Cost is ~2x the weights file
+    /// per net, overwritten in place, so it is bounded by the population.
+    pub save_optim: bool,
         /// Informative (non-ranking) metrics; their labels determine the extra per-net
         /// metric columns a reader may expect.
     pub metrics: Vec<Metric>,
@@ -524,6 +531,7 @@ impl RaceConfig {
             metrics: Vec::new(),
             log_level: LogLevel::default(),
             trace_file: false,
+            save_optim: true,
             mode: RunMode::Tabular,
             csv_export: true,
             elite_save_topology: true,
@@ -590,8 +598,8 @@ impl RaceConfigBuilder {
         self.cfg.pop_size = n;
         self
     }
-        /// Set steps between checkpoints — the durability tick (frontier snapshot + `elite_
-        /// checkpoint_weights` snapshot + CSV flush) and the stream's eval-permutation era.
+    /// Set steps between checkpoints — the durability tick (frontier states + EVERY live
+    /// net's weights + `ckpt.json` + CSV flush) and the stream's eval-permutation era.
         /// **`0` = OFF**: no tick and no era rotation (one eternal era), for profiling or a
         /// smoke run that wants no `nets/` churn from checkpoints. The STOP-time writers are
         /// unaffected — `elites.json`, the elite/worst artifacts and the final CSV flush still
@@ -882,6 +890,14 @@ impl RaceConfigBuilder {
     }
     /// Mutation probation steps: cull-immunity for a random immigrant's first
     /// `k` clocks (see [`RaceConfig::mutation_probation_steps`]). Default 5.
+    /// Write each net's optimizer state at every checkpoint (`nets/<hash>.optim`).
+    /// Default `true` — a resume then continues the SAME optimizer, not a fresh one.
+    /// Pass `false` for weights-only checkpoints: smaller, but a resume restarts the
+    /// moments once (option A), which is visible in the next readings.
+    pub fn set_run_save_optim(mut self, enabled: bool) -> Self {
+        self.cfg.save_optim = enabled;
+        self
+    }
     pub fn set_mutation_probation_steps(mut self, k: usize) -> Self {
         self.cfg.mutation_probation_steps = k;
         self
