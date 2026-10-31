@@ -121,7 +121,7 @@ impl TabularEngine {
         }
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume")?;
         // A legacy dir can hold CSV rows for clocks the last checkpoint never reached
-        // (pre-R3 runs flushed per clock, the frontier per interval). Rewind to the
+        // (older runs flushed per clock, the frontier per interval). Rewind to the
         // frontier BEFORE anything reads the windows or appends to the files — otherwise
         // the resumed run re-emits rows that are already on disk.
         CoreEngine::rewind_csvs_to_manifest(&run_dir)?;
@@ -164,7 +164,7 @@ impl TabularEngine {
         };
         // Resume is Tabular-only today (a persisted run carries a dataset);
         // both fields are wrapped in Some to satisfy the Option'd struct.
-        // R3b: the EVAL ERA comes from the record, not from this call's cadence. The
+        // The EVAL ERA comes from the record, not from this call's cadence. The
         // caller's `checkpoint_every` decides only how often the durability tick fires;
         // deriving the era from it would rotate the eval permutation at different clocks
         // than the first half of the run did, and every parity assertion after that would
