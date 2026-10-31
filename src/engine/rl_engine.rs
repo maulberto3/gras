@@ -85,6 +85,22 @@ impl RlEngine {
         )
     }
 
+    /// One-argument RL resume: the run DIRECTORY (plus your `fitness` and `trainer`,
+    /// which are code). Everything else — pop size, λ, Ω, both cull policies, the
+    /// probation windows, the search space and the step budget — comes from the record,
+    /// so a caller never has to remember the `--pop` it launched with.
+    pub fn resume_from(
+        run_dir: impl Into<std::path::PathBuf>,
+        fitness: Fitness,
+        trainer: impl crate::trainer::RlStep + 'static,
+    ) -> Result<Self> {
+        let run_dir = run_dir.into();
+        let header = crate::state::load_engine_json(&run_dir)?;
+        let mut config = RaceConfig::from_snapshot(&header.config);
+        CoreEngine::apply_header_search_space(&mut config, &header);
+        Self::resume(run_dir, config, fitness, trainer)
+    }
+
     /// Shared resume internals: validate the run's mode, then replay each net.
     fn resume_with(
         run_dir: std::path::PathBuf,
