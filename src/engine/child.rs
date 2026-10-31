@@ -66,7 +66,7 @@ fn mix_feature_masks(
 use crate::engine::config::CrossoverOp;
 use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
-use crate::graph::topology::Topology;
+use crate::graph::topology::{CxReport, Topology};
 use crate::state::NetState;
 use crate::utils::seed::derive_seed;
 
@@ -81,6 +81,9 @@ pub struct RaceChild {
     pub net: Network,
     /// Optimizer whose Adam state carries forward across steps.
     pub optimizer: Box<dyn Optimizer>,
+    /// What the crossover operator exchanged (`uniform` only), so the run ledger can
+    /// total it without reparsing the lineage string.
+    pub cx: Option<CxReport>,
 }
 
 impl CoreEngine {
@@ -153,6 +156,10 @@ impl CoreEngine {
             // split). Captured BEFORE crossover, because `cx_*` re-finalizes both parents
             // and `finalize` drops port-count-bound masks.
         let mut child_masks: Vec<Vec<u8>> = Vec::new();
+            // What the operator exchanged (`uniform` only — a one-point cut is not a
+            // per-gene coin, so it reports nothing rather than a number that would read
+            // like one). It rides the lineage string into `nets/<hash>.json`.
+        let mut cx_report: Option<CxReport> = None;
         let mut cx_note = String::new();
             // Operator pool resolved once per child (not per attempt) so retries vary the
             // PARENTS, not the op. Uniform uses its own swap_prob — no magic 0.5.
@@ -203,7 +210,9 @@ impl CoreEngine {
                     CrossoverOp::Uniform => {
                         // Per-swap probability for the uniform operator.
                         const UNIFORM_SWAP_PROB: f32 = 0.5;
-                        Topology::cx_uniform(&mut pa, &mut pb, UNIFORM_SWAP_PROB, rng)
+                        let report = Topology::cx_uniform(&mut pa, &mut pb, UNIFORM_SWAP_PROB, rng);
+                        cx_report = report;
+                        report.is_some()
                     }
                 };
                 if cx {
@@ -266,6 +275,7 @@ impl CoreEngine {
             clock,
             child_idx,
             &cx_note,
+            cx_report,
             &parent_hashes,
             false,
         )?))
@@ -340,7 +350,7 @@ impl CoreEngine {
         }
             // NO mutation roll on the immigrant path: a brand-new random topology is
             // already maximal exploration; the mutation roll belongs to crossover only.
-        self.finalize_child(graph, clock, child_idx, "random", &[], false)
+        self.finalize_child(graph, clock, child_idx, "random", None, &[], false)
     }
 
         /// Shared child finalization: fresh weight seed from `run_seed + clock`, lineage
@@ -351,13 +361,22 @@ impl CoreEngine {
         clock: usize,
         child_idx: usize,
         origin: &str,
+        cx_report: Option<CxReport>,
         parents: &[String],
         mutated: bool,
     ) -> Result<RaceChild> {
         let new_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx) as usize;
         topo.options.topology_seed = new_seed;
+            // `swapped=3/6` sits BEFORE `:parents=`, so every existing reader keeps
+            // working: `lineage_note` splits on `:parents=`, `origin_cell` takes the
+            // first `:`-segment as the kind, and `created_from.rsplit(",")` for a
+            // parent list still sees only hashes. Old runs' strings simply lack it.
+        let origin = match &cx_report {
+            Some(rep) => format!("{origin}:swapped={}", rep.label()),
+            None => origin.to_string(),
+        };
         let lineage = if parents.is_empty() {
-            origin.to_string()
+            origin
         } else {
             format!("{origin}:parents={}", parents.join(","))
         };
@@ -378,6 +397,7 @@ impl CoreEngine {
             state,
             net,
             optimizer,
+            cx: cx_report,
         })
     }
 

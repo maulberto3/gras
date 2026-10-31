@@ -412,10 +412,10 @@ impl CoreEngine {
     /// the reading on every row, and `✖` marks the nets `worst-<hash>.*` actually saved,
     /// so both ends and everything between them are read in one place.
     ///
-    /// The marks are taken from the SAME calls the artifact writers make (`champion_ranked`
-    /// / `worst_set`), so a mark and a file can never disagree, and a net saved as an elite
-    /// is never marked `✖` (a population under `2k` therefore yields fewer than k worst
-    /// picks).
+    /// The marks are taken from the SAME calls the artifact writers make (`champion_slice`
+    /// / `worst_ranked_from`), over the ONE ranking this card computes, so a mark and a
+    /// file can never disagree, and a net saved as an elite is never marked `✖` (a
+    /// population under `2k` therefore yields fewer than k worst picks).
     ///
     /// Stop-time only, and it cannot perturb a replay (no forward pass, no environment, no
     /// RNG draw beyond the read-only diversity baseline).
@@ -424,10 +424,14 @@ impl CoreEngine {
     /// `final-field.csv` is written at every log level (`None` included), because a
     /// scripted run is exactly the caller who wants the table as a file.
     pub(crate) fn log_final_field(&self, clock: usize, verbose: bool) {
-        let mut rows: Vec<(String, Option<f32>)> = self
-            .ranked_live()
-            .into_iter()
-            .map(|(hash, fit)| (hash, Some(fit)))
+        // ONE ranking for the whole card. The rows, the reported top-k, the `✖` set and
+        // the `inefficiency` column all read it: each of those used to rank the field
+        // again (ranks behind a rank, x4), and the cells they printed could only agree
+        // by coincidence.
+        let ranked = self.ranked_live();
+        let mut rows: Vec<(String, Option<f32>)> = ranked
+            .iter()
+            .map(|(hash, fit)| (hash.clone(), Some(*fit)))
             .collect();
         // EVERY individual, not only the measured ones: a live net with no reading yet
         // still exists, and dropping it would make the table's count disagree with the pop
@@ -450,9 +454,13 @@ impl CoreEngine {
             return;
         }
         let k = self.config.elite_count.max(1); // report at least the champion
-        let top: Vec<(String, f32)> = self.ranked_live().into_iter().take(k).collect();
-        let worst = self.worst_set();
-        let inefficiency = self.inefficiency_field();
+        let top: Vec<(String, f32)> = self.champion_slice(&ranked);
+        let inefficiency = self.inefficiency_field_from(&ranked);
+        let worst: Vec<String> = self
+            .worst_ranked_from(&ranked)
+            .into_iter()
+            .map(|p| p.hash)
+            .collect();
         let mut marks: std::collections::HashMap<String, &'static str> =
             std::collections::HashMap::new();
         // ONE glyph answers "what did the run do with this net", and the crown is part of
@@ -666,25 +674,36 @@ impl CoreEngine {
         // The crown `Δcrown` measures to, in elite rank order; `crown_idx` maps a hash to
         // its index in it, so a champion's own row can skip itself. A blueprint that
         // will not parse simply does not enter (`None` → the cells read `—`).
+            // ONE parse per live net for BOTH reference sets. The champions are a
+            // subset of the population, so parsing the live field first and reading the
+            // crown out of it costs `n` parses instead of `n + k` (the crown used to
+            // re-parse every champion a second time).
+        let mut shapes: std::collections::HashMap<String, NetShape> =
+            std::collections::HashMap::new();
+        for hash in self.state.live_hashes() {
+            if let Some(shape) = self.stop_shape(&hash) {
+                shapes.insert(hash, shape);
+            }
+        }
         let mut crown: Vec<NetShape> = Vec::new();
         let mut crown_idx: std::collections::HashMap<String, Option<usize>> =
             std::collections::HashMap::new();
         for (hash, _) in top {
-            match self.stop_shape(hash) {
+            match shapes.get(hash) {
                 Some(shape) => {
                     crown_idx.insert(hash.clone(), Some(crown.len()));
-                    crown.push(shape);
+                    crown.push(shape.clone());
                 }
                 None => {
                     crown_idx.insert(hash.clone(), None);
                 }
             }
         }
-        // The `Δpop` reference set: every live net's shape, one parse each. Same work the
-        // diversity line already does on its own cadence, and stop-time only.
+        // The `Δpop` reference set: the same parsed shapes, taken in the state's live
+        // order so the pair sampling stays the one a replay expects.
         let mut population: Vec<(String, NetShape)> = Vec::new();
         for hash in self.state.live_hashes() {
-            if let Some(shape) = self.stop_shape(&hash) {
+            if let Some(shape) = shapes.remove(&hash) {
                 population.push((hash, shape));
             }
         }
@@ -755,16 +774,26 @@ impl CoreEngine {
         // The RANK counts the ranked nets only: an unmeasured net prints `—` there (it has
         // no FIT to be ranked by), so the numbers keep meaning "rank in the race".
         let mut rank = 0usize;
+        // The plan already parsed every live net's blueprint for `Δpop`. Reuse those
+        // shapes and clone (cheap) instead of parsing the SAME blueprint a second time
+        // — the only net that still needs a parse here is one the plan never saw.
+        let shapes: std::collections::HashMap<&str, &NetShape> = plan
+            .population
+            .iter()
+            .map(|(h, s)| (h.as_str(), s))
+            .collect();
         for (hash, fit) in rows {
             if fit.is_some() {
                 rank += 1;
             }
             let self_idx = plan.crown_idx.get(hash).copied().flatten();
-            // One parse per reported net; `None` on an unreadable blueprint, which the
-            // cells render `—` rather than pretending the net is structureless.
-            let shape = self.stop_shape(hash);
-            crowns.push(delta_crown(shape.as_ref(), plan, self_idx));
-            pops.push(delta_pop(shape.as_ref(), hash, plan));
+            // `None` on an unreadable blueprint, which the cells render `—` rather than
+            // pretending the net is structureless.
+            // A net absent from the map is one the plan could not parse, which reads as
+            // `None` here — the same `—` cells the row's own parse failure produced.
+            let shape = shapes.get(hash.as_str()).copied();
+            crowns.push(delta_crown(shape, plan, self_idx));
+            pops.push(delta_pop(shape, hash, plan));
             let cells = self.stop_row(StopRow {
                 rank: fit.is_some().then_some(rank),
                 mark: marks.get(hash).copied().unwrap_or("·"),
@@ -776,11 +805,10 @@ impl CoreEngine {
                 a_rescaled: inefficiency.and_then(|f| f.fit_rescaled(hash)),
                 inefficiency: inefficiency.and_then(|f| f.inefficiency(hash)),
                 // The coin's own number: the BLENDED probability, asked exactly as the
-                // step asks it (same clock, same frame), so the column cannot disagree
-                // with `idle`/`tickets` beside it.
-                ticket_p: lottery.map(|f| {
-                    self.train_lottery_p_eff(hash, plan.dealt_clock, Some(f))
-                }),
+                // step asks it (same clock, same frame) and from THIS row's merit, so the
+                // column cannot disagree with `idle`/`tickets` beside it — and costs no
+                // second window read.
+                ticket_frame: lottery,
             });
             table.add_row(cells.clone());
             grid.push(cells);
@@ -799,13 +827,20 @@ impl CoreEngine {
     /// rule for "no value".
     fn stop_row(&self, row: StopRow<'_>) -> Vec<String> {
         let state = self.state.net(row.hash);
+        // ONE window read for the whole row: the `fit (A)` cell, the `A/B` ratio derived
+        // from it and the three window legs printed beside it.
         let reading = self.race_reading_of(row.hash);
+        let score = reading
+            .map(|r| r.risk_adjusted(self.fitness.direction(), self.config.risk_aversion))
+            .or(row.fit);
+        let tickets = state.map(|s| s.measured_clocks());
+        let merit = tickets.and_then(|t| Self::merit_from(score, t));
         let metrics = state.and_then(|s| s.last_metrics.as_ref());
         let born = state.map(|s| s.entered_at_step).unwrap_or(0);
         // Clocks lived INCLUSIVE of the birth clock and the last run — the convention the
         // freeze lines use (`clock − entered_at_step`).
         let age = row.plan.dealt_clock.saturating_sub(born) + 1;
-        let shape = row.shape.as_ref();
+        let shape = row.shape;
         // The saved-set mark plus the net's GATE LETTERS, in one cell: the mark says what
         // the run DID with the net, the letters say what the net is still subject to.
         //   `b` = inside its born CULL SHIELD (the per-channel window that keeps a newborn
@@ -867,7 +902,7 @@ impl CoreEngine {
             // net used to print `3.5` where 3.50 was the honest spelling.
             shape.map(|s| fmt_cell(s.dim)).unwrap_or_else(dash),
             // ── how it is RANKED ───────────────────────────────────────
-            row.fit.map(fmt_cell).unwrap_or_else(dash),
+            score.map(fmt_cell).unwrap_or_else(dash),
             // The window's THREE legs, one column each: `Wm ∓ λ·Ws` is redoable from the
             // row. `Ws = —` at n = 1 — one reading has no observable spread, and a
             // printed 0.0000 would claim a steadiness nobody measured.
@@ -877,16 +912,22 @@ impl CoreEngine {
                 .map(fmt_cell)
                 .unwrap_or_else(dash),
             // ── what its learning COST ─────────────────────────────────
-            state
-                .map(|s| s.measured_clocks().to_string())
-                .unwrap_or_else(dash),
+            tickets.map(|t| t.to_string()).unwrap_or_else(dash),
             // `A/B` takes the CELL precision, not the config one: the lottery's field is
             // often narrow (0.044…0.064 on a loss-like metric), and at 2dp two nets that
             // earn `p = 1.00` and `p = 0.50` would both print `0.06` beside each other.
-            self.merit_per_ticket(row.hash)
-                .map(fmt_cell)
+            merit.map(fmt_cell).unwrap_or_else(dash),
+            row.ticket_frame
+                .map(|f| {
+                    self.train_lottery_p_eff_from(
+                        row.hash,
+                        row.plan.dealt_clock,
+                        Some(f),
+                        merit,
+                    )
+                })
+                .map(fmt_cfg)
                 .unwrap_or_else(dash),
-            row.ticket_p.map(fmt_cfg).unwrap_or_else(dash),
             state.map(|s| s.step.to_string()).unwrap_or_else(dash),
             // Clocks the lottery left IDLE (no train, no eval). `only_act` stays the
             // crown's own count, so the two causes never hide inside one number.
@@ -982,9 +1023,17 @@ impl CoreEngine {
             .into_iter()
             .map(|h| {
                 let state = self.state.net(&h);
+                    // ONE window read per net, per clock: the score, its divisor, the
+                    // ratio, the probability mapped from that ratio and the coin that
+                    // probability implies all come off this reading. Asking
+                    // `merit_per_ticket` here as well walked the same window a second
+                    // time for a number this loop already held.
+                let smt = self.smoothed_fitness_of(&h);
+                let tickets = state.map(|s| s.measured_clocks()).unwrap_or(0);
+                let merit = Self::merit_from(smt, tickets);
                 // The BLENDED probability — the one the coin compares against —
                 // so `p` and the `ticket?` column beside it cannot disagree.
-                let p = self.train_lottery_p_eff(&h, clock, Some(frame));
+                let p = self.train_lottery_p_eff_from(&h, clock, Some(frame), merit);
                     // Why a net is outside the lottery's reach, in one word: the
                     // crown and the born shield always train (p = 1.00).
                 let exempt = if self.frozen_crown.contains(&h) {
@@ -1001,16 +1050,15 @@ impl CoreEngine {
                     // The numerator takes the CELL precision (4dp, widened below 5e-5) so
                     // a small loss-based smt never rounds to `0.00` while the ratio
                     // beside it is plainly non-zero.
-                let smt = self.smoothed_fitness_of(&h);
                     // This clock's coin, asked the same way the step will ask it:
-                    // `train_lottery_draws` is a pure function of (run seed, clock, hash,
-                    // frame) and consumes nothing, so calling it here returns the answer
+                    // `train_lottery_draws_at` is a pure function of (run seed, clock,
+                    // hash, p) and consumes nothing, so calling it here returns the answer
                     // the step is about to act on — not a second draw that could differ.
                     // The crown is forced `no`: the elite freeze takes the trainer step
                     // for its OWN reason, so its `p = 1.00` means "the lottery is not what
                     // denied it", never "it misses this clock's ticket".
                 let trains = !self.frozen_crown.contains(&h)
-                    && self.train_lottery_draws(&h, clock, Some(frame));
+                    && self.train_lottery_draws_at(&h, clock, p);
                 let row = vec![
                     h[..8.min(h.len())].to_string(),
                     exempt.to_string(),
@@ -1018,9 +1066,7 @@ impl CoreEngine {
                     state
                         .map(|s| s.measured_clocks().to_string())
                         .unwrap_or_else(|| "—".to_string()),
-                    self.merit_per_ticket(&h)
-                        .map(fmt_cfg)
-                        .unwrap_or_else(|| "—".to_string()),
+                    merit.map(fmt_cfg).unwrap_or_else(|| "—".to_string()),
                     fmt_cfg(p),
                     if trains { "yes" } else { "no" }.to_string(),
                     state
@@ -1137,6 +1183,43 @@ impl CoreEngine {
         );
     }
 
+    /// The uniform operator's MIXING RATE, cumulative: of every gene it compared, how
+    /// many it actually took from the other parent.
+    ///
+    /// Per birth the roll line says `uniform; parents a b; swaps 3/6` — one child, at
+    /// one clock. This line answers the run-level question that one birth cannot: is the
+    /// operator mixing at all, or are its children mostly one parent in disguise (a
+    /// `swap_prob` that is effectively 0, or pairs whose genes agree)?
+    ///
+    /// Rides the DURABILITY cadence, same clock as the diversity line and for the same
+    /// reason — it is a slow-moving reading, not a per-clock one — and stays SILENT until
+    /// a uniform child has been admitted: an all-one-point run has no mixing rate to
+    /// state, and a `0%` there would be a claim about an operator that never ran.
+    pub(crate) fn log_crossover_mix(&self, clock: usize) {
+        let every = self.config.checkpoint_every;
+        if every == 0
+            || self.log_level == crate::engine::config::LogLevel::None
+            || clock % every != 0
+        {
+            return;
+        }
+        let a = &self.accounting;
+        if a.uniform_cx_births == 0 || a.uniform_cx_pairs == 0 {
+            return;
+        }
+        let births = a.uniform_cx_births as f32;
+        info!(
+            "step {} │ crossover mix │ uniform {} birth(s) · {} gene(s) swapped of {} compared ({:.0}%) · {:.1} swapped per birth over {:.1} aligned · a pairing that swapped nothing is a spent roll, never a child",
+            clock,
+            a.uniform_cx_births,
+            a.uniform_cx_swaps,
+            a.uniform_cx_pairs,
+            100.0 * a.uniform_cx_swaps as f32 / a.uniform_cx_pairs as f32,
+            a.uniform_cx_swaps as f32 / births,
+            a.uniform_cx_pairs as f32 / births,
+        );
+    }
+
     pub(crate) fn log_lottery_summary(
         &self,
         clock: usize,
@@ -1152,12 +1235,22 @@ impl CoreEngine {
             if self.frozen_crown.contains(&h) || self.on_probation(&h, clock) {
                 continue;
             }
-            if self.merit_per_ticket(&h).is_some() {
+            // ONE read per graded net: the score, the ratio from it and the blended
+            // probability are the same three quantities the pre-step card prints, so
+            // they are derived here rather than re-asked through `merit_per_ticket`.
+            let score = self.smoothed_fitness_of(&h);
+            let tickets = self
+                .state
+                .net(&h)
+                .map(|s| s.measured_clocks())
+                .unwrap_or(0);
+            let merit = Self::merit_from(score, tickets);
+            if merit.is_some() {
                 graded += 1;
                     // The BLENDED probability, not the raw fraction: this line's
                     // `won` is a draw against `p_eff`, so printing the raw p would
                     // make `won ≈ graded · p̄` look violated whenever Ω < 1.
-                p_sum += self.train_lottery_p_eff(&h, clock, Some(frame));
+                p_sum += self.train_lottery_p_eff_from(&h, clock, Some(frame), merit);
             }
         }
         // Budget spent: means over the nets that have ever had a ticket (a newborn's
@@ -1566,7 +1659,8 @@ struct StopRow<'a> {
     /// The ranking value (FIT) the `fit (A)` column prints; `None` when never measured.
     fit: Option<f32>,
     /// This net's structure, parsed once by the caller (`None`: unreadable blueprint).
-    shape: Option<NetShape>,
+    /// Borrowed, not owned: the card's shapes live in its `StopPlan` for its whole life.
+    shape: Option<&'a NetShape>,
     /// The plan the whole card prints from.
     plan: &'a StopPlan,
     /// `prop (D) = D ÷ Dmax` — the updates leg of `D * A` alone, printed so the product
@@ -1578,10 +1672,11 @@ struct StopRow<'a> {
     /// `D * A = prop (D) × rescaled (A)` — the net's inefficiency reading
     /// (`None`: no ranking, so it is not in the field the artifact writer picks from).
     inefficiency: Option<f32>,
-    /// `p(ticket)` — the BLENDED probability the LAST clock's coin used, computed by the
-    /// same `train_lottery_p_eff` the step called (`None`: the lottery is off at Ω = 0, or
-    /// the field was never armed — no probability to print).
-    ticket_p: Option<f32>,
+    /// The field the LAST clock's coin drew from (`None`: the lottery is off at Ω = 0, or
+    /// the field was never armed — no probability to print). The caller passes the FRAME,
+    /// not the probability: `p(ticket)` is mapped here from the merit this row already
+    /// derived, by the same `train_lottery_p_eff` arithmetic the step called.
+    ticket_frame: Option<super::step::LotteryFrame>,
 }
 
 /// One card's own structural summary: the mean `Δcrown` and `Δpop` over the rows it
@@ -2133,8 +2228,19 @@ fn origin_cell(created_from: Option<&str>, born: usize) -> String {
             .strip_suffix("+mut")
             .map(|p| (p, true))
             .unwrap_or((rest, false));
-        let kind = head.split(':').next().unwrap_or("one-point");
-        return format!("cx {kind}@{born}{}", if mutated { "+mut" } else { "" });
+        let mut segs = head.split(':');
+        let kind = segs.next().unwrap_or("one-point");
+            // How much of the child the other parent contributed (`uniform` only, since
+            // a one-point cut exchanges no per-gene coins): `3/6` is the honest cousin
+            // of `fit` — two children of the same parents are not the same child.
+        let swapped = segs
+            .find_map(|s| s.strip_prefix("swapped="))
+            .map(|n| format!(" · {n}"))
+            .unwrap_or_default();
+        return format!(
+            "cx {kind}@{born}{swapped}{}",
+            if mutated { "+mut" } else { "" }
+        );
     }
     // `clone:parents=h1` — asexual single-parent child: type + step, no id.
     if raw == "clone" || raw.starts_with("clone:") {
@@ -2176,6 +2282,18 @@ pub(crate) fn accounting_population(
         (
             "  crossover children".to_string(),
             a.crossover_children.to_string(),
+        ),
+        (
+            "    of them uniform (swaps/birth)".to_string(),
+            if a.uniform_cx_births == 0 {
+                "—".to_string()
+            } else {
+                format!(
+                    "{:.1} of {:.1} genes",
+                    a.uniform_cx_swaps as f32 / a.uniform_cx_births as f32,
+                    a.uniform_cx_pairs as f32 / a.uniform_cx_births as f32,
+                )
+            },
         ),
         ("culled".to_string(), a.culls.to_string()),
         (
@@ -2528,6 +2646,11 @@ mod tests {
             founders: 45,
             inherited_founders: 5,
             crossover_children: 65,
+            // The uniform operator's exchange tally: 30 of its 65 births reported a
+            // count, 78 genes swapped of 180 compared.
+            uniform_cx_births: 30,
+            uniform_cx_swaps: 78,
+            uniform_cx_pairs: 180,
             immigrants: 99,
             culls: 164,
             culls_crossover: 65,
@@ -2598,6 +2721,24 @@ mod tests {
                 9
             ),
             "cx uniform@9+mut"
+        );
+        // A uniform birth that recorded its exchange says HOW MUCH of the child came
+        // from the other parent; the `+mut` flag keeps its place at the end.
+        assert_eq!(
+            origin_cell(
+                Some("crossover-uniform:swapped=3/6:parents=aaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbb"),
+                40
+            ),
+            "cx uniform@40 · 3/6"
+        );
+        // One-point reports no count (it has no per-gene coin), and old runs' strings
+        // have no `swapped=` segment at all — both keep the exact old spelling.
+        assert_eq!(
+            origin_cell(
+                Some("crossover-one-point:swapped=2/9:parents=aaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbb+mut"),
+                7
+            ),
+            "cx one-point@7 · 2/9+mut"
         );
         // Single-parent asexual child: same treatment.
         assert_eq!(

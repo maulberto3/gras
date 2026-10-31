@@ -54,17 +54,24 @@ impl RollKind {
     }
 }
 
-/// The crossover line's parent note: the operator kind plus the parents at the
-/// same 8-hex width as every other identity on the line, so a child can be
-/// matched to its parents by eye. Lineage strings look like
-/// `crossover-one-point:parents=<h1>,<h2>[+mut]` or `clone:parents=<h1>`.
+/// The crossover line's parent note: the operator kind, the parents at the same
+/// 8-hex width as every other identity on the line, and — for `uniform` — how many
+/// genes the operator actually exchanged, so a child can be matched to its parents
+/// by eye and the mixing rate read off the line. Lineage strings look like
+/// `crossover-uniform:swapped=3/6:parents=<h1>,<h2>[+mut]` or `clone:parents=<h1>`.
 fn lineage_note(created_from: &str) -> String {
     let (head, mutated) = match created_from.strip_suffix("+mut") {
         Some(h) => (h, true),
         None => (created_from, false),
     };
     let (origin, parents) = head.split_once(":parents=").unwrap_or((head, ""));
-    let kind = origin.strip_prefix("crossover-").unwrap_or(origin);
+    // `uniform:swapped=3/6` — the count sits in the origin segment, so it is split
+    // off here rather than mistaken for part of the parent list.
+    let (kind_raw, swapped) = match origin.split_once(":swapped=") {
+        Some((k, n)) => (k, Some(n)),
+        None => (origin, None),
+    };
+    let kind = kind_raw.strip_prefix("crossover-").unwrap_or(kind_raw);
     let parents = parents
         .split(',')
         .filter(|p| !p.is_empty())
@@ -72,10 +79,13 @@ fn lineage_note(created_from: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let suffix = if mutated { "+mut" } else { "" };
+    let swaps = swapped
+        .map(|n| format!("; swaps {n}"))
+        .unwrap_or_default();
     if parents.is_empty() {
-        format!("{kind}{suffix}")
+        format!("{kind}{swaps}{suffix}")
     } else {
-        format!("{kind}; parents {parents}{suffix}")
+        format!("{kind}; parents {parents}{swaps}{suffix}")
     }
 }
 
@@ -237,6 +247,14 @@ impl CoreEngine {
                         self.cull_net(victim, clock, "crossover-random")?;
                     }
                 }
+            }
+                // The operator's own exchange count, tallied as the child is ADMITTED:
+                // a pairing that produced no child (zero swaps, mismatched shapes) never
+                // reaches here, so `births` counts real mixing events only.
+            if let Some(rep) = child.cx {
+                self.accounting.uniform_cx_births += 1;
+                self.accounting.uniform_cx_swaps += rep.swaps;
+                self.accounting.uniform_cx_pairs += rep.pairs;
             }
             self.insert_child(child, clock, "crossover");
             let victim_note = match self.config.crossover_cull_policy {

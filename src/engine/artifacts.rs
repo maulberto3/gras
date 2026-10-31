@@ -259,8 +259,18 @@ impl CoreEngine {
     /// The champion set: top-`elite_count` live hashes by smoothed fitness. The
     /// ONE ranking all elite writers consume, so they can never disagree.
     fn champion_ranked(&self) -> impl Iterator<Item = (String, f32)> {
+        self.champion_slice(&self.ranked_live()).into_iter()
+    }
+
+    /// [`Self::champion_ranked`] over a ranking the caller already holds.
+    ///
+    /// `ranked_live()` is a window pass over every live net; a caller that reports the
+    /// whole field (the stop-time table) has that vec in hand, and a second one would
+    /// answer a question it has already answered — and could in principle disagree with
+    /// the rows it is labelling.
+    pub(crate) fn champion_slice(&self, ranked: &[(String, f32)]) -> Vec<(String, f32)> {
         let k = self.config.elite_count.max(1);
-        self.ranked_live().into_iter().take(k)
+        ranked.iter().take(k).cloned().collect()
     }
 
     /// Snapshot the champion set into `self.champions` before any writing, so
@@ -364,7 +374,7 @@ impl CoreEngine {
                     // The columns carry the SAME letters the stop-time `Final field`
                     // table uses (`A` = fit, `D * A` = inefficiency), so an artifact row and
                     // its table row name the same two numbers, computed by the same
-                    // `inefficiency_field()`.
+                    // `inefficiency_field_from()`.
                 &crate::utils::cfy::table(
                     &["#", "hash", "A", "D * A", "files"],
                     &written,
@@ -407,10 +417,20 @@ impl CoreEngine {
     /// than `2k` yields fewer picks — the same rule the stop-time `✖` mark applies when it
     /// refuses to mark a net that is already marked `★`.
     pub(crate) fn worst_ranked(&self) -> Vec<WorstPick> {
-        let Some(field) = self.inefficiency_field() else {
+        self.worst_ranked_from(&self.ranked_live())
+    }
+
+    /// [`Self::worst_ranked`] over a ranking the caller already holds — ONE window pass
+    /// for the field, the champion set and the pick, instead of three.
+    pub(crate) fn worst_ranked_from(&self, ranked: &[(String, f32)]) -> Vec<WorstPick> {
+        let Some(field) = self.inefficiency_field_from(ranked) else {
             return Vec::new();
         };
-        let champions: Vec<String> = self.champion_ranked().map(|(h, _)| h).collect();
+        let champions: Vec<String> = self
+            .champion_slice(ranked)
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
         let mut picks: Vec<WorstPick> = field
             .nets
             .iter()
@@ -436,21 +456,21 @@ impl CoreEngine {
         picks
     }
 
-    /// The hashes `write_worst_artifacts` would save — the set the stop-time table marks
-    /// `✖`. Same call, same order, so the mark and the file cannot disagree.
-    pub(crate) fn worst_set(&self) -> Vec<String> {
-        self.worst_ranked().into_iter().map(|p| p.hash).collect()
-    }
-
     /// The MEASURED live field under the inefficiency metric
-    /// (`E = spent × gap`, see [`Self::worst_ranked`] for the legs).
+    /// (`E = spent × gap`, see [`Self::worst_ranked`] for the legs), over a ranking the
+    /// caller already holds (best-first, measured nets only).
     ///
     /// ONE computation serves both readers — the `worst-*` artifact pick and the
     /// stop-time `inefficiency` column — so the table can never rank a net by a different
     /// arithmetic than the file it points at. `None` when nothing is ranked yet.
-    pub(crate) fn inefficiency_field(&self) -> Option<InefficiencyField> {
-        // Best-first, measured nets only — the same ranking every other decision reads.
-        let ranked = self.ranked_live();
+    ///
+    /// It takes the RANKING rather than computing one: both callers (`worst_ranked_from`,
+    /// and the stop card that marks `✖` from the same `worst_ranked_from`) already hold it,
+    /// and the field is only meaningful against the ranking it was sliced from.
+    pub(crate) fn inefficiency_field_from(
+        &self,
+        ranked: &[(String, f32)],
+    ) -> Option<InefficiencyField> {
         let best = ranked.first().map(|(_, s)| *s)?;
         let worst = ranked.last().map(|(_, s)| *s).unwrap_or(best);
         let span = (best - worst).abs();

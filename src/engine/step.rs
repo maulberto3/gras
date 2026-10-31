@@ -248,11 +248,22 @@ impl CoreEngine {
         /// directly, so the guard keeps ∞ out of the field rather than trusting that.
     pub(crate) fn merit_per_ticket(&self, hash: &str) -> Option<f32> {
         let state = self.state.net(hash)?;
-        let tickets = state.measured_clocks();
+        Self::merit_from(self.smoothed_fitness_of(hash), state.measured_clocks())
+    }
+
+        /// The merit a `(score, tickets)` pair implies — the ONE arithmetic every reader
+        /// of `A/B` uses.
+        ///
+        /// Split out so a report that already holds a net's risk-adjusted score (it
+        /// read the window once, for the census or a card) can derive its merit instead
+        /// of asking `smoothed_fitness_of`, which walks the SAME window again. Measured
+        /// before this: the lottery card spent four window passes per net where one
+        /// suffices, every clock.
+    pub(crate) fn merit_from(score: Option<f32>, tickets: usize) -> Option<f32> {
         if tickets == 0 {
             return None;
         }
-        let merit = self.smoothed_fitness_of(hash)? / tickets as f32;
+        let merit = score? / tickets as f32;
         merit.is_finite().then_some(merit)
     }
 
@@ -320,11 +331,31 @@ impl CoreEngine {
         /// This is the RAW fraction at `Ω = 1`. The coin, and every log line that
         /// claims what it will do, read [`Self::train_lottery_p_eff`], which blends it
         /// toward "always train" by Ω.
+    /// Test-only since the reports moved onto [`Self::train_lottery_p_from`]: the
+    /// lottery's tests assert on the UNBLENDED fraction (that is what `p = 0`/`p = 1`
+    /// mean in the field), and no production path wants the raw value any more.
+    #[cfg(test)]
     pub(crate) fn train_lottery_p(
         &self,
         hash: &str,
         clock: usize,
         frame: Option<LotteryFrame>,
+    ) -> f32 {
+        self.train_lottery_p_from(hash, clock, frame, self.merit_per_ticket(hash))
+    }
+
+        /// [`Self::train_lottery_p`] with the merit supplied by the caller.
+        ///
+        /// A report that already read the net's window passes its `A/B` numerator here
+        /// instead of letting the guards re-derive the same number. `None` means "no
+        /// merit" (no reading yet, or no ticket), which grades as `1.0` — the lottery
+        /// abstains rather than starving a net nobody measured.
+    pub(crate) fn train_lottery_p_from(
+        &self,
+        hash: &str,
+        clock: usize,
+        frame: Option<LotteryFrame>,
+        merit: Option<f32>,
     ) -> f32 {
         let Some(frame) = frame else {
             return 1.0; // lottery off (or no field this clock)
@@ -332,7 +363,7 @@ impl CoreEngine {
         if self.frozen_crown.contains(hash) || self.on_probation(hash, clock) {
             return 1.0;
         }
-        let Some(mine) = self.merit_per_ticket(hash) else {
+        let Some(mine) = merit else {
             return 1.0;
         };
             // Higher-is-better scale: Maximize keeps the merit, Minimize negates it, so
@@ -369,8 +400,21 @@ impl CoreEngine {
         clock: usize,
         frame: Option<LotteryFrame>,
     ) -> f32 {
+        self.train_lottery_p_eff_from(hash, clock, frame, self.merit_per_ticket(hash))
+    }
+
+        /// [`Self::train_lottery_p_eff`] with the merit supplied by the caller — the form
+        /// every report uses, so the `p` it prints and the coin the step draws cannot be
+        /// computed from two different merits.
+    pub(crate) fn train_lottery_p_eff_from(
+        &self,
+        hash: &str,
+        clock: usize,
+        frame: Option<LotteryFrame>,
+        merit: Option<f32>,
+    ) -> f32 {
         let omega = self.train_merit_omega();
-        let p = self.train_lottery_p(hash, clock, frame);
+        let p = self.train_lottery_p_from(hash, clock, frame, merit);
         1.0 - omega * (1.0 - p)
     }
 
@@ -390,7 +434,16 @@ impl CoreEngine {
         clock: usize,
         frame: Option<LotteryFrame>,
     ) -> bool {
-        let p = self.train_lottery_p_eff(hash, clock, frame);
+        self.train_lottery_draws_at(hash, clock, self.train_lottery_p_eff(hash, clock, frame))
+    }
+
+        /// The coin itself, given the probability a caller already computed.
+        ///
+        /// The draw is a pure function of `(run seed, clock, hash)` — no shared state, no
+        /// consumption — so asking it twice returns the answer the step will act on. That
+        /// is what lets the pre-step card print `ticket? yes/no` without a second merit
+        /// read: it passes the same `p` the engine loop will use.
+    pub(crate) fn train_lottery_draws_at(&self, hash: &str, clock: usize, p: f32) -> bool {
         if p >= 1.0 {
             return true;
         }

@@ -99,6 +99,11 @@ pub(crate) fn trait_of(values: &[f32]) -> Trait {
 
 /// One net's structural reading: the gene multiset the pair metric uses, plus the
 /// census legs it was read from. Built in ONE pass over the blueprint.
+///
+/// `Clone` because the stop card needs one net's shape in two shapes — as a
+/// `Δpop` entry and as a `Δcrown` anchor — and cloning a parse is far cheaper than
+/// parsing the same blueprint twice.
+#[derive(Clone)]
 pub(crate) struct NetShape {
     /// The net's genes — exactly what [`delta`] compares.
     pub genome: HashMap<String, usize>,

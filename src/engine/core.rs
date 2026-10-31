@@ -1114,6 +1114,9 @@ impl CoreEngine {
             state,
             net,
             optimizer,
+            // A replayed net's exchange count is in its lineage string, not here: this
+            // path rebuilds a resumed run, and re-reporting it would double-count.
+            cx: None,
         })
     }
 
@@ -2093,6 +2096,9 @@ impl CoreEngine {
             // Diversity rides the checkpoint cadence, ABOVE the rollup (the rollup stays
             // the clock's last line).
             self.log_diversity(clock);
+            // Same cadence, same reason: the mixing rate is a slow reading, and it sits
+            // above the rollup so the clock still ends on its summary line.
+            self.log_crossover_mix(clock);
             if self.log_level != crate::engine::config::LogLevel::None {
                 self.log_step_rollup(clock);
             }
@@ -2194,7 +2200,15 @@ impl CoreEngine {
     /// Change the step budget of a LIVE engine — the resume-and-extend door. The budget is
     /// ABSOLUTE (`max_steps` counts clocks, not clocks-this-process), so extending it is the
     /// one stop knob a resume may move; the caller's value wins over the recorded one.
+    ///
+    /// The ONE thing this can quietly change is the shape of a budget-relative LR
+    /// schedule, and the check lives here because this is the single funnel every
+    /// language's "extend the run" goes through — see
+    /// [`warn_budget_changed_under_a_budget_schedule`].
     pub fn set_stop_max_steps(&mut self, steps: usize) {
+        if self.resumed && self.header.max_steps != Some(steps) {
+            warn_budget_changed_under_a_budget_schedule(&self.header, Some(steps));
+        }
         self.config.max_steps = Some(steps);
     }
 
@@ -2301,6 +2315,15 @@ impl CoreEngine {
     /// The elite set: the top `config.elite_count` live nets by smoothed fitness that
     /// pass the gate (probation `≥ k`, seat age `< j`); any seat exit resets probation.
     pub(crate) fn elite_hashes(&self) -> Vec<String> {
+        self.elite_hashes_from(&self.ranked_live())
+    }
+
+    /// [`Self::elite_hashes`] over a ranking the caller already holds.
+    ///
+    /// The crown deal needs the order for its `seat N/M` numbering anyway, and a second
+    /// `ranked_live()` is a second window pass over every live net — so the deal ranks
+    /// once and hands the vec in here.
+    pub(crate) fn elite_hashes_from(&self, ranked: &[(String, f32)]) -> Vec<String> {
         let k = self
             .config
             .elite_count
@@ -2313,8 +2336,8 @@ impl CoreEngine {
         // The REGULAR shield is a precondition, checked first: a net may not be elite
         // before it could be culled (same born-based channel window).
         let clock = self.step_clock();
-        self.ranked_live()
-            .into_iter()
+        ranked
+            .iter()
             .filter(|(h, _)| {
                 self.state.net(h).is_some_and(|s| {
                     // (a) cull shield passed (born-based, never resets) — Rust `on_probation`.
@@ -2326,7 +2349,7 @@ impl CoreEngine {
                 })
             })
             .take(k)
-            .map(|(h, _)| h)
+            .map(|(h, _)| h.clone())
             .collect()
     }
 
@@ -2334,8 +2357,19 @@ impl CoreEngine {
     /// elite take(k) set, recomputed each step; the diff prints one line per transition.
     pub(crate) fn refresh_crown(&mut self, clock: usize) {
         let enabled = self.config.freeze_elites;
+        // ONE ranking for the whole deal. The seat set, the entry order, every
+        // `rank N` note and the exits' standing all read this vec: the old per-call
+        // `rank_position` re-ranked the entire population on each call, and the entry
+        // sort called it from inside its comparator — ~2k full re-ranks per deal, each
+        // one a window pass over every live net.
+        let ranked = self.ranked_live();
+        let positions: std::collections::HashMap<&str, usize> = ranked
+            .iter()
+            .enumerate()
+            .map(|(i, (h, _))| (h.as_str(), i))
+            .collect();
         let new_crown: std::collections::HashSet<String> = if enabled {
-            self.elite_hashes().into_iter().collect()
+            self.elite_hashes_from(&ranked).into_iter().collect()
         } else {
             // Freeze off: nobody holds a seat.
             std::collections::HashSet::new()
@@ -2353,11 +2387,7 @@ impl CoreEngine {
             .collect();
         // Print order: seats then exits, each in rank order — the log reads
         // as one deal of the crown, not k scattered events.
-        entering.sort_by(|a, b| {
-            self.rank_position(a)
-                .unwrap_or(usize::MAX)
-                .cmp(&self.rank_position(b).unwrap_or(usize::MAX))
-        });
+        entering.sort_by_key(|h| positions.get(h.as_str()).copied().unwrap_or(usize::MAX));
         leaving.sort();
         // 3. Seat exits: record WHY each net left before resetting probation (ANY exit
         // restarts it) — inferring the cause from the rank contradicted itself.
@@ -2397,7 +2427,7 @@ impl CoreEngine {
         // 5. One freeze line per net entering (rank order), one dethrone line
         //    per net leaving; a net holding rank is silent.
         for (idx, h) in entering.iter().enumerate() {
-            let pos = self.rank_position(h).unwrap_or(0);
+            let pos = positions.get(h.as_str()).copied().unwrap_or(0);
             // `seat N/M` is the SEAT INDEX inside this deal, NOT the net's global rank: with
             // probation on, rank 18 can take the 10th seat — the rank is named separately.
             let rank_note = if pos == 0 || pos == idx + 1 {
@@ -2530,8 +2560,8 @@ impl CoreEngine {
                 .unwrap_or_else(|| "seat not re-dealt".to_string());
             // Where the net stands as it leaves: a net aged out at peak can still rank #1,
             // so its rank was never the reason it lost the seat.
-            let rank_note = match self.rank_position(h) {
-                Some(r) => format!(" (still rank {r} of {} overall)", self.state.live_count()),
+            let rank_note = match positions.get(h.as_str()) {
+                Some(r) => format!(" (still rank {} of {} overall)", r + 1, self.state.live_count()),
                 None => String::new(),
             };
             // The ex-elite just re-entered the JOIN WINDOW: it trains like any
@@ -2551,8 +2581,9 @@ impl CoreEngine {
         // 5b. Why the elite RANKING and the crown disagree, said on the clocks that
         // changed the deal: the ★ badge shows the STATE, this line shows the REASON.
         if enabled && !(entering.is_empty() && leaving.is_empty()) {
+            // The SAME ranking the deal was made from: the crown was seated out of it
+            // this clock, so re-ranking here only repeated a window pass.
             let crown = &self.frozen_crown;
-            let ranked = self.ranked_live();
             let unseated_total = ranked.iter().filter(|(h, _)| !crown.contains(h)).count();
             let shown: Vec<String> = ranked
                 .iter()
@@ -2707,15 +2738,6 @@ impl CoreEngine {
             lifetime_j: self.config.elite_crown_lifetime_steps,
             crown_armed: self.config.freeze_elites,
         }
-    }
-
-    /// The net's 1-based rank among ALL live nets by smoothed fitness (the same sort
-    /// `elite_hashes` uses); `None` when unknown or unmeasured. Feeds the logs.
-    pub(crate) fn rank_position(&self, hash: &str) -> Option<usize> {
-        self.ranked_live()
-            .iter()
-            .position(|(h, _)| h == hash)
-            .map(|p| p + 1)
     }
 
     // ── Selection helpers ───────────────────────────────────────────────────
@@ -3224,6 +3246,54 @@ pub(crate) fn assert_trainer_blob_matches(
         diffs.join("; ")
     ))
     .into())
+}
+
+/// Warn when a resume changes the BUDGET under a budget-relative LR schedule.
+///
+/// `cosine` and `onecycle` are functions of `step / max_steps` (see
+/// `crate::trainer::schedule`), so extending a 4-clock run to 6 does not merely add
+/// two clocks: the clocks already on disk were trained on a curve drawn against 4,
+/// and the new ones are drawn against 6. The prefix stays honest and the frontier
+/// stays exact — but the file is no longer the twin of a run made at the new budget,
+/// and that is the sort of silent difference this engine warns about instead of
+/// leaving to a diff someone runs a week later.
+///
+/// Not a refusal: extending a run is legitimate, and a resume that keeps the budget
+/// (the crash case) is unaffected.
+pub(crate) fn warn_budget_changed_under_a_budget_schedule(
+    header: &RunHeader,
+    new_budget: Option<usize>,
+) {
+    let Some(blob) = header.trainer.as_ref() else {
+        return;
+    };
+    // The key is arm-specific: tabular records `lr_schedule_name` beside the legacy
+    // boolean, RL records `lr_schedule` as the label. Accept either spelling.
+    let label = blob
+        .get("lr_schedule_name")
+        .or_else(|| blob.get("lr_schedule"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let budget_relative = label.starts_with("cosine(") || label.starts_with("onecycle(");
+    if !budget_relative {
+        return;
+    }
+    let recorded = header.max_steps;
+    if recorded != new_budget {
+        tracing::warn!(
+            "race resume: the step budget changes ({}) while the run trains with the budget-relative \
+             schedule {label} — every clock on disk was drawn against the RECORDED budget, so this \
+             file is not the twin of a run made at the new one; pass max_steps={} to keep the curve, \
+             or launch the whole run at the budget you want",
+            match (recorded, new_budget) {
+                (Some(a), Some(b)) => format!("{a} → {b}"),
+                (Some(a), None) => format!("{a} → unbounded"),
+                (None, Some(b)) => format!("unbounded → {b}"),
+                (None, None) => "unbounded".to_string(),
+            },
+            recorded.map(|n| n.to_string()).unwrap_or_default(),
+        );
+    }
 }
 
 /// Collect human-readable differences between two JSON blobs, recursing into
@@ -5998,6 +6068,89 @@ mod tests {
             }
         }
         assert_eq!(dupes, 0, "history.csv re-emitted a (step, hash) row:\n{resumed_history}");
+        let _ = std::fs::remove_dir_all(&twin_dir);
+        let _ = std::fs::remove_dir_all(&split_dir);
+    }
+
+    /// A NAMED LR schedule is part of the replay contract, not a decoration: a run
+    /// stopped after clock 0 and resumed at the SAME budget must produce the twin's
+    /// history byte for byte. A stateful schedule (or one that reads the clock
+    /// differently on resume) would drift the rates apart, and this is the test that
+    /// catches it.
+    #[test]
+    fn a_named_lr_schedule_survives_a_resume_and_matches_the_twin() {
+        use crate::trainer::{LrSchedule, TabularTrainer};
+        let cfg = |stop_after_first_clock: bool| {
+            let mut c = RaceConfig::defaults();
+            c.pop_size = 2;
+            c.checkpoint_every = 1;
+            c.max_steps = Some(3);
+            c.log_level = crate::engine::config::LogLevel::None;
+            if stop_after_first_clock {
+                // Fires at the top of clock 1: clock 0 is complete and on disk.
+                c.custom_stop = Some(Box::new(|snap| snap.step >= 1));
+            }
+            c
+        };
+        let trainer = || {
+            TabularTrainer::new(loss_fn())
+                .with_named_lr_schedule(LrSchedule::Cosine { min_ratio: 0.1 })
+        };
+        // Built through the SPEC, so the schedule is the trainer the engine records
+        // at construction — swapping `engine.trainer` afterwards would leave the
+        // header describing a scheme that never ran.
+        let build = |dir: &std::path::Path, stop: bool| {
+            let mut config = cfg(stop);
+            config.pop_size = 0; // the test seeds its own tiny topologies
+            crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+                tiny_dataset_dir("schedule"),
+                config,
+                fitness(),
+                trainer(),
+                Some(5150),
+                Some(dir.to_path_buf()),
+            ))
+            .unwrap()
+        };
+        let twin_dir = std::env::temp_dir().join("race_schedule_twin");
+        let split_dir = std::env::temp_dir().join("race_schedule_split");
+        let _ = std::fs::remove_dir_all(&twin_dir);
+        let _ = std::fs::remove_dir_all(&split_dir);
+
+        let mut twin = build(&twin_dir, false);
+        twin.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        assert_eq!(twin.run().unwrap(), StopReason::MaxSteps);
+        let twin_history = std::fs::read_to_string(twin_dir.join("history.csv")).unwrap();
+        drop(twin);
+
+        let mut part = build(&split_dir, true);
+        part.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        assert_eq!(part.run().unwrap(), StopReason::CustomStop);
+        drop(part);
+
+        // The record names the schedule, so a resume can rebuild — and refuse a
+        // different — curve.
+        let header = crate::state::load_engine_json(&split_dir).unwrap();
+        let blob = header.trainer.expect("a run names its trainer");
+        assert_eq!(blob["lr_schedule_name"], "cosine(0.1)");
+        assert_eq!(blob["lr_schedule"], true);
+
+        let mut resumed = crate::engine::TabularEngine::resume(
+            split_dir.clone(),
+            tiny_dataset_dir("schedule_resume"),
+            cfg(false),
+            fitness(),
+            trainer(),
+        )
+        .unwrap();
+        assert_eq!(resumed.run().unwrap(), StopReason::MaxSteps);
+        let resumed_history = std::fs::read_to_string(split_dir.join("history.csv")).unwrap();
+        assert_eq!(
+            resumed_history, twin_history,
+            "a scheduled run resumed at the same budget must equal its twin"
+        );
         let _ = std::fs::remove_dir_all(&twin_dir);
         let _ = std::fs::remove_dir_all(&split_dir);
     }
