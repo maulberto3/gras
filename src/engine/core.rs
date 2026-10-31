@@ -287,6 +287,26 @@ impl RlVolume {
     }
 }
 
+/// One resume knob whose value differs from the record — and is allowed to.
+///
+/// R6's line in one type: a STRUCTURAL difference (mode, population size, dataset
+/// geometry, an unreadable trainer blob, a frontier the weights cannot satisfy) still
+/// errors, because the run cannot be rebuilt at all; a BEHAVIOURAL difference only
+/// changes the draws from here on, so the caller keeps it and the log states both
+/// values. The list exists as data rather than as five `if`s for two reasons: the
+/// warning is printed from it, and the tests read it instead of grepping a log line.
+#[derive(Clone, Debug, PartialEq)]
+struct KnobDrift {
+    /// How the log names the knob: `smoothing_window (K)`, `risk_aversion (λ)`, …
+    label: &'static str,
+    /// The value the run recorded, formatted as the reader will see it.
+    recorded: String,
+    /// The value the resume asked for.
+    current: String,
+    /// The setter call that reproduces the record, e.g. `set_run_risk_aversion(0.00)`.
+    undo: String,
+}
+
 impl CoreEngine {
     /// True when per-step detail lines (evolve rollup, per-child lines, checkpoint,
     /// race-start) are emitted — every level except `Minimal` and `None`.
@@ -734,104 +754,136 @@ impl CoreEngine {
         &self.state
     }
 
-    /// Load every live net from `nets/` and replay it to its recorded step. Also
-    /// reloads the checkpoint ledger so the history is the SAME.
-    pub(crate) fn load_live_frontier(&mut self) -> Result<()> {
-        // Replay-relevant knob guard: the smoothing window shapes every ranking decision,
-        // so a resumed run must use the SAME window the original recorded.
-        if self.config.smoothing_window != self.header.config.smoothing_window {
-            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume: smoothing_window mismatch — run recorded {} but the resume config sets {} — \
-                 ranking semantics would change; set set_run_smoothing_window({}) (or omit) to resume",
-                self.header.config.smoothing_window,
-                self.config.smoothing_window,
-                self.header.config.smoothing_window
-            )).into());
-        }
-        // λ is replay-relevant for the same reason: it decides how much of a net's
-        // spread is charged before it ranks. A run recorded BEFORE FIT stored no λ
-        // (⇒ 0.0) because it ranked on the plain mean, so resuming it needs
-        // `set_run_risk_aversion(0.0)` — the refusal names that value.
-        if (self.config.risk_aversion - self.header.config.risk_aversion).abs() > 1e-6 {
-            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume: risk_aversion mismatch — run recorded λ={} but the resume config sets λ={} — \
-                 ranking semantics would change; set set_run_risk_aversion({}) (or omit) to resume \
-                 (a run that predates FIT recorded 0.00: it ranked on the plain mean)",
-                fmt_cfg(self.header.config.risk_aversion),
-                fmt_cfg(self.config.risk_aversion),
-                fmt_cfg(self.header.config.risk_aversion)
-            )).into());
-        }
-        // The parent draw is replay-relevant for the same class of reason: roulette and
-        // tournament consume the roll's RNG stream differently AND prefer different
-        // parents, so a resume at another method is a different search. A run from
-        // BEFORE the knob recorded nothing (`""`) — it drew roulette, the default, so
-        // that reads equal rather than refusing every legacy run.
-        let recorded_selection = if self.header.config.crossover_selection.is_empty() {
+    /// Every BEHAVIOURAL knob whose resume value differs from the record.
+    ///
+    /// "Behavioural" = it changes the draws from this clock on (the ranking, the parent
+    /// choice, the cull victim, which clocks were idle) but never contradicts what the
+    /// recorded ledger already says happened. R6: those WARN; only an unrebuildable run
+    /// refuses. A legacy header reads as the value its run actually used, not as a
+    /// default: a missing window/Ω/probation reads `0` because those runs trained every
+    /// clock, an empty selection reads roulette, an empty cull policy reads `worst`, and
+    /// a missing λ reads `0.0` (the pre-FIT plain mean).
+    fn behavioural_drift(&self) -> Vec<KnobDrift> {
+        let recorded = &self.header.config;
+        let current = &self.config;
+        let mut drift: Vec<KnobDrift> = Vec::new();
+        let mut push = |label: &'static str, rec: String, cur: String, undo: String| {
+            if rec != cur {
+                drift.push(KnobDrift {
+                    label,
+                    recorded: rec,
+                    current: cur,
+                    undo,
+                });
+            }
+        };
+        push(
+            "smoothing_window (K)",
+            recorded.smoothing_window.to_string(),
+            current.smoothing_window.to_string(),
+            format!("set_run_smoothing_window({})", recorded.smoothing_window),
+        );
+        push(
+            "risk_aversion (λ)",
+            fmt_cfg(recorded.risk_aversion),
+            fmt_cfg(current.risk_aversion),
+            format!("set_run_risk_aversion({})", fmt_cfg(recorded.risk_aversion)),
+        );
+        // `""` = a header written before the knob drew roulette, the default.
+        let rec_selection = if recorded.crossover_selection.is_empty() {
             SelectionMethod::Roulette.to_string()
         } else {
-            self.header.config.crossover_selection.clone()
+            recorded.crossover_selection.clone()
         };
-        let current_selection = self.config.crossover_selection.to_string();
-        if recorded_selection != current_selection {
-            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume: crossover_selection mismatch — run recorded {recorded_selection} but the \
-                 resume config sets {current_selection} — parent draws would change; call \
-                 set_crossover_selection(...) with the recorded method (or omit it) to resume"
-            )).into());
-        }
-        // The training lottery decides WHICH clocks were act-only, and those clocks are
-        // persisted per net (`idle_spans`) for replay. A resume at a different Ω would
-        // disagree with that ledger, so it is refused like K and λ — by the value, not
-        // merely by "on/off": Ω = 0.5 idles a different set from Ω = 1.
-        if (self.config.train_merit - self.header.config.train_merit).abs() > 1e-6 {
-            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume: train_merit (Ω) mismatch — run recorded Ω={} but the resume \
-                 config sets Ω={} — which nets received a train-eval ticket would change; \
-                 call set_run_train_merit({}) (or omit it) to resume",
-                fmt_cfg(self.header.config.train_merit),
-                fmt_cfg(self.config.train_merit),
-                fmt_cfg(self.header.config.train_merit)
-            ))
-            .into());
-        }
-            // Cull policies decide which net the NEXT roll removes, so a resume at a
-            // different policy is a different search — refused like the parent draw above.
-            // This is the ONE rule for this gate: guard a knob when it changes the future
-            // draws the engine will consume. The rest stay forward-only on purpose (rolls,
-            // probs, pools, probation windows, elite_count, freeze_elites): they change
-            // what happens next but never what the recorded ledger says happened, and
-            // their numeric headers predate any safe legacy default (a missing f32 reads
-            // 0.0, not the 0.5 those runs used).
-            // `""` = a header written before the field existed; those runs culled `worst`
-            // (`RaceConfig::defaults()`), so it reads equal instead of refusing.
-        for (label, setter, recorded, current) in [
+        push(
+            "crossover_selection",
+            rec_selection.clone(),
+            current.crossover_selection.to_string(),
+            format!("set_crossover_selection({rec_selection})"),
+        );
+        push(
+            "train_merit (Ω)",
+            fmt_cfg(recorded.train_merit),
+            fmt_cfg(current.train_merit),
+            format!("set_run_train_merit({})", fmt_cfg(recorded.train_merit)),
+        );
+        for (label, setter, rec, cur) in [
             (
                 "crossover_cull_policy",
                 "set_crossover_cull_policy",
-                self.header.config.crossover_cull_policy.clone(),
-                self.config.crossover_cull_policy.to_string(),
+                recorded.crossover_cull_policy.clone(),
+                current.crossover_cull_policy.to_string(),
             ),
             (
                 "mutation_cull_policy",
                 "set_mutation_cull_policy",
-                self.header.config.mutation_cull_policy.clone(),
-                self.config.mutation_cull_policy.to_string(),
+                recorded.mutation_cull_policy.clone(),
+                current.mutation_cull_policy.to_string(),
             ),
         ] {
-            let recorded = if recorded.is_empty() {
+            // `""` = a header written before the field: those runs culled `worst`.
+            let rec = if rec.is_empty() {
                 "worst".to_string()
             } else {
-                recorded
+                rec
             };
-            if recorded != current {
-                return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                    "resume: {label} mismatch — run recorded {recorded} but the resume config \
-                     sets {current} — which net the next cull removes would change; call \
-                     {setter}(...) with the recorded policy (or omit it) to resume"
-                ))
-                .into());
-            }
+            push(label, rec.clone(), cur, format!("{setter}({rec})"));
+        }
+        for (label, setter, rec, cur) in [
+            (
+                "mutation_probation_steps",
+                "set_mutation_probation_steps",
+                recorded.mutation_probation_steps,
+                current.mutation_probation_steps,
+            ),
+            (
+                "crossover_probation_steps",
+                "set_crossover_probation_steps",
+                recorded.crossover_probation_steps,
+                current.crossover_probation_steps,
+            ),
+            (
+                "elite_join_probation_steps",
+                "set_elite_join_probation_steps",
+                recorded.elite_join_probation_steps,
+                current.elite_join_probation_steps,
+            ),
+            (
+                "elite_crown_lifetime_steps",
+                "set_elite_crown_lifetime_steps",
+                recorded.elite_crown_lifetime_steps,
+                current.elite_crown_lifetime_steps,
+            ),
+        ] {
+            push(
+                label,
+                rec.to_string(),
+                cur.to_string(),
+                format!("{setter}({rec})"),
+            );
+        }
+        drift
+    }
+
+    /// Load every live net from `nets/` and replay it to its recorded step. Also
+    /// reloads the checkpoint ledger so the history is the SAME.
+    pub(crate) fn load_live_frontier(&mut self) -> Result<()> {
+        // R6 — refuse only the impossible. A behavioural knob is NOT a reason to refuse a
+        // resume: the caller may want the same population under a different ranking, a
+        // different parent draw, or a different cull victim, and nothing recorded becomes
+        // untrue by that. What cannot happen is the drift passing SILENTLY, so every
+        // differing knob is named with both values and the setter that reproduces the
+        // record. Structural impossibilities refuse elsewhere: schema/frontier (manifest),
+        // weights behind the manifest, pop_size, dataset geometry, the trainer blob, mode.
+        for drift in self.behavioural_drift() {
+            tracing::warn!(
+                "race resume: {} differs from the record — the run recorded {}, this resume sets {} \
+                 — the search from here is NOT the recorded one; pass {} to replay the recorded race",
+                drift.label,
+                drift.recorded,
+                drift.current,
+                drift.undo
+            );
         }
         let run_dir = self.run_dir.clone();
         let nets_dir = run_dir.join("nets");
@@ -5594,11 +5646,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-        /// λ is replay-relevant like K: a run that recorded one λ cannot be resumed at
-        /// another, and a run from BEFORE FIT (no λ in `engine.json` ⇒ 0.0, i.e. it ranked
-        /// on the plain mean) is refused BY NAME until the caller passes 0.0 back.
+    /// R6: λ is BEHAVIOURAL. Ranking differently is the caller's call, so the resume
+    /// WARNS — both values plus the setter that reproduces the record — instead of
+    /// refusing. A pre-FIT run recorded none (`0.0`, the plain mean), so resuming it at
+    /// the new default 1.0 is allowed and shows up in `behavioural_drift()`.
     #[test]
-    fn resume_refuses_a_risk_aversion_mismatch_and_names_the_recorded_value() {
+    fn resume_warns_on_a_risk_aversion_mismatch_and_names_the_recorded_value() {
         let dir = std::env::temp_dir().join("race_resume_risk_aversion");
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = engine(&dir, 99).unwrap();
@@ -5630,37 +5683,36 @@ mod tests {
                 crate::trainer::TabularTrainer::new(loss_fn()),
             )
         };
-        // The NEW default (λ = 1.0) against a run that recorded none is refused, and the
-        // message names the value that reproduces the recorded ranking.
         let mut current = RaceConfig::defaults();
         current.pop_size = 2;
-        let err = resume(current)
-            .err()
-            .expect("a λ mismatch must be refused, not patched")
-            .to_string();
-        assert!(err.contains("risk_aversion mismatch"), "{err}");
+        let resumed = resume(current).expect("λ is behavioural: warn, never refuse");
+        let drift = resumed.behavioural_drift();
+        assert_eq!(drift.len(), 1, "{drift:?}");
+        assert_eq!(drift[0].label, "risk_aversion (λ)");
+        assert_eq!(drift[0].recorded, "0.00");
+        assert_eq!(drift[0].current, "1.00");
         assert!(
-            err.contains("set_run_risk_aversion(0.00)"),
-            "the refusal must name the recorded λ: {err}"
+            drift[0].undo.contains("set_run_risk_aversion(0.00)"),
+            "the warning must say how to reproduce the record: {drift:?}"
         );
-        // …and passing the recorded λ back resumes the run.
+        drop(resumed);
+
+        // …and the recorded λ leaves no drift at all.
         let mut legacy = RaceConfig::defaults();
         legacy.pop_size = 2;
         legacy.risk_aversion = 0.0;
-        assert!(
-            resume(legacy).is_ok(),
-            "a pre-FIT run must resume at the λ it actually ranked with"
-        );
+        let resumed = resume(legacy).expect("a pre-FIT run resumes at the λ it ranked with");
+        assert!(resumed.behavioural_drift().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-        /// The parent draw is replay-relevant like K and λ: roulette and tournament
-        /// prefer different parents AND consume the roll's RNG differently, so a resume
-        /// at another method is a different search. A pre-knob header recorded nothing
-        /// (`""`), which reads as roulette — the draw those runs made — not as a refusal.
+    /// R6: the parent draw is behavioural — roulette and tournament prefer different
+    /// parents and consume the roll's RNG differently — so a resume at another method
+    /// WARNS and keeps the caller's choice. A pre-knob header recorded nothing (`""`),
+    /// which reads as roulette: the draw those runs made, not drift.
     #[test]
-    fn resume_refuses_a_crossover_selection_mismatch_and_reads_legacy_as_roulette() {
+    fn resume_warns_on_a_crossover_selection_mismatch_and_reads_legacy_as_roulette() {
         let dir = std::env::temp_dir().join("race_resume_crossover_selection");
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = engine(&dir, 99).unwrap();
@@ -5683,20 +5735,22 @@ mod tests {
                 crate::trainer::TabularTrainer::new(loss_fn()),
             )
         };
-        // A different method is refused, and the message names BOTH draws.
         let mut tournament = RaceConfig::defaults();
         tournament.pop_size = 2;
         tournament.crossover_selection = SelectionMethod::Tournament { tournament_size: 3 };
-        let err = resume(tournament)
-            .err()
-            .expect("a selection mismatch must be refused, not patched")
-            .to_string();
-        assert!(err.contains("crossover_selection mismatch"), "{err}");
-        assert!(err.contains("roulette"), "names the recorded draw: {err}");
+        let resumed = resume(tournament).expect("selection is behavioural: warn, never refuse");
+        let drift = resumed.behavioural_drift();
+        let row = drift
+            .iter()
+            .find(|d| d.label == "crossover_selection")
+            .expect("the drift is named");
+        assert_eq!(row.recorded, "roulette", "names the recorded draw");
+        assert_eq!(row.current, "tournament(size=3)", "names the requested draw");
         assert!(
-            err.contains("tournament(size=3)"),
-            "names the requested draw: {err}"
+            row.undo.contains("set_crossover_selection(roulette)"),
+            "{drift:?}"
         );
+        drop(resumed);
 
         // A header written before the knob: strip the key, resume at the default.
         let raw = std::fs::read_to_string(dir.join("engine.json")).unwrap();
@@ -5708,9 +5762,10 @@ mod tests {
         std::fs::write(dir.join("engine.json"), json.to_string()).unwrap();
         let mut legacy = RaceConfig::defaults();
         legacy.pop_size = 2;
+        let resumed = resume(legacy).expect("a pre-knob run resumes at roulette, its own draw");
         assert!(
-            resume(legacy).is_ok(),
-            "a pre-knob run must resume at roulette, the draw it actually made"
+            resumed.behavioural_drift().is_empty(),
+            "roulette is what a pre-knob header did"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6229,13 +6284,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-        /// The training lottery's strength Ω decides which clocks were idle, and those
-        /// clocks are the replay ledger: a run recorded at one Ω cannot be resumed at
-        /// another (including on/off), and the refusal names the recorded value. Ω is a
-        /// DIAL, not a switch, so 0.5 vs 1.0 must be refused too — they idle a
-        /// different set of nets.
+    /// R6: Ω is BEHAVIOURAL — it decides which clocks were idle from here on — so a
+    /// resume at another strength WARNS with both values instead of refusing. It is a
+    /// DIAL, not a switch, so 0.5 vs 1.0 reports drift too.
     #[test]
-    fn resume_refuses_a_train_merit_mismatch() {
+    fn resume_warns_on_a_train_merit_mismatch() {
         let dir = std::env::temp_dir().join("race_resume_train_merit");
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = engine(&dir, 99).unwrap();
@@ -6267,28 +6320,36 @@ mod tests {
         };
         let mut off = RaceConfig::defaults();
         off.pop_size = 2;
-        let err = resume(off)
-            .err()
-            .expect("a lottery mismatch must be refused, not patched")
-            .to_string();
-        assert!(err.contains("train_merit (\u{3a9}) mismatch"), "{err}");
-        assert!(
-            err.contains("set_run_train_merit(0.50)"),
-            "the refusal must name the recorded strength: {err}"
-        );
-        // On/off is not the only mismatch a dial can have: the neighbouring strength
-        // idles a DIFFERENT set of nets, so it is refused on the same terms.
+        let resumed = resume(off).expect("Ω is behavioural: warn, never refuse");
+        let drift = resumed.behavioural_drift();
+        let row = drift
+            .iter()
+            .find(|d| d.label == "train_merit (Ω)")
+            .expect("the drift is named");
+        assert_eq!(row.recorded, "0.50");
+        assert_eq!(row.current, "0.00");
+        assert!(row.undo.contains("set_run_train_merit(0.50)"), "{drift:?}");
+        drop(resumed);
+
+        // On/off is not the only mismatch a dial can have.
         let mut full = RaceConfig::defaults();
         full.pop_size = 2;
         full.train_merit = 1.0;
-        assert!(resume(full).is_err(), "0.5 vs 1.0 must be refused");
+        let resumed = resume(full).expect("0.5 vs 1.0 is drift, not a refusal");
+        assert!(
+            resumed
+                .behavioural_drift()
+                .iter()
+                .any(|d| d.label == "train_merit (Ω)" && d.current == "1.00"),
+            "the dial's neighbouring value is drift too"
+        );
+        drop(resumed);
+
         let mut recorded = RaceConfig::defaults();
         recorded.pop_size = 2;
         recorded.train_merit = 0.5;
-        assert!(
-            resume(recorded).is_ok(),
-            "the recorded setting must resume"
-        );
+        let resumed = resume(recorded).expect("the recorded setting must resume");
+        assert!(resumed.behavioural_drift().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6325,12 +6386,12 @@ mod tests {
         assert!(written.contains("\"train_merit\""), "{written}");
     }
 
-        /// A resume at a different cull policy would evict different nets from the very
-        /// next roll: refused by name, on BOTH channels, while the recorded policy still
-        /// resumes. The header's crossover policy is blanked first, so the legacy `""` →
-        /// `worst` path is exercised too.
+    /// R6: cull policies are BEHAVIOURAL — they pick the next victim, not what already
+    /// happened — so a resume at another policy WARNS on BOTH channels, while the
+    /// recorded policy still resumes with no drift. The header's crossover policy is
+    /// blanked first, so the legacy `""` → `worst` path is exercised too.
     #[test]
-    fn resume_refuses_a_cull_policy_mismatch_on_both_channels() {
+    fn resume_warns_on_a_cull_policy_mismatch_on_both_channels() {
         let dir = std::env::temp_dir().join("race_resume_cull_policy");
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = engine(&dir, 99).unwrap();
@@ -6358,30 +6419,41 @@ mod tests {
                 crate::trainer::TabularTrainer::new(loss_fn()),
             )
         };
-        // Legacy `""` reads `worst`, which is what the defaults resume at: allowed.
+        // Legacy `""` reads `worst`, which is what the defaults resume at: no drift.
         let mut same = RaceConfig::defaults();
         same.pop_size = 2;
-        assert!(resume(same).is_ok(), "a blanked legacy policy must resume");
+        let resumed = resume(same).expect("a blanked legacy policy must resume");
+        assert!(resumed.behavioural_drift().is_empty());
+        drop(resumed);
 
         let mut cross = RaceConfig::defaults();
         cross.pop_size = 2;
         cross.crossover_cull_policy = crate::engine::config::CrossCullPolicy::Random;
-        let err = resume(cross)
-            .err()
-            .expect("a crossover cull mismatch must be refused")
-            .to_string();
-        assert!(err.contains("crossover_cull_policy mismatch"), "{err}");
-        assert!(err.contains("set_crossover_cull_policy"), "{err}");
+        let resumed = resume(cross).expect("a cull policy is behavioural: warn, never refuse");
+        let drift = resumed.behavioural_drift();
+        let row = drift
+            .iter()
+            .find(|d| d.label == "crossover_cull_policy")
+            .expect("the crossover channel is named");
+        assert_eq!(row.recorded, "worst");
+        assert!(row.undo.contains("set_crossover_cull_policy(worst)"), "{drift:?}");
+        drop(resumed);
 
         let mut mutp = RaceConfig::defaults();
         mutp.pop_size = 2;
         mutp.mutation_cull_policy = crate::engine::config::MutationCullPolicy::InverseFitness;
-        let err = resume(mutp)
-            .err()
-            .expect("a mutation cull mismatch must be refused")
-            .to_string();
-        assert!(err.contains("mutation_cull_policy mismatch"), "{err}");
-        assert!(err.contains("set_mutation_cull_policy"), "{err}");
+        let resumed = resume(mutp).expect("the mutation channel warns on the same terms");
+        let drift = resumed.behavioural_drift();
+        let row = drift
+            .iter()
+            .find(|d| d.label == "mutation_cull_policy")
+            .expect("the mutation channel is named");
+        assert_eq!(row.recorded, "worst");
+        assert!(row.current.to_lowercase().contains("inverse"), "{drift:?}");
+        assert!(
+            row.undo.contains("set_mutation_cull_policy(worst)"),
+            "{drift:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
