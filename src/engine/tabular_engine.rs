@@ -10,7 +10,9 @@
 //! ## Resume semantics — what must match vs what's yours to change
 //! Every live net is LOADED from `nets/<hash>.safetensors` at the step the frontier
 //! manifest names (R4/R5; the replay path is gone), with `nets/<hash>.optim` restored
-//! when `save_optim` recorded it.
+//! when `save_optim` recorded it, and with the trainer's own per-net bookkeeping
+//! (`nets/<hash>.json` → `trainer_state`, R9) handed back to `TabularStep::restore`
+//! before the first continued step.
 //!
 //! **Refused** — what cannot be rebuilt at all: `pop_size` (checked against the live
 //! frontier), the trainer scheme (loss, update recipe, `stream_shape()` batch sizes),
