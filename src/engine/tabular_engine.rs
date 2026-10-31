@@ -88,8 +88,46 @@ impl TabularEngine {
             ),
         )?))
     }
-    /// Resume a run from its run directory, replaying every live net to its
-    /// recorded step. See the module docs for what must match vs. what may change.
+    /// Resume a run from its run directory ALONE — everything but your code comes from
+    /// the record: `data_dir` (stamped into `engine.json` by the engine), the run-level
+    /// knobs (`RaceConfig::from_snapshot`), the search space (topology options, pools,
+    /// hidden-dim range), the metric set, the step budget and the seed.
+    ///
+    /// `fitness` and `trainer` stay arguments because they are CODE, not data: a
+    /// tabular fitness is a closure over the scorer and the trainer owns the loss, so
+    /// neither can be reconstructed from a header. Pass the same ones the run used —
+    /// `assert_trainer_blob_matches` refuses a different recipe by name.
+    pub fn resume_from(
+        run_dir: impl Into<std::path::PathBuf>,
+        fitness: Fitness,
+        trainer: impl crate::trainer::TabularStep + 'static,
+    ) -> Result<Self> {
+        let run_dir = run_dir.into();
+        let header = crate::state::load_engine_json(&run_dir)?;
+        let Some(data_dir) = header.data_dir.clone() else {
+            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                "resume_from: {} records no data_dir — it was written before the header kept one, so pass it explicitly with TabularEngine::resume(dir, data_dir, …)",
+                run_dir.display()
+            ))
+            .into());
+        };
+        let mut config = RaceConfig::from_snapshot(&header.config);
+        // The SEARCH SPACE (topology options, pools, hidden-dim range, metrics, budget)
+        // lives on the header, not the snapshot — one shared stamper for both arms.
+        CoreEngine::apply_header_search_space(&mut config, &header);
+        Self::resume(
+            run_dir,
+            std::path::PathBuf::from(data_dir),
+            config,
+            fitness,
+            trainer,
+        )
+    }
+
+    /// Resume a run from an explicit directory + dataset + config, replaying every live
+    /// net to its recorded step. See the module docs for what must match vs. what may
+    /// change. This is the form to use for a dir that predates `engine.json`'s
+    /// `data_dir`, or when the dataset moved.
     pub fn resume(
         run_dir: std::path::PathBuf,
         data_dir: std::path::PathBuf,
