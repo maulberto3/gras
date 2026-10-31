@@ -398,7 +398,7 @@ mod tests {
             state.to_string(),
         )
         .unwrap();
-        let mut header = serde_json::json!({
+        let header = serde_json::json!({
             "run_id": run_id,
             "engine_mode": mode,
             "run_seed": 42,
