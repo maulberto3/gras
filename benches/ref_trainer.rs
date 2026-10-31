@@ -128,7 +128,7 @@ impl TabularStep for TabularTrainer {
         &*self.loss_fn
     }
 
-    fn scheduled_lr(&self, step: usize) -> Option<f64> {
+    fn scheduled_lr(&self, step: usize, _max_steps: Option<usize>) -> Option<f64> {
         self.lr_schedule.as_ref().map(|f| f(step))
     }
 
@@ -156,7 +156,7 @@ impl TabularStep for TabularTrainer {
             .bytes()
             .fold(0u64, |a, b| a.wrapping_add(b as u64));
         let batch: (Tensor, Tensor) = ctx.data.train_batch(step as u64)?;
-        if let Some(lr) = self.scheduled_lr(step) {
+        if let Some(lr) = self.scheduled_lr(step, ctx.env.max_steps) {
             optimizer.set_lr(lr);
         }
         let train_loss = deterministic_train_step(
