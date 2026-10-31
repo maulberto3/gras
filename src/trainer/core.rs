@@ -11,7 +11,7 @@
 //!   the fitness is whatever the trainer reports in [`RlStepReport::fitness`].
 //!
 //! Each trait is self-sufficient: it carries the shared lifecycle
-//! (`make_optimizer`, optional `describe`, optional `holdout_score`) next to
+//! (`make_optimizer`, optional `describe`, optional `restore_optimizer`) next to
 //! its mode-specific step, so a trainer is ONE `impl` block. Wrong flavor
 //! combinations stay a **compile error**: `RunSpec::tabular` demands
 //! `T: TabularStep` and `RunSpec::rl` demands `T: RlStep`, and the two traits
@@ -264,19 +264,24 @@ pub trait TabularStep: Send {
     /// Make the optimizer for a newly built or reloaded network.
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
 
+    /// Restore this net's optimizer state from `path`, or `None` to build a fresh one.
+    ///
+    /// The hook exists because flodl's `Stateful::load_state_file` needs the CONCRETE
+    /// optimizer type while the engine holds `Box<dyn Optimizer>` — only the trainer
+    /// knows which optimizer it makes. Default `None`: the engine calls `make_optimizer`
+    /// and logs that the moments restarted (option A).
+    fn restore_optimizer(
+        &self,
+        _net: &Network,
+        _path: &std::path::Path,
+    ) -> Option<Box<dyn flodl::nn::optim::Optimizer>> {
+        None
+    }
+
         /// Optional self-description of this scheme's hyperparameters, recorded in
         /// `engine.json` under `"trainer"`. The engine never interprets the contents.
     fn describe(&self) -> Option<serde_json::Value> {
         None
-    }
-
-        /// Guardrail measurement half: score ONE fresh holdout game with the given net,
-        /// in the run's fitness units. `game_i` seeds your draw. Default: unimplemented.
-    fn holdout_score(&mut self, _net: &mut Network, _game_i: usize) -> flodl::tensor::Result<f32> {
-        unimplemented!(
-            "holdout_score is not implemented for this trainer — implement it (one fresh \
-             game, same units as the reported fitness) to use engine.guardrail()"
-        )
     }
 
     /// The loss this scheme trains against: `(pred, target) -> loss`.
@@ -318,19 +323,20 @@ pub trait RlStep: Send {
     /// Make the optimizer for a newly built or reloaded network.
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
 
+    /// Restore this net's optimizer state from `path` (see
+    /// [`TabularStep::restore_optimizer`] for why this is a trainer hook).
+    fn restore_optimizer(
+        &self,
+        _net: &Network,
+        _path: &std::path::Path,
+    ) -> Option<Box<dyn flodl::nn::optim::Optimizer>> {
+        None
+    }
+
     /// Optional self-description of this scheme's hyperparameters, recorded in
     /// `engine.json` under `"trainer"`. `None` (the default) = "no description".
     fn describe(&self) -> Option<serde_json::Value> {
         None
-    }
-
-        /// Guardrail measurement half: score ONE fresh holdout game with the given net,
-        /// in the run's fitness units. `game_i` seeds your draw. Default: unimplemented.
-    fn holdout_score(&mut self, _net: &mut Network, _game_i: usize) -> flodl::tensor::Result<f32> {
-        unimplemented!(
-            "holdout_score is not implemented for this trainer — implement it (one fresh \
-             game, same units as the reported fitness) to use engine.guardrail()"
-        )
     }
 
     /// Train the network for one clock-step in place: run the environment,
@@ -383,6 +389,18 @@ impl AnyTrainer {
     /// Mode tag (drives the engine's log columns and RL-only phases).
     pub fn is_rl(&self) -> bool {
         matches!(self, Self::Rl(_))
+    }
+
+    /// Restore optimizer state through the trainer's own concrete optimizer type.
+    pub fn restore_optimizer(
+        &self,
+        net: &Network,
+        path: &std::path::Path,
+    ) -> Option<Box<dyn flodl::nn::optim::Optimizer>> {
+        match self {
+            Self::Tabular(t) => t.restore_optimizer(net, path),
+            Self::Rl(t) => t.restore_optimizer(net, path),
+        }
     }
 
     /// Build the optimizer this scheme trains with.
@@ -463,14 +481,6 @@ impl AnyTrainer {
         }
     }
 
-    /// Guardrail dispatch — forwards to the trainer's own `holdout_score`.
-    pub fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> flodl::tensor::Result<f32> {
-        match self {
-            Self::Tabular(t) => t.holdout_score(net, game_i),
-            Self::Rl(t) => t.holdout_score(net, game_i),
-        }
-    }
-
     /// The tabular loss, when this is a tabular trainer (checkpoint exam).
     pub fn tabular_loss(&self) -> Option<super::LossFn<'_>> {
         match self {
@@ -491,26 +501,15 @@ impl AnyTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::node::Node;
-    use crate::graph::topology::Topology;
-    use flodl::Device;
     // `Module` provides `Network::parameters()`, used by `make_optimizer`.
     use flodl::Module;
 
-    /// A trainer that ANSWERS the guardrail with a sentinel, so a test can tell
-    /// "the override ran" from "the trait default panicked".
+    /// The minimal RL scheme: exists to exercise the enum's defaults.
     struct SentinelRl;
 
     impl RlStep for SentinelRl {
         fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
             Box::new(flodl::nn::Adam::new(&net.parameters(), 1e-3_f64))
-        }
-        fn holdout_score(
-            &mut self,
-            _net: &mut Network,
-            game_i: usize,
-        ) -> flodl::tensor::Result<f32> {
-            Ok(100.0 + game_i as f32)
         }
         fn train_step(
             &mut self,
@@ -519,7 +518,7 @@ mod tests {
             _step: usize,
             _ctx: &RlContext<'_>,
         ) -> flodl::tensor::Result<RlStepReport> {
-            unimplemented!("the guardrail dispatch test never trains")
+            unimplemented!("the pop-phase test never trains")
         }
     }
 
@@ -597,50 +596,5 @@ mod tests {
         );
     }
 
-    /// The smallest net that satisfies the guardrail's signature — the
-    /// sentinel never touches it, but a `&mut Network` is required to call.
-    fn tiny_net() -> Network {
-        let mut graph = Topology::new(0, None);
-        graph.nodes.push(Node::new_input(0, 2));
-        graph.nodes.push(Node::new_hidden(1, 3, 2));
-        graph.nodes.push(Node::new_output(2, 2, 1));
-        graph.refresh_labels();
-        graph.finalize();
-        Network::build(&graph, Device::CPU).unwrap()
-    }
 
-        /// REGRESSION: `engine.guardrail()` must reach the trainer's OWN
-        /// `holdout_score` through enum dispatch, not the trait DEFAULT (`unimplemented!()`).
-    #[test]
-    fn enum_dispatch_reaches_the_rl_override() {
-        let mut net = tiny_net();
-        // AnyTrainer::Rl -> Box<dyn RlStep> -> SentinelRl.
-        let mut trainer = AnyTrainer::rl(SentinelRl);
-        assert_eq!(
-            trainer.holdout_score(&mut net, 1).unwrap(),
-            101.0,
-            "the boxed trainer's override must run, not the trait default"
-        );
-    }
-
-        /// The tabular half of the same bug: a trainer WITH a scorer installed must
-        /// reach it through enum dispatch, not a default panic.
-    #[test]
-    fn enum_dispatch_reaches_the_tabular_scorer() {
-        let trainer = crate::trainer::TabularTrainer::new(
-            |_pred, _y| -> flodl::tensor::Result<flodl::Variable> {
-                unimplemented!("the guardrail dispatch test never trains")
-            },
-        )
-        .with_holdout_scorer(|_net, game_i| -> flodl::tensor::Result<f32> {
-            Ok(7.0 + game_i as f32)
-        });
-        let mut any = AnyTrainer::tabular(trainer);
-        let mut net = tiny_net();
-        assert_eq!(
-            any.holdout_score(&mut net, 2).unwrap(),
-            9.0,
-            "the installed scorer must run through enum dispatch"
-        );
-    }
 }
