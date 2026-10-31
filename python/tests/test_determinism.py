@@ -22,10 +22,22 @@ from pathlib import Path
 from gras import (
     RaceConfig,
     RaceEngine,
+    activations,
     algos,
+    combine_ops,
+    crossover_cull_policies,
+    crossover_ops,
+    feature_splits,
     fitnesses,
+    log_levels,
     losses,
+    lr_schedules,
+    menus,
     metrics,
+    mutation_cull_policies,
+    optimizers,
+    selection_methods,
+    standardize_ops,
     tasks,
 )
 
@@ -396,34 +408,39 @@ def check_cartpole_if_available() -> None:
 
 
 # ── one smoke run per menu entry ──────────────────────────────────────────
-# The published tables (`losses()`, `metrics()`, `fitnesses()`, `tasks()`,
-# `algos()`) are swept FROM the table, so an entry added there is covered the
-# day it lands. The config-string menus are not published — `RaceConfig` parses
-# them against the crate's own spellings — so they are mirrored here. A spelling
-# accepted there but absent here is a coverage gap, not a failure; every name
-# listed below must actually train, which is what this sweep proves.
-ACTIVATIONS = [
-    "identity",
-    "relu",
-    "gelu",
-    "silu",
-    "selu",
-    "tanh",
-    "sigmoid",
-    "mish",
-    "leaky_relu",
-    "elu",
-    "gelu_tanh",
-    "softplus",
-    "hardswish",
-    "hardsigmoid",
-    "sin",
-    "cos",
-    "softmax",
-    "log_softmax",
-]
-COMBINE_OPS = ["add", "mean", "max", "min", "mul", "sub", "div"]
-STANDARDIZE_OPS = ["identity", "layernorm", "rmsnorm", "instancenorm", "groupnorm"]
+# EVERY published table is swept FROM the table (`gras.menus()`), so a name added
+# to the binding is covered the day it lands — and a name listed without being
+# accepted fails here rather than in a user's kernel. There is no second copy of
+# any menu in this file: the lists ARE what `RaceEngine.available()` prints.
+
+def check_menus_are_published_once() -> None:
+    """`menus()` and the per-concept functions are one set, not two."""
+    published = menus()
+    per_concept = {
+        "task": tasks(),
+        "loss": losses(),
+        "fitness": fitnesses(),
+        "metric": metrics(),
+        "algo": algos(),
+        "activation_pool": activations(),
+        "combine_op_pool": combine_ops(),
+        "standardize_op_pool": standardize_ops(),
+        "crossover_ops_pool": crossover_ops(),
+        "crossover_cull_policy": crossover_cull_policies(),
+        "mutation_cull_policy": mutation_cull_policies(),
+        "crossover_selection": selection_methods(),
+        "feature_split": feature_splits(),
+        "log_level": log_levels(),
+        "lr_schedule": lr_schedules(),
+        "optimizer": optimizers(),
+    }
+    assert published == per_concept, (
+        f"menus() and the per-concept functions disagree: {published} vs {per_concept}"
+    )
+    assert RaceEngine.available() == per_concept, "RaceEngine.available() must match gras.menus()"
+    for kwarg, names in published.items():
+        assert names, f"{kwarg}: a published menu with no entries"
+        assert len(set(names)) == len(names), f"{kwarg}: duplicate entry in {names}"
 
 
 def smoke(cfg_kw=None, engine_kw=None, env=None) -> tuple[dict, list[str]]:
@@ -463,25 +480,48 @@ def check_menu_entries() -> None:
     for algo in algos():
         meta, _ = smoke(engine_kw={"algo": algo}, env=ScriptedEnv())
         assert meta["engine_mode"] == "rl", meta["engine_mode"]
+    # Every optimizer by name, on both arms — `make_optimizer` and
+    # `restore_optimizer` are each trainer's own hook.
+    for kind in optimizers():
+        meta, _ = smoke(engine_kw={"optimizer": kind})
+        assert meta["trainer"]["optimizer"] == kind, meta["trainer"]
+    for kind in ("sgd", "adamw"):
+        meta, _ = smoke(engine_kw={"algo": "reinforce", "optimizer": kind},
+                        env=ScriptedEnv())
+        assert meta["trainer"]["optimizer"] == kind, meta["trainer"]
+    # An LR schedule is a recipe knob, so it is swept on both arms: the tabular
+    # trainer and `Reinforce` each own their own `set_lr` call site.
+    for schedule in lr_schedules():
+        meta, _ = smoke(engine_kw={"lr_schedule": schedule})
+        assert meta["trainer"]["lr_schedule"] is True, meta["trainer"]
+        assert "lr_schedule_name" in meta["trainer"], meta["trainer"]
+    for schedule in ("cosine", "onecycle", "warmup"):
+        meta, _ = smoke(engine_kw={"algo": "reinforce", "lr_schedule": schedule},
+                        env=ScriptedEnv())
+        # RL records the LABEL (knobs included), so compare the head: `cosine(0.1)`.
+        recorded = meta["trainer"]["lr_schedule"]
+        assert recorded.split("(")[0] == schedule, meta["trainer"]
 
     # One-entry pools force every net through that entry.
-    for name in ACTIVATIONS:
+    for name in activations():
         meta, _ = smoke(cfg_kw={"activation_pool": [name]})
         assert len(meta["activation_pool"]) == 1, name
-    for name in COMBINE_OPS:
+    for name in combine_ops():
         smoke(cfg_kw={"combine_op_pool": [name]})
-    for name in STANDARDIZE_OPS:
+    for name in standardize_ops():
         smoke(cfg_kw={"standardize_op_pool": [name]})
-    for op in ("one_point", "uniform"):
+    for op in crossover_ops():
         smoke(cfg_kw={"crossover_ops_pool": [op]})
 
-    for policy in ("worst", "random"):
+    for policy in crossover_cull_policies():
         smoke(cfg_kw={"crossover_cull_policy": policy})
-    for policy in ("worst", "inverse_fitness", "random"):
+    for policy in mutation_cull_policies():
         smoke(cfg_kw={"mutation_cull_policy": policy})
-    for method in ("roulette", "tournament"):
+    for method in selection_methods():
         smoke(cfg_kw={"crossover_selection": method})
-    for split in ("random", "exclusive", "split_random", "split_exclusive"):
+    # Both canonical names AND the recorded `split_*` aliases an old engine.json
+    # carries — the aliases are not published, but a resume reads them.
+    for split in feature_splits() + [f"split_{name}" for name in feature_splits()]:
         smoke(cfg_kw={"feature_split": split})
 
 
@@ -494,6 +534,7 @@ def main() -> None:
     check_tasks_and_algos()
     check_scripted_env()
     check_cartpole_if_available()
+    check_menus_are_published_once()
     check_menu_entries()
     a = run_once(seed=42)
     b = run_once(seed=42)
