@@ -30,11 +30,8 @@ pub struct TabularTrainer {
     pub lr_schedule: Option<Box<dyn Fn(usize) -> f64 + Send + Sync>>,
     /// What objective `loss_fn` optimizes, for the run record (engine.json).
     pub loss_label: Option<String>,
-    holdout: Option<HoldoutScorer>,
 }
 
-/// The installed holdout scorer (see [`TabularTrainer::with_holdout_scorer`]).
-type HoldoutScorer = Box<dyn Fn(&mut Network, usize) -> Result<f32> + Send>;
 
 impl TabularTrainer {
     /// A tabular scheme is defined by its loss — constructor takes it.
@@ -87,17 +84,6 @@ impl TabularTrainer {
         self
     }
 
-    /// Make this trainer guardrail-capable: the scorer draws ONE fresh
-    /// holdout batch and scores the net in the SAME units as the run's
-    /// fitness. `game_i` is the deterministic game index — seed your draw
-    /// from it.
-    pub fn with_holdout_scorer(
-        mut self,
-        scorer: impl Fn(&mut Network, usize) -> Result<f32> + Send + 'static,
-    ) -> Self {
-        self.holdout = Some(Box::new(scorer));
-        self
-    }
 }
 
 impl Default for TabularTrainer {
@@ -110,7 +96,6 @@ impl Default for TabularTrainer {
             eval_batch_size: 16,
             loss_label: None,
             lr_schedule: None,
-            holdout: None,
         }
     }
 }
@@ -138,16 +123,6 @@ impl TabularStep for TabularTrainer {
         }))
     }
 
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> Result<f32> {
-        match &self.holdout {
-            Some(scorer) => scorer(net, game_i),
-            None => unimplemented!(
-                "holdout_score is not implemented for this trainer — install a scorer via \
-                 with_holdout_scorer (one fresh game, same units as the reported fitness) to \
-                 use engine.guardrail()"
-            ),
-        }
-    }
 
     fn loss(&self) -> gras::trainer::LossFn<'_> {
         &*self.loss_fn
