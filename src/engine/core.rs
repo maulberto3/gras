@@ -956,6 +956,10 @@ impl CoreEngine {
                 .as_ref()
                 .map(|m| m.step)
                 .unwrap_or(state.step);
+            if let Some(trainer_state) = state.trainer_state.clone() {
+                self.trainer
+                    .restore_trainer_state(&state.hash, &trainer_state);
+            }
             let child = self.load_child_from_weights(state, clock)?;
             let (hash, step) = self.insert_replayed(child, &history);
             loaded += 1;
@@ -1055,6 +1059,10 @@ impl CoreEngine {
             state.is_alive = true;
             // The checkpoint carries the weights, so a resume LOADS instead of
             // replaying. The manifest's clock is a consistency check, not work.
+            if let Some(trainer_state) = state.trainer_state.clone() {
+                self.trainer
+                    .restore_trainer_state(&state.hash, &trainer_state);
+            }
             let child = self.load_child_from_weights(state, entry.step)?;
             let (hash, step) = self.insert_replayed(child, history);
             replayed.push(vec![hash, format!("{step} (manifest {})", entry.step)]);
@@ -2752,7 +2760,12 @@ impl CoreEngine {
         let live = self.state.live_hashes();
         for h in &live {
             if let Some(state) = self.state.net(h) {
-                write_net_state(&self.run_dir, state)?;
+                // R9: the one thing this file cannot derive from the net — the trainer's
+                // own per-net bookkeeping. Cloned because the writer takes an owned doc
+                // anyway; a scheme with no state writes `None`, i.e. no field at all.
+                let mut state = state.clone();
+                state.trainer_state = self.trainer.trainer_state(h);
+                write_net_state(&self.run_dir, &state)?;
             }
         }
         Ok(())
@@ -5769,6 +5782,224 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── R9: trainer-owned state rides the net envelope ───────────────────────
+
+    /// A scheme whose bookkeeping is NOT in the weights: it counts its own train calls and
+    /// remembers every `restore` it is handed. Nothing here depends on the crate's trainer
+    /// beyond the fact that it can train.
+    struct StickyTrainer {
+        inner: crate::trainer::TabularTrainer,
+        calls: usize,
+        restores: std::sync::Arc<std::sync::Mutex<Vec<(String, usize)>>>,
+    }
+
+    impl StickyTrainer {
+        fn new(restores: std::sync::Arc<std::sync::Mutex<Vec<(String, usize)>>>) -> Self {
+            Self {
+                inner: crate::trainer::TabularTrainer::new(loss_fn()),
+                calls: 0,
+                restores,
+            }
+        }
+    }
+
+    impl crate::trainer::TabularStep for StickyTrainer {
+        fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
+            self.inner.make_optimizer(net)
+        }
+        fn describe(&self) -> Option<serde_json::Value> {
+            self.inner.describe()
+        }
+        fn loss(&self) -> crate::trainer::LossFn<'_> {
+            self.inner.loss()
+        }
+        /// The value the weights cannot hold — a plain counter.
+        fn state(&self, hash: &str) -> Option<serde_json::Value> {
+            Some(serde_json::json!({ "net": hash, "calls": self.calls }))
+        }
+        fn restore(&mut self, hash: &str, state: &serde_json::Value) {
+            let calls = state.get("calls").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            self.calls = calls;
+            self.restores.lock().unwrap().push((hash.to_string(), calls));
+        }
+        fn train_step(
+            &mut self,
+            net: &mut Network,
+            optimizer: &mut dyn flodl::nn::optim::Optimizer,
+            step: usize,
+            ctx: &crate::trainer::TabularContext<'_>,
+        ) -> Result<crate::trainer::TabularStepReport> {
+            self.calls += 1;
+            self.inner.train_step(net, optimizer, step, ctx)
+        }
+    }
+
+    /// R9: a scheme's per-net bookkeeping is stamped into `nets/<hash>.json` at every
+    /// checkpoint and handed back before the resumed run's first step. The counter lives
+    /// only in a struct field, so a resume that lost it would restart at 0 — the mnist
+    /// example's `last_accuracy` failure, reproduced in one test.
+    #[test]
+    fn trainer_state_rides_the_net_envelope_and_continues_after_a_resume() {
+        let dir = std::env::temp_dir().join("race_trainer_state_r9");
+        let _ = std::fs::remove_dir_all(&dir);
+        let data_dir = tiny_dataset_dir("trainer_state_r9");
+        let cfg = |max_steps: usize| {
+            let mut c = RaceConfig::defaults();
+            c.pop_size = 2;
+            c.checkpoint_every = 1;
+            c.max_steps = Some(max_steps);
+            c
+        };
+        // Construction only: `pop_size = 0` keeps `from_spec` from drawing its own
+        // founders, so this test seeds exactly the two it asserts on.
+        let construction = {
+            let mut c = cfg(2);
+            c.pop_size = 0;
+            c
+        };
+        let stamped = |hash: &str| -> u64 {
+            let path = dir.join("nets").join(format!("{hash}.json"));
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            doc["trainer_state"]["calls"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("no trainer_state in {}", path.display()))
+        };
+
+        let restores = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut engine = crate::engine::TabularEngine::from_spec(
+            crate::engine::run_spec::RunSpec::tabular(
+                data_dir.clone(),
+                construction,
+                fitness(),
+                StickyTrainer::new(restores.clone()),
+                Some(321),
+                Some(dir.clone()),
+            ),
+        )
+        .unwrap();
+        engine
+            .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        // The population is the two seeded nets; the race (and its resume) hold that size.
+        engine.config.pop_size = 2;
+        assert_eq!(engine.run().unwrap(), StopReason::MaxSteps);
+        let live = engine.state.live_hashes();
+        let before = stamped(&live[0]);
+        assert!(before > 0, "the scheme counted its calls at the checkpoint");
+        engine.write_live_net_weights().unwrap();
+        drop(engine);
+
+        let mut resumed = crate::engine::TabularEngine::resume(
+            dir.clone(),
+            data_dir.clone(),
+            cfg(4),
+            fitness(),
+            StickyTrainer::new(restores.clone()),
+        )
+        .unwrap();
+        let seen = restores.lock().unwrap().clone();
+        assert_eq!(seen.len(), live.len(), "every live net's state came back: {seen:?}");
+        for (hash, calls) in &seen {
+            assert!(live.contains(hash), "restore named a net that was not live: {hash}");
+            assert_eq!(
+                *calls as u64, before,
+                "the restored value is the stamped one: {seen:?}"
+            );
+        }
+        // One more clock: the counter must CONTINUE from the restored value.
+        assert_eq!(resumed.run().unwrap(), StopReason::MaxSteps);
+        let after = stamped(&resumed.state.live_hashes()[0].clone());
+        assert!(
+            after > before,
+            "the counter restarted instead of continuing ({before} → {after})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── R10: the kill window, in-crate ──────────────────────────────────────
+
+    /// R10: a run interrupted after ONE clock and resumed must leave a `history.csv`
+    /// BYTE-IDENTICAL to the same run taken in one sitting, with no duplicated
+    /// `(step, hash)` row. The resume loads weights (it does not replay), so a re-emitted
+    /// row would be a double count — this is the claim the Python SIGKILL test makes at
+    /// the process level, asserted here without a subprocess.
+    #[test]
+    fn interrupt_then_resume_matches_the_twin_and_never_duplicates_history_rows() {
+        let cfg = |max_steps: usize, stop_after_first_clock: bool| {
+            let mut c = RaceConfig::defaults();
+            c.pop_size = 2;
+            c.checkpoint_every = 1;
+            c.max_steps = Some(max_steps);
+            c.log_level = crate::engine::config::LogLevel::None;
+            if stop_after_first_clock {
+                // Fires at the top of clock 1: clock 0 has completed and its tick is on disk.
+                c.custom_stop = Some(Box::new(|snap| snap.step >= 1));
+            }
+            c
+        };
+        let twin_dir = std::env::temp_dir().join("race_r10_twin");
+        let split_dir = std::env::temp_dir().join("race_r10_split");
+        let _ = std::fs::remove_dir_all(&twin_dir);
+        let _ = std::fs::remove_dir_all(&split_dir);
+
+        let mut twin = engine(&twin_dir, 4242).unwrap();
+        twin.config = cfg(3, false);
+        twin
+            .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        assert_eq!(twin.run().unwrap(), StopReason::MaxSteps);
+        let twin_history = std::fs::read_to_string(twin_dir.join("history.csv")).unwrap();
+        assert!(
+            twin_history.lines().count() > 2,
+            "the twin must have written real rows:\n{twin_history}"
+        );
+        drop(twin);
+
+        let mut part = engine(&split_dir, 4242).unwrap();
+        part.config = cfg(3, true);
+        part
+            .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+            .unwrap();
+        assert_eq!(part.run().unwrap(), StopReason::CustomStop);
+        part.write_live_net_weights().unwrap();
+        // The resume's precondition: the checkpoint carries real weights, per live net.
+        for h in part.state.live_hashes() {
+            let weights = split_dir.join("nets").join(format!("{h}.safetensors"));
+            assert!(weights.is_file(), "no weights for {h}: {}", weights.display());
+        }
+        drop(part);
+
+        let mut resumed = crate::engine::TabularEngine::resume(
+            split_dir.clone(),
+            tiny_dataset_dir("r10_resume"),
+            cfg(3, false),
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        )
+        .unwrap();
+        assert_eq!(resumed.run().unwrap(), StopReason::MaxSteps);
+        let resumed_history = std::fs::read_to_string(split_dir.join("history.csv")).unwrap();
+        assert_eq!(
+            resumed_history, twin_history,
+            "interrupt + resume must equal the uninterrupted twin, byte for byte"
+        );
+
+        let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let mut dupes = 0usize;
+        for line in resumed_history.lines().skip(1) {
+            let mut cols = line.split(',');
+            let step = cols.next().unwrap_or("").to_string();
+            let hash = cols.next().unwrap_or("").to_string();
+            if !seen.insert((step, hash)) {
+                dupes += 1;
+            }
+        }
+        assert_eq!(dupes, 0, "history.csv re-emitted a (step, hash) row:\n{resumed_history}");
+        let _ = std::fs::remove_dir_all(&twin_dir);
+        let _ = std::fs::remove_dir_all(&split_dir);
     }
 
     // ── Training lottery (experimental) ─────────────────────────
