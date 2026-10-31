@@ -445,6 +445,10 @@ impl CoreEngine {
         let mut header = RunHeader::from_race_options_at(
             RunConfig {
                 run_id: run_id.clone(),
+                // One-argument resume reads this back (`TabularEngine::resume_from`).
+                data_dir: tabular_data_dir
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
                 engine_mode: Some(
                     if tabular_data_dir.is_some() {
                         "tabular"
@@ -2096,6 +2100,44 @@ impl CoreEngine {
         }
     }
 
+    /// Stamp the SEARCH SPACE from a loaded header onto a config. Shared by both
+    /// `resume_from` constructors so the two arms cannot drift: these fields decide WHICH
+    /// topologies exist (options, pools, hidden-dim range), which metrics are recorded,
+    /// and where the run stops — none of them belongs to the caller on a resume.
+    pub(crate) fn apply_header_search_space(
+        config: &mut RaceConfig,
+        header: &crate::state::RunHeader,
+    ) {
+        config.topology_options = header.topology_options;
+        if let Some(pool) = header
+            .hidden_dim_pool
+            .split_once("..=")
+            .and_then(|(start, end)| {
+                Some(start.trim().parse::<usize>().ok()?..=end.trim().parse::<usize>().ok()?)
+            })
+        {
+            config.hidden_dim_pool = Some(pool);
+        }
+        config.hidden_dim_stride = header.hidden_dim_stride.max(1);
+        config.combine_op_pool = header.combine_op_pool.clone();
+        config.activation_pool = header.activation_pool.clone();
+        config.standardize_op_pool = header.standardize_op_pool.clone();
+        // The metric set comes from the RECORD: a resume that drops a metric appends
+        // `history.csv` rows one column short of its own header.
+        config.metrics = header
+            .informative_metrics
+            .iter()
+            .filter_map(|name| crate::trainer::menu::metric_for(name))
+            .collect();
+    }
+
+    /// Change the step budget of a LIVE engine — the resume-and-extend door. The budget is
+    /// ABSOLUTE (`max_steps` counts clocks, not clocks-this-process), so extending it is the
+    /// one stop knob a resume may move; the caller's value wins over the recorded one.
+    pub fn set_stop_max_steps(&mut self, steps: usize) {
+        self.config.max_steps = Some(steps);
+    }
+
     // ── Smoothed fitness ────────────────────────────────────────────────────
 
     /// Per-net RISK-ADJUSTED fitness over the live population, in `live_hashes()`
@@ -2897,6 +2939,7 @@ impl CoreEngine {
     /// A no-op today (the header is written once and config is never mutated mid-run).
     pub fn refresh_header(&mut self) -> Result<()> {
         let cfg = RunConfig {
+            data_dir: None,
             run_id: self.header.run_id.clone(),
             engine_mode: self.header.engine_mode.clone(),
             run_seed: self.header.run_seed,
