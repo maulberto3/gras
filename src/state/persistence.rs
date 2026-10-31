@@ -96,6 +96,9 @@ pub struct ConfigSnapshot {
     pub device: String,
     /// Whether the lossless per-step `metrics.csv` was written.
     pub csv_export: bool,
+    /// Whether optimizer state rode the checkpoint (see `RaceConfig::save_optim`).
+    #[serde(default)]
+    pub save_optim: bool,
     /// Human label for the experiment (`set_run_name`), verbatim. Purely
     /// informative — never affects the results folder name.
     pub run_name: Option<String>,
@@ -121,7 +124,7 @@ pub struct ConfigSnapshot {
         /// an artifact trail with no record of what was asked for is unreadable.
         /// `default_true` on the elite and `false` on the worst mirrors
         /// `RaceConfig::defaults()`, so a legacy header reads what those runs did.
-        /// The WEIGHTS switches are gone with R4: `nets/<hash>.safetensors` is written for
+        /// There are no WEIGHT switches: `nets/<hash>.safetensors` is written for
         /// every live net unconditionally, so there is nothing left to opt out of.
     #[serde(default = "default_true")]
     pub elite_save_topology: bool,
@@ -200,6 +203,7 @@ impl ConfigSnapshot {
             }
             .to_string(),
             csv_export: cfg.csv_export,
+            save_optim: cfg.save_optim,
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
             train_merit: cfg.train_merit,
@@ -301,7 +305,7 @@ pub struct RunHeader {
     pub started_at: Option<String>,
     /// Train/eval split ratio recorded for the run.
     pub train_eval_split_ratio: Option<f32>,
-        /// R3b: the EVAL-PERMUTATION era length, in clocks, as the run actually used it.
+        /// The EVAL-PERMUTATION era length, in clocks, as the run actually used it.
         /// `checkpoint_every` means two things — how often the durability tick fires, and
         /// how often the eval permutation rotates — and only the first is a caller's
         /// choice on resume. Recorded separately so a resume at another cadence still
@@ -483,7 +487,7 @@ impl RunHeader {
             max_steps,
             started_at: None,
             train_eval_split_ratio,
-            // Stamped by `CoreEngine::from_spec` right after construction (R3b): the
+            // Stamped by `CoreEngine::from_spec` right after construction: the
             // constructor has no view of the cadence, the engine does.
             eval_era_every: None,
             explicit_test_rows,
@@ -1254,32 +1258,13 @@ pub fn write_engine_json(dir: &Path, header: &RunHeader) -> Result<()> {
 }
 
 
-/// Insert/replace one key in `engine.json`, preserving everything else
-/// verbatim. Shared by the post-race stamps.
-fn stamp_engine_json_key(dir: &Path, key: &str, value: serde_json::Value) -> Result<()> {
-    let path = dir.join("engine.json");
-    let raw = std::fs::read_to_string(&path).map_err(|source| EngineError::Io {
-        path: path.display().to_string(),
-        source,
-    })?;
-    let mut doc: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| EngineError::Json(format!("engine.json parse: {e}")))?;
-    let obj = doc
-        .as_object_mut()
-        .ok_or_else(|| EngineError::Json("engine.json is not a JSON object".into()))?;
-    obj.insert(key.to_string(), value);
-    let json = serde_json::to_string_pretty(&doc)
-        .map_err(|e| EngineError::Json(format!("engine.json serialize: {e}")))?;
-    write_atomic(&path, json.as_bytes(), true)
-}
-
 // ── Frontier manifest (`ckpt.json`) ────────────────────────────────────────
 
 /// Schema of [`FrontierManifest`]. Bump when the shape changes: a resume reads
 /// the schema BEFORE anything else, so an old manifest is refused by name rather
 /// than half-understood.
 ///
-/// `2` (R4): every net named by the manifest also has `nets/<hash>.safetensors`, written
+/// `2`: every net named by the manifest also has `nets/<hash>.safetensors`, written
 /// in the same tick before this file. `1` was states-only, and this build refuses it by
 /// name — resuming one would need the retired replay path.
 pub const FRONTIER_MANIFEST_SCHEMA: u32 = 2;
@@ -1418,7 +1403,7 @@ pub fn load_frontier_manifest(dir: &Path) -> Result<Option<FrontierManifest>> {
 /// Drop the rows of `<run_dir>/<file>` that belong to clock `next_clock` or later,
 /// returning how many went. A no-op when the file is absent.
 ///
-/// The reason it exists: a dir written before the one-cadence change (R3) flushed
+/// The reason it exists: a dir written before the one-cadence change flushed
 /// `history.csv` at the end of every clock while the frontier moved only every
 /// `checkpoint_every`, so a hard kill left rows for clocks the frontier never
 /// reached and a resume appended them again (measured: 16 and 60 duplicate rows,
