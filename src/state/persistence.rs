@@ -365,6 +365,18 @@ pub struct RunAccounting {
     pub inherited_founders: usize,
     /// Nets born from an evolution roll, by channel.
     pub crossover_children: usize,
+    /// UNIFORM-crossover exchange totals: births that reported a count, genes the
+    /// operator flipped, and genes it compared. `swaps / births` is the mixing rate
+    /// — a uniform run whose children mostly inherit one parent shows it here, and
+    /// `0` births means the operator never produced a child at all.
+    #[serde(default)]
+    pub uniform_cx_births: usize,
+    /// Genes taken from the other parent, summed over those births.
+    #[serde(default)]
+    pub uniform_cx_swaps: usize,
+    /// Aligned genes compared, summed over those births.
+    #[serde(default)]
+    pub uniform_cx_pairs: usize,
     /// Random immigrants inserted.
     pub immigrants: usize,
     /// Culls by the slot they freed (`crossover` / `immigrant-slot`).
