@@ -69,7 +69,7 @@ use crate::trainer::stream::{BatchStream, PoolSplit};
 
 use super::config::{RaceConfig, StopReason};
 use super::format::{
-    ReadingStyle, build_stamp, csv_field, fmt_cell, fmt_cell_opt, fmt_cfg, fmt_line,
+    ReadingStyle, build_stamp, csv_field, fmt_cfg, fmt_line,
     fmt_reading,
 };
 use super::smoothing::{RollingBuffer, WindowStats, rolling_stats};
@@ -480,7 +480,7 @@ impl CoreEngine {
                 .as_secs()
                 .to_string(),
         );
-        // R3b: the eval-permutation era is `checkpoint_every` at birth, and from then on
+        // The eval-permutation era is `checkpoint_every` at birth, and from then on
         // it is whatever THIS file says. A resume may change the tick cadence; it may not
         // change the clocks at which the eval batches were drawn.
         header.eval_era_every = Some(config.checkpoint_every);
@@ -693,7 +693,7 @@ impl CoreEngine {
         self.header.run_seed
     }
 
-    /// The eval-permutation era length this engine's stream was built with (R3b).
+    /// The eval-permutation era length this engine's stream was built with.
     ///
     /// On a fresh run it equals `checkpoint_every`; on a resume it is whatever
     /// `engine.json` recorded, so a caller who changes the tick cadence still draws the
@@ -895,7 +895,12 @@ impl CoreEngine {
                     }
                 }
             }
-            let child = self.replay_loaded_net(state)?;
+            let clock = state
+                .last_metrics
+                .as_ref()
+                .map(|m| m.step)
+                .unwrap_or(state.step);
+            let child = self.load_child_from_weights(state, clock)?;
             let (hash, step) = self.insert_replayed(child, &history);
             loaded += 1;
             replayed.push(vec![hash, step.to_string()]);
@@ -927,6 +932,17 @@ impl CoreEngine {
             .into());
         }
         let nets_dir = self.run_dir.join("nets");
+        // Count first: a pop mismatch is a config error and must be reported as one,
+        // not as the weight load's "incomplete checkpoint" on the first net.
+        if manifest.nets.len() != self.config.pop_size {
+            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                "resume: expected {} live nets in population (per config.pop_size), but found \
+                 {} in ckpt.json — pass the pop size this run used, or start a fresh race",
+                self.config.pop_size,
+                manifest.nets.len()
+            ))
+            .into());
+        }
         let mut loaded = 0usize;
         for entry in &manifest.nets {
             let path = nets_dir.join(format!("{}.json", entry.hash));
@@ -968,19 +984,73 @@ impl CoreEngine {
                 .into());
             }
             if file_clock > entry.step {
-                debug!(
-                    "resume: net {} moved on to clock {file_clock} after the tick at {} — \
-                     rewinding it to the manifest",
+                // A resume loads weights instead of replaying them, and a loaded weight cannot
+                // be rewound: the file on disk is from a LATER clock than the snapshot
+                // this checkpoint describes. Refuse rather than resume with weights the
+                // manifest never claimed.
+                return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                    "resume: net {} on disk is at clock {file_clock}, past the checkpoint's \
+                     {} — its weights are newer than the snapshot and cannot be rewound; \
+                     resume from a later checkpoint (the stop snapshot) instead",
                     entry.hash, entry.step
-                );
+                ))
+                .into());
             }
             state.is_alive = true;
-            let child = self.replay_loaded_net_at(state, Some(entry.step))?;
+            // The checkpoint carries the weights, so a resume LOADS instead of
+            // replaying. The manifest's clock is a consistency check, not work.
+            let child = self.load_child_from_weights(state, entry.step)?;
             let (hash, step) = self.insert_replayed(child, history);
             replayed.push(vec![hash, format!("{step} (manifest {})", entry.step)]);
             loaded += 1;
         }
         Ok(loaded)
+    }
+
+    /// Build a live net from the checkpoint — blueprint + `nets/<hash>.safetensors`,
+    /// plus `nets/<hash>.optim` when the run saved optimizer state.
+    ///
+    /// The replacement for replay: no step is re-run, so a resume costs one
+    /// file read per net instead of `clock` trainings. The recorded `last_metrics` and
+    /// counters ride along so the ranking windows resume warm.
+    fn load_child_from_weights(
+        &self,
+        state: NetState,
+        _clock: usize,
+    ) -> Result<crate::engine::child::RaceChild> {
+        let topo = state.topology()?;
+        let mut net = crate::graph::network::Network::build(&topo, self.config.device())?;
+        let nets = self.run_dir.join("nets");
+        let weights = nets.join(format!("{}.safetensors", state.hash));
+        crate::utils::safetensors::load_safetensors(&mut net, &weights).map_err(|e| {
+            crate::utils::error::EngineError::InvalidOptions(format!(
+                "resume: net {} has no loadable weights ({}): {e} — the checkpoint is \
+                 incomplete (a failed tick write?)",
+                state.hash,
+                weights.display()
+            ))
+        })?;
+        let optim = nets.join(format!("{}.optim", state.hash));
+        let optimizer = if self.config.save_optim && optim.exists() {
+            match self.trainer.restore_optimizer(&net, &optim) {
+                Some(o) => o,
+                None => {
+                    tracing::warn!(
+                        "resume: {} exists but this trainer cannot restore optimizer state \
+                         — the moments restart (option A)",
+                        optim.display()
+                    );
+                    self.trainer.make_optimizer(&net)
+                }
+            }
+        } else {
+            self.trainer.make_optimizer(&net)
+        };
+        Ok(crate::engine::child::RaceChild {
+            state,
+            net,
+            optimizer,
+        })
     }
 
     /// Insert a replayed net into the live maps, with its rolling windows seeded from the
@@ -1213,7 +1283,7 @@ impl CoreEngine {
         // a post-construction config edit must not desync era numbering — but ONLY on a
         // fresh run. On a resume the era is the RECORD: `TabularEngine::resume` built the
         // stream from `header.eval_era_every`, and overwriting it here would rotate the eval
-        // permutation at this call's cadence instead of the one the first half used (R3b).
+        // permutation at this call's cadence instead of the one the first half used.
         if !self.resumed {
             if let Some(stream) = self.stream.as_mut() {
                 stream.set_run_checkpoint_every(self.config.checkpoint_every);
@@ -1390,7 +1460,7 @@ impl CoreEngine {
                 (
                     "score".to_string(),
                     format!(
-                        "score{} = window avg {} λ × window spread (what the ranking sorts on) · λ={}",
+                        "score{} = window avg {} λ × window spread (what the ranking sorts on; the rollup's `±` is the `σ` ACROSS the live scores, not this window spread) · λ={}",
                         self.fitness.direction().arrow(),
                         sign,
                         fmt_cfg(self.config.risk_aversion)
@@ -1922,7 +1992,7 @@ impl CoreEngine {
                     tracing::warn!("checkpoint live states write failed: {e}");
                 }
                 // EVERY live net's WEIGHTS — the frontier states above carry topology and
-                // counters, this completes them (R4). Stale files are swept here, never on
+                // counters, this completes them. Stale files are swept here, never on
                 // cull: see `sweep_stale_net_weights`.
                 if let Err(e) = self.write_live_net_weights() {
                     tracing::warn!("checkpoint net weights write failed: {e}");
@@ -1931,8 +2001,9 @@ impl CoreEngine {
                 // The frontier as a SET, after the files it names: until this lands, a
                 // kill leaves `nets/` as the only record, and a net culled after the
                 // tick has already overwritten its own file with a tombstone. Written
-                // here — nets first, manifest second — so a manifest that lags is safe
-                // (replay to its step) and one that leads them never happens.
+                // here — nets first, manifest second — so a manifest never names a net
+                // whose weights are absent. A manifest that LAGS the weights is refused on
+                // resume: a loaded weight cannot be rewound.
                 if let Err(e) = self.write_frontier_manifest(clock + 1) {
                     tracing::warn!("checkpoint frontier manifest write failed: {e}");
                 }
@@ -1990,6 +2061,11 @@ impl CoreEngine {
             ));
             self.log_stop_summary(clock)?;
         }
+        // After the stop cards, and OUTSIDE the gate: the final-field TABLE is an
+        // artifact, written at every log level — `None` included, since that is the
+        // scripted caller who wants the table as a file. `log_final_field` gates only
+        // its card (and the ancestry under it) on the same `verbose_detail`.
+        self.log_final_field(clock, self.verbose_detail());
         // Stamp the live nets' final readings first: the frontier write below
         // then carries `final_*` on every net file, culled or not.
         self.stamp_live_final_scores();
@@ -4078,67 +4154,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_range_replays_steps_zero_to_clock() {
-        let dir = std::env::temp_dir().join("race_catchup_test");
-        let mut engine = engine(&dir, 42).unwrap();
-        engine.config.crossover_prob = 0.0;
-        engine.config.mutate_prob = 0.0;
-        engine
-            .seed_population_internal(vec![tiny_topology(7)], Some(0.0))
-            .unwrap();
-        let clock = 5;
-        // generate_child can now return Ok(None) (spent roll) — this test
-        // exercises replay mechanics, so build the child directly.
-        let mut child = engine.random_child(clock, 0).unwrap();
-        assert!(
-            !child
-                .state
-                .created_from
-                .as_deref()
-                .unwrap()
-                .contains("crossover"),
-            "the replay test should use the random branch so the child nets fit the tiny harness"
-        );
-        let topo = child.state.topology().unwrap();
-        assert_eq!(topo.options.input_dim, Some(2));
-        assert_eq!(topo.options.output_dim, Some(2));
-        // Replay runs steps 0..clock-1 and leaves the child at the clock.
-        engine.replay_range(&mut child, 0, clock).unwrap();
-        assert_eq!(child.state.step, clock);
-        let m = child.state.last_metrics.as_ref().unwrap();
-        assert_eq!(m.step, clock - 1);
-    }
-
-    #[test]
-    fn replay_range_is_deterministic() {
-        let dir_a = std::env::temp_dir().join("race_catchup_det_a");
-        let dir_b = std::env::temp_dir().join("race_catchup_det_b");
-        let mut engine_a = engine(&dir_a, 42).unwrap();
-        let mut engine_b = engine(&dir_b, 42).unwrap();
-        engine_a.config.crossover_prob = 0.0;
-        engine_b.config.crossover_prob = 0.0;
-        engine_a.config.mutate_prob = 0.0;
-        engine_b.config.mutate_prob = 0.0;
-        engine_a
-            .seed_population_internal(vec![tiny_topology(7)], Some(0.0))
-            .unwrap();
-        engine_b
-            .seed_population_internal(vec![tiny_topology(7)], Some(0.0))
-            .unwrap();
-        let clock = 5;
-        let mut child_a = engine_a.random_child(clock, 0).unwrap();
-        let mut child_b = engine_b.random_child(clock, 0).unwrap();
-        engine_a.replay_range(&mut child_a, 0, clock).unwrap();
-        engine_b.replay_range(&mut child_b, 0, clock).unwrap();
-        // Same seed ⇒ same replayed metrics.
-        let m_a = child_a.state.last_metrics.as_ref().unwrap();
-        let m_b = child_b.state.last_metrics.as_ref().unwrap();
-        assert_eq!(m_a.train_loss, m_b.train_loss);
-        assert_eq!(m_a.fitness, m_b.fitness);
-        assert_eq!(m_a.eval_loss, m_b.eval_loss);
-    }
-
-    #[test]
     fn step_one_net_advances_the_net_step_and_records_metrics() {
         let dir = std::env::temp_dir().join("race_step_one_test");
         let mut engine = engine(&dir, 42).unwrap();
@@ -4331,6 +4346,7 @@ mod tests {
                 let state = eng.state.net(h).cloned().unwrap();
                 crate::state::write_net_state(dir, &state).unwrap();
             }
+            eng.write_live_net_weights().unwrap();
             out
         };
 
@@ -4550,6 +4566,7 @@ mod tests {
                 let state = eng.state.net(h).cloned().unwrap();
                 crate::state::write_net_state(dir, &state).unwrap();
             }
+            eng.write_live_net_weights().unwrap();
             out
         };
 
@@ -4592,6 +4609,7 @@ mod tests {
         let mut eng = engine(&dir, 3).unwrap();
         eng.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
             .unwrap();
+        eng.write_live_net_weights().unwrap();
         drop(eng);
         let err = match crate::engine::RlEngine::resume(
             dir.clone(),
@@ -4962,6 +4980,7 @@ mod tests {
             let state = engine.state.net(h).cloned().unwrap();
             crate::state::write_net_state(&dir, &state).unwrap();
         }
+        engine.write_live_net_weights().unwrap();
         drop(engine);
 
         // The persisted header carries them.
@@ -5016,6 +5035,7 @@ mod tests {
         engine.step_one_net(&h, 0).unwrap();
         let state = engine.state.net(&h).cloned().unwrap();
         crate::state::write_net_state(&dir, &state).unwrap();
+        engine.write_live_net_weights().unwrap();
 
         // New header: root discriminator present and correct.
         let header = crate::state::load_engine_json(&dir).unwrap();
@@ -5088,6 +5108,7 @@ mod tests {
             .iter()
             .map(|h| engine.state.net(h).unwrap().last_metrics.clone().unwrap())
             .collect();
+        engine.write_live_net_weights().unwrap();
         drop(engine);
 
         // Reconstruct via resume — parity is asserted inside.
@@ -5117,7 +5138,7 @@ mod tests {
 
     #[test]
     fn resume_keeps_the_recorded_eval_era_when_the_tick_cadence_changes() {
-        // R3b: `checkpoint_every` is two numbers in one key — how often the durability tick
+        // `checkpoint_every` is two numbers in one key — how often the durability tick
         // fires, and how often the eval permutation rotates. A resume may change the first;
         // the second comes from the record, or the resumed half draws different eval
         // batches than the run it claims to continue.
@@ -5134,6 +5155,7 @@ mod tests {
         let state = part.state.net(&h).cloned().unwrap();
         crate::state::write_net_state(&dir, &state).unwrap();
         part.write_frontier_manifest(3).unwrap();
+        part.write_live_net_weights().unwrap();
         drop(part);
 
         let header = crate::state::load_engine_json(&dir).unwrap();
@@ -5209,6 +5231,7 @@ mod tests {
         }
         let state = part.state.net(&h_part).cloned().unwrap();
         crate::state::write_net_state(&dir_b, &state).unwrap();
+        part.write_live_net_weights().unwrap();
         drop(part);
 
         let mut resumed = crate::engine::TabularEngine::resume(
@@ -5277,6 +5300,7 @@ mod tests {
             .map(|h| (h.clone(), twin.state.net(h).unwrap().last_metrics.clone()))
             .collect();
         let twin_culls = twin.culls;
+        twin.write_live_net_weights().unwrap();
         drop(twin);
 
         // Interrupted twin: run() stops via custom_stop after clock 0, and the
@@ -5289,6 +5313,7 @@ mod tests {
             .unwrap();
         let reason_part = part.run().unwrap();
         assert_eq!(reason_part, StopReason::CustomStop);
+        part.write_live_net_weights().unwrap();
         drop(part);
 
         // Resume through run() with the SAME config (the budget stays 4; the
@@ -5349,6 +5374,7 @@ mod tests {
             1,
             "two clocks ran (0, 1)"
         );
+        first.write_live_net_weights().unwrap();
         drop(first);
 
         let mut resumed = crate::engine::TabularEngine::resume(
@@ -5377,6 +5403,7 @@ mod tests {
             last, 3,
             "budget 4 = clocks 0..=3: the resume must run 2 AND 3"
         );
+        resumed.write_live_net_weights().unwrap();
         drop(resumed);
 
         // The other side of the same predicate: a resume whose budget is ALREADY
@@ -5446,7 +5473,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .set_run_checkpoint_every(ckpt_every);
-        // R3b: `run()` is what normally writes the era into `engine.json`; this test drives
+        // `run()` is what normally writes the era into `engine.json`; this test drives
         // the loop by hand, so it owns that record. Without this line the header would still
         // name the construction-time cadence (10) while the run drew at 2 — and the resume
         // would follow the record into the wrong eval batches.
@@ -5465,6 +5492,7 @@ mod tests {
             }
         }
         let live_before = engine.state.live_count();
+        engine.write_live_net_weights().unwrap();
         drop(engine);
 
         let resumed = crate::engine::TabularEngine::resume(
@@ -5503,6 +5531,7 @@ mod tests {
             let state = engine.state.net(h).cloned().unwrap();
             crate::state::write_net_state(&dir, &state).unwrap();
         }
+        engine.write_live_net_weights().unwrap();
         drop(engine);
 
         // Resume with pop_size 3 (mismatch, expects 3, only 2 found)
@@ -5537,6 +5566,7 @@ mod tests {
             let state = engine.state.net(&h).cloned().unwrap();
             crate::state::write_net_state(&dir, &state).unwrap();
         }
+        engine.write_live_net_weights().unwrap();
         drop(engine);
 
         // Strip the field: exactly what an `engine.json` written before FIT looks like.
@@ -5598,6 +5628,7 @@ mod tests {
             let state = engine.state.net(&h).cloned().unwrap();
             crate::state::write_net_state(&dir, &state).unwrap();
         }
+        engine.write_live_net_weights().unwrap();
         drop(engine);
 
         let resume = |config: RaceConfig| {
@@ -5919,6 +5950,7 @@ mod tests {
         assert_eq!(last.as_ref().map(|m| m.step), Some(2));
         let state = engine.state.net(&h).cloned().unwrap();
         crate::state::write_net_state(&dir, &state).unwrap();
+        engine.write_live_net_weights().unwrap();
         drop(engine);
 
         // Metric parity is asserted INSIDE resume: replaying an idle clock would move
@@ -5996,6 +6028,29 @@ mod tests {
                 .contains(&format!("5,{}", hashes[0])),
             "an idle net must not repeat its last measurement under the new step"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+        /// The final-field TABLE is an artifact: `final-field.csv` lands at `None` too.
+        /// `None` used to skip the whole `log_stop_summary`, which took the file with
+        /// it — the worst combination, because a scripted/notebook run picks `none` and
+        /// is exactly the caller who wants the table as a file rather than as a card.
+    #[test]
+    fn final_field_csv_is_written_at_log_level_none() {
+        let dir = std::env::temp_dir().join("gras-final-field-none");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut eng = engine(&dir, 17).unwrap();
+        eng.log_level = crate::engine::config::LogLevel::None;
+        eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], None)
+            .unwrap();
+        // `false` = the log level's verdict for the CARD; the file is unconditional.
+        eng.log_final_field(0, false);
+        let csv = std::fs::read_to_string(dir.join("final-field.csv"))
+            .expect("a `none` run still writes the final-field table");
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 3, "header + one row per live net: {csv}");
+        assert!(lines[0].starts_with("#,"), "the header is the table's: {}", lines[0]);
+        assert!(lines[1].contains(',') && lines[2].contains(','));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6155,6 +6210,7 @@ mod tests {
         let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         json["config"]["train_merit"] = serde_json::json!(0.5);
         std::fs::write(dir.join("engine.json"), json.to_string()).unwrap();
+        engine.write_live_net_weights().unwrap();
         drop(engine);
 
         let resume = |config: RaceConfig| {
@@ -6242,6 +6298,7 @@ mod tests {
             let state = engine.state.net(&h).cloned().unwrap();
             crate::state::write_net_state(&dir, &state).unwrap();
         }
+        engine.write_live_net_weights().unwrap();
         drop(engine);
         // Blank the recorded crossover policy: a pre-field header.
         let raw = std::fs::read_to_string(dir.join("engine.json")).unwrap();
@@ -6302,6 +6359,7 @@ mod tests {
         engine.step_one_net(&h, 0).unwrap();
         let state = engine.state.net(&h).cloned().unwrap();
         crate::state::write_net_state(&dir, &state).unwrap();
+        engine.write_live_net_weights().unwrap();
         drop(engine);
 
         let resumed = crate::engine::TabularEngine::resume(
@@ -6341,6 +6399,7 @@ mod tests {
         engine.step_one_net(&h, 0).unwrap();
         let state = engine.state.net(&h).cloned().unwrap();
         crate::state::write_net_state(&dir, &state).unwrap();
+        engine.write_live_net_weights().unwrap();
         drop(engine);
 
         let resumed = crate::engine::TabularEngine::resume(
@@ -6671,7 +6730,7 @@ mod tests {
             serde_json::json!({ "topology": topo.to_json().unwrap() }).to_string(),
         )
         .unwrap();
-        let mut header = serde_json::json!({
+        let header = serde_json::json!({
             "run_id": run_id,
             "engine_mode": "tabular",
             "run_seed": 7,
@@ -6915,7 +6974,7 @@ mod tests {
 
 
 
-    // ── Live net weights: the checkpoint's other half (R4) ──────────────
+    // ── Live net weights: the checkpoint's other half ────────────────────
 
     #[test]
     fn every_live_net_gets_weights_at_every_tick_and_at_stop() {
@@ -6928,7 +6987,7 @@ mod tests {
             .unwrap();
         eng.run().unwrap();
         // Files are OVERWRITTEN in place, so the count is the population, never the run
-        // length — the cost bound R4 promises.
+        // length — the cost bound a checkpoint promises.
         let weights: Vec<String> = std::fs::read_dir(dir.join("nets"))
             .unwrap()
             .flatten()
@@ -6982,7 +7041,7 @@ mod tests {
             .unwrap();
         assert_eq!(eng.run().unwrap(), StopReason::MaxSteps);
         // No tick ⇒ no per-tick write; the STOP writer still completes the run, so every
-        // live net has its weights exactly once (R4: there is no flag to turn that off).
+        // live net has its weights exactly once (there is no flag to turn that off).
         let weights = std::fs::read_dir(dir.join("nets"))
             .unwrap()
             .flatten()
