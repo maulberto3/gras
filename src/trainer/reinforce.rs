@@ -90,7 +90,6 @@ const EVAL_SEED_OFFSET: u64 = 1000;
 
 /// The guardrail's games stay on a fixed seed forever: a verdict has to be
 /// comparable across runs, and each run draws its own race seed.
-const GUARDRAIL_SEED: u64 = 2;
 
 /// What a REINFORCE step optimizes and ranks on — the two axes are one decision,
 /// so they are one knob.
@@ -370,6 +369,29 @@ impl<E: Env> Reinforce<E> {
 
 impl<E: Env> RlStep for Reinforce<E> {
     /// Adam over the net's parameters — one optimizer per net, kept across steps.
+    /// Reload `nets/<hash>.optim` into a fresh Adam over this net's
+    /// parameters. `Stateful` needs the concrete type — which is exactly why this
+    /// lives in the trainer instead of the engine.
+    fn restore_optimizer(
+        &self,
+        net: &Network,
+        path: &std::path::Path,
+    ) -> Option<Box<dyn Optimizer>> {
+        use flodl::nn::optim::Stateful;
+        use flodl::nn::Module;
+        let mut opt = flodl::nn::Adam::new(&net.parameters(), self.learning_rate as f64);
+        match opt.load_state_file(&path.to_string_lossy()) {
+            Ok(()) => Some(Box::new(opt)),
+            Err(e) => {
+                tracing::warn!(
+                    "optimizer state {} could not be loaded ({e}) — restarting moments",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
     fn make_optimizer(&self, net: &Network) -> Box<dyn Optimizer> {
         Box::new(flodl::nn::Adam::new(
             &net.parameters(),
@@ -399,14 +421,6 @@ impl<E: Env> RlStep for Reinforce<E> {
             "challenge_policy": self.challenge_policy.to_string(),
             "challenge_decay": self.challenge_decay.to_string(),
         }))
-    }
-
-    /// Guardrail measurement half: play ONE fresh game, in the same units as the
-    /// reported fitness, on a FIXED seed (see [`GUARDRAIL_SEED`]).
-    fn holdout_score(&mut self, net: &mut Network, game_i: usize) -> Result<f32> {
-        let seed = episode_start_seed(GUARDRAIL_SEED, 0, game_i as u64);
-        let episode = self.play_episode(net, seed, None)?;
-        Ok(episode.outcome(self.signal))
     }
 
     /// One step: play the TRAIN episodes (challenge-aware), update, then measure
@@ -664,6 +678,7 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         fn last_seed(&self) -> u64 {
             self.seed
         }
@@ -934,67 +949,4 @@ mod tests {
         assert_eq!(changed["challenge_decay"], "linear");
     }
 
-    /// The guardrail's exam is scored in the run's own fitness units — turns for
-    /// `Turns`, episode total for `Return` — and a fixed seed keeps two runs'
-    /// verdicts comparable.
-    #[test]
-    fn holdout_score_reports_the_same_units_as_the_fitness() {
-        let mut turns = Reinforce::new(LadderEnv::new(5), Device::CPU);
-        let mut net = tiny_net(2, 0.0);
-        assert_eq!(turns.holdout_score(&mut net, 3).unwrap(), 5.0, "a turn count, not a loss");
-        // The seed comes from the game index alone (plus the fixed guardrail seed),
-        // which is what keeps two runs' verdicts comparable.
-        assert_eq!(turns.env().last_seed(), episode_start_seed(GUARDRAIL_SEED, 0, 3));
-
-        // The same exam, in the other unit: one episode's own total.
-        let mut returned = Reinforce::new(LadderEnv::new(5), Device::CPU)
-            .with_signal(Signal::Return { discount: 1.0 });
-        let mut net = tiny_net(2, 0.0);
-        assert_eq!(returned.holdout_score(&mut net, 3).unwrap(), 15.0, "1 + 2 + 3 + 4 + 5");
-    }
-
-    /// The guardrail exam must be games the run NEVER trained on: its seeds come
-    /// from the fixed guardrail base and must land outside both the TRAIN
-    /// namespace (`net_seed ^ run_seed`) and the EVAL one (`run_seed + 1000`).
-    ///
-    /// Honest scope: this is a collision CHECK over a grid, not a proof. The
-    /// guardrail base lives in the same u64 space as a train base, so a net whose
-    /// `net_seed ^ run_seed` lands exactly on [`GUARDRAIL_SEED`] would train on
-    /// the exam at step 0 — ~2^-64 per net, and unreachable for the seeds below.
-    /// What the grid DOES catch is a guardrail constant in the common range (0 or
-    /// 1), which `net_seed == run_seed` reaches instantly.
-    #[test]
-    fn holdout_games_are_outside_the_train_and_eval_namespaces() {
-        let holdout: Vec<u64> = (0..4u64)
-            .map(|i| episode_start_seed(GUARDRAIL_SEED, 0, i))
-            .collect();
-        // Distinct games, so a 100-game exam is 100 different episodes rather
-        // than the same episode scored again.
-        let unique: std::collections::HashSet<u64> = holdout.iter().copied().collect();
-        assert_eq!(unique.len(), holdout.len(), "each game index is its own episode");
-
-        for run_seed in [0u64, 7, 42, 1 << 63] {
-            let eval_base = eval_seed_base(run_seed);
-            for net_seed in [0u64, 7, 12_345] {
-                // The TRAIN base this net actually uses (see `train_step`).
-                let train_base = net_seed ^ run_seed;
-                for step in 0..4usize {
-                    for (game_i, hold) in holdout.iter().enumerate() {
-                        assert_ne!(
-                            *hold,
-                            episode_start_seed(train_base, step, game_i as u64),
-                            "run {run_seed} net {net_seed} step {step} game {game_i}: \
-                             the exam seed is a TRAIN episode"
-                        );
-                        assert_ne!(
-                            *hold,
-                            episode_start_seed(eval_base, step, game_i as u64),
-                            "run {run_seed} step {step} game {game_i}: \
-                             the exam seed collides with an EVAL episode"
-                        );
-                    }
-                }
-            }
-        }
-    }
 }
