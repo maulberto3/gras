@@ -126,6 +126,21 @@ impl CoreEngine {
         } else {
             "—".to_string()
         };
+        // The spread ACROSS the per-net scores: how wide the field is in ranking terms.
+        // It is NOT the window spread — that is the `λ × window spread` leg of the
+        // identity beside it, a charge paid by each net — so a field of identical nets
+        // keeps its mean and drives this one to 0. `—` below two scores: one score has
+        // no observable population spread.
+        let fits_spread = {
+            let n = fits.len();
+            if n < 2 {
+                "—".to_string()
+            } else {
+                let mean = avg(&fits);
+                let var = fits.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / n as f32;
+                fmt_line(var.sqrt())
+            }
+        };
         let score_cell = if readings.is_empty() {
             format!(
                 "score{} avg — (no reading yet) │ window avg —",
@@ -133,9 +148,10 @@ impl CoreEngine {
             )
         } else {
             format!(
-                "score{} avg {} = window avg {} {} {} × window spread {} (λ={}) │ window avg {} (spread {})",
+                "score{} avg {} ± {} (σ over nets) = window avg {} {} {} × window spread {} (λ={}) │ window avg {} (spread {})",
                 direction.arrow(),
                 fmt_line(avg(&fits)),
+                fits_spread,
                 fmt_line(window_avg),
                 sign,
                 fmt_cfg(lambda),
@@ -379,13 +395,10 @@ impl CoreEngine {
             Some("built = nets admitted; discarded = crossover rolls that produced no viable child; blocked = mutation rolls stopped by the cull shield"),
         ));
 
-            // ONE stop-time table for the whole measured field. The elite and the worst
-            // are MARKS on the same ranking, not two cards read against each other:
-            // "worst" here is worst by BADNESS × EFFORT (`B = spent × gap`), which is not
-            // the bottom of the fitness ranking at all — a split pair of cards could only
-            // ever show `A`'s two extremes, and hid exactly the net this run wants to see.
-        self.log_final_field(clock);
-
+        // NOT here: the final-field TABLE is an artifact first — it is written at every
+        // log level, `None` included — so `finish_race` renders it after this block,
+        // gating only the card on `verbose_detail`. One table for the whole measured
+        // field: the elite and the worst are MARKS on the same ranking, not two cards.
         Ok(())
     }
 
@@ -395,7 +408,7 @@ impl CoreEngine {
     /// Why one table and not "elites" + "stragglers": the net worth looking at is the one
     /// that spent the most clocks and still scores at the bottom — and that net is NOT the
     /// last row of the fitness ranking. Cutting two cards from the two ends of
-    /// `ranked_live()` could only show `A`'s extremes; the `inefficiency (E)` column puts
+    /// `ranked_live()` could only show `A`'s extremes; the `D * A` column puts
     /// the reading on every row, and `✖` marks the nets `worst-<hash>.*` actually saved,
     /// so both ends and everything between them are read in one place.
     ///
@@ -406,7 +419,11 @@ impl CoreEngine {
     ///
     /// Stop-time only, and it cannot perturb a replay (no forward pass, no environment, no
     /// RNG draw beyond the read-only diversity baseline).
-    fn log_final_field(&self, clock: usize) {
+    ///
+    /// `verbose` gates the CARD only: the table itself is an ARTIFACT, and
+    /// `final-field.csv` is written at every log level (`None` included), because a
+    /// scripted run is exactly the caller who wants the table as a file.
+    pub(crate) fn log_final_field(&self, clock: usize, verbose: bool) {
         let mut rows: Vec<(String, Option<f32>)> = self
             .ranked_live()
             .into_iter()
@@ -483,164 +500,21 @@ impl CoreEngine {
         // any terminal.
         let legend = crate::utils::cfy::table_wrapped(
             &["abbrev", "description"],
-            &[
-            (
-                "C = age".to_string(),
-                "clocks lived, inclusive of the birth clock: `clock − born + 1`".to_string(),
-            ),
-            (
-                "census".to_string(),
-                "params (K/M/B units) · nodes · wires · width (mean hidden-node width across the hidden nodes)"
-                    .to_string(),
-            ),
-            (
-                "origin".to_string(),
-                "where the net came from: a founder slot, or the crossover/mutation op and the clock it was born at (a newborn's first ticket is the NEXT clock)"
-                    .to_string(),
-            ),
-            // ── how it is RANKED ──────────────────────────────────────────
-            (
-                "A = win_μ ∓ λ × win_σ".to_string(),
-                format!(
-                    "fit: the ranking value — the window mean, charged for its spread. This run charges `{sign} λ × win_σ` with λ = {}",
-                    fmt_cfg(self.config.risk_aversion)
-                ),
-            ),
-            (
-                "win_μ".to_string(),
-                "mean of the last window's results".to_string(),
-            ),
-            (
-                "win_σ".to_string(),
-                "the spread across those results (`—` at a window of 1: one result shows no spread)"
-                    .to_string(),
-            ),
-            (
-                "win_n = min(tickets, K)".to_string(),
-                format!(
-                    "how many results the window holds (K = {}); it stops at K while age keeps counting",
-                    self.config.smoothing_window
-                ),
-            ),
-            // ── what its learning COST ────────────────────────────────────
-            (
-                "B = tickets".to_string(),
-                "clocks the net ran the trainer on AND was scored for — an idle clock is not one"
-                    .to_string(),
-            ),
-            (
-                "A/B".to_string(),
-                "fit per ticket — the LOTTERY's merit: what one clock of train+eval bought from this net. It divides by `B` (tickets), NOT by `D` (updates): a crown act pass spent a ticket and produced a fresh reading, so charging it as if the net had not run would hand the crown a free ratio. `B = D + only_act`, which is why the two columns differ on a net that held a seat"
-                    .to_string(),
-            ),
-            (
-                "p(ticket)".to_string(),
-                "the chance this net had of getting the LAST clock's train+eval ticket: its `A/B` as a position in the split field below, then blended by Ω — `1 − Ω × (1 − p)`; 1.00 = always trains (the worst net keeps a standing `1 − Ω`), 0.00 = never, `—` = the lottery is off (Ω = 0) or the field was never armed"
-                    .to_string(),
-            ),
-            (
-                "A/B field · Ω".to_string(),
-                {
-                    let omega = self.train_merit_omega();
-                    match lottery {
-                        Some(f) => {
-                            // The frame is stored direction-adjusted (`best` = the value
-                            // `p = 1` earns, in either direction), so the printed pair is
-                            // converted back into the COLUMN's own units.
-                            let (best, worst) = match self.fitness.direction() {
-                                crate::utils::fitness::Direction::Maximize => (f.best, f.worst),
-                                crate::utils::fitness::Direction::Minimize => (-f.best, -f.worst),
-                            };
-                            format!(
-                                "the lottery field the last clock drew from: best `A/B = {}` and worst `A/B = {}` over the nets it grades (crown and born-shield nets are exempt, so they never set the scale) · Ω = {} = how much of that spread it withholds; the column prints `A/B` at cell precision so the two ends these bounds name are findable in it",
-                                fmt_cell(best),
-                                fmt_cell(worst),
-                                fmt_cfg(omega),
-                            )
-                        }
-                        None => format!(
-                            "no lottery field at the last clock: Ω = {} (0 = off, every net trains) or the field was not armed yet — so `p(ticket)` reads `—`",
-                            fmt_cfg(omega)
-                        ),
-                    }
-                },
-            ),
-            (
-                "D = updates".to_string(),
-                "clocks it actually applied an optimizer step on".to_string(),
-            ),
-            (
-                "idle".to_string(),
-                "clocks the lottery gave no ticket — nothing ran, so it is not a ticket and not an update"
-                    .to_string(),
-            ),
-            // ── what the ELITE rules did with it ──────────────────────────
-            (
-                "only_act".to_string(),
-                "clocks that held the crown's act and nothing else: it trained, evaluated and was scored, but its update was discarded — the weights held still, the net did not"
-                    .to_string(),
-            ),
-            // ── what that effort BOUGHT ───────────────────────────────────
-            (
-                "(D) prop = D ÷ Dmax".to_string(),
-                format!(
-                    "updates proportional: this net's `D` over the field's busiest net's (`Dmax = {}` this run) — how much of the field's training it took. 1.00 = the most trained net alive, near 0 = barely trained. Not a time (`C` is age) and not a share of the mean: 1.00 is one net, the busiest",
-                    inefficiency.as_ref().map(|f| f.max_trained).unwrap_or(0),
-                ),
-            ),
-            (
-                "(A) rescaled = |A_best − A| ÷ |A_best − A_worst|".to_string(),
-                "how far below the field's best this net scored, as a fraction of the field's span: 0 = the best, 1 = the worst".to_string(),
-            ),
-            (
-                "Dmax · A_best · A_worst".to_string(),
-                format!(
-                    "this run's field: `Dmax = {}` (the most updates any live net took) · `A_best = {}` and `A_worst = {}` (the two ends of the span `(A) rescaled` measures between)",
-                    inefficiency.as_ref().map(|f| f.max_trained).unwrap_or(0),
-                    inefficiency.as_ref().map(|f| fmt_cell(f.best)).unwrap_or_else(dash),
-                    inefficiency.as_ref().map(|f| fmt_cell(f.worst)).unwrap_or_else(dash),
-                ),
-            ),
-            (
-                "E = (D) prop × (A) rescaled".to_string(),
-                format!(
-                    "inefficiency: effort against a score it did not earn — 1.00 = the field's most training on the field's worst score, near 0 = little effort or a score near the best. REPORT ONLY: nothing in the loop reads `E` — it picks the `✖` worst artifacts (top-{} of this column, elites excluded) and nothing else. Ticket allocation uses `A/B`, not this",
-                    worst.len()
-                ),
-            ),
-            (
-                "C = D + only_act + idle (+1 if born mid-run)".to_string(),
-                "every clock a net lived is an update, an act-only clock, or an idle clock — PLUS the birth clock a mid-run child sits out (a founder runs clock 0; a child's first ticket is the NEXT clock), which is why the sum can land one short of `C`"
-                    .to_string(),
-            ),
-            (
-                "B = D + only_act".to_string(),
-                "every ticket is an update or an act-only clock".to_string(),
-            ),
-            // ── what this net IS ───────────────────────────────────────────
-            (
-                "mark".to_string(),
-                format!(
-                    "`★` saved as elite (top-{k} by A) and holding a crown seat · `☆` saved as elite but barred from the seat (the `j` or `t` beside it names the gate) · `✖` saved as worst (top-{} by E) · `·` neither; with the crown off nobody sits, so every saved elite reads `★`",
-                    worst.len()
-                ),
-            ),
-            (
-                "mark b · j · t".to_string(),
-                format!(
-                    "gate flags, and they can co-occur (bt): b = inside its born cull shield (crossover {} / mutation {} clock(s)) — it cannot be culled AND cannot take a seat · j = its seat window is not served yet ({} clocks needed; a seat exit restarts the count) — printed only when the born shield is not already the reason, so `bj` never appears · t = past the crown term ({}, age-blocked)",
-                    self.config.crossover_probation_steps,
-                    self.config.mutation_probation_steps,
-                    self.config.elite_join_probation_steps,
-                    // A lifetime of 0 means the term is DISARMED — printing `0 clocks`
-                    // read as a rule that blocks every net.
-                    match self.config.elite_crown_lifetime_steps {
-                        0 => "off".to_string(),
-                        j => format!("{j} clocks"),
-                    },
-                ),
-            ),
-            ],
+            &stop_legend_rows(&LegendCtx {
+                sign,
+                lambda: self.config.risk_aversion,
+                window: self.config.smoothing_window,
+                omega: self.train_merit_omega(),
+                direction: self.fitness.direction(),
+                lottery,
+                inefficiency: inefficiency.as_ref(),
+                worst_len: worst.len(),
+                k,
+                crossover_probation: self.config.crossover_probation_steps,
+                mutation_probation: self.config.mutation_probation_steps,
+                join_probation: self.config.elite_join_probation_steps,
+                crown_lifetime: self.config.elite_crown_lifetime_steps,
+            }),
         );
         // A barred elite is only named when there is one: `☆ 0` on a healthy run is noise.
         let seat_note = if barred > 0 {
@@ -648,7 +522,13 @@ impl CoreEngine {
         } else {
             String::new()
         };
-        crate::utils::cfy::emit(&crate::utils::cfy::card(
+        // The run's seed rides the card: it is the one input a replay cannot recover
+        // once the run dir is gone, and the console output is what a reader keeps.
+        let run_seed = self.header.run_seed;
+        // The FILE first, and unconditionally: `final-field.csv` is run data, written
+        // from the very cells the card would print (one `StopPlan`, no second query).
+        self.write_final_field_csv(&plan.header, &grid);
+        let field_card = crate::utils::cfy::card(
             &format!(
                 "Final field ({} nets — {} measured, ranked by fit{arrow} (A) · ★ {}{seat_note} · ✖ {})",
                 rows.len(),
@@ -658,7 +538,7 @@ impl CoreEngine {
             ),
             &format!("{legend}\n{table}"),
             Some(&format!(
-                "Δcrown = mean multiset-Jaccard distance to the {} reported champion(s): 0.00 = structurally identical to one of them, 1.00 = shares no gene with any · Δpop = mean distance to every other live net: 0.00 = a clone of the crowd, 1.00 = unlike everything alive · read the two AGAINST the baseline: Δcrown ≈ Δpop means the elite is structurally ordinary (selection is ranking numbers, not designs), Δcrown below it means the elite is a structural cluster · {} · {baseline} · crown {}/{} seats · {} eligible · {} gated (join window or cull shield, {} clocks) · {} age-blocked ({} clocks) · stopped at clock {clock} · the same table is written to `final-field.csv` ({} row(s) under this header)",
+                "Δcrown = mean multiset-Jaccard distance to the {} reported champion(s): 0.00 = structurally identical to one of them, 1.00 = shares no gene with any · Δpop = mean distance to every other live net: 0.00 = a clone of the crowd, 1.00 = unlike everything alive · read the two AGAINST the baseline: Δcrown ≈ Δpop means the elite is structurally ordinary (selection is ranking numbers, not designs), Δcrown below it means the elite is a structural cluster · {} · {baseline} · crown {}/{} seats · {} eligible · {} gated (join window or cull shield, {} clocks) · {} age-blocked ({} clocks) · stopped at clock {clock} · run seed {run_seed} (`--seed {run_seed}` replays this run bit-for-bit) · the same table is written to `final-field.csv` ({} row(s) under this header)",
                 plan.crown.len(),
                 stats.line(),
                 self.frozen_crown.len(),
@@ -672,11 +552,106 @@ impl CoreEngine {
                 self.config.elite_crown_lifetime_steps,
                 grid.len(),
             )),
+        );
+        if !verbose {
+            return;
+        }
+        crate::utils::cfy::emit(&field_card);
+        // And immediately after the table, HOW those nets were born: the same reported
+        // set, drawn as ancestry. The table says what a net IS; without this card the
+        // reader has to open `nets/*.json` and decode `created_from` by hand to learn
+        // which two nets crossed to make it.
+        self.log_lineage(&top, &marks);
+    }
+
+    /// The stop-time ANCESTRY card: every reported net with its parents below it.
+    ///
+    /// The edges already exist in the run's own data — a child's `created_from` names its
+    /// parent hashes, and a culled parent leaves a full `nets/<hash>.json` tombstone — so
+    /// this card adds no bookkeeping; it only draws what is recorded. It is emitted right
+    /// after the final-field table because that is the question the table raises: `#1` is
+    /// `cx one-point@50`, and the reader wants to know WHICH nets crossed and how they
+    /// scored. Stop-time only, read-only (a few tombstone file reads, no RNG, no forward
+    /// pass), so it cannot perturb a replay.
+    fn log_lineage(
+        &self,
+        top: &[(String, f32)],
+        marks: &std::collections::HashMap<String, &'static str>,
+    ) {
+        if top.is_empty() {
+            return;
+        }
+        let lines = self.lineage_lines(top, marks);
+        crate::utils::cfy::emit(&crate::utils::cfy::card(
+            &format!(
+                "Lineage — how the {} reported net(s) were born",
+                top.len()
+            ),
+            &lines.join("\n"),
+            Some(&format!(
+                "read downward, oldest first: each bracketed group sits directly above the net it made (a crossover group is `p1`/`p2`), so the reported net closes its own ancestry at the bottom · `Δfit` = the child's fit minus this parent's, signed so `+` means the child scored better (the ranking's own direction); `Δparams` = child − parent · `†<clock> <channel>` = culled at that clock, `live` = still in the population at stop · `↺` = this ancestor's own ancestry is already drawn above · `…` = ancestry stops at the depth cap of {LINEAGE_MAX_DEPTH} generations (the parent's own `nets/<hash>.json` still carries the rest) · edges are each net's recorded `created_from`, and a dead parent's numbers come from its tombstone, so the tree outlives the cull"
+            )),
         ));
-        // The same table as a FILE, from the very cells just printed (see
-        // `write_final_field_csv`): a stop-time report is also run data, and a second
-        // query over the population is how a table and its export start disagreeing.
-        self.write_final_field_csv(&plan.header, &grid);
+    }
+
+    /// The ancestry card's LINES — split from [`Self::log_lineage`] so the drawing is one
+    /// function and the emission is another.
+    fn lineage_lines(
+        &self,
+        top: &[(String, f32)],
+        marks: &std::collections::HashMap<String, &'static str>,
+    ) -> Vec<String> {
+        let mut tree = LineageTree::new(self);
+        let mut out: Vec<String> = Vec::new();
+        for (rank, (hash, fit)) in top.iter().enumerate() {
+            // The root line mirrors the table's identity columns (rank, hash, origin) and
+            // repeats its mark, so a tree is matched to its row by eye. `fit` falls back to
+            // the table's own value when the net carries no stored reading.
+            tree.root_fit = Some(*fit);
+            tree.root_mark = marks.get(hash).copied().unwrap_or("·");
+            tree.render_node(hash, &format!("#{}", rank + 1), None, 0, "", &mut out);
+            // One blank line between reported nets: each root closes a tree, and the next
+            // root must not read as the same net's child.
+            if rank + 1 < top.len() {
+                out.push(String::new());
+            }
+        }
+        if tree.truncated {
+            out.push(format!(
+                "… ancestry stops at the {LINEAGE_MAX_DEPTH}-generation / {LINEAGE_NODE_BUDGET}-line cap"
+            ));
+        }
+        out
+    }
+
+    /// The `## Ancestry` section of ONE elite's markdown file (`elite-<hash>.md`): the
+    /// same recorded lineage the stop card draws, as a mermaid `graph TB` a doc viewer
+    /// renders. The card is the console's answer; this is the per-net artifact's, so the
+    /// elite file explains its own birth long after the run's log is gone.
+    ///
+    /// A founder (random draw / inherited `seed:` blueprint) has no recorded parents and
+    /// comes out as the single box the reader expects; a crossover converges parent →
+    /// child, with the parents at the top and this net at the bottom.
+    pub(crate) fn lineage_markdown(&self, root: &str) -> String {
+        let mut tree = LineageTree::new(self);
+        let has_parents = tree
+            .facts(root)
+            .map(|f| !f.parents.is_empty())
+            .unwrap_or(false);
+        let (diagram, cut) = tree.mermaid(root);
+        let mut prose = if has_parents {
+            "Read downward: an arrow goes from a parent to the child it made (`p1`/`p2` are the crossover slots), so this net sits at the bottom. `Δfit` on an arrow is the child's fit minus that parent's, signed so `+` means the child scored better. Edges are each net's recorded `created_from`; a culled parent's numbers come from its `nets/<hash>.json` tombstone."
+                .to_string()
+        } else {
+            "No recorded parents: this net entered as a founder — a random draw, an inherited `seed:` blueprint, or the initial batch — so its ancestry is the single box below."
+                .to_string()
+        };
+        if cut {
+            prose.push_str(&format!(
+                " The walk stops at {LINEAGE_MD_MAX_DEPTH} generations / {LINEAGE_MD_NODE_BUDGET} nets; each ancestor's own `nets/<hash>.json` still carries the next step back."
+            ));
+        }
+        format!("## Ancestry\n\n{prose}\n\n{diagram}")
     }
 
     /// The plan the ONE stop-time table renders from: one header, one crown, one live
@@ -728,76 +703,18 @@ impl CoreEngine {
     /// The table's header, in NARRATIVE order: what the net IS (`mark`/`#`/`hash`/`origin`,
     /// age, census) → how it is RANKED (fit and the window behind it) → what its
     /// LEARNING cost (`tickets`, `A/B`, `updates`, `idle`) → what that effort BOUGHT
-    /// (`spent`, `gap`, `inefficiency`) → what the ELITE rules did with it (`only_act`,
+    /// (`prop (D)`, `rescaled (A)`, `D * A`) → what the ELITE rules did with it (`only_act`,
     /// the two Δ columns), then the conditional `eval loss` / informative-metric
     /// columns.
     ///
     /// Each measured quantity carries its WORD and its capital LETTER (`fit (A)`,
     /// `tickets (B)`, `updates (D)`), a DERIVED column is named by its own equation
-    /// (`A/B`, `spent = D ÷ Dmax`), and the card's legend states the relations in those
-    /// same letters (`E = spent × G`). The word is what a reader says, the letter is what
+    /// (`A/B`, `D * A`), and the card's legend states the relations in those
+    /// same letters (`D * A = prop (D) × rescaled (A)`). The word is what a reader says, the letter is what
     /// the arithmetic is written in, and a row is checkable by hand — `0.06` is `A ÷ B`
     /// (fit per ticket), not `A ÷ C` (per clock lived).
     fn stop_header(&self, has_eval: bool) -> Vec<String> {
-        let mut header: Vec<String> = [
-            "#",
-            "hash",
-            // ── what this net IS ───────────────────────────────────────
-            // `origin` next to the identity it explains: who its parents were (or which
-            // founder slot) and the clock it was born at, before any number that it
-            // would otherwise be read as the cause of.
-            "origin",
-            "age (C)",
-            "params",
-            "nodes",
-            "wires",
-            "width",
-            // ── how it is RANKED ───────────────────────────────────────
-            // The word AND its letter, so a legend equation can be read straight off the
-            // row; the DERIVED column (`A/B`) is named by its own equation.
-            "fit (A)",
-            // The window is THREE columns, not one `μ ±σ (SE, n)` cell: `A = win_μ ∓ λ ×
-            // win_σ` can only be redone when its legs are readable on their own.
-            "win_μ",
-            "win_σ",
-            "win_n",
-            // ── what its learning COST ─────────────────────────────────
-            "tickets (B)",
-            // The quotient beside its own denominator, so `fit ÷ tickets` is checked
-            // against the row instead of guessed (it is NOT `fit ÷ age`).
-            "A/B",
-            // The lottery's OUTPUT for the last clock: what that `A/B` earned the net in
-            // draw probability. Right beside its two inputs (`A/B` and the field below),
-            // so the column explains itself instead of looking like another score.
-            "p(ticket)",
-            "updates (D)",
-            "idle",
-            // Act-only clocks: the crown trained and was scored, its update discarded.
-            // `only_act`, not `frozen`: the crown seat DOES train and evaluate — calling
-            // that net frozen claimed it did nothing.
-            "only_act",
-            // ── what that effort BOUGHT: the two legs of `E` ──────────
-            // `(D) prop` is printed so the product needs no division: it is read
-            // straight across the row, and `Dmax` only appears in the legend. Named for
-            // what it IS — `D` proportional to the field's busiest net — not for a vague
-            // "effort", which read like time spent.
-            // Named as a FUNCTION of the letter it derives from, so the legend's
-            // arithmetic reads as the columns do: `(D) prop` is `D` proportional to
-            // the field, `(A) rescaled` is `A` mapped onto the field's span.
-            "(D) prop",
-            "(A) rescaled",
-            "inefficiency (E)",
-            // The Δ columns are NOT here: a raw multiset-Jaccard distance sits at 0.7–0.9
-            // between any two unrelated nets, so a per-row value had no reference scale
-            // and read as noise. What the field CAN support — "is the elite structurally
-            // distinct from the crowd it culls?" — is stated ONCE in the footnote (the
-            // card mean against the population's own baseline), not repeated per row.
-            // LAST: every column before it is the evidence, this is the verdict.
-            "mark",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let mut header: Vec<String> = STOP_HEADER_FIXED.iter().map(|s| s.to_string()).collect();
         if has_eval {
             header.push("eval loss".to_string());
         }
@@ -953,7 +870,6 @@ impl CoreEngine {
                 .and_then(|r| (r.n > 1).then_some(r.std))
                 .map(fmt_cell)
                 .unwrap_or_else(dash),
-            reading.map(|r| r.n.to_string()).unwrap_or_else(dash),
             // ── what its learning COST ─────────────────────────────────
             state
                 .map(|s| s.measured_clocks().to_string())
@@ -980,8 +896,8 @@ impl CoreEngine {
                 .map(|s| crown_act_count(s).to_string())
                 .unwrap_or_else(dash),
             // ── what that effort BOUGHT ────────────────────────────────
-            // `(D) prop`, `(A) rescaled` and `E` side by side, so the product is read straight
-            // across the row: no division, no legend lookup in the middle.
+            // `prop (D)`, `rescaled (A)` and `D * A` side by side, so the product is read
+            // straight across the row: no division, no legend lookup in the middle.
             row.d_prop.map(fmt_cell).unwrap_or_else(dash),
             row.a_rescaled.map(fmt_cell).unwrap_or_else(dash),
             row.inefficiency.map(fmt_cell).unwrap_or_else(dash),
@@ -1307,6 +1223,308 @@ impl CoreEngine {
     }
 }
 
+/// The fixed left-hand columns of the stop-time table, in NARRATIVE order: what the net
+/// IS (`#`, `hash`, `origin`, age, census) → how it is RANKED (`fit (A)` and the two
+/// window legs) → what its learning COST (`tickets (B)`, `A/B`, `p(ticket)`, `updates
+/// (D)`, `idle (I)`, `act (O)`) → what that effort BOUGHT (`prop (D)`, `rescaled (A)`,
+/// `D * A`) → the verdict (`mark`). One list: the header prints it and the legend must
+/// explain every entry (`every_column_has_a_legend_row`).
+const STOP_HEADER_FIXED: &[&str] = &[
+    "#",
+    "hash",
+    "origin",
+    "age (C)",
+    "params",
+    "nodes",
+    "wires",
+    "width",
+    // The word AND its letter, so a legend equation can be read straight off the row;
+    // the DERIVED columns are named by their own operation (`A/B`, `D * A`).
+    "fit (A)",
+    // The window is TWO columns, not one `μ ±σ (SE, n)` cell: `A = mean ∓ λ × spread` can
+    // only be redone when its legs are readable on their own. `n` gets no column — it is
+    // `min(B, K)`, read off `tickets (B)`.
+    "mean",
+    "spread",
+    "tickets (B)",
+    // The quotient beside its own denominator, so `fit ÷ tickets` is checked against the
+    // row instead of guessed (it is NOT `fit ÷ age`).
+    "A/B",
+    // The lottery's OUTPUT for the last clock: what that `A/B` earned the net in draw
+    // probability, beside its two inputs, so it does not look like another score.
+    "p(ticket)",
+    "updates (D)",
+    // The two counters that close the age identity get letters too, so `B = D + O` and
+    // `C = D + O + I` read in the same alphabet as the columns that hold them.
+    "idle (I)",
+    // Act-only clocks: the crown trained and was scored, its update discarded. `act`, not
+    // `frozen`: the crown seat DOES train and evaluate — calling that net frozen claimed
+    // it did nothing.
+    "act (O)",
+    // The two legs of `D * A` beside each other, then the product: no division and no
+    // legend lookup in the middle of the row.
+    "prop (D)",
+    "rescaled (A)",
+    "D * A",
+    // The Δ columns are NOT here: a raw multiset-Jaccard distance sits at 0.7–0.9 between
+    // any two unrelated nets, so a per-row value had no reference scale. What the field CAN
+    // support is stated ONCE in the footnote (the card mean against the population's own
+    // baseline), not repeated per row. LAST: everything before it is evidence, this is the
+    // verdict.
+    "mark",
+];
+
+/// Everything the stop-time legend reads, bundled so its rows can be built (and checked
+/// against the header) without a live engine.
+struct LegendCtx<'a> {
+    sign: &'a str,
+    lambda: f32,
+    window: usize,
+    omega: f32,
+    direction: crate::utils::fitness::Direction,
+    lottery: Option<super::step::LotteryFrame>,
+    inefficiency: Option<&'a super::artifacts::InefficiencyField>,
+    worst_len: usize,
+    k: usize,
+    crossover_probation: usize,
+    mutation_probation: usize,
+    join_probation: usize,
+    crown_lifetime: usize,
+}
+
+/// The stop-time legend: `abbrev | description`, one row per column, keyed by the
+/// column's OWN spelling — plus the identity rows that state how the columns add up
+/// (`B = D + O`, `C = D + O + I`, the field bounds). Every header cell must appear here
+/// as a key; `every_column_has_a_legend_row` enforces it.
+fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
+    let sign = ctx.sign;
+    vec![
+        (
+            "#".to_string(),
+            "rank by `fit (A)`, best first; `—` for a live net with no reading yet (it is listed last, unranked)"
+                .to_string(),
+        ),
+        (
+            "hash".to_string(),
+            "the first 8 hex of the blueprint's xxh3 — the net's identity in `nets/<hash>.json`, `elites.json` and this table"
+                .to_string(),
+        ),
+        // ── what this net IS ────────────────────────────────────────────
+        (
+            "origin".to_string(),
+            "where the net came from: a founder slot, or the crossover/mutation op and the clock it was born at (a newborn's first ticket is the NEXT clock)"
+                .to_string(),
+        ),
+        (
+            "age (C)".to_string(),
+            "`C = clock − born + 1` — clocks lived, inclusive of the birth clock".to_string(),
+        ),
+        (
+            "params".to_string(),
+            "trainable parameters, in K/M/B units (`40.2K` = 40 200); the exact count is in `nets/<hash>.json`"
+                .to_string(),
+        ),
+        (
+            "nodes".to_string(),
+            "nodes in the blueprint: input + hidden + output".to_string(),
+        ),
+        (
+            "wires".to_string(),
+            "connections in the blueprint, one per output-port → input-port wire".to_string(),
+        ),
+        (
+            "width".to_string(),
+            "mean hidden-node width — the mean `hidden_dim` across the hidden nodes".to_string(),
+        ),
+        // ── how it is RANKED ────────────────────────────────────────────
+        (
+            "fit (A)".to_string(),
+            format!(
+                "`A = mean ∓ λ × spread` — the ranking value: the window mean, charged for its own spread. This run charges `{sign} λ × spread` with λ = {}",
+                fmt_cfg(ctx.lambda)
+            ),
+        ),
+        (
+            "mean".to_string(),
+            format!(
+                "the window mean of the last `n = min(B, K)` results, K = {} — `n` gets no column of its own: it only falls short of K for a net born within K clocks of the stop, so it is read off `tickets (B)`",
+                ctx.window
+            ),
+        ),
+        (
+            "spread".to_string(),
+            "the spread across those `n` results (`—` at `n = 1`: one result shows no spread)"
+                .to_string(),
+        ),
+        // ── what its learning COST ──────────────────────────────────────
+        (
+            "tickets (B)".to_string(),
+            "`B = D + O` — clocks the net ran the trainer on AND was scored for; an idle clock is not one"
+                .to_string(),
+        ),
+        (
+            "A/B".to_string(),
+            "fit per ticket — the LOTTERY's merit: what one clock of train+eval bought from this net. It divides by `B` (tickets), NOT by `D` (updates): a crown act pass spent a ticket and produced a fresh reading, so charging it as if the net had not run would hand the crown a free ratio. `B = D + O`, which is why the two columns differ on a net that held a seat"
+                .to_string(),
+        ),
+        (
+            "p(ticket)".to_string(),
+            "the chance this net had of getting the LAST clock's train+eval ticket: its `A/B` as a position in the split field below, then blended by Ω — `1 − Ω × (1 − p)`; 1.00 = always trains (the worst net keeps a standing `1 − Ω`), 0.00 = never, `—` = the lottery is off (Ω = 0) or the field was never armed"
+                .to_string(),
+        ),
+        (
+            "A/B field · Ω".to_string(),
+            match ctx.lottery.as_ref() {
+                Some(f) => {
+                    // The frame is stored direction-adjusted (`best` = the value `p = 1`
+                    // earns, in either direction), so the printed pair is converted back
+                    // into the COLUMN's own units.
+                    let (best, worst) = match ctx.direction {
+                        crate::utils::fitness::Direction::Maximize => (f.best, f.worst),
+                        crate::utils::fitness::Direction::Minimize => (-f.best, -f.worst),
+                    };
+                    format!(
+                        "the lottery field the last clock drew from: best `A/B = {}` and worst `A/B = {}` over the nets it grades (crown and born-shield nets are exempt, so they never set the scale) · Ω = {} = how much of that spread it withholds; the column prints `A/B` at cell precision so the two ends these bounds name are findable in it",
+                        fmt_cell(best),
+                        fmt_cell(worst),
+                        fmt_cfg(ctx.omega),
+                    )
+                }
+                None => format!(
+                    "no lottery field at the last clock: Ω = {} (0 = off, every net trains) or the field was not armed yet — so `p(ticket)` reads `—`",
+                    fmt_cfg(ctx.omega)
+                ),
+            },
+        ),
+        (
+            "updates (D)".to_string(),
+            "`D` — clocks it actually applied an optimizer step on".to_string(),
+        ),
+        (
+            "idle (I)".to_string(),
+            "`I` — clocks the lottery gave no ticket: nothing ran, so it is not a ticket and not an update"
+                .to_string(),
+        ),
+        // ── what the ELITE rules did with it ──────────────────────────
+        (
+            "act (O)".to_string(),
+            "`O` — clocks that held the crown's act and nothing else: it trained, evaluated and was scored, but its update was discarded — the weights held still, the net did not"
+                .to_string(),
+        ),
+        // ── what that effort BOUGHT ───────────────────────────────────
+        (
+            "prop (D)".to_string(),
+            format!(
+                "`prop (D) = D ÷ Dmax` — updates proportional: this net's `D` over the field's busiest net's (`Dmax = {}` this run), i.e. how much of the field's training it took. 1.00 = the most trained net alive, near 0 = barely trained. Not a time (`C` is age) and not a share of the mean: 1.00 is one net, the busiest",
+                ctx.inefficiency.map(|f| f.max_trained).unwrap_or(0),
+            ),
+        ),
+        (
+            "rescaled (A)".to_string(),
+            "`rescaled (A) = |A_best − A| ÷ |A_best − A_worst|` — how far below the field's best this net scored, as a fraction of the field's span: 0 = the best, 1 = the worst".to_string(),
+        ),
+        (
+            "Dmax · A_best · A_worst".to_string(),
+            format!(
+                "this run's field: `Dmax = {}` (the most updates any live net took) · `A_best = {}` and `A_worst = {}` (the two ends of the span `rescaled (A)` measures between)",
+                ctx.inefficiency.map(|f| f.max_trained).unwrap_or(0),
+                ctx.inefficiency.map(|f| fmt_cell(f.best)).unwrap_or_else(dash),
+                ctx.inefficiency.map(|f| fmt_cell(f.worst)).unwrap_or_else(dash),
+            ),
+        ),
+        (
+            "D * A".to_string(),
+            format!(
+                "`D * A = prop (D) × rescaled (A)` — inefficiency, the product of the two legs beside it, EACH ALREADY NORMALISED to 0..1 (raw `D × A` is never meant). 1.00 = the field's most training on the field's worst score, near 0 = little effort or a score near the best. REPORT ONLY: nothing in the loop reads it — it picks the `✖` worst artifacts (top-{} of this column, elites excluded) and nothing else. Ticket allocation uses `A/B`, not this",
+                ctx.worst_len
+            ),
+        ),
+        (
+            "C = D + O + I (+1 if born mid-run)".to_string(),
+            "every clock a net lived is an update, an act-only clock, or an idle clock — PLUS the birth clock a mid-run child sits out (a founder runs clock 0; a child's first ticket is the NEXT clock), which is why the sum can land one short of `C`"
+                .to_string(),
+        ),
+        (
+            "B = D + O".to_string(),
+            "every ticket is an update or an act-only clock".to_string(),
+        ),
+        // ── what this net IS (the verdict) ────────────────────────────
+        (
+            "mark".to_string(),
+            format!(
+                "`★` saved as elite (top-{} by A) and holding a crown seat · `☆` saved as elite but barred from the seat (the `j` or `t` beside it names the gate) · `✖` saved as worst (top-{} by `D * A`) · `·` neither; with the crown off nobody sits, so every saved elite reads `★`",
+                ctx.k,
+                ctx.worst_len
+            ),
+        ),
+        (
+            "mark b · j · t".to_string(),
+            format!(
+                "gate flags, and they can co-occur (bt): b = inside its born cull shield (crossover {} / mutation {} clock(s)) — it cannot be culled AND cannot take a seat · j = its seat window is not served yet ({} clocks needed; a seat exit restarts the count) — printed only when the born shield is not already the reason, so `bj` never appears · t = past the crown term ({}, age-blocked)",
+                ctx.crossover_probation,
+                ctx.mutation_probation,
+                ctx.join_probation,
+                // A lifetime of 0 means the term is DISARMED — printing `0 clocks`
+                // read as a rule that blocks every net.
+                match ctx.crown_lifetime {
+                    0 => "off".to_string(),
+                    j => format!("{j} clocks"),
+                },
+            ),
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod stop_legend_tests {
+    use super::*;
+
+    fn ctx() -> LegendCtx<'static> {
+        LegendCtx {
+            sign: "−",
+            lambda: 0.5,
+            window: 10,
+            omega: 0.0,
+            direction: crate::utils::fitness::Direction::Maximize,
+            lottery: None,
+            inefficiency: None,
+            worst_len: 1,
+            k: 1,
+            crossover_probation: 5,
+            mutation_probation: 5,
+            join_probation: 5,
+            crown_lifetime: 5,
+        }
+    }
+
+    /// The legend and the table are ONE contract: every column the header prints has a
+    /// row that explains it. Without this, a rename lands in one place and the legend
+    /// keeps teaching the old name.
+    #[test]
+    fn every_column_has_a_legend_row() {
+        let rows = stop_legend_rows(&ctx());
+        for cell in STOP_HEADER_FIXED {
+            assert!(
+                rows.iter().any(|(key, _)| key == cell),
+                "column `{cell}` has no legend row — keys: {:?}",
+                rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()
+            );
+        }
+        // The conditional columns (`eval loss`, the informative metrics) are the only ones
+        // outside the 1:1 rule: they exist only when a trainer reports them.
+    }
+
+    /// One key, one explanation — two rows for a column can disagree with each other.
+    #[test]
+    fn legend_keys_are_unique() {
+        let rows = stop_legend_rows(&ctx());
+        let mut seen = std::collections::HashSet::new();
+        for (key, _) in &rows {
+            assert!(seen.insert(key.clone()), "duplicate legend key `{key}`");
+        }
+    }
+}
+
 /// The plan BOTH stop-time cards render from: one column list, one crown, one live
 /// population, one clock. Built once at stop, so the elite and straggler tables are
 /// column-identical by construction instead of by two lists kept in sync by hand.
@@ -1345,13 +1563,13 @@ struct StopRow<'a> {
     shape: Option<NetShape>,
     /// The plan the whole card prints from.
     plan: &'a StopPlan,
-    /// `(D) prop = D ÷ Dmax` — the updates leg of `E` alone, printed so the product
+    /// `prop (D) = D ÷ Dmax` — the updates leg of `D * A` alone, printed so the product
     /// below can be read straight off the row.
     d_prop: Option<f32>,
-    /// `(A) rescaled = |A_best − A| ÷ |A_best − A_worst|` — the fit leg alone, printed
+    /// `rescaled (A) = |A_best − A| ÷ |A_best − A_worst|` — the fit leg alone, printed
     /// so the product below can be redone from the row.
     a_rescaled: Option<f32>,
-    /// `E = (D) prop × (A) rescaled` — the net's inefficiency reading
+    /// `D * A = prop (D) × rescaled (A)` — the net's inefficiency reading
     /// (`None`: no ranking, so it is not in the field the artifact writer picks from).
     inefficiency: Option<f32>,
     /// `p(ticket)` — the BLENDED probability the LAST clock's coin used, computed by the
@@ -1429,6 +1647,418 @@ fn delta_pop(shape: Option<&NetShape>, hash: &str, plan: &StopPlan) -> Option<f3
             .filter(|(h, _)| h != hash)
             .map(|(_, s)| s),
     )
+}
+
+/// How many generations above a reported net the lineage card walks. A search that
+/// crossed for 100 clocks has a deep DAG; 4 generations answers "who made this and how
+/// did they score" without turning one card into a screenful, and every ancestor's own
+/// `nets/<hash>.json` still carries the next step back.
+const LINEAGE_MAX_DEPTH: usize = 4;
+/// How many tree lines ONE card may print, across all reported nets.
+const LINEAGE_NODE_BUDGET: usize = 64;
+/// How many generations the elite files' mermaid diagram walks. A DOC can afford more
+/// than a terminal card: mermaid lays the graph out itself, so depth costs nodes, not
+/// screen width.
+const LINEAGE_MD_MAX_DEPTH: usize = 6;
+/// The most nodes one elite diagram may name. Beyond this the walk stops and the
+/// markdown says so, rather than shipping a 500-node graph in a per-net file.
+const LINEAGE_MD_NODE_BUDGET: usize = 150;
+
+/// The hashes named by a lineage string — `crossover-one-point:parents=<h1>,<h2>[+mut]`
+/// or `clone:parents=<h1>` — as the parent list, oldest first. Founders (`random`,
+/// `founder-N`) and inherited nets (`seed:<run>:<hash>`) name no in-run parents and come
+/// back empty, which is what makes them the roots of a tree.
+fn lineage_parents(created_from: Option<&str>) -> Vec<String> {
+    let Some(raw) = created_from else {
+        return Vec::new();
+    };
+    // `+mut` is a flag ON the child (crossover, then mutated), not part of a parent id.
+    let head = raw.strip_suffix("+mut").unwrap_or(raw);
+    let Some((_, parents)) = head.split_once(":parents=") else {
+        return Vec::new();
+    };
+    parents
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The first 8 hex of a hash — the width every other stop-time identity prints at.
+fn short_hash(hash: &str) -> String {
+    hash[..8.min(hash.len())].to_string()
+}
+
+/// One node's mermaid label: identity, origin, fit, and what happened to it (the root
+/// says `ELITE`; an ancestor says `live` or the clock it was culled at).
+fn mermaid_node_label(hash: &str, facts: Option<&LineageFacts>, root: bool) -> String {
+    let Some(facts) = facts else {
+        return short_hash(hash);
+    };
+    let mut parts = vec![
+        short_hash(hash),
+        origin_cell(facts.origin.as_deref(), facts.born),
+    ];
+    if let Some(fit) = facts.fit {
+        parts.push(format!("fit {}", fmt_cell(fit)));
+    }
+    if root {
+        parts.push("ELITE".to_string());
+    } else if facts.alive {
+        parts.push("live".to_string());
+    } else if let Some(clock) = facts.culled_at {
+        parts.push(format!("†{clock}"));
+    }
+    parts.join("<br/>")
+}
+
+/// One net's ancestry facts, whether it is LIVE or a culled tombstone. One shape for
+/// both is what lets the tree cross a cull: the numbers a dead parent needs
+/// (`final_risk_score` / `final_fitness_mean` / `final_fitness_std` / `final_fitness_samples`)
+/// are the same three legs a live net reads from its window.
+#[derive(Clone, Debug)]
+struct LineageFacts {
+    /// The recorded lineage string (`created_from`), kept verbatim for [`origin_cell`].
+    origin: Option<String>,
+    /// Clock it entered the population.
+    born: usize,
+    /// The ranking value (risk-adjusted fit); `None` when it never measured.
+    fit: Option<f32>,
+    mean: Option<f32>,
+    std: Option<f32>,
+    n: usize,
+    params: Option<i64>,
+    alive: bool,
+    culled_at: Option<usize>,
+    cull_reason: Option<String>,
+    /// Parent hashes named by `created_from` (empty = a root).
+    parents: Vec<String>,
+}
+
+/// The ancestry card's one walker: resolve a hash (live memory first, then the tombstone
+/// on disk), draw it, then recurse into its parents.
+struct LineageTree<'a> {
+    engine: &'a CoreEngine,
+    /// Resolved facts per hash — a shared ancestor is read from disk at most once.
+    cache: std::collections::HashMap<String, Option<LineageFacts>>,
+    /// Hashes already drawn in THIS card: a repeated ancestor is marked `↺` and not
+    /// expanded again, so a DAG shared by two reported nets stays one screen.
+    shown: std::collections::HashSet<String>,
+    budget: usize,
+    truncated: bool,
+    /// The mark (`★`/`☆`) and table fit of the ROOT currently being drawn.
+    root_mark: &'static str,
+    root_fit: Option<f32>,
+}
+
+impl<'a> LineageTree<'a> {
+    fn new(engine: &'a CoreEngine) -> Self {
+        Self {
+            engine,
+            cache: std::collections::HashMap::new(),
+            shown: std::collections::HashSet::new(),
+            budget: LINEAGE_NODE_BUDGET,
+            truncated: false,
+            root_mark: "·",
+            root_fit: None,
+        }
+    }
+
+    /// One net's facts: the live state first (a parent may still be alive), then the
+    /// `nets/<hash>.json` tombstone a cull leaves behind. `None` when neither exists —
+    /// e.g. a parent inherited from another run's directory.
+    fn facts(&mut self, hash: &str) -> Option<LineageFacts> {
+        if let Some(hit) = self.cache.get(hash) {
+            return hit.clone();
+        }
+        let engine = self.engine;
+        let facts = if let Some(state) = engine.state.net(hash) {
+            let reading = engine.race_reading_of(hash);
+            Some(LineageFacts {
+                origin: state.created_from.clone(),
+                born: state.entered_at_step,
+                fit: engine.smoothed_fitness_of(hash),
+                mean: reading.map(|r| r.mean),
+                // `n = 1` has no observable spread, the same rule the table's `spread` cell
+                // follows — a printed `0` would claim a steadiness nobody measured.
+                std: reading.and_then(|r| (r.n > 1).then_some(r.std)),
+                n: reading.map(|r| r.n).unwrap_or(0),
+                params: state.meta.params,
+                alive: true,
+                culled_at: None,
+                cull_reason: None,
+                parents: lineage_parents(state.created_from.as_deref()),
+            })
+        } else {
+            match crate::state::load_net_state(&engine.run_dir, hash) {
+                Ok(state) => Some(LineageFacts {
+                    origin: state.created_from.clone(),
+                    born: state.entered_at_step,
+                    // A legacy tombstone may predate `final_risk_score`; the window mean is
+                    // then the only level it recorded, so it is read as the fit.
+                    fit: state
+                        .final_risk_score
+                        .filter(|v| v.is_finite())
+                        .or_else(|| state.final_fitness_mean.filter(|v| v.is_finite())),
+                    mean: state.final_fitness_mean.filter(|v| v.is_finite()),
+                    std: state
+                        .final_fitness_std
+                        .filter(|v| v.is_finite())
+                        .filter(|_| state.final_fitness_samples > 1),
+                    n: state.final_fitness_samples,
+                    params: state.meta.params,
+                    alive: state.is_alive,
+                    culled_at: state.culled_at_step,
+                    cull_reason: state.cull_reason.clone(),
+                    parents: lineage_parents(state.created_from.as_deref()),
+                }),
+                Err(_) => None,
+            }
+        };
+        self.cache.insert(hash.to_string(), facts.clone());
+        facts
+    }
+
+    /// This net's ancestry as a mermaid `graph TB`: parents at the TOP, the net at the
+    /// BOTTOM, one arrow per parent → child edge. Shared ancestors are ONE node (mermaid
+    /// keys by id), so a DAG converges instead of being repeated the way the console
+    /// tree's `↺` avoids; a founder comes out as a single box.
+    ///
+    /// Returns the fenced diagram and whether the walk was cut short (depth or node
+    /// budget), which the caller states in the section's prose.
+    fn mermaid(&mut self, root: &str) -> (String, bool) {
+        let mut nodes: Vec<String> = Vec::new();
+        let mut edges: Vec<(String, String, usize, usize)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: Vec<(String, usize)> = vec![(root.to_string(), 0)];
+        let mut cut = false;
+        while let Some((hash, depth)) = stack.pop() {
+            if !seen.insert(hash.clone()) {
+                continue;
+            }
+            if nodes.len() >= LINEAGE_MD_NODE_BUDGET {
+                cut = true;
+                break;
+            }
+            nodes.push(hash.clone());
+            let Some(facts) = self.facts(&hash) else {
+                continue;
+            };
+            if facts.parents.is_empty() {
+                continue;
+            }
+            if depth >= LINEAGE_MD_MAX_DEPTH {
+                cut = true;
+                continue;
+            }
+            let n = facts.parents.len();
+            for (i, parent) in facts.parents.iter().enumerate() {
+                edges.push((parent.clone(), hash.clone(), i + 1, n));
+                stack.push((parent.clone(), depth + 1));
+            }
+        }
+        let known: std::collections::HashSet<String> = nodes.iter().cloned().collect();
+        let direction = self.engine.fitness.direction();
+        let adjusted = |v: f32| match direction {
+            crate::utils::fitness::Direction::Maximize => v,
+            crate::utils::fitness::Direction::Minimize => -v,
+        };
+        let mut out = String::from("```mermaid\ngraph TB\n");
+        // Classes first, so a viewer never renders an unstyled node while reading down.
+        out.push_str("    classDef elite fill:#ffe9a8,stroke:#a87b00,stroke-width:2px\n");
+        out.push_str("    classDef culled fill:#f2f2f2,stroke:#9a9a9a,color:#555\n");
+        out.push_str("    classDef ancestor fill:#eaf4ff,stroke:#5a8fbf\n");
+        for hash in &nodes {
+            let facts = self.facts(hash);
+            out.push_str(&format!(
+                "    n_{}[\"{}\"]\n",
+                short_hash(hash),
+                mermaid_node_label(hash, facts.as_ref(), hash == root)
+            ));
+        }
+        for (parent, child, slot, n) in &edges {
+            // A parent beyond the node budget was never declared: drop the edge with the
+            // cut instead of letting mermaid invent a blank node for it.
+            if !known.contains(parent) || !known.contains(child) {
+                cut = true;
+                continue;
+            }
+            let parent_facts = self.facts(parent);
+            let child_facts = self.facts(child);
+            let mut label = if *n == 1 {
+                "p".to_string()
+            } else {
+                format!("p{slot}")
+            };
+            if let (Some(parent_facts), Some(child_facts)) = (parent_facts, child_facts) {
+                if let (Some(parent_fit), Some(child_fit)) = (parent_facts.fit, child_facts.fit) {
+                    let gain = adjusted(child_fit) - adjusted(parent_fit);
+                    label.push_str(&format!(
+                        " · Δfit {}{}",
+                        if gain >= 0.0 { "+" } else { "−" },
+                        fmt_cell(gain.abs())
+                    ));
+                }
+            }
+            out.push_str(&format!(
+                "    n_{} -->|\"{}\"| n_{}\n",
+                short_hash(parent),
+                label,
+                short_hash(child)
+            ));
+        }
+        for hash in &nodes {
+            let class = if hash == root {
+                "elite"
+            } else if self.facts(hash).map(|f| !f.alive).unwrap_or(false) {
+                "culled"
+            } else {
+                "ancestor"
+            };
+            out.push_str(&format!("    class n_{} {class}\n", short_hash(hash)));
+        }
+        out.push_str("```\n");
+        (out, cut)
+    }
+
+        /// Draw one node and, depth permitting, its parents ABOVE it. `label` is the
+        /// root's `#<rank>` or a parent slot `p1`/`p2`; `child` is the net this node
+        /// parented, which is what the `Δ` columns are measured against. Ancestors print
+        /// first, so the card reads downward in birth order: parents, then the net they
+        /// made, ending at the reported net.
+    fn render_node(
+        &mut self,
+        hash: &str,
+        label: &str,
+        child: Option<&LineageFacts>,
+        depth: usize,
+        connector: &str,
+        out: &mut Vec<String>,
+    ) {
+        let indent = "   ".repeat(depth);
+        if self.budget == 0 {
+            self.truncated = true;
+            out.push(format!("{indent}…"));
+            return;
+        }
+        self.budget -= 1;
+        let Some(facts) = self.facts(hash) else {
+            out.push(format!(
+                "{indent}{connector}{label} {} · no `nets/{}.json` — ancestry unknown",
+                short_hash(hash),
+                short_hash(hash),
+            ));
+            return;
+        };
+        let repeated = child.is_some() && self.shown.contains(hash);
+        // Parents FIRST: each generation sits one indent deeper, and the bracketed group
+        // directly above a net is that net's parent set. That is the natural reading order
+        // (oldest ancestor at the top, the reported net at the bottom).
+        if !repeated && depth + 1 < LINEAGE_MAX_DEPTH {
+            let n = facts.parents.len();
+            for (i, parent) in facts.parents.iter().enumerate() {
+                let next_label = if n == 1 {
+                    "p".to_string()
+                } else {
+                    format!("p{}", i + 1)
+                };
+                // A single parent is the group's only line and closes it.
+                let next_connector = if n == 1 || i + 1 == n {
+                    "└─ "
+                } else if i == 0 {
+                    "┌─ "
+                } else {
+                    "├─ "
+                };
+                self.render_node(
+                    parent,
+                    &next_label,
+                    Some(&facts),
+                    depth + 1,
+                    next_connector,
+                    out,
+                );
+            }
+        }
+        self.shown.insert(hash.to_string());
+        let mut line = format!(
+            "{indent}{connector}{label} {} · {}",
+            short_hash(hash),
+            origin_cell(facts.origin.as_deref(), facts.born),
+        );
+        // The ranking value. A root falls back to the table's own cell when the net has no
+        // stored reading; an ancestor prints only what its record carries.
+        let fit = if child.is_none() {
+            facts.fit.or(self.root_fit)
+        } else {
+            facts.fit
+        };
+        if let Some(v) = fit {
+            line.push_str(&format!(" · fit {}", fmt_cell(v)));
+        }
+        if let (Some(mean), true) = (facts.mean, facts.n > 0) {
+            line.push_str(&format!(" · μ {}", fmt_cell(mean)));
+            if let Some(std) = facts.std {
+                line.push_str(&format!(" σ {}", fmt_cell(std)));
+            }
+            line.push_str(&format!(" n {}", facts.n));
+        }
+        if let Some(params) = facts.params {
+            line.push_str(&format!(" · {}", fmt_units(params)));
+        }
+        if !facts.alive {
+            match (facts.culled_at, facts.cull_reason.as_deref()) {
+                (Some(clock), Some(reason)) => line.push_str(&format!(" · †{clock} {reason}")),
+                (Some(clock), None) => line.push_str(&format!(" · †{clock}")),
+                _ => line.push_str(" · dead"),
+            }
+        } else if child.is_some() {
+            line.push_str(" · live");
+        }
+        // The `Δ` leg, read parent-against-child in the RANKING's own direction, so `+`
+        // always means "the child scored better than this parent" — printing a raw `fit`
+        // difference would flip meaning on a minimize run.
+        if let Some(child) = child {
+            let direction = self.engine.fitness.direction();
+            let adjusted = |v: f32| match direction {
+                crate::utils::fitness::Direction::Maximize => v,
+                crate::utils::fitness::Direction::Minimize => -v,
+            };
+            if let (Some(child_fit), Some(parent_fit)) = (child.fit, facts.fit) {
+                let gain = adjusted(child_fit) - adjusted(parent_fit);
+                line.push_str(&format!(
+                    " · Δfit {}{}",
+                    if gain >= 0.0 { "+" } else { "−" },
+                    fmt_cell(gain.abs())
+                ));
+            }
+            if let (Some(child_params), Some(parent_params)) = (child.params, facts.params) {
+                let delta = child_params - parent_params;
+                line.push_str(&format!(
+                    " · Δparams {}{}",
+                    if delta >= 0 { "+" } else { "−" },
+                    fmt_units(delta.abs())
+                ));
+            }
+        }
+        if child.is_none() {
+            line.push_str(&format!(" · {}", self.root_mark));
+        }
+        if repeated {
+            line.push_str(" · ↺ shown above");
+        }
+        // Depth cap: the parents could not be drawn above, so the cut is named on the net
+        // they belong to rather than inventing a line with no net behind it.
+        if !repeated && depth + 1 >= LINEAGE_MAX_DEPTH && !facts.parents.is_empty() {
+            line.push_str(&format!(
+                " · … {} parent(s), depth cap {LINEAGE_MAX_DEPTH}",
+                facts.parents.len()
+            ));
+            self.truncated = true;
+        }
+        out.push(line);
+    }
 }
 
 /// One net's origin cell for the final elite table: WHO made it, without parent-hash
@@ -1694,8 +2324,8 @@ pub(crate) fn seat_score_cell(
 #[cfg(test)]
 mod tests {
     use super::{
-        CardStats, NetShape, StopPlan, delta_crown, delta_pop, elite_badge_entry, mean_of,
-        minimal_score_cell, origin_cell, seat_score_cell, trained_note,
+        CardStats, NetShape, StopPlan, delta_crown, delta_pop, elite_badge_entry, lineage_parents,
+        mean_of, minimal_score_cell, origin_cell, seat_score_cell, trained_note,
     };
     use crate::engine::smoothing::WindowStats;
     use crate::utils::fitness::Direction;
@@ -1710,6 +2340,27 @@ mod tests {
         // Lifetime disarmed: no denominator invented.
         assert_eq!(elite_badge_entry("abc12345", 4, 0), "abc12345(term 4)");
     }
+    #[test]
+    fn lineage_parents_reads_the_ids_a_tree_walks() {
+        // Crossover: two full hashes, in recorded order, `+mut` is a child flag not a parent.
+        assert_eq!(
+            lineage_parents(Some(
+                "crossover-one-point:parents=aaaaaaaaaaaaaaaa,bbbbbbbbbbbbbbbb+mut"
+            )),
+            vec!["aaaaaaaaaaaaaaaa".to_string(), "bbbbbbbbbbbbbbbb".to_string()]
+        );
+        // Asexual clone: one parent still walks like a tree edge.
+        assert_eq!(
+            lineage_parents(Some("clone:parents=cccccccccccccccc")),
+            vec!["cccccccccccccccc".to_string()]
+        );
+        // Roots name no in-run parent: a founder, an inherited seed, or no record at all.
+        assert!(lineage_parents(Some("random")).is_empty());
+        assert!(lineage_parents(Some("founder-2")).is_empty());
+        assert!(lineage_parents(Some("seed:1793334914211:de1f105d")).is_empty());
+        assert!(lineage_parents(None).is_empty());
+    }
+
     #[test]
     fn trained_note_is_trainings_over_clocks_lived() {
         // A net born at step 7 that trained 5 of its 12 lived clocks: the other
