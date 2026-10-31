@@ -87,10 +87,11 @@ fn resume_rl(
     loss: Option<String>,
     fitness: Option<String>,
     lr: Option<f32>,
-    grad_clip: Option<f32>,
-    batch_size: Option<usize>,
-    eval_batch_size: Option<usize>,
-) -> PyResult<PyRaceEngine> {
+    grad_clip: Option<f32>,        batch_size: Option<usize>,
+        eval_batch_size: Option<usize>,
+        lr_schedule: Option<String>,
+        optimizer: Option<String>,
+    ) -> PyResult<PyRaceEngine> {
     let Some(env) = env else {
         return Err(PyValueError::new_err(format!(
             "resume: {} was recorded as mode \"rl\", so it needs env= — the environment it \
@@ -197,13 +198,28 @@ fn resume_rl(
     // `spec.max_episode_steps` still wins, exactly as it did when the run started —
     // and a mismatch there is the blob guard's to report.
     let world = Python::attach(|py| GymEnv::new(py, env, Some(max_turns)))?;
-    let trainer = Reinforce::new(world, gras::auto_device())
+    let mut trainer = Reinforce::new(world, gras::auto_device())
         .with_signal(signal)
         .with_learning_rate(learning_rate)
         .with_grad_clip(clip)
         .with_matches_per_step(matches)
         .with_eval_matches_per_step(eval_matches)
         .with_challenge(challenge_prob, policy, decay);
+    // Same rule as the tabular half: an override wins, else the record's name. An
+    // RL run only carries the key when it TRAINED with a schedule, so a run from
+    // before this existed resumes with none.
+    let recorded_schedule = text_or_none(blob, "lr_schedule");
+    if let Some(schedule) =
+        lr_schedule_of(lr_schedule.as_deref().or(recorded_schedule.as_deref()))?
+    {
+        trainer = trainer.with_named_lr_schedule(schedule);
+    }
+    // Only a run that NAME one carries the key, so a pre-`optimizer=` RL dir
+    // resumes on Adam — what it actually trained with.
+    let recorded_optimizer = text_or_none(blob, "optimizer");
+    if let Some(kind) = optimizer_of(optimizer.as_deref().or(recorded_optimizer.as_deref()))? {
+        trainer = trainer.with_optimizer(kind);
+    }
     // The fitness is the record's, not a guess: `gym()` pairs it with the signal, so
     // re-deriving it from the same record keeps ranking and exam identical.
     let fitness = Fitness::reported(header.fitness_direction, &header.fitness_label.0);
@@ -214,6 +230,48 @@ fn resume_rl(
     }
     Ok(PyRaceEngine {
         engine: Some(Arm::Rl(engine)),
+    })
+}
+
+/// Resolve `lr_schedule=` (or a recorded label) into the crate's named schedule.
+///
+/// `None` in, `None` out — no schedule, which is the crate's fixed-rate default.
+/// The error names the offender AND the full set, so a typo is a one-line fix.
+fn lr_schedule_of(name: Option<&str>) -> PyResult<Option<gras::trainer::LrSchedule>> {
+    name.map(named_lr_schedule).transpose()
+}
+
+/// A blob key that only exists when the run had the feature — `None` for an
+/// absent key OR a non-string (a legacy boolean, say).
+fn text_or_none(blob: &serde_json::Value, key: &str) -> Option<String> {
+    blob.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Resolve `optimizer=` (or a recorded label) into the crate's named optimizer.
+fn optimizer_of(name: Option<&str>) -> PyResult<Option<gras::trainer::OptimizerKind>> {
+    match name {
+        None => Ok(None),
+        Some(text) => gras::trainer::OptimizerKind::parse(text)
+            .map(Some)
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "optimizer {text:?}: expected one of {}",
+                    gras::trainer::OptimizerKind::NAMES.join(", ")
+                ))
+            }),
+    }
+}
+
+/// One `lr_schedule` spelling, or a `ValueError` listing what is accepted.
+fn named_lr_schedule(text: &str) -> PyResult<gras::trainer::LrSchedule> {
+    gras::trainer::LrSchedule::parse(text).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "lr_schedule {text:?}: expected one of {} (parameterised forms like \
+             \"cosine(0.1)\" / \"step_decay(10,0.5)\" / \"onecycle(0.3)\" are accepted too)",
+            gras::trainer::LrSchedule::NAMES.join(", ")
+        ))
     })
 }
 
@@ -249,6 +307,8 @@ impl PyRaceEngine {
         grad_clip=None,
         batch_size=None,
         eval_batch_size=None,
+        lr_schedule=None,
+        optimizer=None,
     ))]
     // A constructor's kwargs ARE its API: bundling them into an object would buy
     // the lint nothing and cost the caller a line per knob.
@@ -266,6 +326,8 @@ impl PyRaceEngine {
         grad_clip: Option<f32>,
         batch_size: Option<usize>,
         eval_batch_size: Option<usize>,
+        lr_schedule: Option<String>,
+        optimizer: Option<String>,
     ) -> PyResult<Self> {
         // A task preset fills only what the caller did NOT name: `task="regression"`
         // with `loss="l1"` trains L1 and ranks on L1's natural fitness.
@@ -337,6 +399,14 @@ impl PyRaceEngine {
         if let Some(n) = eval_batch_size {
             trainer = trainer.with_eval_batch_size(n);
         }
+        // The schedule SCALES `lr=`, so the two compose: base rate and shape.
+        if let Some(schedule) = lr_schedule_of(lr_schedule.as_deref())? {
+            trainer = trainer.with_named_lr_schedule(schedule);
+        }
+        // The update itself, by name (default: adam, what v1 always ran).
+        if let Some(kind) = optimizer_of(optimizer.as_deref())? {
+            trainer = trainer.with_optimizer(kind);
+        }
 
         // Bind the topology dims from the dataset, exactly like the Rust
         // examples do: the engine records dims in `engine.json`, but the
@@ -397,6 +467,8 @@ impl PyRaceEngine {
         grad_clip=None,
         batch_size=None,
         eval_batch_size=None,
+        lr_schedule=None,
+        optimizer=None,
     ))]
     // Same reason as `new`: a constructor's kwargs ARE its API.
     #[allow(clippy::too_many_arguments)]
@@ -416,6 +488,8 @@ impl PyRaceEngine {
         grad_clip: Option<f32>,
         batch_size: Option<usize>,
         eval_batch_size: Option<usize>,
+        lr_schedule: Option<String>,
+        optimizer: Option<String>,
     ) -> PyResult<Self> {
         write_arrays(py, x, y, &data_dir)?;
         // The written files are the only hand-off: from here this is the same
@@ -433,6 +507,8 @@ impl PyRaceEngine {
             grad_clip,
             batch_size,
             eval_batch_size,
+            lr_schedule,
+            optimizer,
         )
     }
 
@@ -479,6 +555,8 @@ impl PyRaceEngine {
         grad_clip = None,
         batch_size = None,
         eval_batch_size = None,
+        lr_schedule = None,
+        optimizer = None,
         env = None,
     ))]
     // Same reason as `new`: a constructor's kwargs ARE its API.
@@ -492,6 +570,8 @@ impl PyRaceEngine {
         grad_clip: Option<f32>,
         batch_size: Option<usize>,
         eval_batch_size: Option<usize>,
+        lr_schedule: Option<String>,
+        optimizer: Option<String>,
         env: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let header = gras::state::load_engine_json(&run_dir)
@@ -510,6 +590,8 @@ impl PyRaceEngine {
                 grad_clip,
                 batch_size,
                 eval_batch_size,
+                lr_schedule,
+                optimizer,
             );
         }
         if env.is_some() {
@@ -553,6 +635,21 @@ impl PyRaceEngine {
         if let Some(value) = eval_batch_size.or_else(|| blob_usize(blob, "eval_batch_size")) {
             trainer = trainer.with_eval_batch_size(value);
         }
+        // The schedule is part of the recipe: an override wins, otherwise the
+        // RECORDED name is rebuilt — a bare resume replays the same curve, and the
+        // crate's blob guard refuses one that differs.
+        let recorded_schedule = blob_str(blob, "lr_schedule_name");
+        if let Some(schedule) =
+            lr_schedule_of(lr_schedule.as_deref().or(recorded_schedule.as_deref()))?
+        {
+            trainer = trainer.with_named_lr_schedule(schedule);
+        }
+        // The optimizer too: an override wins, else the record's. Every tabular run
+        // records one (`adam` since v1), so a bare resume rebuilds exactly that.
+        let recorded_optimizer = blob_str(blob, "optimizer");
+        if let Some(kind) = optimizer_of(optimizer.as_deref().or(recorded_optimizer.as_deref()))? {
+            trainer = trainer.with_optimizer(kind);
+        }
         // Install the sink at the RECORDED level before construction can emit: in a
         // fresh process a resume would otherwise be silent (the subscriber is
         // process-wide, so an earlier engine's ceiling still wins).
@@ -570,6 +667,27 @@ impl PyRaceEngine {
         Ok(Self {
             engine: Some(Arm::Tabular(engine)),
         })
+    }
+
+    /// Every string this binding accepts, keyed by the keyword that takes it —
+    /// the same dictionary as `gras.menus()`, reachable from the class so the
+    /// surface is discoverable by tab-completion as well as by reading docs.
+    ///
+    /// The binding cannot take a closure (the loss IS the autograd graph, and
+    /// `Variable` does not cross the boundary), so EVERY choice a Python caller
+    /// gets is a name from one of these tables. One call answers "what can I ask
+    /// for?":
+    ///
+    /// ```python
+    /// RaceEngine.available()["loss"]        # ['cross_entropy', 'mse', ...]
+    /// gras.losses()                        # the same list, for one concept
+    /// ```
+    ///
+    /// A name printed here is a name the engine accepts — `test_determinism.py`
+    /// drives one real clock through every published entry.
+    #[staticmethod]
+    fn available() -> std::collections::BTreeMap<&'static str, Vec<String>> {
+        crate::menu::menus()
     }
 
     /// Build an RL race on a Python gym/gymnasium environment.
@@ -602,6 +720,8 @@ impl PyRaceEngine {
         challenge_prob = None,
         max_turns = None,
         discount = None,
+        lr_schedule = None,
+        optimizer = None,
     ))]
     // Same reason as `new`: a constructor's kwargs ARE its API.
     #[allow(clippy::too_many_arguments)]
@@ -619,6 +739,8 @@ impl PyRaceEngine {
         challenge_prob: Option<f32>,
         max_turns: Option<usize>,
         discount: Option<f32>,
+        lr_schedule: Option<String>,
+        optimizer: Option<String>,
     ) -> PyResult<Self> {
         if let Some(name) = algo.as_deref() {
             if name != "reinforce" {
@@ -668,6 +790,12 @@ impl PyRaceEngine {
                 ChallengePolicy::LeastAction,
                 ChallengeDecay::Custom { exponent: 0.5 },
             );
+        }
+        if let Some(schedule) = lr_schedule_of(lr_schedule.as_deref())? {
+            trainer = trainer.with_named_lr_schedule(schedule);
+        }
+        if let Some(kind) = optimizer_of(optimizer.as_deref())? {
+            trainer = trainer.with_optimizer(kind);
         }
         let fitness = Fitness::reported(Direction::Maximize, signal.name());
         let engine = RlEngine::from_spec(RunSpec::rl(inner, fitness, trainer, seed, run_dir))
