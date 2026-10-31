@@ -101,13 +101,19 @@ impl CoreEngine {
                     )
                 },
             );
+            // The run seed rides the header: this file outlives the run dir, and the
+            // seed is the one input a later replay cannot reconstruct from the net.
             let md = format!(
-                "**{label} · fitness {} (risk-adjusted) = {:.4} · window {} · λ={:.2}**\n\n{}",
+                "**{label} · fitness {} (risk-adjusted) = {:.4} · window {} · λ={:.2} · run seed {}**\n\n{}\n\n{}",
                 self.fitness.direction().arrow(),
                 fitness,
                 reading,
                 self.config.risk_aversion,
+                self.header.run_seed,
                 crate::utils::markdown::topology_markdown(&topo, None),
+                // The net's own birth, as a mermaid graph: a founder is one box, a
+                // crossover draws its parents above and converges down to this net.
+                self.lineage_markdown(&hash),
             );
             match std::fs::write(&path, &md) {
                 Ok(()) => {
@@ -138,7 +144,7 @@ impl CoreEngine {
 
     /// Write EVERY live net's weights to `nets/<hash>.safetensors`.
     ///
-    /// The weights half of a checkpoint (R4): `nets/<hash>.json` carries the genome, the
+    /// The weights half of a checkpoint: `nets/<hash>.json` carries the genome, the
     /// counters and the ledger; this carries the coefficients — so `nets/` alone describes
     /// the frontier and a resume can LOAD instead of replaying. Called at the durability
     /// tick BEFORE the manifest, so a manifest never names a net whose weights are absent,
@@ -162,6 +168,22 @@ impl CoreEngine {
             if let Err(e) = crate::utils::safetensors::export_safetensors(net, &path) {
                 tracing::warn!("net weights export failed for {hash}: {e}");
             }
+            // The optimizer's own state, when asked for. `save_state_to` is
+            // the object-safe door flodl ships, and it writes atomically, so a kill
+            // mid-write leaves the previous file rather than a torn one.
+            if self.config.save_optim {
+                let optim = dir.join(format!("{hash}.optim"));
+                match self.optimizers.get(hash.as_str()) {
+                    Some(o) => {
+                        if let Err(e) = o.save_state_to(&optim.to_string_lossy()) {
+                            tracing::warn!("net optimizer state write failed for {hash}: {e}");
+                        }
+                    }
+                    None => {
+                        tracing::warn!("net optimizer state: live hash {hash} has no optimizer")
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -182,7 +204,8 @@ impl CoreEngine {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+            let ext = path.extension().and_then(|e| e.to_str());
+            if ext != Some("safetensors") && ext != Some("optim") {
                 continue;
             }
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -296,7 +319,7 @@ impl CoreEngine {
                         // able to see WHY this net is one of the worst, not just which.
                         let md = format!(
                             "**{label} · fitness {} (risk-adjusted) = {:.4} · window {} · \
-                             (D) prop {:.2} (trained {} of the field's {}) × (A) rescaled {:.2} \
+                             prop (D) {:.2} (trained {} of the field's {}) × rescaled (A) {:.2} \
                              (field best {:.4} … worst {:.4}) = {:.4}**\n\n{}",
                             self.fitness.direction().arrow(),
                             pick.score,
@@ -339,15 +362,15 @@ impl CoreEngine {
             crate::utils::cfy::emit(&crate::utils::cfy::card(
                 &format!("Worst-net artifacts (bottom-{})", picks.len()),
                     // The columns carry the SAME letters the stop-time `Final field`
-                    // table uses (`A` = fit, `E` = inefficiency), so an artifact row and its table
-                    // row name the same two numbers, computed by the same
+                    // table uses (`A` = fit, `D * A` = inefficiency), so an artifact row and
+                    // its table row name the same two numbers, computed by the same
                     // `inefficiency_field()`.
                 &crate::utils::cfy::table(
-                    &["#", "hash", "A", "E", "files"],
+                    &["#", "hash", "A", "D * A", "files"],
                     &written,
                 ),
                 Some(&format!(
-                    "the top-{} of the inefficiency column (`E = (D) prop × (A) rescaled`): (D) prop = trained / the field's {} (its most-trained net), (A) rescaled = |best − score| / |best − worst|, so a newborn cannot win either leg · the count is `elite_count` ({}), the same k the elite writers save — both ends of the ranking keep the same number of nets (set_worst_save_topology decides WHETHER, never how many) · a net saved as an elite is never also saved as a worst · `—` = not written (no readable blueprint, or a failed export)",
+                    "the top-{} of the `D * A` column (inefficiency = `prop (D) × rescaled (A)`, both legs normalised): `prop (D)` = trained / the field's {} (its most-trained net), `rescaled (A)` = |best − score| / |best − worst|, so a newborn cannot win either leg · the count is `elite_count` ({}), the same k the elite writers save — both ends of the ranking keep the same number of nets (set_worst_save_topology decides WHETHER, never how many) · a net saved as an elite is never also saved as a worst · `—` = not written (no readable blueprint, or a failed export)",
                     picks.len(),
                     picks.first().map(|p| p.max_trained).unwrap_or(0),
                     self.config.elite_count.max(1),
@@ -488,14 +511,14 @@ impl InefficiencyField {
     }
 
     /// The `(D) prop` leg alone (`D ÷ Dmax`) — the half of `E` that is the net's OWN
-    /// updates, printed beside `(A) rescaled` so the product is read off the row.
+    /// updates, printed beside `rescaled (A)` so the product is read off the row.
     pub(crate) fn updates_prop(&self, hash: &str) -> Option<f32> {
         self.nets.get(hash).map(|(_, spent, _)| *spent)
     }
 
-    /// The `(A) rescaled` leg alone (`|best − score| ÷ |best − worst|`) — `A` mapped onto
+    /// The `rescaled (A)` leg alone (`|best − score| ÷ |best − worst|`) — `A` mapped onto
     /// the field's span, i.e. the half of `E` that is NOT the net's own updates, so the
-    /// stop-time table can print it and let a reader redo `E = (D) prop × (A) rescaled`
+    /// stop-time table can print it and let a reader redo `D * A = prop (D) × rescaled (A)`
     /// from the row instead of trusting the product.
     pub(crate) fn fit_rescaled(&self, hash: &str) -> Option<f32> {
         self.nets.get(hash).map(|(_, _, gap)| *gap)
