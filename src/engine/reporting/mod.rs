@@ -637,8 +637,8 @@ impl CoreEngine {
     /// age, census) → how it is RANKED (fit and the window behind it) → what its
     /// LEARNING cost (`tickets`, `A/B`, `updates`, `idle`) → what that effort BOUGHT
     /// (`prop (D)`, `rescaled (A)`, `D * A`) → what the ELITE rules did with it (`only_act`,
-    /// the two Δ columns), then the conditional `eval loss` / informative-metric
-    /// columns.
+    /// the two Δ columns), then the conditional `eval loss` / `m:<metric>` columns —
+    /// the `m:` prefix marks a column as measured but NEVER ranked.
     ///
     /// Each measured quantity carries its WORD and its capital LETTER (`fit (A)`,
     /// `tickets (B)`, `updates (D)`), a DERIVED column is named by its own equation
@@ -652,7 +652,11 @@ impl CoreEngine {
             header.push("eval loss".to_string());
         }
         for m in &self.metrics {
-            header.push(m.label().to_string());
+                // `m:` marks the informative band: measured on the same eval batch as
+                // `fit (A)`, printed, and never ranked. The `name (letter)` form is taken
+                // by the column letters and the derived equations, so the prefix is the
+                // one spelling that cannot be mistaken for either.
+            header.push(format!("m:{}", m.label()));
         }
         header
     }
@@ -1480,6 +1484,15 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
                 },
             ),
         ),
+        // ── the informative band (appended after the last fixed column) ────
+        // ONE row stands for the whole band: its cells are as dynamic as the caller's
+        // `set_run_metrics(...)` list, so the PREFIX — not each label — is what the
+        // legend can promise.
+        (
+            "m:<name>".to_string(),
+            "an informative METRIC you registered with `set_run_metrics` — `m:` marks it as measured but NEVER ranked: computed on the same eval batch as `fit (A)`, recorded in `history.csv`, and read by no ranking, elite seat, lottery draw or cull. `<name>` is the label you gave `Metric::custom(...)`, verbatim, and the columns are appended after `mark` in config order"
+                .to_string(),
+        ),
     ]
 }
 
@@ -1519,7 +1532,12 @@ mod stop_legend_tests {
             );
         }
         // The conditional columns (`eval loss`, the informative metrics) are the only ones
-        // outside the 1:1 rule: they exist only when a trainer reports them.
+        // outside the 1:1 rule: they exist only when a trainer reports them. The metric
+        // band is dynamic, so its ONE `m:` row is asserted instead of each cell.
+        assert!(
+            rows.iter().any(|(k, _)| k == "m:<name>"),
+            "the `m:` metric prefix needs a legend row"
+        );
     }
 
     /// One key, one explanation — two rows for a column can disagree with each other.
