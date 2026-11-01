@@ -44,6 +44,34 @@ pub const DEFAULT_HUBER_BETA: f64 = 1.0;
 /// (the value the focal-loss paper settled on).
 pub const DEFAULT_FOCAL_GAMMA: f32 = 2.0;
 
+/// The default `k` for `top_k_accuracy` — the depth a 10-class head is usually read
+/// at, and what the BARE name means. `top_k_accuracy(5)` carries any other `k`.
+pub const DEFAULT_TOP_K: usize = 3;
+
+/// Parse a top-k spelling: the bare name (`k = DEFAULT_TOP_K`) or `top_k_accuracy(k)`.
+/// Returns `(k, label)`, the label normalising `k = 3` back to the bare name so
+/// `engine.json` shows ONE spelling for one recipe — the same rule [`Loss::label`]
+/// follows for its own parameters.
+fn parse_top_k(name: &str) -> Option<(usize, String)> {
+    let rest = name.trim().strip_prefix("top_k_accuracy")?;
+    let k = if rest.is_empty() {
+        DEFAULT_TOP_K
+    } else {
+        rest.strip_prefix('(')?.strip_suffix(')')?.trim().parse().ok()?
+    };
+    // `k = 0` asks for no classes at all: refuse the spelling rather than clamp a
+    // caller's typo into a real metric.
+    if k == 0 {
+        return None;
+    }
+    let label = if k == DEFAULT_TOP_K {
+        "top_k_accuracy".to_string()
+    } else {
+        format!("top_k_accuracy({k})")
+    };
+    Some((k, label))
+}
+
 /// What a loss expects `target` to look like. Used to explain a mismatch (and to
 /// pick a sensible default fitness), never to reshape anyone's data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +89,8 @@ pub enum TargetKind {
 pub const METRIC_NAMES: &[&str] = &[
     "accuracy",
     "balanced_accuracy",
+    "top_k_accuracy",
+    "auroc",
     "f1",
     "precision",
     "recall",
@@ -79,6 +109,8 @@ pub const FITNESS_NAMES: &[&str] = &[
     "cross_entropy",
     "accuracy",
     "balanced_accuracy",
+    "top_k_accuracy",
+    "auroc",
     "f1",
     "precision",
     "recall",
@@ -320,12 +352,20 @@ impl std::str::FromStr for Loss {
 /// can list [`METRIC_NAMES`].
 pub fn metric_for(name: &str) -> Option<Metric> {
     type ScoreBox = Box<dyn Fn(&Variable, &Variable) -> flodl::tensor::Result<f32> + Send + Sync>;
+    // The one name that carries an ARGUMENT: `top_k_accuracy(k)`. The k travels in
+    // the closure and the label, so the column header and `engine.json` state it.
+    if let Some((k, label)) = parse_top_k(name) {
+        return Some(Metric::custom(label, move |pred: &Variable, y: &Variable| {
+            crate::utils::score::top_k_accuracy_score(pred, y, k)
+        }));
+    }
     let (label, f): (&'static str, ScoreBox) = match name.trim() {
         "accuracy" => ("accuracy", Box::new(crate::utils::score::accuracy_score)),
         "balanced_accuracy" => (
             "balanced_accuracy",
             Box::new(crate::utils::score::balanced_accuracy_score),
         ),
+        "auroc" => ("auroc", Box::new(crate::utils::score::auroc_score)),
         "f1" => ("f1", Box::new(crate::utils::score::f1_score)),
         "precision" => ("precision", Box::new(crate::utils::score::precision_score)),
         "recall" => ("recall", Box::new(crate::utils::score::recall_score)),
@@ -368,6 +408,11 @@ pub fn metrics_for(names: &[&str]) -> Result<Vec<Metric>, EngineError> {
 /// fixed by what "better" means for each. `None` = unknown; see
 /// [`FITNESS_NAMES`].
 pub fn fitness_for(name: &str) -> Option<Fitness> {
+    if let Some((k, label)) = parse_top_k(name) {
+        return Some(Fitness::maximize(&label, move |pred: &Variable, y: &Variable| {
+            crate::utils::score::top_k_accuracy_score(pred, y, k)
+        }));
+    }
     Some(match name.trim() {
         "cross_entropy" => Fitness::minimize("cross_entropy", crate::utils::score::cross_entropy_onehot),
         "accuracy" => Fitness::maximize("accuracy", crate::utils::score::accuracy_score),
@@ -375,6 +420,7 @@ pub fn fitness_for(name: &str) -> Option<Fitness> {
             "balanced_accuracy",
             crate::utils::score::balanced_accuracy_score,
         ),
+        "auroc" => Fitness::maximize("auroc", crate::utils::score::auroc_score),
         "f1" => Fitness::maximize("f1", crate::utils::score::f1_score),
         "precision" => Fitness::maximize("precision", crate::utils::score::precision_score),
         "recall" => Fitness::maximize("recall", crate::utils::score::recall_score),
@@ -560,6 +606,34 @@ mod tests {
         assert!(fitness_for("nope").is_none());
         // Aliases normalise to the label a run logs.
         assert_eq!(metric_for("l1").unwrap().label(), "mae");
+    }
+
+    #[test]
+    fn top_k_carries_its_k_and_normalises_the_default_spelling() {
+        // The bare name means k = 3 and is labelled bare, so engine.json shows one
+        // spelling per recipe; any other k travels in the label.
+        assert_eq!(
+            metric_for("top_k_accuracy").unwrap().label(),
+            "top_k_accuracy"
+        );
+        assert_eq!(
+            metric_for(&format!("top_k_accuracy({DEFAULT_TOP_K})"))
+                .unwrap()
+                .label(),
+            "top_k_accuracy"
+        );
+        assert_eq!(
+            metric_for("top_k_accuracy(5)").unwrap().label(),
+            "top_k_accuracy(5)"
+        );
+        assert_eq!(
+            fitness_for("top_k_accuracy(5)").unwrap().label(),
+            "top_k_accuracy(5)"
+        );
+        // A k of zero asks for nothing: refused, not silently clamped.
+        assert!(metric_for("top_k_accuracy(0)").is_none());
+        assert!(fitness_for("top_k_accuracy(0)").is_none());
+        assert!(metric_for("top_k_accuracy(x)").is_none());
     }
 
     #[test]
