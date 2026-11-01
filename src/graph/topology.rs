@@ -275,19 +275,37 @@ impl Topology {
             if node.kind == NodeKind::Input || node.num_outputs <= 1 {
                 continue;
             }
-            let mut ports = vec![node.activation];
-            for _ in 1..node.num_outputs {
-                ports.push(pool[self.rng.usize(0..pool.len())]);
+                // FILL-ONLY: a port's activation is genome, and `finalize` carries it
+                // through the port remap — so only ports that still have none (a fresh
+                // net, or a port the rebuild ADDED) draw a coin here. Re-drawing every
+                // port made an inherited activation survive at ~1/|pool| per port.
+            let mut ports: Vec<Option<Activation>> = node
+                .port_activations
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .map(Some)
+                .collect();
+            ports.truncate(node.num_outputs);
+            ports.resize(node.num_outputs, None);
+            for slot in ports.iter_mut().skip(1) {
+                if slot.is_none() {
+                    *slot = Some(pool[self.rng.usize(0..pool.len())]);
+                }
             }
-            node.port_activations = Some(ports);
+                // Port 0 mirrors the node-level activation by construction: that is the
+                // node gene, not a per-port one.
+            ports[0] = Some(node.activation);
+            node.port_activations =
+                Some(ports.into_iter().map(|p| p.unwrap_or(node.activation)).collect());
         }
     }
 
         /// Assign per-output-port feature masks to the Input node from `policy` —
         /// the feature split. MUST run **after** `finalize()`: the Input node's port
         /// count is final only once `trim_orphaned_ports` compacted it (the same rule
-        /// `assign_port_activations` follows), and `finalize` drops any masks from a
-        /// previous build rather than let a stale port count through.
+        /// `assign_port_activations` follows). A rebuild CARRIES existing rows through
+        /// the port remap; this is the creation path, which draws a fresh split.
     pub fn assign_feature_masks(&mut self, policy: FeatureSplitPolicy) {
         let input_dim = self.options.input_dim.unwrap_or(1);
         let Some(input) = self.nodes.iter().position(|n| n.kind == NodeKind::Input) else {
@@ -324,8 +342,9 @@ impl Topology {
     }
 
         /// The Input node's per-port feature masks, cloned (`None` when this
-        /// topology carries no split). The engine snapshots these BEFORE a
-        /// crossover, which re-finalizes both parents and drops them.
+        /// topology carries no split). Read AFTER a crossover (`cx_*` re-finalizes
+        /// both parents, and `finalize` carries the rows through its port remap), so
+        /// the rows and the ports they belong to agree.
     pub fn input_feature_masks(&self) -> Option<Vec<Vec<u8>>> {
         self.nodes
             .iter()
@@ -389,18 +408,6 @@ impl Topology {
         /// dangling outputs — one call turns a pile of nodes into a complete graph.
     pub fn finalize(&mut self) {
         self.connections.clear();
-
-            // Feature masks are bound to the Input node's port COUNT, and this rebuild
-            // re-wires and re-counts those ports (`set_input_fanout` can raise the count,
-            // `trim_orphaned_ports` compacts it). A mask from before the rebuild can
-            // therefore have the wrong length — which `validate` rightly refuses, and
-            // since `finalize` validates, that would panic. Crossover re-finalizes both
-            // parents, and those parents already carry masks, so this is a real path.
-            // Dropping them here loses nothing: every creation path re-derives masks from
-            // the run's policy AFTER `finalize` (`assign_feature_masks`).
-        for node in &mut self.nodes {
-            node.feature_masks = None;
-        }
 
         // Step 1: build_skeleton — ensure Input + Output nodes exist
         self.ensure_scaffold();
@@ -1131,6 +1138,7 @@ impl Topology {
         }
 
         // Update port counts.
+        let mask_width = self.options.input_dim.unwrap_or(1);
         for (i, node) in self.nodes.iter_mut().enumerate() {
             if Some(node.id) != output_id {
                 node.num_outputs = out_remap[i]
@@ -1154,6 +1162,26 @@ impl Topology {
                             .unwrap_or(crate::graph::node::Activation::Identity),
                     );
                     *ports = compacted;
+                }
+                    // Feature masks are port-bound too: carry each row with the port it
+                    // belongs to, drop the rows of ports the rebuild removed, and leave a
+                    // port the rebuild ADDED unmasked (every feature reaches it) rather
+                    // than inventing a row here — the policy draw is the caller's job.
+                if let Some(masks) = &mut node.feature_masks {
+                    let mut kept: Vec<Vec<u8>> = Vec::with_capacity(node.num_outputs);
+                    for &old in &out_remap[i] {
+                        if old == usize::MAX {
+                            continue;
+                        }
+                        kept.push(
+                            masks
+                                .get(old)
+                                .cloned()
+                                .unwrap_or_else(|| vec![1u8; mask_width]),
+                        );
+                    }
+                    kept.resize(node.num_outputs, vec![1u8; mask_width]);
+                    *masks = kept;
                 }
             }
             let connected_in = in_remap[i].iter().filter(|&&v| v != usize::MAX).count();
@@ -2544,10 +2572,11 @@ mod fanout_bounds_tests {
     }
 
     #[test]
-    fn finalize_drops_masks_instead_of_letting_a_stale_count_panic() {
+    fn finalize_carries_masks_through_the_port_remap() {
             // Crossover re-finalizes both parents, and those parents already carry masks
-            // from their own build. A mask sized for the OLD port count must never reach
-            // `validate` — finalize drops it, and the engine re-derives right after.
+            // from their own build. The rebuild re-counts and renumbers ports, so the rows
+            // must travel through the SAME remap the wires did instead of being wiped —
+            // otherwise every child inherits an arbitrary permutation, or nothing.
         let opts = TopologyOptions {
             input_dim: Some(4),
             output_dim: Some(1),
@@ -2557,21 +2586,25 @@ mod fanout_bounds_tests {
         g.create_random_hidden_nodes(3);
         g.finalize();
         g.assign_feature_masks(FeatureSplitPolicy::Exclusive);
-        assert!(
-            g.nodes.iter().any(|n| n.feature_masks.is_some()),
-            "the split must actually be present before the rebuild"
-        );
+        let before = g.input_feature_masks().expect("the split is present");
 
-            // The rebuild itself: it must not panic on the stale masks.
+        // The rebuild itself: the rows must survive it, at the FINAL port count.
         g.finalize();
+        let after = g
+            .input_feature_masks()
+            .expect("finalize must carry the split, not wipe it");
+        let input = g
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Input)
+            .unwrap();
+        assert_eq!(after.len(), input.num_outputs, "one row per final port");
         assert!(
-            g.nodes.iter().all(|n| n.feature_masks.is_none()),
-            "finalize must drop port-count-bound masks"
+            after.iter().all(|m| m.len() == 4),
+            "every carried row keeps its width"
         );
-
-            // And re-deriving immediately afterwards is the engine's flow — it must validate.
-        g.assign_feature_masks(FeatureSplitPolicy::Exclusive);
-        g.validate().expect("re-derived masks must validate");
+        assert_eq!(after[0], before[0], "surviving ports keep their own row");
+        g.validate().expect("carried masks must validate");
     }
 
     #[test]
