@@ -898,6 +898,10 @@ impl CoreEngine {
                     fmt_cfg(self.config.train_merit),
                 ),
                 (
+                    "train_merit_p_min (p_min)".to_string(),
+                    fmt_cfg(self.config.train_merit_p_min),
+                ),
+                (
                     "fitness".to_string(),
                     format!("{} ({})", self.meta_ctx.fitness_label, self.meta_ctx.direction),
                 ),
@@ -1620,6 +1624,15 @@ impl CoreEngine {
         header: &crate::state::RunHeader,
     ) {
         config.topology_options = header.topology_options;
+        // A header written BEFORE the split moved onto `TopologyOptions` recorded it on
+        // `config.feature_split`; restore it here so an old run keeps drawing the same
+        // masks for its newborns instead of silently reverting to "no split".
+        if config.topology_options.feature_split.is_none() {
+            if let Some(raw) = header.config.feature_split.as_deref() {
+                config.topology_options.feature_split =
+                    crate::engine::config::parse_feature_split_wire(raw);
+            }
+        }
         if let Some(pool) = header
             .hidden_dim_pool
             .split_once("..=")

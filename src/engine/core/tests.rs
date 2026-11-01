@@ -64,6 +64,7 @@ max_hidden_outputs_per_node: 1,
 input_dim: Some(2),
 output_dim: Some(2),
 dropout_prob: 0.0,
+feature_split: None,
 }),
 );
 topo.nodes.push(Node::new_input(0, 2));
@@ -1635,6 +1636,7 @@ max_hidden_outputs_per_node: 1,
 input_dim: Some(2),
 output_dim: Some(2),
 dropout_prob: 0.0,
+feature_split: None,
 }),
 );
 topo.nodes.push(Node::new_input(0, 2));
@@ -1726,7 +1728,8 @@ fn crossover_children_inherit_the_parents_feature_split() {
 let dir = std::env::temp_dir().join("gras-mask-inherit");
 let _ = std::fs::remove_dir_all(&dir);
 let mut eng = engine(&dir, 11).unwrap();
-eng.config.feature_split = Some(crate::graph::topology::FeatureSplitPolicy::Random);
+eng.config.topology_options.feature_split =
+Some(crate::graph::topology::FeatureSplitPolicy::Random);
 eng.config.crossover_prob = 1.0;
 eng.config.crossover_ops_pool = vec!["one_point".to_string()];
 // Founders carry a split, installed after their finalize exactly as a real run
@@ -2914,6 +2917,8 @@ let hashes = eng.state.live_hashes();
 // OFF (the default): no field, everybody trains.
 assert!(eng.lottery_frame(50).is_none());
 eng.config.train_merit = 1.0;
+// This test asserts the RAW fractions and the p = 0 coin, so pin the miss-floor.
+eng.config.train_merit_p_min = 0.0;
 
 // Means 100 / 200 / 300 over the SAME budget (each net has spent one ticket):
 // the shared divisor cannot change the ORDER, only the scale — merits are
@@ -3007,6 +3012,8 @@ assert!(eng.train_lottery_draws(h, 5, None));
 // Fixture fitness is Minimize with merits 100/200/300 per ticket: raw fractions
 // are 1, 0.5 and 0 — the best, the middle and the worst.
 eng.config.train_merit = 1.0;
+// Ω is the only dial under test here.
+eng.config.train_merit_p_min = 0.0;
 let frame = eng.lottery_frame(5).expect("armed at clock 5");
 let raw: Vec<f32> = hashes
 .iter()
@@ -3040,6 +3047,57 @@ assert!((eff(&eng, 2) - 0.0).abs() < 1e-6, "Ω clamps to 1");
 eng.config.train_merit = -1.0;
 assert!((eff(&eng, 2) - 1.0).abs() < 1e-6, "Ω clamps to 0");
 
+let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `p_min` is a BOTTOM floor on the field fraction: it lifts the worst net off
+/// `p = 0` without moving the best one, and it sits UNDER Ω, so `Ω = 0` still
+/// means "everybody trains". Fixture: merits 100 / 200 / 300 per ticket under
+/// Minimize ⇒ raw fractions 1 / 0.5 / 0.
+#[test]
+fn train_merit_p_min_floors_only_the_bottom_of_the_field() {
+let dir = std::env::temp_dir().join("gras-train-merit-p-min");
+let _ = std::fs::remove_dir_all(&dir);
+let mut eng = engine(&dir, 21).unwrap();
+eng.config.mutation_probation_steps = 0;
+eng.config.crossover_probation_steps = 0;
+eng.seed_population_internal(
+vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+Some(0.5),
+)
+.unwrap();
+let hashes = eng.state.live_hashes();
+for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
+let h = &hashes[i];
+let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+buf.push(mean);
+*eng.rolling_fitness.get_mut(h).unwrap() = buf;
+eng.state.net_mut(h).unwrap().step = 1;
+}
+eng.config.train_merit = 1.0;
+eng.config.train_merit_p_min = 0.05;
+let frame = eng.lottery_frame(5).expect("armed at clock 5");
+let eff = |eng: &CoreEngine, i: usize| eng.train_lottery_p_eff(&hashes[i], 5, Some(frame));
+// At Ω = 1 the coin IS the floored fraction: 1, 0.05 + 0.95·0.5, 0.05.
+assert!((eff(&eng, 0) - 1.0).abs() < 1e-6, "the best net is untouched");
+assert!((eff(&eng, 1) - 0.525).abs() < 1e-6);
+assert!((eff(&eng, 2) - 0.05).abs() < 1e-6, "the worst keeps the floor");
+// Bottom-ONLY: the gap between the best and the middle shrank by the 0.95 factor,
+// not by a constant, so the field's order and relative shape survive.
+assert!((eff(&eng, 0) - eff(&eng, 1) - 0.475).abs() < 1e-6);
+// Under Ω the floor is blended toward 1, never multiplied away.
+eng.config.train_merit = 0.5;
+assert!((eff(&eng, 2) - 0.525).abs() < 1e-6, "1 − 0.5·(1 − 0.05)");
+assert!((eff(&eng, 1) - 0.7625).abs() < 1e-6, "1 − 0.5·(1 − 0.525)");
+// Ω = 0 is still fully off, floor and all.
+eng.config.train_merit = 0.0;
+assert!(eng.lottery_frame(5).is_none());
+assert!((eff(&eng, 2) - 1.0).abs() < 1e-6);
+// A floor of 0.0 reproduces the pre-floor numbers exactly.
+eng.config.train_merit = 1.0;
+eng.config.train_merit_p_min = 0.0;
+assert!((eff(&eng, 2) - 0.0).abs() < 1e-6);
+assert!((eff(&eng, 1) - 0.5).abs() < 1e-6);
 let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3337,6 +3395,8 @@ let dir = std::env::temp_dir().join("gras-lottery-coin-seed");
 let _ = std::fs::remove_dir_all(&dir);
 let mut eng = engine(&dir, 21).unwrap();
 eng.config.train_merit = 1.0;
+// The midpoint coin is the point of this test, so no floor lifts it to 0.525.
+eng.config.train_merit_p_min = 0.0;
 eng.config.mutation_probation_steps = 5;
 eng.config.crossover_probation_steps = 5;
 eng.seed_population_internal(

@@ -70,6 +70,15 @@ impl CoreEngine {
             fmt_cfg(current.train_merit),
             format!("set_run_train_merit({})", fmt_cfg(recorded.train_merit)),
         );
+        push(
+            "train_merit_p_min (p_min)",
+            fmt_cfg(recorded.train_merit_p_min),
+            fmt_cfg(current.train_merit_p_min),
+            format!(
+                "set_run_train_merit_p_min({})",
+                fmt_cfg(recorded.train_merit_p_min)
+            ),
+        );
         for (label, setter, rec, cur) in [
             (
                 "crossover_cull_policy",
