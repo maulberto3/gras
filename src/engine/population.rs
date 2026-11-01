@@ -32,8 +32,9 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     let mut opts = config.topology_options;
     opts.topology_seed = seed;
     let n_hidden = rng.usize(opts.min_hidden_num_nodes..=opts.max_hidden_num_nodes);
-    // The split travels with the BLUEPRINT (`opts` is moved into the topology).
-    let feature_split = opts.feature_split;
+    // The split is a POOL draw: none, random or exclusive can enter the population.
+    let feature_split = draw_feature_split(config, &mut rng);
+    opts.feature_split = feature_split;
     let mut graph = Topology::new(seed, Some(opts));
     graph.create_random_hidden_nodes(n_hidden);
     let pool = config.hidden_dim_pool.clone().unwrap_or(4..=8);
@@ -55,6 +56,22 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
         graph.assign_feature_masks(policy);
     }
     graph
+}
+
+/// Draw one policy from the run's feature-split pool (`empty ⇒ all three`) with the
+/// caller's own deterministic RNG. `None` = this net carries no split.
+pub(crate) fn draw_feature_split(
+    config: &RaceConfig,
+    rng: &mut fastrand::Rng,
+) -> Option<crate::graph::topology::FeatureSplitPolicy> {
+    let pool = config.resolved_feature_split_pool().unwrap_or_else(|_| {
+        vec![
+            None,
+            Some(crate::graph::topology::FeatureSplitPolicy::Random),
+            Some(crate::graph::topology::FeatureSplitPolicy::Exclusive),
+        ]
+    });
+    pool[rng.usize(..pool.len())]
 }
 
 /// The initial population: `pop_size` deterministic draws, deduped by topology
@@ -357,8 +374,7 @@ mod tests {
         cfg.pop_size = 4;
         cfg.topology_options = opts;
         cfg.hidden_dim_pool = Some(4..=4);
-        cfg.topology_options.feature_split =
-            Some(crate::graph::topology::FeatureSplitPolicy::Exclusive);
+        cfg.feature_split_pool = vec!["exclusive".to_string()];
 
         for topo in initial_population(&cfg, 42) {
             topo.validate().expect("a split topology must validate");
@@ -390,16 +406,58 @@ mod tests {
             // about an existing run's population changes.
         let cfg = tiny_config(4);
         assert!(
-            cfg.topology_options.feature_split.is_none(),
-            "the split is opt-in"
+            cfg.feature_split_pool.is_empty(),
+            "the pool is empty by default (= none, random, exclusive)"
         );
-        for topo in initial_population(&cfg, 42) {
+        let mut none_only = tiny_config(4);
+        none_only.feature_split_pool = vec!["none".to_string()];
+        for topo in initial_population(&none_only, 42) {
             let input = topo
                 .nodes
                 .iter()
                 .find(|n| n.kind == NodeKind::Input)
                 .unwrap();
-            assert_eq!(input.feature_masks, None, "no policy ⇒ no masks");
+            assert_eq!(input.feature_masks, None, "pool [none] ⇒ no masks");
+        }
+    }
+
+    /// The default pool is all three policies, so a population holds unsplit and split
+    /// nets at once — the split is a selectable gene, not a run-wide switch.
+    #[test]
+    fn the_default_pool_puts_all_three_policies_in_one_population() {
+        let opts = crate::graph::topology::TopologyOptions {
+            min_hidden_num_nodes: 4,
+            max_hidden_num_nodes: 4,
+            input_dim: Some(3),
+            output_dim: Some(2),
+            ..Default::default()
+        };
+        let mut cfg = RaceConfig::defaults();
+        cfg.pop_size = 12;
+        cfg.topology_options = opts;
+        cfg.hidden_dim_pool = Some(4..=4);
+        let mut seen: Vec<Option<crate::graph::topology::FeatureSplitPolicy>> = initial_population(&cfg, 7)
+            .iter()
+            .map(|t| t.options.feature_split)
+            .collect();
+        seen.sort_by_key(|p| format!("{p:?}"));
+        seen.dedup();
+        assert!(
+            seen.len() >= 2,
+            "12 draws from {{none, random, exclusive}} produced {seen:?}"
+        );
+        for topo in initial_population(&cfg, 7) {
+            topo.validate().expect("every drawn split must validate");
+            let input = topo
+                .nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Input)
+                .unwrap();
+            assert_eq!(
+                input.feature_masks.is_some(),
+                topo.options.feature_split.is_some(),
+                "the masks that exist are the ones the drawn policy says"
+            );
         }
     }
 }

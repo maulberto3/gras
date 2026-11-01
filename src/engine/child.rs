@@ -153,8 +153,9 @@ impl CoreEngine {
             // FRESH roulette-drawn parents.
         let mut child_topo = None;
             // Inherited feature-mask rows for the child (empty = neither parent carried a
-            // split). Captured BEFORE crossover, because `cx_*` re-finalizes both parents
-            // and `finalize` drops port-count-bound masks.
+            // split). Read AFTER the operator: `cx_*` re-finalizes both parents, and
+            // `finalize` now carries each parent's masks through its port remap, so the
+            // rows line up with the ports the child actually ends up with.
         let mut child_masks: Vec<Vec<u8>> = Vec::new();
             // What the operator exchanged (`uniform` only — a one-point cut is not a
             // per-gene coin, so it reports nothing rather than a number that would read
@@ -201,10 +202,8 @@ impl CoreEngine {
                 .map(|&p| ranked[p].0.clone())
                 .collect();
             let mut pa = self.load_parent_topology(&attempt_parents[0])?;
-            let pa_masks = pa.input_feature_masks();
             if n_parents == 2 {
                 let mut pb = self.load_parent_topology(&attempt_parents[1])?;
-                let pb_masks = pb.input_feature_masks();
                 let cx = match op {
                     CrossoverOp::OnePoint => Topology::cx_one_point(&mut pa, &mut pb, rng),
                     CrossoverOp::Uniform => {
@@ -216,8 +215,14 @@ impl CoreEngine {
                     }
                 };
                 if cx {
+                        // Both parents' rows, in their post-finalize port numbering.
+                    child_masks = mix_feature_masks(
+                        pa.input_feature_masks(),
+                        pb.input_feature_masks(),
+                        op,
+                        rng,
+                    );
                     child_topo = Some(pa);
-                    child_masks = mix_feature_masks(pa_masks, pb_masks, op, rng);
                     cx_note = match op {
                         CrossoverOp::OnePoint => "crossover-one-point",
                         CrossoverOp::Uniform => "crossover-uniform",
@@ -230,10 +235,10 @@ impl CoreEngine {
             } else {
                 // Single-parent mode: the child is the parent with a new seed
                 // (asexual reproduction; crossover needs two).
-                child_topo = Some(pa);
                     // Asexual reproduction inherits the parent's own split verbatim — no
                     // re-draw, since no rebuild ran and the rows already fit the ports.
-                child_masks = pa_masks.unwrap_or_default();
+                child_masks = pa.input_feature_masks().unwrap_or_default();
+                child_topo = Some(pa);
                 cx_note = "clone".to_string();
                 parent_hashes = attempt_parents;
                 break;
@@ -304,6 +309,9 @@ impl CoreEngine {
         let mut opts = topo_opts;
         opts.input_dim = Some(self.header.input_dim);
         opts.output_dim = Some(self.header.output_dim);
+        // Immigrants draw their split from the same pool the founders did, so a
+        // population keeps every policy reachable, not just the ones it started with.
+        opts.feature_split = super::population::draw_feature_split(&self.config, &mut rng);
             // The topology's internal rng must also derive from the run seed, or every
             // random child with the same n_hidden is structurally identical.
         let topo_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx) as usize;

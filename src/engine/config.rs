@@ -292,6 +292,13 @@ pub struct RaceConfig {
         /// Combine/activation/standardize pools actually used by the run; empty uses all
         /// known ops (`empty ⇒ all` convention).
     pub combine_op_pool: Vec<String>,
+    /// The feature-split POOL newborns draw from: `none`, `random`, `exclusive`
+    /// (the `split_*` spellings `engine.json` writes are accepted too). **Empty ⇒
+    /// all three**, so a population can hold unsplit and split nets side by side and
+    /// the split itself becomes selectable instead of a run-wide constant. The drawn
+    /// policy lands on the individual's own `TopologyOptions`, so a newborn's split
+    /// travels with its blueprint and its children inherit the rows, not the draw.
+    pub feature_split_pool: Vec<String>,
     /// Activation pool (empty ⇒ all).
     pub activation_pool: Vec<String>,
     /// Standardize-op pool (empty ⇒ all).
@@ -533,6 +540,7 @@ impl RaceConfig {
             hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
             hidden_dim_stride: 16,
             combine_op_pool: Vec::new(),
+            feature_split_pool: Vec::new(),
             activation_pool: Vec::new(),
             standardize_op_pool: Vec::new(),
             topology_options: crate::graph::topology::TopologyOptions::default(),
@@ -553,6 +561,41 @@ impl RaceConfig {
             mutation_probation_steps: 5,
             crossover_probation_steps: 5,
         }
+    }
+
+        /// The pool resolved to drawable policies (`empty ⇒ all three`, in the fixed
+        /// order none → random → exclusive so the draw is reproducible). An unknown
+        /// name is named in the error; callers fall back to all three rather than
+        /// silently narrowing the search.
+    pub fn resolved_feature_split_pool(
+        &self,
+    ) -> Result<Vec<Option<FeatureSplitPolicy>>, String> {
+        if self.feature_split_pool.is_empty() {
+            return Ok(vec![
+                None,
+                Some(FeatureSplitPolicy::Random),
+                Some(FeatureSplitPolicy::Exclusive),
+            ]);
+        }
+        self.feature_split_pool
+            .iter()
+            .map(|raw| {
+                parse_feature_split_pool_entry(raw).ok_or_else(|| {
+                    format!(
+                        "feature_split_pool {raw:?}: expected one of none, random, exclusive"
+                    )
+                })
+            })
+            .collect()
+    }
+        /// The pool as wire names, in draw order — one spelling for the log, the
+        /// `engine.json` record and the resume diff.
+    pub fn feature_split_pool_names(&self) -> Vec<String> {
+        self.resolved_feature_split_pool()
+            .unwrap_or_else(|_| vec![None])
+            .into_iter()
+            .map(|p| p.map(|p| p.to_string()).unwrap_or_else(|| "none".to_string()))
+            .collect()
     }
 
     /// The inverse of [`crate::state::ConfigSnapshot::from_config`]: rebuild the
@@ -627,10 +670,17 @@ impl RaceConfig {
         } else {
             SelectionMethod::Roulette
         };
-        cfg.topology_options.feature_split = snap
-            .feature_split
-            .as_deref()
-            .and_then(parse_feature_split_wire);
+        // Pool: a header that recorded one (a post-pool run) wins; an older header
+        // recorded a single policy (or none), which becomes a one-entry pool so a
+        // resume cannot silently start drawing splits the run never had.
+        cfg.feature_split_pool = if snap.feature_split_pool.is_empty() {
+            vec![snap
+                .feature_split
+                .clone()
+                .unwrap_or_else(|| "none".to_string())]
+        } else {
+            snap.feature_split_pool.clone()
+        };
         cfg.mode = if snap.mode.eq_ignore_ascii_case("rl") {
             RunMode::Rl
         } else {
@@ -683,6 +733,23 @@ pub(crate) fn parse_feature_split_wire(raw: &str) -> Option<FeatureSplitPolicy> 
         Some(FeatureSplitPolicy::Exclusive)
     } else if raw.contains("random") {
         Some(FeatureSplitPolicy::Random)
+    } else {
+        None
+    }
+}
+
+
+/// One POOL entry: `Some(None)` is the `none` policy (no split), `Some(Some(_))` a
+/// drawable policy, `None` an unknown spelling. Kept separate from
+/// [`parse_feature_split_wire`] so "no split" and "unparseable" cannot be confused.
+pub(crate) fn parse_feature_split_pool_entry(raw: &str) -> Option<Option<FeatureSplitPolicy>> {
+    let raw = raw.to_ascii_lowercase();
+    if raw.contains("none") || raw == "off" {
+        Some(None)
+    } else if raw.contains("exclusive") {
+        Some(Some(FeatureSplitPolicy::Exclusive))
+    } else if raw.contains("random") {
+        Some(Some(FeatureSplitPolicy::Random))
     } else {
         None
     }
@@ -858,7 +925,19 @@ impl RaceConfigBuilder {
         /// are drawn. Unset (`None`, the default) = no split. Off/value rather than a
         /// bool: the policy IS the value, and "off" is simply not calling this.
     pub fn set_topology_feature_split(mut self, policy: FeatureSplitPolicy) -> Self {
-        self.cfg.topology_options.feature_split = Some(policy);
+        self.cfg.feature_split_pool = vec![policy.to_string()];
+        self
+    }
+        /// The pool a NEWBORN's split is drawn from, in draw order — `["none",
+        /// "random", "exclusive"]` gives every policy a chance, `["exclusive"]` pins
+        /// one, `["none"]` turns the split off. Empty (default) means all three.
+        /// Replay-relevant: which masks a lineage gains is decided here.
+    pub fn set_topology_feature_split_pool<I, S>(mut self, pool: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.cfg.feature_split_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
         /// Explicit step budget — the only built-in stop criterion. Accepts a bare value or an

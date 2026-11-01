@@ -79,6 +79,31 @@ impl CoreEngine {
                 fmt_cfg(recorded.train_merit_p_min)
             ),
         );
+        // Pool drift changes which masks the NEXT newborn gets (the nets already live
+        // keep theirs), so it is a behavioural warning like Ω. A pre-pool header has an
+        // empty list, which means its single recorded policy — `from_snapshot` already
+        // folded that in, so the comparison is one spelling.
+        let rec_pool = if recorded.feature_split_pool.is_empty() {
+            vec![recorded
+                .feature_split
+                .clone()
+                .unwrap_or_else(|| "none".to_string())]
+        } else {
+            recorded.feature_split_pool.clone()
+        };
+        push(
+            "feature_split_pool",
+            rec_pool.join(","),
+            current.feature_split_pool_names().join(","),
+            format!(
+                "set_topology_feature_split_pool([{}])",
+                rec_pool
+                    .iter()
+                    .map(|p| format!("\"{p}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
         for (label, setter, rec, cur) in [
             (
                 "crossover_cull_policy",

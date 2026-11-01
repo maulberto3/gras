@@ -902,6 +902,10 @@ impl CoreEngine {
                     fmt_cfg(self.config.train_merit_p_min),
                 ),
                 (
+                    "feature_split_pool".to_string(),
+                    self.config.feature_split_pool_names().join(", "),
+                ),
+                (
                     "fitness".to_string(),
                     format!("{} ({})", self.meta_ctx.fitness_label, self.meta_ctx.direction),
                 ),

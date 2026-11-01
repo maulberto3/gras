@@ -39,6 +39,7 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("risk_aversion", 0.0)?;
     d.set_item("train_merit", round32(cfg.train_merit))?;
     d.set_item("train_merit_p_min", round32(cfg.train_merit_p_min))?;
+    d.set_item("feature_split_pool", cfg.feature_split_pool_names())?;
     d.set_item("log_level", format!("{:?}", cfg.log_level).to_lowercase())?;
     d.set_item("mode", format!("{:?}", cfg.mode).to_lowercase())?;
 

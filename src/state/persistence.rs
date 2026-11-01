@@ -158,6 +158,12 @@ pub struct ConfigSnapshot {
         /// drawn, so a finished run can say what produced it.
     #[serde(default)]
     pub feature_split: Option<String>,
+        /// The feature-split POOL the run drew newborn splits from, in draw order
+        /// (`"none"`, `"split_random"`, `"split_exclusive"`). The run-wide answer to
+        /// "can an unsplit and a split net coexist?". Empty = a header written before
+        /// the pool existed: read that run's single `feature_split` instead.
+    #[serde(default)]
+    pub feature_split_pool: Vec<String>,
         /// Load the newest compatible previous experiment's elites as the first
         /// founders. Recorded because it decides what the founder batch IS. Default
         /// false. `alias` reads headers written before the rename.
@@ -181,6 +187,14 @@ impl ConfigSnapshot {
         batch_size: Option<usize>,
         eval_batch_size: Option<usize>,
     ) -> Self {
+        let split_pool = cfg.feature_split_pool_names();
+        // One policy is also recorded on the single-value field, so readers written
+        // before the pool (and the Python tests that assert on it) keep working.
+        let split_single = if split_pool.len() == 1 {
+            Some(split_pool[0].clone())
+        } else {
+            None
+        };
         ConfigSnapshot {
             pop_size: cfg.pop_size,
             checkpoint_every: cfg.checkpoint_every,
@@ -226,7 +240,8 @@ impl ConfigSnapshot {
             crossover_probation_steps: cfg.crossover_probation_steps,
             elite_join_probation_steps: cfg.elite_join_probation_steps,
             elite_crown_lifetime_steps: cfg.elite_crown_lifetime_steps,
-            feature_split: cfg.topology_options.feature_split.map(|p| p.to_string()),
+            feature_split: split_single,
+            feature_split_pool: split_pool,
             build: crate::engine::format::build_stamp(),
         }
     }
@@ -1855,17 +1870,22 @@ mod tests {
     fn config_snapshot_records_the_feature_split_policy() {
         use crate::graph::topology::FeatureSplitPolicy;
         let mut cfg = crate::engine::config::RaceConfig::defaults();
-        cfg.topology_options.feature_split = None;
+        cfg.feature_split_pool = Vec::new();
+        let all = ConfigSnapshot::from_config(&cfg, None, None);
         assert_eq!(
-            ConfigSnapshot::from_config(&cfg, None, None).feature_split,
-            None,
-            "a run with the split off records no policy"
+            all.feature_split, None,
+            "an all-three pool is not one policy"
+        );
+        assert_eq!(
+            all.feature_split_pool,
+            vec!["none", "split_random", "split_exclusive"],
+            "the record names the resolved pool, in draw order"
         );
         for (policy, wire) in [
             (FeatureSplitPolicy::Exclusive, "split_exclusive"),
             (FeatureSplitPolicy::Random, "split_random"),
         ] {
-            cfg.topology_options.feature_split = Some(policy);
+            cfg.feature_split_pool = vec![policy.to_string()];
             let snap = ConfigSnapshot::from_config(&cfg, None, None);
             assert_eq!(snap.feature_split.as_deref(), Some(wire));
             // Round-trips…

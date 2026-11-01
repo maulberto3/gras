@@ -12,7 +12,6 @@ use gras::engine::config::{
     CrossoverOp, DEFAULT_CHECKPOINT_EVERY, SMOOTHING_WINDOW,
 };
 use gras::evolution::selection::SelectionMethod;
-use gras::graph::topology::FeatureSplitPolicy;
 use gras::prelude::*;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -185,6 +184,11 @@ pub struct PyRaceConfig {
     /// (a true partition).
     #[pyo3(get, set)]
     pub feature_split: Option<String>,
+    /// The POOL a newborn's split is drawn from: `none`, `random`, `exclusive`.
+    /// Empty (default) = all three, so a Python run explores the split itself;
+    /// `feature_split=` above pins the pool to one entry.
+    #[pyo3(get, set)]
+    pub feature_split_pool: Vec<String>,
 
     // ── artifacts ───────────────────────────────────────────────────────
     /// Write `history.csv` and `attempts.csv`.
@@ -255,6 +259,7 @@ impl PyRaceConfig {
         combine_op_pool = Vec::new(),
         standardize_op_pool = Vec::new(),
         feature_split = None,
+        feature_split_pool = vec![],
         // artifacts
         csv_export = true,
         trace_file = false,
@@ -302,6 +307,7 @@ impl PyRaceConfig {
         combine_op_pool: Vec<String>,
         standardize_op_pool: Vec<String>,
         feature_split: Option<String>,
+        feature_split_pool: Vec<String>,
         csv_export: bool,
         trace_file: bool,
         elite_save_topology: bool,
@@ -348,6 +354,7 @@ impl PyRaceConfig {
             combine_op_pool,
             standardize_op_pool,
             feature_split,
+            feature_split_pool,
             csv_export,
             trace_file,
             elite_save_topology,
@@ -410,15 +417,6 @@ fn parse_mutation_cull(name: &str) -> Option<MutationCullPolicy> {
     }
 }
 
-/// `random` | `exclusive`, and the `split_*` spellings `engine.json` records.
-fn parse_feature_split(name: &str) -> Option<FeatureSplitPolicy> {
-    match name {
-        "random" | "split_random" => Some(FeatureSplitPolicy::Random),
-        "exclusive" | "split_exclusive" => Some(FeatureSplitPolicy::Exclusive),
-        _ => None,
-    }
-}
-
 impl PyRaceConfig {
     /// The crate config plus the tracing verbosity `logging::init` takes.
     ///
@@ -465,12 +463,19 @@ impl PyRaceConfig {
                 )));
             }
         };
+        // `feature_split=` pins the pool to ONE policy; `feature_split_pool=` names the
+        // whole draw set; both empty means all three (none, random, exclusive).
         let feature_split = match &self.feature_split {
-            Some(name) => Some(parse_feature_split(name).ok_or_else(|| {
-                PyValueError::new_err(format!(
-                    "feature_split {name:?}: expected one of random, exclusive"
-                ))
-            })?),
+            Some(name) => Some(match name.to_ascii_lowercase().as_str() {
+                "none" | "off" => "none".to_string(),
+                "random" | "split_random" => "random".to_string(),
+                "exclusive" | "split_exclusive" => "exclusive".to_string(),
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "feature_split {other:?}: expected one of none, random, exclusive"
+                    )));
+                }
+            }),
             None => None,
         };
         // An empty or inverted range would panic the sampler (`end - start`), so
@@ -543,8 +548,15 @@ impl PyRaceConfig {
         cfg.activation_pool = self.activation_pool;
         cfg.combine_op_pool = self.combine_op_pool;
         cfg.standardize_op_pool = self.standardize_op_pool;
-        // The split is part of the BLUEPRINT now, not a run-wide switch.
-        cfg.topology_options.feature_split = feature_split;
+        // The pool decides what a NEWBORN draws; `feature_split=` pins it to one entry.
+        cfg.feature_split_pool = if self.feature_split_pool.is_empty() {
+            feature_split.into_iter().collect()
+        } else {
+            self.feature_split_pool.clone()
+        };
+        // Name a bad pool entry here, before a single net is drawn.
+        cfg.resolved_feature_split_pool()
+            .map_err(PyValueError::new_err)?;
         cfg.csv_export = self.csv_export;
         cfg.trace_file = self.trace_file;
         cfg.elite_save_topology = self.elite_save_topology;
