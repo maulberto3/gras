@@ -35,7 +35,6 @@ mod cartpole_tests;
 use fastrand::Rng;
 // Not in the prelude: the engine's own durability-tick default, cited by the config
 // chain below so the showcased value can't drift from the engine's.
-use gras::engine::config::DEFAULT_CHECKPOINT_EVERY;
 // The one sanctioned spelling of a sampled mean —
 // `avg … (spread …; SE … = spread/√n, n=…)`.
 use gras::prelude::*;
@@ -264,6 +263,7 @@ const RISK_AVERSION: f32 = 0.5;
 /// A value between 0.0 and 1.0, where 1.0 means every net has a chance to be
 //  selected for training, and 0.0 means no net is selected.
 const TRAIN_LOTTERY: f32 = 0.75;
+const CHECKPOINT_EVERY: usize = 50;
 
 /// The smoke-test CLI: `--pop`, `--max-steps`, `--seed`, `--log-level`,
 /// `--risk-aversion`, `--train-lottery [OMEGA]`, `--run-dir`. Everything else is
@@ -360,7 +360,7 @@ fn main() {
         // SETUP
         .set_run_name("cartpole")
         .set_run_log_level(log_level)
-        .set_run_checkpoint_every(DEFAULT_CHECKPOINT_EVERY) // 10 — the durability tick
+        .set_run_checkpoint_every(CHECKPOINT_EVERY)
         .set_run_csv_export(true) // history.csv + attempts.csv
         .set_run_pop_size(cli.pop.unwrap_or(POP))
         .set_run_smoothing_window(10)
@@ -379,22 +379,22 @@ fn main() {
         .set_crossover_selection(SelectionMethod::Tournament { tournament_size: 2 })
         // .set_crossover_ops_pool(["uniform"]) // if not specified, use all
         // MUTATION
-        .set_mutation_cull_policy(MutationCullPolicy::Worst)
         .set_mutate_rolls(pop / 20)
+        .set_mutation_cull_policy(MutationCullPolicy::Worst)
         .set_mutate_prob(0.5)
         .set_mutation_probation_steps(5)
         // TOPOLOGY
-        .set_topology_dropout_prob(DROPOUT_PROB)
         .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(15)
         .set_topology_min_inputs_per_node(2)
         .set_topology_max_inputs_per_node(15)
         .set_topology_max_outputs_per_node(15)
         .set_topology_min_outputs_per_node(2)
-        .set_topology_input_dim(4)
-        .set_topology_output_dim(2)
         .set_topology_hidden_dim_range(16, 64)
         .set_topology_hidden_dim_stride(16)
+        .set_topology_dropout_prob(DROPOUT_PROB)
+        .set_topology_input_dim(4)
+        .set_topology_output_dim(2)
         // .set_topology_combine_op_pool([
         //     "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
         // ])
@@ -402,9 +402,9 @@ fn main() {
         // .set_topology_standardize_op_pool(["LayerNorm", …]) // if not specified, use all
         // .set_topology_feature_split(FeatureSplitPolicy::Random) // Other one Exclusive
         // ELITES
+        .set_elite_freeze(true) // frozen elites still score, rank and sire
         .set_elite_count(pop / 20)
         .set_elite_previous_load(true) // on by default
-        .set_elite_freeze(true) // frozen elites still score, rank and sire
         .set_elite_join_probation_steps(5) // age before a net may join the elite set (A/B re-checked 2026-10-26: 5 wins both fast seeds — see DONE.md)
         .set_elite_crown_lifetime_steps(5) // how long the frozen crown may sit at peak
         .set_elite_save_topology(true) // elite-<hash>.md at stop

@@ -539,41 +539,15 @@ const RUN_NAME: &str = "mnist";
 const RUN_SEED: Option<u64> = Some(16);
 const MAX_STEPS: Option<usize> = Some(50);
 const POP_SIZE: usize = 100;
-const CHECKPOINT_EVERY: usize = 5;
+const CHECKPOINT_EVERY: usize = 50;
 /// Per-(net, step) chance an anti-plateau challenge fires (see `train_step`).
 const CHALLENGE_PROB: f32 = 0.15;
-const MUTATE_PROB: f32 = 0.5;
 const LOG_LEVEL: LogLevel = LogLevel::Summ;
 /// FIT risk aversion λ: window σs an accuracy pays for its own spread, so a net
 /// that is steadily 0.90 outranks one alternating 0.80 and 1.00. `0.0` ranks on
 /// the plain window mean.
 const RISK_AVERSION: f32 = 0.5;
-
-// ── Evolution knobs ────────────────────────────────────────────────────
-/// Top-k cull immunity AND the exported elite pair count.
-const ELITE_COUNT: usize = 5;
-/// Clocks a fresh net must train before it may hold a crown seat.
-const ELITE_JOIN_PROBATION: usize = 3;
-/// Clocks a net may sit at peak before the crown rotates it (`0` = never).
-const ELITE_CROWN_LIFETIME: usize = 0;
-/// Cull-immunity for a crossover child / an immigrant before it is ranked.
-const CROSSOVER_PROBATION: usize = 5;
-const MUTATION_PROBATION: usize = 5;
-/// Parent draw for crossover. Tournament is the steadier of the two pools:
-/// it resists one lucky reading the way roulette does not.
-const CROSSOVER_TOURNAMENT_SIZE: usize = 3;
-
-// ── Search-space pools ─────────────────────────────────────────────────
-/// The OP pools the topology draw samples from. An empty pool = the engine's
-/// full set; naming them is how an example keeps a search focused (and how a
-/// run stays comparable with an earlier one after the engine grows an op).
-/// Every label is validated at run start — a typo fails loudly, never silently.
-const COMBINE_OPS: [&str; 3] = ["add", "mean", "mul"];
-const ACTIVATIONS: [&str; 5] = ["relu", "gelu", "silu", "tanh", "leaky_relu"];
-const STANDARDIZE_OPS: [&str; 3] = ["identity", "layernorm", "rmsnorm"];
-/// Input-port split. `Exclusive` is a true partition: no two branches can see
-/// the same feature, so no net can double-count a pixel.
-const FEATURE_SPLIT: FeatureSplitPolicy = FeatureSplitPolicy::Exclusive;
+const TRAIN_LOTTERY: f32 = 0.75;
 
 /// The CLI is an OVERLAY on the consts, never a second source of truth: the
 /// shared engine surface ([`cli::EngineArgs`] — pop/steps/seed/λ/Ω/founders,
@@ -665,35 +639,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     let builder = TabularRaceConfig::builder()
         .set_run_name(RUN_NAME)
-        .set_run_pop_size(pop)
         .set_run_log_level(LOG_LEVEL)
-        .set_run_metrics(metrics)
-        .set_stop_max_steps(max_steps)
         .set_run_checkpoint_every(CHECKPOINT_EVERY)
-        // --- Ranking (FIT): the metric is accuracy, λ decides how much of a
-        // net's rank is steadiness rather than level. Ω is the budget dial:
-        // 0 = every net trains on every clock (the plain metric path), 1 = the
-        // full merit-weighted train-eval lottery. Both endpoints are exact, so
-        // turning Ω on never changes what evolution RANKS on — only who gets
-        // to spend a clock, and how stale a selector's reading can be.
+        .set_run_csv_export(true) // history.csv + attempts.csv
+        .set_run_pop_size(pop)
+        .set_run_metrics(metrics)
+        .set_run_smoothing_window(10)
         .set_run_risk_aversion(RISK_AVERSION)
-        .set_run_train_merit(0.0)
-        .set_run_smoothing_window(5)
-        // --- Evolution: the elite/founder rules (mode-agnostic) ---
-        .set_elite_count(ELITE_COUNT)
-        .set_elite_freeze(true)
-        .set_elite_join_probation_steps(ELITE_JOIN_PROBATION)
-        .set_elite_crown_lifetime_steps(ELITE_CROWN_LIFETIME)
+        .set_run_train_merit(TRAIN_LOTTERY)
+        //
+        .set_stop_max_steps(max_steps)
+        //
+        .set_crossover_rolls(pop / 10)
         .set_crossover_prob(0.5)
-        .set_crossover_rolls(pop / 2)
+        .set_crossover_cull_policy(CrossCullPolicy::Worst)
+        .set_crossover_probation_steps(5)
         .set_crossover_selection(SelectionMethod::Tournament {
-            tournament_size: CROSSOVER_TOURNAMENT_SIZE,
+            tournament_size: 2  ,
         })
-        .set_crossover_probation_steps(CROSSOVER_PROBATION)
         // --- Mutation (both modes) ---
-        .set_mutate_prob(MUTATE_PROB) // per-roll chance a random immigrant is inserted
-        .set_mutate_rolls(pop / 5)
-        .set_mutation_probation_steps(MUTATION_PROBATION)
+        .set_mutate_rolls(pop / 20)
+        .set_mutation_cull_policy(MutationCullPolicy::Worst)
+        .set_mutate_prob(0.5) // per-roll chance a random immigrant is inserted
+        .set_mutation_probation_steps(5)
         // --- Challenge (anti-plateau): TRAINER-owned since 2026-10-10 —
         // `CHALLENGE_PROB` lives on the trainer and rolls inside `train_step`
         // via `gras::trainer::effective_challenge_prob`. No engine knob.
@@ -708,12 +676,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_topology_hidden_dim_range(16, 128)
         .set_topology_hidden_dim_stride(16)
         .set_topology_dropout_prob(0.25)
-        .set_topology_combine_op_pool(COMBINE_OPS)
-        .set_topology_activation_pool(ACTIVATIONS)
-        .set_topology_standardize_op_pool(STANDARDIZE_OPS)
-        .set_topology_feature_split(FEATURE_SPLIT)
+        // .set_topology_combine_op_pool(COMBINE_OPS)
+        // .set_topology_activation_pool(ACTIVATIONS)
+        // .set_topology_standardize_op_pool(STANDARDIZE_OPS)
+        // .set_topology_feature_split(FEATURE_SPLIT)
         // --- Exports ---
-        .set_run_csv_export(true)
+        // --- Evolution: the elite/founder rules (mode-agnostic) ---
+        .set_elite_freeze(true)
+        .set_elite_count(pop / 20)
+        .set_elite_previous_load(true) // on by default
+        .set_elite_join_probation_steps(5)
+        .set_elite_crown_lifetime_steps(5)
         .set_elite_save_topology(true)
         .set_worst_save_topology(true);
     // Every CLI flag is an OVERLAY: a user-passed value wins, anything unset
