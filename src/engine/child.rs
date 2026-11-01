@@ -264,7 +264,7 @@ impl CoreEngine {
             // when there is nothing to inherit does the run's policy draw a fresh split,
             // which is also the founder/immigrant path's behaviour.
         if child_masks.is_empty() {
-            if let Some(policy) = self.config.feature_split {
+            if let Some(policy) = child_topo.options.feature_split {
                 child_topo.assign_feature_masks(policy);
             }
         } else {
@@ -345,7 +345,7 @@ impl CoreEngine {
         graph.assign_port_activations(&act_pool);
             // Feature split for immigrants too — the run's policy owns both paths, and
             // masks must be drawn after finalize so the port count is already final.
-        if let Some(policy) = self.config.feature_split {
+        if let Some(policy) = graph.options.feature_split {
             graph.assign_feature_masks(policy);
         }
             // NO mutation roll on the immigrant path: a brand-new random topology is

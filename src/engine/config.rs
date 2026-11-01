@@ -36,6 +36,12 @@ pub const RISK_AVERSION: f32 = 1.0;
 /// [`RaceConfigBuilder::set_run_checkpoint_every`]); this is the default when unset.
 pub const DEFAULT_CHECKPOINT_EVERY: usize = 10;
 
+/// Default merit floor `p_min`: the smallest share of clocks the WORST net in the
+/// lottery's field still gets. `0.05` — enough that a net graded `p = 0` can still
+/// move its own merit (5 clocks in 100), cheap enough that it never becomes the
+/// "train everybody" path `Ω` would be.
+pub const DEFAULT_TRAIN_MERIT_P_MIN: f32 = 0.05;
+
 // `DEFAULT_LR` moved to `crate::utils::training`: a training scheme reads it
 // (the reference trainer and the example both do), so it belongs below both
 // layers rather than in the engine's config surface.
@@ -247,6 +253,16 @@ pub struct RaceConfig {
         /// Replay-relevant: the idle clocks are persisted per net (`idle_spans`), the
         /// resume replays that ledger, and a resume at a different Ω is refused by name.
     pub train_merit: f32,
+        /// Merit floor `p_min` (`set_run_train_merit_p_min`) — the smallest share of
+        /// clocks the WORST net in the field still gets. Applied to the fraction BEFORE
+        /// Ω blends it (`p = p_min + (1 − p_min)·f`), so it is a BOTTOM-only lift: only
+        /// the nets below the floor move and the relative spread above it is untouched.
+        /// `0.05` (default) keeps the worst net at 5% instead of the permanent `p = 0`,
+        /// which costs little (it only ever un-idles the last few) and lets its merit
+        /// move again — the self-correcting loop needs it to train at least sometimes.
+        /// `0.0` restores the pre-floor arithmetic bit-for-bit. Replay-relevant like Ω:
+        /// a resume at another floor warns by name.
+    pub train_merit_p_min: f32,
         /// Per-net smoothed-fitness rolling window (K) — how many recent step fitnesses every
         /// ranking decision averages over. Defaults to [`SMOOTHING_WINDOW`].
     pub smoothing_window: usize,
@@ -276,11 +292,6 @@ pub struct RaceConfig {
         /// Combine/activation/standardize pools actually used by the run; empty uses all
         /// known ops (`empty ⇒ all` convention).
     pub combine_op_pool: Vec<String>,
-    /// Feature split: how the Input node's per-port feature masks are drawn, or
-    /// `None` (**default**) for no split at all — every port keeps cloning the one
-    /// mixed input vector. See [`FeatureSplitPolicy`]; set with
-    /// `set_topology_feature_split` (there is deliberately no bool).
-    pub feature_split: Option<FeatureSplitPolicy>,
     /// Activation pool (empty ⇒ all).
     pub activation_pool: Vec<String>,
     /// Standardize-op pool (empty ⇒ all).
@@ -510,6 +521,7 @@ impl RaceConfig {
             elite_count: 1,
             freeze_elites: true,
             train_merit: 0.0,
+            train_merit_p_min: DEFAULT_TRAIN_MERIT_P_MIN,
             elite_join_probation_steps: 5,
             elite_crown_lifetime_steps: 5,
             smoothing_window: SMOOTHING_WINDOW,
@@ -521,7 +533,6 @@ impl RaceConfig {
             hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
             hidden_dim_stride: 16,
             combine_op_pool: Vec::new(),
-            feature_split: None,
             activation_pool: Vec::new(),
             standardize_op_pool: Vec::new(),
             topology_options: crate::graph::topology::TopologyOptions::default(),
@@ -574,6 +585,7 @@ impl RaceConfig {
         cfg.run_name = snap.run_name.clone();
         cfg.freeze_elites = snap.freeze_elites;
         cfg.train_merit = snap.train_merit;
+        cfg.train_merit_p_min = snap.train_merit_p_min;
         cfg.elite_previous_load = snap.elite_previous_load;
         cfg.elite_previous_dir = snap
             .elite_previous_dir
@@ -615,16 +627,10 @@ impl RaceConfig {
         } else {
             SelectionMethod::Roulette
         };
-        cfg.feature_split = snap.feature_split.as_deref().and_then(|raw| {
-            let raw = raw.to_ascii_lowercase();
-            if raw.contains("exclusive") {
-                Some(crate::graph::topology::FeatureSplitPolicy::Exclusive)
-            } else if raw.contains("random") {
-                Some(crate::graph::topology::FeatureSplitPolicy::Random)
-            } else {
-                None
-            }
-        });
+        cfg.topology_options.feature_split = snap
+            .feature_split
+            .as_deref()
+            .and_then(parse_feature_split_wire);
         cfg.mode = if snap.mode.eq_ignore_ascii_case("rl") {
             RunMode::Rl
         } else {
@@ -666,6 +672,19 @@ pub fn rl_race_config_builder() -> RaceConfigBuilder {
             mode_specific: ModeConfig::Rl(RlConfig::default()),
             ..RaceConfig::defaults()
         },
+    }
+}
+
+/// Parse a recorded (or user-given) feature-split spelling: `"random"`,
+/// `"exclusive"`, or the `"split_*"` wire form `engine.json` records.
+pub(crate) fn parse_feature_split_wire(raw: &str) -> Option<FeatureSplitPolicy> {
+    let raw = raw.to_ascii_lowercase();
+    if raw.contains("exclusive") {
+        Some(FeatureSplitPolicy::Exclusive)
+    } else if raw.contains("random") {
+        Some(FeatureSplitPolicy::Random)
+    } else {
+        None
     }
 }
 
@@ -766,6 +785,19 @@ impl RaceConfigBuilder {
         self.cfg.train_merit = omega.clamp(0.0, 1.0);
         self
     }
+        /// The lottery's merit floor `p_min` (default `0.05`, `0.0` = the pre-floor
+        /// arithmetic). The worst net in the field keeps this share of clocks even when
+        /// its fraction is exactly 0, so the search never spends a run on a net it has
+        /// stopped measuring; the floor sits UNDER Ω, so `Ω = 0` still means "everybody
+        /// trains every clock". Replay-relevant: a resume at another value warns by name.
+    pub fn set_run_train_merit_p_min(mut self, p_min: f32) -> Self {
+        self.cfg.train_merit_p_min = if p_min.is_finite() {
+            p_min.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_TRAIN_MERIT_P_MIN
+        };
+        self
+    }
         /// Per-net smoothed-fitness rolling window (K). Default [`SMOOTHING_WINDOW`] = 10.
         /// Replay-relevant: a resumed run must use the same value or construction fails parity.
     pub fn set_run_smoothing_window(mut self, k: usize) -> Self {
@@ -826,7 +858,7 @@ impl RaceConfigBuilder {
         /// are drawn. Unset (`None`, the default) = no split. Off/value rather than a
         /// bool: the policy IS the value, and "off" is simply not calling this.
     pub fn set_topology_feature_split(mut self, policy: FeatureSplitPolicy) -> Self {
-        self.cfg.feature_split = Some(policy);
+        self.cfg.topology_options.feature_split = Some(policy);
         self
     }
         /// Explicit step budget — the only built-in stop criterion. Accepts a bare value or an

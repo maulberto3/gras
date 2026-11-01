@@ -389,6 +389,18 @@ impl CoreEngine {
         self.config.train_merit.clamp(0.0, 1.0)
     }
 
+        /// The lottery's merit floor `p_min` (`set_run_train_merit_p_min`), clamped to
+        /// `[0, 1]`.
+        ///
+        /// Applied to the field FRACTION, under Ω: `p = p_min + (1 − p_min)·f`, then
+        /// `p_eff = 1 − Ω·(1 − p)`. Bottom-only by construction — at `p_min = 0.05` the
+        /// worst net keeps 5% of its clocks while a mid-field net moves by `0.95·f`
+        /// only, so the lift costs almost nothing and the relative spread survives.
+        /// Unlike Ω it does not touch the best net at all.
+    pub(crate) fn train_merit_p_min(&self) -> f32 {
+        self.config.train_merit_p_min.clamp(0.0, 1.0)
+    }
+
         /// [`Self::train_lottery_p`] with the clock's Ω blend applied — the number the
         /// coin actually compares against, and the one the logs print.
         ///
@@ -414,7 +426,12 @@ impl CoreEngine {
         merit: Option<f32>,
     ) -> f32 {
         let omega = self.train_merit_omega();
+        let floor = self.train_merit_p_min();
         let p = self.train_lottery_p_from(hash, clock, frame, merit);
+        // Floor the FRACTION first, then blend by Ω: `p_min` is a bottom-only lift, so
+        // only the nets that would have graded under it move, and Ω = 0 still means
+        // "everybody trains" (1 − 0·(…) = 1).
+        let p = floor + (1.0 - floor) * p;
         1.0 - omega * (1.0 - p)
     }
 

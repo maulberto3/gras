@@ -363,6 +363,7 @@ mod tests {
             input_dim: Some(2),
             output_dim: Some(2),
             dropout_prob: 0.0,
+            feature_split: None,
         };
         let mut topo = Topology::new(7, Some(opts));
         topo.nodes.push(crate::graph::node::Node::new_input(0, 2));

@@ -32,6 +32,8 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     let mut opts = config.topology_options;
     opts.topology_seed = seed;
     let n_hidden = rng.usize(opts.min_hidden_num_nodes..=opts.max_hidden_num_nodes);
+    // The split travels with the BLUEPRINT (`opts` is moved into the topology).
+    let feature_split = opts.feature_split;
     let mut graph = Topology::new(seed, Some(opts));
     graph.create_random_hidden_nodes(n_hidden);
     let pool = config.hidden_dim_pool.clone().unwrap_or(4..=8);
@@ -49,7 +51,7 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     graph.finalize();
         // Feature split AFTER finalize: the Input node's port count is final only once
         // `trim_orphaned_ports` compacted the ports (same rule as port activations).
-    if let Some(policy) = config.feature_split {
+    if let Some(policy) = feature_split {
         graph.assign_feature_masks(policy);
     }
     graph
@@ -355,7 +357,8 @@ mod tests {
         cfg.pop_size = 4;
         cfg.topology_options = opts;
         cfg.hidden_dim_pool = Some(4..=4);
-        cfg.feature_split = Some(crate::graph::topology::FeatureSplitPolicy::Exclusive);
+        cfg.topology_options.feature_split =
+            Some(crate::graph::topology::FeatureSplitPolicy::Exclusive);
 
         for topo in initial_population(&cfg, 42) {
             topo.validate().expect("a split topology must validate");
@@ -386,7 +389,10 @@ mod tests {
             // The default (`None`) is today's behaviour: no masks anywhere, so nothing
             // about an existing run's population changes.
         let cfg = tiny_config(4);
-        assert!(cfg.feature_split.is_none(), "the split is opt-in");
+        assert!(
+            cfg.topology_options.feature_split.is_none(),
+            "the split is opt-in"
+        );
         for topo in initial_population(&cfg, 42) {
             let input = topo
                 .nodes
