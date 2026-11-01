@@ -169,6 +169,107 @@ pub fn balanced_accuracy_score(pred: &Variable, y: &Variable) -> Result<f32> {
     })
 }
 
+/// TOP-K accuracy: the share of rows whose TARGET class is among the net's `k`
+/// highest-scoring classes (higher = better).
+///
+/// `k` is clamped to `1..=classes`, so `k = 1` is exactly [`accuracy_score`] and a
+/// `k` at or above the class count accepts every row (`1.0`) — the honest answer
+/// for an exam that cannot miss, not an error. Ties resolve in the row's favour: a
+/// class is top-k when FEWER THAN `k` classes score strictly higher than it, so a
+/// tie at the cut never punishes the net for an ordering the data cannot break.
+///
+/// The string menu spells the bare name `top_k_accuracy` at the crate default
+/// `k = 3`; `top_k_accuracy(5)` carries any other `k` (see
+/// [`crate::trainer::metric_for`]).
+pub fn top_k_accuracy_score(pred: &Variable, y: &Variable, k: usize) -> Result<f32> {
+    let shape = pred.data().shape();
+    let rows = shape[0] as usize;
+    let classes = shape[1] as usize;
+    if rows == 0 || classes == 0 {
+        return Ok(0.0);
+    }
+    let k = k.clamp(1, classes);
+    let (_, ta) = argmax_classes(pred, y)?;
+    let p = pred.data().to_f32_vec()?;
+    let mut hits = 0usize;
+    for r in 0..rows {
+        let truth = ta.get(r).copied().unwrap_or(-1);
+        if truth < 0 || truth as usize >= classes {
+            continue;
+        }
+        let row = &p[r * classes..(r + 1) * classes];
+        let target = row[truth as usize];
+        let strictly_better = row.iter().filter(|v| **v > target).count();
+        if strictly_better < k {
+            hits += 1;
+        }
+    }
+    Ok(hits as f32 / rows as f32)
+}
+
+/// AUROC — area under the ROC curve for BINARY classification (higher = better;
+/// `0.5` = a coin flip).
+///
+/// Rank-based, so it reads the positive class straight off the net and does not
+/// care whether that number is a logit or a probability: the order is the same.
+/// The positive class is column `1` of a two-column `pred` (or of a one-hot
+/// target), or the single column when there is only one (`> 0.5` = positive).
+///
+/// Ties share the average rank (the usual Mann–Whitney correction), so a net that
+/// outputs one constant score lands on `0.5` instead of inventing an ordering the
+/// data never justified. `0.5` is also the answer when the target holds only ONE
+/// class: with no negative (or no positive) row there is no curve to integrate,
+/// and a `NaN` here would poison the ranking — `0.5` says "this exam cannot tell".
+pub fn auroc_score(pred: &Variable, y: &Variable) -> Result<f32> {
+    let p_shape = pred.data().shape().to_vec();
+    let t_shape = y.data().shape().to_vec();
+    let rows = p_shape[0] as usize;
+    if rows == 0 {
+        return Ok(0.5);
+    }
+    let p_cols = *p_shape.get(1).unwrap_or(&1) as usize;
+    let t_cols = *t_shape.get(1).unwrap_or(&1) as usize;
+    let p = pred.data().to_f32_vec()?;
+    let t = y.data().to_f32_vec()?;
+    // Positive-class score per row: the class-1 column when there is one, else the
+    // only column. NaN sorts to the end under `total_cmp` — deterministic either way.
+    let mut pairs: Vec<(f32, bool)> = (0..rows)
+        .map(|r| {
+            let score = if p_cols >= 2 { p[r * p_cols + 1] } else { p[r * p_cols] };
+            let positive = if t_cols >= 2 {
+                t[r * t_cols + 1] > 0.5
+            } else {
+                t[r * t_cols] > 0.5
+            };
+            (score, positive)
+        })
+        .collect();
+    let n_pos = pairs.iter().filter(|(_, pos)| *pos).count();
+    let n_neg = rows - n_pos;
+    if n_pos == 0 || n_neg == 0 {
+        return Ok(0.5);
+    }
+    pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Mann–Whitney U from average ranks: a block of equal scores shares its mean rank.
+    let mut rank_sum_pos = 0.0f64;
+    let mut i = 0usize;
+    while i < pairs.len() {
+        let mut j = i + 1;
+        while j < pairs.len() && pairs[j].0.total_cmp(&pairs[i].0).is_eq() {
+            j += 1;
+        }
+        let rank = ((i + 1) as f64 + j as f64) / 2.0;
+        for (_, positive) in &pairs[i..j] {
+            if *positive {
+                rank_sum_pos += rank;
+            }
+        }
+        i = j;
+    }
+    let u = rank_sum_pos - (n_pos as f64 * (n_pos as f64 + 1.0)) / 2.0;
+    Ok((u / (n_pos as f64 * n_neg as f64)) as f32)
+}
+
 /// MAPE — mean absolute percentage error (lower = better).
 ///
 /// Rows whose TARGET is zero are skipped instead of clamped: a percentage error
@@ -256,6 +357,10 @@ pub fn precision_from_vecs(pa: &[i64], ta: &[i64], classes: usize) -> f32 {
 
 /// Softmax cross-entropy against a **one-hot** target, computed as
 /// `−mean(one_hot · log_softmax(pred))` (lower = better).
+///
+/// (The two rank-sensitive scorers above — [`top_k_accuracy_score`] and
+/// [`auroc_score`] — are the ones a name-only menu cannot wish into existence:
+/// they need the class axis, so they read it from the shapes.)
 pub fn cross_entropy_onehot(pred: &Variable, y: &Variable) -> Result<f32> {
     let n = y.data().shape()[0] as f32;
     if n == 0.0 {
@@ -311,4 +416,83 @@ pub fn cross_entropy_onehot_loss(pred: &Variable, y: &Variable) -> Result<Variab
     let neg = flodl::Tensor::from_f32(&[-1.0], &[1], masked.device())?;
     let n = flodl::Tensor::from_f32(&[y.data().shape()[0] as f32], &[1], y.data().device())?;
     Ok(Variable::new(masked.sum()?.mul(&neg)?.div(&n)?, false))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flodl::{Device, Tensor};
+
+    fn var(xs: &[f32], shape: &[i64]) -> Variable {
+        Variable::new(Tensor::from_f32(xs, shape, Device::CPU).unwrap(), false)
+    }
+
+    /// Three rows, one target class each; row 2 puts its truth SECOND.
+    fn three_class_case() -> (Variable, Variable) {
+        (
+            var(
+                &[
+                    3.0, 0.0, 0.0, // truth 0 — top-1
+                    0.0, 3.0, 0.5, // truth 1 — top-1
+                    0.0, 3.0, 1.0, // truth 2 — ranked 3rd, so top-2 hit, top-1 miss
+                ],
+                &[3, 3],
+            ),
+            var(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], &[3, 3]),
+        )
+    }
+
+    #[test]
+    fn top_k_is_accuracy_at_one_and_inclusive_at_the_class_count() {
+        let (pred, y) = three_class_case();
+        let one = top_k_accuracy_score(&pred, &y, 1).unwrap();
+        let acc = accuracy_score(&pred, &y).unwrap();
+        assert!((one - acc).abs() < 1e-6, "k=1 must BE accuracy: {one} vs {acc}");
+        assert!((one - 2.0 / 3.0).abs() < 1e-6, "k=1 = {one}");
+        // Row 2's truth is second, so k=2 accepts every row.
+        assert!((top_k_accuracy_score(&pred, &y, 2).unwrap() - 1.0).abs() < 1e-6);
+        // k beyond the class count is clamped, not an error.
+        assert!((top_k_accuracy_score(&pred, &y, 99).unwrap() - 1.0).abs() < 1e-6);
+        // k=0 is meaningless and clamps up to k=1 rather than scoring 0 rows.
+        assert!((top_k_accuracy_score(&pred, &y, 0).unwrap() - one).abs() < 1e-6);
+    }
+
+    fn binary_case(positive_scores: &[f32; 4]) -> (Variable, Variable) {
+        // Class-1 scores: rows 0 and 1 are positive, rows 2 and 3 negative.
+        let mut xs = Vec::new();
+        for s in positive_scores {
+            xs.push(1.0 - s);
+            xs.push(*s);
+        }
+        (
+            var(&xs, &[4, 2]),
+            var(&[0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0], &[4, 2]),
+        )
+    }
+
+    #[test]
+    fn auroc_is_one_perfect_zero_reversed_half_tied() {
+        let perfect = auroc_score(&binary_case(&[0.9, 0.8, 0.2, 0.1]).0,
+            &binary_case(&[0.9, 0.8, 0.2, 0.1]).1)
+            .unwrap();
+        assert!((perfect - 1.0).abs() < 1e-6, "perfect separation = {perfect}");
+        let reversed = auroc_score(&binary_case(&[0.1, 0.2, 0.8, 0.9]).0,
+            &binary_case(&[0.1, 0.2, 0.8, 0.9]).1)
+            .unwrap();
+        assert!(reversed.abs() < 1e-6, "reversed separation = {reversed}");
+        let tied = auroc_score(&binary_case(&[0.5, 0.5, 0.5, 0.5]).0,
+            &binary_case(&[0.5, 0.5, 0.5, 0.5]).1)
+            .unwrap();
+        assert!((tied - 0.5).abs() < 1e-6, "all tied = {tied}, expected a coin flip");
+    }
+
+    #[test]
+    fn auroc_on_one_class_says_the_exam_cannot_tell() {
+        // Every target row positive: no negative pair exists, so 0.5 (never NaN).
+        let pred = var(&[0.9, 0.8, 0.7, 0.6], &[4, 1]);
+        let y = var(&[1.0, 1.0, 1.0, 1.0], &[4, 1]);
+        let got = auroc_score(&pred, &y).unwrap();
+        assert!((got - 0.5).abs() < 1e-6, "single-class AUROC = {got}");
+        assert!(got.is_finite());
+    }
 }
