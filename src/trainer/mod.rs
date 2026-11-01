@@ -24,7 +24,7 @@ pub use challenge::{
     forced_action, least_action,
 };
 pub use core::{
-    AnyTrainer, RlContext, RlStep, RlStepMeta, RlStepReport, RunData, StepEnv, StepReport,
+    AnyTrainer, RlContext, RlStep, RlStepMeta, RlStepReport, RunData, StepCtx, StepEnv, StepReport,
     StreamShape, TabularContext, TabularStep, TabularStepReport,
 };
 pub use decision_lag::DecisionLagTrainer;

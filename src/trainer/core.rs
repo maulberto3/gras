@@ -185,6 +185,40 @@ impl RunData<'_> {
     }
 }
 
+/// The per-step bundle for [`AnyTrainer::train_step`]: everything a step needs
+/// except the net itself.
+///
+/// This exists so the seam is `(net, ctx)` instead of nine positional arguments
+/// (which needed `#[allow(clippy::too_many_arguments)]`). The field names are the
+/// argument names the old signature used, so a migrated caller reads the same
+/// word it passed; a future per-step input becomes a field here instead of a tenth
+/// argument threaded through every call site.
+///
+/// It mirrors [`TabularContext`] / [`RlContext`], which is already the shape the
+/// traits see — the outer seam now reads like the inner one.
+pub struct StepCtx<'a> {
+    /// The net's optimizer, borrowed for this step. The freeze pass passes the
+    /// no-op optimizer here, so "who may update the weights" stays one argument.
+    pub optimizer: &'a mut dyn flodl::nn::optim::Optimizer,
+    /// The clock this step runs at (same value as `env.step`).
+    pub step: usize,
+    /// The run's ranking fitness (direction + label).
+    pub fitness: &'a crate::utils::fitness::Fitness,
+    /// Informative non-ranking metrics configured for the run.
+    pub metrics: &'a [crate::utils::fitness::Metric],
+    /// Lightweight snapshot of current run/epoch metadata.
+    pub env: StepEnv,
+    /// Canonical hash of the net being trained (for logs or tracking).
+    pub net_hash: &'a str,
+    /// Deterministic net-specific weight initialization/dropout seed.
+    pub net_seed: u64,
+    /// The run's dataset + shared stream. `Some` in a tabular run, `None` in RL
+    /// (there is no batch stream to hand out). The invariant is checked in ONE
+    /// place — [`AnyTrainer::train_step`] — exactly as it was when this was a
+    /// positional argument.
+    pub data: Option<&'a RunData<'a>>,
+}
+
 /// The context handed to a [`TabularStep`] on every step. Data is **not**
 /// optional — a tabular run always has a dataset and stream, by construction.
 pub struct TabularContext<'a> {
@@ -484,19 +518,25 @@ impl AnyTrainer {
     }
 
     /// One training step — the arm decides which context type to build.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Takes the net plus a [`StepCtx`] by value: the bundle is consumed by the
+    /// step, so the `&mut` optimizer inside is moved out rather than reborrowed
+    /// through a shared reference. No `too_many_arguments` allow is needed.
     pub fn train_step(
         &mut self,
         net: &mut Network,
-        optimizer: &mut dyn flodl::nn::optim::Optimizer,
-        step: usize,
-        data: Option<&RunData<'_>>,
-        fitness: &crate::utils::fitness::Fitness,
-        metrics: &[crate::utils::fitness::Metric],
-        env: StepEnv,
-        net_hash: &str,
-        net_seed: u64,
+        ctx: StepCtx<'_>,
     ) -> flodl::tensor::Result<StepReport> {
+        let StepCtx {
+            optimizer,
+            step,
+            fitness,
+            metrics,
+            env,
+            net_hash,
+            net_seed,
+            data,
+        } = ctx;
         match self {
             Self::Tabular(t) => {
                 let data = data
