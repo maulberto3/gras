@@ -61,6 +61,13 @@ pub struct TopologyOptions {
         /// part of the blueprint so replays don't diverge; defaults to 0.0.
     #[serde(default)]
     pub dropout_prob: f32,
+        /// Feature-split policy this blueprint's Input ports were drawn under — part of
+        /// the topology, not the run, so a newborn's policy travels with its blueprint
+        /// and a population can hold split and unsplit nets side by side. `None`
+        /// (default) = no split. Skipped when `None`, so an unsplit blueprint serializes
+        /// (and hashes) exactly as it did before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_split: Option<FeatureSplitPolicy>,
 }
 
     // `dropout_prob: f32` isn't `Eq`/`Hash`, so these are manual: every other field
@@ -77,6 +84,7 @@ impl PartialEq for TopologyOptions {
             && self.input_dim == other.input_dim
             && self.output_dim == other.output_dim
             && self.dropout_prob.to_bits() == other.dropout_prob.to_bits()
+            && self.feature_split == other.feature_split
     }
 }
 
@@ -94,14 +102,17 @@ impl std::hash::Hash for TopologyOptions {
         self.input_dim.hash(state);
         self.output_dim.hash(state);
         self.dropout_prob.to_bits().hash(state);
+        self.feature_split.hash(state);
     }
 }
 
-/// How a run draws the Input node's per-port feature masks — the feature split.
-/// Stored on the engine config, never in a blueprint: the masks themselves are
-/// genome (they live in [`Node::feature_masks`]), and this only says how they are
-/// generated. `None` on the config = no split at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How a topology draws the Input node's per-port feature masks — the feature split.
+/// Stored on [`TopologyOptions`], i.e. per blueprint, not run-wide: the masks
+/// themselves are genome (they live in [`Node::feature_masks`]) and this only says
+/// how they were generated, so split and unsplit nets can coexist in one population.
+/// `None` = no split at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FeatureSplitPolicy {
     /// **Exclusive** — every feature lands in exactly one port (a true partition):
     /// drawn as "each feature picks one random port". Nothing is dropped and
@@ -128,6 +139,7 @@ impl Default for TopologyOptions {
                 // 0.0 keeps regularization opt-in per binary. Masks draw from libtorch's
                 // global RNG, which the engine seeds per (net_seed, step) — reproducible.
             dropout_prob: 0.0,
+            feature_split: None,
         }
     }
 }
@@ -1344,6 +1356,7 @@ pub(crate) mod test_strategies {
                     input_dim: Some(input_dim),
                     output_dim: Some(output_dim),
                     dropout_prob: 0.0,
+                    feature_split: None,
                 },
             )
     }
@@ -1416,6 +1429,7 @@ mod tests {
             input_dim: Some(4),
             output_dim: Some(10),
             dropout_prob: 0.0,
+            feature_split: None,
         };
         let graph = Topology::new(1, Some(opts));
         assert_eq!(graph.nodes.len(), 0);
