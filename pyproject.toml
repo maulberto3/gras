@@ -1,16 +1,47 @@
 [project]
 name = "gras"
 version = "0.1.0"
-description = "Python package for gras: dev/test scaffold, target for the upcoming PyO3 bindings"
+# TODO(publish): the PyPI NAME "gras" is taken by an unrelated package
+# (GRAScanning), so pick a free distribution name before the first upload.
+# The import name stays `gras` (see module-name below), so no Python code
+# changes — only this line does.
+description = "Neural architecture search by genetic programming: a step-race that evolves, trains and ranks flodl networks"
 readme = "README.md"
+requires-python = ">=3.12"
 authors = [
     { name = "Mauricio Maroto", email = "maulberto3@hotmail.com" }
 ]
-requires-python = ">=3.12"
-dependencies = [
-    "kaggle>=2.2.4",
-    "kagglehub>=1.0.2",
+license = { text = "MIT" }
+keywords = [
+    "neural-architecture-search",
+    "evolution",
+    "genetic-programming",
+    "automl",
+    "deep-learning",
+    "libtorch",
 ]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# No Python runtime dependencies: the extension is Rust, and libtorch is
+# loaded at import time from LIBTORCH_PATH / ~/.flodl (python/gras/__init__.py).
+# The old scaffold listed `kaggle` + `kagglehub`; nothing in the package or the
+# tests imports them, and shipping them would install a Kaggle client for every
+# user of a NAS library.
+dependencies = []
+
+[project.optional-dependencies]
+# The checks in python/tests/ read run artifacts back with pandas.
+test = ["pandas>=2.0"]
 
 # Built by maturin: the module is the Rust extension `gras._core`
 # (`gras-py/src/lib.rs`), re-exported by the pure-Python `python/gras/__init__.py`.
@@ -25,3 +56,5 @@ build-backend = "maturin"
 python-source = "python"
 module-name = "gras._core"
 manifest-path = "gras-py/Cargo.toml"
+# Debug symbols are useless in a wheel and dominate its size.
+strip = true
