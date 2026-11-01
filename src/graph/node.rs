@@ -700,6 +700,7 @@ mod tests {
                 input_dim: Some(4),
                 output_dim: Some(2),
                 dropout_prob: 0.0,
+                feature_split: None,
             };
             let mut graph = Topology::new(0, Some(opts));
             graph.create_random_hidden_node();

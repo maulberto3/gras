@@ -113,6 +113,12 @@ pub struct ConfigSnapshot {
         /// so it is replay-relevant and a resume must match it exactly.
     #[serde(default)]
     pub train_merit: f32,
+        /// Merit floor `p_min` (`set_run_train_merit_p_min`): the worst net's share of
+        /// clocks even at a `0` fraction, applied before Ω blends. `0.0` (what every
+        /// pre-floor header means) is the old arithmetic; decisions depend on it, so a
+        /// resume compares it by name.
+    #[serde(default)]
+    pub train_merit_p_min: f32,
         /// LEGACY, read-only: before Ω this knob was the bool `evolution_train_lottery`
         /// (`true` = the run trained under the full lottery, i.e. Ω = 1.0). Normalized
         /// into `train_merit` on load by [`ConfigSnapshot::normalize_legacy`] and never
@@ -207,6 +213,7 @@ impl ConfigSnapshot {
             run_name: cfg.run_name.clone(),
             freeze_elites: cfg.freeze_elites,
             train_merit: cfg.train_merit,
+            train_merit_p_min: cfg.train_merit_p_min,
             legacy_train_lottery: None,
             elite_previous_load: cfg.elite_previous_load,
             elite_previous_dir: cfg
@@ -219,7 +226,7 @@ impl ConfigSnapshot {
             crossover_probation_steps: cfg.crossover_probation_steps,
             elite_join_probation_steps: cfg.elite_join_probation_steps,
             elite_crown_lifetime_steps: cfg.elite_crown_lifetime_steps,
-            feature_split: cfg.feature_split.map(|p| p.to_string()),
+            feature_split: cfg.topology_options.feature_split.map(|p| p.to_string()),
             build: crate::engine::format::build_stamp(),
         }
     }
@@ -1755,6 +1762,7 @@ mod tests {
                 input_dim: Some(2),
                 output_dim: Some(2),
                 dropout_prob: 0.0,
+                feature_split: None,
             }),
         );
         topo.nodes.push(crate::graph::node::Node::new_input(0, 2));
@@ -1847,7 +1855,7 @@ mod tests {
     fn config_snapshot_records_the_feature_split_policy() {
         use crate::graph::topology::FeatureSplitPolicy;
         let mut cfg = crate::engine::config::RaceConfig::defaults();
-        cfg.feature_split = None;
+        cfg.topology_options.feature_split = None;
         assert_eq!(
             ConfigSnapshot::from_config(&cfg, None, None).feature_split,
             None,
@@ -1857,7 +1865,7 @@ mod tests {
             (FeatureSplitPolicy::Exclusive, "split_exclusive"),
             (FeatureSplitPolicy::Random, "split_random"),
         ] {
-            cfg.feature_split = Some(policy);
+            cfg.topology_options.feature_split = Some(policy);
             let snap = ConfigSnapshot::from_config(&cfg, None, None);
             assert_eq!(snap.feature_split.as_deref(), Some(wire));
             // Round-trips…
