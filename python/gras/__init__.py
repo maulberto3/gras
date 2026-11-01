@@ -94,6 +94,9 @@ try:
         Topology,
         __version__,
         built_with_cuda,
+        # Every numeric default a fresh `RaceConfig()` holds, plus the blueprint
+        # numbers the Python surface hides behind `None`. One dict, notebook-ready.
+        defaults,
         # Name tables: what every string kwarg accepts. `menus()` is all of them
         # in one dict, keyed by the kwarg that takes them; the rest are the same
         # lists one concept at a time. (The binding cannot take a closure, so
@@ -132,6 +135,7 @@ __all__ = [
     "Topology",
     "__version__",
     "built_with_cuda",
+    "defaults",
     # name tables — one per concept, plus the combined view
     "activations",
     "algos",
