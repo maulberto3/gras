@@ -244,8 +244,9 @@ pub struct RaceConfig {
         ///
         /// When it is above 0, each non-crown net's clock is a merit-weighted coin for a
         /// TRAIN-EVAL TICKET — the whole step, the optimizer update AND the evaluation
-        /// that follows it — graded by its FINAL fitness per ticket
-        /// (`smt / measured clocks`; the risk-adjusted score, so λ is already paid)
+        /// that follows it — graded by its FINAL fitness per UPDATE
+        /// (`smt / D`; the risk-adjusted score, so λ is already paid, and `D` — not
+        /// `B` — because a crown act pass costs no learning budget)
         /// against the population's own spread. A net that loses the coin IDLES: no
         /// train batch, no eval batch, no metric row, no weight update, so nothing it is
         /// ranked on moves and no compute is spent measuring it.

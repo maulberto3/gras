@@ -3101,13 +3101,13 @@ assert!((eff(&eng, 1) - 0.5).abs() < 1e-6);
 let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The denominator is TICKETS, not clocks lived: two nets with the SAME score
-/// divide by the clocks that actually ran the trainer and scored them, so the
-/// net that spent 10 tickets grades better than the one that spent 1. This is
-/// also what keeps an idle clock free — it is not a ticket, so the ratio can
+/// The denominator is UPDATES (`D`), not clocks lived and not clocks measured:
+/// two nets with the SAME score divide by the weight updates they applied, so
+/// the net that spent 10 updates grades better than the one that spent 1. This
+/// is also what keeps an idle clock free — it is not an update, so the ratio can
 /// never decay while the numerator stands still.
 #[test]
-fn lottery_merit_divides_by_tickets_not_clocks_lived() {
+fn lottery_merit_divides_by_updates_not_clocks_lived() {
 let dir = std::env::temp_dir().join("gras-lottery-tickets");
 let _ = std::fs::remove_dir_all(&dir);
 let mut eng = engine(&dir, 21).unwrap();
@@ -3129,11 +3129,20 @@ eng.state.net_mut(&hashes[1]).unwrap().entered_at_step = 3;
 eng.state.net_mut(&hashes[1]).unwrap().step = 10;
 
 // Same reading, different budget: 100/1 vs 100/10. Age plays no part.
-assert_eq!(eng.merit_per_ticket(&hashes[0]), Some(100.0));
-assert_eq!(eng.merit_per_ticket(&hashes[1]), Some(10.0));
+assert_eq!(eng.merit_per_update(&hashes[0]), Some(100.0));
+assert_eq!(eng.merit_per_update(&hashes[1]), Some(10.0));
+
+// Crown act passes are NOT learning cost: 7 of them on the net that spent one
+// update leave its merit at 100/1 — the pre-2026-11-01 divisor (`D + O`) would
+// have read 100/8 and dropped it to the bottom of the field for having won.
+for clock in 10..17 {
+    eng.state.net_mut(&hashes[0]).unwrap().record_frozen_step(clock);
+}
+assert_eq!(eng.state.net(&hashes[0]).unwrap().measured_clocks(), 8);
+assert_eq!(eng.merit_per_update(&hashes[0]), Some(100.0));
 
 let frame = eng.lottery_frame(5).expect("armed at clock 5");
-// Minimize: the LOWEST merit is best, so the net that spent 10 tickets takes
+// Minimize: the LOWEST merit is best, so the net that spent 10 updates takes
 // p = 1.0 and the one that spent 1 takes p = 0.0 — the clock-lived divisor
 // inverted this, which is why it went.
 assert!((eng.train_lottery_p(&hashes[0], 5, Some(frame)) - 0.0).abs() < 1e-6);
@@ -3163,16 +3172,16 @@ buf.push(100.0);
 *eng.rolling_fitness.get_mut(h).unwrap() = buf;
 eng.state.net_mut(h).unwrap().step = 5;
 }
-let before = eng.merit_per_ticket(&hashes[1]).expect("graded");
-assert_eq!(before, 20.0, "5 tickets spent, 100 scored");
+let before = eng.merit_per_update(&hashes[1]).expect("graded");
+assert_eq!(before, 20.0, "5 updates spent, 100 scored");
 
 // One clock later: hashes[0] trained, hashes[1] idled. Readings unchanged.
 eng.state.net_mut(&hashes[0]).unwrap().step += 1;
 eng.idle_step(&hashes[1], 6).unwrap();
 assert_eq!(
-eng.merit_per_ticket(&hashes[1]),
+eng.merit_per_update(&hashes[1]),
 Some(before),
-"an idle clock changes neither the score nor the ticket count"
+"an idle clock changes neither the score nor the update count"
 );
 let idled = eng.state.net(&hashes[1]).unwrap();
 assert_eq!(idled.step, 5, "no weight update");
@@ -3181,8 +3190,8 @@ assert_eq!(idled.idle_clocks(), 1);
 assert_eq!(idled.idle_spans, vec![(6, 6)]);
 // The trained peer's denominator grew, so the field CAN separate them — that
 // is the budget rotating, not the idle net climbing.
-let peer = eng.merit_per_ticket(&hashes[0]).expect("graded");
-assert!((peer - 100.0 / 6.0).abs() < 1e-5, "6 tickets spent: {peer}");
+let peer = eng.merit_per_update(&hashes[0]).expect("graded");
+assert!((peer - 100.0 / 6.0).abs() < 1e-5, "6 updates spent: {peer}");
 
 let _ = std::fs::remove_dir_all(&dir);
 }

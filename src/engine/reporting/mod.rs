@@ -635,17 +635,18 @@ impl CoreEngine {
 
     /// The table's header, in NARRATIVE order: what the net IS (`mark`/`#`/`hash`/`origin`,
     /// age, census) → how it is RANKED (fit and the window behind it) → what its
-    /// LEARNING cost (`tickets`, `A/B`, `updates`, `idle`) → what that effort BOUGHT
-    /// (`prop (D)`, `rescaled (A)`, `D * A`) → what the ELITE rules did with it (`only_act`,
-    /// the two Δ columns), then the conditional `eval loss` / `m:<metric>` columns —
-    /// the `m:` prefix marks a column as measured but NEVER ranked.
+    /// LEARNING cost (`updates`, `A/D`, `idle`) and its MEASURING cost (`measured`) →
+    /// what that effort BOUGHT (`prop (D)`, `rescaled (A)`, `D * A`) → what the ELITE
+    /// rules did with it (`only_act`, the two Δ columns), then the conditional
+    /// `eval loss` / `m:<metric>` columns — the `m:` prefix marks a column as measured
+    /// but NEVER ranked.
     ///
     /// Each measured quantity carries its WORD and its capital LETTER (`fit (A)`,
-    /// `tickets (B)`, `updates (D)`), a DERIVED column is named by its own equation
-    /// (`A/B`, `D * A`), and the card's legend states the relations in those
+    /// `updates (D)`, `measured (B)`), a DERIVED column is named by its own operation
+    /// (`A/D`, `D * A`), and the card's legend states the relations in those
     /// same letters (`D * A = prop (D) × rescaled (A)`). The word is what a reader says, the letter is what
-    /// the arithmetic is written in, and a row is checkable by hand — `0.06` is `A ÷ B`
-    /// (fit per ticket), not `A ÷ C` (per clock lived).
+    /// the arithmetic is written in, and a row is checkable by hand — `0.06` is `A ÷ D`
+    /// (fit per update), not `A ÷ C` (per clock lived) and not `A ÷ B` (per measurement).
     fn stop_header(&self, has_eval: bool) -> Vec<String> {
         let mut header: Vec<String> = STOP_HEADER_FIXED.iter().map(|s| s.to_string()).collect();
         if has_eval {
@@ -745,8 +746,14 @@ impl CoreEngine {
         let score = reading
             .map(|r| r.risk_adjusted(self.fitness.direction(), self.config.risk_aversion))
             .or(row.fit);
-        let tickets = state.map(|s| s.measured_clocks());
-        let merit = tickets.and_then(|t| Self::merit_from(score, t));
+        // TWO different counts, deliberately: `B` is what the table PRINTS (clocks
+        // measured, `D + O`), `D` (`state.step`) is what the lottery DIVIDES by — the
+        // learning budget a ticket actually buys. A crown act pass is in `B`, never in
+        // the divisor, so "was once the champion" cannot read as "is inefficient".
+        let measured = state.map(|s| s.measured_clocks());
+        let merit = state
+            .map(|s| s.step)
+            .and_then(|d| Self::merit_from(score, d));
         let metrics = state.and_then(|s| s.last_metrics.as_ref());
         let born = state.map(|s| s.entered_at_step).unwrap_or(0);
         // Clocks lived INCLUSIVE of the birth clock and the last run — the convention the
@@ -824,22 +831,29 @@ impl CoreEngine {
                 .map(fmt_cell)
                 .unwrap_or_else(dash),
             // ── what its learning COST ─────────────────────────────────
-            tickets.map(|t| t.to_string()).unwrap_or_else(dash),
-            // `A/B` takes the CELL precision, not the config one: the lottery's field is
+            measured.map(|t| t.to_string()).unwrap_or_else(dash),
+            // `A/D` takes the CELL precision, not the config one: the lottery's field is
             // often narrow (0.044…0.064 on a loss-like metric), and at 2dp two nets that
             // earn `p = 1.00` and `p = 0.50` would both print `0.06` beside each other.
             merit.map(fmt_cell).unwrap_or_else(dash),
-            row.ticket_frame
-                .map(|f| {
-                    self.train_lottery_p_eff_from(
-                        row.hash,
-                        row.plan.dealt_clock,
-                        Some(f),
-                        merit,
-                    )
-                })
-                .map(fmt_cfg)
-                .unwrap_or_else(dash),
+            // A CROWN row prints `—`, not `1.00`: the crown acts for free, so no coin
+            // was ever thrown for it (`train_lottery_p_from` returns 1.0 before it
+            // looks at the field). A printed 1.00 reads as "guaranteed draw won".
+            if self.frozen_crown.contains(row.hash) {
+                dash()
+            } else {
+                row.ticket_frame
+                    .map(|f| {
+                        self.train_lottery_p_eff_from(
+                            row.hash,
+                            row.plan.dealt_clock,
+                            Some(f),
+                            merit,
+                        )
+                    })
+                    .map(fmt_cfg)
+                    .unwrap_or_else(dash)
+            },
             state.map(|s| s.step.to_string()).unwrap_or_else(dash),
             // Clocks the lottery left IDLE (no train, no eval). `only_act` stays the
             // crown's own count, so the two causes never hide inside one number.
@@ -941,8 +955,11 @@ impl CoreEngine {
                     // `merit_per_ticket` here as well walked the same window a second
                     // time for a number this loop already held.
                 let smt = self.smoothed_fitness_of(&h);
-                let tickets = state.map(|s| s.measured_clocks()).unwrap_or(0);
-                let merit = Self::merit_from(smt, tickets);
+                // The DIVISOR is the update count (`D`), not the measured count: a
+                // crown act pass costs no learning budget, so it never dilutes a
+                // net's merit. `measured` is printed beside it as the cost column.
+                let measured = state.map(|s| s.measured_clocks()).unwrap_or(0);
+                let merit = Self::merit_from(smt, state.map(|s| s.step).unwrap_or(0));
                 // The BLENDED probability — the one the coin compares against —
                 // so `p` and the `ticket?` column beside it cannot disagree.
                 let p = self.train_lottery_p_eff_from(&h, clock, Some(frame), merit);
@@ -955,10 +972,11 @@ impl CoreEngine {
                 } else {
                     "—"
                 };
-                    // `smt / tkt` is ONE quantity, so it prints as its two legs and the
-                    // ratio between them: the numerator here, the divisor (`measured
-                    // clocks` — real updates plus crown act passes) and the quotient
-                    // beside each other, left to right. A reader can redo the division.
+                    // `smt / D` is ONE quantity, so it prints as its two legs and the
+                    // ratio between them: the numerator here, the divisor (`updates`)
+                    // and the quotient beside each other, left to right. A reader can
+                    // redo the division. `measured` rides beside them because it is the
+                    // other cost counter — `B = D + O` — not the divisor.
                     // The numerator takes the CELL precision (4dp, widened below 5e-5) so
                     // a small loss-based smt never rounds to `0.00` while the ratio
                     // beside it is plainly non-zero.
@@ -975,9 +993,11 @@ impl CoreEngine {
                     h[..8.min(h.len())].to_string(),
                     exempt.to_string(),
                     smt.map(fmt_cell).unwrap_or_else(|| "—".to_string()),
-                    state
-                        .map(|s| s.measured_clocks().to_string())
-                        .unwrap_or_else(|| "—".to_string()),
+                    if state.is_some() {
+                        measured.to_string()
+                    } else {
+                        "—".to_string()
+                    },
                     merit.map(fmt_cfg).unwrap_or_else(|| "—".to_string()),
                     fmt_cfg(p),
                     if trains { "yes" } else { "no" }.to_string(),
@@ -1015,8 +1035,8 @@ impl CoreEngine {
                     "net",
                     "exempt",
                     "score",
-                    "tickets",
-                    "score/ticket",
+                    "measured",
+                    "score/update",
                     "p(ticket)",
                     "ticket?",
                     "idle",
@@ -1024,7 +1044,7 @@ impl CoreEngine {
                 &rows.into_iter().map(|(_, _, row)| row).collect::<Vec<_>>(),
             ),
             Some(&format!(
-                "score = the net's smoothed risk-adjusted score (K-reading mean of window avg ∓ λ × window spread, the ranking's number) · tickets = clocks that got a TRAIN-EVAL TICKET — it ran the trainer and was scored (real updates + crown passes); score is the numerator and tickets the divisor · score/ticket = score ÷ tickets (2dp, so a redo from the two legs can miss in the last digit): the window level per ticket spent, so idling leaves it untouched · field THIS clock drew from: best {} worst {} · p(ticket) = where the net's score/ticket sits between those two bounds (1 = best, 0 = worst before the floor), lifted off the bottom by p_min {} (`p = p_min + (1 − p_min)·f`, so only the nets below the floor move) and then blended by Ω: `1 − Ω·(1 − p)`, so Ω < 1 lifts every net toward 1 = always train · ticket? = yes if THIS clock sells it the step (train + eval), no if it IDLES instead (no train, no eval, nothing measured) · exempt nets (crown, born shield) always run and grade 1.00 — but a crown reads no, because the crown's act pass outranks the lottery · idle = clocks the lottery left it idle BEFORE this clock ({} across the run); the step's lottery line names this clock's count",
+                "score = the net's smoothed risk-adjusted score (K-reading mean of window avg ∓ λ × window spread, the ranking's number) · measured = clocks the net was measured on, real updates + crown act passes · score/update = score ÷ UPDATES (`A/D` in the final table, 2dp here so a redo from the legs can miss in the last digit): the window level per weight update, so idling leaves it untouched AND a crown pass does not dilute it · field THIS clock drew from: best {} worst {} · p(ticket) = where the net's score/update sits between those two bounds (1 = best, 0 = worst before the floor), lifted off the bottom by p_min {} (`p = p_min + (1 − p_min)·f`, so only the nets below the floor move) and then blended by Ω: `1 − Ω·(1 − p)`, so Ω < 1 lifts every net toward 1 = always train · ticket? = yes if THIS clock sells it the step (train + eval), no if it IDLES instead (no train, no eval, nothing measured) · exempt nets (crown, born shield) always run and grade 1.00 — but a crown reads no, because the crown's act pass outranks the lottery · idle = clocks the lottery left it idle BEFORE this clock ({} across the run); the step's lottery line names this clock's count",
                 fmt_cfg(best),
                 fmt_cfg(worst),
                 fmt_cfg(self.train_merit_p_min()),
@@ -1152,12 +1172,8 @@ impl CoreEngine {
             // probability are the same three quantities the pre-step card prints, so
             // they are derived here rather than re-asked through `merit_per_ticket`.
             let score = self.smoothed_fitness_of(&h);
-            let tickets = self
-                .state
-                .net(&h)
-                .map(|s| s.measured_clocks())
-                .unwrap_or(0);
-            let merit = Self::merit_from(score, tickets);
+            let updates = self.state.net(&h).map(|s| s.step).unwrap_or(0);
+            let merit = Self::merit_from(score, updates);
             if merit.is_some() {
                 graded += 1;
                     // The BLENDED probability, not the raw fraction: this line's
@@ -1237,10 +1253,10 @@ impl CoreEngine {
 
 /// The fixed left-hand columns of the stop-time table, in NARRATIVE order: what the net
 /// IS (`#`, `hash`, `origin`, age, census) → how it is RANKED (`fit (A)` and the two
-/// window legs) → what its learning COST (`tickets (B)`, `A/B`, `p(ticket)`, `updates
-/// (D)`, `idle (I)`, `act (O)`) → what that effort BOUGHT (`prop (D)`, `rescaled (A)`,
-/// `D * A`) → the verdict (`mark`). One list: the header prints it and the legend must
-/// explain every entry (`every_column_has_a_legend_row`).
+/// window legs) → what its learning COST (`updates (D)`, `A/D`, `p(ticket)`, `idle (I)`,
+/// `act (O)`) → what that effort BOUGHT (`prop (D)`, `rescaled (A)`, `D * A`) → the
+/// verdict (`mark`). One list: the header prints it and the legend must explain every
+/// entry (`every_column_has_a_legend_row`).
 const STOP_HEADER_FIXED: &[&str] = &[
     "#",
     "hash",
@@ -1251,23 +1267,28 @@ const STOP_HEADER_FIXED: &[&str] = &[
     "wires",
     "width",
     // The word AND its letter, so a legend equation can be read straight off the row;
-    // the DERIVED columns are named by their own operation (`A/B`, `D * A`).
+    // the DERIVED columns are named by their own operation (`A/D`, `D * A`).
     "fit (A)",
     // The window is TWO columns, not one `μ ±σ (SE, n)` cell: `A = mean ∓ λ × spread` can
     // only be redone when its legs are readable on their own. `n` gets no column — it is
-    // `min(B, K)`, read off `tickets (B)`.
+    // `min(B, K)`, read off `measured (B)`.
     "mean",
     "spread",
-    "tickets (B)",
-    // The quotient beside its own denominator, so `fit ÷ tickets` is checked against the
-    // row instead of guessed (it is NOT `fit ÷ age`).
-    "A/B",
-    // The lottery's OUTPUT for the last clock: what that `A/B` earned the net in draw
+    // `B = D + O`: every clock the net was MEASURED on. Not the lottery's payout — the
+    // lottery hands out `D` only, and a crown act pass lands in here without ever being
+    // drawn for, which is exactly the confusion the old `tickets (B)` spelling caused.
+    "measured (B)",
+    // The quotient beside its own DIVISOR, so `fit ÷ updates` is checked against the row
+    // instead of guessed (it is NOT `fit ÷ age` and no longer `fit ÷ measured`).
+    "A/D",
+    // The lottery's OUTPUT for the last clock: what that `A/D` earned the net in draw
     // probability, beside its two inputs, so it does not look like another score.
     "p(ticket)",
     "updates (D)",
     // The two counters that close the age identity get letters too, so `B = D + O` and
-    // `C = D + O + I` read in the same alphabet as the columns that hold them.
+    // `C = D + O + I + 1` read in the same alphabet as the columns that hold them. The
+    // +1 is the BIRTH clock: it ages the net (age counts it) but it is neither a ticket
+    // nor an idle, so it belongs in no counter — same rule as the legend's identity row.
     "idle (I)",
     // Act-only clocks: the crown trained and was scored, its update discarded. `act`, not
     // `frozen`: the crown seat DOES train and evaluate — calling that net frozen claimed
@@ -1358,8 +1379,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         ),
         (
             "mean".to_string(),
-            format!(
-                "the window mean of the last `n = min(B, K)` results, K = {} — `n` gets no column of its own: it only falls short of K for a net born within K clocks of the stop, so it is read off `tickets (B)`",
+            format!(                    "the window mean of the last `n = min(B, K)` results, K = {} — `n` gets no column of its own: it only falls short of K for a net born within K clocks of the stop, so it is read off `measured (B)`",
                 ctx.window
             ),
         ),
@@ -1370,22 +1390,22 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         ),
         // ── what its learning COST ──────────────────────────────────────
         (
-            "tickets (B)".to_string(),
-            "`B = D + O` — clocks the net ran the trainer on AND was scored for; an idle clock is not one"
+            "measured (B)".to_string(),
+            "`B = D + O` — clocks the net was MEASURED: it ran the trainer and was scored (`D`), or it held the crown and was scored with its update discarded (`O`). It is the measuring cost, not the learning cost: the lottery hands out `D` only, so a crown pass lifts `B` without ever being drawn for. An IDLE clock is in neither — nothing ran, nothing was measured"
                 .to_string(),
         ),
         (
-            "A/B".to_string(),
-            "fit per ticket — the LOTTERY's merit: what one clock of train+eval bought from this net. It divides by `B` (tickets), NOT by `D` (updates): a crown act pass spent a ticket and produced a fresh reading, so charging it as if the net had not run would hand the crown a free ratio. `B = D + O`, which is why the two columns differ on a net that held a seat"
+            "A/D".to_string(),
+            "fit per UPDATE — the LOTTERY's merit: what one optimizer step bought from this net (`A ÷ D`). It divides by `D`, NOT by `B`: a crown act pass applied no update, so charging it would dilute a demoted champion's merit for the rest of its life and make \"was once the elite\" read as \"is inefficient\". `B = D + O`, which is why the two columns differ on a net that held a seat"
                 .to_string(),
         ),
         (
             "p(ticket)".to_string(),
-            "the chance this net had of getting the LAST clock's train+eval ticket: its `A/B` as a position in the split field below, then blended by Ω — `1 − Ω × (1 − p)`; 1.00 = always trains (the worst net keeps a standing `1 − Ω`), 0.00 = never, `—` = the lottery is off (Ω = 0) or the field was never armed"
+            "the chance this net had of getting the LAST clock's UPDATING ticket: its `A/D` as a position in the split field below, then blended by Ω — `1 − Ω × (1 − p)`; 1.00 = always trains (the worst net keeps a standing `1 − Ω`), 0.00 = never, `—` = the crown acts for free so no coin was thrown for it, or the lottery is off (Ω = 0) / the field was never armed"
                 .to_string(),
         ),
         (
-            "A/B field · Ω".to_string(),
+            "A/D field · Ω".to_string(),
             match ctx.lottery.as_ref() {
                 Some(f) => {
                     // The frame is stored direction-adjusted (`best` = the value `p = 1`
@@ -1396,7 +1416,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
                         crate::utils::fitness::Direction::Minimize => (-f.best, -f.worst),
                     };
                     format!(
-                        "the lottery field the last clock drew from: best `A/B = {}` and worst `A/B = {}` over the nets it grades (crown and born-shield nets are exempt, so they never set the scale) · Ω = {} = how much of that spread it withholds; the column prints `A/B` at cell precision so the two ends these bounds name are findable in it",
+                        "the lottery field the last clock drew from: best `A/D = {}` and worst `A/D = {}` over the nets it grades (crown and born-shield nets are exempt, so they never set the scale) · Ω = {} = how much of that spread it withholds; the column prints `A/D` at cell precision so the two ends these bounds name are findable in it",
                         fmt_cell(best),
                         fmt_cell(worst),
                         fmt_cfg(ctx.omega),
@@ -1447,7 +1467,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         (
             "D * A".to_string(),
             format!(
-                "`D * A = prop (D) × rescaled (A)` — inefficiency, the product of the two legs beside it, EACH ALREADY NORMALISED to 0..1 (raw `D × A` is never meant). 1.00 = the field's most training on the field's worst score, near 0 = little effort or a score near the best. REPORT ONLY: nothing in the loop reads it — it picks the `x` worst artifacts (top-{} of this column, elites excluded) and nothing else. Ticket allocation uses `A/B`, not this",
+                "`D * A = prop (D) × rescaled (A)` — inefficiency, the product of the two legs beside it, EACH ALREADY NORMALISED to 0..1 (raw `D × A` is never meant). 1.00 = the field's most training on the field's worst score, near 0 = little effort or a score near the best. REPORT ONLY: nothing in the loop reads it — it picks the `x` worst artifacts (top-{} of this column, elites excluded) and nothing else. Ticket allocation uses `A/D`, which is the same pair of numbers read the other way round: effort per unit of score",
                 ctx.worst_len
             ),
         ),
