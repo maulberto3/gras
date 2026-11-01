@@ -33,6 +33,7 @@
 
 mod arrays;
 mod config;
+mod defaults;
 mod engine;
 mod gym;
 mod logging;
@@ -55,6 +56,7 @@ use crate::topology::PyTopology;
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(menus, m)?)?;
+    m.add_function(wrap_pyfunction!(defaults::defaults, m)?)?;
     m.add_function(wrap_pyfunction!(losses, m)?)?;
     m.add_function(wrap_pyfunction!(metrics, m)?)?;
     m.add_function(wrap_pyfunction!(fitnesses, m)?)?;

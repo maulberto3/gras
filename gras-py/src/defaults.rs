@@ -1,0 +1,132 @@
+//! `gras.defaults()` — the numbers a fresh `RaceConfig()` actually holds.
+//!
+//! Rust callers get this for free (`RaceConfig::defaults()`, `TopologyOptions::
+//! default()`); a notebook has no way to read a `TopologyOptions` at all, and the
+//! Python surface hides a dozen knobs behind `None` (= "use the crate default") or
+//! an empty pool (= "all"). So the source of truth here is the CRATE's
+//! `RaceConfig::defaults()`, with the two deliberate Python divergences applied and
+//! re-stated in `binding_overrides`: a Python run ranks on the plain mean
+//! (`risk_aversion = 0.0`, not the crate's FIT 1.0) and starts all-random
+//! (`elite_previous_load = false`).
+
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+
+use gras::graph::topology::TopologyOptions;
+
+/// `f32` → `f64` without the binary-tail noise: `0.05f32` must print as `0.05`, not
+/// `0.05000000074505806`. Six decimals is far finer than any knob here.
+fn round32(v: f32) -> f64 {
+    ((v as f64) * 1e6).round() / 1e6
+}
+
+/// Everything a default run holds, as one flat dict plus the nested blueprint + the
+/// binding's own override list.
+#[pyfunction]
+pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let cfg = gras::RaceConfig::defaults();
+    let opts: TopologyOptions = cfg.topology_options;
+    let d = PyDict::new(py);
+
+    // ── run / ranking ───────────────────────────────────────────────────
+    d.set_item("pop_size", cfg.pop_size)?;
+    d.set_item("elite_count", cfg.elite_count)?;
+    d.set_item("max_steps", cfg.max_steps)?;
+    d.set_item("checkpoint_every", cfg.checkpoint_every)?;
+    d.set_item("elite_freeze", cfg.freeze_elites)?;
+    d.set_item("smoothing_window", cfg.smoothing_window)?;
+    // The BINDING's values: the two knobs a Python run does not inherit from the crate.
+    d.set_item("risk_aversion", 0.0)?;
+    d.set_item("train_merit", round32(cfg.train_merit))?;
+    d.set_item("train_merit_p_min", round32(cfg.train_merit_p_min))?;
+    d.set_item("log_level", format!("{:?}", cfg.log_level).to_lowercase())?;
+    d.set_item("mode", format!("{:?}", cfg.mode).to_lowercase())?;
+
+    // ── evolution ───────────────────────────────────────────────────────
+    d.set_item("crossover_rolls", cfg.crossover_rolls)?;
+    d.set_item("mutate_rolls", cfg.mutate_rolls)?;
+    d.set_item("crossover_prob", round32(cfg.crossover_prob))?;
+    d.set_item("mutate_prob", round32(cfg.mutate_prob))?;
+    d.set_item("crossover_selection", cfg.crossover_selection.to_string())?;
+    d.set_item(
+        "crossover_cull_policy",
+        cfg.crossover_cull_policy.to_string(),
+    )?;
+    d.set_item("mutation_cull_policy", cfg.mutation_cull_policy.to_string())?;
+    d.set_item("crossover_ops_pool", cfg.crossover_ops_pool.clone())?;
+    d.set_item("mutation_probation_steps", cfg.mutation_probation_steps)?;
+    d.set_item("crossover_probation_steps", cfg.crossover_probation_steps)?;
+    d.set_item("elite_join_probation_steps", cfg.elite_join_probation_steps)?;
+    d.set_item(
+        "elite_crown_lifetime_steps",
+        cfg.elite_crown_lifetime_steps,
+    )?;
+
+    // ── search space (the blueprint the Python surface only shows as `None`) ──
+    d.set_item(
+        "hidden_dim_pool",
+        cfg.hidden_dim_pool
+            .map(|r| format!("{}..={}", r.start(), r.end())),
+    )?;
+    d.set_item("hidden_dim_stride", cfg.hidden_dim_stride)?;
+    d.set_item("activation_pool", cfg.activation_pool.clone())?;
+    d.set_item("combine_op_pool", cfg.combine_op_pool.clone())?;
+    d.set_item("standardize_op_pool", cfg.standardize_op_pool.clone())?;
+    let topo = PyDict::new(py);
+    topo.set_item("min_hidden_num_nodes", opts.min_hidden_num_nodes)?;
+    topo.set_item("max_hidden_num_nodes", opts.max_hidden_num_nodes)?;
+    topo.set_item(
+        "min_hidden_inputs_per_node",
+        opts.min_hidden_inputs_per_node,
+    )?;
+    topo.set_item(
+        "max_hidden_inputs_per_node",
+        opts.max_hidden_inputs_per_node,
+    )?;
+    topo.set_item(
+        "min_hidden_outputs_per_node",
+        opts.min_hidden_outputs_per_node,
+    )?;
+    topo.set_item(
+        "max_hidden_outputs_per_node",
+        opts.max_hidden_outputs_per_node,
+    )?;
+    topo.set_item("dropout_prob", round32(opts.dropout_prob))?;
+    // `None` = every port sees the whole input vector (no feature split).
+    topo.set_item("feature_split", opts.feature_split.map(|p| p.to_string()))?;
+    d.set_item("topology_options", topo)?;
+
+    // ── artifacts ───────────────────────────────────────────────────────
+    d.set_item("csv_export", cfg.csv_export)?;
+    d.set_item("trace_file", cfg.trace_file)?;
+    d.set_item("save_optim", cfg.save_optim)?;
+    d.set_item("elite_save_topology", cfg.elite_save_topology)?;
+    d.set_item("worst_save_topology", cfg.worst_save_topology)?;
+    d.set_item("run_name", cfg.run_name.clone())?;
+    d.set_item("elite_previous_load", false)?;
+    d.set_item(
+        "elite_previous_dir",
+        cfg.elite_previous_dir
+            .as_ref()
+            .map(|p| p.display().to_string()),
+    )?;
+
+    // What `RaceConfig()` deliberately does NOT take from the crate. Printed rather
+    // than silently folded in, so a reader can see the two sets differ on purpose.
+    let overrides = PyDict::new(py);
+    overrides.set_item("risk_aversion", {
+        let kv = PyDict::new(py);
+        kv.set_item("binding", 0.0)?;
+        kv.set_item("crate", round32(gras::engine::config::RISK_AVERSION))?;
+        kv
+    })?;
+    overrides.set_item("elite_previous_load", {
+        let kv = PyDict::new(py);
+        kv.set_item("binding", false)?;
+        kv.set_item("crate", cfg.elite_previous_load)?;
+        kv
+    })?;
+    d.set_item("binding_overrides", overrides)?;
+
+    Ok(d.unbind())
+}
