@@ -414,7 +414,7 @@ impl CoreEngine {
     /// run keep the same number of nets and there is no second "worst count" to keep in
     /// sync. A net saved as an elite is EXCLUDED here (a run must never write both
     /// `elite-<hash>` and `worst-<hash>` for one net), which is why a population smaller
-    /// than `2k` yields fewer picks — the same rule the stop-time `✖` mark applies when it
+    /// than `2k` yields fewer picks — the same rule the stop-time `x` mark applies when it
     /// refuses to mark a net that is already marked `★`.
     pub(crate) fn worst_ranked(&self) -> Vec<WorstPick> {
         self.worst_ranked_from(&self.ranked_live())
@@ -465,7 +465,7 @@ impl CoreEngine {
     /// arithmetic than the file it points at. `None` when nothing is ranked yet.
     ///
     /// It takes the RANKING rather than computing one: both callers (`worst_ranked_from`,
-    /// and the stop card that marks `✖` from the same `worst_ranked_from`) already hold it,
+    /// and the stop card that marks `x` from the same `worst_ranked_from`) already hold it,
     /// and the field is only meaningful against the ranking it was sliced from.
     pub(crate) fn inefficiency_field_from(
         &self,

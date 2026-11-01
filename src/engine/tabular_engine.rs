@@ -138,7 +138,7 @@ impl TabularEngine {
     pub fn resume(
         run_dir: std::path::PathBuf,
         data_dir: std::path::PathBuf,
-        config: RaceConfig,
+        mut config: RaceConfig,
         fitness: Fitness,
         trainer: impl crate::trainer::TabularStep + 'static,
     ) -> Result<Self> {
@@ -179,7 +179,40 @@ impl TabularEngine {
         } else {
             crate::utils::tabular_data::resolve_dataset(&data_dir)?.to_device(config.device())?
         };
-        let metrics = config.metrics.clone();
+        // The METRIC SET comes from the RECORD, never from this call: it is the header
+        // `history.csv` already carries (`append_csv_file` writes a header only when the
+        // file is missing) and what `engine.json` says the first segment measured. A
+        // caller's DIFFERENT set is refused by name, like the trainer/pop guards — a
+        // resume is the same experiment, so it records the same columns.
+        let mut recorded_metrics = Vec::with_capacity(header.informative_metrics.len());
+        for name in &header.informative_metrics {
+            match crate::trainer::menu::metric_for(name) {
+                Some(metric) => recorded_metrics.push(metric),
+                None => {
+                    return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                        "resume: engine.json records metric {name:?}, which this build no longer provides — the run wrote that column and cannot be continued without it"
+                    ))
+                    .into())
+                }
+            }
+        }
+        let requested: Vec<String> = config.metrics.iter().map(|m| m.label().to_string()).collect();
+        let recorded: Vec<String> = recorded_metrics
+            .iter()
+            .map(|m| m.label().to_string())
+            .collect();
+        // An EMPTY request is the caller saying "whatever the run used" (`resume_from`
+        // always lands here that way), so it is not a mismatch.
+        if !requested.is_empty() && requested != recorded {
+            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                "resume: metrics changed — the run recorded [{}] but this call asks for [{}]; the metric set is part of the record (it is history.csv's header), so pass the recorded set or start a new run",
+                recorded.join(", "),
+                requested.join(", ")
+            ))
+            .into());
+        }
+        config.metrics = recorded_metrics.clone();
+        let metrics = recorded_metrics;
         let run_seed = header.run_seed;
         // On resume, stream shape comes from the run header (data integrity),
         // but the trainer's stream_shape() can still override batch sizes.

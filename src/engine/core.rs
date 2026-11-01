@@ -5315,6 +5315,68 @@ mod tests {
     }
 
     #[test]
+    fn resume_refuses_a_changed_metric_set_and_keeps_the_recorded_one() {
+        // The metric set is the CSV's HEADER: `append_csv_file` writes a header only when
+        // the file is missing, so a changed set would append rows a column short of their
+        // own header and rewrite `engine.json` to name a set the file never measured.
+        let dir = std::env::temp_dir().join("race_resume_metric_set");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut part = engine(&dir, 99).unwrap();
+        part.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+            .unwrap();
+        let h = part.state.live_hashes()[0].clone();
+        part.step_one_net(&h, 0).unwrap();
+        let state = part.state.net(&h).cloned().unwrap();
+        crate::state::write_net_state(&dir, &state).unwrap();
+        part.write_frontier_manifest(1).unwrap();
+        part.write_live_net_weights().unwrap();
+        drop(part);
+
+        // Pretend the first segment recorded `r2` (the `engine()` helper starts bare).
+        let mut header = crate::state::load_engine_json(&dir).unwrap();
+        header.informative_metrics = vec!["r2".to_string()];
+        crate::state::write_engine_json(&dir, &header).unwrap();
+
+        let err = match crate::engine::TabularEngine::resume(
+            dir.clone(),
+            tiny_dataset_dir("resume-metrics"),
+            {
+                let mut c = RaceConfig::defaults();
+                c.pop_size = 1;
+                c.metrics = crate::trainer::metrics_for(&["mse"]).unwrap();
+                c
+            },
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        ) {
+            Ok(_) => panic!("a changed metric set is a different experiment and must refuse"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("r2") && err.contains("mse"),
+            "the refusal names BOTH sets: {err}"
+        );
+
+        // An empty request means "whatever the run used" — the resume then records the
+        // RECORDED set, so the columns and engine.json keep describing the same file.
+        let resumed = crate::engine::TabularEngine::resume(
+            dir.clone(),
+            tiny_dataset_dir("resume-metrics-ok"),
+            {
+                let mut c = RaceConfig::defaults();
+                c.pop_size = 1;
+                c
+            },
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+        )
+        .unwrap();
+        let labels: Vec<&str> = resumed.metrics.iter().map(|m| m.label()).collect();
+        assert_eq!(labels, vec!["r2"], "the recorded set survives the resume");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn resume_keeps_the_recorded_eval_era_when_the_tick_cadence_changes() {
         // `checkpoint_every` is two numbers in one key — how often the durability tick
         // fires, and how often the eval permutation rotates. A resume may change the first;

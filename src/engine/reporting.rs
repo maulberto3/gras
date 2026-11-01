@@ -409,12 +409,12 @@ impl CoreEngine {
     /// that spent the most clocks and still scores at the bottom — and that net is NOT the
     /// last row of the fitness ranking. Cutting two cards from the two ends of
     /// `ranked_live()` could only show `A`'s extremes; the `D * A` column puts
-    /// the reading on every row, and `✖` marks the nets `worst-<hash>.*` actually saved,
+    /// the reading on every row, and `x` marks the nets `worst-<hash>.*` actually saved,
     /// so both ends and everything between them are read in one place.
     ///
     /// The marks are taken from the SAME calls the artifact writers make (`champion_slice`
     /// / `worst_ranked_from`), over the ONE ranking this card computes, so a mark and a
-    /// file can never disagree, and a net saved as an elite is never marked `✖` (a
+    /// file can never disagree, and a net saved as an elite is never marked `x` (a
     /// population under `2k` therefore yields fewer than k worst picks).
     ///
     /// Stop-time only, and it cannot perturb a replay (no forward pass, no environment, no
@@ -424,7 +424,7 @@ impl CoreEngine {
     /// `final-field.csv` is written at every log level (`None` included), because a
     /// scripted run is exactly the caller who wants the table as a file.
     pub(crate) fn log_final_field(&self, clock: usize, verbose: bool) {
-        // ONE ranking for the whole card. The rows, the reported top-k, the `✖` set and
+        // ONE ranking for the whole card. The rows, the reported top-k, the `x` set and
         // the `inefficiency` column all read it: each of those used to rank the field
         // again (ranks behind a rank, x4), and the cells they printed could only agree
         // by coincidence.
@@ -477,7 +477,9 @@ impl CoreEngine {
             marks.insert(hash.clone(), if seated { "★" } else { "☆" });
         }
         for hash in &worst {
-            marks.entry(hash.clone()).or_insert("✖");
+            // Plain ASCII `x`, not `✖`: the heavy glyph renders double-width in
+            // some terminals and pushes the gate letter (`xb`) off its column.
+            marks.entry(hash.clone()).or_insert("x");
         }
         let plan = self.stop_plan(&top);
         let arrow = self.fitness.direction().arrow();
@@ -538,7 +540,7 @@ impl CoreEngine {
         self.write_final_field_csv(&plan.header, &grid);
         let field_card = crate::utils::cfy::card(
             &format!(
-                "Final field ({} nets — {} measured, ranked by fit{arrow} (A) · ★ {}{seat_note} · ✖ {})",
+                "Final field ({} nets — {} measured, ranked by fit{arrow} (A) · ★ {}{seat_note} · x {})",
                 rows.len(),
                 measured,
                 top.len() - barred,
@@ -752,7 +754,7 @@ impl CoreEngine {
     /// Render the stop-time table from the shared plan: one row per ranked net, and the
     /// field's own Δ means.
     ///
-    /// `marks` is the saved-set marking (`★`/`☆`/`✖`/`·`). `lottery` is the field the
+    /// `marks` is the saved-set marking (`★`/`☆`/`x`/`·`). `lottery` is the field the
     /// LAST clock drew from: with it, each row's `p(ticket)` is the arithmetic the coin
     /// actually used, not a re-derivation against a field that no longer exists.
     fn stop_card(
@@ -1534,7 +1536,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         (
             "D * A".to_string(),
             format!(
-                "`D * A = prop (D) × rescaled (A)` — inefficiency, the product of the two legs beside it, EACH ALREADY NORMALISED to 0..1 (raw `D × A` is never meant). 1.00 = the field's most training on the field's worst score, near 0 = little effort or a score near the best. REPORT ONLY: nothing in the loop reads it — it picks the `✖` worst artifacts (top-{} of this column, elites excluded) and nothing else. Ticket allocation uses `A/B`, not this",
+                "`D * A = prop (D) × rescaled (A)` — inefficiency, the product of the two legs beside it, EACH ALREADY NORMALISED to 0..1 (raw `D × A` is never meant). 1.00 = the field's most training on the field's worst score, near 0 = little effort or a score near the best. REPORT ONLY: nothing in the loop reads it — it picks the `x` worst artifacts (top-{} of this column, elites excluded) and nothing else. Ticket allocation uses `A/B`, not this",
                 ctx.worst_len
             ),
         ),
@@ -1551,7 +1553,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         (
             "mark".to_string(),
             format!(
-                "`★` saved as elite (top-{} by A) and holding a crown seat · `☆` saved as elite but barred from the seat (the `j` or `t` beside it names the gate) · `✖` saved as worst (top-{} by `D * A`) · `·` neither; with the crown off nobody sits, so every saved elite reads `★`",
+                "`★` saved as elite (top-{} by A) and holding a crown seat · `☆` saved as elite but barred from the seat (the `j` or `t` beside it names the gate) · `x` saved as worst (top-{} by `D * A`) · `·` neither; with the crown off nobody sits, so every saved elite reads `★`",
                 ctx.k,
                 ctx.worst_len
             ),
@@ -1651,7 +1653,7 @@ struct StopRow<'a> {
     /// 1-based rank in the race, best FIT first; `None` for an UNMEASURED net, which has
     /// no FIT to be ranked by (it prints `—` there and rides at the bottom of the table).
     rank: Option<usize>,
-    /// The saved-set mark: `★` saved elite AND seated, `☆` saved but barred, `✖` worst,
+    /// The saved-set mark: `★` saved elite AND seated, `☆` saved but barred, `x` worst,
     /// `·` neither.
     mark: &'a str,
     /// The net, by full hash (the `hash` cell prints the first eight).
