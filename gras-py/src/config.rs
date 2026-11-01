@@ -46,6 +46,10 @@ const DEFAULT_PROBATION_STEPS: usize = 5;
 /// crate too, so only λ is a deliberate divergence.
 const DEFAULT_RISK_AVERSION: f32 = 0.0;
 const DEFAULT_TRAIN_MERIT: f32 = 0.0;
+/// The lottery's merit floor `p_min`, mirrored from the crate's default. It only has
+/// an effect while Ω is above 0, so exposing it changes nothing about the Ω = 0 path
+/// a Python run starts on.
+const DEFAULT_TRAIN_MERIT_P_MIN: f32 = 0.05;
 
 /// Engine knobs a Python caller turns. Anything not listed keeps the crate's
 /// default, and every field is recorded in the run's `engine.json`.
@@ -74,6 +78,11 @@ pub struct PyRaceConfig {
     /// **`0.0` = off** — the coin is never drawn and every non-crown net runs.
     #[pyo3(get, set)]
     pub train_merit: f32,
+    /// Merit floor `p_min`: the share of clocks the WORST net in the field still gets
+    /// (`0.05` default, `0.0` = the pre-floor arithmetic). Lifts only the bottom, so it
+    /// is a cheaper dial than Ω — which lifts every net toward "always train".
+    #[pyo3(get, set)]
+    pub train_merit_p_min: f32,
     /// Per-step reporting shape, the same vocabulary as the examples'
     /// `--log-level`: `summ` (default), `minimal`, `none`, `debug`, `trace`.
     /// Recorded in `engine.json`, so a run's verbosity is part of its record.
@@ -215,6 +224,7 @@ impl PyRaceConfig {
         smoothing_window = SMOOTHING_WINDOW,
         risk_aversion = DEFAULT_RISK_AVERSION,
         train_merit = DEFAULT_TRAIN_MERIT,
+        train_merit_p_min = DEFAULT_TRAIN_MERIT_P_MIN,
         elite_previous_load = false,
         log_level = String::from("summ"),
         // evolution
@@ -264,6 +274,7 @@ impl PyRaceConfig {
         smoothing_window: usize,
         risk_aversion: f32,
         train_merit: f32,
+        train_merit_p_min: f32,
         elite_previous_load: bool,
         log_level: String,
         crossover_rolls: usize,
@@ -305,6 +316,7 @@ impl PyRaceConfig {
             smoothing_window,
             risk_aversion,
             train_merit,
+            train_merit_p_min,
             // OFF by default: a Python run must not silently inherit elites from
             // whatever `results/` happens to sit in the caller's cwd.
             elite_previous_load,
@@ -491,6 +503,7 @@ impl PyRaceConfig {
         cfg.smoothing_window = self.smoothing_window;
         cfg.risk_aversion = self.risk_aversion;
         cfg.train_merit = self.train_merit;
+        cfg.train_merit_p_min = self.train_merit_p_min;
         cfg.elite_previous_load = self.elite_previous_load;
         cfg.log_level = log_level;
         cfg.crossover_rolls = self.crossover_rolls;
@@ -530,7 +543,8 @@ impl PyRaceConfig {
         cfg.activation_pool = self.activation_pool;
         cfg.combine_op_pool = self.combine_op_pool;
         cfg.standardize_op_pool = self.standardize_op_pool;
-        cfg.feature_split = feature_split;
+        // The split is part of the BLUEPRINT now, not a run-wide switch.
+        cfg.topology_options.feature_split = feature_split;
         cfg.csv_export = self.csv_export;
         cfg.trace_file = self.trace_file;
         cfg.elite_save_topology = self.elite_save_topology;
