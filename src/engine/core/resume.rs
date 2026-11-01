@@ -5,15 +5,15 @@
 use super::*;
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct KnobDrift {
+pub(crate) struct KnobDrift {
     /// How the log names the knob: `smoothing_window (K)`, `risk_aversion (λ)`, …
-    pub(super) label: &'static str,
+    pub(crate) label: &'static str,
     /// The value the run recorded, formatted as the reader will see it.
-    pub(super) recorded: String,
+    pub(crate) recorded: String,
     /// The value the resume asked for.
-    pub(super) current: String,
+    pub(crate) current: String,
     /// The setter call that reproduces the record, e.g. `set_run_risk_aversion(0.00)`.
-    pub(super) undo: String,
+    pub(crate) undo: String,
 }
 
 impl CoreEngine {

@@ -24,11 +24,10 @@
 //! because a run that cannot be replayed cannot be resumed.
 
 use super::config::RaceConfig;
-use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
+use super::core::{CoreEngine, CoreEngineParts, assert_trainer_blob_matches};
 use crate::utils::fitness::Fitness;
-use crate::state::{RaceState, RunHeader};
+use crate::state::{RunHeader};
 use flodl::tensor::Result;
-use std::collections::HashMap;
 
     /// The environment-driven (RL) engine — the public handle for `RunSpec::rl`
     /// runs. Wraps [`CoreEngine`] and derefs to it.
@@ -142,7 +141,7 @@ impl RlEngine {
             pop_size: config.pop_size,
             run_seed,
         };
-        let mut engine = CoreEngine {
+        let mut engine = CoreEngine::assemble(CoreEngineParts {
             run_dir: run_dir.clone(),
             header,
             config,
@@ -152,33 +151,10 @@ impl RlEngine {
             explicit_test_rows: None,
             fitness,
             metrics,
-            state: RaceState::new(),
-            history_csv_buffer: String::new(),
-            attempts_csv_buffer: String::new(),
-            networks: HashMap::new(),
-            optimizers: HashMap::new(),
-            rolling_fitness: HashMap::new(),
-            rolling_train: HashMap::new(),
-            rolling_eval: HashMap::new(),
-            started_at_wall: std::time::Instant::now(),
-            elapsed_base_secs: 0,
-            step_started_at_wall: std::time::Instant::now(),
-            culls: 0,
-            accounting: crate::state::RunAccounting::default(),
-            initial_population_counted: false,
-            children_born_at_clock: HashMap::new(),
-            step_evolve: StepEvolve::default(),
-            step_rl: RlVolume::default(),
-            total_train_turns: 0,
-            champions: Vec::new(),
-            frozen_crown: std::collections::HashSet::new(),
-            minimal_prev_means: None,
-            log_level,
-            interrupt_flag: None,
-            // Frontier + clock came from disk: `run` checks the stop before clock one.
-            resumed: true,
             trainer,
-        };
+            log_level,
+            resumed: true,
+        });
         engine.load_live_frontier()?;
         // Counter restore — same contract as the tabular flavor above.
         engine.culls = persisted_counters.culls;

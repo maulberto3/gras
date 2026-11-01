@@ -82,7 +82,7 @@ pub(crate) use super::smoothing::{RollingBuffer, WindowStats, rolling_stats};
 // One concern per file (AGENTS.md rule 19): these hold `impl CoreEngine`
 // blocks, not new types. A split is a MOVE — fields and method names are
 // unchanged, so the public surface is identical.
-mod artifacts;
+mod durability;
 mod evolution;
 mod ranking;
 mod resume;
@@ -180,6 +180,71 @@ pub struct CoreEngine {
     /// Buffer for evolution-event rows — its own `attempts.csv` with its own header:
     /// the two row kinds share no columns, and padding shifted every later column.
     pub(crate) attempts_csv_buffer: String,
+}
+
+/// The inputs a constructor actually CHOOSES. Everything else on [`CoreEngine`]
+/// is per-run scratch (buffers, caches, counters) and starts empty/fresh.
+///
+/// Exists because the two engines used to spell the whole 30-field struct literal
+/// twice (`tabular_engine.rs` and `rl_engine.rs`), so adding a field was a two-file
+/// edit with no compiler reminder until one side failed. One list, one place.
+pub(crate) struct CoreEngineParts {
+    pub(crate) run_dir: std::path::PathBuf,
+    pub(crate) header: RunHeader,
+    pub(crate) config: RaceConfig,
+    pub(crate) meta_ctx: crate::engine::config::RunMetaCtx,
+    pub(crate) stream: Option<BatchStream>,
+    pub(crate) dataset: Option<crate::utils::tabular_data::Dataset>,
+    pub(crate) explicit_test_rows: Option<usize>,
+    pub(crate) fitness: Fitness,
+    pub(crate) metrics: Vec<Metric>,
+    pub(crate) trainer: crate::trainer::AnyTrainer,
+    pub(crate) log_level: crate::engine::config::LogLevel,
+    pub(crate) resumed: bool,
+}
+
+impl CoreEngine {
+    /// Assemble the engine from the chosen parts; every scratch field is initialised
+    /// HERE, so a new field cannot be added to one engine and forgotten in the other.
+    /// Pure construction — no I/O, no RNG, no record writes.
+    pub(crate) fn assemble(p: CoreEngineParts) -> Self {
+        Self {
+            run_dir: p.run_dir,
+            header: p.header,
+            config: p.config,
+            meta_ctx: p.meta_ctx,
+            stream: p.stream,
+            dataset: p.dataset,
+            explicit_test_rows: p.explicit_test_rows,
+            fitness: p.fitness,
+            metrics: p.metrics,
+            trainer: p.trainer,
+            log_level: p.log_level,
+            interrupt_flag: None,
+            resumed: p.resumed,
+            step_evolve: StepEvolve::default(),
+            step_rl: RlVolume::default(),
+            total_train_turns: 0,
+            champions: Vec::new(),
+            state: RaceState::new(),
+            networks: HashMap::new(),
+            optimizers: HashMap::new(),
+            rolling_fitness: HashMap::new(),
+            rolling_train: HashMap::new(),
+            rolling_eval: HashMap::new(),
+            started_at_wall: std::time::Instant::now(),
+            elapsed_base_secs: 0,
+            step_started_at_wall: std::time::Instant::now(),
+            culls: 0,
+            accounting: crate::state::RunAccounting::default(),
+            initial_population_counted: false,
+            children_born_at_clock: HashMap::new(),
+            frozen_crown: std::collections::HashSet::new(),
+            minimal_prev_means: None,
+            history_csv_buffer: String::new(),
+            attempts_csv_buffer: String::new(),
+        }
+    }
 }
 
 // ── Construction ─────────────────────────────────────────────────────────────

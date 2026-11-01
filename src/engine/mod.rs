@@ -21,7 +21,7 @@
 //! - [`reporting`] — the user-facing log lines (per-step rollup, `Minimal`
 //!   frame, stop summary)
 //! - [`format`] — display/CSV formatting + the build identity stamp
-//! - [`artifacts`] — champion/worst dumps + their ranking helpers
+//! - [`reports`] — champion/worst dumps + their ranking helpers
 //! - [`evolve`] — the crossover/immigrant rolls, cull/insert, victim selection
 //! - [`step`] — one net's step path (trainer dispatch, freeze pass, RNG seeding)
 //! - [`stop`] — stop criteria + `RaceSnapshot`
@@ -33,7 +33,7 @@
 //!   *shares* with any training scheme, so they live below both layers and a
 //!   trainer can reach them without importing the engine.
 
-pub mod artifacts;
+pub mod reports;
 pub mod child;
 pub mod config;
 pub mod core;

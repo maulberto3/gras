@@ -46,12 +46,11 @@
 //! variant (a curriculum ladder) would need one, which is why it isn't in the enum.
 
 use super::config::RaceConfig;
-use super::core::{CoreEngine, RlVolume, StepEvolve, assert_trainer_blob_matches};
+use super::core::{CoreEngine, CoreEngineParts, assert_trainer_blob_matches};
 use crate::utils::fitness::Fitness;
-use crate::state::{RaceState, RunHeader};
+use crate::state::{RunHeader};
 use crate::trainer::stream::{BatchStream, PoolSplit};
 use flodl::tensor::Result;
-use std::collections::HashMap;
 
 /// The dataset-driven (tabular) engine — the public handle for `RunSpec::tabular`
 /// runs. Wraps [`CoreEngine`] and derefs to it.
@@ -278,7 +277,7 @@ impl TabularEngine {
             run_seed,
         };
 
-        let mut engine = CoreEngine {
+        let mut engine = CoreEngine::assemble(CoreEngineParts {
             run_dir: run_dir.clone(),
             header,
             config,
@@ -288,33 +287,10 @@ impl TabularEngine {
             explicit_test_rows,
             fitness,
             metrics,
-            state: RaceState::new(),
-            history_csv_buffer: String::new(),
-            attempts_csv_buffer: String::new(),
-            networks: HashMap::new(),
-            optimizers: HashMap::new(),
-            rolling_fitness: HashMap::new(),
-            rolling_train: HashMap::new(),
-            rolling_eval: HashMap::new(),
-            started_at_wall: std::time::Instant::now(),
-            elapsed_base_secs: 0,
-            step_started_at_wall: std::time::Instant::now(),
-            culls: 0,
-            accounting: crate::state::RunAccounting::default(),
-            initial_population_counted: false,
-            children_born_at_clock: HashMap::new(),
-            step_evolve: StepEvolve::default(),
-            step_rl: RlVolume::default(),
-            total_train_turns: 0,
-            champions: Vec::new(),
-            frozen_crown: std::collections::HashSet::new(),
-            minimal_prev_means: None,
-            log_level,
-            interrupt_flag: None,
-            // Frontier + clock came from disk: `run` checks the stop before clock one.
-            resumed: true,
             trainer,
-        };
+            log_level,
+            resumed: true,
+        });
 
         engine.load_live_frontier()?;
         // Counters continue from the recorded values (cull budget, wall-clock age,
