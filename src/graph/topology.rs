@@ -122,6 +122,22 @@ pub enum FeatureSplitPolicy {
     /// **Random** — every port flips an independent `p = 0.5` coin per feature.
     /// A feature can land in several ports, and some features may go unused.
     Random,
+    /// **Inherited** — the rows were RECOMBINED from two parents, so they are neither
+    /// a fresh partition (`Exclusive`) nor a fresh coin flip (`Random`): a per-port
+    /// mix of two partitions can hand one feature to two ports, and a mix of a split
+    /// with an unsplit parent leaves cover-all rows beside split ones. Stamped by the
+    /// crossover path so the LABEL always matches the rows it is describing (a child
+    /// used to keep parent A's `None` while carrying parent B's rows). Never drawable:
+    /// it is not a pool entry, and [`Topology::assign_feature_masks`] refuses it.
+    Inherited,
+}
+
+impl FeatureSplitPolicy {
+    /// Whether a run's pool may DRAW this policy for a newborn. `Inherited` describes
+    /// provenance, so it can only arrive through crossover.
+    pub fn is_drawable(self) -> bool {
+        !matches!(self, FeatureSplitPolicy::Inherited)
+    }
 }
 
 impl Default for TopologyOptions {
@@ -317,6 +333,9 @@ impl Topology {
         }
         let mut masks = vec![vec![0u8; input_dim]; n_ports];
         match policy {
+            // Provenance, not a draw rule: the only way to get these rows is to inherit
+            // them, so drawing is a no-op rather than a guess at what they ''should'' be.
+            FeatureSplitPolicy::Inherited => return,
             FeatureSplitPolicy::Exclusive => {
                     // Each feature picks one random port: by construction every feature is
                     // placed exactly once and none is shared. Naturally uneven, and a port
@@ -339,6 +358,7 @@ impl Topology {
             }
         }
         self.nodes[input].feature_masks = Some(masks);
+        self.options.feature_split = Some(policy);
     }
 
         /// The Input node's per-port feature masks, cloned (`None` when this
@@ -358,14 +378,30 @@ impl Topology {
         /// starts UNMASKED, i.e. it sees every feature — a mask is never invented for a
         /// port we hold no inherited data for. Truncates when the child has fewer ports.
         ///
+        /// `policy` is the PROVENANCE of those rows (`None` → `Inherited`). The label
+        /// is written from the content here, in the one place masks are installed, so a
+        /// child can never carry rows under a policy that denies them.
+        ///
         /// Deterministic by construction (no RNG): the same inherited rows always give
         /// the same masks, so resume replays identically.
-    pub fn install_input_feature_masks(&mut self, rows: &[Vec<u8>]) {
+    pub fn install_input_feature_masks(
+        &mut self,
+        rows: &[Vec<u8>],
+        policy: Option<FeatureSplitPolicy>,
+    ) {
         let input_dim = self.options.input_dim.unwrap_or(1);
         let Some(input) = self.nodes.iter().position(|n| n.kind == NodeKind::Input) else {
             return;
         };
         if input_dim == 0 {
+            return;
+        }
+            // Nothing inherited at all: keep the net UNSHARED (no rows, no masks) rather
+            // than materializing cover-all rows, which cost a real elementwise multiply
+            // at every forward pass to express "no split".
+        if rows.is_empty() {
+            self.nodes[input].feature_masks = None;
+            self.options.feature_split = policy;
             return;
         }
         let n_ports = self.nodes[input].num_outputs.max(1);
@@ -378,6 +414,23 @@ impl Topology {
             })
             .collect();
         self.nodes[input].feature_masks = Some(masks);
+        self.options.feature_split = Some(policy.unwrap_or(FeatureSplitPolicy::Inherited));
+    }
+
+        /// Reconcile a LOADED blueprint with the rule "rows present ⇒ policy present":
+        /// a record written before `Inherited` existed (or by the crossover bug it
+        /// fixes) can carry masks under `feature_split = None`. Read-time repair, not a
+        /// rewrite: the rows are the genome the build reads, so they win, and the label
+        /// becomes `Inherited` (the only true provenance we can state for them).
+    pub fn reconcile_split_policy(&mut self) {
+        if self.options.feature_split.is_none()
+            && self
+                .nodes
+                .iter()
+                .any(|n| n.kind == NodeKind::Input && n.feature_masks.is_some())
+        {
+            self.options.feature_split = Some(FeatureSplitPolicy::Inherited);
+        }
     }
 
         /// Assign every hidden node a random activation from `pool` (Input/Output stay
@@ -1200,7 +1253,11 @@ impl Topology {
         /// Deserialize a blueprint from JSON (see `to_json`). The RNG is re-seeded from
         /// `options.topology_seed`, so loaded graphs wire identically; weights are fresh.
     pub fn from_json(s: &str) -> Result<Topology, serde_json::Error> {
-        serde_json::from_str(s)
+        let mut topo: Topology = serde_json::from_str(s)?;
+        // Every loaded net (live, tombstone, resumed or imported) passes through here:
+        // the one place that can promise a reader "policy present ⇔ rows present".
+        topo.reconcile_split_policy();
+        Ok(topo)
     }
 
     // ── Crossover ──────────────────────────────────────────────────────────
@@ -2667,7 +2724,7 @@ mod fanout_bounds_tests {
         let ports = input_of(&g).num_outputs;
         assert!(ports >= 2, "fixture needs at least two input ports, got {ports}");
 
-        g.install_input_feature_masks(&[vec![0, 1, 1, 1]]);
+        g.install_input_feature_masks(&[vec![0, 1, 1, 1]], None);
         let masks = input_of(&g)
             .feature_masks
             .clone()
@@ -2687,9 +2744,10 @@ mod fanout_bounds_tests {
     }
 
         /// No inherited rows at all (neither parent carried a split, no policy): the
-        /// input stays unmasked rather than getting an invented one.
+        /// input stays genuinely unmasked — no rows, no policy — rather than getting
+        /// cover-all rows (which would be a real multiply per forward pass for nothing).
     #[test]
-    fn install_feature_masks_with_no_rows_leaves_every_port_unmasked() {
+    fn install_feature_masks_with_no_rows_leaves_the_net_unsplit() {
         let opts = TopologyOptions {
             input_dim: Some(4),
             output_dim: Some(1),
@@ -2698,12 +2756,91 @@ mod fanout_bounds_tests {
         let mut g = Topology::new(24, Some(opts));
         g.create_random_hidden_nodes(2);
         g.finalize();
-        g.install_input_feature_masks(&[]);
-        let masks = g.input_feature_masks().expect("installed");
+        g.install_input_feature_masks(&[], None);
         assert!(
-            masks.iter().all(|m| m == &vec![1u8; 4]),
-            "every port keeps every feature"
+            g.input_feature_masks().is_none(),
+            "no inherited rows means no masks at all"
         );
-        g.validate().expect("unmasked rows must validate");
+        assert_eq!(g.options.feature_split, None);
+        g.validate().expect("unmasked topology must validate");
+    }
+
+        /// The LABEL follows the CONTENT, in the one place rows are installed: an
+        /// inherited row set with no stated provenance is `Inherited`, never `None`.
+        /// This is the bug a real run showed (2 of 12 nets carried masks under
+        /// `feature_split = None`) reduced to its smallest form.
+    #[test]
+    fn installing_inherited_rows_stamps_a_matching_policy() {
+        let opts = TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let build = || {
+            let mut g = Topology::new(25, Some(opts));
+            g.create_random_hidden_nodes(3);
+            g.finalize();
+            g
+        };
+
+        // No provenance supplied → `Inherited` (the only true statement).
+        let mut g = build();
+        g.install_input_feature_masks(&[vec![0, 1, 0, 0]], None);
+        assert_eq!(g.options.feature_split, Some(FeatureSplitPolicy::Inherited));
+        assert!(g.input_feature_masks().is_some());
+
+        // Stated provenance is kept verbatim.
+        let mut g = build();
+        g.install_input_feature_masks(&[vec![1, 0, 1, 0]], Some(FeatureSplitPolicy::Random));
+        assert_eq!(g.options.feature_split, Some(FeatureSplitPolicy::Random));
+
+        // A fresh draw stamps the policy it drew under, too.
+        let mut g = build();
+        g.assign_feature_masks(FeatureSplitPolicy::Exclusive);
+        assert_eq!(
+            g.options.feature_split,
+            Some(FeatureSplitPolicy::Exclusive)
+        );
+
+        // And `Inherited` is never drawable: it does not invent rows.
+        let mut g = build();
+        g.assign_feature_masks(FeatureSplitPolicy::Inherited);
+        assert!(
+            g.input_feature_masks().is_none(),
+            "Inherited is provenance, not a draw rule"
+        );
+        assert_eq!(g.options.feature_split, None);
+        assert!(!FeatureSplitPolicy::Inherited.is_drawable());
+    }
+
+        /// Old records (and nets written by the crossover bug) load with rows under a
+        /// `None` policy. `from_json` repairs the LABEL at read time; the rows win,
+        /// because they are the genome the network build actually reads.
+    #[test]
+    fn loading_a_topology_with_rows_and_no_policy_repairs_the_label() {
+        let opts = TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let mut g = Topology::new(26, Some(opts));
+        g.create_random_hidden_nodes(2);
+        g.finalize();
+        g.assign_feature_masks(FeatureSplitPolicy::Exclusive);
+        let mut json: serde_json::Value = serde_json::from_str(&g.to_json().unwrap()).unwrap();
+        json["options"]
+            .as_object_mut()
+            .unwrap()
+            .remove("feature_split"); // exactly what the old crossover path persisted
+        let loaded = Topology::from_json(&json.to_string()).unwrap();
+        assert_eq!(loaded.options.feature_split, Some(FeatureSplitPolicy::Inherited));
+        assert!(loaded.input_feature_masks().is_some());
+
+        // An honest blueprint is left untouched.
+        let again = Topology::from_json(&g.to_json().unwrap()).unwrap();
+        assert_eq!(
+            again.options.feature_split,
+            Some(FeatureSplitPolicy::Exclusive)
+        );
     }
 }
