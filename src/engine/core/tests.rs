@@ -1544,6 +1544,43 @@ err.contains("Fitness::reported"),
 );
 }
 
+#[test]
+fn a_bad_pool_name_is_refused_at_construction_not_widened() {
+// Before: `feature_split_pool = ["rondom"]` drew all three policies (the draw
+// path's `empty ⇒ all` fallback cannot tell a typo from an empty pool) while the
+// header recorded a pool that was never drawn. After: construction refuses it by
+// name, before the dataset loads and before the first net exists.
+let config = RaceConfig {
+pop_size: 2,
+max_steps: Some(1),
+feature_split_pool: vec!["rondom".to_string()],
+topology_options: crate::graph::topology::TopologyOptions {
+input_dim: Some(1),
+output_dim: Some(1),
+..Default::default()
+},
+..RaceConfig::defaults()
+};
+let spec = crate::engine::run_spec::RunSpec::rl(
+config,
+crate::utils::fitness::Fitness::reported(
+crate::utils::fitness::Direction::Maximize,
+"reward",
+),
+TestRlTrainer,
+Some(7),
+None,
+);
+let err = match CoreEngine::from_spec(spec) {
+Err(e) => e.to_string(),
+Ok(_) => panic!("a typo'd pool entry must not start a run"),
+};
+assert!(
+err.contains("feature_split_pool") && err.contains("rondom"),
+"the refusal must name the pool and the entry: {err}"
+);
+}
+
 // ── Iter-5: child generation contract ──────────────────────────────
 
 fn seed_two_parents(dir: &std::path::Path, seed: u64) -> crate::engine::TabularEngine {
@@ -1741,7 +1778,7 @@ let mut topo = tiny_topology(seed);
 topo.install_input_feature_masks(&[
 vec![1, 0],
 vec![(seed % 2) as u8, ((seed + 1) % 2) as u8],
-]);
+], Some(crate::graph::topology::FeatureSplitPolicy::Random));
 topo
 })
 .collect();
@@ -4878,4 +4915,135 @@ Some(0.5),
 "a rewritten header keeps the eval share"
 );
 let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The EXAM is a separate store, not a third index range: `exam/` rows never enter the
+/// run tensor (so no stream, metric or callback can read them), they are recorded by
+/// COUNT in the header, and they are scored ONCE at stop into `exam.json` for the
+/// reported nets — reported, never fed back.
+#[test]
+fn exam_rows_stay_out_of_the_run_tensor_and_are_scored_once_at_stop() {
+let dir = std::env::temp_dir().join(format!(
+"gras-test-exam-{}-{}",
+std::process::id(),
+fastrand::u64(..)
+));
+let _ = std::fs::remove_dir_all(&dir);
+let data_dir = tiny_dataset_dir("exam");
+// The exam is a SIBLING of the run's data (`<data_dir>/exam`) and a different set of
+// rows, or "held out" would be a word.
+let exam = synthetic_classification(16, 2, 2, 99, Device::CPU).unwrap();
+crate::utils::tabular_data::save_dataset(data_dir.join("exam"), &exam).unwrap();
+
+let run_dir = dir.join("run");
+let config = RaceConfig {
+// 0 ⇒ no auto-seeded random population: this test seeds its own two tiny nets,
+// exactly like the shared `engine()` helper.
+pop_size: 0,
+max_steps: Some(2),
+// Two reported nets, so the exam file and the `exam (X)` column have two rows.
+elite_count: 2,
+..RaceConfig::defaults()
+};
+let mut engine = crate::engine::TabularEngine::from_spec(
+crate::engine::run_spec::RunSpec::tabular(
+data_dir.clone(),
+config,
+fitness(),
+crate::trainer::TabularTrainer::new(loss_fn()),
+Some(11),
+Some(run_dir.clone()),
+),
+)
+.unwrap();
+// STRUCTURAL, not policy: the run tensor holds the run's rows only, and the exam lives
+// in its own field at its own size.
+assert_eq!(engine.dataset.as_ref().unwrap().len(), 64);
+assert_eq!(engine.exam.as_ref().unwrap().len(), 16);
+assert_eq!(engine.header.exam_rows, Some(16));
+assert_eq!(
+engine.stream.as_ref().unwrap().pools().0.len() + engine.stream.as_ref().unwrap().pools().1.len(),
+64,
+"the exam can never become a pool index"
+);
+engine
+.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+.unwrap();
+engine.config.pop_size = 2;
+assert_eq!(engine.run().unwrap(), StopReason::MaxSteps);
+let _ = engine.write_live_net_weights();
+
+let raw = std::fs::read_to_string(run_dir.join("exam.json")).expect("exam.json written at stop");
+let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+assert_eq!(doc["exam_rows"], 16);
+assert_eq!(doc["reported_nets"], 2);
+assert!(
+doc["nets"].as_array().is_some_and(|a| a.len() == 2),
+"one row per reported net"
+);
+}
+
+/// A resumed run refuses a SWAPPED exam: the row count is part of the record, exactly
+/// like the metric set and the trainer. An exam you can quietly replace answers nothing.
+#[test]
+fn resume_refuses_a_different_exam_store() {
+let dir = std::env::temp_dir().join(format!(
+"gras-test-exam-resume-{}-{}",
+std::process::id(),
+fastrand::u64(..)
+));
+let _ = std::fs::remove_dir_all(&dir);
+let data_dir = tiny_dataset_dir("exam-resume");
+let exam = synthetic_classification(16, 2, 2, 99, Device::CPU).unwrap();
+crate::utils::tabular_data::save_dataset(data_dir.join("exam"), &exam).unwrap();
+let run_dir = dir.join("run");
+let config = RaceConfig {
+// 0 ⇒ no auto-seeded random population: this test seeds its own two tiny nets,
+// exactly like the shared `engine()` helper.
+pop_size: 0,
+max_steps: Some(2),
+// Two reported nets, so the exam file and the `exam (X)` column have two rows.
+elite_count: 2,
+..RaceConfig::defaults()
+};
+let mut engine = crate::engine::TabularEngine::from_spec(
+crate::engine::run_spec::RunSpec::tabular(
+data_dir.clone(),
+config,
+fitness(),
+crate::trainer::TabularTrainer::new(loss_fn()),
+Some(12),
+Some(run_dir.clone()),
+),
+)
+.unwrap();
+engine
+.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+.unwrap();
+engine.config.pop_size = 2;
+assert_eq!(engine.run().unwrap(), StopReason::MaxSteps);
+let _ = engine.write_live_net_weights();
+drop(engine);
+
+// Swap in a bigger exam: the same run dir, a different paper.
+let bigger = synthetic_classification(20, 2, 2, 99, Device::CPU).unwrap();
+crate::utils::tabular_data::save_dataset(data_dir.join("exam"), &bigger).unwrap();
+let err = match crate::engine::TabularEngine::resume(
+run_dir,
+data_dir,
+{
+let mut c = RaceConfig::defaults();
+c.pop_size = 2;
+c
+},
+fitness(),
+crate::trainer::TabularTrainer::new(loss_fn()),
+) {
+Ok(_) => panic!("a swapped exam must be refused by name"),
+Err(e) => e.to_string(),
+};
+assert!(
+err.contains("exam_rows = 16"),
+"the refusal names the recorded size: {err}"
+);
 }

@@ -33,12 +33,15 @@ const UNIFORM_MASK_PICK: f32 = 0.5;
 fn mix_feature_masks(
     a: Option<Vec<Vec<u8>>>,
     b: Option<Vec<Vec<u8>>>,
+    a_policy: Option<FeatureSplitPolicy>,
+    b_policy: Option<FeatureSplitPolicy>,
     op: CrossoverOp,
     rng: &mut fastrand::Rng,
-) -> Vec<Vec<u8>> {
+) -> (Vec<Vec<u8>>, Option<FeatureSplitPolicy>) {
     let (a, b) = match (a, b) {
-        (None, None) => return Vec::new(),
-        (Some(rows), None) | (None, Some(rows)) => return rows,
+        (None, None) => return (Vec::new(), None),
+        (Some(rows), None) => return (rows, a_policy),
+        (None, Some(rows)) => return (rows, b_policy),
         (Some(a), Some(b)) => (a, b),
     };
     let n = a.len().max(b.len());
@@ -48,25 +51,37 @@ fn mix_feature_masks(
         let (first, second) = if take_a { (&a, &b) } else { (&b, &a) };
         first.get(i).or_else(|| second.get(i)).cloned().unwrap_or_default()
     };
-    match op {
+    let mixed: Vec<Vec<u8>> = match op {
         CrossoverOp::Uniform => (0..n)
             .map(|i| pick(i, rng.f32() < UNIFORM_MASK_PICK))
             .collect(),
         CrossoverOp::OnePoint => {
             if n <= 1 {
-                return vec![pick(0, rng.f32() < UNIFORM_MASK_PICK)];
+                vec![pick(0, rng.f32() < UNIFORM_MASK_PICK)]
+            } else {
+                // Both sides of the pivot stay non-empty.
+                let pivot = rng.usize(1..n);
+                (0..n).map(|i| pick(i, i < pivot)).collect()
             }
-            // Both sides of the pivot stay non-empty.
-            let pivot = rng.usize(1..n);
-            (0..n).map(|i| pick(i, i < pivot)).collect()
         }
-    }
+    };
+    // The LABEL follows the CONTENT: rows taken verbatim from one parent inherit that
+    // parent's policy, anything actually mixed is `Inherited` — a per-port blend of two
+    // partitions is not a partition, and a blend across split/unsplit is neither family.
+    let policy = if mixed == a {
+        a_policy
+    } else if mixed == b {
+        b_policy
+    } else {
+        Some(FeatureSplitPolicy::Inherited)
+    };
+    (mixed, policy)
 }
 
 use crate::engine::config::CrossoverOp;
 use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
-use crate::graph::topology::{CxReport, Topology};
+use crate::graph::topology::{CxReport, FeatureSplitPolicy, Topology};
 use crate::state::NetState;
 use crate::utils::seed::derive_seed;
 
@@ -157,6 +172,9 @@ impl CoreEngine {
             // `finalize` now carries each parent's masks through its port remap, so the
             // rows line up with the ports the child actually ends up with.
         let mut child_masks: Vec<Vec<u8>> = Vec::new();
+            // Provenance of `child_masks`, stamped onto the child's blueprint so the
+            // policy it declares is the one its rows actually came from.
+        let mut child_policy: Option<FeatureSplitPolicy> = None;
             // What the operator exchanged (`uniform` only — a one-point cut is not a
             // per-gene coin, so it reports nothing rather than a number that would read
             // like one). It rides the lineage string into `nets/<hash>.json`.
@@ -216,12 +234,16 @@ impl CoreEngine {
                 };
                 if cx {
                         // Both parents' rows, in their post-finalize port numbering.
-                    child_masks = mix_feature_masks(
+                    let (masks, policy) = mix_feature_masks(
                         pa.input_feature_masks(),
                         pb.input_feature_masks(),
+                        pa.options.feature_split,
+                        pb.options.feature_split,
                         op,
                         rng,
                     );
+                    child_masks = masks;
+                    child_policy = policy;
                     child_topo = Some(pa);
                     cx_note = match op {
                         CrossoverOp::OnePoint => "crossover-one-point",
@@ -238,6 +260,7 @@ impl CoreEngine {
                     // Asexual reproduction inherits the parent's own split verbatim — no
                     // re-draw, since no rebuild ran and the rows already fit the ports.
                 child_masks = pa.input_feature_masks().unwrap_or_default();
+                child_policy = pa.options.feature_split;
                 child_topo = Some(pa);
                 cx_note = "clone".to_string();
                 parent_hashes = attempt_parents;
@@ -273,7 +296,7 @@ impl CoreEngine {
                 child_topo.assign_feature_masks(policy);
             }
         } else {
-            child_topo.install_input_feature_masks(&child_masks);
+            child_topo.install_input_feature_masks(&child_masks, child_policy);
         }
         Ok(Some(self.finalize_child(
             child_topo,
@@ -432,32 +455,76 @@ mod tests {
     }
 
     /// One parent with a split, one without: the masked parent's rows survive, so a
-    /// split cannot fade out of a lineage just because its partner was unmasked.
+    /// split cannot fade out of a lineage just because its partner was unmasked — and
+    /// the child's LABEL is the masked parent's policy, never the maskless one's `None`.
     #[test]
     fn mix_keeps_the_masked_parent_when_only_one_has_a_split() {
         let masked = vec![row([1, 0]), row([0, 1])];
-        assert_eq!(
-            mix_feature_masks(
-                Some(masked.clone()),
-                None,
-                CrossoverOp::Uniform,
-                &mut rng(7)
-            ),
-            masked,
-            "the masked parent's rows are kept verbatim"
+        let (rows, policy) = mix_feature_masks(
+            Some(masked.clone()),
+            None,
+            Some(FeatureSplitPolicy::Random),
+            None,
+            CrossoverOp::Uniform,
+            &mut rng(7),
         );
+        assert_eq!(rows, masked, "the masked parent's rows are kept verbatim");
         assert_eq!(
-            mix_feature_masks(
-                None,
-                Some(masked.clone()),
-                CrossoverOp::OnePoint,
-                &mut rng(7)
-            ),
-            masked,
+            policy,
+            Some(FeatureSplitPolicy::Random),
+            "rows from B ⇒ B's policy, not A's None (the old bug)"
         );
+
+        let (rows, policy) = mix_feature_masks(
+            None,
+            Some(masked.clone()),
+            None,
+            Some(FeatureSplitPolicy::Random),
+            CrossoverOp::OnePoint,
+            &mut rng(7),
+        );
+        assert_eq!(rows, masked);
+        assert_eq!(policy, Some(FeatureSplitPolicy::Random));
+
         // Neither parent carries one: nothing to inherit, so the caller falls back to
         // the run's policy (or leaves the child unmasked).
-        assert!(mix_feature_masks(None, None, CrossoverOp::Uniform, &mut rng(1)).is_empty());
+        let (rows, policy) = mix_feature_masks(None, None, None, None, CrossoverOp::Uniform, &mut rng(1));
+        assert!(rows.is_empty());
+        assert_eq!(policy, None);
+    }
+
+    /// Both parents masked: the rows are RE-combined, so the honest label is
+    /// `Inherited` — a per-port blend of two partitions is not itself a partition.
+    #[test]
+    fn mixing_two_parents_labels_the_child_inherited() {
+        let a = vec![row([1, 0]), row([0, 1]), row([1, 0])];
+        let b = vec![row([0, 1]), row([1, 0]), row([0, 1])];
+        let (rows, policy) = mix_feature_masks(
+            Some(a.clone()),
+            Some(b.clone()),
+            Some(FeatureSplitPolicy::Exclusive),
+            Some(FeatureSplitPolicy::Exclusive),
+            CrossoverOp::Uniform,
+            &mut rng(9),
+        );
+        assert_eq!(rows.len(), 3);
+        assert_eq!(policy, Some(FeatureSplitPolicy::Inherited));
+
+        // Rows that happen to equal ONE parent verbatim inherit THAT parent's label
+        // (a one-point cut can land entirely on one side of the donor's rows).
+        let (rows, policy) = mix_feature_masks(
+            Some(a.clone()),
+            Some(vec![row([1, 1]); 3]),
+            Some(FeatureSplitPolicy::Exclusive),
+            Some(FeatureSplitPolicy::Random),
+            CrossoverOp::OnePoint,
+            &mut rng(2),
+        );
+        if rows == a {
+            assert_eq!(policy, Some(FeatureSplitPolicy::Exclusive));
+        } else {
+            assert_eq!(policy, Some(FeatureSplitPolicy::Inherited));
+        }
     }
 
     /// Uniform: every row comes from one parent or the other, at 0.5 per port — and
@@ -466,14 +533,21 @@ mod tests {
     fn uniform_mix_takes_each_row_from_a_parent() {
         let a = vec![row([1, 1]), row([1, 1]), row([1, 1]), row([1, 1])];
         let b = vec![row([0, 0]), row([0, 0]), row([0, 0]), row([0, 0])];
-        let mixed = mix_feature_masks(Some(a.clone()), Some(b.clone()), CrossoverOp::Uniform, &mut rng(3));
+        let (mixed, _) = mix_feature_masks(
+            Some(a.clone()),
+            Some(b.clone()),
+            None,
+            None,
+            CrossoverOp::Uniform,
+            &mut rng(3),
+        );
         assert_eq!(mixed.len(), 4);
         for r in &mixed {
             assert!(r == &row([1, 1]) || r == &row([0, 0]), "invented a row: {r:?}");
         }
         assert_eq!(
             mixed,
-            mix_feature_masks(Some(a), Some(b), CrossoverOp::Uniform, &mut rng(3)),
+            mix_feature_masks(Some(a), Some(b), None, None, CrossoverOp::Uniform, &mut rng(3)).0,
             "the same seed must reproduce the same child"
         );
     }
@@ -484,7 +558,7 @@ mod tests {
     fn one_point_mix_takes_a_prefix_from_a_and_a_suffix_from_b() {
         let a = vec![row([1, 1]); 4];
         let b = vec![row([0, 0]); 4];
-        let mixed = mix_feature_masks(Some(a), Some(b), CrossoverOp::OnePoint, &mut rng(5));
+        let (mixed, _) = mix_feature_masks(Some(a), Some(b), None, None, CrossoverOp::OnePoint, &mut rng(5));
         assert_eq!(mixed.len(), 4);
         let pivot = mixed
             .iter()
@@ -501,7 +575,7 @@ mod tests {
     fn mix_maps_donors_by_port_index_with_a_fallback() {
         let a = vec![row([1, 0]), row([0, 1])];
         let b = vec![row([1, 1]); 4];
-        let mixed = mix_feature_masks(Some(a), Some(b), CrossoverOp::Uniform, &mut rng(11));
+        let (mixed, _) = mix_feature_masks(Some(a), Some(b), None, None, CrossoverOp::Uniform, &mut rng(11));
         assert_eq!(mixed.len(), 4, "one row per port the donors can cover");
         for (i, r) in mixed.iter().enumerate() {
             assert_ne!(r, &row([0, 0]), "port {i} fell back to an empty row");

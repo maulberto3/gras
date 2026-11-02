@@ -8,6 +8,8 @@
 //! Module layout (one file per concern):
 //! - [`config`] — `RaceConfig` knob surface, `StopReason`, divergence/stop
 //!   closure types, `RaceSnapshot`, `RunMetaCtx`
+//! - [`pool`] — the NAME POOLS: one interface (`SearchPool`) over the five
+//!   `Vec<String>` config fields that resolve to typed search choices
 //! - [`population`] — initial population generation from the config's pools
 //! - [`child`] — child generation (roulette → crossover → mutate) + resume replay
 //! - [`smoothing`] — the rolling fitness buffer + the window's mean/spread and the
@@ -39,8 +41,10 @@ pub mod config;
 pub mod core;
 pub mod diversity;
 pub mod evolve;
+pub mod exam;
 pub mod format;
 pub mod logging;
+pub mod pool;
 pub mod population;
 pub mod reporting;
 pub mod rl_engine;

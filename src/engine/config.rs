@@ -597,37 +597,23 @@ impl RaceConfig {
 
         /// The pool resolved to drawable policies (`empty ⇒ all three`, in the fixed
         /// order none → random → exclusive so the draw is reproducible). An unknown
-        /// name is named in the error; callers fall back to all three rather than
-        /// silently narrowing the search.
+        /// name is named in the error; the DRAW path cannot return one (a topology draw
+        /// is infallible), so [`RaceConfig::validate_search_pools`] is what refuses it
+        /// at engine construction instead of letting the fallback widen the search.
     pub fn resolved_feature_split_pool(
         &self,
     ) -> Result<Vec<Option<FeatureSplitPolicy>>, String> {
-        if self.feature_split_pool.is_empty() {
-            return Ok(vec![
-                None,
-                Some(FeatureSplitPolicy::Random),
-                Some(FeatureSplitPolicy::Exclusive),
-            ]);
-        }
-        self.feature_split_pool
-            .iter()
-            .map(|raw| {
-                parse_feature_split_pool_entry(raw).ok_or_else(|| {
-                    format!(
-                        "feature_split_pool {raw:?}: expected one of none, random, exclusive"
-                    )
-                })
-            })
-            .collect()
+        super::pool::resolve::<super::pool::FeatureSplitPool>(self)
     }
         /// The pool as wire names, in draw order — one spelling for the log, the
         /// `engine.json` record and the resume diff.
+        ///
+        /// An unparseable pool is echoed AS TYPED instead of being replaced by a pool
+        /// it never drew: `["rondom"]` used to be recorded as `["none"]`, so the header
+        /// described an experiment nobody ran. Construction refuses such a config
+        /// outright (`validate_search_pools`), so this arm only serves direct callers.
     pub fn feature_split_pool_names(&self) -> Vec<String> {
-        self.resolved_feature_split_pool()
-            .unwrap_or_else(|_| vec![None])
-            .into_iter()
-            .map(|p| p.map(|p| p.to_string()).unwrap_or_else(|| "none".to_string()))
-            .collect()
+        super::pool::names::<super::pool::FeatureSplitPool>(self)
     }
 
     /// The inverse of [`crate::state::ConfigSnapshot::from_config`]: rebuild the
@@ -758,10 +744,12 @@ pub fn rl_race_config_builder() -> RaceConfigBuilder {
 }
 
 /// Parse a recorded (or user-given) feature-split spelling: `"random"`,
-/// `"exclusive"`, or the `"split_*"` wire form `engine.json` records.
+/// `"exclusive"`, `"inherited"`, or the `"split_*"` wire form `engine.json` records.
 pub(crate) fn parse_feature_split_wire(raw: &str) -> Option<FeatureSplitPolicy> {
     let raw = raw.to_ascii_lowercase();
-    if raw.contains("exclusive") {
+    if raw.contains("inherited") {
+        Some(FeatureSplitPolicy::Inherited)
+    } else if raw.contains("exclusive") {
         Some(FeatureSplitPolicy::Exclusive)
     } else if raw.contains("random") {
         Some(FeatureSplitPolicy::Random)
@@ -774,16 +762,18 @@ pub(crate) fn parse_feature_split_wire(raw: &str) -> Option<FeatureSplitPolicy> 
 /// One POOL entry: `Some(None)` is the `none` policy (no split), `Some(Some(_))` a
 /// drawable policy, `None` an unknown spelling. Kept separate from
 /// [`parse_feature_split_wire`] so "no split" and "unparseable" cannot be confused.
+///
+/// Matched by WHOLE NAME, like every other pool (`RaceConfig::parse_activation`,
+/// `RaceConfig::parse_combine`, `CrossoverOp::try_from`): a substring test accepts
+/// names nobody offers —
+/// `"nonexclusive"` became `none` because `contains("none")` ran first. The recorded
+/// spellings `split_*` are aliases for the wire form, not extra policies.
 pub(crate) fn parse_feature_split_pool_entry(raw: &str) -> Option<Option<FeatureSplitPolicy>> {
-    let raw = raw.to_ascii_lowercase();
-    if raw.contains("none") || raw == "off" {
-        Some(None)
-    } else if raw.contains("exclusive") {
-        Some(Some(FeatureSplitPolicy::Exclusive))
-    } else if raw.contains("random") {
-        Some(Some(FeatureSplitPolicy::Random))
-    } else {
-        None
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" | "split_none" => Some(None),
+        "exclusive" | "split_exclusive" => Some(Some(FeatureSplitPolicy::Exclusive)),
+        "random" | "split_random" => Some(Some(FeatureSplitPolicy::Random)),
+        _ => None,
     }
 }
 
@@ -1193,7 +1183,10 @@ impl RaceConfigBuilder {
 
 impl RaceConfig {
     /// Parse an activation label (the `Display` form: "relu", "gelu", …).
-    fn parse_activation(s: &str) -> Result<crate::graph::node::Activation, String> {
+    ///
+    /// `pub(crate)` because the pool interface reads it: the parser stays with the
+    /// vocabulary, [`super::pool`] owns the loop over the entries.
+    pub(crate) fn parse_activation(s: &str) -> Result<crate::graph::node::Activation, String> {
         use crate::graph::node::Activation::*;
         Ok(match s.to_lowercase().as_str() {
             "identity" => Identity,
@@ -1218,8 +1211,9 @@ impl RaceConfig {
         })
     }
 
-    /// Parse a combine-op label (the `Display` form: "add", "mean", …).
-    fn parse_combine(s: &str) -> Result<crate::graph::node::CombineOp, String> {
+    /// Parse a combine-op label (the `Display` form: "add", "mean", …) — see
+    /// [`RaceConfig::parse_activation`] for why it is `pub(crate)`.
+    pub(crate) fn parse_combine(s: &str) -> Result<crate::graph::node::CombineOp, String> {
         use crate::graph::node::CombineOp::*;
         Ok(match s.to_lowercase().as_str() {
             "add" => Add,
@@ -1235,38 +1229,24 @@ impl RaceConfig {
 
         /// Resolve the crossover operator pool: the configured labels validated, or both when
         /// empty. Unknown labels error at run start.
+        ///
+        /// The five `resolved_*` readers below are one-liners over [`super::pool`], which owns
+        /// the shared rules (`empty ⇒ all`, parse each, refuse by name, one wire spelling).
+        /// The signatures are unchanged on purpose: this is the public reader.
     pub fn resolved_crossover_ops(&self) -> Result<Vec<CrossoverOp>, String> {
-        if self.crossover_ops_pool.is_empty() {
-            return Ok(vec![CrossoverOp::OnePoint, CrossoverOp::Uniform]);
-        }
-        self.crossover_ops_pool
-            .iter()
-            .map(|s| CrossoverOp::try_from(s.as_str()))
-            .collect()
+        super::pool::resolve::<super::pool::CrossoverOpsPool>(self)
     }
 
         /// Resolve the activation pool: the configured labels parsed, or all known activations
         /// when empty. Unknown labels error at run start.
     pub fn resolved_activation_pool(&self) -> Result<Vec<crate::graph::node::Activation>, String> {
-        if self.activation_pool.is_empty() {
-            return Ok(crate::evolution::pools::all_activations());
-        }
-        self.activation_pool
-            .iter()
-            .map(|s| Self::parse_activation(s))
-            .collect()
+        super::pool::resolve::<super::pool::ActivationPool>(self)
     }
 
     /// Resolve the combine-op sampling pool — see
     /// [`RaceConfig::resolved_activation_pool`].
     pub fn resolved_combine_pool(&self) -> Result<Vec<crate::graph::node::CombineOp>, String> {
-        if self.combine_op_pool.is_empty() {
-            return Ok(crate::evolution::pools::all_combine_ops());
-        }
-        self.combine_op_pool
-            .iter()
-            .map(|s| Self::parse_combine(s))
-            .collect()
+        super::pool::resolve::<super::pool::CombineOpPool>(self)
     }
 
     /// Resolve the standardize-op sampling pool — see
@@ -1274,13 +1254,38 @@ impl RaceConfig {
     pub fn resolved_standardize_pool(
         &self,
     ) -> Result<Vec<crate::graph::node::StandardizeOp>, String> {
-        if self.standardize_op_pool.is_empty() {
-            return Ok(crate::evolution::pools::all_standardize_ops());
+        super::pool::resolve::<super::pool::StandardizePool>(self)
+    }
+
+        /// Check every NAME-based pool once, before a single net is drawn.
+        ///
+        /// Every `resolved_*` resolver above returns `Result`, but the draw paths cannot
+        /// (a topology draw is infallible), so each one falls back to the FULL default
+        /// pool. That fallback is right for an EMPTY pool (`empty ⇒ all`) and wrong for a
+        /// TYPO: `["rondom"]` used to draw all three policies while `engine.json` recorded
+        /// a pool that was never drawn — the log described a run nobody performed. The
+        /// engine calls this at construction, which is the last moment a bad name can be
+        /// named instead of quietly changing the search. Every bad entry is reported at
+        /// once, so one run start fixes all of them.
+        ///
+        /// One rule, five pools: each refusal already names its own field
+        /// ([`super::pool::SearchPool::LABEL`]), so this only joins them.
+    pub fn validate_search_pools(&self) -> Result<(), String> {
+        let errors: Vec<String> = [
+            super::pool::error::<super::pool::CrossoverOpsPool>(self),
+            super::pool::error::<super::pool::ActivationPool>(self),
+            super::pool::error::<super::pool::CombineOpPool>(self),
+            super::pool::error::<super::pool::StandardizePool>(self),
+            super::pool::error::<super::pool::FeatureSplitPool>(self),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
-        self.standardize_op_pool
-            .iter()
-            .map(|s| crate::graph::node::StandardizeOp::try_from(s.as_str()))
-            .collect()
     }
 
 }
@@ -1306,6 +1311,79 @@ mod tests {
         assert_eq!(LogLevel::Summ.env_filter(), "info");
         assert_eq!(LogLevel::Minimal.env_filter(), "warn");
         assert_eq!(LogLevel::None.env_filter(), "warn");
+    }
+
+        /// A pool NAME is either drawable or a refusal — never silently widened.
+        /// Before: `["rondom"]` drew all three policies while `feature_split_pool_names()`
+        /// reported `["none"]`, so `engine.json` described a run nobody performed. After:
+        /// `validate_search_pools()` names the typo once, with every bad pool in one
+        /// message, and an EMPTY pool stays legal (`empty ⇒ all`).
+    #[test]
+    fn an_unparseable_pool_name_is_an_error_not_a_fallback() {
+        // Empty pools are the documented "all" and must keep validating.
+        assert_eq!(RaceConfig::defaults().validate_search_pools(), Ok(()));
+
+        let cfg = RaceConfig {
+            feature_split_pool: vec!["rondom".to_string()],
+            ..RaceConfig::defaults()
+        };
+        // The RECORD no longer invents a pool: the typed spelling is what gets written.
+        assert_eq!(cfg.feature_split_pool_names(), vec!["rondom".to_string()]);
+        let err = cfg
+            .validate_search_pools()
+            .expect_err("a typo must not resolve to a pool");
+        assert!(
+            err.contains("feature_split_pool") && err.contains("rondom"),
+            "the error must name the pool and the entry: {err}"
+        );
+
+        // Every bad pool is reported at once, not one per run start.
+        let many = RaceConfig {
+            feature_split_pool: vec!["rondom".to_string()],
+            activation_pool: vec!["reluu".to_string()],
+            crossover_ops_pool: vec!["two_point".to_string()],
+            ..RaceConfig::defaults()
+        };
+        let err = many.validate_search_pools().expect_err("three typos");
+        for needle in ["feature_split_pool", "activation_pool", "crossover_ops_pool"] {
+            assert!(err.contains(needle), "{needle} missing from: {err}");
+        }
+    }
+
+        /// Pool entries are matched by WHOLE NAME, like `activation_pool` and
+        /// `combine_op_pool` — a substring test turns names nobody offers into policies
+        /// (`"nonexclusive"` → `none`, because `contains("none")` won).
+    #[test]
+    fn feature_split_pool_entries_match_whole_names() {
+        use super::parse_feature_split_pool_entry as parse;
+        // The drawable vocabulary plus the `split_*` spellings `engine.json` records.
+        assert_eq!(parse("none"), Some(None));
+        assert_eq!(parse("off"), Some(None));
+        assert_eq!(parse("random"), Some(Some(super::FeatureSplitPolicy::Random)));
+        assert_eq!(parse("split_random"), Some(Some(super::FeatureSplitPolicy::Random)));
+        assert_eq!(
+            parse("Exclusive"),
+            Some(Some(super::FeatureSplitPolicy::Exclusive))
+        );
+        assert_eq!(
+            parse("split_exclusive"),
+            Some(Some(super::FeatureSplitPolicy::Exclusive))
+        );
+        // Near-misses that the substring test used to accept.
+        for bad in [
+            "nonexclusive",
+            "random_only",
+            "exclusive_",
+            "split_inherited",
+            "",
+        ] {
+            assert_eq!(parse(bad), None, "{bad:?} is not a pool name");
+        }
+        let cfg = RaceConfig {
+            feature_split_pool: vec!["nonexclusive".to_string()],
+            ..RaceConfig::defaults()
+        };
+        assert!(cfg.validate_search_pools().is_err());
     }
 
         /// FIT's one knob: the default is the risk-adjusted ranking, `0.0` is the

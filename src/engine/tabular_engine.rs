@@ -164,6 +164,12 @@ impl TabularEngine {
             }
         }
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume")?;
+        // The SEARCH SPACE a resume inherits (header pools, or the caller's on the
+        // explicit path) is checked by name like a fresh run — a header written by an
+        // older build with a pool entry this build cannot read must say so, not widen.
+        config
+            .validate_search_pools()
+            .map_err(crate::utils::error::EngineError::InvalidOptions)?;
         // A legacy dir can hold CSV rows for clocks the last checkpoint never reached
         // (older runs flushed per clock, the frontier per interval). Rewind to the
         // frontier BEFORE anything reads the windows or appends to the files — otherwise
@@ -172,6 +178,36 @@ impl TabularEngine {
         // Data layout comes from the HEADER (`explicit_test_rows`), not from
         // re-detecting the directory — the same pools replay after a rename.
         let explicit_test_rows = header.explicit_test_rows;
+            // The EXAM comes back from the SAME rule the run started under: a sibling
+            // `exam/` store, kept out of `dataset`. A row count that no longer matches the
+            // header means the exam was swapped, and an exam you can swap is not an exam.
+        let exam = {
+            let exam_dir = data_dir.join("exam");
+            if exam_dir.exists() {
+                let ds = crate::utils::tabular_data::resolve_inputs_targets_datasets(&exam_dir)?
+                    .to_device(config.device())?;
+                if let Some(recorded) = header.exam_rows {
+                    if recorded != ds.len() {
+                        return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                            "resume: header records exam_rows = {recorded} but {} holds {} rows — the exam set changed, so its reading would not be comparable to the recorded run's",
+                            exam_dir.display(),
+                            ds.len()
+                        ))
+                        .into());
+                    }
+                }
+                Some(ds)
+            } else if header.exam_rows.is_some() {
+                return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                    "resume: the run recorded an exam ({} rows) but {} no longer exists",
+                    header.exam_rows.unwrap_or(0),
+                    exam_dir.display()
+                ))
+                .into());
+            } else {
+                None
+            }
+        };
         let dataset = if explicit_test_rows.is_some() {
             let (train, test) = crate::utils::tabular_data::resolve_train_test_datasets(&data_dir)?;
             train.concat(&test)?.to_device(config.device())?
@@ -290,6 +326,7 @@ impl TabularEngine {
             stream,
             dataset,
             explicit_test_rows,
+            exam,
             fitness,
             metrics,
             trainer,

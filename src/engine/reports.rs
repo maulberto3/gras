@@ -113,7 +113,7 @@ impl CoreEngine {
                 crate::utils::markdown::topology_markdown(&topo, None),
                 // The net's own birth, as a mermaid graph: a founder is one box, a
                 // crossover draws its parents above and converges down to this net.
-                self.lineage_markdown(&hash),
+                self.lineage_markdown(&hash, "ELITE"),
             );
             match std::fs::write(&path, &md) {
                 Ok(()) => {
@@ -330,7 +330,7 @@ impl CoreEngine {
                         let md = format!(
                             "**{label} · fitness {} (risk-adjusted) = {:.4} · window {} · \
                              prop (D) {:.2} (trained {} of the field's {}) × rescaled (A) {:.2} \
-                             (field best {:.4} … worst {:.4}) = {:.4}**\n\n{}",
+                             (field best {:.4} … worst {:.4}) = {:.4}**\n\n{}\n\n{}",
                             self.fitness.direction().arrow(),
                             pick.score,
                             reading,
@@ -342,6 +342,11 @@ impl CoreEngine {
                             pick.worst_score,
                             pick.spent * pick.gap,
                             crate::utils::markdown::topology_markdown(&topo, None),
+                            // The SAME ancestry renderer the elite files use, one walker
+                            // for both ends: "how was the worst net born" is exactly as
+                            // interesting as the champion's birth, and a culled
+                            // grandparent is already reachable through its tombstone.
+                            self.lineage_markdown(&pick.hash, "WORST"),
                         );
                         match std::fs::write(&path, &md) {
                             Ok(()) => files.push(format!("worst-{short}.md")),

@@ -60,6 +60,10 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
 
 /// Draw one policy from the run's feature-split pool (`empty ⇒ all three`) with the
 /// caller's own deterministic RNG. `None` = this net carries no split.
+///
+/// The fallback below only covers a config an ENGINE never assembles: a typo is
+/// refused by name at construction (`RaceConfig::validate_search_pools`), because this
+/// path cannot error and widening the pool is worse than the typo it hides.
 pub(crate) fn draw_feature_split(
     config: &RaceConfig,
     rng: &mut fastrand::Rng,
@@ -76,6 +80,10 @@ pub(crate) fn draw_feature_split(
 
 /// The initial population: `pop_size` deterministic draws, deduped by topology
 /// hash — identical JSONs would otherwise collapse onto one `RaceState` key.
+///
+/// `config` is expected to have passed [`RaceConfig::validate_search_pools`] (every
+/// engine does that at construction); a caller using this directly should too, since
+/// the draw path cannot refuse a pool name itself.
 pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
     let pop_size = config.pop_size;
     let mut topos: Vec<Topology> = (0..pop_size)

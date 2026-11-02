@@ -106,6 +106,11 @@ pub struct CoreEngine {
     /// Explicit two-dataset layout marker: `Some(test_len)` for a `{train, test}`
     /// build (test rows concatenated after train). Rebuilds identical pools on resume.
     pub(crate) explicit_test_rows: Option<usize>,
+    /// The EXAM store — a dataset the race never reads. Deliberately its own field and
+    /// NOT concatenated into `dataset`: no stream index, no metric and no callback can
+    /// reach it, so "forgetting it" is structural rather than a policy. Scored once at
+    /// stop, for the reported nets only (`exam.rs`), and reported, never fed back.
+    pub(crate) exam: Option<crate::utils::tabular_data::Dataset>,
     pub(crate) fitness: Fitness,
     pub(crate) metrics: Vec<Metric>,
     /// The caller-supplied training scheme, boxed per mode: the engine never trains,
@@ -196,6 +201,7 @@ pub(crate) struct CoreEngineParts {
     pub(crate) stream: Option<BatchStream>,
     pub(crate) dataset: Option<crate::utils::tabular_data::Dataset>,
     pub(crate) explicit_test_rows: Option<usize>,
+    pub(crate) exam: Option<crate::utils::tabular_data::Dataset>,
     pub(crate) fitness: Fitness,
     pub(crate) metrics: Vec<Metric>,
     pub(crate) trainer: crate::trainer::AnyTrainer,
@@ -216,6 +222,7 @@ impl CoreEngine {
             stream: p.stream,
             dataset: p.dataset,
             explicit_test_rows: p.explicit_test_rows,
+            exam: p.exam,
             fitness: p.fitness,
             metrics: p.metrics,
             trainer: p.trainer,
@@ -296,6 +303,12 @@ impl CoreEngine {
         };
         let mut config = config;
         config.mode = derived_mode;
+        // A pool NAME is refused here, before data loads and before the first draw: the
+        // resolvers' `empty ⇒ all` fallback cannot tell a typo from an empty pool, and a
+        // typo that widens the search silently is a run that describes itself wrongly.
+        config
+            .validate_search_pools()
+            .map_err(|e| crate::utils::error::EngineError::InvalidOptions(e))?;
         // RL mode REQUIRES a reported fitness: there is no dataset, so a (pred, target)
         // scorer has nothing to score. Fail before the run starts, not three steps in.
         if tabular_data_dir.is_none() && fitness.is_computed() {
@@ -406,6 +419,24 @@ impl CoreEngine {
             None => (None, None),
         };
 
+            // The EXAM: a sibling `exam/` store, resolved separately and NEVER
+            // concatenated into `dataset` (see `CoreEngine::exam`). Its row count rides the
+            // header so a resume can prove the same exam is still on disk.
+        let exam = match &tabular_data_dir {
+            Some(data_dir) => {
+                let exam_dir = data_dir.join("exam");
+                if exam_dir.exists() {
+                    Some(
+                        crate::utils::tabular_data::resolve_inputs_targets_datasets(&exam_dir)?
+                            .to_device(config.device())?,
+                    )
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+
         let (header_input_dim, header_output_dim) = match &dataset {
             Some(d) => (d.inputs.shape()[1] as usize, d.targets.shape()[1] as usize),
             None => (
@@ -445,6 +476,7 @@ impl CoreEngine {
                 // value a resume reads back to rebuild the same two pools.
                 train_eval_split_ratio: Some(train_eval_split_ratio),
                 explicit_test_rows,
+                exam_rows: exam.as_ref().map(|d| d.len()),
                 culls: 0,
                 run_elapsed_secs: 0,
                 children_born_at_clock: HashMap::new(),
@@ -614,6 +646,7 @@ impl CoreEngine {
             header,
             dataset,
             explicit_test_rows,
+            exam,
             config: RaceConfig { ..config },
             meta_ctx,
             stream: batch_stream,

@@ -489,8 +489,29 @@ impl CoreEngine {
         // actually stepped on). `None` when the lottery is off (Ω = 0) or was never armed;
         // the `p(ticket)` column then reads `—` instead of inventing a probability.
         let lottery = self.lottery_frame(plan.dealt_clock);
-        let (table, stats, grid) =
-            self.stop_card(&rows, &plan, &marks, inefficiency.as_ref(), lottery);
+        // ONE exam pass, here, for the reported nets: the same scorer the race ranked
+        // with, over rows no ranking clock ever read. It is computed once and both the
+        // table and `exam.json` are written from it.
+        let exam_fits: Vec<f32> = top.iter().map(|(_, fit)| *fit).collect();
+        let exam_report = self.exam_report(
+            &top.iter().map(|(h, _)| h.clone()).collect::<Vec<_>>(),
+            &exam_fits,
+        );
+        let exam_scores = exam_report
+            .as_ref()
+            .map(|r| r.scores.clone())
+            .unwrap_or_default();
+        if let Some(report) = &exam_report {
+            self.write_exam_json(report, &top);
+        }
+        let (table, stats, grid) = self.stop_card(
+            &rows,
+            &plan,
+            &marks,
+            inefficiency.as_ref(),
+            lottery,
+            &exam_scores,
+        );
         let sign = match self.fitness.direction() {
             crate::utils::fitness::Direction::Maximize => "−",
             crate::utils::fitness::Direction::Minimize => "+",
@@ -537,6 +558,24 @@ impl CoreEngine {
         // The run's seed rides the card: it is the one input a replay cannot recover
         // once the run dir is gone, and the console output is what a reader keeps.
         let run_seed = self.header.run_seed;
+            // The exam line states its size and its AGREEMENT with the score the table
+            // ranks on. That is the whole point of the column: `r` near 1 says selection
+            // was reading something real; `r` at 0 says the field was chosen on noise.
+        let exam_note = match &exam_report {
+            Some(r) => match r.correlation {
+                Some(corr) => format!(
+                    "exam: {} row(s) no clock read · r(fit, exam) = {} over {} net(s) · report only",
+                    r.rows,
+                    format!("{corr:.3}"),
+                    r.scores.values().filter(|v| v.is_some()).count()
+                ),
+                None => format!(
+                    "exam: {} row(s) no clock read · r not reported (fewer than 3 scored nets, or no spread) · report only",
+                    r.rows
+                ),
+            },
+            None => "exam: none supplied (`exam/` next to the dataset turns this column on)".to_string(),
+        };
         // The FILE first, and unconditionally: `final-field.csv` is run data, written
         // from the very cells the card would print (one `StopPlan`, no second query).
         self.write_final_field_csv(&plan.header, &grid);
@@ -550,7 +589,7 @@ impl CoreEngine {
             ),
             &format!("{legend}\n{table}"),
             Some(&format!(
-                "Δcrown = mean multiset-Jaccard distance to the {} reported champion(s): 0.00 = structurally identical to one of them, 1.00 = shares no gene with any · Δpop = mean distance to every other live net: 0.00 = a clone of the crowd, 1.00 = unlike everything alive · read the two AGAINST the baseline: Δcrown ≈ Δpop means the elite is structurally ordinary (selection is ranking numbers, not designs), Δcrown below it means the elite is a structural cluster · {} · {baseline} · crown {}/{} seats · {} eligible · {} gated (join window or cull shield, {} clocks) · {} age-blocked ({} clocks) · stopped at clock {clock} · run seed {run_seed} (`--seed {run_seed}` replays this run bit-for-bit) · the same table is written to `final-field.csv` ({} row(s) under this header)",
+                "Δcrown = mean multiset-Jaccard distance to the {} reported champion(s): 0.00 = structurally identical to one of them, 1.00 = shares no gene with any · Δpop = mean distance to every other live net: 0.00 = a clone of the crowd, 1.00 = unlike everything alive · read the two AGAINST the baseline: Δcrown ≈ Δpop means the elite is structurally ordinary (selection is ranking numbers, not designs), Δcrown below it means the elite is a structural cluster · {} · {baseline} · crown {}/{} seats · {} eligible · {} gated (join window or cull shield, {} clocks) · {} age-blocked ({} clocks) · stopped at clock {clock} · run seed {run_seed} (`--seed {run_seed}` replays this run bit-for-bit) · the same table is written to `final-field.csv` ({} row(s) under this header) · {exam_note}",
                 plan.crown.len(),
                 stats.line(),
                 self.frozen_crown.len(),
@@ -568,12 +607,13 @@ impl CoreEngine {
         if !verbose {
             return;
         }
+        // The table is the LAST thing the console prints. Ancestry is not drawn here:
+        // every edge is already recorded (`origin` in `history.csv` carries
+        // `parents=`, and every `nets/<hash>.json` carries `created_from`), so a reader
+        // who wants the tree builds it from the run dir instead of scrolling a card
+        // whose 4-generation / 64-line cap made it both incomplete and hard to read.
+        // The per-elite mermaid ancestry in `elite-<hash>.md` stays.
         crate::utils::cfy::emit(&field_card);
-        // And immediately after the table, HOW those nets were born: the same reported
-        // set, drawn as ancestry. The table says what a net IS; without this card the
-        // reader has to open `nets/*.json` and decode `created_from` by hand to learn
-        // which two nets crossed to make it.
-        self.log_lineage(&top, &marks);
     }
 
     /// The plan the ONE stop-time table renders from: one header, one crown, one live
@@ -675,6 +715,7 @@ impl CoreEngine {
         marks: &std::collections::HashMap<String, &'static str>,
         inefficiency: Option<&super::reports::InefficiencyField>,
         lottery: Option<super::step::LotteryFrame>,
+        exam: &std::collections::HashMap<String, Option<f32>>,
     ) -> (comfy_table::Table, CardStats, Vec<Vec<String>>) {
         let mut table = comfy_table::Table::new();
         table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
@@ -722,6 +763,7 @@ impl CoreEngine {
                 // column cannot disagree with `idle`/`tickets` beside it — and costs no
                 // second window read.
                 ticket_frame: lottery,
+                exam: exam.get(hash).copied().flatten(),
             });
             table.add_row(cells.clone());
             grid.push(cells);
@@ -874,6 +916,10 @@ impl CoreEngine {
             row.d_prop.map(fmt_cell).unwrap_or_else(dash),
             row.a_rescaled.map(fmt_cell).unwrap_or_else(dash),
             row.inefficiency.map(fmt_cell).unwrap_or_else(dash),
+            // The exam: selection's number's honest twin. `—` when no exam was supplied
+            // (and always for a net outside the reported set: the exam costs a forward
+            // pass per net, and only the nets the run is actually reporting are worth it).
+            row.exam.map(fmt_cell).unwrap_or_else(dash),
             // The VERDICT, last: the mark says what the run did with the net, and the
             // gate letters say why it is not sitting.
             format!("{}{gate}", row.mark),
@@ -1299,6 +1345,10 @@ const STOP_HEADER_FIXED: &[&str] = &[
     "prop (D)",
     "rescaled (A)",
     "D * A",
+    // The EXAM: rows no clock ever read, scored ONCE at stop on the reported nets. It sits
+    // beside `fit (A)` at the far right because that is the comparison it exists for
+    // (`A` = what selection saw, `X` = what nothing saw), and it is never ranked on.
+    "exam (X)",
     // The Δ columns are NOT here: a raw multiset-Jaccard distance sits at 0.7–0.9 between
     // any two unrelated nets, so a per-row value had no reference scale. What the field CAN
     // support is stated ONCE in the footnote (the card mean against the population's own
@@ -1482,6 +1532,11 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         ),
         // ── what this net IS (the verdict) ────────────────────────────
         (
+            "exam (X)".to_string(),
+            "the EXAM: the same ranking scorer over rows the race NEVER read — a separate `exam/` store, not the eval pool, and not reachable from any clock. Scored once at stop for the reported nets only and written to `exam.json`; `—` = no exam supplied, or a net outside the reported set. It ranks nothing: read it against `fit (A)`, because `A` is what selection saw and `X` is what nothing saw"
+                .to_string(),
+        ),
+        (
             "mark".to_string(),
             format!(
                 "`★` saved as elite (top-{} by A) and holding a crown seat · `☆` saved as elite but barred from the seat (the `j` or `t` beside it names the gate) · `x` saved as worst (top-{} by `D * A`) · `·` neither; with the crown off nobody sits, so every saved elite reads `★`",
@@ -1616,6 +1671,9 @@ struct StopRow<'a> {
     /// `rescaled (A) = |A_best − A| ÷ |A_best − A_worst|` — the fit leg alone, printed
     /// so the product below can be redone from the row.
     a_rescaled: Option<f32>,
+    /// The EXAM reading `exam (X)`: the same ranking scorer over rows the race never
+    /// read. `None` = no exam supplied, or this net could not be scored.
+    exam: Option<f32>,
     /// `D * A = prop (D) × rescaled (A)` — the net's inefficiency reading
     /// (`None`: no ranking, so it is not in the field the artifact writer picks from).
     inefficiency: Option<f32>,

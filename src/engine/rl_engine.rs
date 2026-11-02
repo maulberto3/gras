@@ -116,6 +116,11 @@ impl RlEngine {
             ..header.clone()
         };
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume_rl")?;
+        // Same pool-name guard as the tabular flavor: the recorded search space is
+        // replayed, so an entry this build cannot read is refused by name.
+        config
+            .validate_search_pools()
+            .map_err(crate::utils::error::EngineError::InvalidOptions)?;
         // The persisted run must itself be RL: replaying an RL frontier as
         // tabular (or vice versa) is a bug. `engine_mode` is the discriminator.
         if header.engine_mode.as_deref() != Some("rl") {
@@ -149,6 +154,9 @@ impl RlEngine {
             stream: None,
             dataset: None,
             explicit_test_rows: None,
+                // RL has no dataset at all, so there is nothing to hold out: an exam is a
+                // property of a tabular run (and a trainer that reports its own fitness).
+            exam: None,
             fitness,
             metrics,
             trainer,

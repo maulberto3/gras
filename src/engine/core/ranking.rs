@@ -217,16 +217,34 @@ impl CoreEngine {
             .config
             .elite_count
             .min(self.state.live_count().saturating_sub(1));
-        // 5. One freeze line per net entering (rank order), one dethrone line
-        //    per net leaving; a net holding rank is silent.
+        // ELITE RANK: the crown ordered by score, 1 = the best SEATED net. This is a
+        // different question from the population rank (an unseated net cannot be here:
+        // it is either better and in its join window, or worse), and it is the one the
+        // seat lines answer — `seat 4 of 10` means "took the 4th-best seat", which is
+        // what "how is the crown behaving" asks. The old label numbered the arriving
+        // BATCH instead, so a deal that filled seats 3 and 9 printed `seat 1 of 10` and
+        // `seat 2 of 10`, numbers that belonged to no net in particular.
+        let mut crown_order: Vec<&str> = self.frozen_crown.iter().map(String::as_str).collect();
+        crown_order.sort_by_key(|h| positions.get(h).copied().unwrap_or(usize::MAX));
+        let elite_rank: std::collections::HashMap<&str, usize> = crown_order
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (*h, i + 1))
+            .collect();
+        // 5. One freeze line per net entering (elite-rank order, which is also score
+        //    order), one dethrone line per net leaving; a net holding rank is silent.
         for (idx, h) in entering.iter().enumerate() {
-            let pos = positions.get(h.as_str()).copied().unwrap_or(0);
-            // `seat N/M` is the SEAT INDEX inside this deal, NOT the net's global rank: with
-            // probation on, rank 18 can take the 10th seat — the rank is named separately.
-            let rank_note = if pos == 0 || pos == idx + 1 {
-                String::new()
-            } else {
-                format!(" (rank {pos})")
+            let elite = elite_rank.get(h.as_str()).copied().unwrap_or(idx + 1);
+            // `positions` is 0-BASED, so the printed rank is `+ 1` — the old note printed
+            // the raw index, which named 19th place "rank 18" while the exit line (which
+            // adds one) named the same net "rank 19". Printed only when it disagrees with
+            // the seat rank: on a full, ungated crown the two are the same number and a
+            // repeat would be noise.
+            let rank_note = match positions.get(h.as_str()) {
+                Some(r) if r + 1 != elite => {
+                    format!(" (rank {} of {} overall)", r + 1, self.state.live_count())
+                }
+                _ => String::new(),
             };
             let fit = self.smoothed_fitness_of(h);
             let age = self
@@ -283,7 +301,7 @@ impl CoreEngine {
             info!(
                 "step {} │ seat {} of {seat} → {}{} │ {} │ reading {} │ age {} clocks │ {} │ {} │ {wait} │ {held}",
                 clock,
-                idx + 1,
+                elite,
                 &h[..8.min(h.len())],
                 rank_note,
                 score_cell,
