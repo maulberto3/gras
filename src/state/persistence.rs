@@ -351,11 +351,17 @@ pub struct RunHeader {
     /// Children born per step clock at the last stop (same-clock siblings get
     /// distinct child seeds). Restored on resume; empty on legacy files.
     #[serde(default)]
-    pub children_born_at_clock: std::collections::HashMap<usize, usize>,
-        /// Data layout: `None` = single-pool seeded split; `Some(n)` = explicit `{train,test}`
-        /// with `n` test rows after the train rows. Recorded so resume rebuilds the pools.
+    pub children_born_at_clock: std::collections::HashMap<usize, usize>,    /// Data layout: `None` = single-pool seeded split; `Some(n)` = explicit `{train,test}`
+    /// with `n` test rows after the train rows. Recorded so resume rebuilds the pools.
     #[serde(default)]
     pub explicit_test_rows: Option<usize>,
+        /// EXAM rows: the one dataset the race never reads. A separate `exam/` store, NOT
+        /// concatenated into the run tensor (so no stream, metric or callback can reach
+        /// it), scored ONCE at stop for the reported nets only and written as `exam.json`.
+        /// A report, never a gate: nothing ranks, culls or seats on it. `None` = no exam
+        /// supplied, and the final table's `exam (X)` column reads `—`.
+    #[serde(default)]
+    pub exam_rows: Option<usize>,
     /// The run's complete configuration (see [`ConfigSnapshot`]). This is the
     /// authoritative settings record — `engine.json` alone reproduces a run.
     #[serde(default)]
@@ -468,6 +474,8 @@ pub struct RunConfig {
     pub train_eval_split_ratio: Option<f32>,
     /// See [`RunHeader::explicit_test_rows`].
     pub explicit_test_rows: Option<usize>,
+    /// See [`RunHeader::exam_rows`].
+    pub exam_rows: Option<usize>,
     /// Cumulative culls at the last stop.
     pub culls: usize,
     /// Accumulated wall-clock seconds at the last stop.
@@ -502,6 +510,7 @@ impl RunHeader {
             max_steps,
             train_eval_split_ratio,
             explicit_test_rows,
+            exam_rows,
             culls,
             run_elapsed_secs,
             children_born_at_clock,
@@ -534,6 +543,7 @@ impl RunHeader {
             // constructor has no view of the cadence, the engine does.
             eval_era_every: None,
             explicit_test_rows,
+            exam_rows,
             culls,
             run_elapsed_secs,
             children_born_at_clock,
@@ -635,6 +645,11 @@ impl RunHeader {
             .get("explicit_test_rows")
             .and_then(|f| f.as_u64())
             .map(|n| n as usize);
+            // Absent on every header written before the exam existed: no exam supplied.
+        let exam_rows = v
+            .get("exam_rows")
+            .and_then(|f| f.as_u64())
+            .map(|n| n as usize);
         // Counter persistence (written at stop; legacy files read as fresh).
         let culls = v.get("culls").and_then(|f| f.as_u64()).unwrap_or(0) as usize;
         let run_elapsed_secs = v
@@ -711,6 +726,7 @@ impl RunHeader {
                 .and_then(|f| f.as_u64())
                 .map(|n| n as usize),
             explicit_test_rows,
+            exam_rows,
             culls,
             run_elapsed_secs,
             children_born_at_clock,
@@ -1664,6 +1680,7 @@ mod tests {
         RunHeader::from_race_options(RunConfig {
             data_dir: None,
             explicit_test_rows: None,
+            exam_rows: None,
             run_id: run_id.to_string(),
             engine_mode: Some("tabular".into()),
             run_seed: 42,
