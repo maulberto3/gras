@@ -372,14 +372,14 @@ fn main() {
         .set_stop_max_steps(Some(cli.max_steps.unwrap_or(RACE_STEPS)))
         // .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
         // CROSSOVER
-        .set_crossover_rolls(pop / 10)
+        .set_crossover_rolls(pop / 30)
         .set_crossover_prob(0.5)
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
         .set_crossover_probation_steps(5)
         .set_crossover_selection(SelectionMethod::Tournament { tournament_size: 2 })
         // .set_crossover_ops_pool(["uniform"]) // if not specified, use all
         // MUTATION
-        .set_mutate_rolls(pop / 20)
+        .set_mutate_rolls(pop / 30)
         .set_mutation_cull_policy(MutationCullPolicy::Worst)
         .set_mutate_prob(0.5)
         .set_mutation_probation_steps(5)
@@ -403,7 +403,7 @@ fn main() {
         // .set_topology_feature_split(FeatureSplitPolicy::Random) // Other one Exclusive
         // ELITES
         .set_elite_freeze(true) // frozen elites still score, rank and sire
-        .set_elite_count(pop / 20)
+        .set_elite_count(pop / 10)
         .set_elite_previous_load(true) // on by default
         .set_elite_join_probation_steps(5) // age before a net may join the elite set (A/B re-checked 2026-10-26: 5 wins both fast seeds — see DONE.md)
         .set_elite_crown_lifetime_steps(5) // how long the frozen crown may sit at peak

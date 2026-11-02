@@ -650,7 +650,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         //
         .set_stop_max_steps(max_steps)
         //
-        .set_crossover_rolls(pop / 10)
+        .set_crossover_rolls(pop / 30)
         .set_crossover_prob(0.5)
         .set_crossover_cull_policy(CrossCullPolicy::Worst)
         .set_crossover_probation_steps(5)
@@ -658,7 +658,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tournament_size: 2  ,
         })
         // --- Mutation (both modes) ---
-        .set_mutate_rolls(pop / 20)
+        .set_mutate_rolls(pop / 30)
         .set_mutation_cull_policy(MutationCullPolicy::Worst)
         .set_mutate_prob(0.5) // per-roll chance a random immigrant is inserted
         .set_mutation_probation_steps(5)
@@ -673,7 +673,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_topology_max_inputs_per_node(15)
         .set_topology_input_dim(d_in)
         .set_topology_output_dim(d_out)
-        .set_topology_hidden_dim_range(16, 128)
+        .set_topology_hidden_dim_range(16, 64)
         .set_topology_hidden_dim_stride(16)
         .set_topology_dropout_prob(0.25)
         // .set_topology_combine_op_pool(COMBINE_OPS)
@@ -683,7 +683,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // --- Exports ---
         // --- Evolution: the elite/founder rules (mode-agnostic) ---
         .set_elite_freeze(true)
-        .set_elite_count(pop / 20)
+        .set_elite_count(pop / 10)
         .set_elite_previous_load(true) // on by default
         .set_elite_join_probation_steps(5)
         .set_elite_crown_lifetime_steps(5)
