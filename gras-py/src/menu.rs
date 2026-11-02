@@ -24,7 +24,7 @@ pub(crate) const TASKS: [&str; 2] = ["classification", "regression"];
 /// what the crate ships, and a menu of one is honest about that.
 pub(crate) const ALGOS: [&str; 1] = ["reinforce"];
 
-/// `activation_pool` — the spellings `RaceConfig::parse_activation` resolves, in
+/// `activation_pool` — the spellings the crate's activation pool resolves, in
 /// the order `all_activations()` lists them.
 pub(crate) const ACTIVATIONS: [&str; 18] = [
     "identity",

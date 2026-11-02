@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use gras::engine::config::{
-    CrossoverOp, DEFAULT_CHECKPOINT_EVERY, SMOOTHING_WINDOW,
+    DEFAULT_CHECKPOINT_EVERY, SMOOTHING_WINDOW,
 };
 use gras::evolution::selection::SelectionMethod;
 use gras::prelude::*;
@@ -507,13 +507,6 @@ impl PyRaceConfig {
             )));
         }
 
-        // The crate owns the spelling of an op name too; letting IT reject a typo keeps
-        // the message and the accepted set identical between Rust and Python.
-        for op in &self.crossover_ops_pool {
-            CrossoverOp::try_from(op.as_str())
-                .map_err(|e| PyValueError::new_err(format!("crossover_ops_pool: {e}")))?;
-        }
-
         let mut cfg = gras::RaceConfig::defaults();
         cfg.pop_size = self.pop_size;
         cfg.elite_count = self.elite_count;
@@ -576,9 +569,10 @@ impl PyRaceConfig {
         } else {
             self.feature_split_pool.clone()
         };
-        // Name a bad pool entry here, before a single net is drawn.
-        cfg.resolved_feature_split_pool()
-            .map_err(PyValueError::new_err)?;
+        // Name a bad pool entry here, before a single net is drawn — every name-based
+        // pool, not just the split: the crate's draw paths fall back to `all` on a typo,
+        // so this is where Python can turn it into a `ValueError` instead.
+        cfg.validate_search_pools().map_err(PyValueError::new_err)?;
         cfg.csv_export = self.csv_export;
         cfg.trace_file = self.trace_file;
         cfg.elite_save_topology = self.elite_save_topology;
@@ -586,16 +580,6 @@ impl PyRaceConfig {
         cfg.run_name = self.run_name;
         cfg.elite_previous_dir = self.elite_previous_dir;
 
-        // The crate resolves pool names; let IT name a typo, so the message and
-        // the accepted set are the ones the engine would have used. (Left to the
-        // first seed instead, a bad name silently falls back to "all" when a
-        // crossover child rewires the graph.)
-        cfg.resolved_activation_pool()
-            .map_err(|e| PyValueError::new_err(format!("activation_pool: {e}")))?;
-        cfg.resolved_combine_pool()
-            .map_err(|e| PyValueError::new_err(format!("combine_op_pool: {e}")))?;
-        cfg.resolved_standardize_pool()
-            .map_err(|e| PyValueError::new_err(format!("standardize_op_pool: {e}")))?;
         Ok((cfg, verbosity))
     }
 }
