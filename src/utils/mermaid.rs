@@ -1,7 +1,46 @@
 //! Mermaid flowchart rendering for topologies.
 
 use crate::graph::node::NodeKind;
-use crate::graph::topology::Topology;
+use crate::graph::topology::{FeatureSplitPolicy, Topology};
+
+/// How a blueprint's feature split names itself in a doc: the policy, when one is
+/// recorded, else `rows` (masks present without a policy is a legacy record the load
+/// path reconciles; naming them `rows` describes what is actually there).
+pub(crate) fn split_policy_name(policy: Option<FeatureSplitPolicy>) -> &'static str {
+    match policy {
+        Some(FeatureSplitPolicy::Exclusive) => "exclusive",
+        Some(FeatureSplitPolicy::Random) => "random",
+        Some(FeatureSplitPolicy::Inherited) => "inherited",
+        None => "rows",
+    }
+}
+
+/// The Input node's feature split as one line — `split random · 8p · 392/784 seen` — or
+/// `None` when the net has none.
+///
+/// `None` is the absence of rows, not an all-ones row: an unsplit Input port carries the
+/// shared mixed vector, so there is nothing to draw and the box stays the bare `in <n>`
+/// it has always been. `seen` is how many features reach AT LEAST one port — the one
+/// number that separates a true partition (`exclusive`, 100% by construction) from a coin
+/// flip (`random`, which drops some features and duplicates others).
+pub(crate) fn feature_split_cell(graph: &Topology) -> Option<String> {
+    let masks = graph.input_feature_masks()?;
+    let input_dim = graph.options.input_dim.unwrap_or(1).max(1);
+    let seen = (0..input_dim)
+        .filter(|f| {
+            masks
+                .iter()
+                .any(|m| m.get(*f).copied().unwrap_or(0) != 0)
+        })
+        .count();
+    Some(format!(
+        "split {} · {}p · {}/{} seen",
+        split_policy_name(graph.options.feature_split),
+        masks.len(),
+        seen,
+        input_dim
+    ))
+}
 
 /// Mermaid flowchart of a [`Topology`] — renders natively in GitHub/GitLab/Notion
 /// and can be exported via `mmdc`.
@@ -22,11 +61,24 @@ pub fn topology_mermaid(graph: &Topology) -> String {
     for node in &graph.nodes {
         let label = match node.kind {
             NodeKind::Input => {
-                format!(
-                    "n{}[\"in {}\"]",
-                    node.id,
-                    graph.options.input_dim.unwrap_or(1)
-                )
+                    // The Input box is where the feature split belongs: it is Genome on
+                    // the INPUT's ports, so a reader who wants to know whether this net
+                    // partitions its columns sees it on the box the wires leave from.
+                    // One `<br/>` and only on this node: the Input box has no combine or
+                    // dim text to share the line with, and every other box stays compact.
+                match feature_split_cell(graph) {
+                    Some(split) => format!(
+                        "n{}[\"in {}<br/>{}\"]",
+                        node.id,
+                        graph.options.input_dim.unwrap_or(1),
+                        split
+                    ),
+                    None => format!(
+                        "n{}[\"in {}\"]",
+                        node.id,
+                        graph.options.input_dim.unwrap_or(1)
+                    ),
+                }
             }
             NodeKind::Hidden => {
                 let dim = node.hidden_dim.unwrap_or(8);

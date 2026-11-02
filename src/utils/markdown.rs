@@ -2,7 +2,7 @@
 //! ASCII wiring diagram, and Mermaid flowchart.
 
 use super::ascii::{AsciiNode, edge_list, render_wire_diagram};
-use super::mermaid::topology_mermaid;
+use super::mermaid::{split_policy_name, topology_mermaid};
 use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
 use crate::graph::topology::Topology;
@@ -43,6 +43,31 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             .output_dim
             .map(|x| x.to_string())
             .unwrap_or_else(|| "?".into()),
+    ));
+
+    // ── The two blueprint knobs that never appear in a box ──
+    // A reader diffing two `elite-*.md` files needs the split and the seed: the split
+    // decides WHICH features each branch can see, and the seed is what makes this exact
+    // blueprint reproducible. Load a file without them and two nets can read identically
+    // while computing different things (the masks are genome, see `Node::feature_masks`).
+    let mut knobs: Vec<String> = Vec::new();
+    match graph.input_feature_masks() {
+        Some(masks) => knobs.push(format!(
+            "feature split `{}` over {} Input port(s)",
+            split_policy_name(graph.options.feature_split),
+            masks.len()
+        )),
+        None => knobs.push(
+            "no feature split — every Input port sees every feature".to_string(),
+        ),
+    }
+    if graph.options.dropout_prob > 0.0 {
+        knobs.push(format!("dropout {:.2}", graph.options.dropout_prob));
+    }
+    out.push_str(&format!(
+        "Blueprint: {} · topology seed {}\n\n",
+        knobs.join(" · "),
+        graph.options.topology_seed
     ));
 
     // ── Nodes table (merged topology + network layer info) ──
@@ -115,6 +140,47 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     }
     out.push('\n');
 
+    // ── Feature split — the Input node's per-port genome ──
+    // The rows are genome (`M:<width>` in the diversity tokens) but a table cannot show
+    // them: they live per PORT, not per node. One row per port is the whole of it, and
+    // the coverage line is the number that matters — `exclusive` covers every feature by
+    // construction, `random` can drop one entirely (a feature no branch ever sees).
+    if let Some(masks) = graph.input_feature_masks() {
+        let input_dim = graph.options.input_dim.unwrap_or(1).max(1);
+        let seen = (0..input_dim)
+            .filter(|f| {
+                masks
+                    .iter()
+                    .any(|m| m.get(*f).copied().unwrap_or(0) != 0)
+            })
+            .count();
+        let mean = masks
+            .iter()
+            .map(|m| m.iter().filter(|b| **b != 0).count())
+            .sum::<usize>() as f32
+            / masks.len().max(1) as f32;
+        out.push_str("## Feature split\n\n");
+        out.push_str(&format!(
+            "`{}` over **{}** Input port(s): **{seen} of {input_dim}** features reach at least one port, mean **{mean:.1}** per port. Rows are genome — a port keeps a feature where its row reads `1` and hides it where it reads `0`, and the rows cross over with the ports that carry them.\n\n",
+            split_policy_name(graph.options.feature_split),
+            masks.len()
+        ));
+        out.push_str("| port | keeps | share |\n|---:|---:|---:|\n");
+        for (port, mask) in masks.iter().enumerate() {
+            let keeps = mask.iter().filter(|b| **b != 0).count();
+            let note = if keeps == 0 {
+                " (bias only)"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "| {port} | {keeps}{note} | {:.1}% |\n",
+                100.0 * keeps as f32 / input_dim as f32
+            ));
+        }
+        out.push('\n');
+    }
+
     // ── Edge list with distance markers ──
     out.push_str("## Edges\n\n");
     out.push_str("```text\n");
@@ -175,6 +241,8 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("\n| **Arrow label (Graph)** | the wire's own activation — per-port, so one node can emit `mish` to one neighbor and `tanh` to another. Equal labels from the same node = same signal; duplicates are impossible (dedup collapses them). |");
     out.push_str("\n| **Dashed stub `selu (input)` / `mish (orphan)`** | orphaned port — an input nothing feeds / an output nothing reads (mermaid's counterpart of the ASCII `*`). |");
     out.push_str("\n| **`in <n>` / `out <n>`** | dataset shape (fixed by the problem). |");
+    out.push_str("\n| **Input box → second line** | the feature split when the net has one: `split <policy> · <ports>p · <seen>/<n> seen`. Absent = no split (every port carries the full mixed vector), which is the common case and why the box is usually one line. Per-port rows are in *Feature split* above. |");
+    out.push_str("\n| **`—` in `Combine` / `Std`** | no per-node override, so the forward pass uses `Add` / no standardisation. `—` is not a missing gene: it is the gene spelled as its default (the diversity metric folds `None` and `Identity` into one token for the same reason). |");
     out.push_str("\n| **Nodes table → `Sources`** | which output port feeds each input port (`n1_o2` = output 2 of node 1), one entry per port in port order — the `k`-th entry feeds `i<k>`; `*` = an unwired port (never left behind by `finalize`). |");
     out.push_str("\n| **Nodes table → `Combine` / `Std`** | how multiple inputs are merged / whether they're normalized first. |");
     out.push_str("\n| **Edge list & wiring diagram** | one line per wire, exact ports (`n0_o1 → n2_i0`); `<<<<` = long jump; `▶ ◀ *` = wired out / wired in / orphaned. |");

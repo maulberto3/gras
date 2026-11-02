@@ -199,4 +199,5 @@ impl Display for MutationMethod {
 variant_names!(FeatureSplitPolicy {
     FeatureSplitPolicy::Exclusive => "split_exclusive",
     FeatureSplitPolicy::Random => "split_random",
+    FeatureSplitPolicy::Inherited => "split_inherited",
 });
