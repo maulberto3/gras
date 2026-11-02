@@ -33,6 +33,9 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("elite_count", cfg.elite_count)?;
     d.set_item("max_steps", cfg.max_steps)?;
     d.set_item("checkpoint_every", cfg.checkpoint_every)?;
+    // The EVAL share of a single-pool dataset (0.2 = 80/20). A `train/`+`test/`
+    // dir states its own split, so this is the "gras decides" default.
+    d.set_item("eval_share", round32(cfg.eval_share))?;
     d.set_item("elite_freeze", cfg.freeze_elites)?;
     d.set_item("smoothing_window", cfg.smoothing_window)?;
     // The BINDING's values: the two knobs a Python run does not inherit from the crate.

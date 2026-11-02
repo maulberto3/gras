@@ -49,6 +49,10 @@ const DEFAULT_TRAIN_MERIT: f32 = 0.0;
 /// an effect while Ω is above 0, so exposing it changes nothing about the Ω = 0 path
 /// a Python run starts on.
 const DEFAULT_TRAIN_MERIT_P_MIN: f32 = 0.05;
+/// The share of a SINGLE-POOL dataset held out for eval, mirrored from the crate's
+/// `DEFAULT_EVAL_SHARE` (0.2 = 80/20). Only consulted when `data_dir` is one pool
+/// (`inputs.*` + `targets.*`); a dir with `train/` + `test/` states its own split.
+const DEFAULT_EVAL_SHARE: f32 = 0.2;
 
 /// Engine knobs a Python caller turns. Anything not listed keeps the crate's
 /// default, and every field is recorded in the run's `engine.json`.
@@ -66,6 +70,12 @@ pub struct PyRaceConfig {
     pub elite_count: usize,
     #[pyo3(get, set)]
     pub max_steps: Option<usize>,
+    /// Share of a SINGLE-POOL dataset held out for eval (`0.2` = the last 20% of
+    /// rows, chosen by a seeded shuffle, are scored and never trained on). A dir
+    /// with `train/` + `test/` subdirs states its own split and this is ignored.
+    /// Clamped to `0.01 …= 0.9` on the way into the engine.
+    #[pyo3(get, set)]
+    pub eval_share: f32,
     #[pyo3(get, set)]
     pub smoothing_window: usize,
     /// Risk aversion λ: window standard deviations subtracted from a net's
@@ -225,6 +235,7 @@ impl PyRaceConfig {
         pop_size = DEFAULT_POP_SIZE,
         elite_count = 1,
         max_steps = None,
+        eval_share = DEFAULT_EVAL_SHARE,
         smoothing_window = SMOOTHING_WINDOW,
         risk_aversion = DEFAULT_RISK_AVERSION,
         train_merit = DEFAULT_TRAIN_MERIT,
@@ -276,6 +287,7 @@ impl PyRaceConfig {
         pop_size: usize,
         elite_count: usize,
         max_steps: Option<usize>,
+        eval_share: f32,
         smoothing_window: usize,
         risk_aversion: f32,
         train_merit: f32,
@@ -319,6 +331,7 @@ impl PyRaceConfig {
             pop_size,
             elite_count,
             max_steps,
+            eval_share,
             smoothing_window,
             risk_aversion,
             train_merit,
@@ -505,6 +518,15 @@ impl PyRaceConfig {
         cfg.pop_size = self.pop_size;
         cfg.elite_count = self.elite_count;
         cfg.max_steps = self.max_steps;
+            // Same bounds the crate's setter enforces: outside them a pool can round
+            // to empty (`split_indices` then hands the whole dataset to eval).
+        if !(0.01..=0.9).contains(&self.eval_share) {
+            return Err(PyValueError::new_err(format!(
+                "eval_share {}: expected 0.01 <= share <= 0.9 (the fraction of rows held out for eval)",
+                self.eval_share
+            )));
+        }
+        cfg.eval_share = self.eval_share;
         cfg.smoothing_window = self.smoothing_window;
         cfg.risk_aversion = self.risk_aversion;
         cfg.train_merit = self.train_merit;

@@ -421,10 +421,34 @@ impl PyRaceEngine {
         LOGGING.call_once(|| {
             gras::engine::logging::init(inner.log_level, log_verbosity);
         });
-        let dataset = gras::resolve_dataset(&data_dir)
-            .map_err(|e| PyRuntimeError::new_err(format!("dataset {}: {e}", data_dir.display())))?;
-        inner.topology_options.input_dim = Some(dataset.inputs.shape()[1] as usize);
-        inner.topology_options.output_dim = Some(dataset.targets.shape()[1] as usize);
+            // The SAME layout sniff the engine runs: a dir holding `train/` + `test/`
+            // is an EXPLICIT split, anything else is one pool that the engine splits
+            // by `eval_share`. Asking only the single-pool resolver here made an
+            // explicit-layout dir raise "no inputs.bin" at construction — the layout
+            // existed in Rust and was unreachable from Python.
+        let (in_dim, out_dim) = {
+            let train_dir = data_dir.join("train");
+            let test_dir = data_dir.join("test");
+            let train = if train_dir.exists() && test_dir.exists() {
+                // The resolver already refuses a train/test dim mismatch, so the
+                // train side speaks for both.
+                let (train, _test) = gras::resolve_train_test_datasets(&data_dir)
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!("dataset {}: {e}", data_dir.display()))
+                    })?;
+                train
+            } else {
+                gras::resolve_dataset(&data_dir).map_err(|e| {
+                    PyRuntimeError::new_err(format!("dataset {}: {e}", data_dir.display()))
+                })?
+            };
+            (
+                train.inputs.shape()[1] as usize,
+                train.targets.shape()[1] as usize,
+            )
+        };
+        inner.topology_options.input_dim = Some(in_dim);
+        inner.topology_options.output_dim = Some(out_dim);
         let spec = RunSpec::tabular(data_dir, inner, fitness, trainer, seed, run_dir);
         let engine = TabularEngine::from_spec(spec)
             .map_err(|e| PyRuntimeError::new_err(format!("engine: {e}")))?;
