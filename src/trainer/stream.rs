@@ -152,9 +152,12 @@ impl BatchStream {
         (&self.train_pool, &self.eval_pool)
     }
 
-    /// The train/eval split ratio this stream was built with (from
-    /// RunSpec::stream / header). For engine bookkeeping.
-    pub fn train_eval_split_ratio(&self) -> f32 {
+        /// The share of the rows this stream TRAINS on (`train ÷ (train + eval)`),
+        /// i.e. `1 − eval_share`. Named for the side it returns: the old
+        /// `train_eval_split_ratio` produced this same number while the header field
+        /// of that name means the EVAL share, and a header written from it silently
+        /// inverted the split on resume.
+    pub fn train_share(&self) -> f32 {
         self.train_pool.len() as f32 / (self.train_pool.len() + self.eval_pool.len()) as f32
     }
 
