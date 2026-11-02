@@ -216,6 +216,11 @@ impl TabularEngine {
         // On resume, stream shape comes from the run header (data integrity),
         // but the trainer's stream_shape() can still override batch sizes.
         let header_stream_ratio = header.train_eval_split_ratio.unwrap_or(0.2); // legacy default if header missing it
+            // The RUN's share wins over the caller's: the pools are the ones the first
+            // half trained on, and a resume that re-chose them would rank nets on rows
+            // they were already selected against. Kept in the config too, so a header
+            // rewritten at the next checkpoint restates the same number.
+        config.eval_share = header_stream_ratio;
 
         // Same rule on resume: the trainer's stream shape overrides batch sizes
         // and the split ratio comes from the header — data integrity is fixed.

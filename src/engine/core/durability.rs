@@ -270,12 +270,11 @@ impl CoreEngine {
             standardize_op_pool: self.config.standardize_op_pool.clone(),
             informative_metrics: self.metrics.clone(),
             max_steps: self.config.max_steps,
-            train_eval_split_ratio: Some(
-                self.stream
-                    .as_ref()
-                    .map(|s| s.train_eval_split_ratio())
-                    .unwrap_or(0.2),
-            ),
+                // The CONFIG's eval share, not the stream's train share: the stream
+                // accessor returns `train_pool / total` (0.8 for a 20% holdout), so
+                // writing it here recorded 0.8 as the EVAL share and a resume built
+                // an 80/20 split the other way round.
+            train_eval_split_ratio: Some(self.config.eval_share),
             explicit_test_rows: self.explicit_test_rows,
             culls: self.culls,
             run_elapsed_secs: self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs(),

@@ -4833,3 +4833,49 @@ assert!(
 "{crownless}"
 );
 }
+
+/// `eval_share` is a CALLER decision, not a constant: it sizes the two pools, and it
+/// is the number the header records. The header a checkpoint rewrites used to store
+/// the stream's TRAIN share (0.8 for a 20% holdout) in the EVAL field, so a resume
+/// rebuilt the split the wrong way round.
+#[test]
+fn eval_share_sizes_the_pools_and_survives_a_header_rewrite() {
+let dir = std::env::temp_dir().join("gras-eval-share");
+let _ = std::fs::remove_dir_all(&dir);
+let data_dir = tiny_dataset_dir("eval-share");
+let config = RaceConfig {
+pop_size: 0,
+eval_share: 0.5,
+..RaceConfig::defaults()
+};
+let mut eng = crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+data_dir,
+config,
+fitness(),
+crate::trainer::TabularTrainer::new(loss_fn()),
+Some(42),
+Some(dir.clone()),
+))
+.unwrap();
+// 64 rows: half the rows are the judge, half do the learning.
+let (train, eval) = eng
+.stream
+.as_ref()
+.expect("tabular run has a stream")
+.pools();
+assert_eq!((train.len(), eval.len()), (32, 32), "64 rows, 50% held out");
+assert_eq!(
+eng.header.train_eval_split_ratio,
+Some(0.5),
+"the header records the EVAL share, not the train share"
+);
+// A checkpoint rewrites engine.json from the config; the share must not flip sides.
+eng.refresh_header().unwrap();
+let reread = crate::state::load_engine_json(&dir).unwrap();
+assert_eq!(
+reread.train_eval_split_ratio,
+Some(0.5),
+"a rewritten header keeps the eval share"
+);
+let _ = std::fs::remove_dir_all(&dir);
+}

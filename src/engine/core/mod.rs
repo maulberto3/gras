@@ -388,7 +388,16 @@ impl CoreEngine {
             .into());
         }
         let metrics = config.metrics.clone();
-        let train_eval_split_ratio = 0.2f32;
+            // The EVAL share (`eval_share`), clamped by the same bounds the setter
+            // uses: this value builds the pools (and, for a single-pool dir, decides
+            // how much of the data the race is judged on). It was a hardcoded `0.2`
+            // until 2026-11-01, so no caller could choose the split at all.
+        let train_eval_split_ratio = config
+            .eval_share
+            .clamp(
+                crate::engine::config::EVAL_SHARE_MIN,
+                crate::engine::config::EVAL_SHARE_MAX,
+            );
         let default_batch_size = 16usize;
         // The trainer owns batch geometry (Tabular only), resolved BEFORE the header so
         // engine.json records the stream shape the run used. `None` = no stream (RL).
@@ -432,6 +441,8 @@ impl CoreEngine {
                 standardize_op_pool: config.standardize_op_pool.clone(),
                 informative_metrics: metrics.clone(),
                 max_steps: config.max_steps,
+                // Legacy key, EVAL share (see `DEFAULT_EVAL_SHARE`): this is the
+                // value a resume reads back to rebuild the same two pools.
                 train_eval_split_ratio: Some(train_eval_split_ratio),
                 explicit_test_rows,
                 culls: 0,

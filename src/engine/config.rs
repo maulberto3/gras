@@ -42,6 +42,23 @@ pub const DEFAULT_CHECKPOINT_EVERY: usize = 10;
 /// "train everybody" path `Ω` would be.
 pub const DEFAULT_TRAIN_MERIT_P_MIN: f32 = 0.05;
 
+/// Default share of the dataset held out for EVAL (`eval_share`): how much of the
+/// rows the race RANKS on and never trains on. `0.2` = 80/20, the ratio every run
+/// before 2026-11-01 used as a hardcoded constant.
+///
+/// The name is the EVAL side on purpose. The artifact key it lands in
+/// (`engine.json → train_eval_split_ratio`) predates it and reads as a train
+/// share, which is exactly how the checkpointed header once recorded the WRONG
+/// side (it wrote the stream's train share into the eval field). One word here,
+/// one meaning: `eval_share`.
+pub const DEFAULT_EVAL_SHARE: f32 = 0.2;
+
+/// The narrowest and widest `eval_share` a run accepts. Below 1% the eval pool can
+/// round to zero rows (which `split_indices` fills back with the whole dataset — a
+/// silent 100% eval), and above 90% the train pool gets too thin to learn from.
+pub const EVAL_SHARE_MIN: f32 = 0.01;
+pub const EVAL_SHARE_MAX: f32 = 0.9;
+
 // `DEFAULT_LR` moved to `crate::utils::training`: a training scheme reads it
 // (the reference trainer and the example both do), so it belongs below both
 // layers rather than in the engine's config surface.
@@ -264,6 +281,19 @@ pub struct RaceConfig {
         /// `0.0` restores the pre-floor arithmetic bit-for-bit. Replay-relevant like Ω:
         /// a resume at another floor warns by name.
     pub train_merit_p_min: f32,
+        /// Share of the dataset held out for EVAL (`set_run_eval_share`): the rows a
+        /// net is SCORED on and never trained on. `0.2` (default) = 80/20.
+        ///
+        /// This is the internal split, used when the data dir is a single pool
+        /// (`inputs.*` + `targets.*`). A dir holding `train/` and `test/` subdirs
+        /// takes the EXPLICIT layout instead and this value is not consulted — the
+        /// two layouts are alternatives, not a stack. Recorded in `engine.json`
+        /// (`train_eval_split_ratio`, the legacy key name) and reused on resume.
+        ///
+        /// Shrinking it gives the search more rows to learn from and a noisier
+        /// judge; growing it gives a steadier ranking and a thinner train pool.
+        /// Replay-relevant: the pools are built from this at run start.
+    pub eval_share: f32,
         /// Per-net smoothed-fitness rolling window (K) — how many recent step fitnesses every
         /// ranking decision averages over. Defaults to [`SMOOTHING_WINDOW`].
     pub smoothing_window: usize,
@@ -530,6 +560,7 @@ impl RaceConfig {
             freeze_elites: true,
             train_merit: 0.0,
             train_merit_p_min: DEFAULT_TRAIN_MERIT_P_MIN,
+            eval_share: DEFAULT_EVAL_SHARE,
             elite_join_probation_steps: 5,
             elite_crown_lifetime_steps: 5,
             smoothing_window: SMOOTHING_WINDOW,
@@ -851,6 +882,25 @@ impl RaceConfigBuilder {
         /// different search).
     pub fn set_run_train_merit(mut self, omega: f32) -> Self {
         self.cfg.train_merit = omega.clamp(0.0, 1.0);
+        self
+    }
+        /// Share of the dataset held out for EVAL — the rows the race ranks on and
+        /// never trains on. Default [`DEFAULT_EVAL_SHARE`] = `0.2` (80/20), clamped
+        /// to `0.01 …= 0.9` so neither pool can round to empty. A single-pool dir
+        /// only: a dir with `train/` + `test/` subdirs takes the explicit layout and
+        /// ignores it.
+        ///
+        /// This is the knob a caller turns to decide whether gras splits at all: at
+        /// `0.01` the search learns on ~99% of the rows and ranks on a small probe;
+        /// at `0.5` the judge is half the data and the train pool is the other half.
+        /// Replay-relevant: the pools are built from it at run start and recorded in
+        /// `engine.json`, so a resume reuses the run's own share.
+    pub fn set_run_eval_share(mut self, share: f32) -> Self {
+        self.cfg.eval_share = if share.is_finite() {
+            share.clamp(EVAL_SHARE_MIN, EVAL_SHARE_MAX)
+        } else {
+            DEFAULT_EVAL_SHARE
+        };
         self
     }
         /// The lottery's merit floor `p_min` (default `0.05`, `0.0` = the pre-floor
