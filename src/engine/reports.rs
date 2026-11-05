@@ -103,13 +103,18 @@ impl CoreEngine {
             );
             // The run seed rides the header: this file outlives the run dir, and the
             // seed is the one input a later replay cannot reconstruct from the net.
+                // The NET seed rides beside the run seed: `run_seed` replays the race's
+                // decisions, `net_seed` is what seeds THIS net's weights — without it a
+                // file that outlives the run dir describes a shape whose coefficients
+                // nothing can rebuild.
             let md = format!(
-                "**{label} · fitness {} (risk-adjusted) = {:.4} · window {} · λ={:.2} · run seed {}**\n\n{}\n\n{}",
+                "**{label} · fitness {} (risk-adjusted) = {:.4} · window {} · λ={:.2} · run seed {} · net seed {}**\n\n{}\n\n{}",
                 self.fitness.direction().arrow(),
                 fitness,
                 reading,
                 self.config.risk_aversion,
                 self.header.run_seed,
+                state.net_seed,
                 crate::utils::markdown::topology_markdown(&topo, None),
                 // The net's own birth, as a mermaid graph: a founder is one box, a
                 // crossover draws its parents above and converges down to this net.
@@ -329,11 +334,12 @@ impl CoreEngine {
                         // able to see WHY this net is one of the worst, not just which.
                         let md = format!(
                             "**{label} · fitness {} (risk-adjusted) = {:.4} · window {} · \
-                             prop (D) {:.2} (trained {} of the field's {}) × rescaled (A) {:.2} \
-                             (field best {:.4} … worst {:.4}) = {:.4}**\n\n{}\n\n{}",
+                             net seed {} · prop (D) {:.2} (trained {} of the field's {}) × \
+                             rescaled (A) {:.2} (field best {:.4} … worst {:.4}) = {:.4}**\n\n{}\n\n{}",
                             self.fitness.direction().arrow(),
                             pick.score,
                             reading,
+                            state.net_seed,
                             pick.spent,
                             pick.trained,
                             pick.max_trained,
@@ -451,9 +457,11 @@ impl CoreEngine {
                 worst_score: field.worst,
             })
             .collect();
+        // Worst-first: the saved `worst-*` set is the nets the inefficiency reading likes
+        // least (`E = spent × gap`, descending).
         picks.sort_by(|a, b| {
-            (b.spent * b.gap)
-                .partial_cmp(&(a.spent * a.gap))
+            let (ka, kb) = (a.spent * a.gap, b.spent * b.gap);
+            kb.partial_cmp(&ka)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.hash.cmp(&b.hash))
         });

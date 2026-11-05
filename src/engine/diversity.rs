@@ -7,8 +7,9 @@
 //!
 //! **The metric is STRUCTURAL and deterministic.** A net becomes a multiset of
 //! genes — one token per node (`N:<kind>:<combine>:<std>:<activation>:<width>`), one
-//! per output port (the activation that port emits), and one per Input port's
-//! feature-mask width — and two nets are compared by multiset Jaccard distance:
+//! per output port (the activation that port emits), one per Input port's
+//! feature-mask width, and one per WIRE (`E:<from_kind>><to_kind>`) — and two nets
+//! are compared by multiset Jaccard distance:
 //!
 //! ```text
 //! Δ(a, b) = 1 − (Σ min(a_t, b_t)) / (Σ max(a_t, b_t))      // 0 = identical, 1 = disjoint
@@ -206,6 +207,17 @@ pub(crate) fn genes(topo: &Topology) -> HashMap<String, usize> {
             }
         }
     }
+    // WIRES ARE GENOME TOO, one token per connection — keyed by the KINDS it joins,
+    // never by node id: crossover and mutation renumber nodes, so the same graph with
+    // two ids swapped must read as the same gene. The COUNT is the shape reading, so a
+    // skip connection is one `E:Input>Output` and a three-way fan-in is `E:Hidden>Hidden
+    // ×3`; a net that re-routes a wire now differs from one that only re-spells a node.
+    let kinds: HashMap<usize, NodeKind> = topo.nodes.iter().map(|n| (n.id, n.kind)).collect();
+    for conn in &topo.connections {
+        if let (Some(from), Some(to)) = (kinds.get(&conn.from.node), kinds.get(&conn.to.node)) {
+            bump(format!("E:{from:?}>{to:?}"));
+        }
+    }
     out
 }
 
@@ -348,6 +360,76 @@ mod tests {
             (t.spread - 2.0).abs() < 1e-6,
             "population std, got {}",
             t.spread
+        );
+    }
+
+    /// A re-route is a structural change; a RENUMBERING is not. One token per wire,
+    /// keyed by kinds, is the only label that satisfies both.
+    #[test]
+    fn a_reroute_is_a_gene_but_renumbering_is_not() {
+        use crate::graph::node::{Activation, Node};
+        use crate::graph::topology::{Connection, Port};
+        let node = |id: usize, kind: NodeKind, num_inputs: usize, num_outputs: usize| Node {
+            id,
+            num_inputs,
+            num_outputs,
+            kind,
+            hidden_dim: (kind == NodeKind::Hidden).then_some(8),
+            activation: if kind == NodeKind::Hidden {
+                Activation::ReLU
+            } else {
+                Activation::Identity
+            },
+            port_activations: None,
+            combine_op: None,
+            standardize: None,
+            feature_masks: None,
+        };
+        let build = |skip: bool| {
+            let mut g = Topology::new(0, None);
+            g.nodes.push(node(0, NodeKind::Input, 0, 4));
+            g.nodes.push(node(1, NodeKind::Hidden, 1, 1));
+            g.nodes.push(node(2, NodeKind::Output, 2, 0));
+            g.connections.push(Connection {
+                from: Port { node: 0, index: 0 },
+                to: Port { node: 1, index: 0 },
+            });
+            g.connections.push(Connection {
+                from: Port { node: 1, index: 0 },
+                to: Port { node: 2, index: 0 },
+            });
+            if skip {
+                // The SAME nodes, one extra wire: input straight to the output.
+                g.connections.push(Connection {
+                    from: Port { node: 0, index: 1 },
+                    to: Port { node: 2, index: 1 },
+                });
+            }
+            g
+        };
+        let direct = genes(&build(false));
+        let skip = genes(&build(true));
+        // Node genes agree; the only difference is the added `E:Input>Output`.
+        assert_eq!(direct.get("E:Input>Hidden"), Some(&1));
+        assert_eq!(direct.get("E:Input>Output"), None);
+        assert_eq!(skip.get("E:Input>Output"), Some(&1));
+        assert!(
+            delta(&direct, &skip) > 0.0,
+            "a re-route must not read as the same architecture"
+        );
+        // Renumber every node: the same wiring must still read as distance zero.
+        let mut moved = build(false);
+        for n in &mut moved.nodes {
+            n.id += 10;
+        }
+        for c in &mut moved.connections {
+            c.from.node += 10;
+            c.to.node += 10;
+        }
+        assert_eq!(
+            delta(&genes(&build(false)), &genes(&moved)),
+            0.0,
+            "node ids are not a gene"
         );
     }
 

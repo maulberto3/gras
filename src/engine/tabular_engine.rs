@@ -175,44 +175,57 @@ impl TabularEngine {
         // frontier BEFORE anything reads the windows or appends to the files — otherwise
         // the resumed run re-emits rows that are already on disk.
         CoreEngine::rewind_csvs_to_manifest(&run_dir)?;
-        // Data layout comes from the HEADER (`explicit_test_rows`), not from
-        // re-detecting the directory — the same pools replay after a rename.
+        // Data layout comes from the HEADER, not from re-detecting the directory: the
+        // same pools replay after a rename. `eval_split` names the ranking pool (`val` or
+        // `test`); a legacy header (written before the VAL role existed) can only mean the
+        // old `train/` + `test/` rule.
         let explicit_test_rows = header.explicit_test_rows;
-            // The EXAM comes back from the SAME rule the run started under: a sibling
-            // `exam/` store, kept out of `dataset`. A row count that no longer matches the
-            // header means the exam was swapped, and an exam you can swap is not an exam.
-        let exam = {
-            let exam_dir = data_dir.join("exam");
-            if exam_dir.exists() {
-                let ds = crate::utils::tabular_data::resolve_inputs_targets_datasets(&exam_dir)?
-                    .to_device(config.device())?;
-                if let Some(recorded) = header.exam_rows {
-                    if recorded != ds.len() {
-                        return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                            "resume: header records exam_rows = {recorded} but {} holds {} rows — the exam set changed, so its reading would not be comparable to the recorded run's",
-                            exam_dir.display(),
-                            ds.len()
-                        ))
-                        .into());
-                    }
-                }
-                Some(ds)
-            } else if header.exam_rows.is_some() {
+        let recorded_eval_split = header
+            .eval_split
+            .clone()
+            .or_else(|| explicit_test_rows.map(|_| "test".to_string()));
+        let roles = super::core::roles::resolve(&data_dir, config.device())?;
+        if roles.eval_split != recorded_eval_split {
+            let name = |s: &Option<String>| {
+                s.clone()
+                    .unwrap_or_else(|| "none (one pool, split by eval_share)".to_string())
+            };
+            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                "resume: the run ranked on `{}` but {} now supplies `{}` — the eval pool is the row set the nets were selected against, so a re-laid-out data dir cannot continue the recorded race",
+                name(&recorded_eval_split),
+                data_dir.display(),
+                name(&roles.eval_split),
+            ))
+            .into());
+        }
+            // The EXAM comes back from the SAME rule the run started under. A row count
+            // that no longer matches the header means the exam was swapped, and an exam you
+            // can swap is not an exam.
+        let exam = roles.exam;
+        match (exam.as_ref(), header.exam_rows) {
+            (Some(ds), Some(recorded)) if recorded != ds.len() => {
                 return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                    "resume: the run recorded an exam ({} rows) but {} no longer exists",
-                    header.exam_rows.unwrap_or(0),
-                    exam_dir.display()
+                    "resume: header records exam_rows = {recorded} but {} holds {} rows — the exam set changed, so its reading would not be comparable to the recorded run's",
+                    data_dir.display(),
+                    ds.len()
                 ))
-                .into());
-            } else {
-                None
+                .into())
             }
-        };
-        let dataset = if explicit_test_rows.is_some() {
-            let (train, test) = crate::utils::tabular_data::resolve_train_test_datasets(&data_dir)?;
-            train.concat(&test)?.to_device(config.device())?
-        } else {
-            crate::utils::tabular_data::resolve_dataset(&data_dir)?.to_device(config.device())?
+            (None, Some(recorded)) => {
+                return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                    "resume: the run recorded an exam ({recorded} rows) but {} no longer supplies one",
+                    data_dir.display(),
+                ))
+                .into())
+            }
+            _ => {}
+        }
+        let Some(dataset) = roles.dataset else {
+            return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                "resume: {} supplied no dataset",
+                data_dir.display()
+            ))
+            .into());
         };
         // The METRIC SET comes from the RECORD, never from this call: it is the header
         // `history.csv` already carries (`append_csv_file` writes a header only when the

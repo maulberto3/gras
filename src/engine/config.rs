@@ -59,6 +59,14 @@ pub const DEFAULT_EVAL_SHARE: f32 = 0.2;
 pub const EVAL_SHARE_MIN: f32 = 0.01;
 pub const EVAL_SHARE_MAX: f32 = 0.9;
 
+/// Default chance that ONE inherited drift slot moves on a crossover child
+/// (`set_topology_drift`): a mask bit flips, or a hidden node's activation / combine /
+/// standardize is re-drawn from its pool, or the net's `dropout_prob` is re-drawn in
+/// `0.0..=cap`. `0.0` = pure inheritance: a child's genes are its parents' genes, and the
+/// search only gets new alleles from a fresh immigrant. That is the behaviour every run
+/// before 2026-11-02 had, so the default is bit-for-bit compatible.
+pub const DEFAULT_TOPOLOGY_DRIFT: f32 = 0.0;
+
 // `DEFAULT_LR` moved to `crate::utils::training`: a training scheme reads it
 // (the reference trainer and the example both do), so it belongs below both
 // layers rather than in the engine's config surface.
@@ -313,6 +321,28 @@ pub struct RaceConfig {
         /// [`RaceConfigBuilder::set_crossover_selection`]. Replay-relevant: the draw
         /// consumes the roll's RNG stream, so a resumed run must use the same method.
     pub crossover_selection: SelectionMethod,
+        /// Fitter parent as the crossover BASE (`set_crossover_fitter_base`). The operator
+        /// mutates ONE parent (the base) into the child, so the base donates everything the
+        /// cut does not swap. Default `false` — the base is whichever roulette draw landed
+        /// first, and a measured probe over `attempts.csv` found that was the WORSE parent
+        /// in ~half of births, i.e. half the births preserved the bad skeleton.
+        ///
+        /// `true` orders the two draws by the SAME best-first ranking every other decision
+        /// reads (`ranked`, so `direction` is already applied) and makes the better net the
+        /// base: the child keeps the good skeleton and receives the donor's slice. It does
+        /// not touch the draw — same parents, same operator, same RNG consumption — only
+        /// which of the two is the recipient.
+        ///
+        /// **The keeper is chosen after the cut, not before it.** The operators already
+        /// build BOTH reciprocal children (they mutate the donor too), so the engine keeps
+        /// the side that still carries more of the fitter parent's node genes. Without that
+        /// check an early pivot on the base leaves the child mostly the DONOR, and keeping
+        /// it "because the fitter one is the base" would preserve exactly the wrong
+        /// skeleton. Ties (and a count tie broken by total `hidden_dim`) keep the base side.
+        ///
+        /// The parent-selection fallback scores an unmeasured net `0.0`, which only matters
+        /// while fewer than two nets are measured (clock 0), where neither order is better.
+        pub crossover_fitter_base: bool,
     /// Max steps before stopping (None = no limit).
     pub max_steps: Option<usize>,
         /// Hidden-dim sampling range (`None` ⇒ default 4..=8). NOTE: batch geometry lives
@@ -330,6 +360,33 @@ pub struct RaceConfig {
     /// policy lands on the individual's own `TopologyOptions`, so a newborn's split
     /// travels with its blueprint and its children inherit the rows, not the draw.
     pub feature_split_pool: Vec<String>,
+        /// Per-SLOT drift on a crossover child's INHERITED genes (`set_topology_drift`):
+        /// the chance, for each slot below, that it moves at all. ONE probability for the
+        /// whole family because it is one idea — crossover can only DONATE an allele, so
+        /// without drift nothing it hands down can ever be edited.
+        ///
+        /// | slot | what `p` does |
+        /// |---|---|
+        /// | each feature-mask bit | flips |
+        /// | hidden `activation` | re-drawn from the activation pool |
+        /// | hidden `combine_op` | re-drawn from the combine pool |
+        /// | hidden `standardize` | re-drawn from the standardize pool |
+        /// | per-port activation (`1..`) | re-drawn from the activation pool |
+        /// | `dropout_prob` | re-drawn in `0.0..=cap` (`set_topology_dropout_prob`) |
+        ///
+        /// `0.0` (default) = exact inheritance. None of these slots changes the SHAPE of the
+        /// net, so drift needs no rebuild; `hidden_dim` and the wiring stay donation-only
+        /// for exactly that reason. Drawn from a seed derived from
+        /// `(run_seed, clock, child_idx)` — one salted stream per family — so it cannot
+        /// perturb the parent draw and a replay moves the same slots. Replay-relevant:
+        /// recorded in `engine.json`, and a resume at another value warns by name.
+        ///
+        /// Scale note: the mask slots are sized against ROW WIDTH (`input_dim` bits per
+        /// port, so `784` on MNIST), the node slots against the net's gene count (~`3 ×
+        /// hidden nodes`). `0.005` flips ~4 bits in a 784-wide row and ~31 per 8-port child,
+        /// while barely touching node genes; `0.5` is a pool draw in disguise — keep it to a
+        /// few edits per child.
+    pub drift_prob: f32,
     /// Activation pool (empty ⇒ all).
     pub activation_pool: Vec<String>,
     /// Standardize-op pool (empty ⇒ all).
@@ -568,11 +625,13 @@ impl RaceConfig {
             mode_specific: ModeConfig::Tabular(TabularConfig::default()),
             crossover_ops_pool: Vec::new(),
             crossover_selection: SelectionMethod::Roulette,
+            crossover_fitter_base: true,
             max_steps: None,
             hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
             hidden_dim_stride: 16,
             combine_op_pool: Vec::new(),
             feature_split_pool: Vec::new(),
+            drift_prob: DEFAULT_TOPOLOGY_DRIFT,
             activation_pool: Vec::new(),
             standardize_op_pool: Vec::new(),
             topology_options: crate::graph::topology::TopologyOptions::default(),
@@ -636,6 +695,7 @@ impl RaceConfig {
         cfg.mutate_prob = snap.mutate_prob;
         cfg.elite_count = snap.elite_count;
         cfg.crossover_ops_pool = snap.crossover_ops_pool.clone();
+        cfg.crossover_fitter_base = snap.crossover_fitter_base;
         cfg.max_steps = snap.max_steps;
         cfg.log_level = LogLevel::parse(&snap.log_level).unwrap_or(cfg.log_level);
         cfg.trace_file = snap.trace_file;
@@ -647,6 +707,7 @@ impl RaceConfig {
         cfg.freeze_elites = snap.freeze_elites;
         cfg.train_merit = snap.train_merit;
         cfg.train_merit_p_min = snap.train_merit_p_min;
+        cfg.drift_prob = snap.drift_prob;
         cfg.elite_previous_load = snap.elite_previous_load;
         cfg.elite_previous_dir = snap
             .elite_previous_dir
@@ -906,6 +967,26 @@ impl RaceConfigBuilder {
         };
         self
     }
+        /// DRIFT on a crossover child's inherited genes (default `0.0` = exact inheritance).
+        /// ONE probability for the whole family — every slot in [`RaceConfig::drift_prob`],
+        /// mask bits and node genes alike — because it is one idea: crossover can only
+        /// DONATE an allele, so drift is the only way an inherited one ever gets edited.
+        /// Clamped to `0.0..=1.0`; non-finite ⇒ the default.
+        ///
+        /// Size it against what it moves: mask slots are counted per ROW WIDTH (`input_dim`
+        /// per port, `784` on MNIST), node slots against ~`3 × hidden nodes`. `0.05` on a
+        /// 4-feature, 10-node cartpole net is ~2 mask flips and ~1.5 gene edits per child.
+        /// `0.5` is a pool draw wearing a drift label — keep it to a few edits per child.
+        /// Replay-safe by construction (each family draws from its own salted stream derived
+        /// from the run seed, never the shared stream).
+    pub fn set_topology_drift(mut self, p: f32) -> Self {
+        self.cfg.drift_prob = if p.is_finite() {
+            p.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_TOPOLOGY_DRIFT
+        };
+        self
+    }
         /// Per-net smoothed-fitness rolling window (K). Default [`SMOOTHING_WINDOW`] = 10.
         /// Replay-relevant: a resumed run must use the same value or construction fails parity.
     pub fn set_run_smoothing_window(mut self, k: usize) -> Self {
@@ -960,6 +1041,17 @@ impl RaceConfigBuilder {
         /// its `engine.json` recorded — a mismatch is refused by name, not patched.
     pub fn set_crossover_selection(mut self, method: SelectionMethod) -> Self {
         self.cfg.crossover_selection = method;
+        self
+    }
+        /// Make the FITTER of the two drawn parents the crossover BASE
+        /// ([`RaceConfig::crossover_fitter_base`]). The operator mutates one parent into
+        /// the child, so the base donates everything the cut does not swap; without this
+        /// the base is the first roulette draw, measured to be the worse parent in roughly
+        /// half of births. On by default — every crossover orders its two parents
+        /// best-first; pass `false` for the raw draw order. Same parents and same RNG
+        /// consumption, only a different recipient.
+    pub fn set_crossover_fitter_base(mut self, on: bool) -> Self {
+        self.cfg.crossover_fitter_base = on;
         self
     }
         /// Enable the feature split and choose how the Input node's per-port masks
