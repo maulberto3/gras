@@ -70,9 +70,10 @@ pub use trainer::menu::{
 
 // ── data ─────────────────────────────────────────────────────────────
 pub use utils::tabular_data::{
-    DataFormat, Dataset, load_csv_dataset, load_dataset, load_dataset_auto, load_tensor, one_hot,
-    resolve_dataset, resolve_inputs_targets_datasets,
-    resolve_train_test_datasets, save_csv_dataset, save_dataset, save_dataset_as, save_tensor,
+    DataFormat, Dataset, PoolLayout, detect_pool_layout, exam_dir, load_csv_dataset, load_dataset,
+    load_dataset_auto, load_tensor, one_hot, resolve_dataset, resolve_inputs_targets_datasets,
+    resolve_train_test_datasets, resolve_train_val_datasets, save_csv_dataset, save_dataset,
+    save_dataset_as, save_tensor,
 };
 
 // ── scoring helpers ──────────────────────────────────────────────────
@@ -120,7 +121,8 @@ pub mod prelude {
     // Trainer contracts + report types.
     pub use crate::trainer::{
         AnyTrainer, BoxedLossFn, ChallengeDecay, ChallengePolicy, Env, ForcedAction, Loss, LossFn,
-        Reinforce, RlContext, RlStep, RlStepMeta, RlStepReport, RunData, Signal, StepEnv, StepReport,
+        ObsMemory, Reinforce, RlContext, RlStep, RlStepMeta, RlStepReport, RunData, Signal, StepEnv,
+        StepReport,
         StreamShape, TabularContext, TabularStep, TabularStepReport, TabularTrainer, TargetKind,
         challenge_fires, effective_challenge_prob, episode_start_seed, fitness_for, forced_action,
         least_action, metric_for, metrics_for,
