@@ -37,7 +37,7 @@ pub use optimizer::OptimizerKind;
 /// The crate's reference RL scheme — SHIPPED surface, like [`TabularTrainer`]:
 /// `Reinforce::new(world, device)` trains any [`Env`], and `Signal` chooses what
 /// the returns and the fitness are derived from.
-pub use reinforce::{Reinforce, Signal, episode_start_seed};
+pub use reinforce::{Reinforce, ObsMemory, Signal, episode_start_seed};
 pub use flodl::Variable;
 
 /// The loss-function signature, aliased for readability in the trait and

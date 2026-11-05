@@ -119,6 +119,83 @@ impl Signal {
     }
 }
 
+/// What the net is told about the PAST at each turn — the trainer's answer to an RL
+/// policy being memoryless by construction.
+///
+/// `play_episode` feeds ONE row per turn, so without this the net sees a single
+/// observation and the episode's history is invisible to it: the feedback loop closes
+/// in the world, not in the net. A memory channel appends a second copy of the row's
+/// width carrying a summary of what came before, which is enough for velocity-like
+/// state (cartpole's cart/pole speeds) without making the graph recurrent.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ObsMemory {
+    /// No memory: the net sees the current observation alone (the engine as it was).
+    None,
+    /// `[obs, obs − prev_obs]` — the discrete derivative. First turn's half is zero.
+    Delta,
+    /// `[obs, ema]` with `ema_t = β·ema_{t−1} + (1−β)·obs_t`, seeded at the episode's
+    /// first observation — the SMOOTH version of "the previous observation", so one
+    /// noisy turn cannot swing the feature.
+    Ema { beta: f32 },
+}
+
+impl ObsMemory {
+    /// How many observation-widths the net is fed (`1` = no memory, `2` = a channel).
+    ///
+    /// The engine builds nets to `input_dim`, so a run using a channel must ask for
+    /// `obs_dim × width_factor()` — the one place this knob reaches outside the trainer.
+    pub fn width_factor(self) -> usize {
+        match self {
+            ObsMemory::None => 1,
+            ObsMemory::Delta | ObsMemory::Ema { .. } => 2,
+        }
+    }
+}
+
+/// One episode's [`ObsMemory`], seeded at its first observation.
+///
+/// Reset by construction at `env.reset`, so every row is a pure function of the seeded
+/// episode — the replay contract holds with no extra bookkeeping. `None` keeps the
+/// pre-knob behaviour bit-for-bit (the row IS the observation).
+struct MemoryState {
+    memory: ObsMemory,
+    prev: Vec<f32>,
+    ema: Vec<f32>,
+}
+
+impl MemoryState {
+    fn new(memory: ObsMemory, first: &[f32]) -> Self {
+        Self {
+            memory,
+            prev: first.to_vec(),
+            ema: first.to_vec(),
+        }
+    }
+
+    /// The row the net is fed for `obs`, advancing the memory. Called ONCE per turn:
+    /// the update re-forwards the STORED row, so train and update can never disagree
+    /// about what the net saw.
+    fn row(&mut self, obs: &[f32]) -> Vec<f32> {
+        let mut fed = obs.to_vec();
+        match self.memory {
+            ObsMemory::None => {}
+            ObsMemory::Delta => {
+                fed.extend(obs.iter().zip(&self.prev).map(|(o, p)| o - p));
+                self.prev = obs.to_vec();
+            }
+            ObsMemory::Ema { beta } => {
+                // Includes the current observation, so the feature is never stale.
+                for (e, o) in self.ema.iter_mut().zip(obs) {
+                    *e = beta * *e + (1.0 - beta) * o;
+                }
+                fed.extend(&self.ema);
+            }
+        }
+        fed
+    }
+}
+
 /// The crate's reference [`RlStep`]: REINFORCE over an [`Env`]. See the module
 /// docs for the algorithm, the replay contract, and the knob defaults.
 pub struct Reinforce<E: Env> {
@@ -137,6 +214,10 @@ pub struct Reinforce<E: Env> {
     eval_matches_per_step: usize,
     /// What the returns and the fitness are derived from.
     signal: Signal,
+    /// The PAST handed to the net alongside the instant (`None` = the observation
+    /// alone). Trainer-owned: the history exists only inside an episode, so the engine
+    /// never sees it — it only has to size `input_dim` by [`ObsMemory::width_factor`].
+    obs_memory: ObsMemory,
     /// The trainer's own anti-plateau knob — the engine never sees it.
     challenge_prob: f32,
     /// Which action a fired challenge forces.
@@ -167,6 +248,7 @@ impl<E: Env> Reinforce<E> {
             matches_per_step: DEFAULT_MATCHES_PER_STEP,
             eval_matches_per_step: DEFAULT_EVAL_MATCHES_PER_STEP,
             signal: Signal::Turns,
+            obs_memory: ObsMemory::None,
             challenge_prob: DEFAULT_CHALLENGE_PROB,
             challenge_policy: ChallengePolicy::LeastAction,
             challenge_decay: DEFAULT_CHALLENGE_DECAY,
@@ -213,6 +295,23 @@ impl<E: Env> Reinforce<E> {
         self.signal = signal;
         self
     }
+        /// Feed the net a MEMORY of the trajectory as well as the instant
+        /// ([`ObsMemory`]): `[obs, obs − prev]` for a velocity-like derivative, or
+        /// `[obs, ema]` for a smooth past. `None` (default) is the engine as it was.
+        ///
+        /// The fed row DOUBLES, so `set_topology_input_dim` must ask for
+        /// `obs_dim × width_factor()`. `beta` clamps to `0.0 …= 1.0` (a non-finite β
+        /// falls back to `0.9`), because the EMA is part of the replay contract.
+        pub fn with_obs_memory(mut self, memory: ObsMemory) -> Self {
+            self.obs_memory = match memory {
+                ObsMemory::Ema { beta } if beta.is_finite() => ObsMemory::Ema {
+                    beta: beta.clamp(0.0, 1.0),
+                },
+                ObsMemory::Ema { .. } => ObsMemory::Ema { beta: 0.9 },
+                other => other,
+            };
+            self
+        }
 
     /// Set the Adam learning rate (default: the crate's `DEFAULT_LR`).
     pub fn with_learning_rate(mut self, lr: f32) -> Self {
@@ -273,8 +372,14 @@ impl<E: Env> Reinforce<E> {
         let max_turns = self.env.max_turns();
         let mut episode = Episode::default();
         let mut obs = self.env.reset(start_seed)?;
+        // Seeded AT the first observation, so turn 0 has no cold-start spike: its
+        // delta half is 0 and its EMA half is the observation itself.
+        let mut memory = MemoryState::new(self.obs_memory, &obs);
         for _ in 0..max_turns {
-            let row = Tensor::from_f32(&obs, &[1, obs.len() as i64], self.device)?;
+            // The row the net SEES and the row the update re-forwards are the same
+            // one, so a channel cannot drift between play and update.
+            let fed = memory.row(&obs);
+            let row = Tensor::from_f32(&fed, &[1, fed.len() as i64], self.device)?;
             let values = net
                 .forward(&Variable::new(row, false))?
                 .data()
@@ -284,7 +389,7 @@ impl<E: Env> Reinforce<E> {
                 None => greedy_action(&values),
             };
             let (next, reward, done) = self.env.step(action)?;
-            episode.turns.push((obs, action));
+            episode.turns.push((fed, action));
             episode.rewards.push(reward);
             obs = next;
             if done {
@@ -431,6 +536,12 @@ impl<E: Env> RlStep for Reinforce<E> {
             "challenge_policy": self.challenge_policy.to_string(),
             "challenge_decay": self.challenge_decay.to_string(),
         });
+        // Only when set: the memory doubles the fed row, so a run that never used it
+        // keeps the exact blob (and therefore the resume compatibility) it had before.
+        if self.obs_memory != ObsMemory::None {
+            blob["obs_memory"] = serde_json::to_value(self.obs_memory)
+                .unwrap_or(serde_json::Value::Null);
+        }
         // Only when set: an RL run with no schedule keeps the exact blob (and
         // therefore the resume compatibility) it had before schedules existed.
         if let Some(named) = &self.lr_schedule {
@@ -917,6 +1028,50 @@ mod tests {
         assert_eq!(report.train_loss, again.train_loss);
         assert_eq!(report.fitness, again.fitness);
         assert_eq!(report.rl, again.rl);
+    }
+
+    /// The memory channel is a pure function of the observation history: the FIRST turn
+    /// cannot show a spike (delta 0, EMA = the observation), the fed row doubles, and two
+    /// states fed the same observations produce identical rows.
+    #[test]
+    fn obs_memory_rows_are_pure_and_cold_start_free() {
+        let a = vec![1.0f32, 2.0];
+        let b = vec![3.0f32, 4.0];
+
+        let mut none = MemoryState::new(ObsMemory::None, &a);
+        assert_eq!(none.row(&a), a, "no channel: the row IS the observation");
+        assert_eq!(ObsMemory::None.width_factor(), 1);
+
+        let mut delta = MemoryState::new(ObsMemory::Delta, &a);
+        assert_eq!(
+            delta.row(&a),
+            vec![1.0, 2.0, 0.0, 0.0],
+            "turn 0 has no past to subtract"
+        );
+        assert_eq!(
+            delta.row(&b),
+            vec![3.0, 4.0, 2.0, 2.0],
+            "then the discrete derivative"
+        );
+        assert_eq!(ObsMemory::Delta.width_factor(), 2);
+
+        let mut ema = MemoryState::new(ObsMemory::Ema { beta: 0.5 }, &a);
+        assert_eq!(
+            ema.row(&a),
+            vec![1.0, 2.0, 1.0, 2.0],
+            "seeded AT the first observation, so no spike"
+        );
+        assert_eq!(
+            ema.row(&b),
+            vec![3.0, 4.0, 2.0, 3.0],
+            "ema = 0.5·prev + 0.5·obs"
+        );
+        assert_eq!(ObsMemory::Ema { beta: 0.5 }.width_factor(), 2);
+
+        // Replay: the same memory fed the same episode yields the same rows.
+        let mut again = MemoryState::new(ObsMemory::Ema { beta: 0.5 }, &a);
+        assert_eq!(again.row(&a), vec![1.0, 2.0, 1.0, 2.0]);
+        assert_eq!(again.row(&b), vec![3.0, 4.0, 2.0, 3.0]);
     }
 
     /// The signal decides both the objective and the unit the fitness is measured
