@@ -86,6 +86,7 @@ mod durability;
 mod evolution;
 mod ranking;
 mod resume;
+pub(crate) mod roles;
 // Re-exported so `crate::engine::core::RlVolume` and friends keep their paths.
 pub(crate) use evolution::*;
 
@@ -154,6 +155,14 @@ pub struct CoreEngine {
     pub(crate) rolling_fitness: HashMap<String, RollingBuffer>,
     pub(crate) rolling_train: HashMap<String, RollingBuffer>,
     pub(crate) rolling_eval: HashMap<String, RollingBuffer>,
+    /// The ticket probability the coin last COMPARED for each net, captured AT THE DRAW
+    /// (`step_one_net_in_frame`). The lottery summary line averages THESE, so its
+    /// `expected` comes from the same number the coin drew against, not a re-derivation
+    /// from merits that have moved on since.
+    ///
+    /// Reporting state only, never replay state: it describes the last clock, so it is
+    /// not persisted and a resume simply refills it on its first graded clock.
+    pub(crate) last_ticket_p: HashMap<String, f32>,
     /// Wall-clock start for the wall-clock stop criterion.
     pub(crate) started_at_wall: std::time::Instant,
     /// Wall-clock seconds accumulated by EARLIER sessions (stop → resume cycles):
@@ -239,6 +248,7 @@ impl CoreEngine {
             rolling_fitness: HashMap::new(),
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
+            last_ticket_p: HashMap::new(),
             started_at_wall: std::time::Instant::now(),
             elapsed_base_secs: 0,
             step_started_at_wall: std::time::Instant::now(),
@@ -318,29 +328,15 @@ impl CoreEngine {
             .into());
         }
         // Catch-up toggles are RL-effective only — Tabular always catches up (one shared
-        // stream). Data layout: `{train, test}` dirs are explicit, anything else is one pool.
-        let (dataset, explicit_test_rows) = match &tabular_data_dir {
-            Some(data_dir) => {
-                let train_dir = data_dir.join("train");
-                let test_dir = data_dir.join("test");
-                if train_dir.exists() && test_dir.exists() {
-                    let (train, test) =
-                        crate::utils::tabular_data::resolve_train_test_datasets(data_dir)?;
-                    let test_len = test.len();
-                    let combined = train.concat(&test)?.to_device(config.device())?;
-                    (Some(combined), Some(test_len))
-                } else {
-                    (
-                        Some(
-                            crate::utils::tabular_data::resolve_dataset(data_dir)?
-                                .to_device(config.device())?,
-                        ),
-                        None,
-                    )
-                }
-            }
-            None => (None, None),
+        // stream). Data ROLES come from the subdirectories, through ONE resolver shared
+        // with resume (`core/roles.rs`): `val/` ranks, `test/` reports, a lone pool splits.
+        let mut roles = match &tabular_data_dir {
+            Some(data_dir) => Some(roles::resolve(data_dir, config.device())?),
+            None => None,
         };
+        let explicit_test_rows = roles.as_ref().and_then(|r| r.explicit_test_rows);
+        let eval_split = roles.as_ref().and_then(|r| r.eval_split.clone());
+        let dataset = roles.as_mut().and_then(|r| r.dataset.take());
         // Random seed when omitted: time ^ fastrand (recorded in engine.json).
         let run_seed = seed.unwrap_or_else(|| {
             let t = std::time::SystemTime::now()
@@ -419,23 +415,11 @@ impl CoreEngine {
             None => (None, None),
         };
 
-            // The EXAM: a sibling `exam/` store, resolved separately and NEVER
-            // concatenated into `dataset` (see `CoreEngine::exam`). Its row count rides the
-            // header so a resume can prove the same exam is still on disk.
-        let exam = match &tabular_data_dir {
-            Some(data_dir) => {
-                let exam_dir = data_dir.join("exam");
-                if exam_dir.exists() {
-                    Some(
-                        crate::utils::tabular_data::resolve_inputs_targets_datasets(&exam_dir)?
-                            .to_device(config.device())?,
-                    )
-                } else {
-                    None
-                }
-            }
-            None => None,
-        };
+            // The EXAM: resolved by `roles` (a sibling `exam/`, or `test/` beside a
+            // ranking `val/`) and NEVER concatenated into `dataset` (see
+            // `CoreEngine::exam`). Its row count rides the header so a resume can prove
+            // the same exam is still on disk.
+        let exam = roles.as_mut().and_then(|r| r.exam.take());
 
         let (header_input_dim, header_output_dim) = match &dataset {
             Some(d) => (d.inputs.shape()[1] as usize, d.targets.shape()[1] as usize),
@@ -476,6 +460,7 @@ impl CoreEngine {
                 // value a resume reads back to rebuild the same two pools.
                 train_eval_split_ratio: Some(train_eval_split_ratio),
                 explicit_test_rows,
+                eval_split,
                 exam_rows: exam.as_ref().map(|d| d.len()),
                 culls: 0,
                 run_elapsed_secs: 0,
@@ -660,6 +645,7 @@ impl CoreEngine {
             rolling_fitness: HashMap::new(),
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
+            last_ticket_p: HashMap::new(),
             started_at_wall: std::time::Instant::now(),
             elapsed_base_secs: 0,
             step_started_at_wall: std::time::Instant::now(),
@@ -949,6 +935,17 @@ impl CoreEngine {
                     "feature_split_pool".to_string(),
                     self.config.feature_split_pool_names().join(", "),
                 ),
+                    // The one knob that edits an INHERITED gene after crossover: masks,
+                    // node ops, port activations and dropout. `0` = exact inheritance, so
+                    // the manifest says so instead of printing a bare number.
+                (
+                    "topology drift".to_string(),
+                    if self.config.drift_prob > 0.0 {
+                        fmt_cfg(self.config.drift_prob)
+                    } else {
+                        "0 (exact inheritance)".to_string()
+                    },
+                ),
                 (
                     "fitness".to_string(),
                     format!("{} ({})", self.meta_ctx.fitness_label, self.meta_ctx.direction),
@@ -1048,6 +1045,9 @@ impl CoreEngine {
             ]);
             crate::utils::cfy::emit(&crate::utils::cfy::card("Legend", &legend, None));
 
+                // The genotype's structural bounds: without these the card names the
+                // pools but hides how big a net may get, which is half the search space.
+            let topo = self.config.topology_options;
             let search = crate::utils::cfy::kv(&[
                 ("crossover_ops".to_string(), ops),
                 ("activations".to_string(), acts),
@@ -1064,6 +1064,27 @@ impl CoreEngine {
                         ),
                         None => "default 4..=8".to_string(),
                     },
+                ),
+                (
+                    "hidden_nodes".to_string(),
+                    format!(
+                        "{}..={}",
+                        topo.min_hidden_num_nodes, topo.max_hidden_num_nodes
+                    ),
+                ),
+                (
+                    "hidden_inputs".to_string(),
+                    format!(
+                        "{}..={}",
+                        topo.min_hidden_inputs_per_node, topo.max_hidden_inputs_per_node
+                    ),
+                ),
+                (
+                    "hidden_outputs".to_string(),
+                    format!(
+                        "{}..={}",
+                        topo.min_hidden_outputs_per_node, topo.max_hidden_outputs_per_node
+                    ),
                 ),
             ]);
             crate::utils::cfy::emit(&crate::utils::cfy::card("Search space", &search, None));

@@ -523,6 +523,9 @@ impl CoreEngine {
         lottery_skips: usize,
     ) -> StepVitals {
         let live = self.state.live_count();
+            // The crown's seats take the act-only path, so they are outside `would_train`
+            // and the `trained` identity below stays true. `frozen` is the count the
+            // rollup prints.
         let frozen = group
             .iter()
             .filter(|h| self.frozen_crown.contains(*h))

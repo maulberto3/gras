@@ -79,6 +79,18 @@ impl CoreEngine {
                 fmt_cfg(recorded.train_merit_p_min)
             ),
         );
+        // Crossover's base choice decides WHICH child a roll yields (same draw, different
+        // recipient), so adopting the header's value silently would change every birth
+        // from here on — named, like the other operator policies.
+        push(
+            "crossover_fitter_base",
+            recorded.crossover_fitter_base.to_string(),
+            current.crossover_fitter_base.to_string(),
+            format!(
+                "set_crossover_fitter_base({})",
+                recorded.crossover_fitter_base
+            ),
+        );
         // Pool drift changes which masks the NEXT newborn gets (the nets already live
         // keep theirs), so it is a behavioural warning like Ω. A pre-pool header has an
         // empty list, which means its single recorded policy — `from_snapshot` already
@@ -91,6 +103,14 @@ impl CoreEngine {
         } else {
             recorded.feature_split_pool.clone()
         };
+        // Drift changes the rows the NEXT crossover child inherits (the nets already
+        // live keep theirs), so it is a behavioural warning like the pool above.
+        push(
+            "drift_prob",
+            fmt_cfg(recorded.drift_prob),
+            fmt_cfg(current.drift_prob),
+            format!("set_topology_drift({})", fmt_cfg(recorded.drift_prob)),
+        );
         push(
             "feature_split_pool",
             rec_pool.join(","),

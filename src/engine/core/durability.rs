@@ -276,6 +276,8 @@ impl CoreEngine {
                 // an 80/20 split the other way round.
             train_eval_split_ratio: Some(self.config.eval_share),
             explicit_test_rows: self.explicit_test_rows,
+            // Which subdirectory ranked — a fact from birth, restated on every rewrite.
+            eval_split: self.header.eval_split.clone(),
                 // The exam store's row count is a fact about the FILE on disk, not a
                 // config knob: re-stamped from what this engine holds (or the header it
                 // was resumed with) so a rewrite can never silently drop it.

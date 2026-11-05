@@ -1755,6 +1755,57 @@ let _ = std::fs::remove_dir_all(&dir);
 }
 }
 
+/// `set_crossover_fitter_base(true)` makes the BETTER drawn parent the BASE the operator
+/// mutates — i.e. the child's skeleton. `ranked` is best-first, so the lineage's first
+/// parent must never be the worse-ranked of the two. With the knob off that is a coin
+/// flip, which is exactly what the attempts probe measured (worse base ~50% of births).
+#[test]
+fn fitter_base_puts_the_better_parent_first() {
+    for seed in [3u64, 17, 55, 123] {
+        let dir = std::env::temp_dir().join(format!("race_fitter_base_{seed}"));
+        let mut eng = engine(&dir, seed).unwrap();
+        eng.seed_population_internal(
+            vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+            Some(0.5),
+        )
+        .unwrap();
+        eng.config.crossover_prob = 1.0;
+        eng.config.crossover_fitter_base = true;
+        // Minimize fixture: net 0 is the overwhelming favorite (0.01), net 2 the worst.
+        let hs = eng.state.live_hashes();
+        for (i, h) in hs.iter().enumerate() {
+            let v = 0.01 + i as f32 * 10.0;
+            eng.rolling_fitness.get_mut(h).unwrap().push(v);
+        }
+        let mut checked = 0usize;
+        for clock in 0..12 {
+            let Some(child) = eng.generate_child(clock, 0).unwrap() else {
+                continue;
+            };
+            let lineage = child.state.created_from.clone().unwrap_or_default();
+            let Some((_, parents)) = lineage.split_once("parents=") else {
+                continue;
+            };
+            let pair: Vec<&str> = parents.split(',').collect();
+            assert_eq!(pair.len(), 2, "seed {seed} clock {clock}: {lineage}");
+            let (Some(base), Some(donor)) = (
+                eng.smoothed_fitness_of(pair[0]),
+                eng.smoothed_fitness_of(pair[1]),
+            ) else {
+                continue;
+            };
+            // Minimize: the SMALLER score is the better net, so the base must not exceed it.
+            assert!(
+                base <= donor,
+                "seed {seed} clock {clock}: base scored {base}, donor {donor} ({lineage})"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "seed {seed}: no measurable crossover birth");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// REGRESSION: a crossover child INHERITS its parents' feature split. `cx_*`
 /// re-finalizes both parents, which drops port-count-bound masks — so the engine
 /// snapshots them before the mix and reinstalls the blend afterwards. With the
@@ -1820,9 +1871,16 @@ let child_rows = child
 .input_feature_masks()
 .expect("the child keeps the inherited split");
 assert_eq!(child_rows.len(), a.len(), "one row per input port");
+// The mask blend is BIT-level (2026-11-02): one cut across the flattened genome, so a
+// cut can land INSIDE a port's row — the row-level prefix/suffix test this replaces
+// could only see cuts between ports.
+let flatten = |rows: &Vec<Vec<u8>>| -> Vec<u8> { rows.iter().flatten().copied().collect() };
+let child_flat = flatten(&child_rows);
+let a_flat = flatten(a);
+let b_flat = flatten(b);
 assert!(
-(1..child_rows.len()).any(|p| child_rows[..p] == a[..p] && child_rows[p..] == b[p..]),
-"clock {clock}: {child_rows:?} is not A's prefix + B's suffix of {a:?} / {b:?}"
+(1..child_flat.len()).any(|k| child_flat[..k] == a_flat[..k] && child_flat[k..] == b_flat[k..]),
+"clock {clock}: {child_flat:?} is not A's prefix + B's suffix of {a_flat:?} / {b_flat:?}"
 );
 checked += 1;
 }
@@ -3138,13 +3196,13 @@ assert!((eff(&eng, 1) - 0.5).abs() < 1e-6);
 let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The denominator is UPDATES (`D`), not clocks lived and not clocks measured:
-/// two nets with the SAME score divide by the weight updates they applied, so
-/// the net that spent 10 updates grades better than the one that spent 1. This
-/// is also what keeps an idle clock free — it is not an update, so the ratio can
-/// never decay while the numerator stands still.
+/// The lottery's merit is the SCORE ITSELF: two nets with the same reading grade
+/// the same no matter how different their update counts or ages are, and a crown
+/// act pass cannot move either. (The retired divisor was `D`, which let one lucky
+/// early reading buy tickets forever and pushed a net that kept improving out of
+/// the field with its own denominator.)
 #[test]
-fn lottery_merit_divides_by_updates_not_clocks_lived() {
+fn lottery_merit_is_the_score_itself_not_a_rate() {
 let dir = std::env::temp_dir().join("gras-lottery-tickets");
 let _ = std::fs::remove_dir_all(&dir);
 let mut eng = engine(&dir, 21).unwrap();
@@ -3165,33 +3223,40 @@ eng.state.net_mut(&hashes[0]).unwrap().step = 1;
 eng.state.net_mut(&hashes[1]).unwrap().entered_at_step = 3;
 eng.state.net_mut(&hashes[1]).unwrap().step = 10;
 
-// Same reading, different budget: 100/1 vs 100/10. Age plays no part.
-assert_eq!(eng.merit_per_update(&hashes[0]), Some(100.0));
-assert_eq!(eng.merit_per_update(&hashes[1]), Some(10.0));
+// Same reading, different budget and age: the merit is 100 for both.
+assert_eq!(eng.merit(&hashes[0]), Some(100.0));
+assert_eq!(eng.merit(&hashes[1]), Some(100.0));
 
-// Crown act passes are NOT learning cost: 7 of them on the net that spent one
-// update leave its merit at 100/1 — the pre-2026-11-01 divisor (`D + O`) would
-// have read 100/8 and dropped it to the bottom of the field for having won.
+// Crown act passes are not learning cost either: 7 of them change no merit.
 for clock in 10..17 {
     eng.state.net_mut(&hashes[0]).unwrap().record_frozen_step(clock);
 }
 assert_eq!(eng.state.net(&hashes[0]).unwrap().measured_clocks(), 8);
-assert_eq!(eng.merit_per_update(&hashes[0]), Some(100.0));
+assert_eq!(eng.merit(&hashes[0]), Some(100.0));
 
+// Identical readings are a FLAT field, so the lottery abstains rather than
+// picking a winner out of a tie: both nets keep their ticket.
 let frame = eng.lottery_frame(5).expect("armed at clock 5");
-// Minimize: the LOWEST merit is best, so the net that spent 10 updates takes
-// p = 1.0 and the one that spent 1 takes p = 0.0 — the clock-lived divisor
-// inverted this, which is why it went.
-assert!((eng.train_lottery_p(&hashes[0], 5, Some(frame)) - 0.0).abs() < 1e-6);
+assert!((eng.train_lottery_p(&hashes[0], 5, Some(frame)) - 1.0).abs() < 1e-6);
 assert!((eng.train_lottery_p(&hashes[1], 5, Some(frame)) - 1.0).abs() < 1e-6);
+
+// One reading down and the field separates on the SCORE alone — the update
+// counts (1 vs 10) play no part.
+let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+buf.push(50.0);
+*eng.rolling_fitness.get_mut(&hashes[1]).unwrap() = buf;
+let frame = eng.lottery_frame(5).expect("armed at clock 5");
+// Minimize: 50 is the better level, so it earns the ticket.
+assert!((eng.train_lottery_p(&hashes[1], 5, Some(frame)) - 1.0).abs() < 1e-6);
+assert!((eng.train_lottery_p(&hashes[0], 5, Some(frame)) - 0.0).abs() < 1e-6);
 
 let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An idle clock moves NOTHING the lottery grades: with the ticket divisor the
-/// reading and the denominator both stand still, so `smt/tkt` is bit-identical
-/// and only the idle ledger grows. (The clock-lived divisor this replaced made
-/// the ratio decay for idling — a penalty for a decision the net did not make.)
+/// An idle clock moves NOTHING the lottery grades: the merit is the reading, the
+/// reading stands still, so the number is bit-identical and only the idle ledger
+/// grows. (Every divisor this replaced made idling cost the net its grade — a
+/// penalty for a decision the net did not make.)
 #[test]
 fn an_idle_clock_leaves_the_merit_bit_identical() {
 let dir = std::env::temp_dir().join("gras-lottery-idle-invariant");
@@ -3209,14 +3274,14 @@ buf.push(100.0);
 *eng.rolling_fitness.get_mut(h).unwrap() = buf;
 eng.state.net_mut(h).unwrap().step = 5;
 }
-let before = eng.merit_per_update(&hashes[1]).expect("graded");
-assert_eq!(before, 20.0, "5 updates spent, 100 scored");
+let before = eng.merit(&hashes[1]).expect("graded");
+assert_eq!(before, 100.0, "the score itself, not the score per update");
 
 // One clock later: hashes[0] trained, hashes[1] idled. Readings unchanged.
 eng.state.net_mut(&hashes[0]).unwrap().step += 1;
 eng.idle_step(&hashes[1], 6).unwrap();
 assert_eq!(
-eng.merit_per_update(&hashes[1]),
+eng.merit(&hashes[1]),
 Some(before),
 "an idle clock changes neither the score nor the update count"
 );
@@ -3225,10 +3290,11 @@ assert_eq!(idled.step, 5, "no weight update");
 assert!(idled.last_metrics.is_none(), "no metric row");
 assert_eq!(idled.idle_clocks(), 1);
 assert_eq!(idled.idle_spans, vec![(6, 6)]);
-// The trained peer's denominator grew, so the field CAN separate them — that
-// is the budget rotating, not the idle net climbing.
-let peer = eng.merit_per_update(&hashes[0]).expect("graded");
-assert!((peer - 100.0 / 6.0).abs() < 1e-5, "6 updates spent: {peer}");
+// The trained peer's update count grew and its SCORE did not move (this fixture
+// rewrites no buffer), so the two grade the same: a clock spent on weights is
+// not itself progress under a score-ranked lottery.
+let peer = eng.merit(&hashes[0]).expect("graded");
+assert_eq!(peer, 100.0, "6 updates spent, same reading");
 
 let _ = std::fs::remove_dir_all(&dir);
 }
@@ -4915,6 +4981,71 @@ Some(0.5),
 "a rewritten header keeps the eval share"
 );
 let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `train/` + `val/` + `test/` dir is the classic three-way split: `train/` learns,
+/// `val/` is the pool the race RANKS on (so it sits inside the run tensor, at its END),
+/// and `test/` is the EXAM — the row set no clock can reach, reported once at stop.
+/// Roles come from the subdirectories, and `engine.json` records which one ranked.
+#[test]
+fn a_train_val_test_layout_ranks_on_val_and_reports_on_test() {
+    let dir = std::env::temp_dir().join(format!(
+        "gras-test-val-roles-{}-{}",
+        std::process::id(),
+        fastrand::u64(..)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let data_dir = dir.join("data");
+    for (name, rows, seed) in [("train", 48, 1u64), ("val", 12, 2), ("test", 8, 3)] {
+        let ds = synthetic_classification(rows, 4, 3, seed, Device::CPU).unwrap();
+        crate::utils::tabular_data::save_dataset(data_dir.join(name), &ds).unwrap();
+    }
+    let config = RaceConfig {
+        pop_size: 0,
+        max_steps: Some(1),
+        ..RaceConfig::defaults()
+    };
+    let engine = crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+        data_dir.clone(),
+        config,
+        fitness(),
+        crate::trainer::TabularTrainer::new(loss_fn()),
+        Some(13),
+        Some(dir.join("run")),
+    ))
+    .unwrap();
+    // The tensor is train + val (never test), and the recorded split says WHERE it ends.
+    assert_eq!(engine.dataset.as_ref().unwrap().len(), 60);
+    assert_eq!(engine.explicit_test_rows, Some(12));
+    assert_eq!(
+        engine.header.eval_split.as_deref(),
+        Some("val"),
+        "engine.json names the pool that ranked"
+    );
+    let (train_pool, eval_pool) = engine.stream.as_ref().unwrap().pools();
+    assert_eq!((train_pool.len(), eval_pool.len()), (48, 12));
+    // `test/` is the exam: its own field, its own size, no stream index.
+    assert_eq!(engine.exam.as_ref().unwrap().len(), 8);
+    assert_eq!(engine.header.exam_rows, Some(8));
+}
+
+/// A role dir nothing can train on is refused by NAME at construction: `val/` ranks,
+/// it never learns, so a dir holding only `val/` would rank on rows no net ever saw.
+#[test]
+fn a_val_dir_without_train_is_refused_by_name() {
+    let dir = std::env::temp_dir().join(format!(
+        "gras-test-val-alone-{}-{}",
+        std::process::id(),
+        fastrand::u64(..)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let data_dir = dir.join("data");
+    let ds = synthetic_classification(12, 4, 3, 5, Device::CPU).unwrap();
+    crate::utils::tabular_data::save_dataset(data_dir.join("val"), &ds).unwrap();
+    let err = crate::utils::tabular_data::detect_pool_layout(&data_dir)
+        .expect_err("val/ alone has no learning pool");
+    let text = err.to_string();
+    assert!(text.contains("`val/` but no `train/`"), "{text}");
 }
 
 /// The EXAM is a separate store, not a third index range: `exam/` rows never enter the
