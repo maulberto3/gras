@@ -346,46 +346,131 @@ pub fn resolve_inputs_targets_datasets(dir: impl AsRef<Path>) -> Result<Dataset>
 /// Resolve a **two-split** dataset dir (`train/` + `test/`), each with
 /// `inputs.csv|bin` + `targets.csv|bin`; returns two independent datasets.
 pub fn resolve_train_test_datasets(dir: impl AsRef<Path>) -> Result<(Dataset, Dataset)> {
-    let dir = dir.as_ref();
-    let train_dir = dir.join("train");
-    let test_dir = dir.join("test");
-    for sub in [&train_dir, &test_dir] {
+    resolve_two_splits(dir.as_ref(), "train", "test")
+}
+
+/// Resolve a **`train/` + `val/`** dir: `train/` learns, `val/` is the pool the race
+/// RANKS on. The third role comes free — a sibling `test/` beside `val/` becomes the
+/// untouched report (see [`exam_dir`]), because once `val/` ranks there are no unread
+/// rows left in `test/` that selection has seen.
+pub fn resolve_train_val_datasets(dir: impl AsRef<Path>) -> Result<(Dataset, Dataset)> {
+    resolve_two_splits(dir.as_ref(), "train", "val")
+}
+
+/// The shared two-role resolver: `learn/` and `rank/`, dims checked to agree.
+fn resolve_two_splits(dir: &Path, learn: &str, rank: &str) -> Result<(Dataset, Dataset)> {
+    let learn_dir = dir.join(learn);
+    let rank_dir = dir.join(rank);
+    for sub in [&learn_dir, &rank_dir] {
         if !sub.exists() {
+            let name = sub.file_name().and_then(|s| s.to_str()).unwrap_or("?");
             return Err(DataError::Io {
                 path: sub.display().to_string(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!(
-                        "missing '{}/' split in {} — resolve_train_test_datasets expects {}/train/ and {}/test/ each with inputs.csv|bin + targets.csv|bin",
-                        sub.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
-                        dir.display(),
-                        dir.display(),
-                        dir.display()
+                        "missing '{name}/' split in {dir} — a two-role layout needs {dir}/{learn}/ and {dir}/{rank}/ each with inputs.csv|bin + targets.csv|bin",
+                        dir = dir.display(),
                     ),
                 ),
             }
             .into());
         }
     }
-    let train = resolve_inputs_targets_datasets(&train_dir)?;
-    let test = resolve_inputs_targets_datasets(&test_dir)?;
-    // Feature/target dims must agree across splits — a train/test dim
-    // mismatch would only surface later as a cryptic shape error mid-step.
-    let (ti, tt) = (train.inputs.shape()[1], test.inputs.shape()[1]);
-    if ti != tt {
+    let learn_ds = resolve_inputs_targets_datasets(&learn_dir)?;
+    let rank_ds = resolve_inputs_targets_datasets(&rank_dir)?;
+    // Feature/target dims must agree across splits — a dim mismatch would only
+    // surface later as a cryptic shape error mid-step.
+    let (li, ri) = (learn_ds.inputs.shape()[1], rank_ds.inputs.shape()[1]);
+    if li != ri {
         return Err(DataError::Csv(format!(
-            "feature dim mismatch: train inputs have {ti} columns, test inputs have {tt}"
+            "feature dim mismatch: {learn}/ inputs have {li} columns, {rank}/ inputs have {ri}"
         ))
         .into());
     }
-    let (ti, tt) = (train.targets.shape()[1], test.targets.shape()[1]);
-    if ti != tt {
+    let (lt, rt) = (learn_ds.targets.shape()[1], rank_ds.targets.shape()[1]);
+    if lt != rt {
         return Err(DataError::Csv(format!(
-            "target dim mismatch: train targets have {ti} columns, test targets have {tt}"
+            "target dim mismatch: {learn}/ targets have {lt} columns, {rank}/ targets have {rt}"
         ))
         .into());
     }
-    Ok((train, test))
+    Ok((learn_ds, rank_ds))
+}
+
+/// Which roles a dataset dir supplies, decided by its SUBDIRECTORIES and nothing else
+/// (no config flag, no setter): the layout on disk is the contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolLayout {
+    /// One pool (`inputs.csv|bin` + `targets.csv|bin`): the engine splits it by
+    /// `eval_share`, so there is no held-out number beyond that split.
+    Single,
+    /// `train/` + `val/` — train learns, **val ranks**, and a sibling `test/` is the
+    /// report-only exam.
+    TrainVal,
+    /// `train/` + `test/` — the pre-2026-11-02 layout: `test/` is the pool the race
+    /// ranks on, and only a separate `exam/` is untouched.
+    TrainTest,
+}
+
+impl PoolLayout {
+    /// The subdirectory whose rows the race ranks on; `None` = a seeded slice of one
+    /// pool. This is what `engine.json → eval_split` records.
+    pub fn eval_dir(self) -> Option<&'static str> {
+        match self {
+            Self::TrainVal => Some("val"),
+            Self::TrainTest => Some("test"),
+            Self::Single => None,
+        }
+    }
+}
+
+/// Read the layout off the directory. Refusals are by NAME: a `val/` with nothing to
+/// learn from, or three role dirs where one of them would be read by nobody.
+pub fn detect_pool_layout(dir: impl AsRef<Path>) -> Result<PoolLayout> {
+    let dir = dir.as_ref();
+    let has = |name: &str| dir.join(name).exists();
+    let (train, val, test, exam) = (has("train"), has("val"), has("test"), has("exam"));
+    match (train, val, test) {
+        (true, true, true) if exam => Err(DataError::Csv(format!(
+            "{dir} holds `val/`, `test/` AND `exam/`: with `val/` ranking, `test/` would already be the \
+             report-only exam, so the second exam store could never be read. Keep `train/` + `val/` + \
+             `test/` (test is the exam) or `train/` + `val/` + `exam/`, not all four",
+            dir = dir.display()
+        ))
+        .into()),
+        (true, true, _) => Ok(PoolLayout::TrainVal),
+        (true, false, true) => Ok(PoolLayout::TrainTest),
+        (false, true, _) => Err(DataError::Csv(format!(
+            "{dir} has `val/` but no `train/` — the val pool RANKS, it never trains, so there is \
+             nothing to learn from",
+            dir = dir.display()
+        ))
+        .into()),
+        (false, false, true) => Err(DataError::Csv(format!(
+            "{dir} has `test/` but no `train/` — add `train/`, or make this dir the pool itself \
+             (inputs.csv|bin + targets.csv|bin)",
+            dir = dir.display()
+        ))
+        .into()),
+        _ => Ok(PoolLayout::Single),
+    }
+}
+
+/// Where the EXAM rows live for a layout, or `None` when nothing is held out.
+///
+/// One rule for birth and resume: a sibling `exam/` wins, and a `test/` beside a
+/// ranking `val/` is the exam (it is the row set selection never sees). Under
+/// [`PoolLayout::TrainTest`] `test/` is the ranking pool, so it is NOT the exam.
+pub fn exam_dir(dir: &Path, layout: PoolLayout) -> Option<std::path::PathBuf> {
+    let exam = dir.join("exam");
+    if exam.exists() {
+        return Some(exam);
+    }
+    match layout {
+        PoolLayout::TrainVal if dir.join("test").exists() => Some(dir.join("test")),
+        _ => None,
+    }
 }
 
 /// Load a dataset from CSV files (`inputs.csv` + `targets.csv`): one sample per

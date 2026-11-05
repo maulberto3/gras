@@ -10,7 +10,7 @@ pub(crate) fn split_policy_name(policy: Option<FeatureSplitPolicy>) -> &'static 
     match policy {
         Some(FeatureSplitPolicy::Exclusive) => "exclusive",
         Some(FeatureSplitPolicy::Random) => "random",
-        Some(FeatureSplitPolicy::Inherited) => "inherited",
+        Some(FeatureSplitPolicy::Inherited) => "crossover",
         None => "rows",
     }
 }

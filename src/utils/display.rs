@@ -199,5 +199,9 @@ impl Display for MutationMethod {
 variant_names!(FeatureSplitPolicy {
     FeatureSplitPolicy::Exclusive => "split_exclusive",
     FeatureSplitPolicy::Random => "split_random",
-    FeatureSplitPolicy::Inherited => "split_inherited",
+    // The enum is `Inherited` because that is the PROVENANCE kind (rows from a parent,
+    // not a fresh draw); every reader calls it `crossover`, which is the operator that
+    // produces mixed rows. A clone keeps its parent's own label, so nothing else can
+    // reach this arm.
+    FeatureSplitPolicy::Inherited => "split_crossover",
 });
