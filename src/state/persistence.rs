@@ -119,6 +119,21 @@ pub struct ConfigSnapshot {
         /// resume compares it by name.
     #[serde(default)]
     pub train_merit_p_min: f32,
+        /// Fitter parent as the crossover base (`set_crossover_fitter_base`): `true` (the
+        /// default) orders both drawn parents best-first, so the child keeps the BETTER
+        /// one's skeleton. `false` is the original "first roulette draw is the base". It
+        /// changes which child a roll yields, so a resume compares it by name.
+    #[serde(default)]
+    pub crossover_fitter_base: bool,
+        /// Drift on a crossover child's INHERITED genes (`set_topology_drift`): each mask
+        /// bit flips, and each hidden activation / combine / standardize is re-drawn
+        /// (dropout in `0.0..=cap`), with this probability per slot. `0.0` (what every
+        /// pre-knob header means) is exact inheritance, so a legacy dir resumes unchanged;
+        /// a different value changes the next children's genes, so a resume compares it by
+        /// name like Ω. `feature_mask_flip_prob` is the pre-merge spelling, read as an
+        /// alias, so a dir written before the two knobs became one still resumes at it.
+    #[serde(default, alias = "feature_mask_flip_prob")]
+    pub drift_prob: f32,
         /// LEGACY, read-only: before Ω this knob was the bool `evolution_train_lottery`
         /// (`true` = the run trained under the full lottery, i.e. Ω = 1.0). Normalized
         /// into `train_merit` on load by [`ConfigSnapshot::normalize_legacy`] and never
@@ -228,6 +243,7 @@ impl ConfigSnapshot {
             freeze_elites: cfg.freeze_elites,
             train_merit: cfg.train_merit,
             train_merit_p_min: cfg.train_merit_p_min,
+            crossover_fitter_base: cfg.crossover_fitter_base,
             legacy_train_lottery: None,
             elite_previous_load: cfg.elite_previous_load,
             elite_previous_dir: cfg
@@ -242,6 +258,7 @@ impl ConfigSnapshot {
             elite_crown_lifetime_steps: cfg.elite_crown_lifetime_steps,
             feature_split: split_single,
             feature_split_pool: split_pool,
+            drift_prob: cfg.drift_prob,
             build: crate::engine::format::build_stamp(),
         }
     }
@@ -351,10 +368,17 @@ pub struct RunHeader {
     /// Children born per step clock at the last stop (same-clock siblings get
     /// distinct child seeds). Restored on resume; empty on legacy files.
     #[serde(default)]
-    pub children_born_at_clock: std::collections::HashMap<usize, usize>,    /// Data layout: `None` = single-pool seeded split; `Some(n)` = explicit `{train,test}`
-    /// with `n` test rows after the train rows. Recorded so resume rebuilds the pools.
+    pub children_born_at_clock: std::collections::HashMap<usize, usize>,    /// Data layout: `None` = single-pool seeded split; `Some(n)` = explicit two-role
+    /// layout with `n` RANKING-pool rows after the train rows. Recorded so resume
+    /// rebuilds the pools.
     #[serde(default)]
     pub explicit_test_rows: Option<usize>,
+    /// Which subdirectory the run RANKED on: `"val"` (train/val/test), `"test"`
+    /// (train/test) or `None` (one pool, split by `eval_share`). Recorded because the
+    /// concat at resume must pick the same pool — `train/`+`val/` and `train/`+`test/`
+    /// can hold the same row count and still be different rows.
+    #[serde(default)]
+    pub eval_split: Option<String>,
         /// EXAM rows: the one dataset the race never reads. A separate `exam/` store, NOT
         /// concatenated into the run tensor (so no stream, metric or callback can reach
         /// it), scored ONCE at stop for the reported nets only and written as `exam.json`.
@@ -474,6 +498,8 @@ pub struct RunConfig {
     pub train_eval_split_ratio: Option<f32>,
     /// See [`RunHeader::explicit_test_rows`].
     pub explicit_test_rows: Option<usize>,
+    /// See [`RunHeader::eval_split`].
+    pub eval_split: Option<String>,
     /// See [`RunHeader::exam_rows`].
     pub exam_rows: Option<usize>,
     /// Cumulative culls at the last stop.
@@ -510,6 +536,7 @@ impl RunHeader {
             max_steps,
             train_eval_split_ratio,
             explicit_test_rows,
+            eval_split,
             exam_rows,
             culls,
             run_elapsed_secs,
@@ -543,6 +570,7 @@ impl RunHeader {
             // constructor has no view of the cadence, the engine does.
             eval_era_every: None,
             explicit_test_rows,
+            eval_split,
             exam_rows,
             culls,
             run_elapsed_secs,
@@ -641,6 +669,12 @@ impl RunHeader {
             .get("train_eval_split_ratio")
             .and_then(|f| f.as_f64())
             .map(|n| n as f32);
+            // Absent on every header written before the VAL role existed: those runs
+            // can only have ranked on `test/`, and the resume guard reads that.
+        let eval_split = v
+            .get("eval_split")
+            .and_then(|f| f.as_str())
+            .map(|s| s.to_string());
         let explicit_test_rows = v
             .get("explicit_test_rows")
             .and_then(|f| f.as_u64())
@@ -726,6 +760,7 @@ impl RunHeader {
                 .and_then(|f| f.as_u64())
                 .map(|n| n as usize),
             explicit_test_rows,
+            eval_split,
             exam_rows,
             culls,
             run_elapsed_secs,
@@ -1680,6 +1715,7 @@ mod tests {
         RunHeader::from_race_options(RunConfig {
             data_dir: None,
             explicit_test_rows: None,
+            eval_split: None,
             exam_rows: None,
             run_id: run_id.to_string(),
             engine_mode: Some("tabular".into()),
