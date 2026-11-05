@@ -129,6 +129,8 @@ pub enum FeatureSplitPolicy {
     /// crossover path so the LABEL always matches the rows it is describing (a child
     /// used to keep parent A's `None` while carrying parent B's rows). Never drawable:
     /// it is not a pool entry, and [`Topology::assign_feature_masks`] refuses it.
+    /// Every user-facing label prints this as **`crossover`**: the enum names the
+    /// PROVENANCE kind, the label names the operator that produced the rows.
     Inherited,
 }
 
@@ -138,6 +140,26 @@ impl FeatureSplitPolicy {
     pub fn is_drawable(self) -> bool {
         !matches!(self, FeatureSplitPolicy::Inherited)
     }
+}
+
+/// Whether `rows` PARTITION the input: every feature belongs to exactly one port.
+///
+/// This is the one claim a split makes that can be checked against its own rows, and it
+/// is what `Exclusive` means — the doc block even promises "nothing is dropped and
+/// nothing is duplicated". So a row set that fails this CANNOT be labelled `Exclusive`:
+/// a cover-all port hands a feature to a second port (duplicated), and a feature no port
+/// keeps is dropped. Both arrive from padding — a port a rebuild added, or a port the
+/// donor rows did not cover — never from the draw itself.
+///
+/// Costs one pass over the rows (`input_dim × ports`), paid only where masks are
+/// installed or a rebuild renumbers ports.
+fn split_rows_are_partition(rows: &[Vec<u8>], input_dim: usize) -> bool {
+    (0..input_dim).all(|feat| {
+        rows.iter()
+            .filter(|row| row.get(feat).copied().unwrap_or(0) != 0)
+            .count()
+            == 1
+    })
 }
 
 impl Default for TopologyOptions {
@@ -413,8 +435,15 @@ impl Topology {
                     .unwrap_or_else(|| vec![1u8; input_dim])
             })
             .collect();
+        // PADDING BREAKS AN `Exclusive` CLAIM. A padded port is cover-all, so the rows
+        // now hand a feature to two ports — which `Exclusive` denies by definition. The
+        // label follows the content, here and nowhere else, so the docs can trust it.
+        let partition = split_rows_are_partition(&masks, input_dim);
         self.nodes[input].feature_masks = Some(masks);
-        self.options.feature_split = Some(policy.unwrap_or(FeatureSplitPolicy::Inherited));
+        self.options.feature_split = Some(match policy.unwrap_or(FeatureSplitPolicy::Inherited) {
+            FeatureSplitPolicy::Exclusive if !partition => FeatureSplitPolicy::Inherited,
+            kept => kept,
+        });
     }
 
         /// Reconcile a LOADED blueprint with the rule "rows present ⇒ policy present":
@@ -430,6 +459,19 @@ impl Topology {
                 .any(|n| n.kind == NodeKind::Input && n.feature_masks.is_some())
         {
             self.options.feature_split = Some(FeatureSplitPolicy::Inherited);
+            return;
+        }
+            // And the other direction: a record can STATE `Exclusive` while carrying rows
+            // that are not a partition (a port the rebuild added, or one an older build
+            // padded). `Exclusive` is a checkable claim — every feature owned exactly
+            // once — so a loaded net is held to it too instead of being trusted.
+        if self.options.feature_split == Some(FeatureSplitPolicy::Exclusive) {
+            let input_dim = self.options.input_dim.unwrap_or(1);
+            if let Some(masks) = self.input_feature_masks() {
+                if !split_rows_are_partition(&masks, input_dim) {
+                    self.options.feature_split = Some(FeatureSplitPolicy::Inherited);
+                }
+            }
         }
     }
 
@@ -1240,6 +1282,18 @@ impl Topology {
             let connected_in = in_remap[i].iter().filter(|&&v| v != usize::MAX).count();
             if connected_in > 0 {
                 node.num_inputs = connected_in;
+            }
+        }
+            // The rebuild can ADD an Input port, and a port the rebuild added keeps every
+            // feature — so a partition plus a cover-all port is no longer "each feature in
+            // exactly one port". Restamp BEFORE anything writes the blueprint, or the file
+            // records a policy its own rows contradict.
+        if self.options.feature_split == Some(FeatureSplitPolicy::Exclusive) {
+            let input_dim = self.options.input_dim.unwrap_or(1);
+            if let Some(masks) = self.input_feature_masks() {
+                if !split_rows_are_partition(&masks, input_dim) {
+                    self.options.feature_split = Some(FeatureSplitPolicy::Inherited);
+                }
             }
         }
     }
@@ -2811,6 +2865,59 @@ mod fanout_bounds_tests {
         );
         assert_eq!(g.options.feature_split, None);
         assert!(!FeatureSplitPolicy::Inherited.is_drawable());
+    }
+
+        /// `Exclusive` is the one checkable claim a split makes — every feature owned
+        /// EXACTLY once — so a row set that fails it cannot wear the label. A cover-all
+        /// port beside a partition (what a rebuild's added port, or a padded install,
+        /// leaves) restamps to `Inherited`; a true partition keeps its label untouched.
+    #[test]
+    fn a_cover_all_port_beside_a_partition_is_not_labelled_exclusive() {
+        let opts = TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let mut g = Topology::new(29, Some(opts));
+        g.create_random_hidden_nodes(2);
+        g.finalize();
+        let input = g
+            .nodes
+            .iter()
+            .position(|n| n.kind == NodeKind::Input)
+            .unwrap();
+
+        // 2 | 0 | 1 | 1 over 4 features: every feature in exactly one port, so the
+        // accounting is 100% and the label stands.
+        g.options.feature_split = Some(FeatureSplitPolicy::Exclusive);
+        g.nodes[input].feature_masks = Some(vec![
+            vec![1, 1, 0, 0],
+            vec![0, 0, 0, 0],
+            vec![0, 0, 1, 0],
+            vec![0, 0, 0, 1],
+        ]);
+        g.reconcile_split_policy();
+        assert_eq!(
+            g.options.feature_split,
+            Some(FeatureSplitPolicy::Exclusive),
+            "a true partition keeps its label"
+        );
+
+        // The same rows plus one port that keeps EVERYTHING: features 0 and 1 now belong
+        // to two ports, the accounting is 200%, and `exclusive` is a lie.
+        g.nodes[input].feature_masks = Some(vec![
+            vec![1, 1, 0, 0],
+            vec![0, 0, 0, 0],
+            vec![0, 0, 1, 0],
+            vec![0, 0, 0, 1],
+            vec![1, 1, 1, 1],
+        ]);
+        g.reconcile_split_policy();
+        assert_eq!(
+            g.options.feature_split,
+            Some(FeatureSplitPolicy::Inherited),
+            "a cover-all port breaks the partition, so the label follows the rows"
+        );
     }
 
         /// Old records (and nets written by the crossover bug) load with rows under a
