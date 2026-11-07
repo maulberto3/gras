@@ -1,12 +1,12 @@
 //! The environment contract — RL's counterpart to the dataset.
 //!
 //! A tabular run takes its experience from [`RunData`](crate::trainer::RunData):
-//! a dataset plus the engine's shared batch stream. An RL run takes its
+//! a dataset plus the engine's shared batch stream. An RL run takes
 //! experience from a *world*, and until this module existed that world had no
 //! contract at all: [`RlStep`](crate::trainer::RlStep) makes the trainer own both
 //! the environment **and** the algorithm, which is why the crate's only RL
-//! reference (`examples/cartpole.rs`) is an environment and a REINFORCE update in
-//! one file. `Env` is the missing half — the world the *algorithm* drives, so an
+//! reference (`examples/cartpole.rs`) is an environment and a REINFORCE update
+//! one file. `Env` is the missing half — the world the *algorithm* drives,
 //! algorithm can ship in the crate and still be told nothing about physics.
 //!
 //! ```ignore
@@ -22,14 +22,14 @@
 //! # The replay contract
 //!
 //! [`reset`](Env::reset) takes the episode's seed and nothing else. The engine
-//! re-seeds both generators once per `(net, step)` before a trainer runs, so a
-//! trainer derives an episode seed from those inputs and hands it here — which
-//! means **every** draw the environment makes (initial state above all, plus any
-//! transition noise) has to come from that seed, never from a hidden global, a
+//! re-seeds both generators once per `(net, step)` before a trainer runs,
+//! trainer derives an episode seed from those inputs and hands it here —
+//! means **every** draw the environment makes (initial state above all, plus
+//! transition noise) has to come from that seed, never from a hidden global,
 //! clock, or the ambient `fastrand` state. An environment that breaks this cannot
 //! be replayed, and a run that cannot be replayed cannot be resumed.
 //!
-//! # Discrete actions only
+//! # Discrete actions
 //!
 //! [`step`](Env::step) takes an action id in `0..action_count()`. Continuous
 //! action spaces are deliberately absent rather than half-supported: a Box space
@@ -38,50 +38,27 @@
 
 use flodl::tensor::Result;
 
-/// One world the engine can drive: a seeded [`reset`](Env::reset), then
-/// [`step`](Env::step) one action at a time.
-///
-/// The implementor owns its own state and the trainer never sees it, so an
-/// environment can be a physics sim, a game, a queue, or a Python object behind
-/// a handle. `Send` because every [`RlStep`](crate::trainer::RlStep) is.
+/// One world the engine can drive: a seeded [`reset`](Env::reset), then [`step`](Env::step) one
+/// action at a time.
 pub trait Env: Send {
     /// Start a fresh episode and return its first observation.
-    ///
-    /// Randomness must be derived from `seed` alone (see the module docs).
-    /// Calling this twice with the same seed must produce the same first
-    /// observation and, given the same actions, the same episode.
     fn reset(&mut self, seed: u64) -> Result<Vec<f32>>;
 
     /// Apply one action and advance the world one turn.
-    ///
-    /// Returns `(observation, reward, done)`: what the policy sees next, what
-    /// this turn earned, and whether the episode is over. Only valid after
-    /// [`reset`](Env::reset).
     fn step(&mut self, action: usize) -> Result<(Vec<f32>, f32, bool)>;
 
     /// How many discrete actions are accepted: ids `0..action_count()`.
     fn action_count(&self) -> usize;
 
-    /// The episode cap, in turns. A trainer stops an episode here even if
-    /// [`step`](Env::step) never reports `done` — the ceiling that keeps a
-    /// runaway episode finite (and the natural fitness unit when a run ranks on
-    /// survival).
+    /// The episode cap, in turns.
     fn max_turns(&self) -> usize;
 
-    /// What this world is, for the run's `engine.json`. Never interpreted by the
-    /// engine: it exists so a stored run says which world it trained in, and so a
-    /// resume can diff it.
+    /// What this world is, for the run's `engine.json`.
     fn describe(&self) -> serde_json::Value;
 }
 
-/// A tiny deterministic world for contract tests: `actions` discrete actions, a
-/// seeded start observation, and a reward of `1.0` on every turn.
-///
-/// The episode ends at `max_turns`, or early if the action equals the one the
-/// seed picked (so a policy that does nothing interesting still gets a short
-/// episode). Kept in the test build: the crate's RL tests need a world whose
-/// numbers they can predict, and cartpole's physics would hide the seed contract
-/// behind 500 turns of simulation.
+/// A tiny deterministic world for contract tests: `actions` discrete actions, a seeded start
+/// observation, and a reward of `1.0` on every turn.
 #[cfg(test)]
 pub(crate) mod toy {
     use super::Env;
@@ -94,7 +71,7 @@ pub(crate) mod toy {
         turns: usize,
         /// The action this seed makes fatal on arrival.
         fatal: usize,
-        /// The seed of the last `reset`, recorded so a caller's seed contract is
+        /// The seed of the last `reset`, recorded so a caller's seed contract
         /// observable rather than merely promised.
         seed: u64,
     }
@@ -116,7 +93,7 @@ pub(crate) mod toy {
             self.turns
         }
 
-        /// The seed the LAST `reset` was given — a test's window into what its
+        /// The seed the LAST `reset` was given — a test's window into what
         /// caller fed this world, since the seed itself is otherwise invisible.
         pub fn last_seed(&self) -> u64 {
             self.seed
@@ -125,7 +102,7 @@ pub(crate) mod toy {
 
     impl Env for ToyEnv {
         fn reset(&mut self, seed: u64) -> Result<Vec<f32>> {
-            // Every draw comes from the seed — the contract this env exists to
+            // Every draw comes from the seed — the contract this env exists
             // demonstrate, and the one its tests pin.
             let mut rng = fastrand::Rng::with_seed(seed);
             self.seed = seed;
@@ -197,7 +174,11 @@ mod tests {
 
         // A different seed is a different world.
         let mut c = ToyEnv::new(4, 50);
-        assert_ne!(c.reset(8).unwrap(), first_a, "seed 8 must not replay seed 7");
+        assert_ne!(
+            c.reset(8).unwrap(),
+            first_a,
+            "seed 8 must not replay seed 7"
+        );
     }
 
     #[test]
@@ -205,7 +186,11 @@ mod tests {
         let mut env = ToyEnv::new(3, 4);
         env.reset(1).unwrap();
         let (obs, reward, done) = env.step(0).unwrap();
-        assert_eq!(obs.len(), 2, "the observation size is the policy's input dim");
+        assert_eq!(
+            obs.len(),
+            2,
+            "the observation size is the policy's input dim"
+        );
         assert_eq!(reward, 1.0);
         assert!(!done, "one turn into a four-turn cap is not done");
 

@@ -1,23 +1,4 @@
 //! The deterministic shared batch stream for the step-race engine.
-//!
-//! Two pieces:
-//! - [`PoolSplit`]: the static, seeded train/eval pool split (D12), fixed at
-//!   run start so every net is compared on identical data. Every held-out row
-//!   is in the eval pool — there is no separate exam pool.
-//! - [`BatchStream`]: batch `step` is a **pure function of
-//!   `(run_seed, step_index)`** — any net (or tool) can materialize any step's
-//!   batch independently, which is what makes resume replays exact (the replay
-//!   contract). The train pool is drawn round-robin from a
-//!   fixed seeded permutation. The **eval permutation rotates per era** (era
-//!   = `step / checkpoint_every`), so smoothed eval fitness reflects skill
-//!   across several different data orderings instead of one memorizable pass.
-//!
-//! Determinism note: because the eval rotation is a pure function of
-//! `(run_seed, step)`, a resume replay automatically sees the exact rotated eval
-//! batches the population saw at those historical steps — no extra bookkeeping.
-//!
-//! There is no epoch concept here (D14): the stream is infinite, and train +
-//! eval both happen per step.
 
 use flodl::Tensor;
 use flodl::tensor::Result;
@@ -31,21 +12,20 @@ pub const EVAL_STREAM_OFFSET: u64 = 0xFFFF;
 
 // ── PoolSplit (D12) ─────────────────────────────────────────────────────────
 
-/// The static train/eval pool split, fixed once at run start: every net trains on
+/// The static train/eval pool split, fixed once at run start: every net trains
 /// the train pool and is evaluated on the eval pool — identical conditions.
 #[derive(Clone, Debug)]
 pub struct PoolSplit {
     /// Row indices nets train on (the stream draws from here).
     pub train: Vec<i64>,
-    /// Row indices nets are evaluated on (eval batches draw from here) — ALL
+    /// Row indices nets are evaluated on (eval batches draw from here) —
     /// held-out rows, so the reading uses every test row the run was given.
     pub eval: Vec<i64>,
 }
 
 impl PoolSplit {
-        /// Split `dataset.len()` rows into train/eval pools with a seeded,
-        /// deterministic shuffle: `train_eval_split_ratio` of the rows train, the
-        /// rest are the eval pool.
+    /// Split `dataset.len()` rows into train/eval pools with a seeded, deterministic shuffle:
+    /// `train_eval_split_ratio` of the rows train, the rest are the eval pool.
     pub fn new(len: usize, train_eval_split_ratio: f32, seed: u64) -> Self {
         let (train, eval) = crate::utils::tabular_data::split_indices(
             len,
@@ -61,14 +41,14 @@ impl PoolSplit {
         Self::new(dataset.len(), train_eval_split_ratio, seed)
     }
 
-        /// Split from an EXPLICIT train/test layout: `train` = all train rows;
-        /// `eval` = a seeded shuffle of all test rows.
+    /// Split from an EXPLICIT train/test layout: `train` = all train rows;
+    /// `eval` = a seeded shuffle of all test rows.
     pub fn explicit(train_len: usize, test_len: usize, seed: u64) -> Self {
         assert!(test_len > 0, "explicit split needs a non-empty test pool");
         let train: Vec<i64> = (0..train_len as i64).collect();
         let mut eval: Vec<i64> = (train_len as i64..(train_len + test_len) as i64).collect();
-            // Seeded shuffle of the TEST rows only (the eval permutation re-shuffles per
-            // era anyway, but this keeps the raw pool order seed-dependent).
+        // Seeded shuffle of the TEST rows only (the eval permutation re-shuffles per
+        // era anyway, but this keeps the raw pool order seed-dependent).
         let mut rng = fastrand::Rng::with_seed(seed);
         for i in (1..eval.len()).rev() {
             let j = rng.usize(0..=i);
@@ -80,7 +60,7 @@ impl PoolSplit {
 
 // ── BatchStream ─────────────────────────────────────────────────────────────
 
-/// The shared, deterministic, infinite batch stream: batch for step *s* is
+/// The shared, deterministic, infinite batch stream: batch for step *s*
 /// `f(run_seed, s)` — no cursor, no state — so resume replays exactly.
 #[derive(Clone, Debug)]
 pub struct BatchStream {
@@ -93,39 +73,35 @@ pub struct BatchStream {
 }
 
 impl BatchStream {
-        /// Build a stream over a run's pools. Holds only indices — rows are gathered
-        /// at materialization time, so the stream is cheap to clone per net.
+    /// Build a stream over a run's pools. Holds only indices — rows are gathered
+    /// at materialization time, so the stream is cheap to clone per net.
     pub fn new(run_seed: u64, batch_size: usize, split: PoolSplit) -> Self {
         BatchStream {
             run_seed,
             batch_size,
             eval_batch_size: batch_size,
-            checkpoint_every: 100,   // default, can be overridden via with_checkpoint_every
+            checkpoint_every: 100, // default, can be overridden via with_checkpoint_every
             train_pool: split.train,
             eval_pool: split.eval,
         }
     }
 
-        /// Override the eval batch size (trainer's `stream_shape` hook). Train and eval
-        /// walk separate permutations, so the two sizes are independent.
+    /// Override the eval batch size (trainer's `stream_shape` hook). Train and eval
+    /// walk separate permutations, so the two sizes are independent.
     pub fn with_eval_batch_size(mut self, eval_batch_size: usize) -> Self {
         self.eval_batch_size = eval_batch_size.max(1);
         self
     }
 
-        /// Set the checkpoint cadence — the eval permutation rotates per era, so it
-        /// must agree with the engine's `checkpoint_every`. **`0` = never rotate**: the
-        /// eval permutation is frozen on era 0 for the whole run, matching an engine
-        /// whose durability tick is off (it must not silently become "rotate every
-        /// step", which would hand every step a different eval batch).
+    /// Set the checkpoint cadence — the eval permutation rotates per era, so it must agree
+    /// engine's `checkpoint_every`.
     pub fn with_checkpoint_every(mut self, n: usize) -> Self {
         self.checkpoint_every = n;
         self
     }
 
-        /// In-place variant of [`Self::with_checkpoint_every`], called by the engine at
-        /// run start / resume so a config edit can't desync the eval rotation. `0` =
-        /// never rotate (see [`Self::with_checkpoint_every`]).
+    /// In-place variant of [`Self::with_checkpoint_every`], called by the engine at run start /
+    /// resume so a config edit can't desync the eval rotation.
     pub fn set_run_checkpoint_every(&mut self, n: usize) {
         self.checkpoint_every = n;
     }
@@ -146,17 +122,13 @@ impl BatchStream {
         self.eval_batch_size
     }
 
-        /// The pool index vectors this stream draws from (train, eval) — read-only
-        /// view; never mutated after construction.
+    /// The pool index vectors this stream draws from (train, eval) — read-only
+    /// view; never mutated after construction.
     pub fn pools(&self) -> (&[i64], &[i64]) {
         (&self.train_pool, &self.eval_pool)
     }
 
-        /// The share of the rows this stream TRAINS on (`train ÷ (train + eval)`),
-        /// i.e. `1 − eval_share`. Named for the side it returns: the old
-        /// `train_eval_split_ratio` produced this same number while the header field
-        /// of that name means the EVAL share, and a header written from it silently
-        /// inverted the split on resume.
+    /// The share of the rows this stream TRAINS on (`train ÷ (train + eval)`), i.e.
     pub fn train_share(&self) -> f32 {
         self.train_pool.len() as f32 / (self.train_pool.len() + self.eval_pool.len()) as f32
     }
@@ -169,15 +141,15 @@ impl BatchStream {
         Ok((x, y))
     }
 
-        /// A contiguous window of `batch_size` pool rows starting at `offset`
-        /// (wrapping): one permutation consumed round-robin.
+    /// A contiguous window of `batch_size` pool rows starting at `offset`
+    /// (wrapping): one permutation consumed round-robin.
     fn window(pool: &[i64], batch_size: usize, offset: usize) -> Vec<i64> {
         let n = pool.len();
         (0..batch_size).map(|i| pool[(offset + i) % n]).collect()
     }
 
-        /// The **train** batch for `step` — what every live net trains on. Pure
-        /// function of `(run_seed, step)`; call it anywhere, any number of times.
+    /// The **train** batch for `step` — what every live net trains on. Pure
+    /// function of `(run_seed, step)`; call it anywhere, any number of times.
     pub fn train_batch(&self, dataset: &Dataset, step: u64) -> Result<(Tensor, Tensor)> {
         // One seeded permutation of the train pool, derived from the run
         // seed only — steps walk it round-robin via a step-derived offset.
@@ -192,8 +164,8 @@ impl BatchStream {
         Self::gather(dataset, &Self::window(&perm, self.batch_size, offset))
     }
 
-        /// The eval permutation for `era` — re-shuffled per checkpoint; pure function
-        /// of `(run_seed, era)`; era 0 matches the legacy fixed permutation.
+    /// The eval permutation for `era` — re-shuffled per checkpoint; pure function
+    /// of `(run_seed, era)`; era 0 matches the legacy fixed permutation.
     fn eval_permutation(&self, era: u64) -> Vec<i64> {
         let perm_seed = derive_seed(self.run_seed.wrapping_add(EVAL_STREAM_OFFSET), era as usize);
         let mut perm = self.eval_pool.clone();
@@ -205,9 +177,8 @@ impl BatchStream {
         perm
     }
 
-        /// The era a step belongs to (steps in the same era share one eval
-        /// permutation — the rotation boundary is the engine's checkpoint). A cadence of
-        /// `0` is ONE eternal era: the guard is load-bearing, since `step / 0` would panic.
+    /// The era a step belongs to (steps in the same era share one eval permutation — the rotation
+    /// boundary is the engine's checkpoint).
     fn era_of(&self, step: u64) -> u64 {
         if self.checkpoint_every == 0 {
             return 0;
@@ -215,8 +186,8 @@ impl BatchStream {
         (step as usize / self.checkpoint_every) as u64
     }
 
-        /// The **eval** batch for `step` — the held-out batch every live net is scored
-        /// on. Rotated per checkpoint era; pure in `(run_seed, step)`.
+    /// The **eval** batch for `step` — the held-out batch every live net is scored
+    /// on. Rotated per checkpoint era; pure in `(run_seed, step)`.
     pub fn eval_batch(&self, dataset: &Dataset, step: u64) -> Result<(Tensor, Tensor)> {
         let perm = self.eval_permutation(self.era_of(step));
         let offset = (step as usize).wrapping_mul(self.eval_batch_size);
@@ -275,7 +246,7 @@ mod tests {
         held.sort();
         assert_eq!(held, (80..100).collect::<Vec<i64>>());
         // Seeded: same (train_len, test_len, seed) ⇒ same split; a different
-        // seed re-shuffles the test side only.
+        // seed re-shuffles the test side
         let again = PoolSplit::explicit(80, 20, 42);
         assert_eq!(split.eval, again.eval);
         let other = PoolSplit::explicit(80, 20, 43);
@@ -338,8 +309,8 @@ mod tests {
         );
     }
 
-        /// `0` is a real cadence, not a clamp: the eval permutation must stay frozen on
-        /// era 0 forever (and `era_of` must not divide by zero).
+    /// `0` is a real cadence, not a clamp: the eval permutation must stay frozen
+    /// era 0 forever (and `era_of` must not divide by zero).
     #[test]
     fn zero_cadence_freezes_the_eval_permutation() {
         let ds = small_dataset();
@@ -347,7 +318,7 @@ mod tests {
             .with_eval_batch_size(4)
             .with_checkpoint_every(0);
         assert_eq!(s.checkpoint_every(), 0);
-        // Every step is era 0 — including steps that would cross many boundaries at
+        // Every step is era 0 — including steps that would cross many boundaries
         // cadence 1 (where step 5 would be era 5).
         for step in [0u64, 1, 5, 4096] {
             let perm = s.eval_permutation(s.era_of(step));
@@ -392,8 +363,8 @@ mod tests {
             b0_again.to_f32_vec().unwrap(),
             "pure function of (run_seed, step)"
         );
-            // Era 0's first batch must differ from era 1's: compare row *sets* across
-            // several windows so the flake probability is ~0.
+        // Era 0's first batch must differ from era 1's: compare row *sets* across
+        // several windows so the flake probability is ~0.
         let era0_rows = (0..4usize)
             .map(|i| s.eval_batch(&ds, i as u64).unwrap().0.to_f32_vec().unwrap())
             .collect::<Vec<_>>()
@@ -407,5 +378,4 @@ mod tests {
             "eval permutation must rotate across the era boundary"
         );
     }
-
 }

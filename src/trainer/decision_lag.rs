@@ -1,46 +1,4 @@
 //! DECISION-LAG relay — an RL experiment, isolated behind one wrapper type.
-//!
-//! **The problem it attacks:** an RL net that learns through its own actions
-//! sits in a closed feedback loop — as the net learns, the games it plays
-//! unfold differently, so its training distribution shifts under its own
-//! feet mid-stride. The loop can reinforce itself and stall learning.
-//!
-//! **The scheme:** per step, the net's CURRENT weights (the *face*) play the
-//! deciding matches and report the fitness evolution ranks on — but never
-//! train. A SHADOW copy (forked from the face at the last step boundary)
-//! plays its own matches and receives the real optimizer step. At the step
-//! boundary the shadow is PROMOTED: its weights become the next face, and a
-//! fresh shadow is forked from it. The deciding policy is therefore always
-//! exactly one step behind its own learning — the game the face plays today
-//! cannot reinforce what the face learned on.
-//!
-//! The relay width is configurable: `.with_lag(k)` makes a cycle span `k`
-//! engine steps — the face holds its weights for all of them, the shadow takes
-//! `k` optimizer steps, and promotion happens on the cycle's last step.
-//!
-//! **Conservative defaults (both knobs unset):** `::new(inner)` starts with
-//! `lag = 0` — the relay is OFF, the wrapper is a plain pass-through — and
-//! `grace = 5` — the first 5 engine steps are plain per-net training (no
-//! relay) before anything engages. `.with_lag(k)` opts the relay in
-//! (`k ≥ 1`; `k = 0` turns it back off); `.with_grace(n)` overrides the
-//! warm-up (`0` = engage immediately). Grace is a pure *absence* of the
-//! relay: inert while `lag = 0`, and with `lag ≥ 1` the relay engages at
-//! step `n` with its first full cycle (the cycle clock is measured from the
-//! end of the grace period).
-//!
-//! **Where it lives:** entirely inside this wrapper. The engine calls
-//! `train_step(&mut net, ...)` exactly as before and consumes the returned
-//! report; the wrapper decides which weights play, which learn, and when to
-//! promote. No engine changes, no new engine state — to remove the experiment,
-//! delete this file and unwrap the trainer at the call sites.
-//!
-//! **Cost:** 2× matches per step (the face's deciding set + the shadow's
-//! learning set). For a Python-bridge env that doubles wall time — measure
-//! before enabling on a full kagi race.
-//!
-//! **Identity:** externally the net is still ONE individual — the engine's
-//! hash, lineage, history rows, culls and exports all describe the face,
-//! which is the only weights that ever decide or rank.
 
 use crate::graph::network::Network;
 use crate::trainer::core::{RlContext, RlStep, RlStepReport, StepEnv};
@@ -49,17 +7,17 @@ use crate::trainer::core::{RlContext, RlStep, RlStepReport, StepEnv};
 /// Defaults are conservative: lag 0 (relay off), grace 5.
 pub struct DecisionLagTrainer<T: RlStep> {
     inner: T,
-        /// Engine steps per relay cycle: the face HOLDS its weights this long and the
-        /// shadow takes this many optimizer steps. `0` (default) = relay off.
+    /// Engine steps per relay cycle: the face HOLDS its weights this long
+    /// shadow takes this many optimizer steps. `0` (default) = relay off.
     lag: usize,
-        /// Engine steps of PLAIN per-net training before the relay engages (default 5);
-        /// inert while `lag = 0`. The cycle clock is measured from the grace end.
+    /// Engine steps of PLAIN per-net training before the relay engages (default 5);
+    /// inert while `lag = 0`. The cycle clock is measured from the grace end.
     grace: usize,
-        /// Steps since the last promotion (diagnostic). The shadow never persists (a
-        /// flodl `Network` is `!Send`); promotion is keyed off `step` alone.
+    /// Steps since the last promotion (diagnostic). The shadow never persists
+    /// flodl `Network` is `!Send`); promotion is keyed off `step` alone.
     pub steps_since_promotion: usize,
-        /// Relay telemetry: counters accumulate across the calls that share a `step` and
-        /// are reported when the step number changes. Banner INFO, tallies DEBUG, stall WARN.
+    /// Relay telemetry: counters accumulate across the calls that share a `step`
+    /// are reported when the step number changes. Banner INFO, tallies DEBUG, stall WARN.
     relay: RelayStats,
 }
 
@@ -72,14 +30,14 @@ struct RelayStats {
     faces: usize,
     /// Shadows that completed a promotion with CHANGED weights this step.
     promoted: usize,
-    /// Shadows whose promotion left the weights bit-identical: the relay is
+    /// Shadows whose promotion left the weights bit-identical: the relay
     /// not learning (lr 0, saturated net, or a broken fork).
     stalled: usize,
 }
 
 impl<T: RlStep> DecisionLagTrainer<T> {
-        /// Wrap an RL trainer with the decision-lag relay. Conservative defaults: `lag = 0`
-        /// (pass-through) and `grace = 5`. Opt in with [`Self::with_lag`].
+    /// Wrap an RL trainer with the decision-lag relay. Conservative defaults: `lag = 0`
+    /// (pass-through) and `grace = 5`. Opt in with [`Self::with_lag`].
     pub fn new(inner: T) -> Self {
         DecisionLagTrainer {
             inner,
@@ -90,8 +48,8 @@ impl<T: RlStep> DecisionLagTrainer<T> {
         }
     }
 
-        /// Widen the relay to `k` ENGINE STEPS per face: the deciding face holds its weights
-        /// while the shadow takes `k` optimizer steps, promoted on the cycle's last step.
+    /// Widen the relay to `k` ENGINE STEPS per face: the deciding face holds its weights
+    /// while the shadow takes `k` optimizer steps, promoted on the cycle's last step.
     pub fn with_lag(mut self, k: usize) -> Self {
         self.lag = k;
         self
@@ -102,8 +60,8 @@ impl<T: RlStep> DecisionLagTrainer<T> {
         self.lag
     }
 
-        /// Plain per-net training for the first `n` engine steps (default `5`; `0` = relay from
-        /// step 0). Inert while the relay is off; engagement starts a full `lag`-step cycle.
+    /// Plain per-net training for the first `n` engine steps (default `5`; `0` = relay
+    /// step 0). Inert while the relay is off; engagement starts a full `lag`-step cycle.
     pub fn with_grace(mut self, n: usize) -> Self {
         self.grace = n;
         self
@@ -128,8 +86,8 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
                     // `decision_lag` records whether the relay is actually
                     // engaged (lag ≥ 1); a lag-0 wrapper trains plainly.
                     obj.insert("decision_lag".into(), serde_json::json!(self.lag > 0));
-                        // The lag and grace are part of the training recipe: carrying them in
-                        // the blob makes `resume` refuse a different lag or grace loudly.
+                    // The lag and grace are part of the training recipe: carrying them
+                    // the blob makes `resume` refuse a different lag or grace loudly.
                     obj.insert("decision_lag_steps".into(), serde_json::json!(self.lag));
                     obj.insert("grace_periods".into(), serde_json::json!(self.grace));
                 }
@@ -150,14 +108,14 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
         step: usize,
         ctx: &RlContext<'_>,
     ) -> flodl::tensor::Result<RlStepReport> {
-            // ── 0. Relay off (the conservative default: lag 0) ─────────────
-            // A plain pass-through: the net trains directly every step. Grace is inert.
+        // ── 0. Relay off (the conservative default: lag 0) ─────────────
+        // A plain pass-through: the net trains directly every step. Grace is inert.
         if self.lag == 0 {
             return self.inner.train_step(net, optimizer, step, ctx);
         }
 
-            // ── 0b. Grace period: plain per-net training before the relay ───
-            // Default 5 steps; the face trains directly and the relay engages after.
+        // ── 0b. Grace period: plain per-net training before the relay ───
+        // Default 5 steps; the face trains directly and the relay engages after.
         if step < self.grace {
             tracing::debug!(
                 "decision-lag grace step {step}/{}: plain per-net training (relay engages at step {})",
@@ -167,8 +125,8 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
             return self.inner.train_step(net, optimizer, step, ctx);
         }
 
-            // ── 0c. Relay telemetry ────────────────────────────────────────
-            // Banner INFO at first use, tallies DEBUG per step-number change; a stall is WARN.
+        // ── 0c. Relay telemetry ────────────────────────────────────────
+        // Banner INFO at first use, tallies DEBUG per step-number change; a stall is WARN.
         if self.relay.step != Some(step) {
             if let Some(prev) = self.relay.step {
                 tracing::debug!(
@@ -188,13 +146,13 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
                 // CFY: the relay notice is a table; the mechanism is a footnote.
                 crate::utils::cfy::emit(&crate::utils::cfy::card(
                     "Decision-lag relay active",
-                    &crate::utils::cfy::kv(&[
-                        (
-                            "lag".to_string(),
-                            format!("{} engine step(s){grace_note}", self.lag),
-                        ),
-                    ]),
-                    Some("each net DECIDES and ranks on held (frozen) weights while a shadow forked from them takes its optimizer step(s) and is promoted at the cycle boundary — ≈2× env per step"),
+                    &crate::utils::cfy::kv(&[(
+                        "lag".to_string(),
+                        format!("{} engine step(s){grace_note}", self.lag),
+                    )]),
+                    Some(
+                        "each net DECIDES and ranks on held (frozen) weights while a shadow forked from them takes its optimizer step(s) and is promoted at the cycle boundary — ≈2× env per step",
+                    ),
                 ));
             }
             self.relay = RelayStats {
@@ -204,36 +162,36 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
         }
         self.relay.faces += 1;
 
-            // ── 1. The FACE decides ─────────────────────────────────────────
-            // Run the inner trainer on the face; its transient backward is DISCARDED.
+        // ── 1. The FACE decides ─────────────────────────────────────────
+        // Run the inner trainer on the face; its transient backward is DISCARDED.
         let face_weights_before = net.export_weights()?;
         let face_report = self.inner.train_step(net, optimizer, step, ctx)?;
         net.import_weights(&face_weights_before)?;
 
-            // ── 2. The SHADOW learns (only on the cycle's last step) ────────
-            // Batching the shadow keeps the wrapper STATELESS (a pure function of weights/step).
+        // ── 2. The SHADOW learns (only on the cycle's last step) ────────
+        // Batching the shadow keeps the wrapper STATELESS (a pure function of weights/step).
         let lag = self.lag;
-            // The cycle clock is RELATIVE to the grace period: engagement at `step >= grace`
-            // starts the first full cycle there.
+        // The cycle clock is RELATIVE to the grace period: engagement at `step >= grace`
+        // starts the first full cycle there.
         let rel = step - self.grace;
         let boundary = (rel + 1) % lag == 0;
-            // First engine step of the current cycle (`saturating` so it never replays a
-            // grace step).
+        // First engine step of the current cycle (`saturating` so it never replays
+        // grace step).
         let cycle_start = self.grace + (rel + 1).saturating_sub(lag);
         let mut promoted: Option<Vec<f32>> = None;
         if boundary {
-                // Fork the shadow from the face's PRE-STEP weights, then run the inner
-                // trainer on it `lag` times; only its optimizer steps survive.
+            // Fork the shadow from the face's PRE-STEP weights, then run the inner
+            // trainer on it `lag` times; only its optimizer steps survive.
             let blueprint = net.topology_blueprint();
             let mut shadow_net = Network::build(&blueprint, net_device(net))?;
             shadow_net.import_weights(&face_weights_before)?;
-                // The shadow's optimizer is created fresh and dropped with it — the relay
-                // measures lagged learning, not Adam momentum transfer.
+            // The shadow's optimizer is created fresh and dropped with it — the relay
+            // measures lagged learning, not Adam momentum transfer.
             let mut shadow_opt = self.inner.make_optimizer(&shadow_net);
             for i in 0..lag {
                 let s = cycle_start + i;
-                    // net_seed mixes the shadow salt AND the step offset so each of the `lag`
-                    // steps draws its own matches — deterministic in (net_seed, step).
+                // net_seed mixes the shadow salt AND the step offset so each of the `lag`
+                // steps draws its own matches — deterministic in (net_seed, step).
                 let shadow_ctx = RlContext {
                     fitness: ctx.fitness,
                     metrics: ctx.metrics,
@@ -250,14 +208,14 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
             promoted = Some(shadow_net.export_weights()?);
         }
 
-            // ── 3. Cycle boundary: PROMOTE the shadow ──────────────────────
-            // The learned weights become the next face: install them into the engine's net.
+        // ── 3. Cycle boundary: PROMOTE the shadow ──────────────────────
+        // The learned weights become the next face: install them into the engine's net.
         match promoted {
             Some(promoted) => {
                 net.import_weights(&promoted)?;
                 self.steps_since_promotion = 0;
-                    // ── 4. Telemetry: did the shadow actually learn? ────────
-                    // A promotion with unmoved weights is a silent failure — report it loudly (WARN).
+                // ── 4. Telemetry: did the shadow actually learn? ────────
+                // A promotion with unmoved weights is a silent failure — report it loudly (WARN).
                 if promoted == face_weights_before {
                     self.relay.stalled += 1;
                     tracing::warn!(
@@ -286,7 +244,7 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
     }
 }
 
-/// The device a live net was built on — read off its first layer (every
+/// The device a live net was built on — read off its first layer
 /// layer shares the net's device by construction).
 fn net_device(net: &Network) -> flodl::Device {
     net.layers
@@ -298,12 +256,12 @@ fn net_device(net: &Network) -> flodl::Device {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::fitness::{Direction, Fitness};
     use crate::trainer::core::{RlContext, StepEnv};
+    use crate::utils::fitness::{Direction, Fitness};
     use flodl::nn::Module;
 
-        /// Minimal RL trainer: fitness = net.forward(input)'s first output value, one
-        /// pseudo-gradient step through the provided optimizer.
+    /// Minimal RL trainer: fitness = net.forward(input)'s first output value, one
+    /// pseudo-gradient step through the provided optimizer.
     struct ProbeTrainer {
         lr: f64,
     }
@@ -344,8 +302,8 @@ mod tests {
     }
 
     fn ctx(step: usize) -> RlContext<'static> {
-            // Leak-free statics: the context only borrows config-level data for the call;
-            // the test constructs it with leaked refs (test-scoped, bounded).
+        // Leak-free statics: the context only borrows config-level data for the call;
+        // the test constructs it with leaked refs (test-scoped, bounded).
         let fitness: &'static Fitness =
             Box::leak(Box::new(Fitness::reported(Direction::Maximize, "reward")));
         let metrics: &'static [crate::utils::fitness::Metric] = &[];
@@ -379,8 +337,8 @@ mod tests {
 
     #[test]
     fn relay_face_never_moves_and_shadow_promotes() {
-            // After one lagged step, the face's weights equal the PROMOTED shadow's — the
-            // core invariant: the face that decides next is the shadow that learned.
+        // After one lagged step, the face's weights equal the PROMOTED shadow's —
+        // core invariant: the face that decides next is the shadow that learned.
         let mut lagged = DecisionLagTrainer::new(ProbeTrainer { lr: 1e-2 })
             .with_lag(1)
             .with_grace(0);
@@ -409,8 +367,8 @@ mod tests {
 
     #[test]
     fn relay_report_describes_the_deciding_face_not_the_learner() {
-            // Two consecutive steps: the step-N report must describe the weights the step-N
-            // DECISIONS used (the promoted face from N-1), not the shadow learning during N.
+        // Two consecutive steps: the step-N report must describe the weights the step-N
+        // DECISIONS used (the promoted face from N-1), not the shadow learning during N.
         let mut lagged = DecisionLagTrainer::new(ProbeTrainer { lr: 1e-2 })
             .with_lag(1)
             .with_grace(0);
@@ -420,15 +378,15 @@ mod tests {
         let _ = lagged
             .train_step(&mut face, &mut face_opt, 0, &ctx(0))
             .unwrap();
-            // Face after step 0 = promoted shadow. Assert the face's weights at this
-            // instant survive step 1's transient backward.
+        // Face after step 0 = promoted shadow. Assert the face's weights
+        // instant survive step 1's transient backward.
         let face_before_step1 = face.export_weights().unwrap();
         let report1 = lagged
             .train_step(&mut face, &mut face_opt, 1, &ctx(1))
             .unwrap();
 
-            // Replay the deciding pass on the captured weights: re-scoring without the
-            // optimizer step reproduces the report.
+        // Replay the deciding pass on the captured weights: re-scoring without
+        // optimizer step reproduces the report.
         let mut replay = probe_net();
         replay.import_weights(&face_before_step1).unwrap();
         let x = flodl::Variable::new(
@@ -485,8 +443,8 @@ mod tests {
 
     #[test]
     fn with_lag_zero_disables_the_relay() {
-            // Conservative default: lag 0 never engages — a plain pass-through (the shadow
-            // would have nothing to promote, so "off" is honest).
+        // Conservative default: lag 0 never engages — a plain pass-through (the shadow
+        // would have nothing to promote, so "off" is honest).
         let mut lagged = DecisionLagTrainer::new(ProbeTrainer { lr: 1e-2 })
             .with_lag(0)
             .with_grace(0);
@@ -521,8 +479,8 @@ mod tests {
 
     #[test]
     fn grace_defers_relay_engagement_then_runs_a_full_cycle() {
-            // grace 2 + lag 3: steps 0-1 are PLAIN, the relay engages at step 2 with its
-            // first FULL cycle — hold at rel 0/1, promote at rel 2.
+        // grace 2 + lag 3: steps 0-1 are PLAIN, the relay engages at step 2
+        // first FULL cycle — hold at rel 0/1, promote at rel 2.
         let mut lagged = DecisionLagTrainer::new(ProbeTrainer { lr: 1e-2 })
             .with_lag(3)
             .with_grace(2);
@@ -563,8 +521,8 @@ mod tests {
 
     #[test]
     fn describe_declares_the_relay_and_its_lag() {
-            // The engine persists this blob and `resume` compares it, so lag and grace
-            // must ride along — resuming under different values changes the recipe.
+        // The engine persists this blob and `resume` compares it, so lag and grace
+        // must ride along — resuming under different values changes the recipe.
         let lagged = DecisionLagTrainer::new(ProbeTrainer { lr: 1e-2 }).with_lag(4);
         let blob = lagged.describe().unwrap();
         assert_eq!(blob["decision_lag"], serde_json::json!(true));
@@ -578,8 +536,8 @@ mod tests {
 
     #[test]
     fn relay_telemetry_counts_faces_per_step_and_rolls_at_the_boundary() {
-            // The engine calls train_step once per live net with the SAME step; the telemetry
-            // must group those calls into one step's totals and roll over when the clock advances.
+        // The engine calls train_step once per live net with the SAME step; the telemetry
+        // must group those calls into one step's totals and roll over when the clock advances.
         let mut lagged = DecisionLagTrainer::new(ProbeTrainer { lr: 1e-2 })
             .with_lag(1)
             .with_grace(0);
@@ -602,8 +560,8 @@ mod tests {
     }
     #[test]
     fn relay_promotion_actually_learns_face_moves_over_steps() {
-            // The point of the scheme: the face should IMPROVE over relay steps. Assert
-            // direction of travel, not magnitude.
+        // The point of the scheme: the face should IMPROVE over relay steps. Assert
+        // direction of travel, not magnitude.
         let mut lagged = DecisionLagTrainer::new(ProbeTrainer { lr: 1e-2 })
             .with_lag(1)
             .with_grace(0);

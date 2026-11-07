@@ -3,7 +3,7 @@
 //! Challenges were engine-wired: `RaceConfig::challenge_prob` + a per-step
 //! engine roll handed every trainer a `challenged` bool. The engine has
 //! forgotten all of it — the trigger is a pure function of values a trainer
-//! already has in its [`StepEnv`]/net seed, so the ROLL belongs where the
+//! already has in its [`StepEnv`]/net seed, so the ROLL belongs where
 //! RESPONSE does: inside `train_step`.
 //!
 //! # Recipe (both modes)
@@ -24,8 +24,8 @@
 //! );
 //! ```
 //!
-//! On a fired step the trainer owns the response: RL forces an action on the
-//! TRAIN matches through [`ChallengePolicy`] + [`forced_action`] (pure, so a
+//! On a fired step the trainer owns the response: RL forces an action
+//! TRAIN matches through [`ChallengePolicy`] + [`forced_action`] (pure,
 //! resume replays the identical force); tabular jitters its batch
 //! at the element level against [`effective_challenge_prob`] (the decayed
 //! per-value rate). Ignoring the flag is legal — keep the knob at 0.
@@ -33,7 +33,7 @@
 //! # Challenge policies (CHA)
 //!
 //! [`ChallengePolicy::Random`] draws ONE action index and holds it for the whole
-//! episode. [`ChallengePolicy::LeastAction`] forces, per turn, the action the
+//! episode. [`ChallengePolicy::LeastAction`] forces, per turn, the action
 //! policy wants least (`argmin`) — no draw, state-dependent, and the sharpest
 //! push away from what the net already does.
 //!
@@ -42,8 +42,8 @@
 //! [`challenge_fires`] is a pure function of `(run_seed, net_seed, step)` —
 //! no stored state, no engine involvement — so a resumed run and the original
 //! run both re-derive the identical trigger. The run seed
-//! is recorded in `engine.json`; the net seed rides the net's blueprint. A
-//! stateful schedule (a counter, an RNG stream) would advance on every
+//! is recorded in `engine.json`; the net seed rides the net's blueprint.
+//! stateful schedule (a counter, an RNG stream) would advance
 //! replay and silently break determinism — don't keep one.
 
 use crate::utils::training::run_progress;
@@ -63,8 +63,8 @@ pub enum ChallengeDecay {
 }
 
 impl ChallengeDecay {
-        /// The exponent `k` as `1 − progress^k`, clamped to [0, 100]: non-finite or
-        /// negative k would explode the knob; the knob stays a probability.
+    /// The exponent `k` as `1 − progress^k`, clamped to [0, 100]: non-finite
+    /// negative k would explode the knob; the knob stays a probability.
     pub(crate) fn exponent(self) -> f32 {
         /// Lower clamp bound for the challenge exponent.
         const MIN_EXPONENT: f32 = 0.0;
@@ -75,13 +75,13 @@ impl ChallengeDecay {
             ChallengeDecay::Exponential => 2.0,
             ChallengeDecay::Custom { exponent } => exponent,
         };
-            // max/min, NOT clamp: `clamp` propagates NaN, while `f32::max/min` fall
-            // to the finite operand — the degenerate-value fallback we want.
+        // max/min, NOT clamp: `clamp` propagates NaN, while `f32::max/min` fall
+        // to the finite operand — the degenerate-value fallback we want.
         k.max(MIN_EXPONENT).min(MAX_EXPONENT)
     }
 }
 
-// `TryFrom<&str>` lives with the enum (reusable by CLI/config tooling), returns a
+// `TryFrom<&str>` lives with the enum (reusable by CLI/config tooling), returns
 // Result instead of panicking, and keeps the parse-and-error string in one place.
 impl TryFrom<&str> for ChallengeDecay {
     type Error = String;
@@ -158,7 +158,7 @@ impl std::fmt::Display for ChallengePolicy {
 /// The action a fired challenge forces, resolved per turn by the trainer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForcedAction {
-    /// One drawn index (the `Random` policy) — every turn of the step plays it.
+    /// One drawn index (the `Random` policy) — every turn of the step plays
     Exact(usize),
     /// The least-preferred action of the CURRENT turn (the `LeastAction` policy).
     Least,
@@ -211,7 +211,7 @@ pub fn forced_action(
 }
 
 /// The effective (decayed) challenge probability at `step`: the knob scaled to 0
-/// by the end of the budget (flat when unbounded). [`challenge_fires`] decides with it.
+/// by the end of the budget (flat when unbounded). [`challenge_fires`] decides
 pub fn effective_challenge_prob(
     prob: f32,
     step: usize,
@@ -248,8 +248,8 @@ pub fn challenge_fires(
 mod tests {
     use super::*;
 
-        /// The decay table, pinned: at each progress the factor is exactly
-        /// `1 − progress^k` for the three published shapes.
+    /// The decay table, pinned: at each progress the factor is exactly
+    /// `1 − progress^k` for the three published shapes.
     #[test]
     fn decay_shapes_match_their_closed_form() {
         let cases: &[(f32, ChallengeDecay, f32)] = &[
@@ -305,8 +305,8 @@ mod tests {
         assert_eq!(ChallengeDecay::Custom { exponent: 1e9 }.exponent(), 100.0);
     }
 
-        /// `prob <= 0` never fires; `prob = 1` at step 0 always fires. The trigger
-        /// is a pure function of its arguments — same inputs, same answer.
+    /// `prob <= 0` never fires; `prob = 1` at step 0 always fires. The trigger
+    /// is a pure function of its arguments — same inputs, same answer.
     #[test]
     fn trigger_is_pure_and_respects_the_knob() {
         assert!(!challenge_fires(
@@ -361,8 +361,8 @@ mod tests {
         assert!(ChallengeDecay::try_from("custom:-1").is_err());
     }
 
-        /// The trigger is per-NET, not per-step: at one step with `p = 0.5` a
-        /// population of distinct seeds must split roughly in half.
+    /// The trigger is per-NET, not per-step: at one step with `p = 0.5`
+    /// population of distinct seeds must split roughly in half.
     #[test]
     fn trigger_is_per_net_not_per_step() {
         use crate::utils::seed::derive_seed;
@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(forced.resolve(&[0.5, -2.0, 0.9]), 1);
     }
 
-    /// The argmin: ties go to the lowest index, a single action is always 0, an
+    /// The argmin: ties go to the lowest index, a single action is always 0,
     /// empty slice is 0, and NaN ranks as least-preferred without ever panicking.
     #[test]
     fn least_action_picks_the_argmin_and_never_panics() {
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(least_action(&[f32::INFINITY, f32::NEG_INFINITY]), 1);
     }
 
-    /// The policy string round-trips through the CLI/`describe()` vocabulary, and
+    /// The policy string round-trips through the CLI/`describe()` vocabulary,
     /// bad input errors instead of panicking.
     #[test]
     fn policy_string_round_trip_and_parse_errors() {
@@ -437,8 +437,9 @@ mod tests {
     fn random_policy_reproduces_the_historical_draw() {
         /// The draw the examples used before the policy existed (verbatim).
         fn legacy(net_seed: u64, step: usize) -> usize {
-            let mut rng =
-                fastrand::Rng::with_seed(net_seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut rng = fastrand::Rng::with_seed(
+                net_seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            );
             rng.usize(..2)
         }
         for net_seed in [1u64, 42, 999] {

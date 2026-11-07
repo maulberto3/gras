@@ -7,7 +7,7 @@
 //! # Only what the contract can carry
 //!
 //! A tabular run's data contract is exactly two tensors — `(pred, target)`, drawn
-//! row-aligned from the shared stream — so only losses that fit that shape are
+//! row-aligned from the shared stream — so only losses that fit that shape
 //! listed. Deliberately absent: `ctc` (needs input lengths), `triplet_margin` /
 //! `margin_ranking` (need three inputs), `poisson_nll` (a `log_input` flag),
 //! `nll` (class-index targets, not the dataset's dense rows) and `kl_div`
@@ -24,8 +24,8 @@
 //! # Why the label carries the parameters
 //!
 //! `engine.json` stores [`Loss::label`] and refuses a resume whose trainer blob
-//! differs. So `label` includes the knobs (`label_smoothing_ce(0.1)`) and
-//! [`Loss::parse`] accepts that same spelling back — a changed ε is then a
+//! differs. So `label` includes the knobs (`label_smoothing_ce(0.1)`)
+//! [`Loss::parse`] accepts that same spelling back — a changed ε
 //! visible diff instead of a silent one. The float is printed at shortest
 //! round-trip precision, so `parse(&label())` returns the identical value.
 
@@ -41,7 +41,7 @@ pub const DEFAULT_LABEL_SMOOTHING: f32 = 0.1;
 pub const DEFAULT_HUBER_BETA: f64 = 1.0;
 
 /// The default `γ` for [`Loss::Focal`] — how hard the easy rows are down-weighted
-/// (the value the focal-loss paper settled on).
+/// (the value the focal-loss paper settled
 pub const DEFAULT_FOCAL_GAMMA: f32 = 2.0;
 
 /// The default `k` for `top_k_accuracy` — the depth a 10-class head is usually read
@@ -49,17 +49,18 @@ pub const DEFAULT_FOCAL_GAMMA: f32 = 2.0;
 pub const DEFAULT_TOP_K: usize = 3;
 
 /// Parse a top-k spelling: the bare name (`k = DEFAULT_TOP_K`) or `top_k_accuracy(k)`.
-/// Returns `(k, label)`, the label normalising `k = 3` back to the bare name so
-/// `engine.json` shows ONE spelling for one recipe — the same rule [`Loss::label`]
-/// follows for its own parameters.
 fn parse_top_k(name: &str) -> Option<(usize, String)> {
     let rest = name.trim().strip_prefix("top_k_accuracy")?;
     let k = if rest.is_empty() {
         DEFAULT_TOP_K
     } else {
-        rest.strip_prefix('(')?.strip_suffix(')')?.trim().parse().ok()?
+        rest.strip_prefix('(')?
+            .strip_suffix(')')?
+            .trim()
+            .parse()
+            .ok()?
     };
-    // `k = 0` asks for no classes at all: refuse the spelling rather than clamp a
+    // `k = 0` asks for no classes at all: refuse the spelling rather than clamp
     // caller's typo into a real metric.
     if k == 0 {
         return None;
@@ -72,7 +73,7 @@ fn parse_top_k(name: &str) -> Option<(usize, String)> {
     Some((k, label))
 }
 
-/// What a loss expects `target` to look like. Used to explain a mismatch (and to
+/// What a loss expects `target` to look like. Used to explain a mismatch
 /// pick a sensible default fitness), never to reshape anyone's data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetKind {
@@ -103,7 +104,7 @@ pub const METRIC_NAMES: &[&str] = &[
     "explained_variance",
 ];
 
-/// Every fitness name [`fitness_for`] accepts. Same scorers as the metrics, but
+/// Every fitness name [`fitness_for`] accepts. Same scorers as the metrics,
 /// with the direction a *ranking* signal needs.
 pub const FITNESS_NAMES: &[&str] = &[
     "cross_entropy",
@@ -135,28 +136,17 @@ pub enum Loss {
     Mse,
     /// Mean absolute error — regression, robust to outliers.
     L1,
-    /// Huber: quadratic below `beta`, linear above it.
+    /// Huber: quadratic below `beta`, linear above
     SmoothL1 { beta: f64 },
-    /// Binary cross-entropy on raw logits — no sigmoid needed before it.
+    /// Binary cross-entropy on raw logits — no sigmoid needed before
     BceWithLogits,
-    /// Focal loss — softmax cross-entropy re-weighted toward the HARD rows by
-    /// `(1 − p_t)^γ`. `γ = 0` is plain cross-entropy. Use it when a few easy rows
-    /// dominate the gradient.
-    ///
-    /// There is deliberately no `α`: in the focal paper it weights the POSITIVE
-    /// class under a sigmoid head, while this crate's classification head is
-    /// softmax over one-hot rows, where a scalar `α` would multiply every row
-    /// equally — a pure rescale that Adam cancels, i.e. a knob that lies. Class
-    /// imbalance here is a DATA problem (resample, or reweight the dataset), and
-    /// saying so is more useful than accepting `alpha=` and doing nothing.
+    /// Focal loss — softmax cross-entropy re-weighted toward the HARD rows by `(1 − p_t)^γ`.
     Focal { gamma: f32 },
-    /// Kullback-Leibler divergence between the net's log-softmax and a target
-    /// DISTRIBUTION (soft labels, a teacher's output). One-hot targets make it
-    /// identical to cross-entropy.
+    /// Kullback-Leibler divergence between the net's log-softmax and a target DISTRIBUTION (soft
+    /// labels, a teacher's output).
     KlDiv,
-    /// Poisson negative log-likelihood for COUNT targets: the net outputs a
-    /// log-rate and the loss is `exp(pred) − target · pred`. Always the log-input
-    /// form, so a negative prediction cannot turn the loss into NaN.
+    /// Poisson negative log-likelihood for COUNT targets: the net outputs a log-rate and the loss
+    /// is `exp(pred) − target · pred`.
     PoissonNll,
 }
 
@@ -194,9 +184,7 @@ impl Loss {
         "poisson_nll",
     ];
 
-    /// Parse a name, with or without parameters. Bare names take the defaults;
-    /// the recorded form (`label_smoothing_ce(0.1)`) round-trips. `None` = not a
-    /// loss this crate knows, so the caller can list [`Loss::NAMES`].
+    /// Parse a name, with or without parameters.
     pub fn parse(name: &str) -> Option<Self> {
         let name = name.trim();
         // Parameterised form: `head(arg)`.
@@ -271,14 +259,13 @@ impl Loss {
             Self::Focal { gamma } => Box::new(move |pred: &Variable, y: &Variable| {
                 crate::utils::score::focal_loss_onehot(pred, y, gamma)
             }),
-            // KL divergence is defined on LOG-probabilities, so the net's output is
-            // passed through the same `log_softmax` cross-entropy uses — a raw-logit
-            // net and a log-softmax one are the same function under this loss.
+            // KL divergence is defined on LOG-probabilities, so the net's output is passed through
+            // the same `log_softmax` cross-entropy uses — a raw-logit net and a log-softmax one
             Self::KlDiv => Box::new(|pred: &Variable, y: &Variable| {
                 let log_p = pred.data().log_softmax(1)?;
                 flodl::nn::loss::kl_div_loss(&Variable::new(log_p, false), y)
             }),
-            // `log_input = true` unconditionally: `exp(pred)` is always positive, so a
+            // `log_input = true` unconditionally: `exp(pred)` is always positive,
             // net that drifts negative stays finite instead of taking `log(<0)`.
             Self::PoissonNll => Box::new(|pred: &Variable, y: &Variable| {
                 flodl::nn::loss::poisson_nll_loss(pred, y, true)
@@ -286,7 +273,7 @@ impl Loss {
         }
     }
 
-    /// What this loss expects of `target`. For docs, validation messages and the
+    /// What this loss expects of `target`. For docs, validation messages
     /// `task=` presets — never for reshaping.
     pub fn target_kind(&self) -> TargetKind {
         match self {
@@ -301,15 +288,11 @@ impl Loss {
         }
     }
 
-    /// The ranking fitness this loss normally pairs with. A loss decides HOW the
+    /// The ranking fitness this loss normally pairs with. A loss decides HOW
     /// net trains; this decides WHICH net wins.
     pub fn natural_fitness(&self) -> Fitness {
         match self {
-            // A classification loss ranks on how well the classes come out. Focal and
-            // KL rank on PLAIN cross-entropy on purpose: the re-weighting is what
-            // trains, but ranking on the re-weighted number would compare nets on a
-            // curve the winner has to beat — CE is the unbiased exam. (For a one-hot
-            // target KL IS CE, so the three agree there by construction.)
+            // A classification loss ranks on how well the classes come out.
             Self::CrossEntropyOnehot
             | Self::LabelSmoothingCe { .. }
             | Self::Focal { .. }
@@ -317,8 +300,10 @@ impl Loss {
                 Fitness::minimize("cross_entropy", crate::utils::score::cross_entropy_onehot)
             }
             // Binary: the loss is not comparable across shapes, so rank on hits.
-            Self::BceWithLogits => Fitness::maximize("accuracy", crate::utils::score::accuracy_score),
-            // Regression: rank on the same unit the loss trains in.
+            Self::BceWithLogits => {
+                Fitness::maximize("accuracy", crate::utils::score::accuracy_score)
+            }
+            // Regression: rank on the same unit the loss trains
             Self::Mse => Fitness::minimize("mse", crate::utils::score::mse_loss_score),
             Self::L1 | Self::SmoothL1 { .. } => {
                 Fitness::minimize("mae", crate::utils::score::l1_loss_score)
@@ -352,12 +337,15 @@ impl std::str::FromStr for Loss {
 /// can list [`METRIC_NAMES`].
 pub fn metric_for(name: &str) -> Option<Metric> {
     type ScoreBox = Box<dyn Fn(&Variable, &Variable) -> flodl::tensor::Result<f32> + Send + Sync>;
-    // The one name that carries an ARGUMENT: `top_k_accuracy(k)`. The k travels in
-    // the closure and the label, so the column header and `engine.json` state it.
+    // The one name that carries an ARGUMENT: `top_k_accuracy(k)`. The k travels
+    // the closure and the label, so the column header and `engine.json` state
     if let Some((k, label)) = parse_top_k(name) {
-        return Some(Metric::custom(label, move |pred: &Variable, y: &Variable| {
-            crate::utils::score::top_k_accuracy_score(pred, y, k)
-        }));
+        return Some(Metric::custom(
+            label,
+            move |pred: &Variable, y: &Variable| {
+                crate::utils::score::top_k_accuracy_score(pred, y, k)
+            },
+        ));
     }
     let (label, f): (&'static str, ScoreBox) = match name.trim() {
         "accuracy" => ("accuracy", Box::new(crate::utils::score::accuracy_score)),
@@ -387,9 +375,8 @@ pub fn metric_for(name: &str) -> Option<Metric> {
     Some(Metric::custom(label, f))
 }
 
-/// Build a run's informative metric list from names, failing on the first
-/// unknown one with the valid set spelled out (the run should not start
-/// half-configured).
+/// Build a run's informative metric list from names, failing on the first unknown one
+/// valid set spelled out (the run should not start half-configured).
 pub fn metrics_for(names: &[&str]) -> Result<Vec<Metric>, EngineError> {
     names
         .iter()
@@ -404,17 +391,21 @@ pub fn metrics_for(names: &[&str]) -> Result<Vec<Metric>, EngineError> {
         .collect()
 }
 
-/// A ranking fitness by name: the same scorers as the metrics, with directions
-/// fixed by what "better" means for each. `None` = unknown; see
-/// [`FITNESS_NAMES`].
+/// A ranking fitness by name: the same scorers as the metrics, with directions fixed by what
+/// "better" means for each.
 pub fn fitness_for(name: &str) -> Option<Fitness> {
     if let Some((k, label)) = parse_top_k(name) {
-        return Some(Fitness::maximize(&label, move |pred: &Variable, y: &Variable| {
-            crate::utils::score::top_k_accuracy_score(pred, y, k)
-        }));
+        return Some(Fitness::maximize(
+            &label,
+            move |pred: &Variable, y: &Variable| {
+                crate::utils::score::top_k_accuracy_score(pred, y, k)
+            },
+        ));
     }
     Some(match name.trim() {
-        "cross_entropy" => Fitness::minimize("cross_entropy", crate::utils::score::cross_entropy_onehot),
+        "cross_entropy" => {
+            Fitness::minimize("cross_entropy", crate::utils::score::cross_entropy_onehot)
+        }
         "accuracy" => Fitness::maximize("accuracy", crate::utils::score::accuracy_score),
         "balanced_accuracy" => Fitness::maximize(
             "balanced_accuracy",
@@ -446,7 +437,7 @@ mod tests {
         Variable::new(Tensor::from_f32(xs, shape, Device::CPU).unwrap(), false)
     }
 
-    /// A `(pred, target)` pair of whatever kind this loss asks for.
+    /// A `(pred, target)` pair of whatever kind this loss asks
     fn sample_pair(loss: &Loss) -> (Variable, Variable) {
         match loss.target_kind() {
             TargetKind::OneHot => (
@@ -521,17 +512,15 @@ mod tests {
     fn every_loss_builds_and_evaluates_on_its_own_target_kind() {
         for loss in Loss::ALL {
             let (pred, y) = sample_pair(loss);
-            let value = loss
-                .build()(&pred, &y)
+            let value = loss.build()(&pred, &y)
                 .unwrap_or_else(|e| panic!("{} failed to evaluate: {e}", loss.label()));
             let x = value.item().unwrap() as f32;
             assert!(x.is_finite(), "{} produced {x}", loss.label());
         }
     }
 
-    /// The claimed identities, measured rather than asserted in prose: at
-    /// `α = 1, γ = 0` focal IS cross-entropy, and KL against a one-hot target IS
-    /// cross-entropy. If either drifts, the docs above are lying.
+    /// The claimed identities, measured rather than asserted in prose: at `α = 1, γ = 0` focal
+    /// cross-entropy, and KL against a one-hot target IS cross-entropy.
     #[test]
     fn focal_and_kl_reduce_to_cross_entropy_at_their_degenerate_settings() {
         let pred = var(&[1.0, -2.0, 0.5, -1.0, 2.0, 0.0], &[2, 3]);
@@ -544,9 +533,8 @@ mod tests {
         let kl = value(&Loss::KlDiv);
         assert!((ce - kl).abs() < 1e-5, "kl_div {kl} vs ce {ce}");
 
-        // And the knob actually moves it: γ > 0 can only LOWER the loss on a net
-        // that is already confident, which is the whole point of the modulating
-        // factor.
+        // And the knob actually moves it: γ > 0 can only LOWER the loss on a net that is already
+        // confident, which is the whole point of the modulating factor.
         let focused = value(&Loss::Focal { gamma: 2.0 });
         assert!(focused < ce, "focal(2) {focused} should be below ce {ce}");
     }

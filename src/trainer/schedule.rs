@@ -1,17 +1,17 @@
 //! Named learning-rate schedules — pure functions of the step clock.
 //!
-//! The engine has no learning rate of its own: the TRAINER owns it, and a
+//! The engine has no learning rate of its own: the TRAINER owns
 //! `TabularStep` / `RlStep` applies its schedule before the step's update. What
 //! this module adds is the part a NAME can carry: a schedule that can be spelled
-//! (`cosine(0.1)`), recorded in `engine.json`, and checked on resume, instead of
+//! (`cosine(0.1)`), recorded in `engine.json`, and checked on resume, instead
 //! a closure only its author can see.
 //!
 //! # The replay contract
 //!
 //! `lr` is a pure function of `(base, step, max_steps)` — no counter, no RNG, no
-//! accumulated factor. Two clocks asked the same question get the same answer, so
+//! accumulated factor. Two clocks asked the same question get the same answer,
 //! a resumed run applies the learning rate the uninterrupted run would have used.
-//! A schedule needs a budget: with `max_steps = None` the run is unbounded and the
+//! A schedule needs a budget: with `max_steps = None` the run is unbounded
 //! progress-based shapes (`cosine`, `onecycle`) deliberately fall back to the base
 //! rate rather than invent a horizon.
 //!
@@ -19,9 +19,9 @@
 //!
 //! flodl ships the same shapes ([`flodl::nn::scheduler`]), but its constructors
 //! need `total_steps` up front and carry a `base_lr` per object. Here the BASE
-//! rate stays the trainer's `learning_rate` and the schedule is a FACTOR, so
+//! rate stays the trainer's `learning_rate` and the schedule is a FACTOR,
 //! `lr=` and `lr_schedule=` compose: changing the base changes the whole curve,
-//! and the recorded name does not embed a number that a resume would have to
+//! and the recorded name does not embed a number that a resume would have
 //! agree with twice.
 
 use crate::utils::training::run_progress;
@@ -55,7 +55,7 @@ pub enum LrSchedule {
     /// `floor → base` on a cosine over the whole budget, where
     /// `floor = base · min_ratio`.
     Cosine { min_ratio: f32 },
-    /// Up from `base/10` to `base` over the first `warmup_frac` of the budget, then
+    /// Up from `base/10` to `base` over the first `warmup_frac` of the budget,
     /// a cosine down to `base/100` — the one-cycle shape at two knobs.
     OneCycle { warmup_frac: f32 },
     /// A cosine triangle between `base · min_ratio` and `base`, period `period`.
@@ -78,7 +78,7 @@ impl LrSchedule {
         "warmup",
     ];
 
-    /// Parse a name, with or without knobs. Bare names take the defaults; the
+    /// Parse a name, with or without knobs. Bare names take the defaults;
     /// recorded form (`cosine(0.1)`) round-trips through [`Self::label`].
     pub fn parse(name: &str) -> Option<Self> {
         let name = name.trim();
@@ -103,9 +103,7 @@ impl LrSchedule {
                     gamma: num(0)?,
                     milestones: args[1..].iter().filter_map(|m| m.parse().ok()).collect(),
                 }),
-                "cosine" => Some(Self::Cosine {
-                    min_ratio: num(0)?,
-                }),
+                "cosine" => Some(Self::Cosine { min_ratio: num(0)? }),
                 "onecycle" => Some(Self::OneCycle {
                     warmup_frac: num(0)?,
                 }),
@@ -120,7 +118,7 @@ impl LrSchedule {
         }
         match name {
             "constant" | "none" | "off" => Some(Self::Constant),
-            // Bare `cosine` is the schedule's own shape at its default floor; the
+            // Bare `cosine` is the schedule's own shape at its default floor;
             // name is an alias, so `cosine` and `cosine_loss`-style typos stay apart.
             "step_decay" | "step" => Some(Self::StepDecay {
                 step_size: DEFAULT_STEP_SIZE,
@@ -148,7 +146,7 @@ impl LrSchedule {
         }
     }
 
-    /// The canonical, recorded spelling — knobs included, so
+    /// The canonical, recorded spelling — knobs included,
     /// `parse(&schedule.label()) == Some(schedule)`.
     pub fn label(&self) -> String {
         match self {
@@ -171,9 +169,6 @@ impl LrSchedule {
     }
 
     /// The learning rate at `step`, given the trainer's `base` and the run budget.
-    ///
-    /// Pure: no state, no clock of its own — see the module docs. A progress shape
-    /// with `max_steps = None` returns `base` rather than guess a horizon.
     pub fn lr(&self, base: f32, step: usize, max_steps: Option<usize>) -> f32 {
         let progress = || run_progress(step, max_steps);
         match self {
@@ -225,7 +220,7 @@ impl LrSchedule {
             }
             Self::Warmup { steps } => {
                 let steps = (*steps).max(1);
-                // `step + 1`: the first clock is already EARNING rate instead of
+                // `step + 1`: the first clock is already EARNING rate instead
                 // training at zero, which would waste a step of every run.
                 let t = ((step + 1) as f32 / steps as f32).min(1.0);
                 base * t
@@ -304,7 +299,11 @@ mod tests {
                 let a = schedule.lr(1e-3, step, budget);
                 let b = schedule.lr(1e-3, step, budget);
                 assert_eq!(a, b, "{} at {step}", schedule.label());
-                assert!(a.is_finite() && a >= 0.0, "{} at {step} → {a}", schedule.label());
+                assert!(
+                    a.is_finite() && a >= 0.0,
+                    "{} at {step} → {a}",
+                    schedule.label()
+                );
             }
         }
     }
@@ -319,7 +318,7 @@ mod tests {
         assert_eq!(LrSchedule::Constant.lr(base, 0, budget), base);
         assert_eq!(LrSchedule::Constant.lr(base, 9, budget), base);
 
-        // step_decay: flat inside a step, halved after it.
+        // step_decay: flat inside a step, halved after
         let step = LrSchedule::StepDecay {
             step_size: 5,
             gamma: 0.5,
@@ -374,7 +373,10 @@ mod tests {
     #[test]
     fn unbounded_runs_keep_the_base_rate() {
         let base = 1e-3f32;
-        assert_eq!(LrSchedule::Cosine { min_ratio: 0.1 }.lr(base, 7, None), base);
+        assert_eq!(
+            LrSchedule::Cosine { min_ratio: 0.1 }.lr(base, 7, None),
+            base
+        );
         assert_eq!(
             LrSchedule::OneCycle { warmup_frac: 0.3 }.lr(base, 7, None),
             base
