@@ -14,10 +14,10 @@
 //! regenerates wiring identically to a fresh graph with the same options
 //! (`Topology::to_json` / `Topology::from_json` delegate here).
 //!
-//! Weights are **never** serialized — the blueprint is the single source of
+//! Weights are **never** serialized — the blueprint is the single source
 //! truth, and the executable module is rebuilt with fresh random weights via
-//! [`Network::build`](crate::graph::network::Network::build). Saving a
-//! found architecture is `graph.to_json()`, reloading it is
+//! [`Network::build`](crate::graph::network::Network::build). Saving
+//! found architecture is `graph.to_json()`, reloading
 //! `Topology::from_json(&json)` then `Network::build(&graph, device)`.
 
 use fastrand::Rng;
@@ -26,11 +26,12 @@ use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::graph::node::Node;
-use crate::graph::topology::{Connection, Topology, TopologyOptions};    /// JSON round-trip representation of a [`Topology`] — the blueprint minus
-    /// the RNG. `options.topology_seed` makes regeneration reproducible.
+use crate::graph::topology::{Connection, Topology, TopologyOptions};
+/// JSON round-trip representation of a [`Topology`] — the blueprint minus
+/// the RNG. `options.topology_seed` makes regeneration reproducible.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Spec {
-    /// Topology id this blueprint was captured from.
+    /// Topology id this blueprint was captured
     pub id: usize,
     /// The options the graph was built with (incl. `topology_seed`).
     pub options: TopologyOptions,
@@ -73,15 +74,12 @@ impl<'de> Deserialize<'de> for Topology {
             graph_inputs: spec.graph_inputs,
             graph_outputs: spec.graph_outputs,
             connections: spec.connections,
-            // Reproducibility: the RNG is re-seeded from options.topology_seed, so
+            // Reproducibility: the RNG is re-seeded from options.topology_seed,
             // a loaded graph regenerates wiring identically to a fresh one.
             rng: Rng::with_seed(spec.options.topology_seed as u64),
         };
-            // Reading is the ONE place old wiring enters the process, and a run recorded
-            // before the one-wire-per-port refactor may stack wires on a port. Split them
-            // here so every in-memory graph satisfies the invariant `validate` enforces —
-            // the engine's inheritance path loads the previous run's `nets/*.json`
-            // automatically, so a raw loaded graph must never be unusable.
+        // Reading is the ONE place old wiring enters the process, and a run recorded before
+        // one-wire-per-port refactor may stack wires on a port.
         topology.unstack_input_ports();
         Ok(topology)
     }
@@ -133,8 +131,9 @@ mod tests {
     }
 
     #[test]
-    fn test_topology_json_rebuilds_same_architecture() {            // The blueprint is the single source of truth: saving/loading it and
-            // re-building yields the same architecture (fresh random weights).
+    fn test_topology_json_rebuilds_same_architecture() {
+        // The blueprint is the single source of truth: saving/loading
+        // re-building yields the same architecture (fresh random weights).
         use crate::graph::network::Network;
         use crate::graph::node::Activation;
         use flodl::nn::Module;

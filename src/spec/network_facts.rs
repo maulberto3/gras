@@ -1,7 +1,4 @@
 //! Materialized-network diagnostics — the network's "nutrition label".
-//!
-//! Mirrors what [`Network::to_json`] used to produce; lives here alongside
-//! [`Spec`](super::Spec) so all serialization stays in one module.
 
 use flodl::nn::Module;
 
@@ -38,9 +35,9 @@ pub struct NetworkFacts {
     pub orphan_counts: (usize, usize),
     /// `(input, hidden, output)` node counts.
     pub kind_counts: (usize, usize, usize),
-    /// Activation → how many nodes use it.
+    /// Activation → how many nodes use
     pub activation_counts: Vec<(crate::graph::node::Activation, usize)>,
-    /// Normalization op → how many nodes use it.
+    /// Normalization op → how many nodes use
     pub standardize_counts: Vec<(crate::graph::node::StandardizeOp, usize)>,
     /// Per-port activation census over the whole graph (node-level + per-port
     /// overrides combined — what actually flows, port by port).
