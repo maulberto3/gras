@@ -1,19 +1,11 @@
 //! Deterministic seed derivation — the one place child-seed math lives.
-//!
-//! Every seeded stream in the crate derives from this one function:
-//! - individual `i` of the initial population: `derive_seed(run_seed, i)`
-//!   (also the topology `options.topology_seed`)
-//! - generation `g`'s trainer seed (train/eval split + batch sampling):
-//!   `derive_seed(run_seed, g)`
-//! - selection/crossover/mutation streams: `derive_seed(run_seed, g*3 + k)`
-//! - step-race child weight seeds: `derive_seed(run_seed, clock)`
 
 /// Deterministic child-seed derivation: multiply by golden ratio for spread.
 pub fn derive_seed(base: u64, i: usize) -> u64 {
     base.wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
-/// xxh3 of a topology's canonical JSON — 16 hex chars, deterministic. The
+/// xxh3 of a topology's canonical JSON — 16 hex chars, deterministic.
 /// topology's identity everywhere it appears (net files, race snapshots).
 pub fn topo_hash(topology_json: &str) -> String {
     format!(
@@ -21,6 +13,16 @@ pub fn topo_hash(topology_json: &str) -> String {
         xxhash_rust::xxh3::xxh3_64(topology_json.as_bytes())
     )
 }
+
+/// The run-wide seed every net's INITIAL WEIGHTS are drawn from — the same for founders, children
+/// and immigrants.
+pub fn weight_seed(run_seed: u64) -> usize {
+    derive_seed(run_seed, WEIGHT_INIT_ORDINAL) as usize
+}
+
+/// Ordinal the shared weight seed lives at: far above every `clock * 1024 + child_idx`
+/// roll and every founder ordinal, so a structural seed can never collide
+const WEIGHT_INIT_ORDINAL: usize = usize::MAX / 2;
 
 #[cfg(test)]
 mod tests {

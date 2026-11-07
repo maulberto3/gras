@@ -1,4 +1,4 @@
-//! Safetensors export — write a built [`Network`]'s parameters as a
+//! Safetensors export — write a built [`Network`]'s parameters
 //! `.safetensors` file (Hugging Face's simple tensor serialization format).
 //!
 //! The format is deliberately tiny: an 8-byte little-endian header length,
@@ -12,7 +12,7 @@
 //!
 //! Naming convention — **two families**, both required:
 //!
-//! - one Linear per graph node ⇒ `node<N>.weight` `[out, in]` and
+//! - one Linear per graph node ⇒ `node<N>.weight` `[out,
 //!   `node<N>.bias` `[out]` (when present);
 //! - one Linear per **cross-dim bridge** (a wire whose source and target dims
 //!   differ) ⇒ `proj<N>_<port>_<src>.weight` `[in_dim, src_dim]` (+ `.bias`),
@@ -20,14 +20,14 @@
 //!
 //! A Python-side mirror builds `torch.nn.Linear(in, out)` per node, applies
 //! the `proj*` layers to the wires that need them, and `load_state_dict`-style
-//! copies by the same names — no gras code needed at inference. Writing only
-//! the `node*` family produces a net that looks right and behaves like a
+//! copies by the same names — no gras code needed at inference. Writing
+//! the `node*` family produces a net that looks right and behaves like
 //! stranger: the bridges stay at their random init, and on a net with mixed
 //! dims those bridges sit on the critical path.
 //!
 //! Round-trip: [`export_safetensors`] writes it, [`load_safetensors`] reads
-//! it back into an already-built [`Network`] (shapes must match — the
-//! blueprint is still the source of topology truth). This is what lets the
+//! it back into an already-built [`Network`] (shapes must match —
+//! blueprint is still the source of topology truth). This is what lets
 //! guardrail re-check the CHAMPION's trained weights, not a newborn's.
 
 use std::path::{Path, PathBuf};
@@ -51,9 +51,7 @@ fn collect_tensors(net: &Network) -> Result<Vec<TensorBlob>> {
     for (idx, layer) in net.layers.iter().enumerate() {
         push_linear(&mut blobs, &format!("node{idx}"), layer)?;
     }
-        // `proj<N>_<port>_0`: one bridge per input port, so the trailing source index is
-        // always 0 — kept because the Python loader builds the same name the same way
-        // (`proj<node>_<port>_<wire index within the port>`).
+    // `proj<N>_<port>_0`: one bridge per input port, so the trailing source index
     for (node, ports) in net.port_projections.iter().enumerate() {
         for (port, proj) in ports.iter().enumerate() {
             if let Some(linear) = proj {
@@ -125,7 +123,7 @@ fn serialize(blobs: &[TensorBlob]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Write a built [`Network`]'s parameters to `path` in safetensors; returns the
+/// Write a built [`Network`]'s parameters to `path` in safetensors; returns
 /// path. Works on CPU/CUDA (blobs copied to host little-endian).
 pub fn export_safetensors(net: &Network, path: &Path) -> Result<PathBuf> {
     let blobs = collect_tensors(net)?;
@@ -170,8 +168,8 @@ pub fn load_safetensors(net: &mut Network, path: &Path) -> Result<()> {
             }
         }
     }
-        // Same count as `Network::parameters()`; checked AFTER loading so a
-        // partial file cannot pass.
+    // Same count as `Network::parameters()`; checked AFTER loading
+    // partial file cannot pass.
     use flodl::nn::Module;
     let expected = net.parameters().len();
     if copied != expected {
@@ -208,7 +206,7 @@ fn load_linear(
     Ok(copied)
 }
 
-/// Copy one header entry's blob into a parameter variable, checking shape. The
+/// Copy one header entry's blob into a parameter variable, checking shape.
 /// tensor is built on CPU then moved to the parameter's device (CUDA-safe).
 fn copy_entry(
     entry: &serde_json::Value,
@@ -238,7 +236,7 @@ fn copy_entry(
             cur.shape()
         )));
     }
-    // Place the host tensor on the parameter's device (no-op on CPU, the
+    // Place the host tensor on the parameter's device (no-op on CPU,
     // crucial step on CUDA — see the doc comment).
     let t = t.to_device(cur.device())?;
     variable.set_data(t);
@@ -311,7 +309,7 @@ mod tests {
         assert!(header.contains_key("node0.weight"));
         assert!(header.contains_key("node1.weight"));
 
-        // 4. ROUND-TRIP: load the file back into a rebuilt network and
+        // 4. ROUND-TRIP: load the file back into a rebuilt network
         //    verify parameters are byte-identical to the exported ones.
         let mut net2 = Network::build(&graph, flodl::tensor::Device::CPU).unwrap();
         load_safetensors(&mut net2, &path).unwrap();
@@ -394,7 +392,7 @@ mod tests {
             );
         }
 
-        // A PARTIAL file must be rejected loudly, never silently applied — that
+        // A PARTIAL file must be rejected loudly, never silently applied —
         // silence is how a guardrail reported 25/500 on a 500 champion.
         let truncated = dir.join("partial.safetensors");
         let only_header_len = 8 + hdr_len;

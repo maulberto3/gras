@@ -1,21 +1,4 @@
-//! Custom error types  — one enum per domain, all in one place.
-//!
-//! Every module's fallible paths build its **typed** error here, then convert
-//! into flodl's [`TensorError`] at the API boundary (the public signatures
-//! stay `flodl::tensor::Result`). The conversion is a single `From` impl per
-//! enum, so call sites never format strings for errors.
-//!
-//! - [`TopologyError`] — blueprint validation ([`Topology::validate`]).
-//! - [`NodeError`] — per-node invariants. Forward-looking: node constructors
-//!   are infallible today and `Activation::apply` delegates straight to
-//!   flodl, so nothing constructs these yet — they exist so future node-level
-//!   rules (port sanity, dim checks) have a typed home.
-//! - [`NetworkError`] — compiling a blueprint into a [`Network`] module.
-//! - [`EngineError`] — the NAS loop (options, data contract, checkpoints).
-//! - [`DataError`] — the tensor file/dataset format.
-//!
-//! [`Topology::validate`]: crate::graph::topology::Topology::validate
-//! [`Network`]: crate::graph::network::Network
+//! Custom error types — one enum per domain, all in one place.
 
 use std::fmt::Display;
 use std::io;
@@ -46,9 +29,7 @@ pub enum TopologyError {
     PortOutOfBounds { port: Port, num_ports: usize },
     /// An output port feeds two inputs (violates 1:1 pairing).
     DoubleUsedOutput(Port),
-    /// An input port receives more than one wire. A port is a socket, not a
-    /// bucket: fan-in is extra input ports (`rewire_orphaned_outputs` grows
-    /// one when every socket is taken).
+    /// An input port receives more than one wire.
     MultiWiredInputPort(Port),
 }
 
@@ -89,29 +70,6 @@ impl Display for TopologyError {
 }
 
 // ── Node ─────────────────────────────────────────────────────────────────
-
-/// Per-node invariant violations — forward-looking: nothing constructs these
-/// yet; they give future node-level rules (port sanity, dim checks) a home.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum NodeError {
-    /// A node with zero input **and** zero output ports contributes nothing.
-    ZeroPorts(usize),
-    /// A `hidden_dim` override of 0 is invalid (also rejected by
-    /// `Topology::validate`).
-    ZeroHiddenDim(usize),
-}
-
-impl Display for NodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NodeError::ZeroPorts(id) => {
-                write!(f, "node n{id} has neither input nor output ports")
-            }
-            NodeError::ZeroHiddenDim(id) => write!(f, "node n{id} has hidden_dim 0"),
-        }
-    }
-}
 
 // ── Network ──────────────────────────────────────────────────────────────
 
@@ -187,7 +145,7 @@ pub enum DataError {
         expected: usize,
         found: usize,
     },
-    /// `inputs` and `targets` disagree on how many samples they hold. Raised by
+    /// `inputs` and `targets` disagree on how many samples they hold. Raised
     /// an IN-MEMORY dataset constructor, so there is no file to name.
     RowCountMismatch { inputs: usize, targets: usize },
     /// A dtype we can't write to disk (only Float32/Float64/Int64).

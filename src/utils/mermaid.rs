@@ -3,9 +3,8 @@
 use crate::graph::node::NodeKind;
 use crate::graph::topology::{FeatureSplitPolicy, Topology};
 
-/// How a blueprint's feature split names itself in a doc: the policy, when one is
-/// recorded, else `rows` (masks present without a policy is a legacy record the load
-/// path reconciles; naming them `rows` describes what is actually there).
+/// How a blueprint's feature split names itself in a doc: the policy, when one is recorded, else
+/// `rows` (masks present without a policy is a legacy record the load path reconciles; naming them
 pub(crate) fn split_policy_name(policy: Option<FeatureSplitPolicy>) -> &'static str {
     match policy {
         Some(FeatureSplitPolicy::Exclusive) => "exclusive",
@@ -15,23 +14,13 @@ pub(crate) fn split_policy_name(policy: Option<FeatureSplitPolicy>) -> &'static 
     }
 }
 
-/// The Input node's feature split as one line — `split random · 8p · 392/784 seen` — or
-/// `None` when the net has none.
-///
-/// `None` is the absence of rows, not an all-ones row: an unsplit Input port carries the
-/// shared mixed vector, so there is nothing to draw and the box stays the bare `in <n>`
-/// it has always been. `seen` is how many features reach AT LEAST one port — the one
-/// number that separates a true partition (`exclusive`, 100% by construction) from a coin
-/// flip (`random`, which drops some features and duplicates others).
+/// The Input node's feature split as one line — `split random · 8p · 392/784 seen` — or `None`
+/// the net has none.
 pub(crate) fn feature_split_cell(graph: &Topology) -> Option<String> {
     let masks = graph.input_feature_masks()?;
     let input_dim = graph.options.input_dim.unwrap_or(1).max(1);
     let seen = (0..input_dim)
-        .filter(|f| {
-            masks
-                .iter()
-                .any(|m| m.get(*f).copied().unwrap_or(0) != 0)
-        })
+        .filter(|f| masks.iter().any(|m| m.get(*f).copied().unwrap_or(0) != 0))
         .count();
     Some(format!(
         "split {} · {}p · {}/{} seen",
@@ -56,16 +45,13 @@ pub fn topology_mermaid(graph: &Topology) -> String {
     );
     let dim_range = (max_dim.saturating_sub(min_dim)).max(1);
 
-        // Node definitions — COMPACT one-line labels; Mermaid auto-sizes boxes, so
-        // multi-line labels balloon every box.
+    // Node definitions — COMPACT one-line labels; Mermaid auto-sizes boxes,
+    // multi-line labels balloon every box.
     for node in &graph.nodes {
         let label = match node.kind {
             NodeKind::Input => {
-                    // The Input box is where the feature split belongs: it is Genome on
-                    // the INPUT's ports, so a reader who wants to know whether this net
-                    // partitions its columns sees it on the box the wires leave from.
-                    // One `<br/>` and only on this node: the Input box has no combine or
-                    // dim text to share the line with, and every other box stays compact.
+                // The Input box is where the feature split belongs: it is Genome on the INPUT's
+                // ports, so a reader who wants to know whether this net partitions its columns sees
                 match feature_split_cell(graph) {
                     Some(split) => format!(
                         "n{}[\"in {}<br/>{}\"]",
@@ -82,8 +68,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
             }
             NodeKind::Hidden => {
                 let dim = node.hidden_dim.unwrap_or(8);
-                    // Activation moves OFF the label (per-port ops belong on the
-                    // wire); label = combine + std + dim, kept one line.
+                // Activation moves OFF the label (per-port ops belong
+                // wire); label = combine + std + dim, kept one line.
                 let combine = node
                     .combine_op
                     .map(|c| c.to_string())
@@ -95,8 +81,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
                 format!("n{}[\"H{} {}·{} {}\"]", node.id, node.id, combine, std, dim)
             }
             NodeKind::Output => {
-                    // Same combine·std·dim shape, prefixed `out`; activation omitted
-                    // (fixed identity readout).
+                // Same combine·std·dim shape, prefixed `out`; activation omitted
+                // (fixed identity readout).
                 let combine = node
                     .combine_op
                     .map(|c| c.to_string())
@@ -117,8 +103,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         out.push_str(&format!("    {}\n", label));
     }
 
-        // Node borders — stroke-width from the node's hidden_dim (per-net
-        // normalized); one inline `style` line per node.
+    // Node borders — stroke-width from the node's hidden_dim (per-net
+    // normalized); one inline `style` line per node.
     const MIN_BORDER: f32 = 0.5;
     /// Thickest border stroke (widest hidden dim in the net).
     const MAX_BORDER: f32 = 5.0;
@@ -132,8 +118,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         ));
     }
 
-        // Edges — stroke-width scaled by HOP DISTANCE, so long-range skips render
-        // as thick trunks; normalized per net.
+    // Edges — stroke-width scaled by HOP DISTANCE, so long-range skips render
+    // as thick trunks; normalized per net.
     const MIN_WIDTH: f32 = 0.5;
     /// Thickest edge stroke (longest hop in the net).
     const MAX_WIDTH: f32 = 5.0;
@@ -145,12 +131,12 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         .unwrap_or(1)
         .max(1);
     for (idx, conn) in graph.connections.iter().enumerate() {
-            // Edge label = the SOURCE PORT's activation: the wire carries the
-            // non-linearity, so the signal name belongs on the arrow.
+        // Edge label = the SOURCE PORT's activation: the wire carries
+        // non-linearity, so the signal name belongs on the arrow.
         let edge_act = graph.nodes[conn.from.node].port_activation(conn.from.index);
         let act = format!("{:#?}", edge_act).to_lowercase();
-            // No port annotation: dedup guarantees at most one wire per
-            // (source → target, activation), so parallel wires differ by label.
+        // No port annotation: dedup guarantees at most one wire per
+        // (source → target, activation), so parallel wires differ by label.
         out.push_str(&format!(
             "    n{} -- {} --> n{}\n",
             conn.from.node, act, conn.to.node
@@ -164,8 +150,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         ));
     }
 
-        // Orphaned ports — the mermaid counterpart of the ASCII `*` marks;
-        // markers styled invisible (bare dashed whiskers).
+    // Orphaned ports — the mermaid counterpart of the ASCII `*` marks;
+    // markers styled invisible (bare dashed whiskers).
     let mut orphan_idx = graph.connections.len();
     let output_id = graph
         .nodes
@@ -173,8 +159,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         .find(|n| n.kind == NodeKind::Output)
         .map(|n| n.id);
     for node in &graph.nodes {
-            // The Output node's port always "dangles" by design (it's the exit, not
-            // an unused port) — skip it so mermaid doesn't invent an orphan.
+        // The Output node's port always "dangles" by design (it's the exit,
+        // an unused port) — skip it so mermaid doesn't invent an orphan.
         let is_output = Some(node.id) == output_id;
         for port in 0..node.num_inputs {
             let wired = graph

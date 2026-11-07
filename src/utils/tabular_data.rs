@@ -1,6 +1,6 @@
 //! Tensor data I/O — the engine's data contract.
 //!
-//! The engine consumes data as a **path to tensors** (flodl-native; this
+//! The engine consumes data as a **path to tensors** (flodl-native;
 //! crate deals with no other data formats). Since flodl has no built-in
 //! `Tensor::save`/`load`, this module owns the tiny binary tensor format
 //! used on disk:
@@ -10,9 +10,9 @@
 //!   | shape (ndim × u64 LE) | raw bytes
 //! ```
 //!
-//! Deliberately **dependency-light**: pure `std` + flodl + fastrand (all
+//! Deliberately **dependency-light**: pure `std` + flodl + fastrand
 //! already in the crate), so the library binary stays lean. Real-world
-//! dataset producers that need HTTP (e.g. a MNIST downloader) live in
+//! dataset producers that need HTTP (e.g. a MNIST downloader) live
 //! `examples/` and use `[dev-dependencies]` instead.
 
 use std::fs;
@@ -44,12 +44,8 @@ impl Dataset {
         self.len() == 0
     }
 
-        /// Build a dataset from tensors already in memory — the same pair
-        /// [`load_dataset`] returns, with no directory in between.
-        ///
-        /// Checks the one invariant the engine relies on: `inputs` and `targets`
-        /// describe the SAME number of samples (row 0 of each). Their column
-        /// counts are free — the graph and the trainer decide those.
+    /// Build a dataset from tensors already in memory — the same pair [`load_dataset`] returns,
+    /// with no directory in between.
     pub fn from_tensors(inputs: Tensor, targets: Tensor) -> Result<Dataset> {
         let rows = |t: &Tensor| t.shape().first().copied().unwrap_or(0) as usize;
         let (rows_in, rows_out) = (rows(&inputs), rows(&targets));
@@ -63,8 +59,8 @@ impl Dataset {
         Ok(Dataset { inputs, targets })
     }
 
-        /// Cast both tensors to `Float32` (flodl's workhorse dtype) so a dataset
-        /// written in another dtype is normalized once, up front.
+    /// Cast both tensors to `Float32` (flodl's workhorse dtype) so a dataset
+    /// written in another dtype is normalized once, up front.
     pub fn to_f32(&self) -> Result<Dataset> {
         self.to_dtype(DType::Float32)
     }
@@ -102,8 +98,8 @@ impl Dataset {
         })
     }
 
-        /// Row-concatenate two datasets (`self` rows first) — shared dims/device —
-        /// used by the explicit train/test layout to build pools by construction.
+    /// Row-concatenate two datasets (`self` rows first) — shared dims/device —
+    /// used by the explicit train/test layout to build pools by construction.
     pub fn concat(&self, other: &Dataset) -> Result<Dataset> {
         Ok(Dataset {
             inputs: Tensor::cat_many(&[&self.inputs, &other.inputs], 0)?,
@@ -220,11 +216,11 @@ pub fn load_tensor(path: &Path) -> Result<Tensor> {
 /// On-disk format for [`save_dataset_as`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataFormat {
-        /// flodl-native binary tensors (`inputs.bin` + `targets.bin` + `meta.json`):
-        /// lossless and fast — the engine's native format.
+    /// flodl-native binary tensors (`inputs.bin` + `targets.bin` + `meta.json`):
+    /// lossless and fast — the engine's native format.
     Bin,
-        /// Plain-text floats (`inputs.csv` + `targets.csv`, 6-decimal precision):
-        /// human-inspectable and portable, lossy for full f32 precision.
+    /// Plain-text floats (`inputs.csv` + `targets.csv`, 6-decimal precision):
+    /// human-inspectable and portable, lossy for full f32 precision.
     Csv,
     /// Write **both** formats into `dir`, so the same dataset is usable
     /// by tools that only read one or the other.
@@ -234,8 +230,8 @@ pub enum DataFormat {
 /// Save a dataset in the requested format — one-stop over [`save_dataset`] (`.bin`)
 /// and [`save_csv_dataset`] (`.csv`); `Both` writes all four files.
 pub fn save_dataset_as(dir: impl AsRef<Path>, ds: &Dataset, format: DataFormat) -> Result<()> {
-        // `impl AsRef<Path>` is an owned generic — normalize to `&Path` ONCE up front
-        // and reuse the borrow.
+    // `impl AsRef<Path>` is an owned generic — normalize to `&Path` ONCE up front
+    // and reuse the borrow.
     let dir = dir.as_ref();
     match format {
         DataFormat::Bin => save_dataset(dir, ds),
@@ -267,8 +263,8 @@ pub fn load_dataset_auto(dir: impl AsRef<Path>) -> Result<Dataset> {
     .into())
 }
 
-/// Save a dataset into `dir` as `inputs.bin` + `targets.bin`, plus a
-/// human-readable `meta.json` with the tensor shapes (informational only).
+/// Save a dataset into `dir` as `inputs.bin` + `targets.bin`, plus
+/// human-readable `meta.json` with the tensor shapes (informational
 pub fn save_dataset(dir: impl AsRef<Path>, ds: &Dataset) -> Result<()> {
     let dir = dir.as_ref();
     fs::create_dir_all(dir).map_err(|source| DataError::Io {
@@ -299,7 +295,7 @@ pub fn load_dataset(dir: impl AsRef<Path>) -> Result<Dataset> {
     Ok(Dataset { inputs, targets })
 }
 
-/// Auto-detect the format: `flodl_data/inputs.bin`, then `inputs.bin`, then
+/// Auto-detect the format: `flodl_data/inputs.bin`, then `inputs.bin`,
 /// `inputs.csv` (converted + cached). Errors loudly — no synthetic fallback.
 pub fn resolve_dataset(dir: impl AsRef<Path>) -> Result<Dataset> {
     resolve_inputs_targets_datasets(dir)
@@ -343,16 +339,13 @@ pub fn resolve_inputs_targets_datasets(dir: impl AsRef<Path>) -> Result<Dataset>
     .into())
 }
 
-/// Resolve a **two-split** dataset dir (`train/` + `test/`), each with
+/// Resolve a **two-split** dataset dir (`train/` + `test/`), each
 /// `inputs.csv|bin` + `targets.csv|bin`; returns two independent datasets.
 pub fn resolve_train_test_datasets(dir: impl AsRef<Path>) -> Result<(Dataset, Dataset)> {
     resolve_two_splits(dir.as_ref(), "train", "test")
 }
 
-/// Resolve a **`train/` + `val/`** dir: `train/` learns, `val/` is the pool the race
-/// RANKS on. The third role comes free — a sibling `test/` beside `val/` becomes the
-/// untouched report (see [`exam_dir`]), because once `val/` ranks there are no unread
-/// rows left in `test/` that selection has seen.
+/// Resolve a **`train/` + `val/`** dir: `train/` learns, `val/` is the pool the race RANKS
 pub fn resolve_train_val_datasets(dir: impl AsRef<Path>) -> Result<(Dataset, Dataset)> {
     resolve_two_splits(dir.as_ref(), "train", "val")
 }
@@ -379,7 +372,7 @@ fn resolve_two_splits(dir: &Path, learn: &str, rank: &str) -> Result<(Dataset, D
     }
     let learn_ds = resolve_inputs_targets_datasets(&learn_dir)?;
     let rank_ds = resolve_inputs_targets_datasets(&rank_dir)?;
-    // Feature/target dims must agree across splits — a dim mismatch would only
+    // Feature/target dims must agree across splits — a dim mismatch would
     // surface later as a cryptic shape error mid-step.
     let (li, ri) = (learn_ds.inputs.shape()[1], rank_ds.inputs.shape()[1]);
     if li != ri {
@@ -402,10 +395,10 @@ fn resolve_two_splits(dir: &Path, learn: &str, rank: &str) -> Result<(Dataset, D
 /// (no config flag, no setter): the layout on disk is the contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolLayout {
-    /// One pool (`inputs.csv|bin` + `targets.csv|bin`): the engine splits it by
+    /// One pool (`inputs.csv|bin` + `targets.csv|bin`): the engine splits
     /// `eval_share`, so there is no held-out number beyond that split.
     Single,
-    /// `train/` + `val/` — train learns, **val ranks**, and a sibling `test/` is the
+    /// `train/` + `val/` — train learns, **val ranks**, and a sibling `test/`
     /// report-only exam.
     TrainVal,
     /// `train/` + `test/` — the pre-2026-11-02 layout: `test/` is the pool the race
@@ -425,7 +418,7 @@ impl PoolLayout {
     }
 }
 
-/// Read the layout off the directory. Refusals are by NAME: a `val/` with nothing to
+/// Read the layout off the directory. Refusals are by NAME: a `val/` with nothing
 /// learn from, or three role dirs where one of them would be read by nobody.
 pub fn detect_pool_layout(dir: impl AsRef<Path>) -> Result<PoolLayout> {
     let dir = dir.as_ref();
@@ -458,10 +451,6 @@ pub fn detect_pool_layout(dir: impl AsRef<Path>) -> Result<PoolLayout> {
 }
 
 /// Where the EXAM rows live for a layout, or `None` when nothing is held out.
-///
-/// One rule for birth and resume: a sibling `exam/` wins, and a `test/` beside a
-/// ranking `val/` is the exam (it is the row set selection never sees). Under
-/// [`PoolLayout::TrainTest`] `test/` is the ranking pool, so it is NOT the exam.
 pub fn exam_dir(dir: &Path, layout: PoolLayout) -> Option<std::path::PathBuf> {
     let exam = dir.join("exam");
     if exam.exists() {
@@ -754,7 +743,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The in-memory constructor takes the same pair the loaders produce, and
+    /// The in-memory constructor takes the same pair the loaders produce,
     /// refuses the one shape the engine cannot use.
     #[test]
     fn from_tensors_accepts_matching_rows_and_rejects_a_mismatch() {

@@ -45,11 +45,8 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             .unwrap_or_else(|| "?".into()),
     ));
 
-    // ── The two blueprint knobs that never appear in a box ──
-    // A reader diffing two `elite-*.md` files needs the split and the seed: the split
-    // decides WHICH features each branch can see, and the seed is what makes this exact
-    // blueprint reproducible. Load a file without them and two nets can read identically
-    // while computing different things (the masks are genome, see `Node::feature_masks`).
+    // ── The two blueprint knobs that never appear in a box ── A reader diffing two `elite-*.md`
+    // files needs the split and the seed: the split decides WHICH features each branch can see,
     let mut knobs: Vec<String> = Vec::new();
     match graph.input_feature_masks() {
         Some(masks) => knobs.push(format!(
@@ -57,17 +54,13 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             split_policy_name(graph.options.feature_split),
             masks.len()
         )),
-        None => knobs.push(
-            "no feature split — every Input port sees every feature".to_string(),
-        ),
+        None => knobs.push("no feature split — every Input port sees every feature".to_string()),
     }
-        // ALWAYS printed, even at 0.00: a gene that vanishes at its own default cannot be
-        // diffed between two files, and dropout is a real gene on every net (an elite at
-        // 0.00 and one at 0.25 used to render the same Blueprint line).
+    // ALWAYS printed, even at 0.00: a gene that vanishes at its own default cannot be diffed
+    // between two files, and dropout is a real gene on every net (an elite at 0.00 and one at 0.25
     knobs.push(format!("dropout {:.2}", graph.options.dropout_prob));
-        // Seed PLUS the bounds it was drawn from: a seed alone reproduces a blueprint only
-        // when the ranges that constrained the draw travel with it, and this file is meant
-        // to outlive the run dir that holds `engine.json`.
+    // Seed PLUS the bounds it was drawn from: a seed alone reproduces a blueprint
+    // ranges that constrained the draw travel with it, and this file is meant to outlive the run
     let o = &graph.options;
     out.push_str(&format!(
         "Blueprint: {} · topology seed {} · sampled {}–{} nodes · {}–{} in · {}–{} out\n\n",
@@ -151,33 +144,23 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     }
     out.push('\n');
 
-    // ── Feature split — the Input node's per-port genome ──
-    // The rows are genome (`M:<width>` in the diversity tokens) but a table cannot show
-    // them: they live per PORT, not per node. One row per port is the whole of it, and
-    // the coverage line is the number that matters — `exclusive` covers every feature by
-    // construction, `random` can drop one entirely (a feature no branch ever sees).
+    // ── Feature split — the Input node's per-port genome ── The rows are genome (`M:<width>`
+    // the diversity tokens) but a table cannot show them: they live per PORT, not per node.
     if let Some(masks) = graph.input_feature_masks() {
         let input_dim = graph.options.input_dim.unwrap_or(1).max(1);
         let seen = (0..input_dim)
-            .filter(|f| {
-                masks
-                    .iter()
-                    .any(|m| m.get(*f).copied().unwrap_or(0) != 0)
-            })
+            .filter(|f| masks.iter().any(|m| m.get(*f).copied().unwrap_or(0) != 0))
             .count();
         let total: usize = masks
             .iter()
             .map(|m| m.iter().filter(|b| **b != 0).count())
             .sum();
         let mean = total as f32 / masks.len().max(1) as f32;
-        // The accounting is the check a reader can do at a glance: `exclusive` is a
-        // partition, so the rows must add up to exactly one full vector (100%). A bigger
-        // total means some port ALSO sees what another port owns — a cover-all row beside
-        // a partition, which is `inherited` content and is labelled as such.
+        // The accounting is the check a reader can do at a glance: `exclusive` is a partition,
+        // the rows must add up to exactly one full vector (100%).
         let pct = 100.0 * total as f32 / input_dim as f32;
-        // The accounting means something DIFFERENT per policy, so the sentence says what
-        // this net's own label makes of it: 100% is a partition, >100% is sharing, <100% is
-        // dropped features — and only `exclusive` promises which of the three it is.
+        // The accounting means something DIFFERENT per policy, so the sentence says what this net's
+        // own label makes of it: 100% is a partition, >100% is sharing, <100% is dropped features —
         let accounting = match graph.options.feature_split {
             Some(FeatureSplitPolicy::Exclusive) => format!(
                 "`exclusive` is a partition, so this must account for exactly **100%** — {}",
@@ -203,11 +186,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
         out.push_str("| port | keeps | share | features |\n|---:|---:|---:|---|\n");
         for (port, mask) in masks.iter().enumerate() {
             let keeps = mask.iter().filter(|b| **b != 0).count();
-            let note = if keeps == 0 {
-                " (bias only)"
-            } else {
-                ""
-            };
+            let note = if keeps == 0 { " (bias only)" } else { "" };
             out.push_str(&format!(
                 "| {port} | {keeps}{note} | {:.1}% | {} |\n",
                 100.0 * keeps as f32 / input_dim as f32,
@@ -288,18 +267,14 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
 }
 
 /// Above this `input_dim`, a mask row is printed as kept INDICES instead of a bit
-/// string: 32 bits is still one glance, 784 is not.
+/// string: 32 bits is still one glance, 784
 const MASK_BIT_MAX_DIM: usize = 32;
 
-/// How many indices the index form may list before it says `… +n`. The cap trims the
-/// VIEW only — `keeps` beside it stays the exact count, so a wide net's file cannot
-/// grow with `input_dim`.
+/// How many indices the index form may list before it says `… +n`.
 const MASK_INDEX_CAP: usize = 32;
 
-/// One mask row, spelled so the reader can check WHICH features a port keeps, not just
-/// how many: a bit string while the vector is short (`1010`), else the kept indices
-/// (`0,2,… +41`). This is the allele the counts alone could not show — `[1,0,0,0]` and
-/// `[0,0,1,0]` keep one feature each and compute different things.
+/// One mask row, spelled so the reader can check WHICH features a port keeps, not just how many:
+/// bit string while the vector is short (`1010`), else the kept indices (`0,2,… +41`).
 fn kept_features(mask: &[u8], input_dim: usize) -> String {
     if input_dim <= MASK_BIT_MAX_DIM {
         return (0..input_dim)
@@ -350,8 +325,7 @@ mod tests {
     }
 
     /// The allele the counts used to hide: a split row now names WHICH features it keeps,
-    /// which is the difference `[1,0,1,0]` makes against `[0,1,0,0]` — both are "keeps 2
-    /// of 4"-ish rows whose counts alone read the same kind of thing.
+    /// the difference `[1,0,1,0]` makes against `[0,1,0,0]` — both are "keeps 2 of 4"-ish rows
     #[test]
     fn a_split_row_names_its_features_instead_of_only_counting_them() {
         use crate::graph::node::Node;
@@ -361,6 +335,7 @@ mod tests {
             Some(TopologyOptions {
                 input_dim: Some(4),
                 output_dim: Some(1),
+                dropout_prob: 0.0,
                 ..Default::default()
             }),
         );
@@ -369,7 +344,10 @@ mod tests {
         g.nodes.push(Node::new_output(2, 1, 1));
         for (from, to) in [(0, 0), (1, 1)] {
             g.connections.push(Connection {
-                from: Port { node: 0, index: from },
+                from: Port {
+                    node: 0,
+                    index: from,
+                },
                 to: Port { node: 1, index: to },
             });
         }
@@ -378,7 +356,7 @@ mod tests {
             to: Port { node: 2, index: 0 },
         });
         g.finalize();
-        // Masks are genome but `finalize` drops them (a rebuild may renumber ports), so
+        // Masks are genome but `finalize` drops them (a rebuild may renumber ports),
         // the fixture installs them exactly where the engine does: after the build.
         g.nodes[0].feature_masks = Some(vec![vec![1, 0, 1, 0], vec![0, 1, 0, 0]]);
         g.options.feature_split = Some(FeatureSplitPolicy::Exclusive);
@@ -397,7 +375,7 @@ mod tests {
         // with the bounds it was drawn from, so the draw is reproducible from the file.
         assert!(md.contains("dropout 0.00"), "{md}");
         assert!(
-            md.contains("sampled 2–5 nodes · 2–5 in · 2–5 out"),
+            md.contains("sampled 2–15 nodes · 2–15 in · 2–15 out"),
             "the topology seed needs its bounds beside it:\n{md}"
         );
     }
@@ -418,7 +396,7 @@ mod tests {
     #[test]
     fn markdown_legend_describes_one_wire_per_port() {
         // The old caveat ("a port with several wires is drawn once per wire") described
-        // the wiring model that no longer exists; the legend must say what replaced it.
+        // the wiring model that no longer exists; the legend must say what replaced
         let md = topology_markdown(&sample(), None);
         assert!(
             md.contains("An input port carries exactly ONE wire"),
@@ -437,7 +415,11 @@ mod tests {
         let g = sample();
         let md = topology_markdown(&g, None);
         for node in &g.nodes {
-            let in_wires = g.connections.iter().filter(|c| c.to.node == node.id).count();
+            let in_wires = g
+                .connections
+                .iter()
+                .filter(|c| c.to.node == node.id)
+                .count();
             assert_eq!(in_wires, node.num_inputs, "n{}", node.id);
             assert!(
                 md.contains(&format!("{}w→{}i", node.num_inputs, node.num_inputs)),

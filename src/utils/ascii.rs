@@ -1,6 +1,5 @@
-//! ASCII diagram primitives used by [`super::markdown`] — the Manhattan-wire
-//! rendering and compact edge list. Extracted from the old ascii module;
-//! only the pieces markdown needs survive.
+//! ASCII diagram primitives used by [`super::markdown`] — the Manhattan-wire rendering and compact
+//! edge list.
 
 use crate::graph::node::NodeKind;
 use crate::graph::topology::{Connection, Topology};
@@ -42,8 +41,8 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
     let labels: Vec<String> = nodes
         .iter()
         .map(|n| {
-                // Wires vs ports on both sides. In = Out on the input side (`2w→2i`:
-                // one wire per port); the output side can fan out (`1o→5w`).
+            // Wires vs ports on both sides. In = Out on the input side (`2w→2i`:
+            // one wire per port); the output side can fan out (`1o→5w`).
             let in_part = format!("{}w→{}i", n.in_wires.max(n.num_inputs), n.num_inputs);
             let out_part = format!("{}o→{}w", n.num_outputs, n.out_wires.max(n.num_outputs));
             match n.out_dim {
@@ -68,10 +67,7 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         .map(|c| c.from.node < c.to.node && c.to.node < nodes.len() && c.to.node > 0)
         .collect();
 
-        // ── Port slots: ONE PER WIRE, so each wire is drawn one-to-one. ──
-        // On the input side that is one slot per port (one wire each); on the output
-        // side the Input node's fan-out makes a label repeat (`o1 o1`). No wires →
-        // one orphan slot.
+    // ── Port slots: ONE PER WIRE, so each wire is drawn one-to-one.
     let mut out_slots: Vec<Vec<(usize, Option<usize>)>> = Vec::with_capacity(nodes.len());
     let mut in_slots: Vec<Vec<(usize, Option<usize>)>> = Vec::with_capacity(nodes.len());
     let mut src_slot = vec![0usize; connections.len()];
@@ -110,8 +106,8 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         }
         in_slots.push(slots);
     }
-        // Each wire is labelled with its PORT index; where one port feeds several
-        // wires (Input only) the label repeats (`o1 o1` = fan-out).
+    // Each wire is labelled with its PORT index; where one port feeds several
+    // wires (Input only) the label repeats (`o1 o1` = fan-out).
     let slot_labels = |prefix: char, ports: &[usize]| -> Vec<String> {
         ports.iter().map(|p| format!("{prefix}{p}")).collect()
     };
@@ -387,7 +383,7 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
     out
 }
 
-/// Compact edge list with distance markers for a [`Topology`] — sorted by
+/// Compact edge list with distance markers for a [`Topology`] — sorted
 /// source node, long-range jumps marked `>>>`.
 pub(crate) fn edge_list(graph: &Topology) -> String {
     let mut out = String::new();

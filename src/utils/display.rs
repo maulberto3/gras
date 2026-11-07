@@ -1,24 +1,8 @@
 //! Hand-written `Display` impls — all formatting in one place.
-//!
-//! `Debug` impls are `#[derive(Debug)]` on each type and stay with their
-//! type; only hand-written formatting lives here.
-//!
-//! Trait impls are crate-global: moving them here does not change any call
-//! site (`println!("{graph}")` works exactly the same).
-//!
-//! The enums whose `Display` is nothing but a wire name (activation, combine
-//! op, standardize op, direction, feature split) share ONE shape, spelled
-//! through [`variant_names!`]: a variant → its name, one arm per line, with the
-//! `fn fmt` wrapper written once instead of five times.
 
 use std::fmt::Display;
 
 /// A `Display` impl that is exactly a variant → wire-name table.
-///
-/// Each arm is the variant and its name; the separator is nothing (the name IS
-/// the whole output), so this is the same string the hand-written impls printed.
-/// Only unit-variant enums qualify — a variant that carries data needs its own
-/// `write!`.
 macro_rules! variant_names {
     ($ty:ty { $($variant:pat => $name:literal),+ $(,)? }) => {
         impl Display for $ty {
@@ -32,14 +16,14 @@ macro_rules! variant_names {
     };
 }
 
-use crate::utils::fitness::{Direction, FitnessLabel};
 use crate::evolution::crossover::CrossoverMethod;
 use crate::evolution::mutation::MutationMethod;
-use crate::graph::topology::FeatureSplitPolicy;
 use crate::evolution::selection::SelectionMethod;
 use crate::graph::network::NetworkOptions;
 use crate::graph::node::{Activation, Node, StandardizeOp};
+use crate::graph::topology::FeatureSplitPolicy;
 use crate::graph::topology::{CombineOp, Connection, KindCounts, TopologyOptions};
+use crate::utils::fitness::{Direction, FitnessLabel};
 
 impl Display for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -199,9 +183,7 @@ impl Display for MutationMethod {
 variant_names!(FeatureSplitPolicy {
     FeatureSplitPolicy::Exclusive => "split_exclusive",
     FeatureSplitPolicy::Random => "split_random",
-    // The enum is `Inherited` because that is the PROVENANCE kind (rows from a parent,
-    // not a fresh draw); every reader calls it `crossover`, which is the operator that
-    // produces mixed rows. A clone keeps its parent's own label, so nothing else can
-    // reach this arm.
+    // The enum is `Inherited` because that is the PROVENANCE kind (rows from a parent, not a fresh
+    // draw); every reader calls it `crossover`, which is the operator that produces mixed rows.
     FeatureSplitPolicy::Inherited => "split_crossover",
 });

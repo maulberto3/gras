@@ -1,7 +1,4 @@
 //! Scoring — fitness function for ranking individuals.
-//!
-//! [`Fitness`] is a pure scoring function. Training loss is the user's
-//! responsibility (lives inside the [`Trainer`](crate::trainer::Trainer)).
 
 use flodl::Variable;
 use flodl::tensor::Result;
@@ -48,21 +45,8 @@ impl Direction {
         }
     }
 
-    /// The RISK-ADJUSTED ranking value: the window `mean` shifted by `lambda`
-    /// window standard deviations TOWARD THE BAD SIDE, in the fitness's own
-    /// units. This is the single place the smoothing window's spread becomes a
-    /// ranking decision (FIT).
-    ///
-    /// - `Maximize` — a weak window drags the net DOWN (`mean − λσ`): the net is
-    ///   credited only with the value it is still expected to beat after one
-    ///   window of bad luck.
-    /// - `Minimize` — a costly window drags the net UP (`mean + λσ`).
-    ///
-    /// `std` is direction-INVARIANT (spread is spread), which is why ONE lambda
-    /// covers both directions — no per-direction knob exists or is needed. The
-    /// shift is expressed in fitness units, so [`Direction::cmp`] and every
-    /// call site that sorts with it keep working unchanged: `lambda = 0.0`
-    /// returns the plain mean exactly (the pre-FIT ranking).
+    /// The RISK-ADJUSTED ranking value: the window `mean` shifted by `lambda` window standard
+    /// deviations TOWARD THE BAD SIDE, in the fitness's own units.
     pub fn risk_adjusted(&self, mean: f32, std: f32, lambda: f32) -> f32 {
         match self {
             Direction::Maximize => mean - lambda * std,
@@ -73,16 +57,11 @@ impl Direction {
 
 // ── Fitness — computed or reported ───────────────────────────────────────
 
-/// Ranking signal for the race. [`Fitness::Computed`] = the engine scores
-/// `(pred, target)`; [`Fitness::Reported`] = the trainer ships the scalar.
-///
-/// `Clone` is cheap and shares ONE scorer: cloning a [`Fitness::Computed`]
-/// clones an `Arc`, so the same scoring function can travel into several runs
-/// (and several `RunSpec`s) without being rebuilt per copy.
+/// Ranking signal for the race.
 #[derive(Clone)]
 pub enum Fitness {
     /// Engine-computed: a pure `(pred, target) → f32` scoring function,
-    /// plus the direction and label that travel with it.
+    /// plus the direction and label that travel
     Computed {
         /// Ranking metric: `(pred, target) → f32`.
         score_fn: std::sync::Arc<ScoreFn>,
@@ -91,7 +70,7 @@ pub enum Fitness {
         /// Label for logs.
         label: String,
     },
-    /// Trainer-reported: the value arrives via `StepReport.fitness`; the
+    /// Trainer-reported: the value arrives via `StepReport.fitness`;
     /// engine never scores. Carries only the direction and label.
     Reported {
         /// Score direction.
@@ -114,8 +93,8 @@ impl Fitness {
         }
     }
 
-        /// Trainer-reported fitness (RL style): the trainer supplies the scalar
-        /// each step and the engine ranks on it.
+    /// Trainer-reported fitness (RL style): the trainer supplies the scalar
+    /// each step and the engine ranks
     pub fn reported(direction: Direction, label: &str) -> Self {
         Fitness::Reported {
             direction,
@@ -123,8 +102,8 @@ impl Fitness {
         }
     }
 
-        /// Lower-is-better scorer — shorthand for
-        /// `Fitness::new(score_fn, Direction::Minimize, label)`.
+    /// Lower-is-better scorer — shorthand
+    /// `Fitness::new(score_fn, Direction::Minimize, label)`.
     pub fn minimize<F>(label: &str, score_fn: F) -> Self
     where
         F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
@@ -132,8 +111,8 @@ impl Fitness {
         Fitness::new(score_fn, Direction::Minimize, label)
     }
 
-        /// Higher-is-better scorer — shorthand for
-        /// `Fitness::new(score_fn, Direction::Maximize, label)`.
+    /// Higher-is-better scorer — shorthand
+    /// `Fitness::new(score_fn, Direction::Maximize, label)`.
     pub fn maximize<F>(label: &str, score_fn: F) -> Self
     where
         F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
@@ -141,8 +120,8 @@ impl Fitness {
         Fitness::new(score_fn, Direction::Maximize, label)
     }
 
-        /// Score prediction against target — engine-computed ranking metric.
-        /// Errors on a [`Fitness::Reported`] (nothing to score there).
+    /// Score prediction against target — engine-computed ranking metric.
+    /// Errors on a [`Fitness::Reported`] (nothing to score there).
     pub fn score(&self, pred: &Variable, target: &Variable) -> Result<f32> {
         match self {
             Fitness::Computed { score_fn, .. } => score_fn(pred, target),
@@ -198,7 +177,7 @@ pub struct Metric {
 }
 
 impl Metric {
-        /// Build a metric: a label + your own `(pred, target) -> f32` closure.
+    /// Build a metric: a label + your own `(pred, target) -> f32` closure.
     pub fn custom<F>(label: impl Into<String>, score_fn: F) -> Self
     where
         F: Fn(&Variable, &Variable) -> Result<f32> + Send + Sync + 'static,
@@ -267,9 +246,8 @@ mod tests {
         )
     }
 
-    /// `Fitness` is `Clone` so one scorer can be shared across runs: the clone
-    /// must run the SAME closure (not a rebuilt one), and carry the same
-    /// direction and label.
+    /// `Fitness` is `Clone` so one scorer can be shared across runs: the clone must run the SAME
+    /// closure (not a rebuilt one), and carry the same direction and label.
     #[test]
     fn fitness_clone_shares_the_scorer() {
         use std::sync::Arc;
@@ -301,7 +279,7 @@ mod tests {
 
     #[test]
     fn risk_adjusted_at_zero_lambda_is_the_plain_mean() {
-        // The pre-FIT ranking, exactly — for BOTH directions and both signs of
+        // The pre-FIT ranking, exactly — for BOTH directions and both signs
         // value (a negative-mean fitness must not drift either).
         for (mean, std) in [(320.4, 41.0), (-0.75, 0.25), (0.0, 3.0)] {
             assert_eq!(Direction::Maximize.risk_adjusted(mean, std, 0.0), mean);
@@ -349,9 +327,7 @@ mod tests {
 
     #[test]
     fn risk_adjustment_breaks_a_mean_tie_toward_the_steadier_net() {
-        // THE FIT CONTRACT: two nets with the SAME window mean, one steady one
-        // volatile. Under Maximize the steady net must rank better; the volatile
-        // one still wins on the plain mean (a tie, decided by the tie-break).
+        // THE FIT CONTRACT: two nets with the SAME window mean, one steady one volatile.
         let steady = (300.0_f32, 5.0_f32); // always ~300
         let volatile = (300.0_f32, 120.0_f32); // 40s and 500s
         let dir = Direction::Maximize;
@@ -372,7 +348,10 @@ mod tests {
         let dir = Direction::Minimize;
         let s = dir.risk_adjusted(steady.0, steady.1, 1.0);
         let v = dir.risk_adjusted(volatile.0, volatile.1, 1.0);
-        assert!(dir.is_better(s, v), "minimizer: steady {s} beats volatile {v}");
+        assert!(
+            dir.is_better(s, v),
+            "minimizer: steady {s} beats volatile {v}"
+        );
     }
 
     #[test]
@@ -443,9 +422,6 @@ mod tests {
         assert_eq!(f.direction(), Direction::Minimize);
         assert_eq!(f.label(), "mse");
     }
-
-    // TODO: restore `test_fitness_from_loss_with_other` when
-    // `from_loss_with_other` is re-enabled.
 
     #[test]
     fn test_categorical_helpers() {

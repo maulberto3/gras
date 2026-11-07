@@ -1,7 +1,4 @@
 //! Scoring helpers — convenience functions for fitness metrics.
-//!
-//! These are not core to the engine. Users can use them inside their
-//! own fitness functions, or implement their own.
 
 use flodl::Variable;
 use flodl::tensor::Result;
@@ -87,11 +84,6 @@ pub fn precision_score(pred: &Variable, y: &Variable) -> Result<f32> {
 }
 
 /// Macro RECALL from argmax class vectors (higher = better).
-///
-/// One difference from [`precision_from_vecs`], and the reason both exist: a class
-/// is averaged only when the TARGET contains it. A class the data never asks about
-/// has no recall to measure (0/0), and counting it as `0.0` would punish a net for
-/// a question nobody asked — precision has the same guard on its own denominator.
 pub fn recall_from_vecs(pa: &[i64], ta: &[i64], classes: usize) -> f32 {
     if classes == 0 || pa.is_empty() {
         return 0.0;
@@ -128,13 +120,8 @@ pub fn recall_score(pred: &Variable, y: &Variable) -> Result<f32> {
     Ok(recall_from_vecs(&pa, &ta, classes))
 }
 
-/// BALANCED accuracy: the mean of per-class `(TP + TN) / n` over the classes the
-/// TARGET contains (higher = better).
-///
-/// Plain accuracy is dominated by the biggest class; this one gives every class the
-/// same weight, so a net that ignores a rare class cannot look skilled. Restricting
-/// the average to classes the target contains is what makes it comparable to
-/// `recall` and `precision` here rather than to a class list the data never ran.
+/// BALANCED accuracy: the mean of per-class `(TP + TN) / n` over the classes the TARGET contains
+/// (higher = better).
 pub fn balanced_accuracy_score(pred: &Variable, y: &Variable) -> Result<f32> {
     let (pa, ta) = argmax_classes(pred, y)?;
     let classes = y.data().shape()[1] as usize;
@@ -169,18 +156,8 @@ pub fn balanced_accuracy_score(pred: &Variable, y: &Variable) -> Result<f32> {
     })
 }
 
-/// TOP-K accuracy: the share of rows whose TARGET class is among the net's `k`
-/// highest-scoring classes (higher = better).
-///
-/// `k` is clamped to `1..=classes`, so `k = 1` is exactly [`accuracy_score`] and a
-/// `k` at or above the class count accepts every row (`1.0`) — the honest answer
-/// for an exam that cannot miss, not an error. Ties resolve in the row's favour: a
-/// class is top-k when FEWER THAN `k` classes score strictly higher than it, so a
-/// tie at the cut never punishes the net for an ordering the data cannot break.
-///
-/// The string menu spells the bare name `top_k_accuracy` at the crate default
-/// `k = 3`; `top_k_accuracy(5)` carries any other `k` (see
-/// [`crate::trainer::metric_for`]).
+/// TOP-K accuracy: the share of rows whose TARGET class is among the net's `k` highest-scoring
+/// classes (higher = better).
 pub fn top_k_accuracy_score(pred: &Variable, y: &Variable, k: usize) -> Result<f32> {
     let shape = pred.data().shape();
     let rows = shape[0] as usize;
@@ -207,19 +184,8 @@ pub fn top_k_accuracy_score(pred: &Variable, y: &Variable, k: usize) -> Result<f
     Ok(hits as f32 / rows as f32)
 }
 
-/// AUROC — area under the ROC curve for BINARY classification (higher = better;
-/// `0.5` = a coin flip).
-///
-/// Rank-based, so it reads the positive class straight off the net and does not
-/// care whether that number is a logit or a probability: the order is the same.
-/// The positive class is column `1` of a two-column `pred` (or of a one-hot
-/// target), or the single column when there is only one (`> 0.5` = positive).
-///
-/// Ties share the average rank (the usual Mann–Whitney correction), so a net that
-/// outputs one constant score lands on `0.5` instead of inventing an ordering the
-/// data never justified. `0.5` is also the answer when the target holds only ONE
-/// class: with no negative (or no positive) row there is no curve to integrate,
-/// and a `NaN` here would poison the ranking — `0.5` says "this exam cannot tell".
+/// AUROC — area under the ROC curve for BINARY classification (higher = better; `0.5` = a coin
+/// flip).
 pub fn auroc_score(pred: &Variable, y: &Variable) -> Result<f32> {
     let p_shape = pred.data().shape().to_vec();
     let t_shape = y.data().shape().to_vec();
@@ -231,11 +197,15 @@ pub fn auroc_score(pred: &Variable, y: &Variable) -> Result<f32> {
     let t_cols = *t_shape.get(1).unwrap_or(&1) as usize;
     let p = pred.data().to_f32_vec()?;
     let t = y.data().to_f32_vec()?;
-    // Positive-class score per row: the class-1 column when there is one, else the
+    // Positive-class score per row: the class-1 column when there is one, else
     // only column. NaN sorts to the end under `total_cmp` — deterministic either way.
     let mut pairs: Vec<(f32, bool)> = (0..rows)
         .map(|r| {
-            let score = if p_cols >= 2 { p[r * p_cols + 1] } else { p[r * p_cols] };
+            let score = if p_cols >= 2 {
+                p[r * p_cols + 1]
+            } else {
+                p[r * p_cols]
+            };
             let positive = if t_cols >= 2 {
                 t[r * t_cols + 1] > 0.5
             } else {
@@ -271,11 +241,6 @@ pub fn auroc_score(pred: &Variable, y: &Variable) -> Result<f32> {
 }
 
 /// MAPE — mean absolute percentage error (lower = better).
-///
-/// Rows whose TARGET is zero are skipped instead of clamped: a percentage error
-/// against `0` is undefined, and substituting an epsilon turns it into a number
-/// that is really a measure of the epsilon. `0.0` when every target is zero, which
-/// matches the other scorers' empty-input answer.
 pub fn mape_score(pred: &Variable, y: &Variable) -> Result<f32> {
     let t = y.data().to_f32_vec()?;
     let p = pred.data().to_f32_vec()?;
@@ -291,11 +256,6 @@ pub fn mape_score(pred: &Variable, y: &Variable) -> Result<f32> {
 }
 
 /// EXPLAINED variance — `1 − Var(target − pred) / Var(target)` (higher = better).
-///
-/// The residual-variance cousin of `r2`: `r2` compares the SUM of squared residuals
-/// against the target's, this compares their VARIANCE, so a net that is right up to
-/// a constant offset scores 1.0 here and less than 1.0 on `r2`. Degenerate when the
-/// target has no variance — same rule as `r2` (`1.0` only for a perfect fit).
 pub fn explained_variance_score(pred: &Variable, y: &Variable) -> Result<f32> {
     let t = y.data().to_f32_vec()?;
     let p = pred.data().to_f32_vec()?;
@@ -355,12 +315,8 @@ pub fn precision_from_vecs(pa: &[i64], ta: &[i64], classes: usize) -> f32 {
     sum / classes as f32
 }
 
-/// Softmax cross-entropy against a **one-hot** target, computed as
-/// `−mean(one_hot · log_softmax(pred))` (lower = better).
-///
-/// (The two rank-sensitive scorers above — [`top_k_accuracy_score`] and
-/// [`auroc_score`] — are the ones a name-only menu cannot wish into existence:
-/// they need the class axis, so they read it from the shapes.)
+/// Softmax cross-entropy against a **one-hot** target, computed as `−mean(one_hot ·
+/// log_softmax(pred))` (lower = better).
 pub fn cross_entropy_onehot(pred: &Variable, y: &Variable) -> Result<f32> {
     let n = y.data().shape()[0] as f32;
     if n == 0.0 {
@@ -371,7 +327,7 @@ pub fn cross_entropy_onehot(pred: &Variable, y: &Variable) -> Result<f32> {
     Ok(-masked.sum()?.item()? as f32 / n)
 }
 
-/// Label-smoothed CE loss (for backward): the one-hot target is softened to
+/// Label-smoothed CE loss (for backward): the one-hot target is softened
 /// `1−ε` on the true class and `ε/n_classes` elsewhere. `ε = 0` = plain CE.
 pub fn label_smoothing_cross_entropy_loss(
     pred: &Variable,
@@ -386,17 +342,6 @@ pub fn label_smoothing_cross_entropy_loss(
 }
 
 /// Focal loss against a ONE-HOT target: `−(1−p_t)^γ·log p_t`, averaged over rows.
-///
-/// The modulating sibling of [`cross_entropy_onehot_loss`]: `γ > 0` down-weights
-/// the easy rows (where `p_t` is already near 1) so the gradient is spent on the
-/// hard ones. `γ = 0` is exactly `cross_entropy_onehot_loss` — the equality the
-/// tests pin.
-///
-/// No `α`: see [`crate::trainer::Loss::Focal`] — under a softmax head a scalar
-/// class weight multiplies every row equally and Adam cancels it.
-///
-/// Derived from the SAME `log_softmax` the cross-entropy uses, so `p_t` is the
-/// model's own probability for the true class and the graph stays one path.
 pub fn focal_loss_onehot(pred: &Variable, y: &Variable, gamma: f32) -> Result<Variable> {
     let log_p = pred.data().log_softmax(1)?;
     // One term per row: the true class's log-probability, then its probability.
@@ -447,7 +392,10 @@ mod tests {
         let (pred, y) = three_class_case();
         let one = top_k_accuracy_score(&pred, &y, 1).unwrap();
         let acc = accuracy_score(&pred, &y).unwrap();
-        assert!((one - acc).abs() < 1e-6, "k=1 must BE accuracy: {one} vs {acc}");
+        assert!(
+            (one - acc).abs() < 1e-6,
+            "k=1 must BE accuracy: {one} vs {acc}"
+        );
         assert!((one - 2.0 / 3.0).abs() < 1e-6, "k=1 = {one}");
         // Row 2's truth is second, so k=2 accepts every row.
         assert!((top_k_accuracy_score(&pred, &y, 2).unwrap() - 1.0).abs() < 1e-6);
@@ -472,18 +420,30 @@ mod tests {
 
     #[test]
     fn auroc_is_one_perfect_zero_reversed_half_tied() {
-        let perfect = auroc_score(&binary_case(&[0.9, 0.8, 0.2, 0.1]).0,
-            &binary_case(&[0.9, 0.8, 0.2, 0.1]).1)
-            .unwrap();
-        assert!((perfect - 1.0).abs() < 1e-6, "perfect separation = {perfect}");
-        let reversed = auroc_score(&binary_case(&[0.1, 0.2, 0.8, 0.9]).0,
-            &binary_case(&[0.1, 0.2, 0.8, 0.9]).1)
-            .unwrap();
+        let perfect = auroc_score(
+            &binary_case(&[0.9, 0.8, 0.2, 0.1]).0,
+            &binary_case(&[0.9, 0.8, 0.2, 0.1]).1,
+        )
+        .unwrap();
+        assert!(
+            (perfect - 1.0).abs() < 1e-6,
+            "perfect separation = {perfect}"
+        );
+        let reversed = auroc_score(
+            &binary_case(&[0.1, 0.2, 0.8, 0.9]).0,
+            &binary_case(&[0.1, 0.2, 0.8, 0.9]).1,
+        )
+        .unwrap();
         assert!(reversed.abs() < 1e-6, "reversed separation = {reversed}");
-        let tied = auroc_score(&binary_case(&[0.5, 0.5, 0.5, 0.5]).0,
-            &binary_case(&[0.5, 0.5, 0.5, 0.5]).1)
-            .unwrap();
-        assert!((tied - 0.5).abs() < 1e-6, "all tied = {tied}, expected a coin flip");
+        let tied = auroc_score(
+            &binary_case(&[0.5, 0.5, 0.5, 0.5]).0,
+            &binary_case(&[0.5, 0.5, 0.5, 0.5]).1,
+        )
+        .unwrap();
+        assert!(
+            (tied - 0.5).abs() < 1e-6,
+            "all tied = {tied}, expected a coin flip"
+        );
     }
 
     #[test]

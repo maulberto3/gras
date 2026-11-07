@@ -3,12 +3,8 @@
 use crate::graph::node::{Activation, Node, NodeKind};
 use crate::graph::topology::{Connection, KindCounts, Port};
 
-/// Per node, per input port, the ONE source port feeding it — the wiring model is
-/// one wire per port, so a port without a wire reads `None`.
-///
-/// Two wires into one port cannot reach here: `Topology::validate` refuses them
-/// (`MultiWiredInputPort`). The map is nonetheless built defensively, keeping the
-/// first wire of a port if one ever did, so a lookup can never lose a port.
+/// Per node, per input port, the ONE source port feeding it — the wiring model is one wire per
+/// port, so a port without a wire reads `None`.
 pub(crate) fn build_node_sources(
     connections: &[Connection],
     num_inputs: &[usize],

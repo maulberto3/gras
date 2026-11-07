@@ -1,18 +1,12 @@
 //! Per-step training/eval primitives for the step-race engine.
-//!
-//! These are the single-batch analogs of [`super::supervised::train_network`]:
-//! one forward+backward+step on one batch (`train_one_step`), one no-grad
-//! scored forward on one batch (`eval_one_step`). Determinism contract: the
-//! caller seeds per-step randomness via [`seed_step_randomness`] so dropout
-//! and any other stochastic op see identical streams across nets.
 
 use flodl::nn::Module;
 use flodl::nn::optim::Optimizer;
 use flodl::tensor::Result;
 use flodl::{Tensor, Variable};
 
-use crate::utils::fitness::{Fitness, Metric};
 use crate::graph::network::Network;
+use crate::utils::fitness::{Fitness, Metric};
 
 /// Process-global lock over the two seeded RNGs (fastrand + libtorch's
 /// generator). See [`rng_lock`].
@@ -47,15 +41,15 @@ pub fn deterministic_train_step(
     batch: &(Tensor, Tensor),
     grad_clip: f32,
 ) -> Result<f32> {
-        // The seed→forward→backward region must be exclusive against any other
-        // thread touching the generator (see [`rng_lock`]).
+    // The seed→forward→backward region must be exclusive against any other
+    // thread touching the generator (see [`rng_lock`]).
     let _guard = rng_lock();
     seed_step_randomness(net_seed, step, call_index);
     train_one_step(net, optimizer, loss_fn, batch, grad_clip)
 }
 
-    // ── Generic (`F: Fn`) siblings — for the example/user side, where the loss
-    // is a concrete closure (monomorphized call, no vtable). Same contract. ──
+// ── Generic (`F: Fn`) siblings — for the example/user side, where the loss
+// is a concrete closure (monomorphized call, no vtable). Same contract. ──
 
 /// Generic sibling of [`deterministic_train_step`]: monomorphized loss
 /// closure (direct call, inlinable — no vtable). See the note above.
@@ -134,18 +128,6 @@ pub fn train_one_step(
 }
 
 /// One train step whose loss is built OUTSIDE the forward — the RL shape.
-///
-/// Same mechanics as [`train_one_step`] (forward → backward → clip → step), but
-/// the loss closure receives only the prediction, because an RL update derives
-/// its objective from the trajectory it just played (returns, advantages) rather
-/// than from a `(pred, target)` batch. `inputs` is what the forward runs on: a
-/// caller that already built its graph from an earlier forward passes a dummy row
-/// and lets that graph carry the gradients, which is why the closure may ignore
-/// `pred`.
-///
-/// The graph must be differentiable in the network's parameters — for a policy
-/// gradient that means a **normalized** log-probability (`log_softmax`), never
-/// raw logits or an argmax indicator, which carry no gradient at all.
 pub fn train_one_step_pred_only(
     net: &mut Network,
     optimizer: &mut dyn Optimizer,
@@ -242,8 +224,8 @@ mod tests {
         Network::build(&topo, flodl::Device::CPU).unwrap()
     }
 
-        // #[ignore]d by default: libtorch's CPU generator is process-global and
-        // not transactional, so exact-equality flakes under parallel tests.
+    // #[ignore]d by default: libtorch's CPU generator is process-global
+    // not transactional, so exact-equality flakes under parallel tests.
     #[test]
     #[ignore = "needs --test-threads=1: libtorch's generator is process-global and other tests draw from it concurrently (see comment)"]
     fn dropout_masks_reproduce_under_seed_step_randomness() {
@@ -269,8 +251,8 @@ mod tests {
         };
         assert_eq!(a, b, "same (net_seed, step) must redraw identical masks");
 
-        // A different step → a different stream → (almost surely) a
-        // different mask, which is what makes the sequence varied at all.
+        // A different step → a different stream → (almost surely)
+        // different mask, which is what makes the sequence varied
         let c = {
             seed_step_randomness(7, 6, 0);
             forward_in_train_mode(&mut net, &x)
