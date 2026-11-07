@@ -40,7 +40,6 @@ impl Arm {
     }
 }
 
-
 // ── recorded-recipe knobs ──────────────────────────────────────────────
 //
 // The trainer blob is the scheme's own `describe()` output, persisted verbatim
@@ -87,11 +86,12 @@ fn resume_rl(
     loss: Option<String>,
     fitness: Option<String>,
     lr: Option<f32>,
-    grad_clip: Option<f32>,        batch_size: Option<usize>,
-        eval_batch_size: Option<usize>,
-        lr_schedule: Option<String>,
-        optimizer: Option<String>,
-    ) -> PyResult<PyRaceEngine> {
+    grad_clip: Option<f32>,
+    batch_size: Option<usize>,
+    eval_batch_size: Option<usize>,
+    lr_schedule: Option<String>,
+    optimizer: Option<String>,
+) -> PyResult<PyRaceEngine> {
     let Some(env) = env else {
         return Err(PyValueError::new_err(format!(
             "resume: {} was recorded as mode \"rl\", so it needs env= — the environment it \
@@ -209,8 +209,7 @@ fn resume_rl(
     // RL run only carries the key when it TRAINED with a schedule, so a run from
     // before this existed resumes with none.
     let recorded_schedule = text_or_none(blob, "lr_schedule");
-    if let Some(schedule) =
-        lr_schedule_of(lr_schedule.as_deref().or(recorded_schedule.as_deref()))?
+    if let Some(schedule) = lr_schedule_of(lr_schedule.as_deref().or(recorded_schedule.as_deref()))?
     {
         trainer = trainer.with_named_lr_schedule(schedule);
     }
@@ -421,24 +420,25 @@ impl PyRaceEngine {
         LOGGING.call_once(|| {
             gras::engine::logging::init(inner.log_level, log_verbosity);
         });
-            // The SAME layout sniff the engine runs: a dir holding `train/` + `test/`
-            // is an EXPLICIT split, anything else is one pool that the engine splits
-            // by `eval_share`. Asking only the single-pool resolver here made an
-            // explicit-layout dir raise "no inputs.bin" at construction — the layout
-            // existed in Rust and was unreachable from Python.
+        // The SAME layout sniff the engine runs: a dir holding `train/` + `test/`
+        // is an EXPLICIT split, anything else is one pool that the engine splits
+        // by `eval_share`. Asking only the single-pool resolver here made an
+        // explicit-layout dir raise "no inputs.bin" at construction — the layout
+        // existed in Rust and was unreachable from Python.
         let (in_dim, out_dim) = {
-            let train_dir = data_dir.join("train");
-            let test_dir = data_dir.join("test");
-            let train = if train_dir.exists() && test_dir.exists() {
-                // The resolver already refuses a train/test dim mismatch, so the
-                // train side speaks for both.
-                let (train, _test) = gras::resolve_train_test_datasets(&data_dir)
-                    .map_err(|e| {
-                        PyRuntimeError::new_err(format!("dataset {}: {e}", data_dir.display()))
-                    })?;
-                train
-            } else {
+            // The SAME layout sniff the engine runs: `train/` + `val/` ranks on val and
+            // reports on test/, `train/` + `test/` ranks on test, anything else is one pool
+            // the engine splits by `eval_share`. Every split agrees on dims (the resolver
+            // refuses a mismatch), so the TRAIN pool speaks for all of them.
+            let layout = gras::detect_pool_layout(&data_dir).map_err(|e| {
+                PyRuntimeError::new_err(format!("dataset {}: {e}", data_dir.display()))
+            })?;
+            let train = if layout == gras::PoolLayout::Single {
                 gras::resolve_dataset(&data_dir).map_err(|e| {
+                    PyRuntimeError::new_err(format!("dataset {}: {e}", data_dir.display()))
+                })?
+            } else {
+                gras::resolve_dataset(data_dir.join("train")).map_err(|e| {
                     PyRuntimeError::new_err(format!("dataset {}: {e}", data_dir.display()))
                 })?
             };
@@ -828,7 +828,6 @@ impl PyRaceEngine {
             engine: Some(Arm::Rl(engine)),
         })
     }
-
 
     /// How many nets are in the race right now.
     ///

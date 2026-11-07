@@ -53,17 +53,23 @@ pub(crate) const COMBINE_OPS: [&str; 7] = ["add", "mean", "max", "min", "mul", "
 
 /// `standardize_op_pool` — the canonical spellings (`rms_norm`, `instance_norm`
 /// and `group_norm` are also accepted).
-pub(crate) const STANDARDIZE_OPS: [&str; 5] =
-    ["identity", "layernorm", "rmsnorm", "instancenorm", "groupnorm"];
+pub(crate) const STANDARDIZE_OPS: [&str; 5] = [
+    "identity",
+    "layernorm",
+    "rmsnorm",
+    "instancenorm",
+    "groupnorm",
+];
 
 /// `crossover_ops_pool`: the mixing methods a crossover attempt can draw.
 pub(crate) const CROSSOVER_OPS: [&str; 2] = ["one_point", "uniform"];
 
 /// `crossover_cull_policy`: who a surviving crossover child evicts.
-pub(crate) const CROSSOVER_CULLS: [&str; 2] = ["worst", "random"];
+pub(crate) const CROSSOVER_CULLS: [&str; 3] = ["worst", "random", "unfed"];
 
-/// `mutation_cull_policy`: who a firing mutation roll evicts.
-pub(crate) const MUTATION_CULLS: [&str; 3] = ["worst", "inverse_fitness", "random"];
+/// `mutation_cull_policy`: who a firing mutation roll evicts. `unfed` is the same
+/// lottery-starved selector the crossover channel offers.
+pub(crate) const MUTATION_CULLS: [&str; 4] = ["worst", "inverse_fitness", "random", "unfed"];
 
 /// `crossover_selection`: how a crossover attempt draws its parents.
 pub(crate) const SELECTION_METHODS: [&str; 2] = ["roulette", "tournament"];

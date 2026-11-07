@@ -36,12 +36,14 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     // The EVAL share of a single-pool dataset (0.2 = 80/20). A `train/`+`test/`
     // dir states its own split, so this is the "gras decides" default.
     d.set_item("eval_share", round32(cfg.eval_share))?;
-    d.set_item("elite_freeze", cfg.freeze_elites)?;
+    d.set_item("freeze_elites", cfg.freeze_elites)?;
     d.set_item("smoothing_window", cfg.smoothing_window)?;
+    d.set_item("mean_type", cfg.mean_type.to_string())?;
     // The BINDING's values: the two knobs a Python run does not inherit from the crate.
     d.set_item("risk_aversion", 0.0)?;
     d.set_item("train_merit", round32(cfg.train_merit))?;
     d.set_item("train_merit_p_min", round32(cfg.train_merit_p_min))?;
+    d.set_item("drift_prob", round32(cfg.drift_prob))?;
     d.set_item("feature_split_pool", cfg.feature_split_pool_names())?;
     d.set_item("log_level", format!("{:?}", cfg.log_level).to_lowercase())?;
     d.set_item("mode", format!("{:?}", cfg.mode).to_lowercase())?;
@@ -61,10 +63,7 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("mutation_probation_steps", cfg.mutation_probation_steps)?;
     d.set_item("crossover_probation_steps", cfg.crossover_probation_steps)?;
     d.set_item("elite_join_probation_steps", cfg.elite_join_probation_steps)?;
-    d.set_item(
-        "elite_crown_lifetime_steps",
-        cfg.elite_crown_lifetime_steps,
-    )?;
+    d.set_item("elite_crown_lifetime_steps", cfg.elite_crown_lifetime_steps)?;
 
     // ── search space (the blueprint the Python surface only shows as `None`) ──
     d.set_item(
@@ -105,7 +104,6 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("trace_file", cfg.trace_file)?;
     d.set_item("save_optim", cfg.save_optim)?;
     d.set_item("elite_save_topology", cfg.elite_save_topology)?;
-    d.set_item("worst_save_topology", cfg.worst_save_topology)?;
     d.set_item("run_name", cfg.run_name.clone())?;
     d.set_item("elite_previous_load", false)?;
     d.set_item(

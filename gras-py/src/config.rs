@@ -1,16 +1,14 @@
 //! `RaceConfig`: the engine knobs a Python caller turns.
 //!
-//! The defaults ARE the crate's (`RaceConfig::defaults()`), with one documented
-//! exception — `elite_previous_load`, forced off so a Python run never inherits
-//! elites from whatever `results/` happens to sit in the caller's cwd. Anything
-//! this class does not expose still inherits the crate default, because
-//! [`PyRaceConfig::into_inner`] starts from `RaceConfig::defaults()`.
+//! The defaults ARE the crate's (`RaceConfig::defaults()`), with two documented
+//! exceptions: λ `0.0` (rank on the plain window mean) and `elite_previous_load`
+//! off (a Python run never inherits elites from whatever `results/` sits in the
+//! caller's cwd). Anything this class does not expose still inherits the crate
+//! default, because [`PyRaceConfig::into_inner`] starts from `RaceConfig::defaults()`.
 
 use std::path::PathBuf;
 
-use gras::engine::config::{
-    DEFAULT_CHECKPOINT_EVERY, SMOOTHING_WINDOW,
-};
+use gras::engine::config::{DEFAULT_CHECKPOINT_EVERY, SMOOTHING_WINDOW};
 use gras::evolution::selection::SelectionMethod;
 use gras::prelude::*;
 use pyo3::exceptions::PyValueError;
@@ -20,17 +18,23 @@ use pyo3::prelude::*;
 // `#[pyo3(signature = …)]` below can name them. `defaults_mirror_the_crate` pins
 // every one of them against the crate, so a changed crate default fails a test
 // instead of silently re-tuning Python.
-const DEFAULT_POP_SIZE: usize = 5;
-const DEFAULT_CROSSOVER_ROLLS: usize = 1;
-const DEFAULT_MUTATE_ROLLS: usize = 1;
+const DEFAULT_POP_SIZE: usize = 10;
+const DEFAULT_CROSSOVER_ROLLS: usize = 2;
+const DEFAULT_MUTATE_ROLLS: usize = 2;
 const DEFAULT_CROSSOVER_PROB: f32 = 0.5;
-const DEFAULT_MUTATE_PROB: f32 = 0.5;
+const DEFAULT_MUTATE_PROB: f32 = 0.2;
 const DEFAULT_HIDDEN_DIM_STRIDE: usize = 16;
 const DEFAULT_TOURNAMENT_SIZE: usize = 2;
+/// Step budget a no-arg `RaceConfig()` carries. `None` removes the cap, which
+/// leaves the run with no built-in stop at all, so the mirror is the safe default.
+const DEFAULT_MAX_STEPS: Option<usize> = Some(10);
 
-/// Dropout the crate builds nets with (`TopologyOptions::default().dropout_prob`).
-/// `0.0` keeps regularization opt-in per run rather than on by inheritance.
-const DEFAULT_DROPOUT_PROB: f32 = 0.0;
+/// Dropout the crate builds nets with (`TopologyOptions::default().dropout_prob`);
+/// `0.0` turns it off per run.
+const DEFAULT_DROPOUT_PROB: f32 = 0.25;
+
+/// Drift on a crossover child's inherited genes (`DEFAULT_TOPOLOGY_DRIFT`).
+const DEFAULT_DRIFT_PROB: f32 = 0.1;
 
 /// Cull immunity for every newcomer, in clocks. The crate's shipped value, mirrored
 /// here so the signature can name it. Unlike λ and Ω this is not a "neutral at
@@ -38,13 +42,11 @@ const DEFAULT_DROPOUT_PROB: f32 = 0.0;
 /// ranking, so a Python caller inherits the crate's 5 instead of starting bare.
 const DEFAULT_PROBATION_STEPS: usize = 5;
 
-/// λ and Ω default to the values that change NOTHING about a ranking: the plain
-/// window mean (λ = 0) and the plain step (Ω = 0). The crate's λ default is 1.0
-/// — FIT charges a net for its own spread — so that is an opt-in here rather
-/// than something a Python caller inherits without asking. Ω is 0.0 in the
-/// crate too, so only λ is a deliberate divergence.
+/// λ is the binding's one ranking divergence: `0.0` ranks on the plain window mean,
+/// while the crate's FIT default is `0.5` (a net pays for its own spread). Ω and
+/// every other knob mirror the crate's tuned reference run.
 const DEFAULT_RISK_AVERSION: f32 = 0.0;
-const DEFAULT_TRAIN_MERIT: f32 = 0.0;
+const DEFAULT_TRAIN_MERIT: f32 = 0.75;
 /// The lottery's merit floor `p_min`, mirrored from the crate's default. It only has
 /// an effect while Ω is above 0, so exposing it changes nothing about the Ω = 0 path
 /// a Python run starts on.
@@ -68,6 +70,8 @@ pub struct PyRaceConfig {
     pub pop_size: usize,
     #[pyo3(get, set)]
     pub elite_count: usize,
+    /// Step budget. `None` = no cap (the race then stops only on Ctrl+C or a
+    /// custom stop); the crate's default, mirrored here, is 10 clocks.
     #[pyo3(get, set)]
     pub max_steps: Option<usize>,
     /// Share of a SINGLE-POOL dataset held out for eval (`0.2` = the last 20% of
@@ -80,11 +84,17 @@ pub struct PyRaceConfig {
     pub smoothing_window: usize,
     /// Risk aversion λ: window standard deviations subtracted from a net's
     /// smoothed mean before ranking. **`0.0` here** ranks on the plain mean (the
-    /// crate's FIT default is `1.0`).
+    /// crate's FIT default is `0.5`).
     #[pyo3(get, set)]
     pub risk_aversion: f32,
+    /// How the smoothing window is averaged into the ranking centre:
+    /// `"arithmetic"` (default), `"signed_log"` (geometric-like damping that is
+    /// defined for negative readings) or `"median"` (one fluke cannot move it).
+    #[pyo3(get, set)]
+    pub mean_type: String,
     /// Train/eval lottery strength Ω: how much of a clock's budget merit decides;
     /// **`0.0` = off** — the coin is never drawn and every non-crown net runs.
+    /// The crate's tuned default is `0.75`.
     #[pyo3(get, set)]
     pub train_merit: f32,
     /// Merit floor `p_min`: the share of clocks the WORST net in the field still gets
@@ -92,6 +102,14 @@ pub struct PyRaceConfig {
     /// is a cheaper dial than Ω — which lifts every net toward "always train".
     #[pyo3(get, set)]
     pub train_merit_p_min: f32,
+    /// Drift on a crossover child's INHERITED genes (`0.0` = exact inheritance), one
+    /// probability for the whole family: each mask bit flips, and each hidden activation /
+    /// combine / standardize is re-drawn from its pool (dropout re-drawn in
+    /// `0.0..=dropout_prob`). The mutation half a pool draw cannot give — a newborn's genes
+    /// are unrelated to any parent, so without drift nothing inherited can ever be edited.
+    /// `0.1` (the crate's default) edits about one gene in ten.
+    #[pyo3(get, set)]
+    pub drift_prob: f32,
     /// Per-step reporting shape, the same vocabulary as the examples'
     /// `--log-level`: `summ` (default), `minimal`, `none`, `debug`, `trace`.
     /// Recorded in `engine.json`, so a run's verbosity is part of its record.
@@ -114,15 +132,15 @@ pub struct PyRaceConfig {
     /// The top-k nets act and measure without weight updates.
     #[pyo3(get, set)]
     pub freeze_elites: bool,
-    /// Who a surviving crossover child evicts: `worst` (default) or `random`.
+    /// Who a surviving crossover child evicts: `unfed` (default), `worst`, or `random`.
     #[pyo3(get, set)]
     pub crossover_cull_policy: String,
-    /// Who a firing mutation roll evicts: `worst` (default), `inverse_fitness`,
-    /// or `random`.
+    /// Who a firing mutation roll evicts: `unfed` (default), `worst`,
+    /// `inverse_fitness`, or `random`.
     #[pyo3(get, set)]
     pub mutation_cull_policy: String,
-    /// How a crossover attempt draws parents: `roulette` (default) or
-    /// `tournament` (K-way; see `tournament_size`).
+    /// How a crossover attempt draws parents: `tournament` (default, K =
+    /// `tournament_size`) or `roulette`.
     #[pyo3(get, set)]
     pub crossover_selection: String,
     /// K for `crossover_selection="tournament"`; small K is mild pressure.
@@ -176,8 +194,9 @@ pub struct PyRaceConfig {
     /// crate's `2..=5` (`set_topology_min/max_outputs_per_node`).
     #[pyo3(get, set)]
     pub hidden_outputs_pool: Option<(usize, usize)>,
-    /// Dropout baked into each net at build; `0.0` (default) is off. TRAIN path
-    /// only, so a replay does not depend on a random mask.
+    /// Dropout baked into each net at build; `0.25` is the crate's default and
+    /// `0.0` turns it off. TRAIN path only, so a replay does not depend on a
+    /// random mask.
     #[pyo3(get, set)]
     pub dropout_prob: f32,
     /// Activation pool; empty means all known activations.
@@ -209,9 +228,6 @@ pub struct PyRaceConfig {
     pub trace_file: bool,
     #[pyo3(get, set)]
     pub elite_save_topology: bool,
-    /// Also save the bottom `elite_count` nets' topologies (the anti-champion).
-    #[pyo3(get, set)]
-    pub worst_save_topology: bool,
     /// Human label recorded in `engine.json` as `"run_name"`.
     #[pyo3(get, set)]
     pub run_name: Option<String>,
@@ -234,12 +250,14 @@ impl PyRaceConfig {
         // population + ranking
         pop_size = DEFAULT_POP_SIZE,
         elite_count = 1,
-        max_steps = None,
+        max_steps = DEFAULT_MAX_STEPS,
         eval_share = DEFAULT_EVAL_SHARE,
         smoothing_window = SMOOTHING_WINDOW,
         risk_aversion = DEFAULT_RISK_AVERSION,
+        mean_type = String::from("arithmetic"),
         train_merit = DEFAULT_TRAIN_MERIT,
         train_merit_p_min = DEFAULT_TRAIN_MERIT_P_MIN,
+        drift_prob = DEFAULT_DRIFT_PROB,
         elite_previous_load = false,
         log_level = String::from("summ"),
         // evolution
@@ -248,9 +266,9 @@ impl PyRaceConfig {
         crossover_prob = DEFAULT_CROSSOVER_PROB,
         mutate_prob = DEFAULT_MUTATE_PROB,
         freeze_elites = true,
-        crossover_cull_policy = String::from("worst"),
-        mutation_cull_policy = String::from("worst"),
-        crossover_selection = String::from("roulette"),
+        crossover_cull_policy = String::from("unfed"),
+        mutation_cull_policy = String::from("unfed"),
+        crossover_selection = String::from("tournament"),
         tournament_size = DEFAULT_TOURNAMENT_SIZE,
         crossover_ops_pool = Vec::new(),
         // durability + probation
@@ -275,7 +293,6 @@ impl PyRaceConfig {
         csv_export = true,
         trace_file = false,
         elite_save_topology = true,
-        worst_save_topology = false,
         run_name = None,
         elite_previous_dir = None,
     ))]
@@ -290,8 +307,10 @@ impl PyRaceConfig {
         eval_share: f32,
         smoothing_window: usize,
         risk_aversion: f32,
+        mean_type: String,
         train_merit: f32,
         train_merit_p_min: f32,
+        drift_prob: f32,
         elite_previous_load: bool,
         log_level: String,
         crossover_rolls: usize,
@@ -323,7 +342,6 @@ impl PyRaceConfig {
         csv_export: bool,
         trace_file: bool,
         elite_save_topology: bool,
-        worst_save_topology: bool,
         run_name: Option<String>,
         elite_previous_dir: Option<PathBuf>,
     ) -> Self {
@@ -334,8 +352,10 @@ impl PyRaceConfig {
             eval_share,
             smoothing_window,
             risk_aversion,
+            mean_type,
             train_merit,
             train_merit_p_min,
+            drift_prob,
             // OFF by default: a Python run must not silently inherit elites from
             // whatever `results/` happens to sit in the caller's cwd.
             elite_previous_load,
@@ -371,7 +391,6 @@ impl PyRaceConfig {
             csv_export,
             trace_file,
             elite_save_topology,
-            worst_save_topology,
             run_name,
             elite_previous_dir,
         }
@@ -411,21 +430,23 @@ fn parse_range_pool(
     }
 }
 
-/// `worst` | `random` — the spellings the crate records in `engine.json`.
+/// `worst` | `random` | `unfed` — the spellings the crate records in `engine.json`.
 fn parse_crossover_cull(name: &str) -> Option<CrossCullPolicy> {
     match name {
         "worst" => Some(CrossCullPolicy::Worst),
         "random" => Some(CrossCullPolicy::Random),
+        "unfed" => Some(CrossCullPolicy::Unfed),
         _ => None,
     }
 }
 
-/// `worst` | `inverse_fitness` | `random`.
+/// `worst` | `inverse_fitness` | `random` | `unfed`.
 fn parse_mutation_cull(name: &str) -> Option<MutationCullPolicy> {
     match name {
         "worst" => Some(MutationCullPolicy::Worst),
         "inverse_fitness" => Some(MutationCullPolicy::InverseFitness),
         "random" => Some(MutationCullPolicy::Random),
+        "unfed" => Some(MutationCullPolicy::Unfed),
         _ => None,
     }
 }
@@ -446,14 +467,14 @@ impl PyRaceConfig {
         let crossover_cull_policy =
             parse_crossover_cull(&self.crossover_cull_policy).ok_or_else(|| {
                 PyValueError::new_err(format!(
-                    "crossover_cull_policy {:?}: expected one of worst, random",
+                    "crossover_cull_policy {:?}: expected one of worst, random, unfed",
                     self.crossover_cull_policy
                 ))
             })?;
         let mutation_cull_policy =
             parse_mutation_cull(&self.mutation_cull_policy).ok_or_else(|| {
                 PyValueError::new_err(format!(
-                    "mutation_cull_policy {:?}: expected one of worst, inverse_fitness, random",
+                    "mutation_cull_policy {:?}: expected one of worst, inverse_fitness, random, unfed",
                     self.mutation_cull_policy
                 ))
             })?;
@@ -511,8 +532,8 @@ impl PyRaceConfig {
         cfg.pop_size = self.pop_size;
         cfg.elite_count = self.elite_count;
         cfg.max_steps = self.max_steps;
-            // Same bounds the crate's setter enforces: outside them a pool can round
-            // to empty (`split_indices` then hands the whole dataset to eval).
+        // Same bounds the crate's setter enforces: outside them a pool can round
+        // to empty (`split_indices` then hands the whole dataset to eval).
         if !(0.01..=0.9).contains(&self.eval_share) {
             return Err(PyValueError::new_err(format!(
                 "eval_share {}: expected 0.01 <= share <= 0.9 (the fraction of rows held out for eval)",
@@ -522,8 +543,22 @@ impl PyRaceConfig {
         cfg.eval_share = self.eval_share;
         cfg.smoothing_window = self.smoothing_window;
         cfg.risk_aversion = self.risk_aversion;
+        cfg.mean_type =
+            gras::engine::config::MeanType::parse(&self.mean_type).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "mean_type {:?}: expected one of arithmetic, signed_log, median",
+                    self.mean_type
+                ))
+            })?;
         cfg.train_merit = self.train_merit;
         cfg.train_merit_p_min = self.train_merit_p_min;
+        // Clamped like the Rust setter (a stray 1.5 must not flip every bit twice); the
+        // value is recorded in `engine.json` and compared by name on resume.
+        cfg.drift_prob = if self.drift_prob.is_finite() {
+            self.drift_prob.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         cfg.elite_previous_load = self.elite_previous_load;
         cfg.log_level = log_level;
         cfg.crossover_rolls = self.crossover_rolls;
@@ -576,7 +611,6 @@ impl PyRaceConfig {
         cfg.csv_export = self.csv_export;
         cfg.trace_file = self.trace_file;
         cfg.elite_save_topology = self.elite_save_topology;
-        cfg.worst_save_topology = self.worst_save_topology;
         cfg.run_name = self.run_name;
         cfg.elite_previous_dir = self.elite_previous_dir;
 

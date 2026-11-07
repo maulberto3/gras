@@ -37,14 +37,19 @@ impl GymEnv {
         let space = bound.getattr("action_space").map_err(|_| {
             PyValueError::new_err("env has no `action_space`: expected a gym/gymnasium environment")
         })?;
-        let actions = space.getattr("n").and_then(|n| n.extract::<usize>()).map_err(|_| {
-            PyValueError::new_err(
-                "env.action_space has no discrete `n` — v1 takes Discrete actions only \
+        let actions = space
+            .getattr("n")
+            .and_then(|n| n.extract::<usize>())
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "env.action_space has no discrete `n` — v1 takes Discrete actions only \
                  (a Box/MultiDiscrete space needs a different policy head, not a flag)",
-            )
-        })?;
+                )
+            })?;
         if actions == 0 {
-            return Err(PyValueError::new_err("env.action_space.n is 0 — no action to take"));
+            return Err(PyValueError::new_err(
+                "env.action_space.n is 0 — no action to take",
+            ));
         }
         // Prefer what the environment publishes, then the caller, then the
         // reference cap (CartPole's 500). A world without a spec is normal.
@@ -122,10 +127,7 @@ impl Env for GymEnv {
         })
     }
 
-    fn step(
-        &mut self,
-        action: usize,
-    ) -> gras::flodl::tensor::Result<(Vec<f32>, f32, bool)> {
+    fn step(&mut self, action: usize) -> gras::flodl::tensor::Result<(Vec<f32>, f32, bool)> {
         Python::attach(|py| {
             let out = self
                 .env
@@ -171,7 +173,7 @@ impl Env for GymEnv {
                     return Err(tensor_error(format!(
                         "env.step returned {n} values; expected gym's 4-tuple or \
                          gymnasium's 5-tuple"
-                    )))
+                    )));
                 }
             };
             let obs = obs
@@ -200,13 +202,7 @@ impl Env for GymEnv {
                 .and_then(|spec| spec.getattr("id"))
                 .and_then(|id| id.extract::<String>())
                 .ok()
-                .or_else(|| {
-                    bound
-                        .get_type()
-                        .name()
-                        .map(|name| name.to_string())
-                        .ok()
-                })
+                .or_else(|| bound.get_type().name().map(|name| name.to_string()).ok())
                 .unwrap_or_else(|| "gym".to_string())
         });
         serde_json::json!({
