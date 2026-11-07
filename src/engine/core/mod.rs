@@ -1,87 +1,28 @@
 //! Step-race scheduler for the continuous step-race engine.
-//!
-//! One global `step_clock`. Every live net steps together each loop iteration,
-//! pulling from the same shared batch stream. One iteration = one step_clock:
-//!
-//! 1. Evolve first (from clock 1 on) — two independent roll groups. Crossover
-//!    rolls: a recombined child evicts a victim per `CrossCullPolicy`; a draw
-//!    that produces nothing is discarded and the population is unchanged.
-//!    Immigrant rolls: a random entrant replaces an inverse-fitness
-//!    victim (pop stays constant). Acting on the metrics the previous clock
-//!    recorded, this is what makes a clock's log read in the order the clock
-//!    happened: evolve → crown → step.
-//! 2. Deal the crown (`refresh_crown`): the eligible elite take(k) is frozen
-//!    for this clock, so the seats that evolved population produced print
-//!    before anyone steps.
-//! 3. The shared `BatchStream` produces one `(train_batch, eval_batch)` for
-//!    this step — identical for every net. Each live net (deterministic hash
-//!    order) does `train_one_step` + `eval_one_step` on its **live** `Network`
-//!    + `Optimizer` (coefs evolve in place; optimizer state carries forward
-//!    across steps), records its metrics into `nets/<hash>.json`, and logs one
-//!    per-net line. A child born at the head of this clock sits it out (see
-//!    the birth-clock invariant below).
-//! 4. After **all** nets stepped: every `checkpoint_every` steps, snapshot the
-//!    live frontier (states + elite weights) and flush the CSVs — the durability
-//!    tick, which also advances the stream's eval-permutation era.
-//! 5. One per-step rollup line (or the `Minimal` frame) describing the step
-//!    that just ended — logged LAST on purpose, so it always sits at the bottom
-//!    of the terminal.
-//! 6. Stop criteria checked (max_steps, custom_stop) —
-//!    log which fired.
-//! 7. Repeat — the loop's clock is the nets' recorded steps (every net is at
-//!    the same step after the group steps, so reading any live net's step
-//!    gives the clock).
-//!
-//! Determinism: resume replay uses the same `seed_step_randomness` + same step
-//! primitives as the group loop, so two identical-seed runs produce identical
-//! cull/insertion sequences.
-//!
-//! Memory model: **all live nets + their optimizers live inside the loop** for
-//! the whole run. Pop 5 → 5 networks + 5 optimizers in memory at once. On
-//! cull, the culled net's entries are dropped (memory freed). On insert, the
-//! child's entries are added. This is simple, not minimal-memory — fine for
-//! the small default pop; the user runs bigger pops when it matters.
-//!
-//! Persistence:
-//! - `engine.json` — written once at run start (the run header; `RunHeader`).
-//! - `nets/<hash>.json` — written **once** when a net leaves the live pop
-//!   (cull write — its final state snapshot), and written **once** at run end
-//!   for every still-live net (stop write — the live pop's final state).
-//!   During the run, live nets are held only in memory. An interrupted run
-//!   leaves `engine.json` + the culled nets' JSONs on disk; resume
-//!   reconstructs the live frontier from those + replays each net's stream.
-//!   `history.csv` (per-step metric rows) and `attempts.csv` (evolution
-//!   events) are the run's logs, flushed at checkpoints and at stop.
 
 pub(crate) use flodl::nn::Optimizer;
 pub(crate) use flodl::tensor::Result;
 pub(crate) use std::collections::HashMap;
 pub(crate) use tracing::{debug, info};
 
-pub(crate) use crate::utils::fitness::{Fitness, FitnessLabel, Metric};
+pub(crate) use crate::engine::evolve::RollKind;
+pub(crate) use crate::evolution::selection::SelectionMethod;
 pub(crate) use crate::graph::network::Network;
 pub(crate) use crate::state::{
     ConfigSnapshot, NetState, RaceState, RunConfig, RunHeader, write_engine_json, write_net_state,
 };
-pub(crate) use crate::engine::evolve::RollKind;
-pub(crate) use crate::evolution::selection::SelectionMethod;
 pub(crate) use crate::trainer::stream::{BatchStream, PoolSplit};
+pub(crate) use crate::utils::fitness::{Fitness, FitnessLabel, Metric};
 
 pub(crate) use super::config::{RaceConfig, StopReason};
-pub(crate) use super::format::{
-    ReadingStyle, build_stamp, csv_field, fmt_cfg, fmt_line,
-    fmt_reading,
-};
-pub(crate) use super::smoothing::{RollingBuffer, WindowStats, rolling_stats};
+pub(crate) use super::format::{build_stamp, csv_field, fmt_cfg, fmt_line};
+pub(crate) use super::smoothing::{RollingBuffer, WindowStats, rolling_stats_with};
 
 // ── CoreEngine ───────────────────────────────────────────────────────────────
 
 /// The continuous step-race loop: owns the step clock (the nets' recorded steps
 /// ARE the clock), the batch stream, the live population and the rolling buffers.
-
-// One concern per file (AGENTS.md rule 19): these hold `impl CoreEngine`
-// blocks, not new types. A split is a MOVE — fields and method names are
-// unchanged, so the public surface is identical.
+// One concern per file (AGENTS.md rule 19): these hold `impl CoreEngine` blocks, not new types.
 mod durability;
 mod evolution;
 mod ranking;
@@ -107,10 +48,7 @@ pub struct CoreEngine {
     /// Explicit two-dataset layout marker: `Some(test_len)` for a `{train, test}`
     /// build (test rows concatenated after train). Rebuilds identical pools on resume.
     pub(crate) explicit_test_rows: Option<usize>,
-    /// The EXAM store — a dataset the race never reads. Deliberately its own field and
-    /// NOT concatenated into `dataset`: no stream index, no metric and no callback can
-    /// reach it, so "forgetting it" is structural rather than a policy. Scored once at
-    /// stop, for the reported nets only (`exam.rs`), and reported, never fed back.
+    /// The EXAM store — a dataset the race never reads.
     pub(crate) exam: Option<crate::utils::tabular_data::Dataset>,
     pub(crate) fitness: Fitness,
     pub(crate) metrics: Vec<Metric>,
@@ -119,20 +57,16 @@ pub struct CoreEngine {
     pub(crate) trainer: crate::trainer::AnyTrainer,
     /// Per-step log verbosity for the engine.
     pub(crate) log_level: crate::engine::config::LogLevel,
-    /// Graceful Ctrl+C flag (set by `run`'s signal handler, consumed by
-    /// `check_stop`). `None` outside `run` — tests construct without it.
+    /// Graceful Ctrl+C flag (set by `run`'s signal handler, consumed
+    /// `check_stop`). `None` outside `run` — tests construct without
     pub(crate) interrupt_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// True when the frontier and clock came from DISK (`resume` / `resume_with`).
-    /// `run` then checks the stop BEFORE its first clock: a budget the recorded run
-    /// already spent must re-examine the frontier as recorded, not advance it one
-    /// clock further. A fresh race keeps the bottom-of-loop check, so its clock
-    /// numbering is unchanged.
     pub(crate) resumed: bool,
 
-    /// Per-step step-log counters captured during the evolve phase and consumed by
+    /// Per-step step-log counters captured during the evolve phase and consumed
     /// the SAME step's rollup line / `Minimal` table (both render after the evolve).
     pub(crate) step_evolve: StepEvolve,
-    /// Per-step RL volume (matches + turns), summed over every net that stepped this
+    /// Per-step RL volume (matches + turns), summed over every net that stepped
     /// clock: reset each step, consumed by the same step's rollup. Zero in Tabular mode.
     pub(crate) step_rl: RlVolume,
     /// Run-total of the TRAIN turns (live path only — a resume's replay mirrors
@@ -150,25 +84,20 @@ pub struct CoreEngine {
     /// Per-net `Optimizer` — created on insert, mutated in place each step;
     /// Adam momentum/variance carries forward across steps.
     pub(crate) optimizers: HashMap<String, Box<dyn Optimizer>>,
-    /// Rolling fitness history per net (in-memory): every ranking decision reads the
+    /// Rolling fitness history per net (in-memory): every ranking decision reads
     /// smoothed mean of this buffer, not the raw per-step value.
     pub(crate) rolling_fitness: HashMap<String, RollingBuffer>,
     pub(crate) rolling_train: HashMap<String, RollingBuffer>,
     pub(crate) rolling_eval: HashMap<String, RollingBuffer>,
     /// The ticket probability the coin last COMPARED for each net, captured AT THE DRAW
-    /// (`step_one_net_in_frame`). The lottery summary line averages THESE, so its
-    /// `expected` comes from the same number the coin drew against, not a re-derivation
-    /// from merits that have moved on since.
-    ///
-    /// Reporting state only, never replay state: it describes the last clock, so it is
-    /// not persisted and a resume simply refills it on its first graded clock.
+    /// (`step_one_net_in_frame`).
     pub(crate) last_ticket_p: HashMap<String, f32>,
     /// Wall-clock start for the wall-clock stop criterion.
     pub(crate) started_at_wall: std::time::Instant,
     /// Wall-clock seconds accumulated by EARLIER sessions (stop → resume cycles):
     /// `elapsed_seconds` reports `elapsed_base_secs + started_at_wall.elapsed()`.
     pub(crate) elapsed_base_secs: u64,
-    /// Wall-clock start of the CURRENT step (set at the top of the run loop), so the
+    /// Wall-clock start of the CURRENT step (set at the top of the run loop),
     /// per-step logs surface per-step cost — e.g. RL bridges playing full matches.
     pub(crate) step_started_at_wall: std::time::Instant,
     /// Cumulative culls so far (for max_culls stop).
@@ -176,16 +105,16 @@ pub struct CoreEngine {
     /// The run's tally of evolution events (see [`crate::state::RunAccounting`]):
     /// printed at stop and persisted under `accounting` in `engine.json`.
     pub(crate) accounting: crate::state::RunAccounting,
-    /// Set once, at the first evolve clock, when the initial population is
+    /// Set once, at the first evolve clock, when the initial population
     /// counted into `accounting` (see the evolve phase).
     pub(crate) initial_population_counted: bool,
-    /// Children born per step clock — disambiguates same-clock siblings across all
+    /// Children born per step clock — disambiguates same-clock siblings across
     /// evolution rounds, so same-clock children derive distinct seeds.
     pub(crate) children_born_at_clock: HashMap<usize, usize>,
     /// Anti-devolution A: the nets holding the freeze crown — the seats the elite gate
     /// dealt, a SUBSET of the count-top nets; tracked so crown lines fire on transitions.
     pub(crate) frozen_crown: std::collections::HashSet<String>,
-    /// `Minimal` mode: last step's population means (train, eval, fitness) so the
+    /// `Minimal` mode: last step's population means (train, eval, fitness)
     /// framed table can show what changed. `None` until the first render.
     pub(crate) minimal_prev_means: Option<(f32, f32, f32)>,
     /// Buffer history rows in memory to minimize slow disk I/O writes.
@@ -196,12 +125,7 @@ pub struct CoreEngine {
     pub(crate) attempts_csv_buffer: String,
 }
 
-/// The inputs a constructor actually CHOOSES. Everything else on [`CoreEngine`]
-/// is per-run scratch (buffers, caches, counters) and starts empty/fresh.
-///
-/// Exists because the two engines used to spell the whole 30-field struct literal
-/// twice (`tabular_engine.rs` and `rl_engine.rs`), so adding a field was a two-file
-/// edit with no compiler reminder until one side failed. One list, one place.
+/// The inputs a constructor actually CHOOSES.
 pub(crate) struct CoreEngineParts {
     pub(crate) run_dir: std::path::PathBuf,
     pub(crate) header: RunHeader,
@@ -219,9 +143,8 @@ pub(crate) struct CoreEngineParts {
 }
 
 impl CoreEngine {
-    /// Assemble the engine from the chosen parts; every scratch field is initialised
-    /// HERE, so a new field cannot be added to one engine and forgotten in the other.
-    /// Pure construction — no I/O, no RNG, no record writes.
+    /// Assemble the engine from the chosen parts; every scratch field is initialised HERE, so a new
+    /// field cannot be added to one engine and forgotten in the other.
     pub(crate) fn assemble(p: CoreEngineParts) -> Self {
         Self {
             run_dir: p.run_dir,
@@ -276,7 +199,7 @@ impl CoreEngine {
         )
     }
 
-    /// The run directory this engine writes to (`RunSpec.run_dir` or
+    /// The run directory this engine writes to (`RunSpec.run_dir`
     /// `results/<timestamp>`) — read back here after construction, e.g. to resume later.
     pub fn run_dir(&self) -> &std::path::Path {
         &self.run_dir
@@ -304,7 +227,7 @@ impl CoreEngine {
                 None,
             ),
         };
-        // The spec variant DECIDES the mode; the config's `mode` field is DERIVED (the
+        // The spec variant DECIDES the mode; the config's `mode` field is DERIVED
         // `set_run_mode` setter was deleted — disagreement is now unrepresentable).
         let derived_mode = if tabular_data_dir.is_some() {
             crate::engine::config::RunMode::Tabular
@@ -313,23 +236,20 @@ impl CoreEngine {
         };
         let mut config = config;
         config.mode = derived_mode;
-        // A pool NAME is refused here, before data loads and before the first draw: the
-        // resolvers' `empty ⇒ all` fallback cannot tell a typo from an empty pool, and a
-        // typo that widens the search silently is a run that describes itself wrongly.
+        // A pool NAME is refused here, before data loads and before the first draw: the resolvers'
+        // `empty ⇒ all` fallback cannot tell a typo from an empty pool, and a typo that widens
         config
             .validate_search_pools()
             .map_err(|e| crate::utils::error::EngineError::InvalidOptions(e))?;
         // RL mode REQUIRES a reported fitness: there is no dataset, so a (pred, target)
-        // scorer has nothing to score. Fail before the run starts, not three steps in.
+        // scorer has nothing to score. Fail before the run starts, not three steps
         if tabular_data_dir.is_none() && fitness.is_computed() {
             return Err(crate::utils::error::EngineError::InvalidOptions(
                 "RL spec requires Fitness::reported(direction, label) — a Computed (pred, target) scorer has no dataset to score against. The trainer must supply the fitness value in StepReport.".to_string(),
             )
             .into());
         }
-        // Catch-up toggles are RL-effective only — Tabular always catches up (one shared
-        // stream). Data ROLES come from the subdirectories, through ONE resolver shared
-        // with resume (`core/roles.rs`): `val/` ranks, `test/` reports, a lone pool splits.
+        // Catch-up toggles are RL-effective only — Tabular always catches up (one shared stream).
         let mut roles = match &tabular_data_dir {
             Some(data_dir) => Some(roles::resolve(data_dir, config.device())?),
             None => None,
@@ -351,7 +271,7 @@ impl CoreEngine {
             .as_millis()
             .to_string();
         let run_dir = run_dir.unwrap_or_else(|| std::path::Path::new("results").join(&run_id));
-        // Infer dims from data_dir when TopologyOptions leaves them unset (Tabular only):
+        // Infer dims from data_dir when TopologyOptions leaves them unset (Tabular
         // `None` means "fill from the dataset at run start". RL specs must set them.
         let mut topology_options = config.topology_options;
         let mut topology_errors: Vec<String> = Vec::new();
@@ -397,28 +317,22 @@ impl CoreEngine {
             .into());
         }
         let metrics = config.metrics.clone();
-            // The EVAL share (`eval_share`), clamped by the same bounds the setter
-            // uses: this value builds the pools (and, for a single-pool dir, decides
-            // how much of the data the race is judged on). It was a hardcoded `0.2`
-            // until 2026-11-01, so no caller could choose the split at all.
-        let train_eval_split_ratio = config
-            .eval_share
-            .clamp(
-                crate::engine::config::EVAL_SHARE_MIN,
-                crate::engine::config::EVAL_SHARE_MAX,
-            );
+        // The EVAL share (`eval_share`), clamped by the same bounds the setter uses: this value
+        // builds the pools (and, for a single-pool dir, decides how much of the data the race
+        let train_eval_split_ratio = config.eval_share.clamp(
+            crate::engine::config::EVAL_SHARE_MIN,
+            crate::engine::config::EVAL_SHARE_MAX,
+        );
         let default_batch_size = 16usize;
-        // The trainer owns batch geometry (Tabular only), resolved BEFORE the header so
+        // The trainer owns batch geometry (Tabular only), resolved BEFORE the header
         // engine.json records the stream shape the run used. `None` = no stream (RL).
         let (batch_size, eval_batch_size) = match trainer.stream_shape() {
             Some(shape) => (Some(shape.batch_size), Some(shape.eval_batch_size)),
             None => (None, None),
         };
 
-            // The EXAM: resolved by `roles` (a sibling `exam/`, or `test/` beside a
-            // ranking `val/`) and NEVER concatenated into `dataset` (see
-            // `CoreEngine::exam`). Its row count rides the header so a resume can prove
-            // the same exam is still on disk.
+        // The EXAM: resolved by `roles` (a sibling `exam/`, or `test/` beside a ranking `val/`)
+        // NEVER concatenated into `dataset` (see `CoreEngine::exam`).
         let exam = roles.as_mut().and_then(|r| r.exam.take());
 
         let (header_input_dim, header_output_dim) = match &dataset {
@@ -432,9 +346,7 @@ impl CoreEngine {
             RunConfig {
                 run_id: run_id.clone(),
                 // One-argument resume reads this back (`TabularEngine::resume_from`).
-                data_dir: tabular_data_dir
-                    .as_ref()
-                    .map(|p| p.display().to_string()),
+                data_dir: tabular_data_dir.as_ref().map(|p| p.display().to_string()),
                 engine_mode: Some(
                     if tabular_data_dir.is_some() {
                         "tabular"
@@ -456,7 +368,7 @@ impl CoreEngine {
                 standardize_op_pool: config.standardize_op_pool.clone(),
                 informative_metrics: metrics.clone(),
                 max_steps: config.max_steps,
-                // Legacy key, EVAL share (see `DEFAULT_EVAL_SHARE`): this is the
+                // Legacy key, EVAL share (see `DEFAULT_EVAL_SHARE`):
                 // value a resume reads back to rebuild the same two pools.
                 train_eval_split_ratio: Some(train_eval_split_ratio),
                 explicit_test_rows,
@@ -474,9 +386,8 @@ impl CoreEngine {
                 .as_secs()
                 .to_string(),
         );
-        // The eval-permutation era is `checkpoint_every` at birth, and from then on
-        // it is whatever THIS file says. A resume may change the tick cadence; it may not
-        // change the clocks at which the eval batches were drawn.
+        // The eval-permutation era is `checkpoint_every` at birth, and from then on it is whatever
+        // THIS file says.
         header.eval_era_every = Some(config.checkpoint_every);
         write_engine_json(&run_dir, &header)?;
         // Settle the log sinks now that the run dir exists: `trace_file` opens the sidecar
@@ -495,11 +406,11 @@ impl CoreEngine {
                 .as_ref()
                 .and_then(|t| t.get("trainer"))
                 .and_then(|v| v.as_str());
-            // `max_seeds = pop_size`: the WHOLE elite list comes over in rank order, so the
-            // founders are the source's own ranking, never a reshuffle of it.
+            // `max_seeds = pop_size`: the WHOLE elite list comes over in rank order,
+            // founders are the source's own ranking, never a reshuffle
             match super::seed::resolve_plan(
                 config.elite_previous_dir.as_deref(),
-                // This run's own dir already exists on disk (the header is
+                // This run's own dir already exists on disk (the header
                 // written above), so it would otherwise be "the newest run".
                 Some(run_dir.as_path()),
                 header.engine_mode.as_deref().unwrap_or(""),
@@ -540,7 +451,9 @@ impl CoreEngine {
                                 },
                             ),
                         ]),
-                        Some("rank 1 of the source run's final table; the rest follow that table's order"),
+                        Some(
+                            "rank 1 of the source run's final table; the rest follow that table's order",
+                        ),
                     ));
                     let elite_hashes: Vec<String> =
                         plan.picks.iter().map(|p| p.champion_hash.clone()).collect();
@@ -689,11 +602,7 @@ impl CoreEngine {
         self.header.run_seed
     }
 
-    /// The eval-permutation era length this engine's stream was built with.
-    ///
-    /// On a fresh run it equals `checkpoint_every`; on a resume it is whatever
-    /// `engine.json` recorded, so a caller who changes the tick cadence still draws the
-    /// eval batches the first half drew. `0` = one eternal era, or no stream (RL).
+    /// The eval-permutation era length this engine's stream was built
     pub fn eval_era_every(&self) -> usize {
         self.stream
             .as_ref()
@@ -701,10 +610,10 @@ impl CoreEngine {
             .unwrap_or(0)
     }
 
-    /// The current step clock — read from any live net's recorded step (after the
+    /// The current step clock — read from any live net's recorded step (after
     /// group steps every live net is at the same step). 0 when the population is empty.
     pub fn step_clock(&self) -> usize {
-        // The next clock is one past the last clock any live net trained — read from the
+        // The next clock is one past the last clock any live net trained — read
         // RECORDED clock, not `state.step`: a mid-run insert skips its birth clock.
         self.state
             .live_hashes()
@@ -738,7 +647,7 @@ impl CoreEngine {
         self.seed_population_labeled(labeled, initial_fitness)
     }
 
-    /// [`Self::seed_population_internal`] with per-slot lineage labels: slot 0 of a
+    /// [`Self::seed_population_internal`] with per-slot lineage labels: slot 0
     /// seeded run carries `seed:<run id>:<hash>` instead of `founder-0`.
     fn seed_population_labeled(
         &mut self,
@@ -782,10 +691,7 @@ impl CoreEngine {
         // CFY: the init line is a table; inheritance provenance becomes its own rows.
         let mut rows: Vec<(String, String)> = vec![
             ("live nets".to_string(), count.to_string()),
-            (
-                "run dir".to_string(),
-                self.run_dir.display().to_string(),
-            ),
+            ("run dir".to_string(), self.run_dir.display().to_string()),
             ("seeded slots".to_string(), seeded_slots.to_string()),
         ];
         if let Some(src) = self.header.run_topology_source.as_ref() {
@@ -822,17 +728,13 @@ impl CoreEngine {
     pub fn run(&mut self) -> Result<StopReason> {
         self.apply_eval_defaults();
         // Keep the stream's eval-rotation cadence in lockstep with the checkpoint cadence —
-        // a post-construction config edit must not desync era numbering — but ONLY on a
-        // fresh run. On a resume the era is the RECORD: `TabularEngine::resume` built the
-        // stream from `header.eval_era_every`, and overwriting it here would rotate the eval
-        // permutation at this call's cadence instead of the one the first half used.
+        // post-construction config edit must not desync era numbering — but ONLY on a fresh run.
         if !self.resumed {
             if let Some(stream) = self.stream.as_mut() {
                 stream.set_run_checkpoint_every(self.config.checkpoint_every);
             }
             // The record follows the run that is actually starting: a config edit between
-            // construction and `run` would otherwise leave `engine.json` naming an era this
-            // run never used, and a later resume would draw the wrong eval batches.
+            // construction and `run` would otherwise leave `engine.json` naming an era this run
             if self.header.eval_era_every != Some(self.config.checkpoint_every) {
                 self.header.eval_era_every = Some(self.config.checkpoint_every);
                 if let Err(e) = crate::state::write_engine_json(&self.run_dir, &self.header) {
@@ -840,10 +742,8 @@ impl CoreEngine {
                 }
             }
         }
-        // CFY: the whole start-up block is comfy tables — a run manifest (B), a
-        // search-space section (A), a trainer section, and the log legend as a
-        // card footnote (E). None of these lines start with `step`, so none
-        // stays a one-liner; every field the old prose carried is a cell here.
+        // CFY: the whole start-up block is comfy tables — a run manifest (B), a search-space
+        // section (A), a trainer section, and the log legend as a card footnote (E).
         if self.verbose_detail() {
             let ops = self
                 .config
@@ -901,6 +801,18 @@ impl CoreEngine {
                     fmt_cfg(self.config.risk_aversion),
                 ),
                 (
+                    "window_recency (r)".to_string(),
+                    fmt_cfg(self.config.window_recency),
+                ),
+                ("mean_type".to_string(), self.config.mean_type.to_string()),
+                (
+                    "train_age".to_string(),
+                    match self.config.train_age {
+                        true => "armed".to_string(),
+                        false => "off".to_string(),
+                    },
+                ),
+                (
                     "checkpoint_every".to_string(),
                     self.config.checkpoint_every.to_string(),
                 ),
@@ -908,7 +820,10 @@ impl CoreEngine {
                     "crossover_rolls".to_string(),
                     self.config.crossover_rolls.to_string(),
                 ),
-                ("mutate_rolls".to_string(), self.config.mutate_rolls.to_string()),
+                (
+                    "mutate_rolls".to_string(),
+                    self.config.mutate_rolls.to_string(),
+                ),
                 (
                     "crossover_prob".to_string(),
                     fmt_cfg(self.config.crossover_prob),
@@ -918,7 +833,10 @@ impl CoreEngine {
                     self.config.crossover_selection.to_string(),
                 ),
                 ("mutate_prob".to_string(), fmt_cfg(self.config.mutate_prob)),
-                ("elite_count".to_string(), self.config.elite_count.to_string()),
+                (
+                    "elite_count".to_string(),
+                    self.config.elite_count.to_string(),
+                ),
                 (
                     "freeze_elites".to_string(),
                     self.config.freeze_elites.to_string(),
@@ -932,12 +850,25 @@ impl CoreEngine {
                     fmt_cfg(self.config.train_merit_p_min),
                 ),
                 (
+                    "train_merit_p_max (p_max)".to_string(),
+                    fmt_cfg(self.config.train_merit_p_max),
+                ),
+                // Which end of the field the tickets favour, spelled out so a reader
+                // does not have to interpret a bare `false`.
+                (
+                    "lottery tilt".to_string(),
+                    if self.config.train_merit_inverted {
+                        "worst-first".to_string()
+                    } else {
+                        "best-first".to_string()
+                    },
+                ),
+                (
                     "feature_split_pool".to_string(),
                     self.config.feature_split_pool_names().join(", "),
                 ),
-                    // The one knob that edits an INHERITED gene after crossover: masks,
-                    // node ops, port activations and dropout. `0` = exact inheritance, so
-                    // the manifest says so instead of printing a bare number.
+                // The one knob that edits an INHERITED gene after crossover: masks, node ops, port
+                // activations and dropout.
                 (
                     "topology drift".to_string(),
                     if self.config.drift_prob > 0.0 {
@@ -948,10 +879,16 @@ impl CoreEngine {
                 ),
                 (
                     "fitness".to_string(),
-                    format!("{} ({})", self.meta_ctx.fitness_label, self.meta_ctx.direction),
+                    format!(
+                        "{} ({})",
+                        self.meta_ctx.fitness_label, self.meta_ctx.direction
+                    ),
                 ),
                 ("input_dim".to_string(), self.meta_ctx.input_dim.to_string()),
-                ("output_dim".to_string(), self.meta_ctx.output_dim.to_string()),
+                (
+                    "output_dim".to_string(),
+                    self.meta_ctx.output_dim.to_string(),
+                ),
                 (
                     "batch_size".to_string(),
                     self.meta_ctx
@@ -959,10 +896,13 @@ impl CoreEngine {
                         .map(|b| b.to_string())
                         .unwrap_or_else(|| "—".to_string()),
                 ),
-                ("dropout".to_string(), format!("{}", self.meta_ctx.dropout_prob)),
+                (
+                    "dropout".to_string(),
+                    format!("{}", self.meta_ctx.dropout_prob),
+                ),
                 ("build".to_string(), build_stamp()),
             ];
-            // Knobs that silently change what a run MEANS — kept beside the identity so a
+            // Knobs that silently change what a run MEANS — kept beside the identity
             // resumed command stays reconstructible from the log alone.
             for (k, v) in [
                 (
@@ -974,7 +914,6 @@ impl CoreEngine {
                     self.config.mutation_cull_policy.to_string(),
                 ),
                 ("elite_save", self.config.elite_save_topology.to_string()),
-                ("worst_save", self.config.worst_save_topology.to_string()),
                 (
                     "probation_steps",
                     self.config.mutation_probation_steps.to_string(),
@@ -999,9 +938,8 @@ impl CoreEngine {
                 &crate::utils::cfy::kv(&manifest),
                 None,
             ));
-            // The legend: every word and symbol the step lines use, defined ONCE
-            // next to the arithmetic it names. Later lines can stay short because
-            // the reader met the identities here.
+            // The legend: every word and symbol the step lines use, defined ONCE next
+            // arithmetic it names.
             let sign = match self.fitness.direction() {
                 crate::utils::fitness::Direction::Maximize => "−",
                 crate::utils::fitness::Direction::Minimize => "+",
@@ -1045,8 +983,8 @@ impl CoreEngine {
             ]);
             crate::utils::cfy::emit(&crate::utils::cfy::card("Legend", &legend, None));
 
-                // The genotype's structural bounds: without these the card names the
-                // pools but hides how big a net may get, which is half the search space.
+            // The genotype's structural bounds: without these the card names
+            // pools but hides how big a net may get, which is half the search space.
             let topo = self.config.topology_options;
             let search = crate::utils::cfy::kv(&[
                 ("crossover_ops".to_string(), ops),
@@ -1117,7 +1055,7 @@ impl CoreEngine {
                     std::process::exit(130);
                 }
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                // CFY: the interrupt notice is a table, kept on stderr so it does not
+                // CFY: the interrupt notice is a table, kept on stderr so it does
                 // disturb the `Minimal` frame's stdout redraw.
                 eprintln!(
                     "{}",
@@ -1136,22 +1074,17 @@ impl CoreEngine {
 
         loop {
             let clock = self.step_clock();
-            // Pre-flight stop for a RESUMED race: the clock came from disk, so the budget
-            // may ALREADY be spent (`--max-steps` at or under the recorded clock). Checking
-            // here keeps a guardrail-only re-exam looking at the frontier as RECORDED — no
-            // clock is trained, evolved or re-ranked before the check. A fresh race starts
-            // at clock 0 and never takes this branch, so its numbering is unchanged.
+            // Pre-flight stop for a RESUMED race: the clock came from disk, so the budget may
+            // ALREADY be spent (`--max-steps` at or under the recorded clock).
             if self.resumed {
-                // `check_stop_before_clock`, not `check_stop`: at the TOP of a
-                // clock the budget predicate is `clock >= max`, one clock apart
-                // from the bottom-of-loop form. Sharing the bottom form here
-                // silently ate the last allowed clock of every top-up.
+                // `check_stop_before_clock`, not `check_stop`: at the TOP of a clock the budget
+                // predicate is `clock >= max`, one clock apart from the bottom-of-loop form.
                 if let Some(reason) = self.check_stop_before_clock(clock) {
                     return self.finish_race(reason, clock.saturating_sub(1));
                 }
             }
             self.step_started_at_wall = std::time::Instant::now();
-            // Per-step accumulators start empty; the rollup at the END of this
+            // Per-step accumulators start empty; the rollup at the END
             // step reads them (it is the last line printed for the step).
             self.step_rl = RlVolume::default();
 
@@ -1172,15 +1105,13 @@ impl CoreEngine {
                 let culls_before = self.culls;
                 let cross_total = self.config.crossover_rolls;
                 let mutate_total = self.config.mutate_rolls;
-                // The cull shield is a POPULATION-level fact: when nobody is cull-eligible, every
+                // The cull shield is a POPULATION-level fact: when nobody is cull-eligible,
                 // roll would be spent for nothing — say it once. Derived draws shift no later roll.
                 let evolve_allowed = self.has_cull_eligible();
                 if !evolve_allowed {
                     self.accounting.deferred_clocks += 1;
-                    // The windows are NAMED, with their lengths: "no cull-eligible net"
-                    // alone reads as a stuck engine, while `k=5` at clock 3 makes it
-                    // arithmetic — the shield is per-child and outlives a short run, so
-                    // every clock of it defers by construction.
+                    // The windows are NAMED, with their lengths: "no cull-eligible net" alone reads
+                    // as a stuck engine, while `k=5` at clock 3 makes it arithmetic — the shield
                     let shielded = self.config.crossover_probation_steps >= clock
                         || self.config.mutation_probation_steps >= clock;
                     info!(
@@ -1197,7 +1128,7 @@ impl CoreEngine {
                         },
                     );
                 }
-                // The initial batch is whatever is alive at the FIRST evolve clock — nothing is
+                // The initial batch is whatever is alive at the FIRST evolve clock — nothing
                 // inserted yet and this clock's culls come later, so it is the founder batch.
                 if !self.initial_population_counted {
                     self.initial_population_counted = true;
@@ -1217,10 +1148,7 @@ impl CoreEngine {
                 }
                 self.accounting.crossover_rolls += cross_total;
                 self.accounting.mutation_rolls += mutate_total;
-                // 3a. crossover rolls: recombined children.
-                // Non-firing rolls are the NORMAL case (p < 1). Collected here and
-                // reported as ONE summary line per clock, so a reader does not mistake
-                // `1/5, 3/5, 5/5` for lost output.
+                // 3a.
                 let mut cross_missed: Vec<usize> = Vec::new();
                 let mut mutate_missed: Vec<usize> = Vec::new();
                 for roll in 0..cross_total {
@@ -1240,7 +1168,7 @@ impl CoreEngine {
                         // roll fired — fall through to the attempt loop
                     } else {
                         // debug: a roll that missed is the NORMAL case (p < 1), so it is per-roll
-                        // detail, not a per-clock event; `--log-level debug` shows them all.
+                        // detail, not a per-clock event; `--log-level debug` shows them
                         cross_missed.push(roll + 1);
                         debug!(
                             "step {} │ crossover roll {} of {} missed (p={})",
@@ -1252,7 +1180,7 @@ impl CoreEngine {
                         continue;
                     }
                     cross_fired += 1;
-                    // A crossover roll retries the FULL attempt (fresh parents) up to a
+                    // A crossover roll retries the FULL attempt (fresh parents) up
                     // fixed budget; a roll that still produces nothing is discarded.
                     let max_attempts = CROSSOVER_ATTEMPTS;
                     let mut attempt = 0usize;
@@ -1264,7 +1192,7 @@ impl CoreEngine {
                             break out;
                         }
                         if out.no_slot {
-                            // Hard shield: no cull-eligible victim. Retrying cannot change that within this
+                            // Hard shield: no cull-eligible victim. Retrying cannot change that within
                             // clock, and it is not a discard (no child was ever built).
                             break out;
                         }
@@ -1340,7 +1268,7 @@ impl CoreEngine {
                                 detail,
                             );
                         }
-                        // Hard shield: the roll is spent with nothing culled and no immigrant built — a
+                        // Hard shield: the roll is spent with nothing culled and no immigrant built —
                         // fresh net is never evicted. Per-roll detail; the rollup carries the verdict.
                         None => {
                             self.accounting.mutation_blocked += 1;
@@ -1356,9 +1284,10 @@ impl CoreEngine {
                         }
                     }
                 }
-                // The rolls that did NOT fire, named in one line: their absence is
+                // The rolls that did NOT fire, named in one line: their absence
                 // the probability working, not dropped output.
-                if self.verbose_detail() && (!cross_missed.is_empty() || !mutate_missed.is_empty()) {
+                if self.verbose_detail() && (!cross_missed.is_empty() || !mutate_missed.is_empty())
+                {
                     let list = |v: &[usize]| {
                         v.iter()
                             .map(|n| n.to_string())
@@ -1408,7 +1337,7 @@ impl CoreEngine {
 
             // ── 1. group step: every live net on the same shared batch ──────
 
-            // A child born above is deliberately NOT in this clock's group (it skipped its
+            // A child born above is deliberately NOT in this clock's group (it skipped
             // birth clock), keeping the `entered_at_step + 1` metric-row contract.
             let hashes: Vec<String> = self
                 .state
@@ -1431,15 +1360,12 @@ impl CoreEngine {
                 ));
                 return Ok(StopReason::MaxSteps);
             }
-            // 1-pre. KISS crown: the crown IS the elite take(k) set, recomputed fresh every
+            // 1-pre. KISS crown: the crown IS the elite take(k) set, recomputed fresh
             // step (refresh_crown prints the freeze/dethrone diffs up front).
             self.refresh_crown(clock);
-            // 1a. pop-wide phase (RL only): hand the trainer the whole live population once
-            // per step, before any per-net step. The trainer is asked FIRST whether it uses
-            // the hook — the gather below is O(population), so a mode (or scheme) that
-            // ignores `pop_phase` must not pay for it every step.
+            // 1a.
             if self.trainer.wants_pop_phase() {
-                // One pass over the map — multiple get_mut borrows stored at
+                // One pass over the map — multiple get_mut borrows stored
                 // once don't compile (NLL), but iter_mut does.
                 let live: std::collections::HashSet<&String> = hashes.iter().collect();
                 let mut nets: Vec<(String, &mut Network)> = self
@@ -1450,36 +1376,48 @@ impl CoreEngine {
                     .collect();
                 self.trainer.pop_phase(&mut nets, clock);
             }
-                // One lottery field per clock, built BEFORE anyone steps: every net is
-                // graded against the same pre-clock readings (order-independent) and the
-                // walk over live nets happens once, not once per net. `None` when the
-                // lottery is off — zero cost on the default path.
+            // One lottery field per clock, built BEFORE anyone steps: every net is graded against
+            // the same pre-clock readings (order-independent) and the walk over live nets happens
             let lottery = self.lottery_frame(clock);
-            // The rollup is the only consumer of the skipped-update tally, so its two
-            // O(n) sums only run when a line will actually be printed.
-            //
-            // It does NOT ride the crown's switch: the line also carries the training
-            // budget (ran / ticketed / idled) and the population identity, which a run with
-            // `freeze_elites = false` needs just as much. The seat legs render themselves
-            // off instead (`crown_armed`), so silencing the crown never silences the budget.
+            // THE COIN NEVER STARVES THE WHOLE GROUP.
+            let forced_ticket: Option<(String, f32)> = lottery.and_then(|frame| {
+                let mut best: Option<(String, f32)> = None;
+                for hash in &hashes {
+                    let p = self.train_lottery_p_eff(hash, clock, Some(frame));
+                    if self.train_lottery_draws_at(hash, clock, p) {
+                        return None; // a real ticket exists: nothing to force
+                    }
+                    let better = match &best {
+                        None => true,
+                        Some((held, top)) => p > *top || (p == *top && hash < held),
+                    };
+                    if better {
+                        best = Some((hash.clone(), p));
+                    }
+                }
+                best
+            });
+            let forced_ticket = forced_ticket.map(|(hash, _)| hash);
+            if let Some(hash) = &forced_ticket {
+                info!(
+                    "step {} │ lottery │ every net in the group lost its draw — {} takes the clock on the highest chance (p={}) so the clock is not pinned",
+                    clock,
+                    &hash[..8.min(hash.len())],
+                    fmt_cfg(self.train_lottery_p_eff(hash, clock, lottery)),
+                );
+            }
+            // The rollup is the only consumer of the skipped-update tally, so its two O(n) sums
+            // only run when a line will actually be printed.
             let rollup_on = self.log_level == crate::engine::config::LogLevel::Summ;
-                // The lottery's own tally for this clock: a per-net snapshot of the IDLE
-                // counters (clocks it has left the net untrained and unmeasured), so
-                // after the loop the rollup can say how many tickets it denied AND WHICH
-                // nets got none (the delta, not the cumulative total).
-                // Gated on the LOTTERY's own line, not the rollup's: `freeze_elites` off
-                // silences the crown rollup, never the train-budget report.
+            // The lottery's own tally for this clock: a per-net snapshot of the IDLE counters
+            // (clocks it has left the net untrained and unmeasured), so after the loop the rollup
             let lottery_line_on = self.lottery_line_on(lottery.is_some());
-                // The lottery's per-net card, printed BEFORE anyone steps: every number in
-                // it is an input to this clock's coin — the same `frame` handed to
-                // `step_one_net_in_frame` below — so `p` and the field bounds printed with
-                // it explain the draw rather than being rebuilt from post-step readings.
-                // What the clock actually skipped is the who-line, after the loop.
+            // The lottery's per-net card, printed BEFORE anyone steps: every number
+            // input to this clock's coin — the same `frame` handed to `step_one_net_in_frame` below
             if lottery_line_on {
                 if let Some(frame) = lottery {
-                    // The per-net card is the DEBUG view: at Summ a population of 88 would
-                    // redraw 88 rows every clock. Debug/trace still gets it in full; Summ
-                    // gets the one aggregate line after the loop.
+                    // The per-net card is the DEBUG view: at Summ a population of 88 would redraw
+                    // 88 rows every clock.
                     if tracing::enabled!(tracing::Level::DEBUG) {
                         self.log_lottery_card(clock, frame);
                     }
@@ -1509,7 +1447,8 @@ impl CoreEngine {
                 }
                 // A trainer error DURING an interrupt IS the interrupt (SIGINT hits the whole
                 // process group, so a bridge child dies first): route it into the graceful path.
-                if let Err(e) = self.step_one_net_in_frame(hash, clock, lottery) {
+                let forced = forced_ticket.as_deref() == Some(hash.as_str());
+                if let Err(e) = self.step_one_net_in_frame(hash, clock, lottery, forced) {
                     let flagged = self
                         .interrupt_flag
                         .as_ref()
@@ -1528,11 +1467,8 @@ impl CoreEngine {
 
             // ── 1b. per-step rollup: trained / frozen / newborn + elite gate ──
 
-            // One line per GROUP step, printed LAST so it lands at the bottom of the
-            // terminal; what each field means is documented once on `step_rollup_line`.
-                // Per-net idle deltas: ONE read, consumed by BOTH the rollup (as a count)
-                // and the who-line (as hashes). Independent of the rollup's gate, so a
-                // crown-less run still reports who the budget denied.
+            // One line per GROUP step, printed LAST so it lands at the bottom of the terminal; what
+            // each field means is documented once on `step_rollup_line`.
             let (trained, withheld) = self.lottery_clock_report(&hashes, &idle_before);
             let lottery_skips = withheld.len();
 
@@ -1540,15 +1476,14 @@ impl CoreEngine {
                 let vitals = self.step_vitals(clock, &hashes, lottery_skips);
                 info!("step {} │ {}", clock, step_rollup_line(&vitals));
             }
-                // The who-line rides the LOTTERY's gate, not the rollup's: a run with the
-                // elite crown off (`freeze_elites = false`) still reports which nets got no
-                // ticket. Printed only when something actually did not.
+            // The who-line rides the LOTTERY's gate, not the rollup's: a run with the elite crown
+            // off (`freeze_elites = false`) still reports which nets got no ticket.
             if lottery_line_on {
                 if let Some(frame) = lottery {
-                    // The Summ view is the aggregate: `p̄` vs the realized `won`, the
+                    // The Summ view is the aggregate: `p̄` vs the realized `won`,
                     // field, and the budget means. One line, whatever the population size.
                     self.log_lottery_summary(clock, frame, trained.len(), withheld.len());
-                    // WHO got the tickets is DEBUG: a Summ terminal cannot carry a
+                    // WHO got the tickets is DEBUG: a Summ terminal cannot carry
                     // wrapped hash list per clock.
                     if lottery_skips > 0 {
                         let (mut trained, mut withheld) = (trained, withheld);
@@ -1563,32 +1498,23 @@ impl CoreEngine {
                 }
             }
 
-            // ── 2. durability tick (every `checkpoint_every` steps) ─────────
-            // `> 0` is load-bearing twice: `checkpoint_every = 0` is the documented OFF
-            // (no tick, no era rotation) and `clock % 0` would panic.
-            if self.config.checkpoint_every > 0 && clock > 0 && clock % self.config.checkpoint_every == 0
+            // ── 2.
+            if self.config.checkpoint_every > 0
+                && clock > 0
+                && clock % self.config.checkpoint_every == 0
             {
-                // Snapshot the live frontier. NOTE: this is not a point-in-time SET — a
-                // net culled after this tick overwrites its own file with a tombstone, so a
-                // hard kill can leave a frontier that no longer resumes (measured: 2 live of
-                // 8, refused as a pop_size mismatch). notes/RESUME.md §4 has the numbers and
-                // §6 the fix (an atomic `ckpt.json` manifest).
+                // Snapshot the live frontier.
                 if let Err(e) = self.write_live_frontier_states() {
                     tracing::warn!("checkpoint live states write failed: {e}");
                 }
-                // EVERY live net's WEIGHTS — the frontier states above carry topology and
-                // counters, this completes them. Stale files are swept here, never on
-                // cull: see `sweep_stale_net_weights`.
+                // EVERY live net's WEIGHTS — the frontier states above carry topology and counters,
+                // this completes them.
                 if let Err(e) = self.write_live_net_weights() {
                     tracing::warn!("checkpoint net weights write failed: {e}");
                 }
                 self.sweep_stale_net_weights();
-                // The frontier as a SET, after the files it names: until this lands, a
-                // kill leaves `nets/` as the only record, and a net culled after the
-                // tick has already overwritten its own file with a tombstone. Written
-                // here — nets first, manifest second — so a manifest never names a net
-                // whose weights are absent. A manifest that LAGS the weights is refused on
-                // resume: a loaded weight cannot be rewound.
+                // The frontier as a SET, after the files it names: until this lands, a kill leaves
+                // `nets/` as the only record, and a net culled after the tick has already
                 if let Err(e) = self.write_frontier_manifest(clock + 1) {
                     tracing::warn!("checkpoint frontier manifest write failed: {e}");
                 }
@@ -1609,10 +1535,8 @@ impl CoreEngine {
 
             // ── 3c. per-step rollup — LAST line of the step ─────────────────
 
-            // Ordered evolve → crown → train → checkpoint → rollup so the summary always
-            // sits at the bottom; `took` covers the whole step. `Minimal` renders the table.
-            // Diversity rides the checkpoint cadence, ABOVE the rollup (the rollup stays
-            // the clock's last line).
+            // Ordered evolve → crown → train → checkpoint → rollup so the summary always sits
+            // the bottom; `took` covers the whole step.
             self.log_diversity(clock);
             // Same cadence, same reason: the mixing rate is a slow reading, and it sits
             // above the rollup so the clock still ends on its summary line.
@@ -1635,7 +1559,6 @@ impl CoreEngine {
         // it must land on disk at every log level, even `None`.
         self.write_elite_index()?;
         self.write_champion_markdown()?;
-        self.write_worst_artifacts()?;
         // `None` mode stays silent until the caller's final stop print.
         if self.verbose_detail() {
             // CFY: the stop banner is a table too.
@@ -1649,13 +1572,11 @@ impl CoreEngine {
             ));
             self.log_stop_summary(clock)?;
         }
-        // After the stop cards, and OUTSIDE the gate: the final-field TABLE is an
-        // artifact, written at every log level — `None` included, since that is the
-        // scripted caller who wants the table as a file. `log_final_field` gates only
-        // its card (and the ancestry under it) on the same `verbose_detail`.
+        // After the stop cards, and OUTSIDE the gate: the final-field TABLE is an artifact, written
+        // at every log level — `None` included, since that is the scripted caller who wants
         self.log_final_field(clock, self.verbose_detail());
         // Stamp the live nets' final readings first: the frontier write below
-        // then carries `final_*` on every net file, culled or not.
+        // then carries `final_*` on every net file, culled
         self.stamp_live_final_scores();
         self.write_live_frontier_states()?;
         // …and their weights, so the stop-time frontier is as loadable as a tick's.
@@ -1677,25 +1598,21 @@ impl CoreEngine {
         header.run_elapsed_secs = self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs();
         header.children_born_at_clock = self.children_born_at_clock.clone();
         // The run's tally of evolution events: part of "what happened", not re-derivable
-        // from the config — stamped here, the last write of the run. Resume ignores it.
+        // from the config — stamped here, the last write of the run. Resume ignores
         header.accounting = Some(self.accounting.clone());
         if let Err(e) = crate::state::write_engine_json(&self.run_dir, &header) {
             tracing::warn!("engine.json counter persistence failed: {e}");
         }
     }
 
-    /// Stamp the SEARCH SPACE from a loaded header onto a config. Shared by both
-    /// `resume_from` constructors so the two arms cannot drift: these fields decide WHICH
-    /// topologies exist (options, pools, hidden-dim range), which metrics are recorded,
-    /// and where the run stops — none of them belongs to the caller on a resume.
+    /// Stamp the SEARCH SPACE from a loaded header onto a config.
     pub(crate) fn apply_header_search_space(
         config: &mut RaceConfig,
         header: &crate::state::RunHeader,
     ) {
         config.topology_options = header.topology_options;
-        // A header written BEFORE the split moved onto `TopologyOptions` recorded it on
-        // `config.feature_split`; restore it here so an old run keeps drawing the same
-        // masks for its newborns instead of silently reverting to "no split".
+        // A header written BEFORE the split moved onto `TopologyOptions` recorded
+        // `config.feature_split`; restore it here so an old run keeps drawing the same masks
         if config.topology_options.feature_split.is_none() {
             if let Some(raw) = header.config.feature_split.as_deref() {
                 config.topology_options.feature_split =
@@ -1724,22 +1641,13 @@ impl CoreEngine {
             .collect();
     }
 
-    /// Change the step budget of a LIVE engine — the resume-and-extend door. The budget is
-    /// ABSOLUTE (`max_steps` counts clocks, not clocks-this-process), so extending it is the
-    /// one stop knob a resume may move; the caller's value wins over the recorded one.
-    ///
-    /// The ONE thing this can quietly change is the shape of a budget-relative LR
-    /// schedule, and the check lives here because this is the single funnel every
-    /// language's "extend the run" goes through — see
-    /// [`warn_budget_changed_under_a_budget_schedule`].
+    /// Change the step budget of a LIVE engine — the resume-and-extend door.
     pub fn set_stop_max_steps(&mut self, steps: usize) {
         if self.resumed && self.header.max_steps != Some(steps) {
             warn_budget_changed_under_a_budget_schedule(&self.header, Some(steps));
         }
         self.config.max_steps = Some(steps);
     }
-
-
 }
 
 /// The per-step participation rollup line (the `1b.` block of `run()`) as a pure
@@ -1765,7 +1673,7 @@ pub(crate) struct StepVitals {
     pub eligible: usize,
     /// Nets still inside the join window (`elite_join_probation_steps`).
     pub probation: usize,
-    /// Nets past the crown lifetime (`elite_crown_lifetime_steps`); 0 disarms it.
+    /// Nets past the crown lifetime (`elite_crown_lifetime_steps`); 0 disarms
     pub age_blocked: usize,
     /// Seats actually dealt this clock (the crown's size).
     pub seats_held: usize,
@@ -1775,16 +1683,12 @@ pub(crate) struct StepVitals {
     pub join_k: usize,
     /// The crown lifetime `j` this clock was graded against (`0` = disarmed).
     pub lifetime_j: usize,
-    /// Whether the crown is armed at all (`freeze_elites`). When it is not, the seat and
-    /// gate legs are meaningless — every live net is seat-eligible and no seat can be
-    /// dealt — so the line says so instead of printing a gate tally nobody is subject to.
+    /// Whether the crown is armed at all (`freeze_elites`).
     pub crown_armed: bool,
 }
 
-/// WHO the ticket lottery graded this clock, in one compact line: both counts are
-/// always stated, and the SMALLER side is listed in full (capped at
-/// [`LOTTERY_LIST_MAX`]) so the other side is the explicit complement — a clock where
-/// 4 of 28 trained names the 4; a clock where 24 of 28 idled names the 24.
+/// WHO the ticket lottery graded this clock, in one compact line: both counts are always stated,
+/// and the SMALLER side is listed in full (capped at [`LOTTERY_LIST_MAX`]) so the other side
 fn lottery_who_line(trained: &[String], withheld: &[String]) -> String {
     /// Hashes listed before the `+N` tail.
     const LOTTERY_LIST_MAX: usize = 12;
@@ -1817,18 +1721,12 @@ fn lottery_who_line(trained: &[String], withheld: &[String]) -> String {
     }
 }
 
-/// The per-step participation line, every composite printed with the arithmetic
-/// that produced it: `ran A of L = T ticketed + C crown`, `held back H = …`,
-/// `L = A + H`, the seat gate as a partition of the live count, and the lottery's
-/// `would-train` budget.
-///
-/// Invariant: `stepped + held = live`. The crown is INSIDE `ran` (it ran the
-/// trainer) and never in the held-back list, so the two counts cannot overshoot
-/// `live`.
+/// The per-step participation line, every composite printed with the arithmetic that produced
+/// `ran A of L = T ticketed + C crown`, `held back H = …`, `L = A + H`, the seat gate
 fn step_rollup_line(v: &StepVitals) -> String {
     let mut parts = Vec::new();
     // `ticketed` and `updating` are the same number: the nets that got a real
-    // weight update. The word changes with the lottery, the count does not.
+    // weight update. The word changes with the lottery, the count does
     let update_word = if v.lottery_skips > 0 {
         "ticketed"
     } else {
@@ -1853,10 +1751,7 @@ fn step_rollup_line(v: &StepVitals) -> String {
         not_run.push(format!("{} idled (no train, no eval)", v.lottery_skips));
     }
     if v.newborn > 0 {
-        not_run.push(format!(
-            "{} newborn (first step next clock)",
-            v.newborn
-        ));
+        not_run.push(format!("{} newborn (first step next clock)", v.newborn));
     }
     let held = v.lottery_skips + v.newborn;
     if !not_run.is_empty() {
@@ -1864,7 +1759,7 @@ fn step_rollup_line(v: &StepVitals) -> String {
     }
     parts.push(format!("{} = {} + {}", v.live, v.stepped, held));
     if !v.crown_armed {
-        // No crown ⇒ no seats and no gates: the two legs below would print a tally for a
+        // No crown ⇒ no seats and no gates: the two legs below would print a tally
         // restriction that is not in force (and a `seats 0 of k` that reads like a bug).
         parts.push(format!(
             "crown off (freeze_elites = false): 0 of {} seats, no gate — every live net is seat-eligible",
@@ -1873,7 +1768,7 @@ fn step_rollup_line(v: &StepVitals) -> String {
     } else {
         parts.push(format!("seats {} of {}", v.seats_held, v.seats_capacity));
         // The seat gates partition the live count: eligible + join window/cull shield
-        // + age-blocked = live. Printing the subtraction lets a reader check it.
+        // + age-blocked = live. Printing the subtraction lets a reader check
         let lifetime = if v.lifetime_j == 0 {
             "age block off".to_string()
         } else {
@@ -1885,8 +1780,8 @@ fn step_rollup_line(v: &StepVitals) -> String {
         ));
     }
     if v.lottery_skips > 0 {
-        // The lottery's budget, in its own units: the ticketed plus the idled are
-        // exactly the nets that would have trained without it.
+        // The lottery's budget, in its own units: the ticketed plus the idled
+        // exactly the nets that would have trained without
         parts.push(format!(
             "would-train {} = {} ticketed + {} idled",
             v.would_train, v.trained, v.lottery_skips
@@ -1921,17 +1816,6 @@ pub(crate) fn assert_trainer_blob_matches(
 }
 
 /// Warn when a resume changes the BUDGET under a budget-relative LR schedule.
-///
-/// `cosine` and `onecycle` are functions of `step / max_steps` (see
-/// `crate::trainer::schedule`), so extending a 4-clock run to 6 does not merely add
-/// two clocks: the clocks already on disk were trained on a curve drawn against 4,
-/// and the new ones are drawn against 6. The prefix stays honest and the frontier
-/// stays exact — but the file is no longer the twin of a run made at the new budget,
-/// and that is the sort of silent difference this engine warns about instead of
-/// leaving to a diff someone runs a week later.
-///
-/// Not a refusal: extending a run is legitimate, and a resume that keeps the budget
-/// (the crash case) is unaffected.
 pub(crate) fn warn_budget_changed_under_a_budget_schedule(
     header: &RunHeader,
     new_budget: Option<usize>,
@@ -2010,7 +1894,6 @@ fn diff_json(path: &str, a: &serde_json::Value, b: &serde_json::Value, out: &mut
 // ── Optimizer construction ───────────────────────────────────────────────────
 
 // ── Tests ────────────────────────────────────────────────────────────────────
-
 
 #[cfg(test)]
 mod tests;

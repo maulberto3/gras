@@ -1,6 +1,5 @@
-//! The engine's small value types (`RollOutcome`, `StepEvolve`, `RlVolume`, the
-//! no-op optimizer) — split out of `core/mod.rs` by AGENTS.md rule 19. `use
-//! super::*` keeps every name the impls were written against.
+//! The engine's small value types (`RollOutcome`, `StepEvolve`, `RlVolume`, the no-op optimizer) —
+//! split out of `core/mod.rs` by AGENTS.md rule 19.
 
 use super::*;
 
@@ -95,9 +94,8 @@ impl RlVolume {
         self.train_turns + self.eval_turns
     }
 
-    /// The RL middle column of the rollup: the episode count, the turn identity
-    /// `turns = train + eval`, the mean turns per episode, and the per-turn wall
-    /// cost — `took` alone cannot answer "did the engine get slower?".
+    /// The RL middle column of the rollup: the episode count, the turn identity `turns = train +
+    /// eval`, the mean turns per episode, and the per-turn wall cost — `took` alone cannot answer
     pub(crate) fn label(&self, step_secs: f32) -> String {
         if self.nets == 0 || self.matches == 0 {
             return "episodes — │ turns — = train — + eval — │ turns/episode — │ ms/turn —"
@@ -120,4 +118,3 @@ impl RlVolume {
         )
     }
 }
-

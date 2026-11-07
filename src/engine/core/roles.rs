@@ -1,22 +1,4 @@
 //! Data ROLES — which directory trains, which one ranks, which one only reports.
-//!
-//! Three roles, decided by the layout on disk and by nothing else:
-//!
-//! | layout | learns | ranks (eval) | reports (exam) |
-//! |---|---|---|---|
-//! | `inputs.csv|bin` | it (80%) | the `eval_share` slice | `exam/` if present |
-//! | `train/` + `test/` | `train/` | `test/` | `exam/` if present |
-//! | `train/` + `val/` | `train/` | `val/` | `test/`, else `exam/` |
-//!
-//! The `val` layout is the classic three-way split: the pool that ranks is a pool the
-//! nets never trained on, and `test/` is still untouched by selection — which is what
-//! makes it a usable report. Under `train/` + `test/` the `test/` rows ARE the ranking
-//! pool (they were the only held-out rows there), so only a separate `exam/` is honest.
-//!
-//! **One resolver for birth and resume.** Resume rebuilds the pools through this same
-//! function and then compares the result with what the header recorded, so a data dir
-//! that was re-labelled (`test/` renamed to `val/`, or a role removed) is refused by
-//! name instead of silently continuing on a different row set.
 
 use crate::utils::tabular_data::{self, Dataset, PoolLayout};
 use flodl::tensor::Result;
@@ -29,7 +11,7 @@ pub(crate) struct DataRoles {
     /// Rows of the RANKING pool at the END of `dataset`; `None` = single-pool seeded
     /// split (`PoolSplit::of`), `Some` = pools by construction (`PoolSplit::explicit`).
     pub(crate) explicit_test_rows: Option<usize>,
-    /// Which subdirectory ranks: `"val"` or `"test"`; `None` for a single pool. This is
+    /// Which subdirectory ranks: `"val"` or `"test"`; `None` for a single pool.
     /// the fact `engine.json` records and a resume verifies.
     pub(crate) eval_split: Option<String>,
     /// The exam store: a dataset NO clock can reach, scored once at stop.
@@ -60,9 +42,7 @@ pub(crate) fn resolve(data_dir: &std::path::Path, device: flodl::Device) -> Resu
         _ => Some(eval_rows),
     };
     let exam = match tabular_data::exam_dir(data_dir, layout) {
-        Some(dir) => Some(
-            tabular_data::resolve_inputs_targets_datasets(&dir)?.to_device(device)?,
-        ),
+        Some(dir) => Some(tabular_data::resolve_inputs_targets_datasets(&dir)?.to_device(device)?),
         None => None,
     };
     let exam_rows = exam.as_ref().map(|d| d.len());
@@ -70,7 +50,8 @@ pub(crate) fn resolve(data_dir: &std::path::Path, device: flodl::Device) -> Resu
         "data │ roles: {} · train {} row(s) · eval ({}) {} row(s) · exam {} row(s)",
         match layout {
             PoolLayout::TrainVal => "train/ learns, val/ ranks, test/ reports",
-            PoolLayout::TrainTest => "train/ learns, test/ ranks (no val/ — nothing held out but exam/)",
+            PoolLayout::TrainTest =>
+                "train/ learns, test/ ranks (no val/ — nothing held out but exam/)",
             PoolLayout::Single => "one pool, split by eval_share",
         },
         train_rows,

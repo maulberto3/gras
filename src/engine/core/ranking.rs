@@ -1,15 +1,13 @@
-//! Split out of `core/mod.rs` by AGENTS.md rule 19 (a MOVE: no behaviour,
-//! no public surface, no renamed method). `use super::*` reaches every name
-//! the parent module saw.
+//! Split out of `core/mod.rs` by AGENTS.md rule 19 (a MOVE: no behaviour, no public surface, no
+//! renamed method).
 
 use super::*;
 
 impl CoreEngine {
     // ── Smoothed fitness ────────────────────────────────────────────────────
 
-    /// Per-net RISK-ADJUSTED fitness over the live population, in `live_hashes()`
-    /// order — the shared input for ranking and `RaceSnapshot` (FIT: the window
-    /// mean charged `λ` window-stds for its own spread).
+    /// Per-net RISK-ADJUSTED fitness over the live population, in `live_hashes()` order —
+    /// shared input for ranking and `RaceSnapshot` (FIT: the window mean charged `λ` window-stds
     pub(crate) fn smoothed_fitness_values(&self) -> Vec<f32> {
         // Only nets with a non-empty rolling buffer get a value — a caught-up child
         // qualifies at once, and phantom 0.0 values never drag the mean down.
@@ -19,27 +17,26 @@ impl CoreEngine {
             .live_hashes()
             .into_iter()
             .filter_map(|h| self.race_reading_of(&h))
-            .map(|s| s.risk_adjusted(direction, lambda))
+            .map(|s| s.score(direction, lambda))
             .collect()
     }
 
-        /// The net's ranking value (FIT): the risk-adjusted window score, `mean ∓ λ·σ`
-        /// over `smoothing_window` step fitnesses — what every ranking decision reads.
-        /// `None` = no fitness yet. The READABLE level behind it is
-        /// [`CoreEngine::race_reading_of`]'s `mean`; at `λ = 0` the two are identical.
+    /// The net's ranking value (FIT): the risk-adjusted window score, `mean ∓ λ·σ` over
+    /// `smoothing_window` step fitnesses — what every ranking decision reads.
     pub fn smoothed_fitness_of(&self, hash: &str) -> Option<f32> {
         let direction = self.fitness.direction();
         let lambda = self.config.risk_aversion;
         self.race_reading_of(hash)
-            .map(|s| s.risk_adjusted(direction, lambda))
+            .map(|s| s.score(direction, lambda))
     }
 
     /// The net's RACE READING with its own error bar: the smoothed mean plus how many
     /// step readings are behind it and how far apart they were ([`WindowStats`]).
     pub(crate) fn race_reading_of(&self, hash: &str) -> Option<WindowStats> {
-        self.rolling_fitness.get(hash).and_then(rolling_stats)
+        self.rolling_fitness.get(hash).and_then(|buf| {
+            rolling_stats_with(buf, self.config.window_recency, self.config.mean_type)
+        })
     }
-
 
     /// A live net's parameter count (`NetMeta::params`) — the ranking
     /// tie-break key.
@@ -47,26 +44,21 @@ impl CoreEngine {
         self.state.net(hash).and_then(|s| s.meta.params)
     }
 
-
     /// THE ranking primitive: live nets paired with smoothed fitness, ordered
     /// best-first. `require_measured` is the eligibility contract (true = ranked_live).
     pub(crate) fn ranked_live_impl(&self, require_measured: bool) -> Vec<(String, f32)> {
         let direction = self.fitness.direction();
         let lambda = self.config.risk_aversion;
-            // `(hash, score, params)`: the size rides along so the comparator below is a
-            // pure function of the tuple — ONE map lookup per net instead of two per
-            // comparison, and no borrow gymnastics inside the sort.
+        // `(hash, score, params)`: the size rides along so the comparator below is a pure function
+        // of the tuple — ONE map lookup per net instead of two per comparison, and no borrow
         let mut ranked: Vec<(String, f32, i64)> = self
             .state
             .live_hashes()
             .into_iter()
-            .filter_map(|h| match self.rolling_fitness.get(&h).and_then(rolling_stats) {
-                // FIT: the ranking value is the risk-adjusted score, so a net with a
-                // wild window pays for its spread before it is ever crowned, culled
-                // or drawn as a parent.
-                Some(s) if !require_measured || s.n > 0 => {
-                    Some((h, s.risk_adjusted(direction, lambda)))
-                }
+            .filter_map(|h| match self.race_reading_of(&h) {
+                // FIT: the ranking value is the risk-adjusted score, so a net with a wild window
+                // pays for its spread before it is ever crowned, culled or drawn as a parent.
+                Some(s) if !require_measured || s.n > 0 => Some((h, s.score(direction, lambda))),
                 Some(_) => None,
                 // Never measured: the parent-selection contract counts it as 0.0.
                 None if !require_measured => Some((h, 0.0)),
@@ -77,14 +69,8 @@ impl CoreEngine {
                 (h, score, params)
             })
             .collect();
-            // A TOTAL order, so no card's numbering depends on hash-map or insertion
-            // order: the risk-adjusted score first, then the SMALLER net (equal score ⇒
-            // prefer the cheaper one to export — the rule the guardrail champion used to
-            // apply on its own, now shared by every card and by parent/cull selection),
-            // then the hash, which is unique and makes the order total even for two
-            // identical-score, identical-size nets. Ties here are EXACT equality: a
-            // tolerance would not be a total order, and the sort is free to reorder
-            // anything its comparator calls equal.
+        // A TOTAL order, so no card's numbering depends on hash-map or insertion order:
+        // risk-adjusted score first, then the SMALLER net (equal score ⇒ prefer the cheaper one
         ranked.sort_by(|a, b| {
             direction
                 .cmp(b.1, a.1)
@@ -99,23 +85,19 @@ impl CoreEngine {
         self.ranked_live_impl(true)
     }
 
-    /// Every live net, best-first; a net with no measurement yet counts as
+    /// Every live net, best-first; a net with no measurement yet counts
     /// 0.0 — the parent-selection contract.
     pub(crate) fn ranked_live_all(&self) -> Vec<(String, f32)> {
         self.ranked_live_impl(false)
     }
 
-    /// The elite set: the top `config.elite_count` live nets by smoothed fitness that
+    /// The elite set: the top `config.elite_count` live nets by smoothed fitness
     /// pass the gate (probation `≥ k`, seat age `< j`); any seat exit resets probation.
     pub(crate) fn elite_hashes(&self) -> Vec<String> {
         self.elite_hashes_from(&self.ranked_live())
     }
 
     /// [`Self::elite_hashes`] over a ranking the caller already holds.
-    ///
-    /// The crown deal needs the order for its `seat N/M` numbering anyway, and a second
-    /// `ranked_live()` is a second window pass over every live net — so the deal ranks
-    /// once and hands the vec in here.
     pub(crate) fn elite_hashes_from(&self, ranked: &[(String, f32)]) -> Vec<String> {
         let k = self
             .config
@@ -146,15 +128,11 @@ impl CoreEngine {
             .collect()
     }
 
-    /// KISS crown refresh (the FREEZE-ELITES model, in one place): the crown IS the
+    /// KISS crown refresh (the FREEZE-ELITES model, in one place): the crown
     /// elite take(k) set, recomputed each step; the diff prints one line per transition.
     pub(crate) fn refresh_crown(&mut self, clock: usize) {
         let enabled = self.config.freeze_elites;
-        // ONE ranking for the whole deal. The seat set, the entry order, every
-        // `rank N` note and the exits' standing all read this vec: the old per-call
-        // `rank_position` re-ranked the entire population on each call, and the entry
-        // sort called it from inside its comparator — ~2k full re-ranks per deal, each
-        // one a window pass over every live net.
+        // ONE ranking for the whole deal.
         let ranked = self.ranked_live();
         let positions: std::collections::HashMap<&str, usize> = ranked
             .iter()
@@ -181,26 +159,27 @@ impl CoreEngine {
         // Print order: seats then exits, each in rank order — the log reads
         // as one deal of the crown, not k scattered events.
         entering.sort_by_key(|h| positions.get(h.as_str()).copied().unwrap_or(usize::MAX));
-        leaving.sort();
-        // 3. Seat exits: record WHY each net left before resetting probation (ANY exit
-        // restarts it) — inferring the cause from the rank contradicted itself.
+        // Exits read best-first too, so the line scans from the top of the field down.
+        leaving.sort_by_key(|h| {
+            (
+                positions.get(h.as_str()).copied().unwrap_or(usize::MAX),
+                h.clone(),
+            )
+        });
+        // 3.
         let lifetime = self.config.elite_crown_lifetime_steps;
-        let mut exit_reason: std::collections::HashMap<String, String> =
+        let mut exit_info: std::collections::HashMap<String, (usize, &'static str)> =
             std::collections::HashMap::new();
         for h in &leaving {
-            if let Some(s) = self.state.net(h) {                let short = &h[..8.min(h.len())];
+            if let Some(s) = self.state.net(h) {
+                // `term` = a rotation, not a defeat: the seat's lifetime ran out.
+                // `outranked` = the deal simply did not re-seat
                 let reason = if lifetime > 0 && s.elite_seat_age >= lifetime {
-                    // A rotation, not a defeat: the seat term simply ran out.
-                    format!(
-                        "seat term complete → {short} turned over after {} of {} clocks",
-                        s.elite_seat_age, lifetime
-                    )
+                    "term"
                 } else {
-                    format!(
-                        "seat term complete → {short} turned over, outranked among the eligible nets"
-                    )
+                    "outranked"
                 };
-                exit_reason.insert(h.clone(), reason);
+                exit_info.insert(h.clone(), (s.elite_seat_age, reason));
             }
         }
         for h in &leaving {
@@ -209,7 +188,7 @@ impl CoreEngine {
                 s.elite_seat_age = 0;
             }
         }
-        // 4. Settle the crown BEFORE the lines: every field they print is the
+        // 4. Settle the crown BEFORE the lines: every field they print
         //    outcome of THIS deal, not the previous clock's state.
         self.frozen_crown = new_crown;
         let seat = self.frozen_crown.len();
@@ -217,13 +196,7 @@ impl CoreEngine {
             .config
             .elite_count
             .min(self.state.live_count().saturating_sub(1));
-        // ELITE RANK: the crown ordered by score, 1 = the best SEATED net. This is a
-        // different question from the population rank (an unseated net cannot be here:
-        // it is either better and in its join window, or worse), and it is the one the
-        // seat lines answer — `seat 4 of 10` means "took the 4th-best seat", which is
-        // what "how is the crown behaving" asks. The old label numbered the arriving
-        // BATCH instead, so a deal that filled seats 3 and 9 printed `seat 1 of 10` and
-        // `seat 2 of 10`, numbers that belonged to no net in particular.
+        // ELITE RANK: the crown ordered by score, 1 = the best SEATED net.
         let mut crown_order: Vec<&str> = self.frozen_crown.iter().map(String::as_str).collect();
         crown_order.sort_by_key(|h| positions.get(h).copied().unwrap_or(usize::MAX));
         let elite_rank: std::collections::HashMap<&str, usize> = crown_order
@@ -231,85 +204,20 @@ impl CoreEngine {
             .enumerate()
             .map(|(i, h)| (*h, i + 1))
             .collect();
-        // 5. One freeze line per net entering (elite-rank order, which is also score
-        //    order), one dethrone line per net leaving; a net holding rank is silent.
+        // 5.
+        let mut news: Vec<String> = Vec::new();
         for (idx, h) in entering.iter().enumerate() {
             let elite = elite_rank.get(h.as_str()).copied().unwrap_or(idx + 1);
-            // `positions` is 0-BASED, so the printed rank is `+ 1` — the old note printed
-            // the raw index, which named 19th place "rank 18" while the exit line (which
-            // adds one) named the same net "rank 19". Printed only when it disagrees with
-            // the seat rank: on a full, ungated crown the two are the same number and a
-            // repeat would be noise.
-            let rank_note = match positions.get(h.as_str()) {
-                Some(r) if r + 1 != elite => {
-                    format!(" (rank {} of {} overall)", r + 1, self.state.live_count())
-                }
-                _ => String::new(),
-            };
             let fit = self.smoothed_fitness_of(h);
-            let age = self
-                .state
-                .net(h)
-                .map(|s| clock.saturating_sub(s.entered_at_step));
-            let params = self
-                .networks
-                .get(h)
-                .map(|n| n.topology_blueprint().param_estimate());
-            // Trainings vs clocks LIVED, and the gate in words. The old pair looked like a
-            // training count but was the age of the WEIGHTS (children inherit it).
-            let trainings = self.state.net(h).map(|s| s.step).unwrap_or(0);
-            let age_now = age.unwrap_or(0);
-            // The two counters that both look like `n/5` get their own names: the
-            // join window (`wait`) and the seat lifetime (`this seat held`).
-            let (join_age, seat_age) = self
-                .state
-                .net(h)
-                .map(|s| (s.elite_probation_age, s.elite_seat_age))
-                .unwrap_or((0, 0));
-            let join_k = self.config.elite_join_probation_steps;
-            let lifetime = self.config.elite_crown_lifetime_steps;
-            let wait = format!("wait served {} of {join_k}", join_age.min(join_k));
-            let held = if lifetime == 0 {
-                format!("this seat held {seat_age} clocks (lifetime off)")
-            } else {
-                format!("this seat held {seat_age} of {lifetime} clocks")
-            };
-                // The reading behind the rank: `smt` on the line is the risk-adjusted
-                // score (FIT); this is `μ ±σ (SE, n)` — the level it was charged from, the
-                // spread it paid, and how well that level is pinned down. `—` with no window.
-            let reading = self.race_reading_of(h);
-            let reading_txt = reading.map_or_else(
-                || "—".to_string(),
-                |r| {
-                    fmt_reading(
-                        Some(r.mean),
-                        (r.n > 1).then_some(r.std),
-                        r.n,
-                        ReadingStyle::Line,
-                    )
-                },
-            );
-            let params_txt = params
-                .map(|p| format!("{p} parameters"))
-                .unwrap_or_else(|| "parameters —".to_string());
-            // The score, with the arithmetic that produced it: `score = avg ∓ λ·spread`.
-            let score_cell = crate::engine::reporting::seat_score_cell(
-                fit,
-                reading.as_ref(),
-                self.fitness.direction(),
-            );
-            info!(
-                "step {} │ seat {} of {seat} → {}{} │ {} │ reading {} │ age {} clocks │ {} │ {} │ {wait} │ {held}",
-                clock,
-                elite,
+            // `(n6)` = the readings behind the score: how much evidence the seat was won
+            // on, in the one cell that answers it. A net with no window reads `(n0)`.
+            let n = self.race_reading_of(h).map(|r| r.n).unwrap_or(0);
+            news.push(crate::engine::reporting::seat_entry_cell(
                 &h[..8.min(h.len())],
-                rank_note,
-                score_cell,
-                reading_txt,
-                age_now,
-                crate::engine::reporting::trained_note(trainings, age_now),
-                params_txt,
-            );
+                elite,
+                fit,
+                n,
+            ));
         }
         for h in &leaving {
             // Freeze/dethrone chatter belongs to the elite process only —
@@ -317,82 +225,48 @@ impl CoreEngine {
             if !enabled {
                 continue;
             }
-            let fit = self.smoothed_fitness_of(h);
-            // k == 1 keeps the crown-moved pointer (the new #1 really did replace the old).
-            // Multi-seat crowns use MEMBERSHIP language: with k seats churn has no one taker.
-            let detail = if seat <= 1 {
-                let taker = self.frozen_crown.iter().next().cloned().unwrap_or_default();
-                let taker_fit = if taker.is_empty() {
-                    None
-                } else {
-                    self.smoothed_fitness_of(&taker)
-                };
-                // The scores themselves; the line's `score = …` cell already names
-                // the quantity, so repeating the tag here would read twice.
-                let gap_txt = match (fit, taker_fit) {
-                    (Some(a), Some(b)) => format!(
-                        " ({}{} → {}{})",
-                        self.fitness.direction().arrow(),
-                        fmt_line(a),
-                        self.fitness.direction().arrow(),
-                        fmt_line(b)
-                    ),
-                    (Some(a), None) => format!(
-                        " ({}{})",
-                        self.fitness.direction().arrow(),
-                        fmt_line(a)
-                    ),
-                    _ => String::new(),
-                };
-                if taker.is_empty() {
-                    String::new() // crown is empty now — no successor to name
-                } else {
-                    format!(
-                        " — crown moved {} → {}{}",
-                        &h[..8.min(h.len())],
-                        &taker[..8.min(taker.len())],
-                        gap_txt
-                    )
-                }
-            } else {
-                // Multi-seat crowns add nothing here: the REASON and the net's current rank are
-                // printed by the caller, and guessing a cause produced self-contradictory lines.
-                String::new()
-            };
-            // Trainings vs clocks LIVED for this net — the same pairing the seat line prints
-            // (see `trained_note`); the old pair was weight staleness, not a training count.
+            // Trainings vs clocks LIVED for this net — the same pairing the seat line
+            // prints: only a GAP is news, so a net that trained every clock adds no cell.
             let (trainings, age) = match self.state.net(h) {
                 Some(s) => (s.step, clock.saturating_sub(s.entered_at_step)),
                 None => (0, 0),
             };
-            let reason = exit_reason
+            let (seat_age, reason) = exit_info
                 .get(h)
-                .cloned()
-                .unwrap_or_else(|| "seat not re-dealt".to_string());
+                .copied()
+                .unwrap_or((0, "seat not re-dealt"));
+            // The term it had served: `5/5` on a rotation, `2/5` when outranked, `3/off`
+            // when the lifetime is disabled (j = 0), where there is no limit to name.
+            let held = if lifetime == 0 {
+                format!("{seat_age}/off")
+            } else {
+                format!("{seat_age}/{lifetime}")
+            };
             // Where the net stands as it leaves: a net aged out at peak can still rank #1,
             // so its rank was never the reason it lost the seat.
-            let rank_note = match positions.get(h.as_str()) {
-                Some(r) => format!(" (still rank {} of {} overall)", r + 1, self.state.live_count()),
-                None => String::new(),
-            };
-            // The ex-elite just re-entered the JOIN WINDOW: it trains like any
-            // non-elite until it has re-served the k-clock window.
-            info!(
-                "step {} │ {}{}{} │ {} │ seat wait restarts at 0 of {} │ weights and optimizer kept, next step resumes │ crown {}/{}",
-                clock,
+            let standing = positions
+                .get(h.as_str())
+                .map(|r| (r + 1, self.state.live_count()));
+            news.push(crate::engine::reporting::seat_exit_cell(
+                &h[..8.min(h.len())],
                 reason,
-                rank_note,
-                detail,
-                crate::engine::reporting::trained_note(trainings, age),
-                self.config.elite_join_probation_steps,
-                self.frozen_crown.len(),
-                capacity,
+                &held,
+                standing,
+                crate::engine::reporting::no_update_gap(trainings, age),
+            ));
+        }
+        if !news.is_empty() {
+            // The seat occupancy AFTER the deal leads the line, so the events read as "this crown,
+            // then these changes" — and the ex-elite's restart of the join window, the kept weights
+            info!(
+                "{}",
+                crate::engine::reporting::seat_news_line(clock, seat, capacity, &news)
             );
         }
-        // 5b. Why the elite RANKING and the crown disagree, said on the clocks that
+        // 5b. Why the elite RANKING and the crown disagree, said on the clocks
         // changed the deal: the ★ badge shows the STATE, this line shows the REASON.
         if enabled && !(entering.is_empty() && leaving.is_empty()) {
-            // The SAME ranking the deal was made from: the crown was seated out of it
+            // The SAME ranking the deal was made from: the crown was seated out
             // this clock, so re-ranking here only repeated a window pass.
             let crown = &self.frozen_crown;
             let unseated_total = ranked.iter().filter(|(h, _)| !crown.contains(h)).count();
@@ -434,7 +308,7 @@ impl CoreEngine {
         }
     }
 
-    /// Why `hash` — a net in the elite RANKING — holds no seat right now: barred by
+    /// Why `hash` — a net in the elite RANKING — holds no seat right now: barred
     /// the join window (`a/k`) or the cull shield, or `outranked` (the seats ran out).
     pub(crate) fn unseated_reason(&self, hash: &str, clock: usize) -> String {
         let k = self.config.elite_join_probation_steps;
@@ -469,27 +343,14 @@ impl CoreEngine {
         (eligible, probation, age_blocked)
     }
 
-        /// Whether this clock prints the `lottery │ who` line: the `Summ` reporting shape
-        /// with the lottery actually ARMED (`lottery_frame` returned a field).
-        ///
-        /// Deliberately independent of `freeze_elites`: that knob gates the CROWN rollup
-        /// (its `crown H/C seats` tally and the `stepped A/B` line), and switching the
-        /// crown off must not hide who the training lottery let update — the two rules
-        /// answer different questions about the same clock.
+    /// Whether this clock prints the `lottery │ who` line: the `Summ` reporting shape
+    /// lottery actually ARMED (`lottery_frame` returned a field).
     pub(crate) fn lottery_line_on(&self, armed: bool) -> bool {
         armed && self.log_level == crate::engine::config::LogLevel::Summ
     }
 
-        /// Split one clock's nets into `(trained, idled)` from the IDLE-ledger snapshot
-        /// taken BEFORE the clock ran: a net whose `idle_clocks` grew got no ticket,
-        /// everyone else in the group ran the trainer. Crown members land in NEITHER
-        /// list — they acted for the elite freeze, which the rollup names separately.
-        ///
-        /// Reads the ledger, not a counter: `idle_spans` is what replay obeys, so the
-        /// report and the resume plan cannot disagree about which clocks were idle.
-        ///
-        /// Returns two empty vectors when there was no snapshot (lottery off, or the
-        /// line off), so the caller's `lottery_skips` is 0 and nothing is reported.
+    /// Split one clock's nets into `(trained, idled)` from the IDLE-ledger snapshot taken BEFORE
+    /// the clock ran: a net whose `idle_clocks` grew got no ticket, everyone else in the group ran
     pub(crate) fn lottery_clock_report(
         &self,
         group: &[String],
@@ -511,11 +372,8 @@ impl CoreEngine {
         (trained, withheld)
     }
 
-    /// Every count the per-step rollup needs, from ONE walk of the live population
-    /// plus the seats the crown knows: `newborn = live − group.len()` (a net born this
-    /// clock sits the clock out entirely), `would_train = group − crown`,
-    /// `stepped = group − lottery skips` (idle nets did nothing) and
-    /// `trained = would_train − lottery skips`.
+    /// Every count the per-step rollup needs, from ONE walk of the live population plus the seats
+    /// the crown knows: `newborn = live − group.len()` (a net born this clock sits the clock out
     pub(crate) fn step_vitals(
         &self,
         clock: usize,
@@ -523,9 +381,8 @@ impl CoreEngine {
         lottery_skips: usize,
     ) -> StepVitals {
         let live = self.state.live_count();
-            // The crown's seats take the act-only path, so they are outside `would_train`
-            // and the `trained` identity below stays true. `frozen` is the count the
-            // rollup prints.
+        // The crown's seats take the act-only path, so they are outside `would_train`
+        // `trained` identity below stays true.
         let frozen = group
             .iter()
             .filter(|h| self.frozen_crown.contains(*h))
@@ -533,8 +390,8 @@ impl CoreEngine {
         let would_train = group.len().saturating_sub(frozen);
         let (eligible, probation, age_blocked) = self.elite_gate_counts(clock);
         StepVitals {
-            // An idle net did not step at all (no train, no eval): `stepped` counts the
-            // updaters plus the crown's act-and-measure passes only.
+            // An idle net did not step at all (no train, no eval): `stepped` counts
+            // updaters plus the crown's act-and-measure passes
             stepped: group.len().saturating_sub(lottery_skips),
             trained: would_train.saturating_sub(lottery_skips),
             live,

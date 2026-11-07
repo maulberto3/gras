@@ -1,6 +1,5 @@
-//! Split out of `core/mod.rs` by AGENTS.md rule 19 (a MOVE: no behaviour,
-//! no public surface, no renamed method). `use super::*` reaches every name
-//! the parent module saw.
+//! Split out of `core/mod.rs` by AGENTS.md rule 19 (a MOVE: no behaviour, no public surface, no
+//! renamed method).
 
 use super::*;
 
@@ -8,9 +7,9 @@ use super::*;
 pub(crate) struct KnobDrift {
     /// How the log names the knob: `smoothing_window (K)`, `risk_aversion (λ)`, …
     pub(crate) label: &'static str,
-    /// The value the run recorded, formatted as the reader will see it.
+    /// The value the run recorded, formatted as the reader will see
     pub(crate) recorded: String,
-    /// The value the resume asked for.
+    /// The value the resume asked
     pub(crate) current: String,
     /// The setter call that reproduces the record, e.g. `set_run_risk_aversion(0.00)`.
     pub(crate) undo: String,
@@ -18,14 +17,6 @@ pub(crate) struct KnobDrift {
 
 impl CoreEngine {
     /// Every BEHAVIOURAL knob whose resume value differs from the record.
-    ///
-    /// "Behavioural" = it changes the draws from this clock on (the ranking, the parent
-    /// choice, the cull victim, which clocks were idle) but never contradicts what the
-    /// recorded ledger already says happened. R6: those WARN; only an unrebuildable run
-    /// refuses. A legacy header reads as the value its run actually used, not as a
-    /// default: a missing window/Ω/probation reads `0` because those runs trained every
-    /// clock, an empty selection reads roulette, an empty cull policy reads `worst`, and
-    /// a missing λ reads `0.0` (the pre-FIT plain mean).
     pub(crate) fn behavioural_drift(&self) -> Vec<KnobDrift> {
         let recorded = &self.header.config;
         let current = &self.config;
@@ -51,6 +42,34 @@ impl CoreEngine {
             fmt_cfg(recorded.risk_aversion),
             fmt_cfg(current.risk_aversion),
             format!("set_run_risk_aversion({})", fmt_cfg(recorded.risk_aversion)),
+        );
+        push(
+            "window_recency (r)",
+            fmt_cfg(recorded.window_recency),
+            fmt_cfg(current.window_recency),
+            format!(
+                "set_run_window_recency({})",
+                fmt_cfg(recorded.window_recency)
+            ),
+        );
+        // `""` = a header written before the knob: those runs averaged arithmetically,
+        // which is what the default spells, so the two compare equal.
+        let rec_mean = if recorded.mean_type.is_empty() {
+            crate::engine::config::DEFAULT_MEAN_TYPE.to_string()
+        } else {
+            recorded.mean_type.clone()
+        };
+        push(
+            "mean_type",
+            rec_mean.clone(),
+            current.mean_type.to_string(),
+            format!("set_run_mean_type({rec_mean})",),
+        );
+        push(
+            "train_age",
+            if recorded.train_age { "armed" } else { "off" }.to_string(),
+            if current.train_age { "armed" } else { "off" }.to_string(),
+            format!("set_run_train_age({})", recorded.train_age),
         );
         // `""` = a header written before the knob drew roulette, the default.
         let rec_selection = if recorded.crossover_selection.is_empty() {
@@ -79,9 +98,28 @@ impl CoreEngine {
                 fmt_cfg(recorded.train_merit_p_min)
             ),
         );
+        push(
+            "train_merit_p_max (p_max)",
+            fmt_cfg(recorded.train_merit_p_max),
+            fmt_cfg(current.train_merit_p_max),
+            format!(
+                "set_run_train_merit_p_max({})",
+                fmt_cfg(recorded.train_merit_p_max)
+            ),
+        );
+        // Which END of the field the tickets favour. The same idle ledger means
+        // different search under the other order, so it is named like Ω.
+        push(
+            "train_merit inverted",
+            recorded.train_merit_inverted.to_string(),
+            current.train_merit_inverted.to_string(),
+            format!(
+                "set_run_train_merit_inverted({})",
+                recorded.train_merit_inverted
+            ),
+        );
         // Crossover's base choice decides WHICH child a roll yields (same draw, different
-        // recipient), so adopting the header's value silently would change every birth
-        // from here on — named, like the other operator policies.
+        // recipient), so adopting the header's value silently would change every birth from here
         push(
             "crossover_fitter_base",
             recorded.crossover_fitter_base.to_string(),
@@ -91,15 +129,15 @@ impl CoreEngine {
                 recorded.crossover_fitter_base
             ),
         );
-        // Pool drift changes which masks the NEXT newborn gets (the nets already live
-        // keep theirs), so it is a behavioural warning like Ω. A pre-pool header has an
-        // empty list, which means its single recorded policy — `from_snapshot` already
-        // folded that in, so the comparison is one spelling.
+        // Pool drift changes which masks the NEXT newborn gets (the nets already live keep theirs),
+        // so it is a behavioural warning like Ω.
         let rec_pool = if recorded.feature_split_pool.is_empty() {
-            vec![recorded
-                .feature_split
-                .clone()
-                .unwrap_or_else(|| "none".to_string())]
+            vec![
+                recorded
+                    .feature_split
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string()),
+            ]
         } else {
             recorded.feature_split_pool.clone()
         };
@@ -182,16 +220,10 @@ impl CoreEngine {
         drift
     }
 
-    /// Load every live net from `nets/` and replay it to its recorded step. Also
+    /// Load every live net from `nets/` and replay it to its recorded step.
     /// reloads the checkpoint ledger so the history is the SAME.
     pub(crate) fn load_live_frontier(&mut self) -> Result<()> {
-        // R6 — refuse only the impossible. A behavioural knob is NOT a reason to refuse a
-        // resume: the caller may want the same population under a different ranking, a
-        // different parent draw, or a different cull victim, and nothing recorded becomes
-        // untrue by that. What cannot happen is the drift passing SILENTLY, so every
-        // differing knob is named with both values and the setter that reproduces the
-        // record. Structural impossibilities refuse elsewhere: schema/frontier (manifest),
-        // weights behind the manifest, pop_size, dataset geometry, the trainer blob, mode.
+        // R6 — refuse only the impossible.
         for drift in self.behavioural_drift() {
             tracing::warn!(
                 "race resume: {} differs from the record — the run recorded {}, this resume sets {} \
@@ -205,7 +237,7 @@ impl CoreEngine {
         let run_dir = self.run_dir.clone();
         let nets_dir = run_dir.join("nets");
         let mut loaded = 0usize;
-        // The frontier as a SET, when the run recorded one (`ckpt.json`). Handled and
+        // The frontier as a SET, when the run recorded one (`ckpt.json`). Handled
         // returned first, so the scan below stays exactly the pre-manifest path.
         if let Some(manifest) = crate::state::load_frontier_manifest(&run_dir)? {
             let history = Self::load_history_windows(&run_dir, self.config.smoothing_window);
@@ -222,11 +254,8 @@ impl CoreEngine {
         })?;
         // CFY: per-net replay rows collected here, emitted as one table after the load.
         let mut replayed: Vec<Vec<String>> = Vec::new();
-        // The smoothing windows themselves are not persisted per net (only its LAST
-        // reading is), but `history.csv` holds every reading the run took. Replaying it
-        // keeps each window warm, so the ranking score, the elite set and the guardrail's
-        // race-reading baseline resume where the recorded run stopped instead of
-        // restarting from a single cold reading.
+        // The smoothing windows themselves are not persisted per net (only its LAST reading
+        // but `history.csv` holds every reading the run took.
         let history = Self::load_history_windows(&run_dir, self.config.smoothing_window);
         for entry in entries {
             let path = entry
@@ -286,14 +315,8 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// The frontier exactly as `ckpt.json` recorded it: those hashes, at the clocks they
-    /// had reached, whatever the directory has said since.
-    ///
-    /// Two differences from the scan: a file may have moved on (a cull or the stop
-    /// rewrote it), so it is rewound to the manifest's clock rather than trusted; and
-    /// `is_alive` is IGNORED, because a net culled after the tick is a tombstone now but
-    /// was live at the tick. That is the defect this file exists to fix — measured: 8
-    /// live nets became 2, and the resume refused as a `pop_size` mismatch.
+    /// The frontier exactly as `ckpt.json` recorded it: those hashes, at the clocks they had
+    /// reached, whatever the directory has said since.
     pub(crate) fn replay_manifest_frontier(
         &mut self,
         manifest: &crate::state::FrontierManifest,
@@ -343,9 +366,7 @@ impl CoreEngine {
                 ))
                 .into());
             }
-            // How far the file has moved since the tick. NEWER is normal (a cull or the
-            // stop rewrote it) and is rewound; OLDER means the net files predate the
-            // manifest — a checkpoint write that failed — and cannot be repaired.
+            // How far the file has moved since the tick.
             let file_clock = state
                 .last_metrics
                 .as_ref()
@@ -361,10 +382,8 @@ impl CoreEngine {
                 .into());
             }
             if file_clock > entry.step {
-                // A resume loads weights instead of replaying them, and a loaded weight cannot
-                // be rewound: the file on disk is from a LATER clock than the snapshot
-                // this checkpoint describes. Refuse rather than resume with weights the
-                // manifest never claimed.
+                // A resume loads weights instead of replaying them, and a loaded weight cannot be
+                // rewound: the file on disk is from a LATER clock than the snapshot this checkpoint
                 return Err(crate::utils::error::EngineError::InvalidOptions(format!(
                     "resume: net {} on disk is at clock {file_clock}, past the checkpoint's \
                      {} — its weights are newer than the snapshot and cannot be rewound; \
@@ -374,7 +393,7 @@ impl CoreEngine {
                 .into());
             }
             state.is_alive = true;
-            // The checkpoint carries the weights, so a resume LOADS instead of
+            // The checkpoint carries the weights, so a resume LOADS instead
             // replaying. The manifest's clock is a consistency check, not work.
             if let Some(trainer_state) = state.trainer_state.clone() {
                 self.trainer
@@ -388,12 +407,8 @@ impl CoreEngine {
         Ok(loaded)
     }
 
-    /// Build a live net from the checkpoint — blueprint + `nets/<hash>.safetensors`,
-    /// plus `nets/<hash>.optim` when the run saved optimizer state.
-    ///
-    /// The replacement for replay: no step is re-run, so a resume costs one
-    /// file read per net instead of `clock` trainings. The recorded `last_metrics` and
-    /// counters ride along so the ranking windows resume warm.
+    /// Build a live net from the checkpoint — blueprint + `nets/<hash>.safetensors`, plus
+    /// `nets/<hash>.optim` when the run saved optimizer state.
     pub(crate) fn load_child_from_weights(
         &self,
         state: NetState,
@@ -431,15 +446,14 @@ impl CoreEngine {
             state,
             net,
             optimizer,
-            // A replayed net's exchange count is in its lineage string, not here: this
+            // A replayed net's exchange count is in its lineage string, not here:
             // path rebuilds a resumed run, and re-reporting it would double-count.
             cx: None,
         })
     }
 
-    /// Insert a replayed net into the live maps, with its rolling windows seeded from the
-    /// run's own recorded readings so the smoothed stats are warm on resume, not cold.
-    /// Returns `(hash, clock)` for the resume card.
+    /// Insert a replayed net into the live maps, with its rolling windows seeded from the run's own
+    /// recorded readings so the smoothed stats are warm on resume, not cold.
     pub(crate) fn insert_replayed(
         &mut self,
         child: crate::engine::child::RaceChild,
@@ -490,7 +504,7 @@ impl CoreEngine {
         (hash, step)
     }
 
-    /// The one pop guard + resume card both frontiers end with.
+    /// The one pop guard + resume card both frontiers end
     pub(crate) fn report_resume(
         &self,
         loaded: usize,
@@ -516,11 +530,8 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// The last `window` readings per net, oldest → newest, read back from
-    /// `<run_dir>/history.csv` (`fitness`, `train_loss`, `eval_loss` columns, located
-    /// by the header so appended FIT/informative columns cannot shift them). Empty
-    /// when the run exported no CSV — the caller then falls back to the one reading
-    /// the net state carries.
+    /// The last `window` readings per net, oldest → newest, read back from `<run_dir>/history.csv`
+    /// (`fitness`, `train_loss`, `eval_loss` columns, located by the header so appended
     pub(crate) fn load_history_windows(
         run_dir: &std::path::Path,
         window: usize,

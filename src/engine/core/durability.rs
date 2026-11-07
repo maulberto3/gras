@@ -1,6 +1,5 @@
-//! Split out of `core/mod.rs` by AGENTS.md rule 19 (a MOVE: no behaviour,
-//! no public surface, no renamed method). `use super::*` reaches every name
-//! the parent module saw.
+//! Split out of `core/mod.rs` by AGENTS.md rule 19 (a MOVE: no behaviour, no public surface, no
+//! renamed method).
 
 use super::*;
 
@@ -10,9 +9,8 @@ impl CoreEngine {
         let live = self.state.live_hashes();
         for h in &live {
             if let Some(state) = self.state.net(h) {
-                // R9: the one thing this file cannot derive from the net — the trainer's
-                // own per-net bookkeeping. Cloned because the writer takes an owned doc
-                // anyway; a scheme with no state writes `None`, i.e. no field at all.
+                // R9: the one thing this file cannot derive from the net — the trainer's own
+                // per-net bookkeeping.
                 let mut state = state.clone();
                 state.trainer_state = self.trainer.trainer_state(h);
                 write_net_state(&self.run_dir, &state)?;
@@ -21,18 +19,10 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Write `<run_dir>/ckpt.json` — the frontier as a point-in-time SET (which nets
-    /// were live at this tick, and the clock each had MEASURED). See
-    /// [`crate::state::FrontierManifest`] for why the set, not just the files, has to be
-    /// recorded: `nets/<hash>.json` is rewritten by later culls, so after a hard kill the
-    /// directory alone no longer says who was alive at the checkpoint.
+    /// Write `<run_dir>/ckpt.json` — the frontier as a point-in-time SET (which nets were live
+    /// this tick, and the clock each had MEASURED).
     pub(crate) fn write_frontier_manifest(&self, next_clock: usize) -> Result<()> {
-        // No entry may claim the clock that has not FINISHED. A frozen crown records an
-        // act-and-measure reading at the clock it is on (`record_frozen_act` sets
-        // `last_metrics.step` without advancing the race clock), so at a stop taken
-        // between phases the crown can sit one clock ahead of the last completed one.
-        // Replaying that act would resume at `next_clock + 1` and skip a whole clock; the
-        // unfinished clock is replayed from its start instead.
+        // No entry may claim the clock that has not FINISHED.
         let last_clock = next_clock.saturating_sub(1);
         let mut nets: Vec<crate::state::FrontierNet> = self
             .state
@@ -42,7 +32,7 @@ impl CoreEngine {
                 let state = self.state.net(&hash)?;
                 Some(crate::state::FrontierNet {
                     hash: state.hash.clone(),
-                    // The replay target: last MEASURED clock (frozen act passes count; an
+                    // The replay target: last MEASURED clock (frozen act passes count;
                     // idle clock records nothing, which is why `step` is only the fallback).
                     step: state
                         .last_metrics
@@ -52,7 +42,7 @@ impl CoreEngine {
                 })
             })
             .collect();
-        // Sorted so the file's bytes are deterministic — a manifest is a record, and
+        // Sorted so the file's bytes are deterministic — a manifest is a record,
         // two runs of the same race must produce the same bytes.
         nets.sort_by(|a, b| a.hash.cmp(&b.hash));
         crate::state::write_frontier_manifest(
@@ -67,12 +57,6 @@ impl CoreEngine {
     }
 
     /// Rewind the run's CSVs to the last checkpoint before a resume appends to them.
-    ///
-    /// A dir written before the one-cadence change flushed a row per clock while the
-    /// frontier moved every `checkpoint_every`, so a hard kill left rows for clocks the
-    /// snapshot never reached; appending after a resume from the older frontier would
-    /// duplicate them.
-    /// No manifest = nothing to rewind against (legacy dir): do nothing, as before.
     pub(crate) fn rewind_csvs_to_manifest(run_dir: &std::path::Path) -> Result<()> {
         let Some(manifest) = crate::state::load_frontier_manifest(run_dir)? else {
             return Ok(());
@@ -90,16 +74,7 @@ impl CoreEngine {
     }
 
     /// Stamp the tombstone fields onto LIVE nets at stop: `final_fitness_mean`,
-    /// `final_fitness_std`, `final_fitness_samples` from the net's race reading and
-    /// `final_risk_score` from the FIT score it ranked by — the same three legs a
-    /// cull records. Without this, a net still alive at stop carries `None` and
-    /// `nets/<hash>.json` mixes censored and complete records: a culled net could
-    /// be read back but a survivor could not, which is exactly backwards. The
-    /// fields mean "final", so they are stamped at stop, not at durability ticks.
-    /// Called from [`Self::finish_race`] BEFORE the frontier write, so one write
-    /// carries them. This is now a record rather than an input: the only reader
-    /// that ever ranked by it (`run_topologies_from_run_dir`) was retired with
-    /// `set_run_topologies`, and founder batches come from `elite_previous_load`.
+    /// `final_fitness_std`, `final_fitness_samples` from the net's race reading
     pub(crate) fn stamp_live_final_scores(&mut self) {
         for h in self.state.live_hashes() {
             let reading = self.race_reading_of(&h);
@@ -116,10 +91,8 @@ impl CoreEngine {
         }
     }
 
-        /// Append a step's metrics for the live nets that were trained and scored this
-        /// clock to the history buffer (idle nets contribute no row: nothing happened to
-        /// them). `history.csv` carries ONLY these rows — evolution events live in
-        /// `attempts.csv`.
+    /// Append a step's metrics for the live nets that were trained and scored this clock
+    /// history buffer (idle nets contribute no row: nothing happened to them).
     pub(crate) fn append_metrics_csv(&mut self, step: usize) -> Result<()> {
         if !self.config.csv_export {
             return Ok(());
@@ -127,10 +100,7 @@ impl CoreEngine {
         for hash in &self.state.live_hashes() {
             if let Some(net_state) = self.state.net(hash) {
                 if let Some(m) = &net_state.last_metrics {
-                        // Only a clock that was TRAINED AND SCORED owns a row. An idle
-                        // lottery clock (or a newborn's birth clock) has no metrics for
-                        // THIS step, and repeating the last measurement under a new step
-                        // label would fabricate one — so the row is simply absent.
+                    // Only a clock that was TRAINED AND SCORED owns a row.
                     if m.step != step {
                         continue;
                     }
@@ -152,10 +122,8 @@ impl CoreEngine {
                         row.push(',');
                         row.push_str(&val.to_string());
                     }
-                        // FIT columns, appended LAST so every existing column keeps its
-                        // position (positional readers stay valid): the risk-adjusted
-                        // score this net ranked by and the window spread it paid for.
-                        // `nan` = no reading yet, the same convention as `eval_loss`.
+                    // FIT columns, appended LAST so every existing column keeps its position
+                    // (positional readers stay valid): the risk-adjusted score this net ranked
                     let reading = self.race_reading_of(hash);
                     let score = self.smoothed_fitness_of(hash);
                     row.push(',');
@@ -178,7 +146,7 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Flush both buffered CSV exports — `history.csv` (metric rows) and
+    /// Flush both buffered CSV exports — `history.csv` (metric rows)
     /// `attempts.csv` (evolution events) — at checkpoints and stop, gated by `csv_export`.
     pub(crate) fn flush_csv_exports(&mut self) -> Result<()> {
         if !self.config.csv_export {
@@ -202,7 +170,7 @@ impl CoreEngine {
         self.append_csv_file("attempts.csv", attempts_header, &attempts_body)
     }
 
-    /// Append `body` to `<run_dir>/<file>`, writing `header` first when the
+    /// Append `body` to `<run_dir>/<file>`, writing `header` first
     /// file does not exist yet. A no-op for an empty body.
     fn append_csv_file(&self, file: &str, header: &str, body: &str) -> Result<()> {
         if body.is_empty() {
@@ -270,18 +238,19 @@ impl CoreEngine {
             standardize_op_pool: self.config.standardize_op_pool.clone(),
             informative_metrics: self.metrics.clone(),
             max_steps: self.config.max_steps,
-                // The CONFIG's eval share, not the stream's train share: the stream
-                // accessor returns `train_pool / total` (0.8 for a 20% holdout), so
-                // writing it here recorded 0.8 as the EVAL share and a resume built
-                // an 80/20 split the other way round.
+            // The CONFIG's eval share, not the stream's train share: the stream accessor returns
+            // `train_pool / total` (0.8 for a 20% holdout), so writing it here recorded 0.8
             train_eval_split_ratio: Some(self.config.eval_share),
             explicit_test_rows: self.explicit_test_rows,
             // Which subdirectory ranked — a fact from birth, restated on every rewrite.
             eval_split: self.header.eval_split.clone(),
-                // The exam store's row count is a fact about the FILE on disk, not a
-                // config knob: re-stamped from what this engine holds (or the header it
-                // was resumed with) so a rewrite can never silently drop it.
-            exam_rows: self.exam.as_ref().map(|d| d.len()).or(self.header.exam_rows),
+            // The exam store's row count is a fact about the FILE on disk, not a config knob:
+            // re-stamped from what this engine holds (or the header it was resumed
+            exam_rows: self
+                .exam
+                .as_ref()
+                .map(|d| d.len())
+                .or(self.header.exam_rows),
             culls: self.culls,
             run_elapsed_secs: self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs(),
             children_born_at_clock: self.children_born_at_clock.clone(),
@@ -298,5 +267,4 @@ impl CoreEngine {
         header.run_topology_source = self.header.run_topology_source.clone();
         write_engine_json(&self.run_dir, &header)
     }
-
 }
