@@ -127,6 +127,30 @@ def test_lambda_charges_the_window_spread() -> None:
         assert checked, "no net had a non-flat window — the λ charge was never observable"
 
 
+def test_mean_type_reaches_the_ranking() -> None:
+    """`mean_type="median"` is the ranking's centre, not a config field that is
+    only echoed: the same seed ranks on a different centre, and the recorded
+    score is still the one `smoothed_fitness_of` reports."""
+    with tempfile.TemporaryDirectory(prefix="gras-introspect-mean-") as tmp:
+        plain, _, hist_a = run(Path(tmp), "arith")
+        median, run_dir, hist_b = run(Path(tmp), "median", mean_type="median")
+        recorded = json.loads((run_dir / "engine.json").read_text())["config"]
+        assert recorded["mean_type"] == "median", recorded
+
+        moved = 0
+        for hash in hist_b["hash"].unique():
+            score = median.smoothed_fitness_of(hash)
+            assert score is not None, f"{hash}: no reading with mean_type=median"
+            row = last_reading(hist_b, hash)
+            assert abs(score - row["fitness_smooth"]) <= 1e-5, (
+                f"{hash}: smoothed_fitness_of={score} but history.csv says "
+                f"fitness_smooth={row['fitness_smooth']}"
+            )
+            if plain.smoothed_fitness_of(hash) not in (None, score):
+                moved += 1
+        assert moved, "median and arithmetic ranked every net the same — the knob never arrived"
+
+
 def test_unknown_hash_has_no_reading() -> None:
     with tempfile.TemporaryDirectory(prefix="gras-introspect-none-") as tmp:
         engine, _, history = run(Path(tmp), "none")
@@ -142,5 +166,6 @@ if __name__ == "__main__":
     test_live_count_matches_the_artifacts()
     test_smoothed_fitness_is_the_recorded_score()
     test_lambda_charges_the_window_spread()
+    test_mean_type_reaches_the_ranking()
     test_unknown_hash_has_no_reading()
-    print("test_introspection: ok (4 checks)")
+    print("test_introspection: ok (5 checks)")

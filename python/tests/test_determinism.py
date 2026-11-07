@@ -27,6 +27,7 @@ from gras import (
     combine_ops,
     crossover_cull_policies,
     crossover_ops,
+    defaults,
     feature_splits,
     fitnesses,
     log_levels,
@@ -111,23 +112,28 @@ def check_engine_knobs() -> None:
     else starts at the crate's `RaceConfig::defaults()`.
     """
     cfg = RaceConfig()
-    assert (cfg.risk_aversion, cfg.train_merit, cfg.elite_previous_load) == (0.0, 0.0, False), cfg
-    assert (cfg.pop_size, cfg.elite_count, cfg.smoothing_window) == (5, 1, 10), cfg
-    assert (cfg.crossover_prob, cfg.mutate_prob) == (0.5, 0.5), cfg
-    assert (cfg.crossover_cull_policy, cfg.mutation_cull_policy) == ("worst", "worst"), cfg
-    assert cfg.crossover_selection == "roulette", cfg
+    assert (cfg.risk_aversion, cfg.elite_previous_load) == (0.0, False), cfg
+    assert (cfg.pop_size, cfg.elite_count, cfg.max_steps) == (10, 1, 10), cfg
+    assert (cfg.pop_size, cfg.elite_count, cfg.smoothing_window) == (10, 1, 5), cfg
+    assert cfg.mean_type == "arithmetic", cfg
+    # Floats are stored as f32, so compare with a tolerance: 0.2 is not exact.
+    assert (cfg.crossover_prob, round(cfg.mutate_prob, 6)) == (0.5, 0.2), cfg
+    assert (cfg.crossover_rolls, cfg.mutate_rolls) == (2, 2), cfg
+    assert (cfg.crossover_cull_policy, cfg.mutation_cull_policy) == ("unfed", "unfed"), cfg
+    assert cfg.crossover_selection == "tournament", cfg
+    assert cfg.train_merit == 0.75, cfg
     assert cfg.activation_pool == [] and cfg.feature_split is None, cfg
-    # The topology shape behind the width range: unset means the crate's 2..=5
-    # for node count and both fan ranges, and dropout off.
+    # The topology shape behind the width range: `None` means the crate's range
+    # (2..=15 for node count and both fans), and dropout is the crate's 0.25.
     assert (
         cfg.hidden_nodes_pool,
         cfg.hidden_inputs_pool,
         cfg.hidden_outputs_pool,
         cfg.dropout_prob,
-    ) == (None, None, None, 0.0), cfg
+    ) == (None, None, None, 0.25), cfg
     # Durability + probation are NOT neutral-at-zero: `0` removes a protection, so
     # these inherit the crate's shipped values instead of starting bare.
-    assert cfg.checkpoint_every == 10, cfg
+    assert cfg.checkpoint_every == 20, cfg
     assert cfg.crossover_ops_pool == [], cfg
     assert (
         cfg.mutation_probation_steps,
@@ -144,6 +150,7 @@ def check_engine_knobs() -> None:
             log_level="none",
             crossover_prob=0.25,
             mutate_prob=0.75,
+            mean_type="median",
             freeze_elites=False,
             crossover_cull_policy="random",
             mutation_cull_policy="inverse_fitness",
@@ -174,6 +181,7 @@ def check_engine_knobs() -> None:
         # Evolution knobs, under `config`.
         assert sub["crossover_prob"] == 0.25, sub
         assert sub["mutate_prob"] == 0.75, sub
+        assert sub["mean_type"] == "median", sub
         assert sub["freeze_elites"] is False, sub
         assert sub["crossover_cull_policy"] == "random", sub
         assert sub["mutation_cull_policy"] == "inverse_fitness", sub
@@ -211,6 +219,7 @@ def check_engine_knobs() -> None:
         {"mutation_cull_policy": "nope"},
         {"crossover_selection": "nope"},
         {"feature_split": "nope"},
+        {"mean_type": "geometric"},
         {"activation_pool": ["nope"]},
         {"crossover_ops_pool": ["nope"]},
         {"hidden_dim_pool": (8, 4)},
@@ -226,6 +235,69 @@ def check_engine_knobs() -> None:
             assert next(iter(bad)) in str(exc), exc
         else:
             raise AssertionError(f"{bad} must be refused, not guessed")
+
+
+def check_defaults_agree() -> None:
+    """`RaceConfig()` and `gras.defaults()` are one set of numbers.
+
+    The two documented overrides are applied inside `defaults()` itself, so the
+    dict a notebook prints and the object it constructs cannot drift apart: a
+    retuned crate fails here instead of silently re-tuning Python.
+    """
+    d = defaults()
+    cfg = RaceConfig()
+    pairs = {
+        "pop_size": cfg.pop_size,
+        "elite_count": cfg.elite_count,
+        "max_steps": cfg.max_steps,
+        "checkpoint_every": cfg.checkpoint_every,
+        "eval_share": cfg.eval_share,
+        "smoothing_window": cfg.smoothing_window,
+        "mean_type": cfg.mean_type,
+        "risk_aversion": cfg.risk_aversion,
+        "train_merit": cfg.train_merit,
+        "train_merit_p_min": cfg.train_merit_p_min,
+        "drift_prob": cfg.drift_prob,
+        "log_level": cfg.log_level,
+        "crossover_rolls": cfg.crossover_rolls,
+        "mutate_rolls": cfg.mutate_rolls,
+        "crossover_prob": cfg.crossover_prob,
+        "mutate_prob": cfg.mutate_prob,
+        "freeze_elites": cfg.freeze_elites,
+        "crossover_cull_policy": cfg.crossover_cull_policy,
+        "mutation_cull_policy": cfg.mutation_cull_policy,
+        "crossover_ops_pool": cfg.crossover_ops_pool,
+        "mutation_probation_steps": cfg.mutation_probation_steps,
+        "crossover_probation_steps": cfg.crossover_probation_steps,
+        "elite_join_probation_steps": cfg.elite_join_probation_steps,
+        "elite_crown_lifetime_steps": cfg.elite_crown_lifetime_steps,
+        "hidden_dim_stride": cfg.hidden_dim_stride,
+        "activation_pool": cfg.activation_pool,
+        "combine_op_pool": cfg.combine_op_pool,
+        "standardize_op_pool": cfg.standardize_op_pool,
+        "csv_export": cfg.csv_export,
+        "trace_file": cfg.trace_file,
+        "elite_save_topology": cfg.elite_save_topology,
+        "run_name": cfg.run_name,
+        "elite_previous_load": cfg.elite_previous_load,
+        "elite_previous_dir": cfg.elite_previous_dir,
+    }
+    for key, got in pairs.items():
+        want = d[key]
+        same = abs(got - want) <= 1e-6 if isinstance(want, float) else got == want
+        assert same, f"{key}: RaceConfig()={got!r} but defaults() reports {want!r}"
+    # The parents' draw is recorded with its K: `tournament(size=2)`.
+    assert d["crossover_selection"] == f"tournament(size={cfg.tournament_size})", d
+    # A `None` pool means the crate's range, not "no nodes"; `[]` means every member.
+    assert d["hidden_dim_pool"] == "16..=64", d["hidden_dim_pool"]
+    topo = d["topology_options"]
+    assert topo["dropout_prob"] == cfg.dropout_prob, topo
+    assert (topo["min_hidden_num_nodes"], topo["max_hidden_num_nodes"]) == (2, 15), topo
+    assert (topo["min_hidden_inputs_per_node"], topo["max_hidden_inputs_per_node"]) == (2, 15), topo
+    assert (topo["min_hidden_outputs_per_node"], topo["max_hidden_outputs_per_node"]) == (2, 15), topo
+    assert topo["feature_split"] is None, topo
+    assert cfg.hidden_dim_pool is None and cfg.feature_split_pool == [], cfg
+    assert d["feature_split_pool"] == ["none", "split_random", "split_exclusive"], d
 
 
 def check_unknown_names_are_refused() -> None:
@@ -529,6 +601,7 @@ def main() -> None:
     check_log_level_knob()
     check_trainer_knobs()
     check_engine_knobs()
+    check_defaults_agree()
     check_unknown_names_are_refused()
     check_from_arrays()
     check_tasks_and_algos()
