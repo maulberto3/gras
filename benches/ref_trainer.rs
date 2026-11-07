@@ -32,7 +32,6 @@ pub struct TabularTrainer {
     pub loss_label: Option<String>,
 }
 
-
 impl TabularTrainer {
     /// A tabular scheme is defined by its loss — constructor takes it.
     pub fn new(
@@ -83,7 +82,6 @@ impl TabularTrainer {
         self.lr_schedule = Some(Box::new(schedule));
         self
     }
-
 }
 
 impl Default for TabularTrainer {
@@ -122,7 +120,6 @@ impl TabularStep for TabularTrainer {
             "lr_schedule": self.lr_schedule.is_some(),
         }))
     }
-
 
     fn loss(&self) -> gras::trainer::LossFn<'_> {
         &*self.loss_fn
