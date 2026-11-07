@@ -220,13 +220,16 @@ const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 /// the reference run, so every value that shapes a number in `history.csv` is
 /// visible in one place. They happen to equal `Reinforce::new`'s defaults — the
 /// defaults were taken from this recipe — so setting them changes no result.
-fn trainer(device: Device) -> Reinforce<CartPole> {
+fn trainer(device: Device, memory: ObsMemory) -> Reinforce<CartPole> {
     Reinforce::new(CartPole::new(0.0, 0.0), device)
         .with_learning_rate(LEARNING_RATE)
         .with_grad_clip(GRAD_CLIP)
         .with_matches_per_step(MATCHES_PER_STEP)
         .with_eval_matches_per_step(EVAL_MATCHES_PER_STEP)
         .with_signal(Signal::Turns)
+        // EXPERIMENTAL obs memory: `none` is the engine as it was, `delta`/`ema` append a
+        // second observation-width carrying the past (see `--obs-memory`).
+        .with_obs_memory(memory)
         .with_challenge(
             CHALLENGE_PROB,
             CHALLENGE_POLICY,
@@ -239,7 +242,6 @@ fn trainer(device: Device) -> Reinforce<CartPole> {
 // ═══ SECTION 3 — THE GUARDRAIL (fresh unseen games) ════════════════════
 /// Fresh unseen games the champion is re-scored on at stop.
 
-
 // ═══ SECTION 4 — main(): config → spec → run → guardrail ═══════════════
 
 // RunSpec::rl declares the mode; Fitness::reported takes the value from the
@@ -251,19 +253,19 @@ const POP: usize = 100;
 /// clocks RUN: `--max-steps N` runs exactly N clocks before Stop.
 const RACE_STEPS: usize = 20;
 /// Train matches each net plays per step — the learning signal.
-const MATCHES_PER_STEP: usize = 1;
+const MATCHES_PER_STEP: usize = 3;
 /// Eval matches each net plays per step — the ranking signal. Raising it
 /// resolves fitness more finely and multiplies both turns and step time.
-const EVAL_MATCHES_PER_STEP: usize = 5;
+const EVAL_MATCHES_PER_STEP: usize = 3;
 /// FIT risk aversion λ (default; `--risk-aversion` overrides). Window-σs a net
 /// pays for its own spread; 0.0 ranks on the plain window mean.
 const RISK_AVERSION: f32 = 0.5;
-/// Train lottery parameter (default; `--train-lottery` overrides). Determines 
+/// Train lottery parameter (default; `--train-lottery` overrides). Determines
 // the probability of a net being selected for training in each step.
 /// A value between 0.0 and 1.0, where 1.0 means every net has a chance to be
 //  selected for training, and 0.0 means no net is selected.
 const TRAIN_LOTTERY: f32 = 0.75;
-const CHECKPOINT_EVERY: usize = 50;
+const CHECKPOINT_EVERY: usize = 20;
 
 /// The smoke-test CLI: `--pop`, `--max-steps`, `--seed`, `--log-level`,
 /// `--risk-aversion`, `--train-lottery [OMEGA]`, `--run-dir`. Everything else is
@@ -299,6 +301,56 @@ struct Cli {
     /// with no value means 1.0, so the old switch still works.
     #[arg(long, value_name = "OMEGA", num_args = 0..=1, default_missing_value = "1.0")]
     train_lottery: Option<f32>,
+    /// Lottery FLOOR `p_min` (`set_run_train_merit_p_min`, example default 0.05): the share
+    /// every net keeps before Ω blends, so the worst net still runs a fraction of clocks.
+    /// It is paid out of the same budget the U-shape redistributes — at `0.05` with Ω 0.75
+    /// it gives every net `0.29`, i.e. 5.8 of the 6.7 tickets a clock on 20 nets — so `0`
+    /// is the clean way to see the shape's own allocation.
+    #[arg(long, value_name = "P")]
+    merit_p_min: Option<f32>,
+    /// Lottery CEILING `p_max` (`set_run_train_merit_p_max`, default 1.0 = none): the
+    /// biggest share of clocks the best-graded net may take. `--merit-p-min` and Ω only
+    /// raise a net's chance, so this is the one dial that LOWERS ticket volume — use it
+    /// to run an inverted field at the merit run's rate (`--invert-merit --merit-p-max
+    /// 0.45 --merit-p-min 0` is ~0.4 per net instead of >0.9).
+    #[arg(long, value_name = "P")]
+    merit_p_max: Option<f32>,
+    /// Age leg of the lottery (`set_run_train_age`, default ARMED; `--train-age false` is
+    /// fitness only). ARMED, the ticket is paid on `P * Y` (`Y` = 1 at the YOUNGEST graded
+    /// net), so a net with a zero leg earns nothing: on an inverted field `--invert-merit`
+    /// with this armed is what stops the stale bottom net from taking the most tickets
+    /// forever.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    train_age: Option<bool>,
+    /// Recency ramp r of the K-reading window (`set_run_window_recency`, default 0.0 =
+    /// the plain mean): weights run `1` on the oldest reading to `1 + r·(K−1)` on the
+    /// newest, so `--window-recency 0.25` weighs the newest of 5 readings twice the
+    /// oldest and the ranking follows a net that just moved instead of averaging the
+    /// move against readings from K clocks ago.
+    /// Bare `--window-recency` means `0.25` (the newest of 5 readings weighs 2× the
+    /// oldest); pass a value for anything else, `--window-recency 0` turns it off.
+    #[arg(long, value_name = "R", num_args = 0..=1, default_missing_value = "0.25")]
+    window_recency: Option<f32>,
+    /// INVERT the lottery ordering (the engine default): the LEAST fit net earns the
+    /// MOST tickets, the best the fewest (`--invert-ranking` is the same flag, and
+    /// `--invert-merit false` restores the merit ordering). Only meaningful with
+    /// `--train-lottery` above 0.
+    #[arg(long, visible_alias = "invert-ranking", value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
+    invert_merit: Option<bool>,
+    /// Crossover fire probability per roll (example default 0.5). `0` turns the channel
+    /// off, so the population holds still while the lottery is watched.
+    #[arg(long, value_name = "P")]
+    crossover_prob: Option<f32>,
+    /// Mutation fire probability per roll (example default 0.5). `0` turns the channel off.
+    #[arg(long, value_name = "P")]
+    mutate_prob: Option<f32>,
+    /// Crossover cull policy (`set_crossover_cull_policy`): `unfed` (default — evict the
+    /// net the LOTTERY starves: lowest merit `P × Y`, the fitness ordering times the age
+    /// leg, with the tilt ignored so an inverted run does not evict its champion),
+    /// `worst` (lowest smoothed fitness) or `random`. `unfed` needs `--train-lottery`
+    /// above 0; with the lottery off it falls back to `worst`.
+    #[arg(long, value_name = "POLICY")]
+    cross_cull: Option<String>,
     /// Log level (default: the `LOG_LEVEL` const). `none`/`summ`/`minimal` pick
     /// the shape; `debug`/`trace` add the engine's per-roll detail.
     #[arg(
@@ -320,6 +372,30 @@ struct Cli {
     /// than continued under a blob they were not produced with.
     #[arg(long, value_name = "DIR")]
     resume: Option<std::path::PathBuf>,
+    /// EXPERIMENTAL obs memory: what the net is told about the PAST at each turn.
+    /// `none` (default) feeds the observation alone — the engine as it was, memoryless
+    /// by construction. `delta` appends `obs − prev_obs` (a velocity-like derivative),
+    /// `ema` appends a smooth `β·ema + (1−β)·obs` (β from `--obs-memory-beta`, default
+    /// 0.9) so one noisy turn cannot swing the feature. The fed row DOUBLES, so the
+    /// topology input width doubles with it; this changes the trainer blob, so a run
+    /// cannot be resumed across a change.
+    #[arg(long, value_name = "KIND", value_parser = ["none", "delta", "ema"])]
+    obs_memory: Option<String>,
+    /// EMA β for `--obs-memory ema` (default 0.9). Clamped to `0.0 …= 1.0`.
+    #[arg(long, value_name = "F32")]
+    obs_memory_beta: Option<f32>,
+    /// Crossover/mutation DRIFT on inherited genes: the chance a slot (mask bit,
+    /// activation, combine, standardize, dropout) is re-drawn after a birth. `0` = exact
+    /// inheritance. The example's default is `0.5`; the long cartpole runs that reached
+    /// 350+ turns used `0.05` — at `0.5` half of every child's inherited circuit is
+    /// re-rolled, so a good parent cannot pass its wiring down.
+    #[arg(long, value_name = "P")]
+    drift: Option<f32>,
+    /// Hold the top `elite_count` nets out of the weight update (the anti-devolution
+    /// guard: they still act, score and sire). The example's default is OFF; the runs
+    /// that reached 350+ turns had it ON.
+    #[arg(long)]
+    freeze_elites: bool,
     /// Where a NEW run writes (default: `results/<timestamp>`). Output only —
     /// continuing an existing run is `--resume`.
     #[arg(long, value_name = "DIR")]
@@ -346,12 +422,25 @@ fn main() {
         .as_deref()
         .and_then(LogLevel::parse_verbose)
         .unwrap_or((LOG_LEVEL, None));
-    
+
     // Install the run's log sinks — without this the console stays silent and
     // the run LOOKS hung while the race grinds.
     gras::engine::logging::init(log_level, log_verbosity);
 
     let device = gras::auto_device();
+
+    // The channel, if any: `none` is the engine as it was.
+    let obs_memory = match cli.obs_memory.as_deref() {
+        Some("delta") => ObsMemory::Delta,
+        Some("ema") => ObsMemory::Ema {
+            beta: cli.obs_memory_beta.unwrap_or(0.9),
+        },
+        _ => ObsMemory::None,
+    };
+    // CartPole's observation is [x, v, θ, ω]; a channel appends one more copy's width,
+    // so the nets are built twice as wide. This is the ONE place a trainer knob reaches
+    // into the engine — the history lives inside the episode, the width lives here.
+    let input_dim = 4 * obs_memory.width_factor();
 
     let baseline = random_baseline(20);
     println!("baseline: random policy survives {baseline:.1} turns (race must beat this)");
@@ -363,27 +452,33 @@ fn main() {
         .set_run_checkpoint_every(CHECKPOINT_EVERY)
         .set_run_csv_export(true) // history.csv + attempts.csv
         .set_run_pop_size(cli.pop.unwrap_or(POP))
-        .set_run_smoothing_window(10)
+        .set_run_smoothing_window(5)
+        .set_run_window_recency(cli.window_recency.unwrap_or(0.0))
         .set_run_risk_aversion(cli.risk_aversion.unwrap_or(RISK_AVERSION))
         .set_run_train_merit(cli.train_lottery.unwrap_or(TRAIN_LOTTERY))
+        .set_run_train_merit_p_min(cli.merit_p_min.unwrap_or(0.05))
+        .set_run_train_merit_p_max(cli.merit_p_max.unwrap_or(0.4))
+        .set_run_train_merit_inverted(cli.invert_merit.unwrap_or(true))
+        .set_run_train_age(cli.train_age.unwrap_or(true))
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra history.csv column
         // .set_run_trace_file(true) // also write <run_dir>/telemetry.jsonl: one JSON record per engine event, full fidelity (debug included)
         // STOP
         .set_stop_max_steps(Some(cli.max_steps.unwrap_or(RACE_STEPS)))
         // .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
         // CROSSOVER
-        .set_crossover_rolls(pop / 30)
-        .set_crossover_prob(0.5)
-        .set_crossover_cull_policy(CrossCullPolicy::Worst)
+        .set_crossover_prob(cli.crossover_prob.unwrap_or(0.5))
+        .set_crossover_rolls(2)
+        .set_crossover_cull_policy(CrossCullPolicy::Unfed)
         .set_crossover_probation_steps(5)
         .set_crossover_selection(SelectionMethod::Tournament { tournament_size: 2 })
         // .set_crossover_ops_pool(["uniform"]) // if not specified, use all
         // MUTATION
-        .set_mutate_rolls(pop / 30)
-        .set_mutation_cull_policy(MutationCullPolicy::Worst)
-        .set_mutate_prob(0.5)
+        .set_mutate_prob(cli.mutate_prob.unwrap_or(0.2))
+        .set_mutate_rolls(2)
+        .set_mutation_cull_policy(MutationCullPolicy::Unfed)
         .set_mutation_probation_steps(5)
         // TOPOLOGY
+        .set_topology_drift(cli.drift.unwrap_or(0.1))
         .set_topology_min_hidden_num_nodes(2)
         .set_topology_max_hidden_num_nodes(15)
         .set_topology_min_inputs_per_node(2)
@@ -393,31 +488,27 @@ fn main() {
         .set_topology_hidden_dim_range(16, 64)
         .set_topology_hidden_dim_stride(16)
         .set_topology_dropout_prob(DROPOUT_PROB)
-        .set_topology_input_dim(4)
+        .set_topology_input_dim(input_dim)
         .set_topology_output_dim(2)
-        // .set_topology_combine_op_pool([
-        //     "Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min",
-        // ])
+        // .set_topology_feature_split_pool(["none"]) // if not specified, use all
+        // .set_topology_combine_op_pool(["Add", "Mean", "Multiply", "Subtract", "Divide", "Max", "Min"]) // if not specified, use all
         // .set_topology_activation_pool(["ReLU", "Tanh", …]) // if not specified, use all
         // .set_topology_standardize_op_pool(["LayerNorm", …]) // if not specified, use all
-        // .set_topology_feature_split(FeatureSplitPolicy::Random) // Other one Exclusive
         // ELITES
-        .set_elite_freeze(true) // frozen elites still score, rank and sire
+        .set_elite_freeze(false) // frozen elites still score, rank and sire
         .set_elite_count(pop / 10)
         .set_elite_previous_load(true) // on by default
-        .set_elite_join_probation_steps(5) // age before a net may join the elite set (A/B re-checked 2026-10-26: 5 wins both fast seeds — see DONE.md)
-        .set_elite_crown_lifetime_steps(5) // how long the frozen crown may sit at peak
+        .set_elite_join_probation_steps(0) // age before a net may join the elite set (A/B re-checked 2026-10-26: 5 wins both fast seeds — see DONE.md)
+        .set_elite_crown_lifetime_steps(0) // how long the frozen crown may sit at peak
         .set_elite_save_topology(true) // elite-<hash>.md at stop
-        .set_worst_save_topology(true)
-        // .set_elite_previous_dir("assets/1790920031289_500")
+        // .set_elite_previous_dir("assets/1792211580845_2_*_500")
         // The mins are `TopologyOptions::default`; the max_* twins above are raised by
         // this example, so the sampler still varies topology width.
-
         .build();
 
     let fitness = Fitness::reported(Direction::Maximize, "match_survival");
     // The world, plus the crate's trainer at this example's knobs (see `trainer`).
-    let trainer = trainer(device);
+    let trainer = trainer(device, obs_memory);
 
     // `--resume <dir>` CONTINUES that run (its `engine.json` + `nets/` define the race
     // and its recorded seed wins over `--seed`); `--run-dir` only names where a fresh

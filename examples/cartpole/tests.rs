@@ -163,11 +163,14 @@ mod tests {
     /// re-forces the identical action, so a challenged step is bit-exact.
     #[test]
     fn challenge_draw_is_replay_stable() {
-        let draw = |net_seed: u64, step: usize| {
-            match forced_action(ChallengePolicy::Random, net_seed, step, ACTIONS) {
-                ForcedAction::Exact(a) => a,
-                ForcedAction::Least => unreachable!("the Random policy draws an index"),
-            }
+        let draw = |net_seed: u64, step: usize| match forced_action(
+            ChallengePolicy::Random,
+            net_seed,
+            step,
+            ACTIONS,
+        ) {
+            ForcedAction::Exact(a) => a,
+            ForcedAction::Least => unreachable!("the Random policy draws an index"),
         };
         for net_seed in [1u64, 42, 999] {
             for step in 0..8usize {

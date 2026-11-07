@@ -5,8 +5,7 @@ gras exports a net's architecture and weights separately in the run dir:
 
   nets/<full-hash>.json          — the topology (the "how to build it"), one per
                                    individual, elite or not
-  elite-<short-hash>.safetensors — the trained weights (or worst-<short>.safetensors
-                                   when it was the worst net and worst-save is on)
+  elite-<short-hash>.safetensors — the trained weights (the trained weights)
 
 A non-elite individual has a topology JSON but NO weights file, so loading it
 yields the SEEDED initial net (see below), not its trained state.
@@ -353,7 +352,7 @@ def load_gras_net(
     """Rebuild the net from nets/<hash>.json.
 
     With trained weights present (nets/<hash>.safetensors, else the older
-    elite-/worst- exports) the weights are loaded and any missing parameter raises — a partial load is a
+    elite- exports) the weights are loaded and any missing parameter raises — a partial load is a
     different network, never accepted silently. With none (or `force_init`),
     the SEEDED initial weights are rebuilt from the blueprint (see
     `init_weights`) so the net can be trained from scratch in Python."""
@@ -376,12 +375,12 @@ def load_gras_net(
 
     short = state["hash"][:8]
     # R4: every live net's weights live beside its state as nets/<full-hash>
-    # .safetensors. The older per-rank exports (elite-<short>, worst-<short>) are
+    # .safetensors. The older per-rank exports (elite-<short>) are
     # tried too, so a directory written before R4 still loads.
     weights_path = None
     if not force_init:
         candidates = [state_path.with_suffix(".safetensors")]
-        candidates += [run_dir / f"{prefix}{short}.safetensors" for prefix in ("elite-", "worst-")]
+        candidates += [run_dir / f"{prefix}{short}.safetensors" for prefix in ("elite-",)]
         weights_path = next((p for p in candidates if p.exists()), None)
 
     if weights_path is None:
