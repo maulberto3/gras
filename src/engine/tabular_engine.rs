@@ -1,6 +1,6 @@
 //! Tabular engine — the dataset-driven race constructor + resume.
 //!
-//! One of the 2026-09-24 engine-split slices (TODO.md) out of what was the
+//! One of the 2026-09-24 engine-split slices (TODO.md) out of what
 //! single `race_engine.rs` monolith. This file holds the TABULAR-specific
 //! constructors (`resume`); the tabular arm of `new` is built on the shared
 //! core. Everything else — the struct, the step loop, evolution, artifacts —
@@ -16,8 +16,8 @@
 //!
 //! **Refused** — what cannot be rebuilt at all: `pop_size` (checked against the live
 //! frontier), the trainer scheme (loss, update recipe, `stream_shape()` batch sizes),
-//! the fitness function, the dataset at `data_dir`, the metric set, dims, and
-//! `run_seed` / `train_eval_split_ratio` / eval-row counts, which come from the
+//! the fitness function, the dataset at `data_dir`, the metric set, dims,
+//! `run_seed` / `train_eval_split_ratio` / eval-row counts, which come
 //! persisted header rather than your config.
 //!
 //! **Warned, not refused (R6)** — everything BEHAVIOURAL, i.e. it changes the draws
@@ -25,35 +25,35 @@
 //! policies, the probation windows, the crown lifetime. `CoreEngine::behavioural_drift()`
 //! names each one with both values and the setter that reproduces the record.
 //!
-//! **Yours freely** (surface only): the stop criterion (the `max_steps` budget is
+//! **Yours freely** (surface only): the stop criterion (the `max_steps` budget
 //! **absolute**, not per-process: interrupt at 17 with `max_steps: 20` and the resumed
 //! run does 3 more steps), `log_level`, and `checkpoint_every` (the recorded eval era
 //! still governs the stream — R3b).
 //!
 //! Also: `step_clock()` reads the max step across live nets, so a trailing
 //! crossover child can never repeat an iteration; replayed nets' rolling buffers
-//! are seeded by replay, and the checkpoint ledger is reloaded so the history is
+//! are seeded by replay, and the checkpoint ledger is reloaded so the history
 //! the SAME. Tabular resume is bit-identical because
 //! trainer randomness is engine-seeded — in RL only the env's own internal draws
 //! (the Python-side seeding contract) can drift; engine-side rolls always replay.
 //!
-//! Recorded schema (identical for tabular and RL): run-level settings in
-//! `engine.json`'s `config`, per-net facts in `nets/<hash>.json`, and
+//! Recorded schema (identical for tabular and RL): run-level settings
+//! `engine.json`'s `config`, per-net facts in `nets/<hash>.json`,
 //! trainer-owned facts (LR, grad clip, loss/update scheme) only in `engine.json`
 //! → `"trainer"`. Mode-owned absences are recorded as absences (`batch_size: null`
-//! for RL, not a tabular `16`). `MatchLength::draw` is a pure function of
+//! for RL, not a tabular `16`). `MatchLength::draw` is a pure function
 //! `(run_seed, step, match_i)`, so no schedule cursor is stored — a stateful
 //! variant (a curriculum ladder) would need one, which is why it isn't in the enum.
 
 use super::config::RaceConfig;
 use super::core::{CoreEngine, CoreEngineParts, assert_trainer_blob_matches};
-use crate::utils::fitness::Fitness;
-use crate::state::{RunHeader};
+use crate::state::RunHeader;
 use crate::trainer::stream::{BatchStream, PoolSplit};
+use crate::utils::fitness::Fitness;
 use flodl::tensor::Result;
 
 /// The dataset-driven (tabular) engine — the public handle for `RunSpec::tabular`
-/// runs. Wraps [`CoreEngine`] and derefs to it.
+/// runs. Wraps [`CoreEngine`] and derefs
 pub struct TabularEngine(pub(crate) CoreEngine);
 
 impl std::ops::Deref for TabularEngine {
@@ -94,15 +94,8 @@ impl TabularEngine {
             ),
         )?))
     }
-    /// Resume a run from its run directory ALONE — everything but your code comes from
-    /// the record: `data_dir` (stamped into `engine.json` by the engine), the run-level
-    /// knobs (`RaceConfig::from_snapshot`), the search space (topology options, pools,
-    /// hidden-dim range), the metric set, the step budget and the seed.
-    ///
-    /// `fitness` and `trainer` stay arguments because they are CODE, not data: a
-    /// tabular fitness is a closure over the scorer and the trainer owns the loss, so
-    /// neither can be reconstructed from a header. Pass the same ones the run used —
-    /// `assert_trainer_blob_matches` refuses a different recipe by name.
+    /// Resume a run from its run directory ALONE — everything but your code comes from the record:
+    /// `data_dir` (stamped into `engine.json` by the engine), the run-level knobs
     pub fn resume_from(
         run_dir: impl Into<std::path::PathBuf>,
         fitness: Fitness,
@@ -130,10 +123,8 @@ impl TabularEngine {
         )
     }
 
-    /// Resume a run from an explicit directory + dataset + config, replaying every live
-    /// net to its recorded step. See the module docs for what must match vs. what may
-    /// change. This is the form to use for a dir that predates `engine.json`'s
-    /// `data_dir`, or when the dataset moved.
+    /// Resume a run from an explicit directory + dataset + config, replaying every live net
+    /// recorded step.
     pub fn resume(
         run_dir: std::path::PathBuf,
         data_dir: std::path::PathBuf,
@@ -143,7 +134,7 @@ impl TabularEngine {
     ) -> Result<Self> {
         let trainer = crate::trainer::AnyTrainer::tabular(trainer);
         let header = crate::state::load_engine_json(&run_dir)?;
-        // Pluck the run-level counters out BEFORE `header` moves into the
+        // Pluck the run-level counters out BEFORE `header` moves into
         // engine struct (resume restores them after the frontier loads).
         let persisted_counters = RunHeader {
             culls: header.culls,
@@ -151,7 +142,7 @@ impl TabularEngine {
             children_born_at_clock: header.children_born_at_clock.clone(),
             ..header.clone()
         };
-        // Mode guard: a run dir written by the RL engine cannot be resumed as
+        // Mode guard: a run dir written by the RL engine cannot be resumed
         // tabular (no dataset geometry); `engine_mode` is the discriminator.
         match header.engine_mode.as_deref() {
             Some("tabular") | None => {}
@@ -164,21 +155,16 @@ impl TabularEngine {
             }
         }
         assert_trainer_blob_matches(&header.trainer, &trainer, "resume")?;
-        // The SEARCH SPACE a resume inherits (header pools, or the caller's on the
-        // explicit path) is checked by name like a fresh run — a header written by an
-        // older build with a pool entry this build cannot read must say so, not widen.
+        // The SEARCH SPACE a resume inherits (header pools, or the caller's on the explicit path)
+        // is checked by name like a fresh run — a header written by an older build with a pool
         config
             .validate_search_pools()
             .map_err(crate::utils::error::EngineError::InvalidOptions)?;
-        // A legacy dir can hold CSV rows for clocks the last checkpoint never reached
-        // (older runs flushed per clock, the frontier per interval). Rewind to the
-        // frontier BEFORE anything reads the windows or appends to the files — otherwise
-        // the resumed run re-emits rows that are already on disk.
+        // A legacy dir can hold CSV rows for clocks the last checkpoint never reached (older runs
+        // flushed per clock, the frontier per interval).
         CoreEngine::rewind_csvs_to_manifest(&run_dir)?;
-        // Data layout comes from the HEADER, not from re-detecting the directory: the
-        // same pools replay after a rename. `eval_split` names the ranking pool (`val` or
-        // `test`); a legacy header (written before the VAL role existed) can only mean the
-        // old `train/` + `test/` rule.
+        // Data layout comes from the HEADER, not from re-detecting the directory: the same pools
+        // replay after a rename.
         let explicit_test_rows = header.explicit_test_rows;
         let recorded_eval_split = header
             .eval_split
@@ -198,9 +184,7 @@ impl TabularEngine {
             ))
             .into());
         }
-            // The EXAM comes back from the SAME rule the run started under. A row count
-            // that no longer matches the header means the exam was swapped, and an exam you
-            // can swap is not an exam.
+        // The EXAM comes back from the SAME rule the run started under.
         let exam = roles.exam;
         match (exam.as_ref(), header.exam_rows) {
             (Some(ds), Some(recorded)) if recorded != ds.len() => {
@@ -228,10 +212,7 @@ impl TabularEngine {
             .into());
         };
         // The METRIC SET comes from the RECORD, never from this call: it is the header
-        // `history.csv` already carries (`append_csv_file` writes a header only when the
-        // file is missing) and what `engine.json` says the first segment measured. A
-        // caller's DIFFERENT set is refused by name, like the trainer/pop guards — a
-        // resume is the same experiment, so it records the same columns.
+        // `history.csv` already carries (`append_csv_file` writes a header only when the file
         let mut recorded_metrics = Vec::with_capacity(header.informative_metrics.len());
         for name in &header.informative_metrics {
             match crate::trainer::menu::metric_for(name) {
@@ -244,7 +225,11 @@ impl TabularEngine {
                 }
             }
         }
-        let requested: Vec<String> = config.metrics.iter().map(|m| m.label().to_string()).collect();
+        let requested: Vec<String> = config
+            .metrics
+            .iter()
+            .map(|m| m.label().to_string())
+            .collect();
         let recorded: Vec<String> = recorded_metrics
             .iter()
             .map(|m| m.label().to_string())
@@ -265,10 +250,8 @@ impl TabularEngine {
         // On resume, stream shape comes from the run header (data integrity),
         // but the trainer's stream_shape() can still override batch sizes.
         let header_stream_ratio = header.train_eval_split_ratio.unwrap_or(0.2); // legacy default if header missing it
-            // The RUN's share wins over the caller's: the pools are the ones the first
-            // half trained on, and a resume that re-chose them would rank nets on rows
-            // they were already selected against. Kept in the config too, so a header
-            // rewritten at the next checkpoint restates the same number.
+        // The RUN's share wins over the caller's: the pools are the ones the first half trained
+        // and a resume that re-chose them would rank nets on rows they were already selected
         config.eval_share = header_stream_ratio;
 
         // Same rule on resume: the trainer's stream shape overrides batch sizes
@@ -277,7 +260,7 @@ impl TabularEngine {
             Some(shape) => (shape.batch_size, shape.eval_batch_size),
             None => (16, 16), // conservative default when no stream_shape override
         };
-        // Resume always has a stream by construction (tabular-only today), so
+        // Resume always has a stream by construction (tabular-only today),
         // the recorded geometry is genuinely `Some` here.
         let split = match explicit_test_rows {
             Some(test_len) => {
@@ -293,14 +276,8 @@ impl TabularEngine {
             }
             None => PoolSplit::of(&dataset, header_stream_ratio, run_seed),
         };
-        // Resume is Tabular-only today (a persisted run carries a dataset);
-        // both fields are wrapped in Some to satisfy the Option'd struct.
-        // The EVAL ERA comes from the record, not from this call's cadence. The
-        // caller's `checkpoint_every` decides only how often the durability tick fires;
-        // deriving the era from it would rotate the eval permutation at different clocks
-        // than the first half of the run did, and every parity assertion after that would
-        // be measuring a different experiment. Legacy dirs (no recorded era) fall back to
-        // the caller's value — what those runs used for both roles.
+        // Resume is Tabular-only today (a persisted run carries a dataset); both fields are wrapped
+        // in Some to satisfy the Option'd struct.
         let eval_era_every = header.eval_era_every.unwrap_or(config.checkpoint_every);
         if header
             .eval_era_every

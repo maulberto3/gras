@@ -1,44 +1,14 @@
-//! The NAME POOLS — the five `Vec<String>` config fields that resolve to typed
-//! search choices, read through ONE interface.
-//!
-//! All five do the same four things, and used to do them in five separate
-//! `resolved_*` bodies inside `config.rs`:
-//!
-//! 1. an **empty** pool means "the default set" (`empty ⇒ all`),
-//! 2. every other entry is **parsed**, one at a time,
-//! 3. an entry that does not parse is an **error naming the pool and the entry**
-//!    (never a silent widening — see [`resolve`]),
-//! 4. the choices have one **wire spelling** for `engine.json`, the resume diff
-//!    and the log (`[SearchPool::wire]`).
-//!
-//! Copy-pasting those four rules is how the pools drifted: the feature-split
-//! pool matched SUBSTRINGS and had its own fallback while the other four did
-//! not. Here the loop exists once, so a sixth pool is a declaration —
-//! `impl SearchPool` — rather than a sixth copy.
-//!
-//! **This module is plumbing, not vocabulary.** The parsers stay with the types
-//! they parse (`CrossoverOp::try_from`, `StandardizeOp::try_from`,
-//! `RaceConfig::parse_activation`, `parse_feature_split_pool_entry`) and the
-//! default vocabularies stay in [`crate::evolution::pools`]; a pool impl only
-//! names those four facts.
-//!
-//! Public surface: none. `RaceConfig::resolved_*` stay the public readers and
-//! delegate here, so a Rust or Python caller (and their setters) sees no change.
+//! The NAME POOLS — the five `Vec<String>` config fields that resolve to typed search choices, read
+//! through ONE interface.
 
 use crate::graph::node::{Activation, CombineOp, StandardizeOp};
 use crate::graph::topology::FeatureSplitPolicy;
 
 use super::config::{CrossoverOp, RaceConfig};
 
-/// One name-addressed search pool: a list of typed strings plus the four facts
-/// needed to read them.
-///
-/// The `Choice` is the typed result — `Option<FeatureSplitPolicy>` for the split
-/// pool, because there "no split at all" is a real choice and must not be
-/// confused with "this entry did not parse" (that is [`SearchPool::parse`]'s
-/// `None`).
+/// One name-addressed search pool: a list of typed strings plus the four facts needed to read them.
 pub(crate) trait SearchPool {
-    /// What one entry resolves to.
+    /// What one entry resolves
     type Choice;
     /// The config field and error label, spelled exactly (`"activation_pool"`).
     const LABEL: &'static str;
@@ -48,7 +18,7 @@ pub(crate) trait SearchPool {
 
     /// The raw strings as the user typed them.
     fn entries(cfg: &RaceConfig) -> &[String];
-    /// What an EMPTY pool means (`empty ⇒ all`).
+    /// What an EMPTY pool means (`empty ⇒
     fn default_choices() -> Vec<Self::Choice>;
     /// One entry → its choice; `None` = unknown spelling.
     fn parse(entry: &str) -> Option<Self::Choice>;
@@ -56,14 +26,7 @@ pub(crate) trait SearchPool {
     fn wire(choice: &Self::Choice) -> String;
 }
 
-/// Resolve a pool: the configured entries parsed in order, or the default set
-/// when empty. An unknown entry is an error naming the pool, the entry and the
-/// accepted vocabulary.
-///
-/// The DRAW paths cannot return a `Result` (a topology draw is infallible), so
-/// they fall back to the full default pool — right for an EMPTY pool, wrong for a
-/// TYPO. That is why [`super::config::RaceConfig::validate_search_pools`] calls
-/// `resolve` for every pool before a single net is drawn.
+/// Resolve a pool: the configured entries parsed in order, or the default set when empty.
 pub(crate) fn resolve<P: SearchPool>(cfg: &RaceConfig) -> Result<Vec<P::Choice>, String> {
     let entries = P::entries(cfg);
     if entries.is_empty() {
@@ -83,14 +46,8 @@ pub(crate) fn resolve<P: SearchPool>(cfg: &RaceConfig) -> Result<Vec<P::Choice>,
         .collect()
 }
 
-/// The pool as wire names, in draw order — one spelling for the log, the
-/// `engine.json` record and the resume diff.
-///
-/// An unparseable pool is echoed AS TYPED instead of being replaced by a pool it
-/// never drew: `["rondom"]` used to be recorded as `["none"]`, so the header
-/// described an experiment nobody ran. Construction refuses such a config
-/// outright ([`super::config::RaceConfig::validate_search_pools`]), so this arm
-/// only serves direct callers.
+/// The pool as wire names, in draw order — one spelling for the log, the `engine.json` record
+/// the resume diff.
 pub(crate) fn names<P: SearchPool>(cfg: &RaceConfig) -> Vec<String> {
     match resolve::<P>(cfg) {
         Ok(choices) => choices.iter().map(P::wire).collect(),
@@ -182,7 +139,7 @@ pub(crate) struct CombineOpPool;
 impl SearchPool for CombineOpPool {
     type Choice = CombineOp;
     const LABEL: &'static str = "combine_op_pool";
-    // `mul` / `sub` / `div` are accepted but NOT in the default pool: unstable with
+    // `mul` / `sub` / `div` are accepted but NOT in the default pool: unstable
     // random weights, so a run must ask for them. The message lists what parses.
     const ACCEPTED: &'static [&'static str] = &[
         "add", "mean", "max", "min", "mul", "multiply", "sub", "subtract", "div", "divide",
@@ -234,10 +191,6 @@ impl SearchPool for StandardizePool {
 }
 
 /// `feature_split_pool` — how a NEWBORN's input→hidden mask rows are drawn.
-///
-/// `Choice = Option<FeatureSplitPolicy>`: `None` is "no split at all" (no rows),
-/// which is a drawable choice, not a parse failure. `Inherited` is provenance
-/// stamped by crossover, never drawable, so it is not in [`Self::ACCEPTED`].
 pub(crate) struct FeatureSplitPool;
 
 impl SearchPool for FeatureSplitPool {
@@ -280,8 +233,8 @@ mod tests {
     };
     use crate::engine::config::RaceConfig;
 
-    /// The pool's raw entries as a mutable field, by label — the test's only
-    /// per-pool knowledge, and a loud panic if a sixth pool is added without it.
+    /// The pool's raw entries as a mutable field, by label — the test's
+    /// per-pool knowledge, and a loud panic if a sixth pool is added without
     fn entries_mut<'a>(cfg: &'a mut RaceConfig, label: &str) -> &'a mut Vec<String> {
         match label {
             "crossover_ops_pool" => &mut cfg.crossover_ops_pool,
@@ -296,7 +249,7 @@ mod tests {
     /// The contract every pool must keep, checked generically so a sixth pool
     /// inherits the test instead of needing its own copy.
     fn contract<P: SearchPool>() {
-        // 1. Every advertised spelling really parses: the refusal message and the
+        // 1. Every advertised spelling really parses: the refusal message
         //    parser cannot drift apart.
         for token in P::ACCEPTED {
             assert!(
@@ -348,7 +301,7 @@ mod tests {
         contract::<FeatureSplitPool>();
     }
 
-    /// The split pool's `Choice` is an `Option`, so "no split" must survive the
+    /// The split pool's `Choice` is an `Option`, so "no split" must survive
     /// pipeline as a choice while an unknown name stays a refusal.
     #[test]
     fn no_split_is_a_choice_not_a_parse_failure() {
@@ -363,7 +316,10 @@ mod tests {
             pool[1],
             Some(crate::graph::topology::FeatureSplitPolicy::Random)
         );
-        assert_eq!(names::<FeatureSplitPool>(&cfg), vec!["none", "split_random"]);
+        assert_eq!(
+            names::<FeatureSplitPool>(&cfg),
+            vec!["none", "split_random"]
+        );
         // `Inherited` is provenance, not a drawable policy.
         assert!(FeatureSplitPool::parse("split_inherited").is_none());
     }

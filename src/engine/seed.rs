@@ -1,46 +1,4 @@
 //! Seed the founder batch from a PREVIOUS experiment's elites.
-//!
-//! The engine does this automatically (it is on by default; turn it off with
-//! `RaceConfig::set_elite_previous_load(false)`): the newest compatible prior
-//! run's ELITES are copied in as the first slots of the initial population, in
-//! rank order (best first), capped by the new run's `pop_size`; the rest stay
-//! random draws. The cap is what makes a small population work: with 10 elites
-//! and `pop_size = 4` the top 4 by rank come in, and the order is the source's
-//! own ranking (see `elites.json` below), never a file-mtime guess.
-//! TOPOLOGY ONLY: a blueprint brings its nodes, wiring, dims and its stored
-//! `topology_seed` (which is what `Network::build` derives weights from, so the
-//! imported net restarts from the same step-0 weight init its source had),
-//! never trained weights. Weight import is a separate, not-yet-landed path.
-//!
-//! WHICH elites: the source run writes `elites.json` at stop
-//! (`write_elite_index`) — `[{rank, hash, fitness, params, born}]`, best first,
-//! k = its `elite_count`. That list IS the final table, ranked by the
-//! risk-adjusted fitness the run itself printed, so there is no second exam
-//! between "the table says rank 1" and "this run inherits rank 1".
-//!
-//! Resolution (deterministic, and every failure is survivable):
-//! 1. root = `set_elite_previous_dir(path)`, else [`DEFAULT_RESULTS_ROOT`].
-//!    A root that IS a run dir (it holds `engine.json`) is used as-is;
-//!    otherwise the newest run dir under it wins — newest by the numeric
-//!    `run_id` prefix, so both the timestamped `results/<id>` layout and the
-//!    archived `assets/<id>_<label>` layout order correctly. The RUN'S OWN
-//!    directory is excluded: its header is written before the lookup happens,
-//!    so without the exclusion every run would "find" itself (empty table)
-//!    and never inherit anything.
-//! 2. a compatibility gate read from the candidate's `engine.json` header
-//!    ALONE (no net is loaded to decide it): same `engine_mode`, same
-//!    `input_dim`/`output_dim`, and the same trainer name whenever both sides
-//!    declare one (`engine.json` → `trainer.trainer`). Mode + dims alone can't
-//!    separate two environments that happen to share dims while measuring
-//!    different units (survival turns vs solve score).
-//! 3. the ranked list is read from `elites.json` — the source's FINAL TABLE,
-//!    in the risk-adjusted-fitness order it printed. Rank 1 is the net that table
-//!    called best; the table is the verdict, so there is no separate exam.
-//! 4. each entry's topology comes from `nets/<hash>.json`.
-//!
-//! There is deliberately NO fallback chain: a source with no `elites.json`
-//! inherits nothing at all. The caller prints the reason and runs with an
-//! all-random population.
 
 use std::path::{Path, PathBuf};
 
@@ -58,7 +16,7 @@ pub struct SeedPick {
     pub rank: usize,
     /// The source run's id (its run-directory name).
     pub source_run_id: String,
-    /// The directory the source was read from.
+    /// The directory the source was read
     pub source_dir: PathBuf,
     /// Full hash of the net at this rank (rank 1 = the source table's best).
     pub champion_hash: String,
@@ -74,7 +32,7 @@ pub struct SeedPick {
 pub struct SeedPlan {
     /// The source run's id (its `results/<id>` directory name).
     pub source_run_id: String,
-    /// The directory the source was read from.
+    /// The directory the source was read
     pub source_dir: PathBuf,
     /// Ranked picks, best first, already capped by the caller's `max_seeds`.
     pub picks: Vec<SeedPick>,
@@ -99,7 +57,7 @@ pub enum SeedOutcome {
 }
 
 impl SeedOutcome {
-    /// The plan, if any.
+    /// The plan,
     pub fn seeded(&self) -> Option<&SeedPlan> {
         match self {
             SeedOutcome::Seeded(p) => Some(p),
@@ -108,7 +66,7 @@ impl SeedOutcome {
     }
 }
 
-/// One entry of a source run's `elites.json` — the machine-readable ranking the
+/// One entry of a source run's `elites.json` — the machine-readable ranking
 /// next experiment reads; only the rank and hash matter here.
 #[derive(Clone, Debug, serde::Deserialize)]
 struct EliteIndexEntry {
@@ -118,7 +76,7 @@ struct EliteIndexEntry {
     hash: String,
 }
 
-/// Resolve the previous experiment's CERTIFIED CHAMPION (rank 1 only) — the
+/// Resolve the previous experiment's CERTIFIED CHAMPION (rank 1 only) —
 /// narrow entry point; the engine uses [`resolve_plan`] for the whole list.
 pub fn resolve(
     root: Option<&Path>,
@@ -146,9 +104,8 @@ pub fn resolve_plan(
     let root = root.unwrap_or(Path::new(DEFAULT_RESULTS_ROOT));
     let dirs = run_dirs(root, exclude);
     let Some(dir) = dirs.first() else {
-        // The caller's one-line receipt leans on these two wordings: an explicit
-        // dir that holds no run is different from the default folder simply not
-        // existing yet (a first-ever run inherits nothing).
+        // The caller's one-line receipt leans on these two wordings: an explicit dir that holds no
+        // run is different from the default folder simply not existing yet (a first-ever run
         return SeedOutcome::Skipped(if explicit {
             format!("no previous run under {}", root.display())
         } else {
@@ -187,18 +144,14 @@ pub fn resolve_plan(
             ));
         }
     }
-    // ── 3. the ranked list: the source's FINAL TABLE ───────────────────────
-    // `elites.json` is written at stop in risk-adjusted-fitness order — the same
-    // ranking the `Final field` card printed. There is no certification step: the
-    // table IS the verdict, so rank 1 here is the net the source run itself called
-    // best, and the new run inherits exactly what that table listed.
+    // ── 3.
     let ranked: Vec<(usize, String)> = match read_elite_index(dir) {
         Some(entries) if !entries.is_empty() => entries,
         _ => {
             return SeedOutcome::Skipped(format!(
                 "run {source_run_id} has no elites.json (its final table was not recorded, or it \
                  predates the index)"
-            ))
+            ));
         }
     };
     let cap = max_seeds.max(1);
@@ -219,8 +172,8 @@ pub fn resolve_plan(
                 continue;
             }
         };
-            // The header gate proved the RUN matched; this proves the BLUEPRINT did
-            // (a legacy one may carry disagreeing dims). A mismatch is dropped.
+        // The header gate proved the RUN matched; this proves the BLUEPRINT did
+        // (a legacy one may carry disagreeing dims). A mismatch is dropped.
         let opts = &topology.options;
         if opts.input_dim.is_some()
             && (opts.input_dim != Some(input_dim) || opts.output_dim != Some(output_dim))
@@ -236,7 +189,7 @@ pub fn resolve_plan(
             source_run_id: source_run_id.clone(),
             source_dir: dir.clone(),
             champion_hash: hash,
-            // The parameter count stays a record-only field; the ranking itself is
+            // The parameter count stays a record-only field; the ranking itself
             // the source's own table order (no second measurement exists any more).
             champion_params: None,
             topology,
@@ -275,7 +228,7 @@ fn read_elite_index(dir: &Path) -> Option<Vec<(usize, String)>> {
     Some(out)
 }
 
-/// The trainer name a header's `trainer` blob declares, if any.
+/// The trainer name a header's `trainer` blob declares,
 fn trainer_name_of(blob: &serde_json::Value) -> Option<&str> {
     blob.get("trainer").and_then(|v| v.as_str())
 }
@@ -364,6 +317,7 @@ mod tests {
             output_dim: Some(2),
             dropout_prob: 0.0,
             feature_split: None,
+            weight_seed: None,
         };
         let mut topo = Topology::new(7, Some(opts));
         topo.nodes.push(crate::graph::node::Node::new_input(0, 2));
@@ -387,9 +341,15 @@ mod tests {
         topo
     }
 
-        /// Write a minimal but realistic prior-run directory: an `engine.json`
-        /// header, a `nets/<hash>.json` state carrying the blueprint.
-    fn write_run(dir: &Path, run_id: &str, mode: &str, trainer: &str, with_index: bool) -> Topology {
+    /// Write a minimal but realistic prior-run directory: an `engine.json`
+    /// header, a `nets/<hash>.json` state carrying the blueprint.
+    fn write_run(
+        dir: &Path,
+        run_id: &str,
+        mode: &str,
+        trainer: &str,
+        with_index: bool,
+    ) -> Topology {
         std::fs::create_dir_all(dir.join("nets")).unwrap();
         let topo = toy_topology();
         let hash = "abcd1234abcd1234";
@@ -411,7 +371,7 @@ mod tests {
             "trainer": { "trainer": trainer },
         });
         if with_index {
-            // The FINAL TABLE is what inheritance reads now: rank 1 is the net the
+            // The FINAL TABLE is what inheritance reads now: rank 1 is the net
             // source run's own `Final field` card printed first.
             std::fs::write(
                 dir.join("elites.json"),
@@ -492,7 +452,7 @@ mod tests {
     fn a_missing_trainer_name_skips_that_check() {
         let root = tmp("no-trainer-name");
         write_run(&root.join("1000"), "1000", "tabular", "toy", true);
-        // This run declares no trainer name → the check cannot be applied, so
+        // This run declares no trainer name → the check cannot be applied,
         // it must not reject the candidate.
         assert!(
             resolve(Some(&root), None, "tabular", 2, 2, None)
@@ -540,8 +500,8 @@ mod tests {
         );
     }
 
-        /// The run's OWN directory is written before the lookup, so it is the
-        /// "newest" candidate by construction and must always be excluded.
+    /// The run's OWN directory is written before the lookup,
+    /// "newest" candidate by construction and must always be excluded.
     #[test]
     fn the_current_runs_own_directory_is_never_chosen() {
         let root = tmp("self-exclude");
@@ -592,7 +552,7 @@ mod tests {
         );
     }
 
-    /// The widened inheritance: `elites.json` is read as the ranked list, the
+    /// The widened inheritance: `elites.json` is read as the ranked list,
     /// cap takes the TOP ranks, and the champion is rank 1 either way.
     #[test]
     fn elites_json_is_read_ranked_and_capped() {
@@ -652,7 +612,7 @@ mod tests {
         assert_eq!(plan.picks[1].champion_hash, extra[0].1);
     }
 
-    /// Rank 1 keeps the all-or-nothing contract (the certified champion is the
+    /// Rank 1 keeps the all-or-nothing contract (the certified champion
     /// gate); a missing later rank is dropped and the rest still inherit.
     #[test]
     fn a_missing_later_rank_is_dropped_but_the_rest_inherit() {

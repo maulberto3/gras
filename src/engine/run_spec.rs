@@ -1,22 +1,11 @@
-//! The one bundle a caller hands the engine to start a race — one variant per
-//! run mode (see [`RunSpec`]).
-//!
-//! Everything the engine needs for the chosen mode, nothing else. The
-//! training scheme is a **self-contained** struct you build — it owns its
-//! loss, its optimizer choice, its learning-rate / grad-clip / schedule, and
-//! optionally its own shape for the shared batch stream (Tabular). The engine
-//! never touches any of that: it only reads the [`Trainer`] contract from the
-//! scheme.
-//!
-//! The engine derives the rest — run id, run directory, (Tabular only:)
-//! dataset load and batch stream — and exposes what it chose via
-//! [`crate::RaceEngine::run_dir`] and [`crate::RaceEngine::run_seed`].
+//! The one bundle a caller hands the engine to start a race — one variant per run mode (see
+//! [`RunSpec`]).
 
 use crate::engine::config::RaceConfig;
-use crate::utils::fitness::Fitness;
 use crate::trainer::{RlStep, TabularStep};
+use crate::utils::fitness::Fitness;
 
-/// Start-a-race spec: the entire `new` argument surface. `fitness` is the
+/// Start-a-race spec: the entire `new` argument surface. `fitness`
 /// ranking signal; the loss lives on your `trainer`.
 pub struct TabularSpec<T = Box<dyn TabularStep>> {
     /// Dataset directory the engine loads.
@@ -48,7 +37,7 @@ pub struct RLSpec<T = Box<dyn RlStep>> {
     pub run_dir: Option<std::path::PathBuf>,
 }
 
-/// Start-a-race spec — one variant per run mode, each self-contained, so the
+/// Start-a-race spec — one variant per run mode, each self-contained,
 /// compiler enforces exactly each mode's requirement set.
 pub enum RunSpec<TT = Box<dyn TabularStep>, TR = Box<dyn RlStep>> {
     /// Supervised tabular run: `data_dir` + engine-computed fitness.
@@ -58,8 +47,8 @@ pub enum RunSpec<TT = Box<dyn TabularStep>, TR = Box<dyn RlStep>> {
 }
 
 impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
-        /// Convenience constructor for the Tabular variant — path fields coerce via
-        /// `Into<PathBuf>`; `run_dir: None` uses `results/<timestamp>`.
+    /// Convenience constructor for the Tabular variant — path fields coerce via
+    /// `Into<PathBuf>`; `run_dir: None` uses `results/<timestamp>`.
     pub fn tabular<P: Into<std::path::PathBuf>>(
         data_dir: impl Into<std::path::PathBuf>,
         mut config: RaceConfig,
@@ -68,8 +57,8 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
         seed: Option<u64>,
         run_dir: Option<P>,
     ) -> Self {
-            // The spec variant DECIDES the mode arm: stamp the Tabular arm, replacing
-            // whatever placeholder the builder carried.
+        // The spec variant DECIDES the mode arm: stamp the Tabular arm, replacing
+        // whatever placeholder the builder carried.
         config.mode_specific = crate::engine::config::ModeConfig::Tabular(
             crate::engine::config::TabularConfig::default(),
         );
@@ -83,8 +72,8 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
         })
     }
 
-        /// Convenience constructor for the RL variant: no `data_dir`, and `fitness`
-        /// MUST be [`Fitness::reported`] (a `Computed` scorer has nothing to score).
+    /// Convenience constructor for the RL variant: no `data_dir`, and `fitness`
+    /// MUST be [`Fitness::reported`] (a `Computed` scorer has nothing to score).
     pub fn rl(
         mut config: RaceConfig,
         fitness: Fitness,
@@ -110,13 +99,11 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
     }
 }
 
-// Deliberately no engine-side "default trainer": a run without a trainer is a type
-// error, and this stays true now that one reference scheme ships
-// (`trainer::TabularTrainer`) — a spec still names its trainer explicitly. Mode
-// specific recipes (an environment, an exotic scheme) live in `examples/`.
+// Deliberately no engine-side "default trainer": a run without a trainer is a type error,
+// stays true now that one reference scheme ships (`trainer::TabularTrainer`) — a spec still names
 
 /// Stream shape request — what the trainer wants the shared batch stream to look
-/// like (returned from `TabularStep::stream_shape`); the engine applies it.
+/// like (returned from `TabularStep::stream_shape`); the engine applies
 #[derive(Clone, Copy, Debug)]
 pub struct StreamShape {
     /// Rows per shared train batch.
@@ -126,7 +113,7 @@ pub struct StreamShape {
 }
 
 impl StreamShape {
-    /// No override — use the engine's default stream shape (batch_size from
+    /// No override — use the engine's default stream shape (batch_size
     /// the trainer's default + eval_batch_size == batch_size).
     pub fn none() -> Self {
         Self {

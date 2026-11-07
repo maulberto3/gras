@@ -1,5 +1,5 @@
-//! Logging: the process-wide `tracing` subscriber the engine installs, and
-//! the three sinks its single event stream fans out to.
+//! Logging: the process-wide `tracing` subscriber the engine installs,
+//! the three sinks its single event stream fans out
 //!
 //! ```text
 //! engine event ─┬─ console (stdout)  the human lines, filtered by `LogLevel`
@@ -7,14 +7,14 @@
 //!               └─ telemetry (file)  <run_dir>/telemetry.jsonl, opt-in
 //! ```
 //!
-//! The console writes to STDOUT, the same stream the frame, the CFY receipts and
+//! The console writes to STDOUT, the same stream the frame, the CFY receipts
 //! the log legend use: `cargo run > run.log` therefore captures the WHOLE run.
 //! Warning the user means writing to the terminal, not writing to a different
 //! file descriptor — a split stream silently saved a run with everything except
 //! the engine's own lines.
 //!
-//! The file sink can't be aimed at `init` — the run dir does not exist yet — so
-//! it BUFFERS the start-up block (race init / search space / build stamp) and
+//! The file sink can't be aimed at `init` — the run dir does not exist yet —
+//! it BUFFERS the start-up block (race init / search space / build stamp)
 //! flushes it in place when the engine settles the run dir. Until it settles,
 //! the telemetry layer is inert: a run that never traces pays nothing.
 
@@ -34,7 +34,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use super::config::LogLevel;
 
-/// Target the `Minimal` vitals frame rides on: the console layer skips it, the
+/// Target the `Minimal` vitals frame rides on: the console layer skips
 /// frame layer renders it and nothing else.
 pub const FRAME_TARGET: &str = "gras::frame";
 
@@ -50,17 +50,15 @@ static PENDING: AtomicBool = AtomicBool::new(false);
 /// The file is open and the sink streams into it (set once, never cleared).
 static ARMED: AtomicBool = AtomicBool::new(false);
 
-/// Cap on the start-up buffer: a caller that never settles the sink must not
+/// Cap on the start-up buffer: a caller that never settles the sink must
 /// be able to grow it without bound.
 const MAX_STARTUP_BYTES: usize = 1 << 20;
 
 /// Install the subscriber for a run: console + frame, plus the telemetry sink
 /// (inert until [`settle_run_dir`] decides). Returns false if already installed.
 pub fn init(level: LogLevel, filter_override: Option<&str>) -> bool {
-    // The LEVEL is authoritative, and `RUST_LOG` does not silently outrank it: an
-    // inherited env var used to override the flag the example was run with, which made
-    // "I set `--log-level minimal` and still got info lines" a real (and invisible)
-    // failure. The env var is now reported as ignored instead, once, on the same stream.
+    // The LEVEL is authoritative, and `RUST_LOG` does not silently outrank it: an inherited env var
+    // used to override the flag the example was run with, which made "I set `--log-level minimal`
     let base = filter_override.unwrap_or_else(|| level.env_filter());
     if let Ok(env) = std::env::var("RUST_LOG")
         && env != base
@@ -73,8 +71,8 @@ pub fn init(level: LogLevel, filter_override: Option<&str>) -> bool {
 
     PENDING.store(true, Ordering::Relaxed);
 
-        // `Minimal` mutes info lines (its `env_filter` is `warn`); the frame rides
-        // a different target, so it still gets through.
+    // `Minimal` mutes info lines (its `env_filter` is `warn`); the frame rides
+    // a different target, so it still gets through.
     let console = fmt::layer()
         .with_writer(io::stdout)
         .with_ansi(false)
@@ -86,8 +84,8 @@ pub fn init(level: LogLevel, filter_override: Option<&str>) -> bool {
         );
     let frame =
         FrameLayer::new().with_filter(filter_fn(|m: &Metadata<'_>| m.target() == FRAME_TARGET));
-        // The record, not a view: every gras event lands in the file and no other
-        // crate's chatter does. Gated on settle state so untraced runs are silent.
+    // The record, not a view: every gras event lands in the file and no other
+    // crate's chatter does. Gated on settle state so untraced runs are silent.
     let telemetry = fmt::layer()
         .with_writer(SINK.get_or_init(Sink::new).clone())
         .with_ansi(false)
@@ -104,7 +102,7 @@ pub fn init(level: LogLevel, filter_override: Option<&str>) -> bool {
         .try_init()
         .is_ok();
     if !installed {
-        // Someone else owns the subscriber: our layers never run, so the
+        // Someone else owns the subscriber: our layers never run,
         // start-up window would just buffer for nobody.
         PENDING.store(false, Ordering::Relaxed);
     }
@@ -112,7 +110,7 @@ pub fn init(level: LogLevel, filter_override: Option<&str>) -> bool {
 }
 
 /// Emit one `Minimal` vitals frame. The frame layer draws it; the console
-/// layer ignores it.
+/// layer ignores
 pub(crate) fn frame(text: &str) {
     tracing::info!(target: FRAME_TARGET, frame = text);
 }
@@ -143,8 +141,8 @@ pub fn settle_run_dir(run_dir: &Path, trace_file: bool) {
         })
     };
 
-        // Reported outside the lock: the telemetry layer writes through this sink,
-        // so emitting while holding it would deadlock.
+    // Reported outside the lock: the telemetry layer writes through this sink,
+    // so emitting while holding it would deadlock.
     match outcome {
         Ok(()) => ARMED.store(true, Ordering::Relaxed),
         Err(e) => tracing::warn!("telemetry {} unavailable: {e}", path.display()),

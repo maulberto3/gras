@@ -27,70 +27,54 @@ use crate::state::NetMetrics;
 use crate::utils::race_steps::eval_one_step;
 
 /// The training lottery's per-clock FIELD: the population's best and worst merit,
-/// on a higher-is-better scale, snapshotted ONCE before any net steps.
-///
-/// One snapshot per clock (instead of a walk per net) is what makes the draw
-/// order-independent — a net's decision cannot depend on whether a rival stepped
-/// earlier in the same clock — and it is cheap: the walk over live nets and their
-/// K-reading windows happens once per clock. Crown members and nets inside their
-/// born shield are excluded from the field: they train unconditionally, so letting
-/// them set the scale would price the lottery against nets it never grades.
+/// higher-is-better scale, snapshotted ONCE before any net steps.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LotteryFrame {
     /// The best merit in the field (`state.step > 0`, has a reading).
     pub best: f32,
     /// The worst merit in the field.
     pub worst: f32,
+    /// Clocks lived by the YOUNGEST graded net (`1` on its birth clock) — the top
+    /// the youth ratio the age leg reads.
+    pub youngest: usize,
+    /// Clocks lived by the OLDEST graded net.
+    pub oldest: usize,
 }
 
 impl CoreEngine {
-        /// One net's step with the clock's lottery field built HERE — the test/one-off
-        /// entry point. The run loop builds the field ONCE before its loop and calls
-        /// [`Self::step_one_net_in_frame`], so every net in a clock is graded against the
-        /// same pre-clock snapshot (and the population walk happens once, not per net).
-        ///
-        /// Three outcomes per clock. The crown freeze (anti-devolution,
-        /// unconditional) still ACTS AND MEASURES without the optimizer step. The
-        /// training lottery (`train_merit` Ω > 0, a merit-weighted coin) sells a
-        /// TRAIN-EVAL TICKET: no ticket means the net idles — no batch, no forward, no
-        /// eval, no metrics, so nothing it is ranked on moves. Everyone else updates.
+    /// One net's step with the clock's lottery field built HERE — the test/one-off entry point.
     #[cfg(test)]
     pub(crate) fn step_one_net(&mut self, hash: &str, clock: usize) -> Result<()> {
         let frame = self.lottery_frame(clock);
-        self.step_one_net_in_frame(hash, clock, frame)
+        self.step_one_net_in_frame(hash, clock, frame, false)
     }
 
-        /// [`Self::step_one_net`] with the clock's lottery field supplied by the caller.
+    /// [`Self::step_one_net`] with the clock's lottery field supplied by the caller.
     pub(crate) fn step_one_net_in_frame(
         &mut self,
         hash: &str,
         clock: usize,
         frame: Option<LotteryFrame>,
+        forced: bool,
     ) -> Result<()> {
-            // ANTI-DEVOLUTION A — elite freeze: the crown holds the nets that skip
-            // the trainer update this step; scoring proceeds off carried metrics.
+        // ANTI-DEVOLUTION A — elite freeze: the crown holds the nets that skip
+        // the trainer update this step; scoring proceeds off carried metrics.
         if self.frozen_crown.contains(hash) {
             return self.act_only_step(hash, clock, "FROZEN (elite)");
         }
-            // TRAIN-EVAL LOTTERY (experimental, off by default): a non-crown net may be
-            // denied this clock's ticket. It then IDLES — no train batch, no eval batch,
-            // no weight update — so its reading, its update count and every number
-            // derived from them stay exactly where its last ticket left them.
-        // CAPTURE the number the coin is about to compare, so the stop-time table can
-        // print the data the step actually USED. Re-deriving it at stop time (as the
-        // report used to) reads merits that have moved on since, i.e. it answers "what
-        // would the next draw say" rather than "what did this one say".
+        // TRAIN-EVAL LOTTERY (experimental, off by default): a non-crown net may be denied
+        // clock's ticket.
         if let Some(_frame) = frame {
             let p = self.train_lottery_p_eff(hash, clock, frame);
             self.last_ticket_p.insert(hash.to_string(), p);
-            // `draws_at` is the same draw the wrapper would make, with `p` already in
+            // `draws_at` is the same draw the wrapper would make, with `p` already
             // hand — one merit read per net per clock, not two.
-            if !self.train_lottery_draws_at(hash, clock, p) {
+            if !forced && !self.train_lottery_draws_at(hash, clock, p) {
                 return self.idle_step(hash, clock);
             }
         }
-            // One step = whatever the caller's training scheme does; the engine only
-            // consumes the report. Challenges are the trainer's business.
+        // One step = whatever the caller's training scheme does; the engine
+        // consumes the report. Challenges are the trainer's business.
         let optimizer_ok = self.optimizers.contains_key(hash);
         if !optimizer_ok {
             return Err(crate::utils::error::EngineError::InvalidOptions(format!(
@@ -110,11 +94,11 @@ impl CoreEngine {
             informative: report.informative,
             frozen: false,
         };
-            // record_step owns the clock bookkeeping end-to-end (metrics snapshot +
-            // local step advance); a second advance would double-count.
+        // record_step owns the clock bookkeeping end-to-end (metrics snapshot +
+        // local step advance); a second advance would double-count.
         self.state.record_step(hash, metrics.clone())?;
-            // A challenge is just another step: its forced-action fitness ranks like
-            // any other — the user's semantics.
+        // A challenge is just another step: its forced-action fitness ranks like
+        // any other — the user's semantics.
         if let Some(buf) = self.rolling_fitness.get_mut(hash) {
             buf.push(metrics.fitness);
         }
@@ -126,13 +110,8 @@ impl CoreEngine {
                 buf.push(e);
             }
         }
-        // Per-net detail is debug-only (Plan A: the user log shows one rollup
-        // line per step — see `run`). All values remain in nets/<hash>.json.
-        //
-        // The hash is spelled at the SAME width every table and card uses (8 hex), so a
-        // DEBUG line and a stop-time row name the same net identically. The run's custom
-        // informative metrics ride here too: the Summ rollup carries their population
-        // MEAN, and the per-net value belongs beside the loss that produced it.
+        // Per-net detail is debug-only (Plan A: the user log shows one rollup line per step — see
+        // `run`).
         let extra: String = self
             .metrics
             .iter()
@@ -160,15 +139,8 @@ impl CoreEngine {
         Ok(())
     }
 
-        /// The CROWN's act-and-measure pass: the net plays a real step (fresh batch,
-        /// honest standing) and its weight update is DISCARDED (no-op optimizer).
-        ///
-        /// It is measured on purpose — a frozen champion must still be ranked and
-        /// culled on current data — and the clock is recorded in `frozen_spans`, so a
-        /// resume re-runs it through the no-op optimizer. The lottery no longer takes
-        /// this path: a denied ticket means a fully idle clock (`idle_step`).
-        ///
-        /// `why` names the cause for the debug line — the crown's seat.
+    /// The CROWN's act-and-measure pass: the net plays a real step (fresh batch, honest standing)
+    /// and its weight update is DISCARDED (no-op optimizer).
     fn act_only_step(&mut self, hash: &str, clock: usize, why: &str) -> Result<()> {
         let mut noop = NoopOptimizer;
         let report = self.run_trainer_step(hash, clock, &mut noop)?;
@@ -191,8 +163,8 @@ impl CoreEngine {
                 buf.push(e);
             }
         }
-            // Act-and-measure records WITHOUT advancing the clock: `state.step` counts
-            // trainings, and `last_update_step` must not rotate.
+        // Act-and-measure records WITHOUT advancing the clock: `state.step` counts
+        // trainings, and `last_update_step` must not rotate.
         self.state.record_frozen_act(hash, metrics.clone())?;
         tracing::debug!(
             "step {} │ net {} │ {why} — acted+measured fitness{} {} (no weight update)",
@@ -204,18 +176,8 @@ impl CoreEngine {
         Ok(())
     }
 
-        /// The IDLE pass: the lottery denied this clock's train-eval ticket, so the net
-        /// does NOTHING — no train batch, no forward/backward, no eval batch, no metrics
-        /// row, no weight update, no RNG reseed.
-        ///
-        /// Recording nothing is the point: `last_metrics`, `state.step` and the rolling
-        /// windows keep the values of the net's last ticket, so `smt`, its rank and its
-        /// merit are bit-identical across an idle clock. Only the idle ledger and its
-        /// count move, and `history.csv` writes no row (nothing was measured).
-        ///
-        /// The clock still ages the net elsewhere (`refresh_crown` ticks the probation /
-        /// seat counters for every live net): an idle net is untrained, not frozen in the
-        /// race.
+    /// The IDLE pass: the lottery denied this clock's train-eval ticket, so the net does NOTHING —
+    /// no train batch, no forward/backward, no eval batch, no metrics row, no weight update, no RNG
     pub(crate) fn idle_step(&mut self, hash: &str, clock: usize) -> Result<()> {
         let state = self.state.net_mut(hash).ok_or_else(|| {
             crate::utils::error::EngineError::InvalidOptions(format!(
@@ -233,42 +195,20 @@ impl CoreEngine {
 
     // ── The train-eval lottery ──────────────────────────────────────────────
 
-        /// A net's MERIT under the lottery: its risk-adjusted score ITSELF — the same
-        /// `smt = μ ∓ λσ` the ranking decides on (`fit (A)` in the table), with no
-        /// division. The ticket therefore follows "which net is better", not "which net
-        /// bought the most per update": a net that has trained a hundred clocks and one
-        /// that has trained ten compete on their level, and the one that stalls loses its
-        /// share to whoever overtakes it.
-        ///
-        /// The old divisor was `D`, the weight updates it actually applied. That made the
-        /// lottery a rate, which had two consequences worth naming: a net could win
-        /// tickets forever off a single lucky early reading (few updates = big ratio), and
-        /// a net that kept IMPROVING was pushed out of the field by its own denominator.
-        /// `A/D` is still printed in the table as the efficiency of the clocks a net got;
-        /// it is no longer what the coin reads.
-        ///
-        /// `None` when there is no reading yet (a newborn, also inside its born shield).
+    /// A net's MERIT under the lottery: its risk-adjusted score ITSELF — the same `smt = μ ∓ λσ`
+    /// the ranking decides on (`fit (F)` in the table), with no division.
     pub(crate) fn merit(&self, hash: &str) -> Option<f32> {
         Self::merit_from(self.smoothed_fitness_of(hash))
     }
 
-        /// The merit a net's `score` implies — the ONE place the lottery's number is
-        /// defined, so a report that already holds the reading can derive it instead of
-        /// walking the window a second time.
-        ///
-        /// A non-finite score is no merit: ∞ / NaN must never set the field's bounds.
+    /// The merit a net's `score` implies — the ONE place the lottery's number is defined,
+    /// report that already holds the reading can derive it instead of walking the window a second
     pub(crate) fn merit_from(score: Option<f32>) -> Option<f32> {
         score.filter(|s| s.is_finite())
     }
 
-        /// The clock's lottery field: the best/worst merit among the nets the lottery
-        /// actually grades (live, non-crown, out of their born shield, with a ratio).
-        /// `None` when the lottery is off (`Ω = 0`), the field is not armed yet, or
-        /// nobody qualifies (no spread ⇒ abstain).
-        ///
-        /// The merits come from data the engine already carries — each net's K-reading
-        /// rolling window (`race_reading_of`) and its update count (`state.step`) —
-        /// so the field costs ONE walk per clock and no new per-step bookkeeping.
+    /// The clock's lottery field: the best/worst merit among the nets the lottery actually grades
+    /// (live, non-crown, out of their born shield, with a reading).
     pub(crate) fn lottery_frame(&self, clock: usize) -> Option<LotteryFrame> {
         if self.train_merit_omega() <= 0.0 || !self.lottery_armed(clock) {
             return None;
@@ -279,6 +219,7 @@ impl CoreEngine {
             crate::utils::fitness::Direction::Minimize => -m,
         };
         let (mut best, mut worst) = (f32::NEG_INFINITY, f32::INFINITY);
+        let (mut youngest, mut oldest) = (usize::MAX, 0usize);
         let mut any = false;
         for h in self.state.live_hashes() {
             if self.frozen_crown.contains(&h) || self.on_probation(&h, clock) {
@@ -288,30 +229,32 @@ impl CoreEngine {
                 let q = quality(m);
                 best = best.max(q);
                 worst = worst.min(q);
+                // The age bounds ride the SAME walk: the youth fraction is one more
+                // min-max over the field, not a second pass over the population.
+                if let Some(age) = self.lottery_age_of(&h, clock) {
+                    youngest = youngest.min(age);
+                    oldest = oldest.max(age);
+                }
                 any = true;
             }
         }
         if !any {
             return None;
         }
-        Some(LotteryFrame { best, worst })
+        let youngest = if youngest == usize::MAX { 0 } else { youngest };
+        Some(LotteryFrame {
+            best,
+            worst,
+            youngest,
+            oldest,
+        })
     }
 
-        /// Whether the lottery is ARMED yet.
-        ///
-        /// It stays disarmed until every net that started the race has served its born
-        /// shield (`on_probation`) — the opening clocks must compare like with like, so a
-        /// founder cannot be skipped before it has had the same chance as its peers.
-        /// Nets born LATER keep their own shield (`train_lottery_p` always trains them)
-        /// but do not re-disarm the field: otherwise a run with live mutation/crossover
-        /// would never reach a shield-free clock and the lottery would never engage.
-        /// Crossover, mutation and the elite rules are untouched by this: they operate as
-        /// before, the lottery only decides who gets this clock's train-eval ticket.
+    /// Whether the lottery is ARMED yet.
     fn lottery_armed(&self, clock: usize) -> bool {
         self.state.live_hashes().iter().all(|h| {
-            // Only the STARTING population gates the arming; `entered_at_step == 0` is
-            // the founder/seeded-batch contract (`NetState::new` stamps `step` as the
-            // entry step and the initial pool is built at clock 0).
+            // Only the STARTING population gates the arming; `entered_at_step == 0`
+            // founder/seeded-batch contract (`NetState::new` stamps `step` as the entry step
             match self.state.net(h) {
                 Some(s) if s.entered_at_step != 0 => true,
                 Some(_) => !self.on_probation(h, clock),
@@ -320,17 +263,8 @@ impl CoreEngine {
         })
     }
 
-        /// `p(ticket)` for this clock: the net's merit (its risk-adjusted score, `A`) as
-        /// a FRACTION of the clock's field — 1 = the best, 0 = the worst. `1.0` (always
-        /// train) for the crown, a net inside its born shield, a net with no ratio yet,
-        /// and a flat field (no spread = no signal, so the lottery abstains).
-        ///
-        /// This is the RAW fraction at `Ω = 1`. The coin, and every log line that
-        /// claims what it will do, read [`Self::train_lottery_p_eff`], which blends it
-        /// toward "always train" by Ω.
-    /// Test-only since the reports moved onto [`Self::train_lottery_p_from`]: the
-    /// lottery's tests assert on the UNBLENDED fraction (that is what `p = 0`/`p = 1`
-    /// mean in the field), and no production path wants the raw value any more.
+    /// `T` (the ticket chance) for this clock: the net's merit (its score, `F`) as a FRACTION
+    /// the clock's field — 1 = the best, 0 = the worst.
     #[cfg(test)]
     pub(crate) fn train_lottery_p(
         &self,
@@ -341,12 +275,7 @@ impl CoreEngine {
         self.train_lottery_p_from(hash, clock, frame, self.merit(hash))
     }
 
-        /// [`Self::train_lottery_p`] with the merit supplied by the caller.
-        ///
-        /// A report that already read the net's window passes its `A/D` numerator here
-        /// instead of letting the guards re-derive the same number. `None` means "no
-        /// merit" (no reading yet, or no ticket), which grades as `1.0` — the lottery
-        /// abstains rather than starving a net nobody measured.
+    /// [`Self::train_lottery_p`] with the merit supplied by the caller.
     pub(crate) fn train_lottery_p_from(
         &self,
         hash: &str,
@@ -360,49 +289,139 @@ impl CoreEngine {
         if self.frozen_crown.contains(hash) || self.on_probation(hash, clock) {
             return 1.0;
         }
-        let Some(mine) = merit else {
+        let Some((_, _, mix)) = self.train_lottery_parts(hash, clock, Some(frame), merit) else {
             return 1.0;
         };
-            // Higher-is-better scale: Maximize keeps the merit, Minimize negates it, so
-            // the SAME fraction means "closer to the best" in both directions.
-        let direction = self.fitness.direction();
-        let q = match direction {
+        mix
+    }
+
+    /// The lottery's THREE grading numbers for one net, derived in ONE place so the coin
+    /// table cannot use two different fractions: - `P` — the fitness PLACE: the net's merit between
+    pub(crate) fn train_lottery_parts(
+        &self,
+        hash: &str,
+        clock: usize,
+        frame: Option<LotteryFrame>,
+        merit: Option<f32>,
+    ) -> Option<(f32, f32, f32)> {
+        self.grade_lottery(hash, clock, frame, merit).ok()
+    }
+
+    /// WHY the lottery gave a net no chance — the gate a `—` in the ticket cell stands
+    pub(crate) fn lottery_abstain(
+        &self,
+        hash: &str,
+        clock: usize,
+        frame: Option<LotteryFrame>,
+        merit: Option<f32>,
+    ) -> Option<&'static str> {
+        self.grade_lottery(hash, clock, frame, merit).err()
+    }
+
+    /// [`Self::train_lottery_parts`] carrying the reason a grade was refused.
+    fn grade_lottery(
+        &self,
+        hash: &str,
+        clock: usize,
+        frame: Option<LotteryFrame>,
+        merit: Option<f32>,
+    ) -> std::result::Result<(f32, f32, f32), &'static str> {
+        let Some(frame) = frame else {
+            return Err("off");
+        };
+        if self.frozen_crown.contains(hash) {
+            return Err("crown");
+        }
+        if self.on_probation(hash, clock) {
+            return Err("shield");
+        }
+        let Some(mine) = merit else {
+            return Err("unread");
+        };
+        // Higher-is-better scale: Maximize keeps the merit, Minimize negates
+        // the SAME fraction means "closer to the best" in both directions.
+        let q = match self.fitness.direction() {
             crate::utils::fitness::Direction::Maximize => mine,
             crate::utils::fitness::Direction::Minimize => -mine,
         };
-        Self::merit_fraction(q, frame.best, frame.worst)
+        // The ABSTAIN rule, checked before either term: no signal in the field means everybody
+        // trains — blending youth into "no field" would invent a spread that does not exist.
+        if !q.is_finite()
+            || !frame.best.is_finite()
+            || !frame.worst.is_finite()
+            || frame.best <= frame.worst
+        {
+            return Err("flat");
+        }
+        let f = Self::merit_fraction_inverted(
+            q,
+            frame.best,
+            frame.worst,
+            self.config.train_merit_inverted,
+        );
+        let youth = self
+            .lottery_age_of(hash, clock)
+            .map(|age| Self::youth_fraction(age, frame.youngest, frame.oldest))
+            .unwrap_or(1.0);
+        // The age leg ARMS the product: OFF, nothing multiplies `Ym`, so the fraction is `Fm`
+        // itself — the pre-knob lottery, bit for bit.
+        let fraction = if self.train_age() { f * youth } else { f };
+        Ok((f, youth, fraction))
     }
 
-        /// The lottery's strength Ω (`set_run_train_merit`), clamped to `[0, 1]`.
-        ///
-        /// Ω scales what the lottery actually APPLIES — the withholding — never the
-        /// merit itself: `p_eff = 1 − Ω·(1 − p)`. Scaling the merits would cancel out,
-        /// because `p` is a min-max FRACTION of the field (`Ω·m ÷ Ω·best` = `m ÷ best`),
-        /// so only `Ω = 0` would change anything. This form keeps both endpoints exact
-        /// (`0` ⇒ `p_eff = 1` ⇒ no draws at all; `1` ⇒ the full merit weighting) and is
-        /// linear in between, λ-style, with the worst net keeping a standing `1 − Ω`
-        /// chance instead of the permanent `p = 0` starvation.
+    /// Whether the lottery's AGE leg is armed (`set_run_train_age`). `false` = the ticket
+    /// follows the fitness place alone.
+    pub(crate) fn train_age(&self) -> bool {
+        self.config.train_age
+    }
+
+    /// Clocks lived by a net, `1` on its birth clock — the age the youth fraction
+    /// ranks on, and the same age the stop table's `age (A)` column prints.
+    pub(crate) fn lottery_age_of(&self, hash: &str, clock: usize) -> Option<usize> {
+        self.state
+            .net(hash)
+            .map(|s| clock.saturating_sub(s.entered_at_step) + 1)
+    }
+
+    /// The YOUTH fraction: `1.0` at the youngest net in the field, `0.0` at the oldest.
+    pub(crate) fn youth_fraction(age: usize, youngest: usize, oldest: usize) -> f32 {
+        if oldest <= youngest {
+            return 1.0;
+        }
+        let span = (oldest - youngest) as f32;
+        1.0 - (age.saturating_sub(youngest) as f32 / span).clamp(0.0, 1.0)
+    }
+
+    /// The lottery's strength Ω (`set_run_train_merit`), clamped to `[0, 1]`.
     pub(crate) fn train_merit_omega(&self) -> f32 {
         self.config.train_merit.clamp(0.0, 1.0)
     }
 
-        /// The lottery's merit floor `p_min` (`set_run_train_merit_p_min`), clamped to
-        /// `[0, 1]`.
-        ///
-        /// Applied to the field FRACTION, under Ω: `p = p_min + (1 − p_min)·f`, then
-        /// `p_eff = 1 − Ω·(1 − p)`. Bottom-only by construction — at `p_min = 0.05` the
-        /// worst net keeps 5% of its clocks while a mid-field net moves by `0.95·f`
-        /// only, so the lift costs almost nothing and the relative spread survives.
-        /// Unlike Ω it does not touch the best net at all.
+    /// The lottery's merit floor `p_min` (`set_run_train_merit_p_min`), clamped to `[0, 1]`.
     pub(crate) fn train_merit_p_min(&self) -> f32 {
         self.config.train_merit_p_min.clamp(0.0, 1.0)
     }
 
-        /// [`Self::train_lottery_p`] with the clock's Ω blend applied — the number the
-        /// coin actually compares against, and the one the logs print.
-        ///
-        /// `Ω = 0` returns `1.0` for everyone without consulting the field, i.e. the
-        /// lottery is fully off and the engine works on the metric alone.
+    /// The lottery's ceiling `p_max` (`set_run_train_merit_p_max`), clamped to `[p_min, 1]`.
+    pub(crate) fn train_merit_p_max(&self) -> f32 {
+        self.config
+            .train_merit_p_max
+            .clamp(0.0, 1.0)
+            .max(self.train_merit_p_min())
+    }
+
+    /// Which END of the field earns the tickets, in one word — the manifest, the debug card
+    /// per-clock lottery line all print it, so a reader never has to translate an ordering out
+    pub(crate) fn lottery_tilt(&self) -> &'static str {
+        if self.config.train_merit_inverted {
+            "worst-first"
+        } else {
+            "best-first"
+        }
+    }
+
+    /// [`Self::train_lottery_p`] with the clock's Ω blend applied — the number the coin actually
+    /// compares against, and the one the logs print.
     pub(crate) fn train_lottery_p_eff(
         &self,
         hash: &str,
@@ -412,9 +431,8 @@ impl CoreEngine {
         self.train_lottery_p_eff_from(hash, clock, frame, self.merit(hash))
     }
 
-        /// [`Self::train_lottery_p_eff`] with the merit supplied by the caller — the form
-        /// every report uses, so the `p` it prints and the coin the step draws cannot be
-        /// computed from two different merits.
+    /// [`Self::train_lottery_p_eff`] with the merit supplied by the caller — the form every report
+    /// uses, so the `p` it prints and the coin the step draws cannot be computed from two different
     pub(crate) fn train_lottery_p_eff_from(
         &self,
         hash: &str,
@@ -422,30 +440,15 @@ impl CoreEngine {
         frame: Option<LotteryFrame>,
         merit: Option<f32>,
     ) -> f32 {
+        let fraction = self.train_lottery_p_from(hash, clock, frame, merit);
+        // TWO ENDS, one affine step.
         let omega = self.train_merit_omega();
-        let floor = self.train_merit_p_min();
-        let p = self.train_lottery_p_from(hash, clock, frame, merit);
-        // Floor the FRACTION first, then blend by Ω: `p_min` is a bottom-only lift, so
-        // only the nets that would have graded under it move, and Ω = 0 still means
-        // "everybody trains" (1 − 0·(…) = 1).
-        let p = floor + (1.0 - floor) * p;
-        1.0 - omega * (1.0 - p)
+        let lo = 1.0 - omega * (1.0 - self.train_merit_p_min());
+        let hi = 1.0 - omega * (1.0 - self.train_merit_p_max());
+        lo + (hi - lo) * fraction
     }
 
-        /// The lottery's coin: did this net EARN a train-eval ticket this clock?
-        ///
-        /// A ticket is the whole step — weight update AND the measurement that follows
-        /// it — because every trainer runs the two inside one `train_step` call. A `true`
-        /// means train + eval; a `false` means idle (neither), never "eval only".
-        ///
-        /// Deterministic in `(run_seed, clock, hash)` — never the loop order and never a
-        /// shared RNG — so a resume replays exactly the same decisions, and a reordered
-        /// population cannot change who trained. Off (or `p = 1`) returns `true` without
-        /// consuming a draw.
-        ///
-        /// Test-only since the step captures `p` first and calls
-        /// [`Self::train_lottery_draws_at`] with it — the table then prints the number
-        /// the coin actually used — so no production path needs the wrapper any more.
+    /// The lottery's coin: did this net EARN a train-eval ticket this clock?
     #[cfg(test)]
     pub(crate) fn train_lottery_draws(
         &self,
@@ -456,12 +459,7 @@ impl CoreEngine {
         self.train_lottery_draws_at(hash, clock, self.train_lottery_p_eff(hash, clock, frame))
     }
 
-        /// The coin itself, given the probability a caller already computed.
-        ///
-        /// The draw is a pure function of `(run seed, clock, hash)` — no shared state, no
-        /// consumption — so asking it twice returns the answer the step will act on. That
-        /// is what lets the pre-step card print `ticket? yes/no` without a second merit
-        /// read: it passes the same `p` the engine loop will use.
+    /// The coin itself, given the probability a caller already computed.
     pub(crate) fn train_lottery_draws_at(&self, hash: &str, clock: usize, p: f32) -> bool {
         if p >= 1.0 {
             return true;
@@ -474,25 +472,21 @@ impl CoreEngine {
         fastrand::Rng::with_seed(seed).f32() < p
     }
 
-    /// Map a merit onto `[0, 1]` against the population's own spread, on a
-    /// higher-is-better scale: `1.0` = the best level-per-ticket, `0.0` = the worst.
-    ///
-    /// A flat population (`best <= worst`) has no signal, and a non-finite merit
-    /// (NaN/∞) cannot be graded — both return `1.0`, i.e. the lottery abstains and
-    /// the net trains, rather than silently starving a net on bad data.
-    ///
-    /// Why min-max rather than `merit / best`: this form is bounded for BOTH
-    /// directions and for negative readings (a Minimize loss, a shaped reward), and it
-    /// needs no divide-by-zero guard. The cost is that the current worst net gets
-    /// exactly 0 — self-correcting, because an idle net's update count stays put while
-    /// every trained peer's grows, so its ratio climbs back into the field. Ω also puts
-    /// a standing floor under it: the coin sees `1 − Ω·(1 − 0) = 1 − Ω`, so the worst
-    /// net still runs a share of clocks unless Ω is 1.
+    /// Map a merit onto `[0, 1]` against the population's own spread, on a higher-is-better scale:
+    /// `1.0` = the best score, `0.0` = the worst.
+    #[cfg(test)]
     pub(crate) fn merit_fraction(q: f32, best: f32, worst: f32) -> f32 {
+        Self::merit_fraction_inverted(q, best, worst, false)
+    }
+
+    /// [`Self::merit_fraction`] with the ordering tilt: `inverted` grades the WORST merit `1.0`
+    /// the best `0.0` (the `set_run_train_merit_inverted` flag, i.e.
+    pub(crate) fn merit_fraction_inverted(q: f32, best: f32, worst: f32, inverted: bool) -> f32 {
         if !q.is_finite() || !best.is_finite() || !worst.is_finite() || best <= worst {
             return 1.0;
         }
-        ((q - worst) / (best - worst)).clamp(0.0, 1.0)
+        let f = ((q - worst) / (best - worst)).clamp(0.0, 1.0);
+        if inverted { 1.0 - f } else { f }
     }
 
     /// The normal group step: drive one trainer step through the net's REAL
@@ -512,8 +506,8 @@ impl CoreEngine {
         Ok(report)
     }
 
-        /// Drive one trainer step for net `hash` at `clock` through the given
-        /// optimizer — shared by the group step and the act-and-measure freeze pass.
+    /// Drive one trainer step for net `hash` at `clock` through the given
+    /// optimizer — shared by the group step and the act-and-measure freeze pass.
     fn run_trainer_step(
         &mut self,
         hash: &str,
@@ -542,8 +536,8 @@ impl CoreEngine {
                 "race: net {hash} not live (no Network in memory)"
             ))
         })?;
-            // Seed BOTH RNGs for this (net, step) before the trainer runs (fastrand +
-            // libtorch), or dropout masks differ on replay and resume parity breaks.
+        // Seed BOTH RNGs for this (net, step) before the trainer runs (fastrand +
+        // libtorch), or dropout masks differ on replay and resume parity breaks.
         crate::utils::race_steps::seed_step_randomness(net_seed, clock as u64, 0);
         let report = self.trainer.train_step(
             net,
@@ -558,8 +552,8 @@ impl CoreEngine {
                 data: run_data.as_ref(),
             },
         )?;
-            // Debug-only probe: re-score the net on the eval batch and check the
-            // report's loss — catches a stale/fabricated report. Free in release.
+        // Debug-only probe: re-score the net on the eval batch and check
+        // report's loss — catches a stale/fabricated report. Free in release.
         #[cfg(debug_assertions)]
         // Tabular-only: the probe needs an eval batch + a computed fitness
         // scorer. RL mode has neither (reported fitness, no dataset).
@@ -585,8 +579,8 @@ impl CoreEngine {
                 }
             }
         }
-            // RL volume: the trainer's reported env work accumulates across the group
-            // so the rollup shows the step's real workload.
+        // RL volume: the trainer's reported env work accumulates across the group
+        // so the rollup shows the step's real workload.
         if let Some(rl) = report.rl {
             self.step_rl.nets += 1;
             self.step_rl.matches += rl.matches;

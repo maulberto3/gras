@@ -5,7 +5,7 @@
 //! means, and neither notices that the population has collapsed onto one blueprint.
 //! This module measures that directly.
 //!
-//! **The metric is STRUCTURAL and deterministic.** A net becomes a multiset of
+//! **The metric is STRUCTURAL and deterministic.** A net becomes a multiset
 //! genes — one token per node (`N:<kind>:<combine>:<std>:<activation>:<width>`), one
 //! per output port (the activation that port emits), one per Input port's
 //! feature-mask width, and one per WIRE (`E:<from_kind>><to_kind>`) — and two nets
@@ -15,22 +15,22 @@
 //! Δ(a, b) = 1 − (Σ min(a_t, b_t)) / (Σ max(a_t, b_t))      // 0 = identical, 1 = disjoint
 //! ```
 //!
-//! **No matrix is materialised.** Δ is symmetric, so only the upper triangle is
-//! walked (`i < j`) — one pair at a time, `O(1)` memory beyond the genome set — and
-//! the pair count is therefore `n(n−1)/2` (a 100-net population is 4,950 pairs, not
+//! **No matrix is materialised.** Δ is symmetric, so only the upper triangle
+//! walked (`i < j`) — one pair at a time, `O(1)` memory beyond the genome set —
+//! the pair count is therefore `n(n−1)/2` (a 100-net population is 4,950 pairs,
 //! 10,000).
 //!
-//! `mean pairwise Δ` is the mean of that distance over pairs of live nets, so it
-//! starts high (founders share only the Input/Output skeleton) and falls as
+//! `mean pairwise Δ` is the mean of that distance over pairs of live nets,
+//! starts high (founders share only the Input/Output skeleton) and falls
 //! crossover and selection homogenise the population. `distinct` is the blunter
-//! companion number: how many byte-different blueprints are alive at all.
+//! companion number: how many byte-different blueprints are alive
 //!
 //! **The census is the shape reading.** `nodes`, `wires` and `dim` carry each
 //! trait's mean AND its spread across the live nets, because a collapsing
-//! population keeps its mean while the spread falls to zero: the mean says what the
+//! population keeps its mean while the spread falls to zero: the mean says what
 //! population looks like, the spread says whether it still varies.
 //!
-//! **What it is not.** A PROXY for behavioural convergence: two nets can share every
+//! **What it is not.** A PROXY for behavioural convergence: two nets can share
 //! gene and still hold different weights, and two differently-wired nets can compute
 //! nearly the same policy. The engine never runs the environment (the trainer owns
 //! it), so a behavioural number — action agreement on a probe set, say — belongs
@@ -41,7 +41,7 @@ use crate::graph::topology::Topology;
 use crate::state::RaceState;
 use std::collections::{HashMap, HashSet};
 
-/// One reading of population diversity (`log_diversity` renders it).
+/// One reading of population diversity (`log_diversity` renders
 pub(crate) struct DiversityReport {
     /// Live nets in the population.
     pub live: usize,
@@ -62,15 +62,11 @@ pub(crate) struct DiversityReport {
 }
 
 /// One structural trait's population reading: its mean and its spread.
-///
-/// `spread` is the POPULATION std (divide by `n`, not `n − 1`): the live nets are the
-/// population itself, not a draw from a larger one. A collapse reads as `spread → 0`
-/// while `mean` barely moves, which is why both are printed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Trait {
     /// The trait's mean across the live nets.
     pub mean: f32,
-    /// The trait's population std — how much the nets still differ on it.
+    /// The trait's population std — how much the nets still differ
     pub spread: f32,
 }
 
@@ -98,12 +94,8 @@ pub(crate) fn trait_of(values: &[f32]) -> Trait {
     }
 }
 
-/// One net's structural reading: the gene multiset the pair metric uses, plus the
-/// census legs it was read from. Built in ONE pass over the blueprint.
-///
-/// `Clone` because the stop card needs one net's shape in two shapes — as a
-/// `Δpop` entry and as a `Δcrown` anchor — and cloning a parse is far cheaper than
-/// parsing the same blueprint twice.
+/// One net's structural reading: the gene multiset the pair metric uses, plus the census legs
+/// was read
 #[derive(Clone)]
 pub(crate) struct NetShape {
     /// The net's genes — exactly what [`delta`] compares.
@@ -117,10 +109,6 @@ pub(crate) struct NetShape {
 }
 
 /// Read one net's structure: the pair metric's genes plus the census legs.
-///
-/// Costs one blueprint parse and one token build — the same work the population
-/// census does per net, so a caller that already has the `Topology` pays nothing
-/// extra for the shape.
 pub(crate) fn shape_of(topo: &Topology) -> NetShape {
     let hidden: Vec<f32> = topo
         .nodes
@@ -136,18 +124,8 @@ pub(crate) fn shape_of(topo: &Topology) -> NetShape {
     }
 }
 
-/// Mean Δ from ONE net to a set of reference nets: `0.0` means the net is
-/// structurally identical to every reference, `1.0` that it shares nothing with any
-/// of them.
-///
-/// The reference is any iterator of shapes, not a slice, so a caller can measure to
-/// a SUBSET without materialising one: the stop-time elite card compares a champion
-/// to the OTHER champions (never to itself, which would print a meaningless `0.00`),
-/// while the straggler card compares to all of them — one function, one arithmetic.
-///
-/// `None` when there is no reference to measure against — a run whose elite set is
-/// empty (or whose blueprints would not parse) must print `—`, never `0.0`, which
-/// would read as "identical to the champions".
+/// Mean Δ from ONE net to a set of reference nets: `0.0` means the net is structurally identical
+/// every reference, `1.0` that it shares nothing with any of them.
 pub(crate) fn mean_delta_to<'a, I>(shape: &NetShape, reference: I) -> Option<f32>
 where
     I: IntoIterator<Item = &'a NetShape>,
@@ -164,9 +142,8 @@ where
     Some(sum / n as f32)
 }
 
-/// Below this many live nets every pair is compared exactly (`n(n−1)/2` pairs: 100
-/// nets = 4,950, 512 nets = 130,776). Above it the pairs are SAMPLED, because the
-/// count grows quadratically and the line prints every `checkpoint_every` clocks.
+/// Below this many live nets every pair is compared exactly (`n(n−1)/2` pairs: 100 nets = 4,950,
+/// 512 nets = 130,776).
 const ALL_PAIRS_UP_TO: usize = 512;
 /// Pairs drawn when sampling (enough to move slowly, cheap enough for every clock).
 const SAMPLED_PAIRS: usize = 4096;
@@ -176,12 +153,8 @@ pub(crate) fn genes(topo: &Topology) -> HashMap<String, usize> {
     let mut out: HashMap<String, usize> = HashMap::new();
     let mut bump = |token: String| *out.entry(token).or_insert(0) += 1;
     for node in &topo.nodes {
-        // Effective ops, resolved exactly as the forward pass resolves them
-        // (`network.rs`: no per-node override ⇒ `Add` / no standardisation), so two
-        // nets that express the same thing two ways read as equal. That means the
-        // standardize leg too: `None` and `Some(Identity)` are one architecture (both
-        // run no standardisation), so they must be one gene — the raw `Option` would
-        // have made a spelling-only mutation look like a structural change.
+        // Effective ops, resolved exactly as the forward pass resolves them (`network.rs`: no
+        // per-node override ⇒ `Add` / no standardisation), so two nets that express the same thing
         let combine = node.combine_op.unwrap_or(CombineOp::Add);
         let std = node.standardize.unwrap_or(StandardizeOp::Identity);
         bump(format!(
@@ -203,15 +176,15 @@ pub(crate) fn genes(topo: &Topology) -> HashMap<String, usize> {
         // The feature split is genome too: how many features each Input port keeps.
         if let Some(masks) = &node.feature_masks {
             for mask in masks {
-                bump(format!("M:{}", mask.iter().filter(|kept| **kept != 0).count()));
+                bump(format!(
+                    "M:{}",
+                    mask.iter().filter(|kept| **kept != 0).count()
+                ));
             }
         }
     }
-    // WIRES ARE GENOME TOO, one token per connection — keyed by the KINDS it joins,
-    // never by node id: crossover and mutation renumber nodes, so the same graph with
-    // two ids swapped must read as the same gene. The COUNT is the shape reading, so a
-    // skip connection is one `E:Input>Output` and a three-way fan-in is `E:Hidden>Hidden
-    // ×3`; a net that re-routes a wire now differs from one that only re-spells a node.
+    // WIRES ARE GENOME TOO, one token per connection — keyed by the KINDS it joins, never by node
+    // id: crossover and mutation renumber nodes, so the same graph with two ids swapped must read
     let kinds: HashMap<usize, NodeKind> = topo.nodes.iter().map(|n| (n.id, n.kind)).collect();
     for conn in &topo.connections {
         if let (Some(from), Some(to)) = (kinds.get(&conn.from.node), kinds.get(&conn.to.node)) {
@@ -257,8 +230,8 @@ pub(crate) fn measure(state: &RaceState, run_seed: u64, clock: usize) -> Option<
     for hash in &hashes {
         let Some(net) = state.net(hash) else { continue };
         blueprints.insert(net.topology.as_str());
-        // A blueprint that will not parse is a bug, not a reason to fail a run: the
-        // net simply does not enter the comparison (`live` still counts it).
+        // A blueprint that will not parse is a bug, not a reason to fail a run:
+        // net simply does not enter the comparison (`live` still counts
         if let Ok(topo) = net.topology() {
             node_counts.push(topo.nodes.len() as f32);
             wire_counts.push(topo.connections.len() as f32);
@@ -274,7 +247,7 @@ pub(crate) fn measure(state: &RaceState, run_seed: u64, clock: usize) -> Option<
     if genomes.len() < 2 {
         return None;
     }
-    // Pairs: every pair for a small population, a SEEDED sample above the cap — the
+    // Pairs: every pair for a small population, a SEEDED sample above the cap —
     // seed depends on `(run_seed, clock)`, so a replay sees the same pairs.
     let mut rng = fastrand::Rng::with_seed(run_seed.wrapping_add(clock as u64));
     let mut pairs = 0usize;
@@ -338,7 +311,11 @@ mod tests {
     fn one_missing_gene_out_of_n_is_one_over_n() {
         let a = genome(&[("W:Tanh", 3), ("W:SiLU", 1)]);
         let b = genome(&[("W:Tanh", 3)]);
-        assert!((delta(&a, &b) - 0.25).abs() < 1e-6, "Δ = 1/|A|, got {}", delta(&a, &b));
+        assert!(
+            (delta(&a, &b) - 0.25).abs() < 1e-6,
+            "Δ = 1/|A|, got {}",
+            delta(&a, &b)
+        );
     }
 
     #[test]
@@ -465,9 +442,8 @@ mod tests {
         assert_eq!(mixed, Some(0.5), "the two legs average, got {mixed:?}");
     }
 
-    /// `None` and `Some(Identity)` are spelled differently and mean the same thing
-    /// (`network.rs`: `None` ⇒ no standardisation). One architecture must be one
-    /// genome, or a spelling-only mutation would read as a structural change.
+    /// `None` and `Some(Identity)` are spelled differently and mean the same thing (`network.rs`:
+    /// `None` ⇒ no standardisation).
     #[test]
     fn a_missing_standardize_op_is_the_identity_gene() {
         let cfg = crate::engine::config::RaceConfig::defaults();
@@ -531,6 +507,10 @@ mod tests {
         // Same token set, different multiplicity: multiset Jaccard still separates them.
         let a = genome(&[("W:Tanh", 1)]);
         let b = genome(&[("W:Tanh", 3)]);
-        assert!((delta(&a, &b) - 2.0 / 3.0).abs() < 1e-6, "Δ = 1 − 1/3, got {}", delta(&a, &b));
+        assert!(
+            (delta(&a, &b) - 2.0 / 3.0).abs() < 1e-6,
+            "Δ = 1 − 1/3, got {}",
+            delta(&a, &b)
+        );
     }
 }

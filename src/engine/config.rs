@@ -1,10 +1,9 @@
-//! The step-race knob surface: `RaceConfig`, `StopReason`, the pluggable
-//! stop closure alias, the read-only `RaceSnapshot`, and the run-level
-//! context stamped into every net's `meta` block (`RunMetaCtx`).
+//! The step-race knob surface: `RaceConfig`, `StopReason`, the pluggable stop closure alias,
+//! read-only `RaceSnapshot`, and the run-level context stamped into every net's `meta` block
 
-use crate::utils::fitness::Metric;
-use crate::graph::topology::FeatureSplitPolicy;
 use crate::evolution::selection::SelectionMethod;
+use crate::graph::topology::FeatureSplitPolicy;
+use crate::utils::fitness::Metric;
 
 /// What the scheduler checks to decide whether to stop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,82 +13,155 @@ pub enum StopReason {
     /// A user-supplied `custom_stop` closure returned true (Iter 5 pluggable
     /// contract; consulted after all built-ins).
     CustomStop,
-        /// Ctrl+C received: the step was abandoned at the loop boundary and the race shut
-        /// down through the SAME artifact path. Always on.
+    /// Ctrl+C received: the step was abandoned at the loop boundary and the race shut
+    /// down through the SAME artifact path. Always
     Interrupted,
 }
 
 // ── Consolidated defaults (one place for all engine constants) ────────────────────
 
-/// Per-net smoothed-fitness rolling window (K) — the span every ranking
-/// decision averages over.
-pub const SMOOTHING_WINDOW: usize = 10;
+/// Per-net smoothed-fitness rolling window (K) — the span every ranking decision averages over.
+pub const SMOOTHING_WINDOW: usize = 5;
 
-/// Default risk aversion (λ, FIT): how many window standard deviations a net is
-/// charged for its own spread. `1.0` = "credit the net only with the value it is
-/// still expected to beat after one window of bad luck"; `0.0` = rank on the
-/// plain window mean (the pre-FIT behavior).
-pub const RISK_AVERSION: f32 = 1.0;
+/// Default risk aversion (λ, FIT): how many window standard deviations a net is charged for its own
+/// spread.
+pub const RISK_AVERSION: f32 = 0.5;
 
-/// Steps between population checkpoints — the cadence the stream's era rotation
-/// and the CSV flush key off. `0` is a legal value meaning "no tick" (see
-/// [`RaceConfigBuilder::set_run_checkpoint_every`]); this is the default when unset.
-pub const DEFAULT_CHECKPOINT_EVERY: usize = 10;
+/// Default recency ramp r for the smoothing window: `0.0` = the plain arithmetic mean every run
+/// before this knob used.
+pub const DEFAULT_WINDOW_RECENCY: f32 = 0.0;
 
-/// Default merit floor `p_min`: the smallest share of clocks the WORST net in the
-/// lottery's field still gets. `0.05` — enough that a net graded `p = 0` can still
-/// move its own merit (5 clocks in 100), cheap enough that it never becomes the
-/// "train everybody" path `Ω` would be.
+/// How the smoothing window's readings are averaged into the ranking centre (`set_run_mean_type`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MeanType {
+    /// The weighted window mean — the plain average, and the default.
+    #[default]
+    Arithmetic,
+    /// `g(x) = sign(x)·ln(1 + |x|)`: centre and spread are taken in that compressed space
+    /// score is mapped back, so one spike cannot dominate the window the way it does through
+    SignedLog,
+    /// The WEIGHTED MEDIAN: no single reading can move the centre at all; the spread is the medians
+    /// absolute deviation scaled by `1.4826`, so λ still reads in std-like units.
+    Median,
+}
+
+impl MeanType {
+    /// The spelling `engine.json` records and the log prints.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MeanType::Arithmetic => "arithmetic",
+            MeanType::SignedLog => "signed_log",
+            MeanType::Median => "median",
+        }
+    }
+
+    /// Parse a recorded spelling. Unknown (and `""` from a header written before
+    /// knob) yields `None`, which every caller reads as the arithmetic default.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "arithmetic" | "mean" | "simple" | "average" => Some(MeanType::Arithmetic),
+            "signed_log" | "signedlog" | "signed-log" | "log1p" => Some(MeanType::SignedLog),
+            "median" => Some(MeanType::Median),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for MeanType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Default [`MeanType`] — the arithmetic mean, i.e. the ranking every run before
+/// knob used.
+pub const DEFAULT_MEAN_TYPE: MeanType = MeanType::Arithmetic;
+
+/// Default lottery strength Ω (`set_run_train_merit`): how much of a clock's TRAIN-EVAL budget
+/// merit ordering decides.
+pub const DEFAULT_TRAIN_MERIT: f32 = 0.75;
+
+/// Default lottery ORDERING (`set_run_train_merit_inverted`): `true` = the LEAST fit net earns
+/// MOST tickets, i.e.
+pub const DEFAULT_TRAIN_MERIT_INVERTED: bool = true;
+
+/// Default for the lottery's AGE leg (`set_run_train_age`): `true` = ARMED, so the graded fraction
+/// is the PRODUCT `Fm × Ym` (the min-max fitness place times the youth fraction, `1`
+pub const DEFAULT_TRAIN_AGE: bool = true;
+
+/// Steps between population checkpoints — the cadence the stream's era rotation and the CSV flush
+/// key off.
+pub const DEFAULT_CHECKPOINT_EVERY: usize = 20;
+
+/// Default population size: `10`, deliberately conservative.
+pub const DEFAULT_POP_SIZE: usize = 10;
+
+/// Default step budget, read at the same conservative scale as the population: `10` clocks.
+pub const DEFAULT_MAX_STEPS: usize = 10;
+
+/// Default rolls offered per step on each channel: the cartpole reference's two draws
+/// clock, on the crossover channel and on the mutation channel alike.
+pub const DEFAULT_CROSSOVER_ROLLS: usize = 2;
+pub const DEFAULT_MUTATE_ROLLS: usize = 2;
+
+/// Default share of an evolution attempt that fires: the cartpole reference's values.
+pub const DEFAULT_CROSSOVER_PROB: f32 = 0.5;
+pub const DEFAULT_MUTATE_PROB: f32 = 0.2;
+
+/// Default elite guard: the reference's `pop / 10`, read at the conservative default population
+/// 10 — one seat.
+pub const DEFAULT_ELITE_COUNT: usize = 1;
+
+/// Default clocks a net must have lived before it may take an elite seat: `5`, the guarded value.
+pub const DEFAULT_ELITE_JOIN_PROBATION: usize = 5;
+
+/// Default clocks a crown seat may sit at peak: `5`, the guarded value (a seated net
+/// rotates out on its term). The cartpole reference disarms the term (`0`).
+pub const DEFAULT_CROWN_LIFETIME: usize = 5;
+
+/// Default hidden-width sampling range: the cartpole reference's `16..=64`,
+/// stride [`RaceConfig::defaults`] pins.
+pub const DEFAULT_HIDDEN_POOL: std::ops::RangeInclusive<usize> = 16..=64;
+
+/// Default merit floor `p_min`: the smallest share of clocks the WORST net in the lottery's field
+/// still gets.
 pub const DEFAULT_TRAIN_MERIT_P_MIN: f32 = 0.05;
+/// Default lottery CEILING `p_max`: the largest share of clocks the best-graded net may take.
+pub const DEFAULT_TRAIN_MERIT_P_MAX: f32 = 0.4;
 
-/// Default share of the dataset held out for EVAL (`eval_share`): how much of the
-/// rows the race RANKS on and never trains on. `0.2` = 80/20, the ratio every run
-/// before 2026-11-01 used as a hardcoded constant.
-///
-/// The name is the EVAL side on purpose. The artifact key it lands in
-/// (`engine.json → train_eval_split_ratio`) predates it and reads as a train
-/// share, which is exactly how the checkpointed header once recorded the WRONG
-/// side (it wrote the stream's train share into the eval field). One word here,
-/// one meaning: `eval_share`.
+/// Default share of the dataset held out for EVAL (`eval_share`): how much of the rows the race
+/// RANKS on and never trains
 pub const DEFAULT_EVAL_SHARE: f32 = 0.2;
 
-/// The narrowest and widest `eval_share` a run accepts. Below 1% the eval pool can
-/// round to zero rows (which `split_indices` fills back with the whole dataset — a
-/// silent 100% eval), and above 90% the train pool gets too thin to learn from.
+/// The narrowest and widest `eval_share` a run accepts.
 pub const EVAL_SHARE_MIN: f32 = 0.01;
 pub const EVAL_SHARE_MAX: f32 = 0.9;
 
-/// Default chance that ONE inherited drift slot moves on a crossover child
-/// (`set_topology_drift`): a mask bit flips, or a hidden node's activation / combine /
-/// standardize is re-drawn from its pool, or the net's `dropout_prob` is re-drawn in
-/// `0.0..=cap`. `0.0` = pure inheritance: a child's genes are its parents' genes, and the
-/// search only gets new alleles from a fresh immigrant. That is the behaviour every run
-/// before 2026-11-02 had, so the default is bit-for-bit compatible.
-pub const DEFAULT_TOPOLOGY_DRIFT: f32 = 0.0;
+/// Default chance that ONE inherited drift slot moves on a crossover child (`set_topology_drift`):
+/// a mask bit flips, or a hidden node's activation / combine / standardize is re-drawn
+pub const DEFAULT_TOPOLOGY_DRIFT: f32 = 0.1;
 
-// `DEFAULT_LR` moved to `crate::utils::training`: a training scheme reads it
-// (the reference trainer and the example both do), so it belongs below both
-// layers rather than in the engine's config surface.
-
+// `DEFAULT_LR` moved to `crate::utils::training`: a training scheme reads it (the reference trainer
+// and the example both do), so it belongs below both layers rather than in the engine's config
 
 /// Per-step log verbosity for the race engine.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LogLevel {
-        /// Silent per step: only the run start line and final stop reason print — the
-        /// fastest I/O path for users who parse `engine.json`.
+    /// Silent per step: only the run start line and final stop reason print —
+    /// fastest I/O path for users who parse `engine.json`.
     None,
     /// One compact line per step: pop size, loss range+mean, fitness range+mean,
     /// plus a short evolve note on the same line when crossover/mutation fires.
     #[default]
     Summ,
-        /// A boxed table per step (from step 2): rollup stats with deltas, evolve counters,
-        /// and the current best net. No per-net detail, no separate rollup line.
+    /// A boxed table per step (from step 2): rollup stats with deltas, evolve counters,
+    /// and the current best net. No per-net detail, no separate rollup line.
     Minimal,
 }
 
 impl LogLevel {
-        /// Parse the engine's own level name (`none`/`summ`/`minimal`, case-insensitive) —
-        /// the vocabulary of the examples' `--log-level` flag.
+    /// Parse the engine's own level name (`none`/`summ`/`minimal`, case-insensitive) —
+    /// the vocabulary of the examples' `--log-level` flag.
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "none" | "off" | "silent" => Some(LogLevel::None),
@@ -99,8 +171,8 @@ impl LogLevel {
         }
     }
 
-        /// Parse a CLI log level into the pair `logging::init` takes: the engine's reporting
-        /// SHAPE plus an optional tracing verbosity (`--log-level debug` keeps Summ's detail).
+    /// Parse a CLI log level into the pair `logging::init` takes: the engine's reporting
+    /// SHAPE plus an optional tracing verbosity (`--log-level debug` keeps Summ's detail).
     pub fn parse_verbose(raw: &str) -> Option<(Self, Option<&'static str>)> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "debug" => Some((LogLevel::Summ, Some("debug"))),
@@ -109,12 +181,8 @@ impl LogLevel {
         }
     }
 
-        /// The `tracing` verbosity the console layer is built with: `Summ` prints the
-        /// engine's `info!` lines; `Minimal`/`None` mute them (`warn`) — the framed vitals
-        /// table rides its own target, so it renders at `Minimal` regardless.
-        ///
-        /// This is the ONLY filter (see `logging::init`): `RUST_LOG` is deliberately not
-        /// consulted, so the level the caller asked for is the level the run gets.
+    /// The `tracing` verbosity the console layer is built with: `Summ` prints the engine's `info!`
+    /// lines; `Minimal`/`None` mute them (`warn`) — the framed vitals table rides its own target,
     pub fn env_filter(self) -> &'static str {
         match self {
             LogLevel::Summ => "info",
@@ -123,17 +191,20 @@ impl LogLevel {
     }
 }
 
-    /// Who gets evicted when a crossover child takes a slot.
-    /// **Crossover-only** — the mutation channel has its own policy.
+/// Who gets evicted when a crossover child takes a slot.
+/// **Crossover-only** — the mutation channel has its own policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CrossCullPolicy {
-        /// **Worst** (default) — evict the current worst net by smoothed fitness; strictly
-        /// merit-based. Risk: the population can ossify around one lineage.
-    #[default]
+    /// **Worst** — evict the current worst net by smoothed fitness; strictly
+    /// merit-based. Risk: the population can ossify around one lineage.
     Worst,
-        /// **Random** — evict a uniformly random live net; keeps slots turning over and
-        /// prevents a long-lived leader from starving diversity. Risk: losing a strong net.
+    /// **Random** — evict a uniformly random live net; keeps slots turning over
+    /// prevents a long-lived leader from starving diversity. Risk: losing a strong net.
     Random,
+    /// **Unfed** (default) — evict the net with the least claim on the grid: the lowest **merit**
+    /// `Fm × Ym`, the fitness place in the MERIT ordering (best = 1) times the youth fraction
+    #[default]
+    Unfed,
 }
 
 impl std::fmt::Display for CrossCullPolicy {
@@ -143,42 +214,44 @@ impl std::fmt::Display for CrossCullPolicy {
         f.write_str(match self {
             Self::Worst => "worst",
             Self::Random => "random",
+            Self::Unfed => "unfed",
         })
     }
 }
 
-    /// Who gets evicted when a MUTATION roll inserts a fresh random immigrant.
-    /// **Mutation-only** — the crossover channel has its own policy.
+/// Who gets evicted when a MUTATION roll inserts a fresh random immigrant.
+/// **Mutation-only** — the crossover channel has its own policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MutationCullPolicy {
-        /// **Worst** (default) — evict the worst net by smoothed fitness, deterministically
-        /// (mirrors [`CrossCullPolicy::Worst`]; this is what `RaceConfig::defaults()`
-        /// and the recorded-run legacy default mean).
-    #[default]
+    /// **Worst** — evict the worst net by smoothed fitness, deterministically (mirrors
+    /// [`CrossCullPolicy::Worst`]).
     Worst,
-        /// **InverseFitness** — a fitness-inverse roulette over non-elite nets (an opt-in:
-        /// the worst net weighs most, the best is never drawn; chance is kept).
+    /// **InverseFitness** — a fitness-inverse roulette over non-elite nets (an opt-in:
+    /// the worst net weighs most, the best is never drawn; chance is kept).
     InverseFitness,
-        /// **Random** — evict a uniformly random live net, at the cost of occasionally
-        /// losing a good one.
+    /// **Random** — evict a uniformly random live net, at the cost of occasionally
+    /// losing a good one.
     Random,
+    /// **Unfed** (default) — the SAME selector as [`CrossCullPolicy::Unfed`]: evict the net
+    /// train-eval lottery would starve (lowest merit `Fm × Ym` among the graded nets).
+    #[default]
+    Unfed,
 }
 
 impl std::fmt::Display for MutationCullPolicy {
-    /// The STABLE spelling recorded in `engine.json` and the run manifest. Note it is NOT
-    /// `format!("{:?}").to_lowercase()`: `InverseFitness` would collapse to
-    /// `inversefitness`, which no reader could parse back to the variant.
+    /// The STABLE spelling recorded in `engine.json` and the run manifest.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::InverseFitness => "inverse_fitness",
             Self::Worst => "worst",
             Self::Random => "random",
+            Self::Unfed => "unfed",
         })
     }
 }
 
-    /// The two-parent crossover operators, drawn from `crossover_ops_pool` (empty ⇒ both)
-    /// per attempt; parent A's post-swap body becomes the child.
+/// The two-parent crossover operators, drawn from `crossover_ops_pool` (empty ⇒ both)
+/// per attempt; parent A's post-swap body becomes the child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrossoverOp {
     /// Swap the hidden-node tail after a matching pivot node.
@@ -188,8 +261,8 @@ pub enum CrossoverOp {
 }
 
 impl CrossoverOp {
-        /// How many parent topologies this operator combines. All current operators are
-        /// binary, so both return 2 (the engine derives parent count from this).
+    /// How many parent topologies this operator combines. All current operators
+    /// binary, so both return 2 (the engine derives parent count
     pub fn required_parents(&self) -> usize {
         match self {
             CrossoverOp::OnePoint | CrossoverOp::Uniform => 2,
@@ -197,8 +270,8 @@ impl CrossoverOp {
     }
 }
 
-    // `TryFrom<&str>` lives with the enum: the parse sits where the type is, gives
-    // `?`-compatible conversion, and is reachable for users' own tooling.
+// `TryFrom<&str>` lives with the enum: the parse sits where the type is, gives
+// `?`-compatible conversion, and is reachable for users' own tooling.
 impl TryFrom<&str> for CrossoverOp {
     type Error = String;
     fn try_from(s: &str) -> Result<Self, Self::Error> {
@@ -212,8 +285,8 @@ impl TryFrom<&str> for CrossoverOp {
     }
 }
 
-    /// The training paradigm / problem space the run targets. Only `Tabular` and `Rl` are
-    /// constructible; the image/NLP arms are reserved future `RunSpec` variants.
+/// The training paradigm / problem space the run targets. Only `Tabular` and `Rl`
+/// constructible; the image/NLP arms are reserved future `RunSpec` variants.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
 pub enum RunMode {
     #[default]
@@ -229,241 +302,149 @@ pub enum RunMode {
     Rl,
 }
 
-    /// Step-race knob surface. Size defaults are small for quick tests; evolution
-    /// semantics default to the tuned cartpole reference. Mode knobs live in `mode_specific`.
+/// Step-race knob surface. Size defaults are small for quick tests; evolution
+/// semantics default to the tuned cartpole reference. Mode knobs live in `mode_specific`.
 pub struct RaceConfig {
     /// Number of live nets in the population.
     pub pop_size: usize,
-        /// Steps between population checkpoints (the stream's era rotation and the
-        /// CSV flush cadence key off this). **`0` = no durability tick**, and no era
-        /// rotation either (one eternal era) — see
-        /// [`RaceConfigBuilder::set_run_checkpoint_every`].
+    /// Steps between population checkpoints (the stream's era rotation and the CSV flush cadence
+    /// key off
     pub checkpoint_every: usize,
-        /// Independent crossover rolls per step; each fires with `crossover_prob`. A
-        /// not-fired or failed roll is SPENT (no random fallback).
+    /// Independent crossover rolls per step; each fires with `crossover_prob`.
+    /// not-fired or failed roll is SPENT (no random fallback).
     pub crossover_rolls: usize,
-        /// Independent mutation rolls per step; each fires with `mutate_prob` and culls one
-        /// net (by `mutation_cull_policy`), inserting a random immigrant.
+    /// Independent mutation rolls per step; each fires with `mutate_prob` and culls one
+    /// net (by `mutation_cull_policy`), inserting a random immigrant.
     pub mutate_rolls: usize,
-        /// Who a surviving crossover child evicts (crossover-only; immigrants follow
-        /// `mutation_cull_policy`).
+    /// Who a surviving crossover child evicts (crossover-only; immigrants follow
+    /// `mutation_cull_policy`).
     pub crossover_cull_policy: CrossCullPolicy,
-        /// Who a firing mutation roll evicts (mutation-only; crossover children follow
-        /// `crossover_cull_policy`).
+    /// Who a firing mutation roll evicts (mutation-only; crossover children follow
+    /// `crossover_cull_policy`).
     pub mutation_cull_policy: MutationCullPolicy,
-        /// Elite guard: the top-k nets by smoothed fitness are immune to ALL culls (minimum
-        /// 1). "Elite" is a rank, not an identity.
+    /// Elite guard: the top-k nets by smoothed fitness are immune to ALL culls (minimum
+    /// 1). "Elite" is a rank, not an identity.
     pub elite_count: usize,
     /// Anti-devolution A: the top-k nets act-and-measure without weight
     /// updates (see [`RaceConfigBuilder::set_elite_freeze`]). Default `true`.
     pub freeze_elites: bool,
-        /// EXPERIMENTAL train-eval lottery strength, Ω (`set_run_train_merit`): how much
-        /// of this clock's budget the merit decides. `0.0` (default) = OFF — no coin is
-        /// drawn and every non-crown net runs, as before; `1.0` = full merit weighting;
-        /// `0.5` = half the withholding. NOT the merit's scale: `p` is a min-max
-        /// FRACTION of the field, so scaling every merit by Ω would cancel out and only
-        /// `0` would differ. Ω blends what the lottery actually applies — the
-        /// withholding: `p_eff = 1 − Ω·(1 − p)`, which is λ-shaped (one scalar, `0` is
-        /// "no effect"), keeps the two endpoints exact, and gives the worst net a
-        /// standing `1 − Ω` chance instead of the permanent `p = 0` starvation.
-        ///
-        /// When it is above 0, each non-crown net's clock is a merit-weighted coin for a
-        /// TRAIN-EVAL TICKET — the whole step, the optimizer update AND the evaluation
-        /// that follows it — graded by its FINAL fitness per UPDATE
-        /// (`smt / D`; the risk-adjusted score, so λ is already paid, and `D` — not
-        /// `B` — because a crown act pass costs no learning budget)
-        /// against the population's own spread. A net that loses the coin IDLES: no
-        /// train batch, no eval batch, no metric row, no weight update, so nothing it is
-        /// ranked on moves and no compute is spent measuring it.
-        ///
-        /// Replay-relevant: the idle clocks are persisted per net (`idle_spans`), the
-        /// resume replays that ledger, and a resume at a different Ω is refused by name.
+    /// Train-eval lottery strength, Ω (`set_run_train_merit`): how much of this clock's budget
+    /// merit decides.
     pub train_merit: f32,
-        /// Merit floor `p_min` (`set_run_train_merit_p_min`) — the smallest share of
-        /// clocks the WORST net in the field still gets. Applied to the fraction BEFORE
-        /// Ω blends it (`p = p_min + (1 − p_min)·f`), so it is a BOTTOM-only lift: only
-        /// the nets below the floor move and the relative spread above it is untouched.
-        /// `0.05` (default) keeps the worst net at 5% instead of the permanent `p = 0`,
-        /// which costs little (it only ever un-idles the last few) and lets its merit
-        /// move again — the self-correcting loop needs it to train at least sometimes.
-        /// `0.0` restores the pre-floor arithmetic bit-for-bit. Replay-relevant like Ω:
-        /// a resume at another floor warns by name.
+    /// Merit floor `p_min` (`set_run_train_merit_p_min`) — the smallest share of clocks the WORST
+    /// net in the field still gets.
     pub train_merit_p_min: f32,
-        /// Share of the dataset held out for EVAL (`set_run_eval_share`): the rows a
-        /// net is SCORED on and never trained on. `0.2` (default) = 80/20.
-        ///
-        /// This is the internal split, used when the data dir is a single pool
-        /// (`inputs.*` + `targets.*`). A dir holding `train/` and `test/` subdirs
-        /// takes the EXPLICIT layout instead and this value is not consulted — the
-        /// two layouts are alternatives, not a stack. Recorded in `engine.json`
-        /// (`train_eval_split_ratio`, the legacy key name) and reused on resume.
-        ///
-        /// Shrinking it gives the search more rows to learn from and a noisier
-        /// judge; growing it gives a steadier ranking and a thinner train pool.
-        /// Replay-relevant: the pools are built from this at run start.
+    /// Merit CEILING `p_max` (`set_run_train_merit_p_max`) — the largest share
+    pub train_merit_p_max: f32,
+    /// INVERT the lottery's merit ordering (`set_run_train_merit_inverted`): the LEAST fit net
+    /// earns the MOST tickets and the best earns the fewest.
+    pub train_merit_inverted: bool,
+    /// Share of the dataset held out for EVAL (`eval_share`): the rows a net is SCORED on and never
+    /// trained
     pub eval_share: f32,
-        /// Per-net smoothed-fitness rolling window (K) — how many recent step fitnesses every
-        /// ranking decision averages over. Defaults to [`SMOOTHING_WINDOW`].
+    /// Per-net smoothed-fitness rolling window (K) — how many recent step fitnesses
+    /// ranking decision averages over. Defaults to [`SMOOTHING_WINDOW`].
     pub smoothing_window: usize,
-        /// Risk aversion λ (FIT): window standard deviations subtracted from (Maximize) or
-        /// added to (Minimize) a net's smoothed mean before ranking. Defaults to
-        /// [`RISK_AVERSION`]; `0.0` ranks on the plain mean.
+    /// Risk aversion λ (FIT): window standard deviations subtracted from (Maximize) or added
+    /// (Minimize) a net's smoothed mean before ranking.
     pub risk_aversion: f32,
-        /// Mode-specific knobs (tabular vs RL) — the arm is carried in the type. The engine
-        /// core reads only the shared fields; mode branches match on this arm.
+    /// Recency ramp r for the smoothing window (`set_run_window_recency`): how much
+    pub window_recency: f32,
+    /// How the window's readings are averaged into the ranking centre (`set_run_mean_type`):
+    /// [`MeanType::Arithmetic`] (default, the pre-knob ranking), [`MeanType::SignedLog`]
+    pub mean_type: MeanType,
+    /// Age leg of the lottery (`set_run_train_age`): `true` ARMS the product `Fm × Ym`, `Ym` = `1`
+    /// at the youngest graded net.
+    pub train_age: bool,
+    /// Mode-specific knobs (tabular vs RL) — the arm is carried in the type. The engine
+    /// core reads only the shared fields; mode branches match on this arm.
     pub mode_specific: ModeConfig,
-        /// Crossover operator pool (`"one_point"` | `"uniform"`), drawn uniformly per attempt.
-        /// Empty ⇒ both.
+    /// Crossover operator pool (`"one_point"` | `"uniform"`), drawn uniformly per attempt.
+    /// Empty ⇒ both.
     pub crossover_ops_pool: Vec<String>,
-        /// How a crossover attempt draws its parents: [`SelectionMethod::Roulette`]
-        /// (default — the engine's historical behavior) or a `Tournament { k }`, which
-        /// concentrates recombination on the fittest. See
-        /// [`RaceConfigBuilder::set_crossover_selection`]. Replay-relevant: the draw
-        /// consumes the roll's RNG stream, so a resumed run must use the same method.
+    /// How a crossover attempt draws its parents: [`SelectionMethod::Roulette`] (default —
+    /// engine's historical behavior) or a `Tournament { k }`, which concentrates recombination
     pub crossover_selection: SelectionMethod,
-        /// Fitter parent as the crossover BASE (`set_crossover_fitter_base`). The operator
-        /// mutates ONE parent (the base) into the child, so the base donates everything the
-        /// cut does not swap. Default `false` — the base is whichever roulette draw landed
-        /// first, and a measured probe over `attempts.csv` found that was the WORSE parent
-        /// in ~half of births, i.e. half the births preserved the bad skeleton.
-        ///
-        /// `true` orders the two draws by the SAME best-first ranking every other decision
-        /// reads (`ranked`, so `direction` is already applied) and makes the better net the
-        /// base: the child keeps the good skeleton and receives the donor's slice. It does
-        /// not touch the draw — same parents, same operator, same RNG consumption — only
-        /// which of the two is the recipient.
-        ///
-        /// **The keeper is chosen after the cut, not before it.** The operators already
-        /// build BOTH reciprocal children (they mutate the donor too), so the engine keeps
-        /// the side that still carries more of the fitter parent's node genes. Without that
-        /// check an early pivot on the base leaves the child mostly the DONOR, and keeping
-        /// it "because the fitter one is the base" would preserve exactly the wrong
-        /// skeleton. Ties (and a count tie broken by total `hidden_dim`) keep the base side.
-        ///
-        /// The parent-selection fallback scores an unmeasured net `0.0`, which only matters
-        /// while fewer than two nets are measured (clock 0), where neither order is better.
-        pub crossover_fitter_base: bool,
+    /// Fitter parent as the crossover BASE (`set_crossover_fitter_base`).
+    pub crossover_fitter_base: bool,
     /// Max steps before stopping (None = no limit).
     pub max_steps: Option<usize>,
-        /// Hidden-dim sampling range (`None` ⇒ default 4..=8). NOTE: batch geometry lives
-        /// on the trainer's `stream_shape()`, not here.
+    /// Hidden-dim sampling range (`None` ⇒ default 4..=8). NOTE: batch geometry lives
+    /// on the trainer's `stream_shape()`, not here.
     pub hidden_dim_pool: Option<std::ops::RangeInclusive<usize>>,
     /// Stride within the hidden-dim pool when sampling node dimensions.
     pub hidden_dim_stride: usize,
-        /// Combine/activation/standardize pools actually used by the run; empty uses all
-        /// known ops (`empty ⇒ all` convention).
+    /// Combine/activation/standardize pools actually used by the run; empty uses
+    /// known ops (`empty ⇒ all` convention).
     pub combine_op_pool: Vec<String>,
-    /// The feature-split POOL newborns draw from: `none`, `random`, `exclusive`
-    /// (the `split_*` spellings `engine.json` writes are accepted too). **Empty ⇒
-    /// all three**, so a population can hold unsplit and split nets side by side and
-    /// the split itself becomes selectable instead of a run-wide constant. The drawn
-    /// policy lands on the individual's own `TopologyOptions`, so a newborn's split
-    /// travels with its blueprint and its children inherit the rows, not the draw.
+    /// The feature-split POOL newborns draw from: `none`, `random`, `exclusive` (the `split_*`
+    /// spellings `engine.json` writes are accepted too).
     pub feature_split_pool: Vec<String>,
-        /// Per-SLOT drift on a crossover child's INHERITED genes (`set_topology_drift`):
-        /// the chance, for each slot below, that it moves at all. ONE probability for the
-        /// whole family because it is one idea — crossover can only DONATE an allele, so
-        /// without drift nothing it hands down can ever be edited.
-        ///
-        /// | slot | what `p` does |
-        /// |---|---|
-        /// | each feature-mask bit | flips |
-        /// | hidden `activation` | re-drawn from the activation pool |
-        /// | hidden `combine_op` | re-drawn from the combine pool |
-        /// | hidden `standardize` | re-drawn from the standardize pool |
-        /// | per-port activation (`1..`) | re-drawn from the activation pool |
-        /// | `dropout_prob` | re-drawn in `0.0..=cap` (`set_topology_dropout_prob`) |
-        ///
-        /// `0.0` (default) = exact inheritance. None of these slots changes the SHAPE of the
-        /// net, so drift needs no rebuild; `hidden_dim` and the wiring stay donation-only
-        /// for exactly that reason. Drawn from a seed derived from
-        /// `(run_seed, clock, child_idx)` — one salted stream per family — so it cannot
-        /// perturb the parent draw and a replay moves the same slots. Replay-relevant:
-        /// recorded in `engine.json`, and a resume at another value warns by name.
-        ///
-        /// Scale note: the mask slots are sized against ROW WIDTH (`input_dim` bits per
-        /// port, so `784` on MNIST), the node slots against the net's gene count (~`3 ×
-        /// hidden nodes`). `0.005` flips ~4 bits in a 784-wide row and ~31 per 8-port child,
-        /// while barely touching node genes; `0.5` is a pool draw in disguise — keep it to a
-        /// few edits per child.
+    /// Per-SLOT drift on a crossover child's INHERITED genes (`set_topology_drift`): the chance,
+    /// for each slot below, that it moves
     pub drift_prob: f32,
-    /// Activation pool (empty ⇒ all).
+    /// Activation pool (empty ⇒
     pub activation_pool: Vec<String>,
-    /// Standardize-op pool (empty ⇒ all).
+    /// Standardize-op pool (empty ⇒
     pub standardize_op_pool: Vec<String>,
     /// Topology template (input/output dims, hidden node ranges, dropout, etc.)
     /// shared by every individual in the run.
     pub topology_options: crate::graph::topology::TopologyOptions,
     /// Chance a crossover roll fires.
     pub crossover_prob: f32,
-        /// Per-roll chance a mutation roll FIRES and inserts a random immigrant.
-        /// `mutate_rolls` controls rolls per step; this controls how often each fires.
+    /// Per-roll chance a mutation roll FIRES and inserts a random immigrant.
+    /// `mutate_rolls` controls rolls per step; this controls how often each fires.
     pub mutate_prob: f32,
     /// Pluggable stop criterion **in addition** to the built-ins (Iter 5
     /// contract). When `None`, only the built-ins apply.
     pub custom_stop: StopFn,
     /// Per-step log verbosity for the engine.
     pub log_level: LogLevel,
-        /// Write `<run_dir>/telemetry.jsonl`: one JSON record per event at full fidelity.
-        /// Off by default — the console is the view, this is the record.
+    /// Write `<run_dir>/telemetry.jsonl`: one JSON record per event at full fidelity.
+    /// Off by default — the console is the view, this is the record.
     pub trace_file: bool,
-    /// Write each live net's OPTIMIZER state beside its weights
-    /// (`nets/<hash>.optim`) at every checkpoint, so a resume restores Adam's
-    /// moments instead of restarting them. `true` = exact resume (option C);
-    /// `false` = weights only (option A): the first update after a resume starts
-    /// from `m = v = 0`, a visible one-time restart. Cost is ~2x the weights file
-    /// per net, overwritten in place, so it is bounded by the population.
+    /// Write each live net's OPTIMIZER state beside its weights (`nets/<hash>.optim`)
+    /// checkpoint, so a resume restores Adam's moments instead of restarting them.
     pub save_optim: bool,
-        /// Informative (non-ranking) metrics; their labels determine the extra per-net
-        /// metric columns a reader may expect.
+    /// Informative (non-ranking) metrics; their labels determine the extra per-net
+    /// metric columns a reader may expect.
     pub metrics: Vec<Metric>,
     /// The training paradigm / problem space target.
     pub mode: RunMode,
-        /// Whether to write `history.csv` (one row per live net per clock it was TRAINED
-        /// AND SCORED on — an idle lottery clock has nothing to record) and `attempts.csv`
-        /// (per evolution attempt) — separate files, separate headers. No `options.csv`.
+    /// Whether to write `history.csv` (one row per live net per clock it was TRAINED AND SCORED
+    /// — an idle lottery clock has nothing to record) and `attempts.csv` (per evolution attempt) —
     pub csv_export: bool,
     /// At stop, save the elite's topology markdown (`elite-<hash>.md`).
     /// Default true — the champion's blueprint is the run's headline artifact.
     pub elite_save_topology: bool,
-        /// At stop, additionally save the `elite_count` WORST live nets' topology markdown
-        /// (`worst-<hash>.md`, one per net). Default false — the anti-champion is a
-        /// debugging artifact. The COUNT is `elite_count`: [elite_count] is how many the
-        /// elite writers keep, so both ends of the ranking save the same number of nets.
-    pub worst_save_topology: bool,
-        /// Human label for the experiment, recorded verbatim in `engine.json` as
-        /// `"run_name"`. Informational — does not affect the results folder name.
+    /// Human label for the experiment, recorded verbatim in `engine.json`
+    /// `"run_name"`. Informational — does not affect the results folder name.
     pub run_name: Option<String>,
-        /// AUTOMATIC inheritance: load the newest compatible PREVIOUS experiment's
-        /// elites into the first founder slots (topology-only). "Compatible" is read
-        /// from the header (same mode, dims and trainer); a different experiment, or
-        /// no default folder, runs all-random. Default true — turn it off to force a
-        /// fresh, all-random founder batch.
+    /// AUTOMATIC inheritance: load the newest compatible PREVIOUS experiment's elites into
+    /// first founder slots (topology-only).
     pub elite_previous_load: bool,
-        /// Where `elite_previous_load` looks: a run dir or a dir of run dirs (newest run id
-        /// wins). `None` ⇒ the default `results/` folder.
+    /// Where `elite_previous_load` looks: a run dir or a dir of run dirs (newest run id
+    /// wins). `None` ⇒ the default `results/` folder.
     pub elite_previous_dir: Option<std::path::PathBuf>,
-        /// Mutation probation: a random immigrant is cull-IMMUNE for its first
-        /// `mutation_probation_steps` clocks. Default 5 (set in `defaults()`);
-        /// `0` = only the empty-buffer step-0 immunity.
+    /// Mutation probation: a random immigrant is cull-IMMUNE for its first
+    /// `mutation_probation_steps` clocks.
     pub mutation_probation_steps: usize,
-        /// Crossover probation: a crossover-born net is cull-IMMUNE for its first
-        /// `crossover_probation_steps` clocks. Default 5 (set in `defaults()`);
-        /// `0` = only the empty-buffer step-0 immunity.
+    /// Crossover probation: a crossover-born net is cull-IMMUNE for its first
+    /// `crossover_probation_steps` clocks.
     pub crossover_probation_steps: usize,
-        /// Elite join probation: a net cannot join the elite set until it has aged
-        /// `elite_join_probation_steps` clocks since arrival. Default `5`.
+    /// Elite join probation: a net cannot join the elite set until it has aged
+    /// `elite_join_probation_steps` clocks since arrival. Default `5`.
     pub elite_join_probation_steps: usize,
-        /// Elite crown lifetime: a net on the frozen crown is culled out after
-        /// `elite_crown_lifetime_steps` clocks. Default `5`; zero = permanent until rank moves.
+    /// Elite crown lifetime: a net on the frozen crown is culled out after
+    /// `elite_crown_lifetime_steps` clocks. Default `5`; zero = permanent until rank moves.
     pub elite_crown_lifetime_steps: usize,
 }
 
 // `run_progress` and `DEFAULT_LR` live in `crate::utils::training` — the run
 // loop and any training scheme both need them, so they sit below both layers.
 
-    /// Mode-specific knob set — the arm is carried in the TYPE. Built via
-    /// `TabularConfig::builder()`/`RlConfig::builder()`; the engine derives it from `RunSpec`.
+/// Mode-specific knob set — the arm is carried in the TYPE. Built via
+/// `TabularConfig::builder()`/`RlConfig::builder()`; the engine derives it from `RunSpec`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModeConfig {
     /// Knobs that only exist in dataset-driven (tabular) runs.
@@ -486,10 +467,9 @@ impl ModeConfig {
     pub fn is_rl(&self) -> bool {
         matches!(self, ModeConfig::Rl(_))
     }
-
 }
 
-    /// Tabular-arm knobs (reserved; the tabular mode has no mode-specific knobs today).
+/// Tabular-arm knobs (reserved; the tabular mode has no mode-specific knobs today).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TabularConfig {}
 
@@ -513,7 +493,7 @@ impl TabularConfigBuilder {
     }
 }
 
-    /// RL-arm knobs (reserved; the RL mode has no mode-specific knobs today).
+/// RL-arm knobs (reserved; the RL mode has no mode-specific knobs today).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RlConfig {}
 
@@ -537,12 +517,12 @@ impl RlConfigBuilder {
     }
 }
 
-    /// Type alias for the pluggable stop closure. Plain alias, so `RaceConfig` derives
-    /// neither `Clone` nor `Debug`.
+/// Type alias for the pluggable stop closure. Plain alias, so `RaceConfig` derives
+/// neither `Clone` nor `Debug`.
 pub type StopFn = Option<Box<dyn Fn(&RaceSnapshot) -> bool + Send + Sync + 'static>>;
 
-    /// The run-level context stamped into every net's `meta` block. Built once at engine
-    /// construction; cheap to pass around.
+/// The run-level context stamped into every net's `meta` block. Built once at engine
+/// construction; cheap to pass around.
 #[derive(Clone, Debug, Default)]
 pub struct RunMetaCtx {
     /// Input feature dimension.
@@ -564,21 +544,21 @@ pub struct RunMetaCtx {
     pub run_seed: u64,
 }
 
-    /// A cheap read-only snapshot of the live race state at decision time, passed to a custom
-    /// stop closure. Not a full run dump.
+/// A cheap read-only snapshot of the live race state at decision time, passed to a custom
+/// stop closure. Not a full run dump.
 #[derive(Clone)]
 pub struct RaceSnapshot {
     /// Live nets at decision time.
     pub live_count: usize,
     /// Current step.
     pub step: usize,
-        /// Best smoothed fitness — the RISK-ADJUSTED window score (FIT: `mean ∓ λσ`), which is
-        /// what the race actually ranks on. At λ = 0 this is the plain window mean again.
+    /// Best smoothed fitness — the RISK-ADJUSTED window score (FIT: `mean ∓ λσ`),
+    /// what the race actually ranks on. At λ = 0 this is the plain window mean again.
     pub best_smoothed_fitness: f32,
     /// Worst smoothed fitness — the same risk-adjusted score, at the other end.
     pub worst_smoothed_fitness: f32,
-        /// Mean of the live risk-adjusted scores (a plain arithmetic mean OF the scores, not a
-        /// second smoothing pass).
+    /// Mean of the live risk-adjusted scores (a plain arithmetic mean OF the scores,
+    /// second smoothing pass).
     pub mean_smoothed_fitness: f32,
     /// Cumulative culls.
     pub culls: usize,
@@ -587,7 +567,7 @@ pub struct RaceSnapshot {
 }
 
 impl RaceConfig {
-    /// Returns the device the engine should run on (CUDA if the cuda feature is
+    /// Returns the device the engine should run on (CUDA if the cuda feature
     /// enabled, CPU otherwise). Mirrors ``crate::auto_device()``.
     pub fn device(&self) -> flodl::Device {
         #[cfg(feature = "cuda")]
@@ -600,33 +580,35 @@ impl RaceConfig {
         }
     }
 
-        /// Conservative defaults for a quick smoke test: stop budgets are inactive by default
-        /// (`None` = no limit), so a run stops only when the caller sets a criterion.
+    /// The loop the reference run was tuned on (`examples/cartpole.rs`): two rolls a clock on each
+    /// channel, tournament-2 crossover parents, a 5-reading window at λ 0.5, the inverted lottery
     pub fn defaults() -> Self {
-        /// Default hidden-dim sampling range.
-        const DEFAULT_HIDDEN_POOL: std::ops::RangeInclusive<usize> = 4..=8;
-
         RaceConfig {
-            pop_size: 5,
+            pop_size: DEFAULT_POP_SIZE,
             checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
-            crossover_rolls: 1,
-            mutate_rolls: 1,
+            crossover_rolls: DEFAULT_CROSSOVER_ROLLS,
+            mutate_rolls: DEFAULT_MUTATE_ROLLS,
             crossover_cull_policy: CrossCullPolicy::default(),
-            mutation_cull_policy: MutationCullPolicy::Worst,
-            elite_count: 1,
+            mutation_cull_policy: MutationCullPolicy::default(),
+            elite_count: DEFAULT_ELITE_COUNT,
             freeze_elites: true,
-            train_merit: 0.0,
+            train_merit: DEFAULT_TRAIN_MERIT,
             train_merit_p_min: DEFAULT_TRAIN_MERIT_P_MIN,
+            train_merit_p_max: DEFAULT_TRAIN_MERIT_P_MAX,
+            train_merit_inverted: DEFAULT_TRAIN_MERIT_INVERTED,
             eval_share: DEFAULT_EVAL_SHARE,
-            elite_join_probation_steps: 5,
-            elite_crown_lifetime_steps: 5,
+            elite_join_probation_steps: DEFAULT_ELITE_JOIN_PROBATION,
+            elite_crown_lifetime_steps: DEFAULT_CROWN_LIFETIME,
             smoothing_window: SMOOTHING_WINDOW,
             risk_aversion: RISK_AVERSION,
+            window_recency: DEFAULT_WINDOW_RECENCY,
+            mean_type: DEFAULT_MEAN_TYPE,
+            train_age: DEFAULT_TRAIN_AGE,
             mode_specific: ModeConfig::Tabular(TabularConfig::default()),
             crossover_ops_pool: Vec::new(),
-            crossover_selection: SelectionMethod::Roulette,
+            crossover_selection: SelectionMethod::Tournament { tournament_size: 2 },
             crossover_fitter_base: true,
-            max_steps: None,
+            max_steps: Some(DEFAULT_MAX_STEPS),
             hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
             hidden_dim_stride: 16,
             combine_op_pool: Vec::new(),
@@ -635,8 +617,8 @@ impl RaceConfig {
             activation_pool: Vec::new(),
             standardize_op_pool: Vec::new(),
             topology_options: crate::graph::topology::TopologyOptions::default(),
-            crossover_prob: 0.5,
-            mutate_prob: 0.5,
+            crossover_prob: DEFAULT_CROSSOVER_PROB,
+            mutate_prob: DEFAULT_MUTATE_PROB,
             custom_stop: None,
             metrics: Vec::new(),
             log_level: LogLevel::default(),
@@ -645,7 +627,6 @@ impl RaceConfig {
             mode: RunMode::Tabular,
             csv_export: true,
             elite_save_topology: true,
-            worst_save_topology: false,
             run_name: None,
             elite_previous_load: true,
             elite_previous_dir: None,
@@ -654,37 +635,19 @@ impl RaceConfig {
         }
     }
 
-        /// The pool resolved to drawable policies (`empty ⇒ all three`, in the fixed
-        /// order none → random → exclusive so the draw is reproducible). An unknown
-        /// name is named in the error; the DRAW path cannot return one (a topology draw
-        /// is infallible), so [`RaceConfig::validate_search_pools`] is what refuses it
-        /// at engine construction instead of letting the fallback widen the search.
-    pub fn resolved_feature_split_pool(
-        &self,
-    ) -> Result<Vec<Option<FeatureSplitPolicy>>, String> {
+    /// The pool resolved to drawable policies (`empty ⇒ all three`, in the fixed order none →
+    /// random → exclusive so the draw is reproducible).
+    pub fn resolved_feature_split_pool(&self) -> Result<Vec<Option<FeatureSplitPolicy>>, String> {
         super::pool::resolve::<super::pool::FeatureSplitPool>(self)
     }
-        /// The pool as wire names, in draw order — one spelling for the log, the
-        /// `engine.json` record and the resume diff.
-        ///
-        /// An unparseable pool is echoed AS TYPED instead of being replaced by a pool
-        /// it never drew: `["rondom"]` used to be recorded as `["none"]`, so the header
-        /// described an experiment nobody ran. Construction refuses such a config
-        /// outright (`validate_search_pools`), so this arm only serves direct callers.
+    /// The pool as wire names, in draw order — one spelling for the log, the `engine.json` record
+    /// and the resume diff.
     pub fn feature_split_pool_names(&self) -> Vec<String> {
         super::pool::names::<super::pool::FeatureSplitPool>(self)
     }
 
-    /// The inverse of [`crate::state::ConfigSnapshot::from_config`]: rebuild the
-    /// run-level knobs a header recorded, so a resume needs only its directory.
-    ///
-    /// The SEARCH SPACE is deliberately NOT here — topology options, the pool lists and
-    /// the hidden-dim range live on `RunHeader` itself, and a caller stamps them after
-    /// this (see `TabularEngine::resume_from`).
-    ///
-    /// Never fails: an enum spelling this build cannot read falls back to the crate
-    /// default, and the resume guards still compare whatever came out, so a real
-    /// mismatch is refused loudly rather than silently patched.
+    /// The inverse of [`crate::state::ConfigSnapshot::from_config`]: rebuild the run-level knobs
+    /// header recorded, so a resume needs only its directory.
     pub fn from_snapshot(snap: &crate::state::ConfigSnapshot) -> Self {
         let mut cfg = RaceConfig::defaults();
         cfg.pop_size = snap.pop_size;
@@ -701,12 +664,18 @@ impl RaceConfig {
         cfg.trace_file = snap.trace_file;
         cfg.smoothing_window = snap.smoothing_window;
         cfg.risk_aversion = snap.risk_aversion;
+        cfg.window_recency = snap.window_recency;
+        // `""` = a header written before the knob, which averaged arithmetically.
+        cfg.mean_type = MeanType::parse(&snap.mean_type).unwrap_or(DEFAULT_MEAN_TYPE);
+        cfg.train_age = snap.train_age;
         cfg.csv_export = snap.csv_export;
         cfg.save_optim = snap.save_optim;
         cfg.run_name = snap.run_name.clone();
         cfg.freeze_elites = snap.freeze_elites;
         cfg.train_merit = snap.train_merit;
         cfg.train_merit_p_min = snap.train_merit_p_min;
+        cfg.train_merit_p_max = snap.train_merit_p_max;
+        cfg.train_merit_inverted = snap.train_merit_inverted;
         cfg.drift_prob = snap.drift_prob;
         cfg.elite_previous_load = snap.elite_previous_load;
         cfg.elite_previous_dir = snap
@@ -714,22 +683,24 @@ impl RaceConfig {
             .as_ref()
             .map(std::path::PathBuf::from);
         cfg.elite_save_topology = snap.elite_save_topology;
-        cfg.worst_save_topology = snap.worst_save_topology;
         cfg.mutation_probation_steps = snap.mutation_probation_steps;
         cfg.crossover_probation_steps = snap.crossover_probation_steps;
         cfg.elite_join_probation_steps = snap.elite_join_probation_steps;
         cfg.elite_crown_lifetime_steps = snap.elite_crown_lifetime_steps;
-        // The replay-relevant enums, matched on their recorded SPELLING — the snapshots
-        // store `Display` output (`"worst"`, `"tournament(size=2)"`, `"split_random"`),
-        // so a `contains` test survives a formatting change on either side.
+        // The replay-relevant enums, matched on their recorded SPELLING — the snapshots store
+        // `Display` output (`"worst"`, `"tournament(size=2)"`, `"split_random"`), so a `contains`
         let cull = snap.crossover_cull_policy.to_ascii_lowercase();
-        cfg.crossover_cull_policy = if cull.contains("random") {
+        cfg.crossover_cull_policy = if cull.contains("unfed") {
+            CrossCullPolicy::Unfed
+        } else if cull.contains("random") {
             CrossCullPolicy::Random
         } else {
             CrossCullPolicy::Worst
         };
         let mcull = snap.mutation_cull_policy.to_ascii_lowercase();
-        cfg.mutation_cull_policy = if mcull.contains("random") {
+        cfg.mutation_cull_policy = if mcull.contains("unfed") {
+            MutationCullPolicy::Unfed
+        } else if mcull.contains("random") {
             MutationCullPolicy::Random
         } else if mcull.contains("worst") {
             MutationCullPolicy::Worst
@@ -743,20 +714,18 @@ impl RaceConfig {
                 .filter_map(|n| n.parse::<usize>().ok())
                 .next()
                 .unwrap_or(2);
-            SelectionMethod::Tournament {
-                tournament_size: k,
-            }
+            SelectionMethod::Tournament { tournament_size: k }
         } else {
             SelectionMethod::Roulette
         };
-        // Pool: a header that recorded one (a post-pool run) wins; an older header
-        // recorded a single policy (or none), which becomes a one-entry pool so a
-        // resume cannot silently start drawing splits the run never had.
+        // Pool: a header that recorded one (a post-pool run) wins; an older header recorded
+        // single policy (or none), which becomes a one-entry pool so a resume cannot silently start
         cfg.feature_split_pool = if snap.feature_split_pool.is_empty() {
-            vec![snap
-                .feature_split
-                .clone()
-                .unwrap_or_else(|| "none".to_string())]
+            vec![
+                snap.feature_split
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string()),
+            ]
         } else {
             snap.feature_split_pool.clone()
         };
@@ -768,8 +737,8 @@ impl RaceConfig {
         cfg
     }
 
-        /// Fluent builder for the non-CLI config surface, starting from `RaceConfig::defaults`.
-        /// Starts TABULAR; for RL prefer [`RlRaceConfig::builder`].
+    /// Fluent builder for the non-CLI config surface, starting from `RaceConfig::defaults`.
+    /// Starts TABULAR; for RL prefer [`RlRaceConfig::builder`].
     pub fn builder() -> RaceConfigBuilder {
         RaceConfigBuilder {
             cfg: RaceConfig::defaults(),
@@ -777,14 +746,14 @@ impl RaceConfig {
     }
 }
 
-    /// Typed front door for RL runs: `builder()` with the RL arm pre-stamped.
+/// Typed front door for RL runs: `builder()` with the RL arm pre-stamped.
 pub type RlRaceConfig = RaceConfig;
 
 /// Typed front door for tabular runs (reads well at the call site).
 pub type TabularRaceConfig = RaceConfig;
 
-    /// `TabularRaceConfig::builder()` — the tabular front door: a free function so the type
-    /// alias can't shadow `RaceConfig::builder`.
+/// `TabularRaceConfig::builder()` — the tabular front door: a free function so the type
+/// alias can't shadow `RaceConfig::builder`.
 #[doc(hidden)]
 pub fn tabular_race_config_builder() -> RaceConfigBuilder {
     RaceConfigBuilder {
@@ -792,8 +761,8 @@ pub fn tabular_race_config_builder() -> RaceConfigBuilder {
     }
 }
 
-    /// `RlRaceConfig::builder()` — the RL front door (a free function; an inherent method on
-    /// the alias would collide with `RaceConfig::builder`).
+/// `RlRaceConfig::builder()` — the RL front door (a free function; an inherent method
+/// the alias would collide with `RaceConfig::builder`).
 #[doc(hidden)]
 pub fn rl_race_config_builder() -> RaceConfigBuilder {
     RaceConfigBuilder {
@@ -819,16 +788,8 @@ pub(crate) fn parse_feature_split_wire(raw: &str) -> Option<FeatureSplitPolicy> 
     }
 }
 
-
-/// One POOL entry: `Some(None)` is the `none` policy (no split), `Some(Some(_))` a
-/// drawable policy, `None` an unknown spelling. Kept separate from
-/// [`parse_feature_split_wire`] so "no split" and "unparseable" cannot be confused.
-///
-/// Matched by WHOLE NAME, like every other pool (`RaceConfig::parse_activation`,
-/// `RaceConfig::parse_combine`, `CrossoverOp::try_from`): a substring test accepts
-/// names nobody offers —
-/// `"nonexclusive"` became `none` because `contains("none")` ran first. The recorded
-/// spellings `split_*` are aliases for the wire form, not extra policies.
+/// One POOL entry: `Some(None)` is the `none` policy (no split), `Some(Some(_))` a drawable policy,
+/// `None` an unknown spelling.
 pub(crate) fn parse_feature_split_pool_entry(raw: &str) -> Option<Option<FeatureSplitPolicy>> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "none" | "off" | "split_none" => Some(None),
@@ -844,8 +805,8 @@ impl Default for RaceConfig {
     }
 }
 
-    /// Fluent builder over [`RaceConfig`], covering options a caller is likely to set;
-    /// untouched fields keep conservative defaults.
+/// Fluent builder over [`RaceConfig`], covering options a caller is likely to set;
+/// untouched fields keep conservative defaults.
 pub struct RaceConfigBuilder {
     cfg: RaceConfig,
 }
@@ -856,12 +817,8 @@ impl RaceConfigBuilder {
         self.cfg.pop_size = n;
         self
     }
-    /// Set steps between checkpoints — the durability tick (frontier states + EVERY live
-    /// net's weights + `ckpt.json` + CSV flush) and the stream's eval-permutation era.
-        /// **`0` = OFF**: no tick and no era rotation (one eternal era), for profiling or a
-        /// smoke run that wants no `nets/` churn from checkpoints. The STOP-time writers are
-        /// unaffected — `elites.json`, the elite/worst artifacts and the final CSV flush still
-        /// land, so a 0-cadence run is still a complete run.
+    /// Set steps between checkpoints — the durability tick (frontier states + EVERY live net's
+    /// weights + `ckpt.json` + CSV flush) and the stream's eval-permutation era.
     pub fn set_run_checkpoint_every(mut self, n: usize) -> Self {
         self.cfg.checkpoint_every = n;
         self
@@ -876,89 +833,36 @@ impl RaceConfigBuilder {
         self.cfg.mutate_rolls = n;
         self
     }
-        /// Crossover replacement policy (crossover-only). `Worst` (default) or `Random`;
-        /// mutation immigrants use `set_mutation_cull_policy`.
+    /// Crossover replacement policy (crossover-only).
     pub fn set_crossover_cull_policy(mut self, policy: CrossCullPolicy) -> Self {
         self.cfg.crossover_cull_policy = policy;
         self
     }
-        /// Mutation replacement policy: who a firing mutation roll evicts before inserting its
-        /// immigrant. Defaults to `Worst` (the enum default and the legacy
-        /// recorded default agree). Mutation-only.
+    /// Mutation replacement policy: who a firing mutation roll evicts before inserting
+    /// immigrant.
     pub fn set_mutation_cull_policy(mut self, policy: MutationCullPolicy) -> Self {
         self.cfg.mutation_cull_policy = policy;
         self
     }
-        /// Elite guard: top-k nets are immune to ALL culls. Minimum 1; elites hold rank, not
-        /// identity.
+    /// Elite guard: top-k nets are immune to ALL culls. Minimum 1; elites hold rank,
+    /// identity.
     pub fn set_elite_count(mut self, n: usize) -> Self {
         self.cfg.elite_count = n.max(1);
         self
     }
-        /// ANTI-DEVOLUTION A — elite freeze: the top-`elite_count` nets are exempt from the
-        /// trainer call (frozen, but still scored/ranked/parents). Default `true`.
+    /// ANTI-DEVOLUTION A — elite freeze: the top-`elite_count` nets are exempt
+    /// trainer call (frozen, but still scored/ranked/parents). Default `true`.
     pub fn set_elite_freeze(mut self, yes: bool) -> Self {
         self.cfg.freeze_elites = yes;
         self
     }
-        /// EXPERIMENTAL: the train-eval lottery's strength Ω (default `0.0` = OFF, every
-        /// non-frozen net runs every clock).
-        ///
-        /// Ω is an ALLOCATION dial, not a merit scale, and it is λ-shaped: `0.0` means
-        /// the engine may as well not know about the lottery (no coin, no idle clocks,
-        /// no ledger entries), `1.0` is the full merit weighting, and anything between
-        /// withholds that fraction of the tickets the field would have withheld. It is
-        /// implemented on `p` itself — `p_eff = 1 − Ω·(1 − p)` — because `p` is a min-max
-        /// FRACTION of the field: multiplying the merits by Ω would cancel in that
-        /// fraction and leave no middle. Scaling the withholding does not: at `Ω = 0.5`
-        /// the worst net keeps a 0.5 chance rather than a permanent 0.
-        ///
-        /// With Ω > 0, each non-crown net's clock is a weighted coin for a TRAIN-EVAL
-        /// TICKET — it runs the trainer (optimizer update AND the evaluation after it,
-        /// which live in one `train_step`) or it IDLES, doing neither, so its reading,
-        /// its update count and its merit are unchanged. `p` is the net's **merit** —
-        /// its FINAL fitness (the same risk-adjusted `smt = μ − λσ` the ranking uses, so
-        /// a risky net already paid for its spread) divided by the clocks that actually
-        /// trained and scored it (`state.step` plus its crown act-and-measure passes; an
-        /// idle clock is not in there) — mapped onto `[0, 1]` against the population's
-        /// own spread, so 1 is the best score-per-ticket and 0 the worst. Spending a
-        /// ticket grows a net's denominator, so its merit decays and the budget rotates:
-        /// a self-limiting allocation, not a leader lock-in.
-        ///
-        /// Two floors by design: a net inside its born shield (`on_probation`) and a
-        /// crown member always get the ticket, and a net with no ticket yet has no ratio
-        /// to grade. The draw is deterministic in `(run_seed, clock, net hash)` at a
-        /// FIXED Ω — never the loop order — so a resume replays the same decisions; a
-        /// resume at a different Ω is refused by name (the idle ledger describes a
-        /// different search).
+    /// The train-eval lottery's strength Ω (default [`DEFAULT_TRAIN_MERIT`] = `0.75`; `0.0` = OFF,
+    /// every non-frozen net runs every clock).
     pub fn set_run_train_merit(mut self, omega: f32) -> Self {
         self.cfg.train_merit = omega.clamp(0.0, 1.0);
         self
     }
-        /// Share of the dataset held out for EVAL — the rows the race ranks on and
-        /// never trains on. Default [`DEFAULT_EVAL_SHARE`] = `0.2` (80/20), clamped
-        /// to `0.01 …= 0.9` so neither pool can round to empty. A single-pool dir
-        /// only: a dir with `train/` + `test/` subdirs takes the explicit layout and
-        /// ignores it.
-        ///
-        /// This is the knob a caller turns to decide whether gras splits at all: at
-        /// `0.01` the search learns on ~99% of the rows and ranks on a small probe;
-        /// at `0.5` the judge is half the data and the train pool is the other half.
-        /// Replay-relevant: the pools are built from it at run start and recorded in
-        /// `engine.json`, so a resume reuses the run's own share.
-    pub fn set_run_eval_share(mut self, share: f32) -> Self {
-        self.cfg.eval_share = if share.is_finite() {
-            share.clamp(EVAL_SHARE_MIN, EVAL_SHARE_MAX)
-        } else {
-            DEFAULT_EVAL_SHARE
-        };
-        self
-    }
-        /// The lottery's merit floor `p_min` (default `0.05`, `0.0` = the pre-floor
-        /// arithmetic). The worst net in the field keeps this share of clocks even when
-        /// its fraction is exactly 0, so the search never spends a run on a net it has
-        /// stopped measuring; the floor sits UNDER Ω, so `Ω = 0` still means "everybody
-        /// trains every clock". Replay-relevant: a resume at another value warns by name.
+    /// The lottery's merit floor `p_min` (default `0.05`, `0.0` = the pre-floor arithmetic).
     pub fn set_run_train_merit_p_min(mut self, p_min: f32) -> Self {
         self.cfg.train_merit_p_min = if p_min.is_finite() {
             p_min.clamp(0.0, 1.0)
@@ -967,18 +871,23 @@ impl RaceConfigBuilder {
         };
         self
     }
-        /// DRIFT on a crossover child's inherited genes (default `0.0` = exact inheritance).
-        /// ONE probability for the whole family — every slot in [`RaceConfig::drift_prob`],
-        /// mask bits and node genes alike — because it is one idea: crossover can only
-        /// DONATE an allele, so drift is the only way an inherited one ever gets edited.
-        /// Clamped to `0.0..=1.0`; non-finite ⇒ the default.
-        ///
-        /// Size it against what it moves: mask slots are counted per ROW WIDTH (`input_dim`
-        /// per port, `784` on MNIST), node slots against ~`3 × hidden nodes`. `0.05` on a
-        /// 4-feature, 10-node cartpole net is ~2 mask flips and ~1.5 gene edits per child.
-        /// `0.5` is a pool draw wearing a drift label — keep it to a few edits per child.
-        /// Replay-safe by construction (each family draws from its own salted stream derived
-        /// from the run seed, never the shared stream).
+    /// CEILING `p_max` on the lottery fraction: the best-graded net's share of clocks (default
+    /// `1.0` = no ceiling).
+    pub fn set_run_train_merit_p_max(mut self, p_max: f32) -> Self {
+        self.cfg.train_merit_p_max = if p_max.is_finite() {
+            p_max.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_TRAIN_MERIT_P_MAX
+        };
+        self
+    }
+    /// INVERT the lottery so the LEAST fit net earns the most tickets (default
+    /// [`DEFAULT_TRAIN_MERIT_INVERTED`] = `true`; `false` = the merit ordering).
+    pub fn set_run_train_merit_inverted(mut self, yes: bool) -> Self {
+        self.cfg.train_merit_inverted = yes;
+        self
+    }
+    /// DRIFT on a crossover child's inherited genes (default `0.0` = exact inheritance).
     pub fn set_topology_drift(mut self, p: f32) -> Self {
         self.cfg.drift_prob = if p.is_finite() {
             p.clamp(0.0, 1.0)
@@ -987,18 +896,33 @@ impl RaceConfigBuilder {
         };
         self
     }
-        /// Per-net smoothed-fitness rolling window (K). Default [`SMOOTHING_WINDOW`] = 10.
-        /// Replay-relevant: a resumed run must use the same value or construction fails parity.
+    /// Per-net smoothed-fitness rolling window (K). Default [`SMOOTHING_WINDOW`] = 10.
+    /// Replay-relevant: a resumed run must use the same value or construction fails parity.
     pub fn set_run_smoothing_window(mut self, k: usize) -> Self {
         self.cfg.smoothing_window = k.max(1);
         self
     }
-        /// Risk aversion λ (FIT) — how many window standard deviations a net pays for its own
-        /// spread, so a steady net outranks a volatile one with the same window mean.
-        /// Default [`RISK_AVERSION`] = 1.0; `0.0` restores the plain-mean ranking exactly.
-        /// Negative values clamp to 0.0 (a risk-SEEKING ranking is not offered) and a
-        /// non-finite λ falls back to the default. Replay-relevant: a resumed run must use
-        /// the same value or construction fails parity.
+    /// Recency ramp r for the smoothing window (`window_recency`).
+    pub fn set_run_train_age(mut self, armed: bool) -> Self {
+        self.cfg.train_age = armed;
+        self
+    }
+
+    pub fn set_run_window_recency(mut self, r: f32) -> Self {
+        self.cfg.window_recency = if r.is_finite() {
+            r.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_WINDOW_RECENCY
+        };
+        self
+    }
+    /// How the window's readings are averaged into the ranking centre (`mean_type`).
+    pub fn set_run_mean_type(mut self, mean_type: MeanType) -> Self {
+        self.cfg.mean_type = mean_type;
+        self
+    }
+    /// Risk aversion λ (FIT) — how many window standard deviations a net pays for its own spread,
+    /// so a steady net outranks a volatile one with the same window mean.
     pub fn set_run_risk_aversion(mut self, lambda: f32) -> Self {
         self.cfg.risk_aversion = if lambda.is_finite() {
             lambda.max(0.0)
@@ -1007,8 +931,8 @@ impl RaceConfigBuilder {
         };
         self
     }
-        /// A user-supplied stop predicate, consulted every step alongside `max_steps`;
-        /// returning `true` ends the race with stop reason `Custom`.
+    /// A user-supplied stop predicate, consulted every step alongside `max_steps`;
+    /// returning `true` ends the race with stop reason `Custom`.
     pub fn set_stop_custom(
         mut self,
         f: impl Fn(&RaceSnapshot) -> bool + Send + Sync + 'static,
@@ -1016,8 +940,8 @@ impl RaceConfigBuilder {
         self.cfg.custom_stop = Some(Box::new(f));
         self
     }
-        /// Crossover operator pool, drawn uniformly per attempt; empty (default) ⇒ both.
-        /// Takes owned or borrowed strings.
+    /// Crossover operator pool, drawn uniformly per attempt; empty (default) ⇒ both.
+    /// Takes owned or borrowed strings.
     pub fn set_crossover_ops_pool<I, S>(mut self, ops: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1026,45 +950,24 @@ impl RaceConfigBuilder {
         self.cfg.crossover_ops_pool = ops.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
-        /// Parent-selection method for the crossover draw. Default
-        /// [`SelectionMethod::Roulette`] — what every run drew before this knob existed,
-        /// so an untouched builder changes nothing.
-        ///
-        /// `Tournament { tournament_size: k }` holds `k` uniform draws per parent and
-        /// keeps the best under the run's direction. `k = 1` is a plain uniform draw;
-        /// a larger `k` increasingly favours the best (the leader's win rate goes from
-        /// `1/n` toward 1 — at `k = n` it is already ≈63%, because the entrants are
-        /// drawn WITH replacement). Minimize flips the favourite to the lowest score.
-        ///
-        /// Replay-relevant like K and λ: the two methods consume the roll's RNG stream
-        /// differently and pick different parents, so a resumed run must use the method
-        /// its `engine.json` recorded — a mismatch is refused by name, not patched.
+    /// Parent-selection method for the crossover draw.
     pub fn set_crossover_selection(mut self, method: SelectionMethod) -> Self {
         self.cfg.crossover_selection = method;
         self
     }
-        /// Make the FITTER of the two drawn parents the crossover BASE
-        /// ([`RaceConfig::crossover_fitter_base`]). The operator mutates one parent into
-        /// the child, so the base donates everything the cut does not swap; without this
-        /// the base is the first roulette draw, measured to be the worse parent in roughly
-        /// half of births. On by default — every crossover orders its two parents
-        /// best-first; pass `false` for the raw draw order. Same parents and same RNG
-        /// consumption, only a different recipient.
+    /// Make the FITTER of the two drawn parents the crossover BASE
+    /// ([`RaceConfig::crossover_fitter_base`]).
     pub fn set_crossover_fitter_base(mut self, on: bool) -> Self {
         self.cfg.crossover_fitter_base = on;
         self
     }
-        /// Enable the feature split and choose how the Input node's per-port masks
-        /// are drawn. Unset (`None`, the default) = no split. Off/value rather than a
-        /// bool: the policy IS the value, and "off" is simply not calling this.
+    /// Enable the feature split and choose how the Input node's per-port masks are drawn.
     pub fn set_topology_feature_split(mut self, policy: FeatureSplitPolicy) -> Self {
         self.cfg.feature_split_pool = vec![policy.to_string()];
         self
     }
-        /// The pool a NEWBORN's split is drawn from, in draw order — `["none",
-        /// "random", "exclusive"]` gives every policy a chance, `["exclusive"]` pins
-        /// one, `["none"]` turns the split off. Empty (default) means all three.
-        /// Replay-relevant: which masks a lineage gains is decided here.
+    /// The pool a NEWBORN's split is drawn from, in draw order — `["none", "random", "exclusive"]`
+    /// gives every policy a chance, `["exclusive"]` pins one, `["none"]` turns the split off.
     pub fn set_topology_feature_split_pool<I, S>(mut self, pool: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1073,9 +976,7 @@ impl RaceConfigBuilder {
         self.cfg.feature_split_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
-        /// Explicit step budget — the only built-in stop criterion. Accepts a bare value or an
-        /// `Option`; `None` (default) = run until externally stopped. Budget = clocks RUN:
-        /// `set_stop_max_steps(n)` runs exactly `n` clocks (0..n) before stopping.
+    /// Explicit step budget — the only built-in stop criterion.
     pub fn set_stop_max_steps(mut self, n: impl Into<Option<usize>>) -> Self {
         self.cfg.max_steps = n.into();
         self
@@ -1120,8 +1021,8 @@ impl RaceConfigBuilder {
         self.cfg.standardize_op_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
-        /// Dropout probability applied when building this run's networks (part of
-        /// `TopologyOptions`). TRAIN forwards only.
+    /// Dropout probability applied when building this run's networks (part
+    /// `TopologyOptions`). TRAIN forwards
     pub fn set_topology_dropout_prob(mut self, p: f32) -> Self {
         self.cfg.topology_options.dropout_prob = p;
         self
@@ -1177,15 +1078,15 @@ impl RaceConfigBuilder {
         self.cfg.mutate_prob = v;
         self
     }
-        /// Extra informative (non-ranking) metrics recorded in history.csv and engine.json.
-        /// Never affect selection — the ranking fitness is set separately via `Fitness`.
+    /// Extra informative (non-ranking) metrics recorded in history.csv and engine.json.
+    /// Never affect selection — the ranking fitness is set separately via `Fitness`.
     pub fn set_run_metrics(mut self, metrics: Vec<Metric>) -> Self {
         self.cfg.metrics = metrics;
         self
     }
 
-        /// Human label for the experiment, written as `"run_name"`. Informational only — the
-        /// results folder name is unchanged.
+    /// Human label for the experiment, written as `"run_name"`. Informational only —
+    /// results folder name is unchanged.
     pub fn set_run_name(mut self, name: impl Into<String>) -> Self {
         self.cfg.run_name = Some(name.into());
         self
@@ -1196,41 +1097,32 @@ impl RaceConfigBuilder {
         self.cfg.log_level = level;
         self
     }
-        /// Also write the event stream to `<run_dir>/telemetry.jsonl` (one JSON record per
-        /// event). Off by default.
+    /// Also write the event stream to `<run_dir>/telemetry.jsonl` (one JSON record per
+    /// event). Off by default.
     pub fn set_run_trace_file(mut self, enabled: bool) -> Self {
         self.cfg.trace_file = enabled;
         self
     }
-        /// Set whether to write the lossless event logs (`history.csv` + `attempts.csv`).
-        // NOTE: there is no `set_run_mode` — RunMode is DERIVED from the RunSpec variant.
+    /// Set whether to write the lossless event logs (`history.csv` + `attempts.csv`).
+    // NOTE: there is no `set_run_mode` — RunMode is DERIVED from the RunSpec variant.
     pub fn set_run_csv_export(mut self, enabled: bool) -> Self {
         self.cfg.csv_export = enabled;
         self
     }
-        /// Opt in/out of the automatic inheritance of the newest compatible previous
-        /// experiment's elites (topology-only). ON by default; `false` forces a fresh,
-        /// all-random founder batch.
+    /// Opt in/out of the automatic inheritance of the newest compatible previous experiment's
+    /// elites (topology-only).
     pub fn set_elite_previous_load(mut self, enabled: bool) -> Self {
         self.cfg.elite_previous_load = enabled;
         self
     }
-        /// Where the automatic inheritance looks: a run dir or a dir of run dirs
-        /// (newest id wins). Unset ⇒ the default `results/`.
+    /// Where the automatic inheritance looks: a run dir or a dir of run dirs
+    /// (newest id wins). Unset ⇒ the default `results/`.
     pub fn set_elite_previous_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
         self.cfg.elite_previous_dir = Some(dir.into());
         self
     }
     /// Mutation probation steps: cull-immunity for a random immigrant's first
     /// `k` clocks (see [`RaceConfig::mutation_probation_steps`]). Default 5.
-    /// Write each net's optimizer state at every checkpoint (`nets/<hash>.optim`).
-    /// Default `true` — a resume then continues the SAME optimizer, not a fresh one.
-    /// Pass `false` for weights-only checkpoints: smaller, but a resume restarts the
-    /// moments once (option A), which is visible in the next readings.
-    pub fn set_run_save_optim(mut self, enabled: bool) -> Self {
-        self.cfg.save_optim = enabled;
-        self
-    }
     pub fn set_mutation_probation_steps(mut self, k: usize) -> Self {
         self.cfg.mutation_probation_steps = k;
         self
@@ -1241,14 +1133,14 @@ impl RaceConfigBuilder {
         self.cfg.crossover_probation_steps = k;
         self
     }
-        /// Elite join probation steps: a net cannot become an elite until it has aged `k`
-        /// clocks since arrival. Default `5`.
+    /// Elite join probation steps: a net cannot become an elite until it has aged `k`
+    /// clocks since arrival. Default `5`.
     pub fn set_elite_join_probation_steps(mut self, k: usize) -> Self {
         self.cfg.elite_join_probation_steps = k;
         self
     }
-        /// Elite crown lifetime: how long a net may stay at peak on the frozen crown before
-        /// age-elimination. Default `5`.
+    /// Elite crown lifetime: how long a net may stay at peak on the frozen crown before
+    /// age-elimination. Default `5`.
     pub fn set_elite_crown_lifetime_steps(mut self, k: usize) -> Self {
         self.cfg.elite_crown_lifetime_steps = k;
         self
@@ -1259,14 +1151,6 @@ impl RaceConfigBuilder {
         self.cfg.elite_save_topology = enabled;
         self
     }
-        /// At stop, ALSO save the `elite_count` WORST live nets' topology markdown, one
-        /// `worst-<hash>.md` per net. Useful for diffing what the search avoided. Default
-        /// false. The count mirrors `set_elite_count` (both ends of the ranking keep the
-        /// same number of nets), and no net is saved as both an elite and a worst.
-    pub fn set_worst_save_topology(mut self, enabled: bool) -> Self {
-        self.cfg.worst_save_topology = enabled;
-        self
-    }
     /// Finish and return the configured [`RaceConfig`].
     pub fn build(self) -> RaceConfig {
         self.cfg
@@ -1275,9 +1159,6 @@ impl RaceConfigBuilder {
 
 impl RaceConfig {
     /// Parse an activation label (the `Display` form: "relu", "gelu", …).
-    ///
-    /// `pub(crate)` because the pool interface reads it: the parser stays with the
-    /// vocabulary, [`super::pool`] owns the loop over the entries.
     pub(crate) fn parse_activation(s: &str) -> Result<crate::graph::node::Activation, String> {
         use crate::graph::node::Activation::*;
         Ok(match s.to_lowercase().as_str() {
@@ -1319,18 +1200,13 @@ impl RaceConfig {
         })
     }
 
-        /// Resolve the crossover operator pool: the configured labels validated, or both when
-        /// empty. Unknown labels error at run start.
-        ///
-        /// The five `resolved_*` readers below are one-liners over [`super::pool`], which owns
-        /// the shared rules (`empty ⇒ all`, parse each, refuse by name, one wire spelling).
-        /// The signatures are unchanged on purpose: this is the public reader.
+    /// Resolve the crossover operator pool: the configured labels validated, or both when empty.
     pub fn resolved_crossover_ops(&self) -> Result<Vec<CrossoverOp>, String> {
         super::pool::resolve::<super::pool::CrossoverOpsPool>(self)
     }
 
-        /// Resolve the activation pool: the configured labels parsed, or all known activations
-        /// when empty. Unknown labels error at run start.
+    /// Resolve the activation pool: the configured labels parsed, or all known activations
+    /// when empty. Unknown labels error at run start.
     pub fn resolved_activation_pool(&self) -> Result<Vec<crate::graph::node::Activation>, String> {
         super::pool::resolve::<super::pool::ActivationPool>(self)
     }
@@ -1349,19 +1225,7 @@ impl RaceConfig {
         super::pool::resolve::<super::pool::StandardizePool>(self)
     }
 
-        /// Check every NAME-based pool once, before a single net is drawn.
-        ///
-        /// Every `resolved_*` resolver above returns `Result`, but the draw paths cannot
-        /// (a topology draw is infallible), so each one falls back to the FULL default
-        /// pool. That fallback is right for an EMPTY pool (`empty ⇒ all`) and wrong for a
-        /// TYPO: `["rondom"]` used to draw all three policies while `engine.json` recorded
-        /// a pool that was never drawn — the log described a run nobody performed. The
-        /// engine calls this at construction, which is the last moment a bad name can be
-        /// named instead of quietly changing the search. Every bad entry is reported at
-        /// once, so one run start fixes all of them.
-        ///
-        /// One rule, five pools: each refusal already names its own field
-        /// ([`super::pool::SearchPool::LABEL`]), so this only joins them.
+    /// Check every NAME-based pool once, before a single net is drawn.
     pub fn validate_search_pools(&self) -> Result<(), String> {
         let errors: Vec<String> = [
             super::pool::error::<super::pool::CrossoverOpsPool>(self),
@@ -1379,16 +1243,14 @@ impl RaceConfig {
             Err(errors.join("; "))
         }
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use super::{LogLevel, RISK_AVERSION, RaceConfig};
 
-        /// The examples' `--log-level` vocabulary must parse: handed to an `EnvFilter`
-        /// verbatim, `summ` would be read as a module name and mute the whole run — this
-        /// mapping is load-bearing.
+    /// The examples' `--log-level` vocabulary must parse: handed to an `EnvFilter` verbatim, `summ`
+    /// would be read as a module name and mute the whole run — this mapping is load-bearing.
     #[test]
     fn log_level_names_parse_to_a_visible_verbosity() {
         assert_eq!(LogLevel::parse("summ"), Some(LogLevel::Summ));
@@ -1405,11 +1267,7 @@ mod tests {
         assert_eq!(LogLevel::None.env_filter(), "warn");
     }
 
-        /// A pool NAME is either drawable or a refusal — never silently widened.
-        /// Before: `["rondom"]` drew all three policies while `feature_split_pool_names()`
-        /// reported `["none"]`, so `engine.json` described a run nobody performed. After:
-        /// `validate_search_pools()` names the typo once, with every bad pool in one
-        /// message, and an EMPTY pool stays legal (`empty ⇒ all`).
+    /// A pool NAME is either drawable or a refusal — never silently widened.
     #[test]
     fn an_unparseable_pool_name_is_an_error_not_a_fallback() {
         // Empty pools are the documented "all" and must keep validating.
@@ -1437,22 +1295,31 @@ mod tests {
             ..RaceConfig::defaults()
         };
         let err = many.validate_search_pools().expect_err("three typos");
-        for needle in ["feature_split_pool", "activation_pool", "crossover_ops_pool"] {
+        for needle in [
+            "feature_split_pool",
+            "activation_pool",
+            "crossover_ops_pool",
+        ] {
             assert!(err.contains(needle), "{needle} missing from: {err}");
         }
     }
 
-        /// Pool entries are matched by WHOLE NAME, like `activation_pool` and
-        /// `combine_op_pool` — a substring test turns names nobody offers into policies
-        /// (`"nonexclusive"` → `none`, because `contains("none")` won).
+    /// Pool entries are matched by WHOLE NAME, like `activation_pool` and `combine_op_pool` —
+    /// substring test turns names nobody offers into policies (`"nonexclusive"` → `none`, because
     #[test]
     fn feature_split_pool_entries_match_whole_names() {
         use super::parse_feature_split_pool_entry as parse;
         // The drawable vocabulary plus the `split_*` spellings `engine.json` records.
         assert_eq!(parse("none"), Some(None));
         assert_eq!(parse("off"), Some(None));
-        assert_eq!(parse("random"), Some(Some(super::FeatureSplitPolicy::Random)));
-        assert_eq!(parse("split_random"), Some(Some(super::FeatureSplitPolicy::Random)));
+        assert_eq!(
+            parse("random"),
+            Some(Some(super::FeatureSplitPolicy::Random))
+        );
+        assert_eq!(
+            parse("split_random"),
+            Some(Some(super::FeatureSplitPolicy::Random))
+        );
         assert_eq!(
             parse("Exclusive"),
             Some(Some(super::FeatureSplitPolicy::Exclusive))
@@ -1478,13 +1345,11 @@ mod tests {
         assert!(cfg.validate_search_pools().is_err());
     }
 
-        /// FIT's one knob: the default is the risk-adjusted ranking, `0.0` is the
-        /// documented OFF switch (the pre-FIT plain mean), negatives clamp to `0.0`
-        /// (no risk-SEEKING ranking exists) and a non-finite λ falls back to the
-        /// default rather than poisoning every comparison with NaN.
+    /// FIT's one knob: the default is the risk-adjusted ranking, `0.0` is the documented OFF switch
+    /// (the pre-FIT plain mean), negatives clamp to `0.0` (no risk-SEEKING ranking exists)
     #[test]
     fn risk_aversion_defaults_on_and_clamps_at_off() {
-        // Default: the risk term is ON.
+        // Default: the risk term
         assert_eq!(RaceConfig::defaults().risk_aversion, RISK_AVERSION);
         assert!(RISK_AVERSION > 0.0, "the feature ships enabled");
         let set = |lambda: f32| {
@@ -1505,16 +1370,15 @@ mod tests {
         assert_eq!(set(f32::NEG_INFINITY), RISK_AVERSION);
     }
 
-        /// The parent draw's default must be the method every pre-knob run actually
-        /// used (roulette), so an untouched builder is a zero-behavior-change surface;
-        /// the tournament arm must survive the round-trip untouched.
+    /// The parent draw defaults to the reference loop's tournament of 2; the tournament arm must
+    /// survive the round-trip untouched, and roulette stays expressible for a caller that wants
     #[test]
-    fn crossover_selection_defaults_to_roulette_and_round_trips() {
+    fn crossover_selection_defaults_to_tournament_two_and_round_trips() {
         use crate::evolution::selection::SelectionMethod;
         assert_eq!(
             RaceConfig::defaults().crossover_selection,
-            SelectionMethod::Roulette,
-            "the knob's default is the engine's historical draw"
+            SelectionMethod::Tournament { tournament_size: 2 },
+            "the knob's default is the reference loop's draw"
         );
         let cfg = RaceConfig::builder()
             .set_crossover_selection(SelectionMethod::Tournament { tournament_size: 3 })
@@ -1528,11 +1392,11 @@ mod tests {
         assert_eq!(SelectionMethod::Roulette.to_string(), "roulette");
     }
 
-        /// The stop field setters are mutually exclusive BY CONSTRUCTION: each write clears its
-        /// sibling, so "const default then flag wins" composes.
+    /// The stop field setters are mutually exclusive BY CONSTRUCTION: each write clears
+    /// sibling, so "const default then flag wins" composes.
     #[test]
     fn stop_setters_are_exclusive_last_writer_wins() {
-        // (the old max_target_fitness exclusivity test shrank with the
+        // (the old max_target_fitness exclusivity test shrank
         // feature's deletion — only the step budget remains)
         let cfg = RaceConfig::builder().set_stop_max_steps(15).build();
         assert_eq!(cfg.max_steps, Some(15));

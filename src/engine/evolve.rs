@@ -1,15 +1,4 @@
 //! Evolution: the two independent roll groups that reshape the population.
-//!
-//! - **Crossover** (`evolve_crossover_child`): a recombined child, inserted
-//!   fresh (no replay) and evicting a victim per `CrossCullPolicy`. A draw that
-//!   produces nothing is a SPENT ROLL — no cull, no random fallback (random
-//!   whole nets enter only via the mutation channel).
-//! - **Mutation** (`evolve_random_immigrant`): a fresh random topology, evicting
-//!   a victim per `MutationCullPolicy`.
-//!
-//! Both share the cull/insert primitives here: `pre_insert_buffer`,
-//! `insert_child`, `cull_net`, and the victim selectors (elite-guarded,
-//! probation-aware, deterministic from `(run_seed, clock, salt)`).
 
 use flodl::tensor::{Result, TensorError};
 use tracing::info;
@@ -26,7 +15,7 @@ fn is_crossover_origin(created_from: Option<&str>) -> bool {
     created_from.is_some_and(|s| s.starts_with("crossover"))
 }
 
-/// Which roll group a roll belongs to. Kept apart so a crossover roll and a
+/// Which roll group a roll belongs to. Kept apart so a crossover roll
 /// mutation roll at the same `(clock, roll)` never draw the same number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RollKind {
@@ -43,8 +32,8 @@ const ROLL_STREAM_CROSSOVER: u64 = 0x5A5A_0000_0000_00C1;
 const ROLL_STREAM_MUTATION: u64 = 0x5A5A_0000_0000_003D;
 
 impl RollKind {
-        /// The seed a fire check (or victim draw) for this roll derives from —
-        /// `clock * 1024 + roll` in this roll group's lane, so skips don't shift.
+    /// The seed a fire check (or victim draw) for this roll derives from —
+    /// `clock * 1024 + roll` in this roll group's lane, so skips don't shift.
     fn seed(self, run_seed: u64, clock: usize, roll: usize) -> u64 {
         let tag = match self {
             RollKind::Crossover => ROLL_STREAM_CROSSOVER,
@@ -54,11 +43,8 @@ impl RollKind {
     }
 }
 
-/// The crossover line's parent note: the operator kind, the parents at the same
-/// 8-hex width as every other identity on the line, and — for `uniform` — how many
-/// genes the operator actually exchanged, so a child can be matched to its parents
-/// by eye and the mixing rate read off the line. Lineage strings look like
-/// `crossover-uniform:swapped=3/6:parents=<h1>,<h2>[+mut]` or `clone:parents=<h1>`.
+/// The crossover line's parent note: the operator kind, the parents at the same 8-hex width
+/// every other identity on the line, and how many genes the operator actually exchanged (both
 fn lineage_note(created_from: &str) -> String {
     let (head, mutated) = match created_from.strip_suffix("+mut") {
         Some(h) => (h, true),
@@ -79,9 +65,7 @@ fn lineage_note(created_from: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let suffix = if mutated { "+mut" } else { "" };
-    let swaps = swapped
-        .map(|n| format!("; swaps {n}"))
-        .unwrap_or_default();
+    let swaps = swapped.map(|n| format!("; swaps {n}")).unwrap_or_default();
     if parents.is_empty() {
         format!("{kind}{swaps}{suffix}")
     } else {
@@ -90,8 +74,8 @@ fn lineage_note(created_from: &str) -> String {
 }
 
 impl CoreEngine {
-        /// Fresh empty rolling buffer for a net about to be inserted, so its per-step
-        /// pushes land somewhere.
+    /// Fresh empty rolling buffer for a net about to be inserted, so its per-step
+    /// pushes land somewhere.
     fn pre_insert_buffer(&mut self, hash: &str) {
         self.rolling_fitness.insert(
             hash.to_string(),
@@ -107,8 +91,8 @@ impl CoreEngine {
         );
     }
 
-        /// A guaranteed-fresh random child (mutation path): roll `random_child`
-        /// directly (the caller already resolved the branch), re-rolling on duplicates.
+    /// A guaranteed-fresh random child (mutation path): roll `random_child`
+    /// directly (the caller already resolved the branch), re-rolling on duplicates.
     fn generate_random_at(&mut self, clock: usize, start_idx: usize) -> Result<RaceChild> {
         for attempt in 0..8 {
             let child = self.random_child(clock, start_idx + attempt)?;
@@ -142,22 +126,22 @@ impl CoreEngine {
             .insert(child.state.hash.clone(), child.optimizer);
     }
 
-        /// One crossover roll: generate a child, cull a victim, insert the child fresh
-        /// (no replay, no checkpoint gate).
+    /// One crossover roll: generate a child, cull a victim, insert the child fresh
+    /// (no replay, no checkpoint gate).
     pub(crate) fn evolve_crossover_child(
         &mut self,
         clock: usize,
         _roll: usize,
         attempt: usize,
     ) -> Result<RollOutcome> {
-            // HARD SHIELD before any work: with no cull-eligible slot the child would
-            // have nowhere to go, so the roll is spent up front.
+        // HARD SHIELD before any work: with no cull-eligible slot the child would
+        // have nowhere to go, so the roll is spent up front.
         if !self.has_cull_eligible() {
             return Ok(RollOutcome::no_slot(self.no_cull_roll_detail("crossover")));
         }
         let idx = self.next_child_ordinal(clock);
-        // Ok(spent) = spent roll (crossover produced nothing viable or a
-        // duplicate of a live net): no cull, no insert, move on.
+        // Ok(spent) = spent roll (crossover produced nothing viable
+        // duplicate of a live net): no cull, no insert, move
         let mut child = match self.generate_child(clock, idx)? {
             Some(c) => c,
             None => {
@@ -169,8 +153,8 @@ impl CoreEngine {
             }
         };
         if self.state.net(&child.state.hash).is_some() {
-                // Duplicate of a live topology → the roll is spent: discard, no
-                // replacement. Random whole nets enter only via mutation.
+            // Duplicate of a live topology → the roll is spent: discard, no
+            // replacement. Random whole nets enter only via mutation.
             self.record_attempt(
                 clock,
                 "crossover",
@@ -189,7 +173,7 @@ impl CoreEngine {
             )));
         }
 
-        // A newborn joins fresh: step 0, no replay — its first optimizer update is the
+        // A newborn joins fresh: step 0, no replay — its first optimizer update
         // next group step.
         self.pre_insert_buffer(&child.state.hash);
         {
@@ -208,9 +192,10 @@ impl CoreEngine {
                 crate::engine::config::CrossCullPolicy::Random => {
                     self.select_random_victim(clock)?
                 }
+                crate::engine::config::CrossCullPolicy::Unfed => self.select_unfed_victim(clock)?,
             };
-                // Defensive: a `None` victim means the selection filter disagreed —
-                // discard the child and spend the roll (probation is never broken).
+            // Defensive: a `None` victim means the selection filter disagreed —
+            // discard the child and spend the roll (probation is never broken).
             if victim_for_log.is_none() {
                 self.rolling_fitness.remove(&child.state.hash);
                 self.rolling_train.remove(&child.state.hash);
@@ -234,7 +219,7 @@ impl CoreEngine {
                 victim_net_seed,
             );
             // The population the victim was the worst OF — read before the cull,
-            // because `cull_net` shrinks it.
+            // because `cull_net` shrinks
             let live_before = self.state.live_count();
             match self.config.crossover_cull_policy {
                 crate::engine::config::CrossCullPolicy::Worst => {
@@ -247,11 +232,15 @@ impl CoreEngine {
                         self.cull_net(victim, clock, "crossover-random")?;
                     }
                 }
+                crate::engine::config::CrossCullPolicy::Unfed => {
+                    if let Some(victim) = &victim_for_log {
+                        self.cull_net(victim, clock, "crossover-unfed")?;
+                    }
+                }
             }
-                // The operator's own exchange count, tallied as the child is ADMITTED:
-                // a pairing that produced no child (zero swaps, mismatched shapes) never
-                // reaches here, so `births` counts real mixing events only.
-            if let Some(rep) = child.cx {
+            // The operator's own exchange count, tallied as the child is ADMITTED: a pairing
+            // produced no child (zero swaps, mismatched shapes) never reaches here, so `births`
+            if let Some(ref rep) = child.cx {
                 self.accounting.uniform_cx_births += 1;
                 self.accounting.uniform_cx_swaps += rep.swaps;
                 self.accounting.uniform_cx_pairs += rep.pairs;
@@ -262,6 +251,9 @@ impl CoreEngine {
                     format!("lowest score of {live_before}")
                 }
                 crate::engine::config::CrossCullPolicy::Random => "random draw".to_string(),
+                crate::engine::config::CrossCullPolicy::Unfed => {
+                    format!("fewest tickets of {live_before}")
+                }
             };
             return Ok(RollOutcome::survived(format!(
                 "child {} ({}) │ culled {} ({victim_note}) │ first step at {clock}",
@@ -275,8 +267,8 @@ impl CoreEngine {
         }
     }
 
-        /// Append one evolution-event row to the `attempts.csv` buffer: every attempt
-        /// is recorded (inserted or rejected), so the failed-draw rate stays queryable.
+    /// Append one evolution-event row to the `attempts.csv` buffer: every attempt
+    /// is recorded (inserted or rejected), so the failed-draw rate stays queryable.
     #[allow(clippy::too_many_arguments)] // one row of the attempt ledger — fields, not logic
     pub(crate) fn record_attempt(
         &mut self,
@@ -294,8 +286,8 @@ impl CoreEngine {
         if !self.config.csv_export {
             return;
         }
-            // `attempts.csv` columns (see `flush_csv_exports`) with FULL hashes +
-            // net_seed — (hash, net_seed) is the unique individual key.
+        // `attempts.csv` columns (see `flush_csv_exports`) with FULL hashes +
+        // net_seed — (hash, net_seed) is the unique individual key.
         let row = format!(
             "{},{},{},{},{},{},{},{},{},{},{}\n",
             step,
@@ -313,8 +305,8 @@ impl CoreEngine {
         self.attempts_csv_buffer.push_str(&row);
     }
 
-        /// Uniformly random **cullable** live net (the `Random` arm of both policies):
-        /// deterministic in `(run_seed, clock, salt)`; elites/probation excluded.
+    /// Uniformly random **cullable** live net (the `Random` arm of both policies):
+    /// deterministic in `(run_seed, clock, salt)`; elites/probation excluded.
     fn select_random_victim_at(&self, clock: usize, salt: usize) -> Result<Option<String>> {
         let elite = self.elite_hashes();
         // The param `clock` is the SALTED seed input; the probation check needs
@@ -337,14 +329,14 @@ impl CoreEngine {
         Ok(Some(hashes[idx].clone()))
     }
 
-        /// [`Self::select_random_victim_at`] with salt 0 — the crossover path's original
-        /// derivation, kept verbatim so its victim draws are unchanged.
+    /// [`Self::select_random_victim_at`] with salt 0 — the crossover path's original
+    /// derivation, kept verbatim so its victim draws are unchanged.
     pub(crate) fn select_random_victim(&self, clock: usize) -> Result<Option<String>> {
         self.select_random_victim_at(clock, 0)
     }
 
-        /// Whether ANY live net is cull-eligible right now (non-elite AND past
-        /// probation). Consulted before building a child, so the check saves work.
+    /// Whether ANY live net is cull-eligible right now (non-elite AND past
+    /// probation). Consulted before building a child, so the check saves work.
     pub(crate) fn has_cull_eligible(&self) -> bool {
         let elite = self.elite_hashes();
         let now = self.step_clock();
@@ -354,7 +346,7 @@ impl CoreEngine {
             .any(|h| !elite.contains(h) && !self.on_probation(h, now))
     }
 
-    /// The one-line detail for a roll skipped by the hard shield — shared by
+    /// The one-line detail for a roll skipped by the hard shield — shared
     /// both channels so the log reads identically.
     pub(crate) fn no_cull_roll_detail(&self, branch: &str) -> String {
         let k = if branch == "crossover" {
@@ -367,8 +359,8 @@ impl CoreEngine {
         )
     }
 
-        /// The mutation channel's victim, per `MutationCullPolicy`. Every arm is
-        /// probation-aware and the shield is HARD: `None` = skip the roll.
+    /// The mutation channel's victim, per `MutationCullPolicy`. Every arm
+    /// probation-aware and the shield is HARD: `None` = skip the roll.
     pub(crate) fn select_mutation_victim(
         &self,
         clock: usize,
@@ -380,8 +372,11 @@ impl CoreEngine {
                 .select_inverse_proportional_at(clock, roll)?
                 .or_else(|| self.mutation_victim_fallback()),
             MutationCullPolicy::Worst => self.mutation_victim_fallback(),
-                    // Salt `roll + 1`: the crossover path draws with salt 0, so a mutation
-                    // roll never mirrors a crossover victim.
+            // The SAME selector the crossover channel's `Unfed` arm runs: the loop that starves
+            // net closes on both channels, so a net the lottery never feeds loses its place
+            MutationCullPolicy::Unfed => self.select_unfed_victim(clock)?,
+            // Salt `roll + 1`: the crossover path draws with salt 0, so a mutation
+            // roll never mirrors a crossover victim.
             MutationCullPolicy::Random => self
                 .select_random_victim_at(clock, roll + 1)?
                 .or_else(|| self.mutation_victim_fallback()),
@@ -389,26 +384,26 @@ impl CoreEngine {
         Ok(picked)
     }
 
-        /// Mutation victim last resorts: worst by smoothed fitness, else first live
-        /// hash. `None` only when the population is empty.
+    /// Mutation victim last resorts: worst by smoothed fitness, else first live
+    /// hash. `None` only when the population is empty.
     fn mutation_victim_fallback(&self) -> Option<String> {
         let clock = self.step_clock();
         let elite = self.elite_hashes();
-            // `&str` over `&String`: the closures only look up the hash, and `elite` is
-            // a tiny Vec — a linear `iter().any` beats forcing `Vec::contains`.
+        // `&str` over `&String`: the closures only look up the hash, and `elite`
+        // a tiny Vec — a linear `iter().any` beats forcing `Vec::contains`.
         let eligible = |h: &str| !elite.iter().any(|e| e == h);
         let off_probation = |h: &str| !self.on_probation(h, clock);
         let live = self.state.live_hashes();
-            // The worst non-elite net that has ALSO served its channel probation; no
-            // "first live" fallback — when nobody qualifies the caller SKIPS the roll.
+        // The worst non-elite net that has ALSO served its channel probation; no
+        // "first live" fallback — when nobody qualifies the caller SKIPS the roll.
         self.worst_nets_by_smoothed_fitness(live.len())
             .ok()?
             .into_iter()
             .find(|h| eligible(h) && off_probation(h))
     }
 
-        /// One mutation roll: cull a net inversely-proportionate to fitness and insert a
-        /// fully-random immigrant, fresh from the current clock.
+    /// One mutation roll: cull a net per `MutationCullPolicy` (worst, fitness-inverse, random
+    /// lottery-unfed) and insert a fully-random immigrant, fresh from the current clock.
     pub(crate) fn evolve_random_immigrant(
         &mut self,
         clock: usize,
@@ -418,9 +413,8 @@ impl CoreEngine {
         if !self.has_cull_eligible() {
             return Ok(None);
         }
-            // Pick a victim per the mutation cull policy (`Worst` default,
-            // `InverseFitness`, `Random`); the elite guard and probation shield apply in
-            // every arm.
+        // Pick a victim per the mutation cull policy (`Worst` default, `InverseFitness`, `Random`);
+        // the elite guard and probation shield apply in every arm.
         let Some(victim) = self.select_mutation_victim(clock, roll)? else {
             return Ok(None);
         };
@@ -428,8 +422,8 @@ impl CoreEngine {
         let idx = self.next_child_ordinal(clock);
         let mut child = self.generate_random_at(clock, idx)?;
         self.pre_insert_buffer(&child.state.hash);
-            // A newborn immigrant joins fresh: step 0, no replay. Empty buffers mean "no
-            // verdict yet"; its first optimizer update is the next group step.
+        // A newborn immigrant joins fresh: step 0, no replay. Empty buffers mean "no
+        // verdict yet"; its first optimizer update is the next group step.
         child.state.step = 0;
         child.state.last_metrics = None;
         let detail = format!(
@@ -463,18 +457,15 @@ impl CoreEngine {
 
     /// Cull one net: final state snapshot to disk, drop from all live maps.
     pub(crate) fn cull_net(&mut self, hash: &str, clock: usize, reason: &str) -> Result<()> {
-        // NO per-event log here: culls are reported on the calling roll's
-        // single line (crossover/mutation) — one roll, one line.
-        // The tombstone records all three legs of the reading it died with: the
-        // readable window mean, its spread, and the risk-adjusted score it was
-        // actually ranked by (FIT). An unmeasured net records NaN throughout.
+        // NO per-event log here: culls are reported on the calling roll's single line
+        // (crossover/mutation) — one roll, one line.
         let reading = self.race_reading_of(hash);
         let smoothed = reading.map(|r| r.mean).unwrap_or(f32::NAN);
         let smoothed_std = reading.map(|r| r.std);
         let risk_score = self.smoothed_fitness_of(hash);
         let samples = reading.map(|r| r.n).unwrap_or(0);
-            // The run's accounting tallies culls by the slot freed — the one funnel
-            // every cull passes through.
+        // The run's accounting tallies culls by the slot freed — the one funnel
+        // every cull passes through.
         self.accounting.culls += 1;
         match reason {
             "crossover" => self.accounting.culls_crossover += 1,
@@ -483,7 +474,7 @@ impl CoreEngine {
         }
         if let Some(mut state) = self.state.net(hash).cloned() {
             state.is_alive = false;
-            // Cull metadata turns the tombstone into a complete record of
+            // Cull metadata turns the tombstone into a complete record
             // when/why this net left the population, not just a dead snapshot.
             state.culled_at_step = Some(clock);
             state.cull_reason = Some(reason.to_string());
@@ -499,25 +490,24 @@ impl CoreEngine {
         self.rolling_fitness.remove(hash);
         self.rolling_train.remove(hash);
         self.rolling_eval.remove(hash);
-            // Decision-lag state dies with the net (shadow + promotion clock are
-            // per-individual); a culled frozen elite leaves the crown.
+        // Decision-lag state dies with the net (shadow + promotion clock
+        // per-individual); a culled frozen elite leaves the crown.
         self.frozen_crown.remove(hash);
         self.culls += 1;
         Ok(())
     }
 
-        /// Select a live net inversely-proportionate to smoothed fitness — the
-        /// `InverseFitness` arm. Elites and probation nets are excluded; `None` = none.
+    /// Select a live net inversely-proportionate to smoothed fitness —
+    /// `InverseFitness` arm. Elites and probation nets are excluded; `None` = none.
     pub(crate) fn select_inverse_proportional_at(
         &self,
         clock: usize,
         roll: usize,
     ) -> Result<Option<String>> {
-            // The roulette draw comes from the MUTATION roll lane, like the fire check:
-            // same (clock, roll), same lane, no shift when the batch is skipped.
-        let mut rng = fastrand::Rng::with_seed(
-            RollKind::Mutation.seed(self.header.run_seed, clock, roll),
-        );
+        // The roulette draw comes from the MUTATION roll lane, like the fire check:
+        // same (clock, roll), same lane, no shift when the batch is skipped.
+        let mut rng =
+            fastrand::Rng::with_seed(RollKind::Mutation.seed(self.header.run_seed, clock, roll));
         let hashes = self.state.live_hashes();
         if hashes.len() < 2 {
             return Ok(None);
@@ -525,11 +515,8 @@ impl CoreEngine {
         let direction = self.fitness.direction();
         let elite = self.elite_hashes();
         let clock = self.step_clock();
-            // Inverse fitness: weight = (adjusted best) − (adjusted value) ≥ 0 — the
-            // worst net gets the largest weight, the best gets zero.
-            // The weights read the SAME ranking value as every other site (FIT: the
-            // risk-adjusted score), so "who is worst" cannot disagree between the
-            // inverse-roulette draw and the cull itself.
+        // Inverse fitness: weight = (adjusted best) − (adjusted value) ≥ 0 — the worst net gets
+        // largest weight, the best gets zero.
         let scored: Vec<(String, f32)> = hashes
             .iter()
             .filter(|h| !elite.contains(h))
@@ -567,7 +554,7 @@ impl CoreEngine {
         Ok(weights.last().map(|(h, _)| h.clone()))
     }
 
-    /// Whether a roll of `kind` in this `clock` FIRES, derived from
+    /// Whether a roll of `kind` in this `clock` FIRES, derived
     /// `(run_seed, clock, roll)` rather than the process-global `fastrand` stream.
     pub(crate) fn roll_fires(&self, kind: RollKind, clock: usize, roll: usize) -> bool {
         let p = match kind {
@@ -580,10 +567,8 @@ impl CoreEngine {
         fastrand::Rng::with_seed(kind.seed(self.header.run_seed, clock, roll)).f32() < p
     }
 
-    /// Whether `hash` is still under its **cull shield** at `clock` — what the log
-    /// calls `cull shield` (NOT the elite `join window`, which is
-    /// `elite_probation_age`): cull-IMMUNE for its first few clocks (from the
-    /// persisted `entered_at_step`); a status, not a queue.
+    /// Whether `hash` is still under its **cull shield** at `clock` — what the log calls `cull
+    /// shield` (NOT the elite `join window`, which is `elite_probation_age`): cull-IMMUNE
     pub(crate) fn on_probation(&self, hash: &str, clock: usize) -> bool {
         let Some(state) = self.state.net(hash) else {
             return false;
@@ -596,9 +581,45 @@ impl CoreEngine {
         window > 0 && clock.saturating_sub(state.entered_at_step) < window
     }
 
-        /// The crossover Worst-policy victim: the worst non-elite net that has served
-        /// its crossover probation. `None` when nobody is cullable (shield is HARD).
-    fn select_crossover_worst_victim(&self, clock: usize) -> Result<Option<String>> {
+    /// The **Unfed** victim, shared by both channels' `Unfed` arm: the net with the least claim
+    /// the grid — the lowest **merit** `Fm × Ym`, the fitness place in the MERIT ordering (best =
+    pub(crate) fn select_unfed_victim(&self, clock: usize) -> Result<Option<String>> {
+        let Some(frame) = self.lottery_frame(clock) else {
+            return self.select_crossover_worst_victim(clock);
+        };
+        let elite = self.elite_hashes();
+        let age_leg = self.train_age();
+        let mut scored: Vec<(String, f32)> = self
+            .state
+            .live_hashes()
+            .into_iter()
+            .filter(|h| !elite.contains(h))
+            // `train_lottery_parts` is `None` for the crown, a net inside its born shield, a net
+            // with no reading, or a flat field — all of them un-gradable, so none of them can be
+            .filter_map(|h| {
+                self.train_lottery_parts(&h, clock, Some(frame), self.merit(&h))
+                    .map(|(f, youth, _)| {
+                        // The tilt is a plain mirror of the fitness leg (`p = 1 − f`),
+                        // so flipping it back recovers the merit ordering exactly.
+                        let fitness = if self.config.train_merit_inverted {
+                            1.0 - f
+                        } else {
+                            f
+                        };
+                        (h, if age_leg { fitness * youth } else { fitness })
+                    })
+            })
+            .collect();
+        if scored.is_empty() {
+            return self.select_crossover_worst_victim(clock);
+        }
+        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(Some(scored.swap_remove(0).0))
+    }
+
+    /// The crossover Worst-policy victim: the worst non-elite net that has served
+    /// its crossover probation. `None` when nobody is cullable (shield is HARD).
+    pub(crate) fn select_crossover_worst_victim(&self, clock: usize) -> Result<Option<String>> {
         Ok(self
             .worst_nets_by_smoothed_fitness(self.state.live_count())?
             .into_iter()

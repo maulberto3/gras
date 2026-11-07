@@ -1,18 +1,11 @@
-//! Initial population generation — shared by the `race` binary and any
-//! embedding (e.g. the mnist `main.rs`).
-//!
-//! Determinism contract: individual `i` derives everything from
-//! `derive_seed(run_seed, i)`. The duplicate gate re-rolls at ordinals past
-//! the initial batch (`pop_size + attempt`), so a given `(run_seed, config)`
-//! still produces a bit-identical population — duplicates included in the
-//! draw order, replaced deterministically when they collide.
+//! Initial population generation — shared by the `race` binary and any embedding (e.g.
 
 use super::config::RaceConfig;
 use crate::graph::node::NodeKind;
 use crate::graph::topology::Topology;
 use crate::utils::seed::{derive_seed, topo_hash};
 
-/// One deterministic topology draw from the run's config + pools, keyed by an
+/// One deterministic topology draw from the run's config + pools, keyed
 /// ordinal. Shared by the initial loop and the duplicate re-roll.
 fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology {
     // Empty config pool ⇒ all known ops (resolved_* handles the fallback).
@@ -27,10 +20,13 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
         .unwrap_or_else(|_| crate::evolution::pools::all_standardize_ops());
     let seed = derive_seed(run_seed, ordinal) as usize;
     let mut rng = fastrand::Rng::with_seed(seed as u64);
-        // Per-individual identity seed. `options.topology_seed` keys the whole engine;
-        // sharing the template default made every founder identical.
+    // Per-individual identity seed. `options.topology_seed` keys the whole engine;
+    // sharing the template default made every founder identical.
     let mut opts = config.topology_options;
     opts.topology_seed = seed;
+    // Structure keeps the individual seed; WEIGHT creation is run-wide, so the same
+    // architecture is born with the same coefficients whoever draws
+    opts.weight_seed = Some(crate::utils::seed::weight_seed(run_seed));
     let n_hidden = rng.usize(opts.min_hidden_num_nodes..=opts.max_hidden_num_nodes);
     // The split is a POOL draw: none, random or exclusive can enter the population.
     let feature_split = draw_feature_split(config, &mut rng);
@@ -50,20 +46,16 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     }
     graph.refresh_labels();
     graph.finalize();
-        // Feature split AFTER finalize: the Input node's port count is final only once
-        // `trim_orphaned_ports` compacted the ports (same rule as port activations).
+    // Feature split AFTER finalize: the Input node's port count is final only once
+    // `trim_orphaned_ports` compacted the ports (same rule as port activations).
     if let Some(policy) = feature_split {
         graph.assign_feature_masks(policy);
     }
     graph
 }
 
-/// Draw one policy from the run's feature-split pool (`empty ⇒ all three`) with the
-/// caller's own deterministic RNG. `None` = this net carries no split.
-///
-/// The fallback below only covers a config an ENGINE never assembles: a typo is
-/// refused by name at construction (`RaceConfig::validate_search_pools`), because this
-/// path cannot error and widening the pool is worse than the typo it hides.
+/// Draw one policy from the run's feature-split pool (`empty ⇒ all three`) with the caller's own
+/// deterministic RNG.
 pub(crate) fn draw_feature_split(
     config: &RaceConfig,
     rng: &mut fastrand::Rng,
@@ -78,12 +70,8 @@ pub(crate) fn draw_feature_split(
     pool[rng.usize(..pool.len())]
 }
 
-/// The initial population: `pop_size` deterministic draws, deduped by topology
-/// hash — identical JSONs would otherwise collapse onto one `RaceState` key.
-///
-/// `config` is expected to have passed [`RaceConfig::validate_search_pools`] (every
-/// engine does that at construction); a caller using this directly should too, since
-/// the draw path cannot refuse a pool name itself.
+/// The initial population: `pop_size` deterministic draws, deduped by topology hash — identical
+/// JSONs would otherwise collapse onto one `RaceState` key.
 pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
     let pop_size = config.pop_size;
     let mut topos: Vec<Topology> = (0..pop_size)
@@ -96,7 +84,7 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
         let hash = match topo.to_json() {
             Ok(json) => topo_hash(&json),
             Err(_) => {
-                // Unserializable topology would fail later anyway; keep it
+                // Unserializable topology would fail later anyway; keep
                 // and let the engine's build path surface the error.
                 out.push(topo);
                 continue;
@@ -139,7 +127,7 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
     out
 }
 
-/// Build the founder batch from explicit blueprints + random draws, deduped by
+/// Build the founder batch from explicit blueprints + random draws, deduped
 /// topology hash and always landing on `target` nets (import first, then draws).
 pub fn fill_unique(
     config: &RaceConfig,
@@ -183,7 +171,8 @@ pub fn fill_unique(
         if seen.insert(topo_hash(&json)) {
             out.push(topo);
             continue;
-        }        crate::utils::cfy::emit(&crate::utils::cfy::card(
+        }
+        crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Founder batch",
             &crate::utils::cfy::kv(&[(
                 "random draw".to_string(),
@@ -217,9 +206,8 @@ pub fn fill_unique(
 
 // ── Seed blueprint loading ─────────────────────────────────────────────
 
-/// Load a blueprint from a saved artifact (a topology JSON, or a
-/// `nets/<hash>.json` state's `topology` field). Blueprint-only, fresh weights;
-/// this is how `elite_previous_load` reads a source run's ranked elites.
+/// Load a blueprint from a saved artifact (a topology JSON, or a `nets/<hash>.json` state's
+/// `topology` field).
 pub fn run_topology_from_json_file(path: &std::path::Path) -> Result<Topology, String> {
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("run-topology {}: {e}", path.display()))?;
@@ -277,8 +265,8 @@ mod tests {
         assert_eq!(hashes.len(), total, "no two topologies may share a hash");
     }
 
-        /// An import duplicating a random draw must not shrink the population: the
-        /// colliding draw is re-rolled, so the batch lands on `pop_size` uniques.
+    /// An import duplicating a random draw must not shrink the population:
+    /// colliding draw is re-rolled, so the batch lands on `pop_size` uniques.
     #[test]
     fn fill_unique_keeps_pop_size_when_a_draw_collides_with_an_import() {
         let cfg = tiny_config(6);
@@ -307,8 +295,8 @@ mod tests {
         );
     }
 
-    /// With no imports the batch is `initial_population` verbatim, so the
-    /// no-seed path stays bit-identical to what it always was.
+    /// With no imports the batch is `initial_population` verbatim,
+    /// no-seed path stays bit-identical to what it always
     #[test]
     fn fill_unique_without_founders_is_the_plain_population() {
         let cfg = tiny_config(6);
@@ -339,8 +327,8 @@ mod tests {
 
     #[test]
     fn forced_space_of_one_keeps_exactly_one_unique() {
-            // A 1-hidden-node fixed-dim space yields ONE topology; the gate must
-            // keep pop_size entries with only 1 unique hash (the warn path).
+        // A 1-hidden-node fixed-dim space yields ONE topology; the gate must
+        // keep pop_size entries with only 1 unique hash (the warn path).
         let mut cfg = tiny_config(3);
         cfg.activation_pool = vec!["relu".into()];
         cfg.combine_op_pool = vec!["mean".into()];
@@ -349,8 +337,8 @@ mod tests {
         assert_eq!(topos.len(), 3, "pop size preserved even when trapped");
     }
 
-        /// Every founder must carry its OWN `net_seed` — sharing the template seed
-        /// gave the whole population identical weights and one challenge trigger.
+    /// Every founder must carry its OWN `net_seed` — sharing the template seed
+    /// gave the whole population identical weights and one challenge trigger.
     #[test]
     fn founders_get_distinct_net_seeds() {
         let cfg = tiny_config(8);
@@ -367,10 +355,8 @@ mod tests {
 
     #[test]
     fn feature_split_masks_match_the_final_port_count() {
-            // End-to-end through the real engine draw: with the policy on, every founder
-            // must carry masks whose length matches the POST-finalize port count (a stale
-            // port count is exactly what would break the validate rule), and Exclusive
-            // must still partition the features.
+        // End-to-end through the real engine draw: with the policy on, every founder must carry
+        // masks whose length matches the POST-finalize port count (a stale port count is exactly
         let opts = crate::graph::topology::TopologyOptions {
             min_hidden_num_nodes: 4,
             max_hidden_num_nodes: 4,
@@ -410,8 +396,8 @@ mod tests {
 
     #[test]
     fn feature_split_off_leaves_every_port_unmasked() {
-            // The default (`None`) is today's behaviour: no masks anywhere, so nothing
-            // about an existing run's population changes.
+        // The default (`None`) is today's behaviour: no masks anywhere, so nothing
+        // about an existing run's population changes.
         let cfg = tiny_config(4);
         assert!(
             cfg.feature_split_pool.is_empty(),
@@ -444,10 +430,11 @@ mod tests {
         cfg.pop_size = 12;
         cfg.topology_options = opts;
         cfg.hidden_dim_pool = Some(4..=4);
-        let mut seen: Vec<Option<crate::graph::topology::FeatureSplitPolicy>> = initial_population(&cfg, 7)
-            .iter()
-            .map(|t| t.options.feature_split)
-            .collect();
+        let mut seen: Vec<Option<crate::graph::topology::FeatureSplitPolicy>> =
+            initial_population(&cfg, 7)
+                .iter()
+                .map(|t| t.options.feature_split)
+                .collect();
         seen.sort_by_key(|p| format!("{p:?}"));
         seen.dedup();
         assert!(
