@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-/// Mutation strategy for perturbing a single topology. Each variant carries its
+/// Mutation strategy for perturbing a single topology. Each variant carries
 /// own probability; the op pools come from the engine, never per-variant.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum MutationMethod {

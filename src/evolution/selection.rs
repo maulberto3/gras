@@ -1,19 +1,4 @@
 //! Parent selection — how a crossover attempt chooses the nets it recombines.
-//!
-//! [`SelectionMethod`] turns a slice of scores into a parent INDEX. The race
-//! engine (`engine::child`) calls [`SelectionMethod::draw_one`] once per parent
-//! per attempt, so this type is the pressure knob on WHICH nets get bred;
-//! `RaceConfigBuilder::set_crossover_selection` is its setter. Two arms exist:
-//! fitness-proportionate (roulette, the default and the engine's historical
-//! behavior) and tournament (`k` uniform draws, best wins).
-//!
-//! [`SelectionMethod::apply`] is the older generation-shaped entry point — a
-//! whole next-generation vector with elitism — kept for callers that select a
-//! generation at once; the race does not use it (it needs one parent, not `n`).
-//!
-//! The contract is *blueprint-level*: selection reads scores and returns
-//! indices, never touches built networks, so a draw is reproducible from its
-//! RNG like any other topology decision.
 
 use crate::utils::fitness::Direction;
 use serde::Serialize;
@@ -31,11 +16,8 @@ pub enum SelectionMethod {
 }
 
 impl Default for SelectionMethod {
-        /// The tournament's default size is 2 — the smallest tournament that is
-        /// actually a tournament (a 2-way draw already doubles the leader's odds over
-        /// a uniform pick) without the extreme pressure of a large `k`. NOTE: the
-        /// ENGINE's default method is `Roulette` (see `RaceConfig::defaults`), so this
-        /// only applies where a `SelectionMethod::default()` is used directly.
+    /// The tournament's default size is 2 — the smallest tournament that is actually a tournament
+    /// (a 2-way draw already doubles the leader's odds over a uniform pick) without the extreme
     fn default() -> Self {
         SelectionMethod::Tournament { tournament_size: 2 }
     }
@@ -59,13 +41,7 @@ impl SelectionMethod {
         }
     }
 
-        /// ONE parent draw — the race engine's entry point.
-        ///
-        /// `None` only for an empty score slice (no parents to draw). The draw is
-        /// exactly one RNG consumption pattern per method — roulette one weighted roll,
-        /// tournament `k` uniform picks — which is why the method is replay-relevant:
-        /// changing it changes both the chosen parent and the RNG stream the next roll
-        /// reads. `Tournament { tournament_size: 1 }` is a uniform draw by definition.
+    /// ONE parent draw — the race engine's entry point.
     pub fn draw_one(
         &self,
         scores: &[f32],
@@ -78,9 +54,8 @@ impl SelectionMethod {
         match self {
             Self::Roulette => roulette_select(scores, direction, rng).into_iter().next(),
             Self::Tournament { tournament_size } => {
-                // Same rule as `tournament_select`: k uniform entrants, the better one
-                // under the run's direction wins. Capped at the population so a knob
-                // larger than the pool stays a full tournament instead of looping.
+                // Same rule as `tournament_select`: k uniform entrants, the better one under
+                // run's direction wins.
                 let k = (*tournament_size).max(1).min(scores.len());
                 let mut winner = rng.usize(0..scores.len());
                 for _ in 1..k {
@@ -105,8 +80,9 @@ impl SelectionMethod {
             Self::Roulette => "roulette".to_string(),
         }
     }
-}    /// One roulette-wheel draw: returns an index into `scores`, probability
-    /// proportional to direction-adjusted weight (negatives clamped to 0).
+}
+/// One roulette-wheel draw: returns an index into `scores`, probability
+/// proportional to direction-adjusted weight (negatives clamped to 0).
 fn roulette_select(scores: &[f32], direction: Direction, rng: &mut fastrand::Rng) -> Vec<usize> {
     if scores.is_empty() {
         return Vec::new();
@@ -134,8 +110,9 @@ fn roulette_select(scores: &[f32], direction: Direction, rng: &mut fastrand::Rng
         }
     }
     vec![weights.len() - 1]
-}    /// Tournament selection with elitism: returns `scores.len()` indices, top
-    /// `elite_count` always kept, the rest a `tournament`-way draw.
+}
+/// Tournament selection with elitism: returns `scores.len()` indices, top
+/// `elite_count` always kept, the rest a `tournament`-way draw.
 fn tournament_select(
     scores: &[f32],
     direction: Direction,
@@ -258,8 +235,8 @@ mod tests {
     fn test_label() {
         let m = SelectionMethod::Tournament { tournament_size: 5 };
         assert_eq!(m.label(), "tournament(k=5)");
-    }        // Roulette sanity: the wheel must be biased toward higher-ranked nets
-        // in expectation (3:1 for weights 3,1) and deterministic under a seed.
+    } // Roulette sanity: the wheel must be biased toward higher-ranked nets
+    // in expectation (3:1 for weights 3,1) and deterministic under a seed.
     #[test]
     fn test_roulette_biased_toward_higher_score() {
         let scores = [3.0, 1.0];
@@ -326,10 +303,8 @@ mod tests {
         }
     }
 
-        /// `k = n` does NOT mean "always the leader": the tournament is k uniform
-        /// entrants, so the argmax is only in it `1 − (1 − 1/n)^n ≈ 63%` of the time
-        /// (~68% here) and wins whenever it is. The test pins that pressure — well above
-        /// the 25% a uniform draw would give — and that Minimize flips the favourite.
+    /// `k = n` does NOT mean "always the leader": the tournament is k uniform entrants,
+    /// argmax is only in it `1 − (1 − 1/n)^n ≈ 63%` of the time (~68% here) and wins whenever
     #[test]
     fn tournament_draw_one_pressures_toward_the_best() {
         let scores = [1.0, 5.0, 3.0, 9.0];
@@ -345,7 +320,10 @@ mod tests {
         // Maximize: index 3 (9.0) is the favourite, index 0 (1.0) the underdog.
         let best = rate(Direction::Maximize, 11, 3);
         let worst = rate(Direction::Maximize, 12, 0);
-        assert!(best > 0.55, "the leader should win most tournaments, got {best}");
+        assert!(
+            best > 0.55,
+            "the leader should win most tournaments, got {best}"
+        );
         assert!(best > worst, "pressure toward the best: {best} vs {worst}");
         // Minimize: the SAME method must favour index 0 (1.0) instead.
         let best_min = rate(Direction::Minimize, 13, 0);
@@ -362,7 +340,9 @@ mod tests {
         let mut rng = fastrand::Rng::with_seed(7);
         let mut seen = [false; 4];
         for _ in 0..400 {
-            let i = method.draw_one(&scores, Direction::Maximize, &mut rng).unwrap();
+            let i = method
+                .draw_one(&scores, Direction::Maximize, &mut rng)
+                .unwrap();
             seen[i] = true;
         }
         assert!(seen.iter().all(|&s| s), "k=1 must reach every slot");

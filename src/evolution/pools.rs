@@ -1,7 +1,4 @@
 //! Centralized default pools for GP search space.
-//!
-//! When the user doesn't call `set_*_pool()` on the engine builder,
-//! these defaults are used to fill the empty pools.
 
 use crate::graph::node::{Activation, CombineOp, StandardizeOp};
 
@@ -36,7 +33,7 @@ pub fn all_combine_ops() -> Vec<CombineOp> {
         CombineOp::Mean,
         CombineOp::Max,
         CombineOp::Min,
-        // Multiply/Subtract/Divide stay out by default: numerically unstable with
+        // Multiply/Subtract/Divide stay out by default: numerically unstable
         // random weights. Add them back via `.set_combine_op_pool(vec![..])`.
     ]
 }
@@ -51,4 +48,3 @@ pub fn all_standardize_ops() -> Vec<StandardizeOp> {
         StandardizeOp::GroupNorm,
     ]
 }
-
