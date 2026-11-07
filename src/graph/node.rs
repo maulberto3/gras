@@ -1,17 +1,13 @@
 //! The node type — pure metadata (ports, kind, dim, activation).
-//!
-//! Nodes hold no tensors; execution happens in
-//! [`Network`](crate::graph::network::Network). The NAS knobs live here:
-//! `hidden_dim`, `activation`, `combine_op`, `standardize`, `feature_masks`.
 
 use flodl::Variable;
 use serde::{Deserialize, Serialize};
 
-/// Divide floor used by [`CombineOp::Divide`]: denominators smaller than this
+/// Divide floor used by [`CombineOp::Divide`]: denominators smaller
 /// in magnitude are treated as ±ε (bounded output, bounded gradients).
 pub const DIVIDE_EPS: f64 = 1e-3;
 
-/// `n / d` without the singularity: `n * (d / clamp(|d|, ε))`. Exact for
+/// `n / d` without the singularity: `n * (d / clamp(|d|, ε))`. Exact
 /// `|d| ≥ ε`, saturating below it; differentiable with no NaN in backward.
 pub fn safe_divide(n: &Variable, d: &Variable) -> flodl::tensor::Result<Variable> {
     let d_abs = d.abs()?;
@@ -134,7 +130,7 @@ pub enum Activation {
     /// softmax(x) over the feature dim -- rows sum to 1; a competitive mixer
     /// over channels (winner-take-most reweighting).
     Softmax,
-    /// log(softmax(x)) over the feature dim -- numerically stable log of
+    /// log(softmax(x)) over the feature dim -- numerically stable log
     /// Softmax. Pairs with NLL-style downstream losses; strictly negative.
     LogSoftmax,
 }
@@ -159,7 +155,7 @@ impl Activation {
             Activation::HardSigmoid => x.hardsigmoid(),
             Activation::Sin => x.sin(),
             Activation::Cos => x.cos(),
-            // Dim -1 = feature dim: matches LayerNorm's axis convention, so a
+            // Dim -1 = feature dim: matches LayerNorm's axis convention,
             // node's normalization/activation both operate per-sample.
             Activation::Softmax => x.softmax(-1),
             Activation::LogSoftmax => x.log_softmax(-1),
@@ -186,8 +182,8 @@ pub enum StandardizeOp {
     GroupNorm,
 }
 
-/// The label parse lives with the enum, so every new arm's label is added in
-/// one place and any tooling can reuse it.
+/// The label parse lives with the enum, so every new arm's label is added
+/// one place and any tooling can reuse
 impl TryFrom<&str> for StandardizeOp {
     /// The unknown-label message.
     type Error = String;
@@ -282,7 +278,6 @@ impl StandardizeOp {
     }
 }
 
-
 /// A node in the computational graph: receives tensors, transforms them,
 /// applies an activation, exposes outputs. Invariants live in `Topology::validate`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -308,18 +303,7 @@ pub struct Node {
     /// activation (`None` = inherit the graph's `standardize_op`).
     #[serde(default)]
     pub standardize: Option<StandardizeOp>,
-    /// Per-output-port **feature masks** over the raw input features — the feature
-    /// split. Input nodes only (`validate()` enforces it). Entry `i` belongs to
-    /// output port `i`: `1` keeps that feature, `0` hides it, so port `i` carries
-    /// `Linear(input ⊙ mask_i)` — one weight matrix with its input columns gated
-    /// per port, which is how one node can see features `{0,1}` while another sees
-    /// `{2,3,4}`. `None` (the default) is today's behaviour: every port clones the
-    /// single mixed vector. An all-zero mask is a port with no features at all —
-    /// it emits the layer's bias alone (see `assign_feature_masks`).
-    ///
-    /// Masks are bound to the port count, so `Topology::finalize` **drops** them: any
-    /// rebuild re-wires and may re-count the ports, and the engine re-derives masks
-    /// from the run's policy right after finalizing.
+    /// Per-output-port **feature masks** over the raw input features — the feature split.
     #[serde(default)]
     pub feature_masks: Option<Vec<Vec<u8>>>,
 }
@@ -329,7 +313,7 @@ pub struct Node {
 pub enum NodeKind {
     /// Start of the network: no inputs, feeds the rest.
     Input,
-    /// Middle of the network: combine → pass on.
+    /// Middle of the network: combine → pass
     Hidden,
     /// End of the network: its output becomes the network output.
     Output,
@@ -403,13 +387,13 @@ impl Node {
     }
 
     /// Set per-port activations (builder style). Empty = inherit everywhere;
-    /// otherwise it must be exactly `num_outputs` long — `validate()` enforces it.
+    /// otherwise it must be exactly `num_outputs` long — `validate()` enforces
     pub fn with_port_activations(mut self, ports: Vec<Activation>) -> Self {
         self.port_activations = if ports.is_empty() { None } else { Some(ports) };
         self
     }
 
-    /// The activation carried by output port `i`: its override when set, else the
+    /// The activation carried by output port `i`: its override when set, else
     /// node-level one. Input-node ports are Identity (raw data fan-out).
     pub fn port_activation(&self, i: usize) -> Activation {
         self.port_activations
@@ -418,9 +402,7 @@ impl Node {
             .unwrap_or(self.activation)
     }
 
-    /// Set per-output-port feature masks (builder style). Empty = no split at all;
-    /// otherwise the outer length must be `num_outputs` and every mask
-    /// `input_dim` long — `validate()` enforces both.
+    /// Set per-output-port feature masks (builder style).
     pub fn with_feature_masks(mut self, masks: Vec<Vec<u8>>) -> Self {
         self.feature_masks = if masks.is_empty() { None } else { Some(masks) };
         self
@@ -532,7 +514,7 @@ mod tests {
         let id = inst.data().to_f32_vec().unwrap();
         assert_ne!(r0.to_vec(), id[0..12].to_vec(), "GroupNorm ≠ InstanceNorm");
 
-        // Degenerate feats ≤ 4: falls back to the InstanceNorm shape, avoiding a
+        // Degenerate feats ≤ 4: falls back to the InstanceNorm shape, avoiding
         // single-feature group that would z-score to 0/0.
         let g4 = StandardizeOp::GroupNorm.apply(&x).unwrap();
         let gd4 = g4.data().to_f32_vec().unwrap();
@@ -544,7 +526,7 @@ mod tests {
             "feats=4 ⇒ InstanceNorm fallback"
         );
 
-        // Non-divisible count: 10 feats → groups {3,3,3,1+pad}; the pad lands only
+        // Non-divisible count: 10 feats → groups {3,3,3,1+pad}; the pad lands
         // in the last group, so groups 0-2 stay exact and the shape is unchanged.
         let x10 = flodl::Tensor::from_f32(
             &[
@@ -656,7 +638,7 @@ mod tests {
     // ── property tests (proptest) ───────────────────────────────────────────
 
     proptest! {
-        /// The builder methods only touch their target field: id, kind and
+        /// The builder methods only touch their target field: id, kind
         /// port counts must survive chaining, in either order.
         #[test]
         fn prop_node_builders_preserve_identity(
@@ -701,6 +683,7 @@ mod tests {
                 output_dim: Some(2),
                 dropout_prob: 0.0,
                 feature_split: None,
+                weight_seed: None,
             };
             let mut graph = Topology::new(0, Some(opts));
             graph.create_random_hidden_node();

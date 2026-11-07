@@ -1,10 +1,4 @@
-//! The graph blueprint  — pure topology data, no tensors.
-//!
-//! Two-phase design: **Topology** (this file, pure data) declares nodes
-//! and connections. **Network** compiles it into real layers and executes.
-//!
-//! Invariants: contiguous ids (0..n), forward-only edges, orphaned ports
-//! fed by network input. `validate()` checks all of them.
+//! The graph blueprint — pure topology data, no tensors.
 
 use fastrand::Rng;
 use serde::{Deserialize, Serialize};
@@ -30,7 +24,7 @@ pub struct KindCounts {
     pub output: usize,
 }
 
-/// Knobs for building a graph: dims, RNG seed, combine op, ranges. Serialized with
+/// Knobs for building a graph: dims, RNG seed, combine op, ranges. Serialized
 /// every topology, so a saved graph is self-describing for `Network::build`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 // ── TopologyOptions — the blueprint template ──────────────────────────────
@@ -39,6 +33,9 @@ pub struct KindCounts {
 pub struct TopologyOptions {
     /// RNG seed — same seed => same random graph.
     pub topology_seed: usize,
+    /// Seed the network's INITIAL WEIGHTS are drawn from, when it must differ from `topology_seed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_seed: Option<usize>,
     /// Min hidden nodes per individual (sampled by engine).
     pub min_hidden_num_nodes: usize,
     /// Max hidden nodes per individual (sampled by engine).
@@ -51,27 +48,24 @@ pub struct TopologyOptions {
     pub min_hidden_outputs_per_node: usize,
     /// Each random hidden node gets at most this many outputs.
     pub max_hidden_outputs_per_node: usize,
-        /// Feature dimension of the network input tensor. `None` = infer from the
-        /// dataset at run start (the engine fills it in and validates it).
+    /// Feature dimension of the network input tensor. `None` = infer
+    /// dataset at run start (the engine fills it in and validates
     pub input_dim: Option<usize>,
-        /// Output dimension of the network (set on the Output node's layer).
-        /// `None` = infer from the dataset at run start.
+    /// Output dimension of the network (set on the Output node's layer).
+    /// `None` = infer from the dataset at run start.
     pub output_dim: Option<usize>,
-        /// Dropout probability the engine used when building this topology's network —
-        /// part of the blueprint so replays don't diverge; defaults to 0.0.
+    /// Dropout probability the engine used when building this topology's network —
+    /// part of the blueprint so replays don't diverge; defaults to 0.0.
     #[serde(default)]
     pub dropout_prob: f32,
-        /// Feature-split policy this blueprint's Input ports were drawn under — part of
-        /// the topology, not the run, so a newborn's policy travels with its blueprint
-        /// and a population can hold split and unsplit nets side by side. `None`
-        /// (default) = no split. Skipped when `None`, so an unsplit blueprint serializes
-        /// (and hashes) exactly as it did before this field existed.
+    /// Feature-split policy this blueprint's Input ports were drawn under — part of the topology,
+    /// not the run, so a newborn's policy travels with its blueprint and a population can hold
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feature_split: Option<FeatureSplitPolicy>,
 }
 
-    // `dropout_prob: f32` isn't `Eq`/`Hash`, so these are manual: every other field
-    // compares normally, dropout by bit pattern. Keeps `HashSet<Spec>` dedup working.
+// `dropout_prob: f32` isn't `Eq`/`Hash`, so these are manual: every other field compares normally,
+// dropout by bit pattern.
 impl PartialEq for TopologyOptions {
     fn eq(&self, other: &Self) -> bool {
         self.topology_seed == other.topology_seed
@@ -107,30 +101,17 @@ impl std::hash::Hash for TopologyOptions {
 }
 
 /// How a topology draws the Input node's per-port feature masks — the feature split.
-/// Stored on [`TopologyOptions`], i.e. per blueprint, not run-wide: the masks
-/// themselves are genome (they live in [`Node::feature_masks`]) and this only says
-/// how they were generated, so split and unsplit nets can coexist in one population.
-/// `None` = no split at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FeatureSplitPolicy {
-    /// **Exclusive** — every feature lands in exactly one port (a true partition):
-    /// drawn as "each feature picks one random port". Nothing is dropped and
-    /// nothing is duplicated, so no two branches can see the same feature. The
-    /// split is uneven by construction, and a port may end up with no features.
+    /// **Exclusive** — every feature lands in exactly one port (a true partition): drawn as "each
+    /// feature picks one random port".
     Exclusive,
     /// **Random** — every port flips an independent `p = 0.5` coin per feature.
     /// A feature can land in several ports, and some features may go unused.
     Random,
-    /// **Inherited** — the rows were RECOMBINED from two parents, so they are neither
-    /// a fresh partition (`Exclusive`) nor a fresh coin flip (`Random`): a per-port
-    /// mix of two partitions can hand one feature to two ports, and a mix of a split
-    /// with an unsplit parent leaves cover-all rows beside split ones. Stamped by the
-    /// crossover path so the LABEL always matches the rows it is describing (a child
-    /// used to keep parent A's `None` while carrying parent B's rows). Never drawable:
-    /// it is not a pool entry, and [`Topology::assign_feature_masks`] refuses it.
-    /// Every user-facing label prints this as **`crossover`**: the enum names the
-    /// PROVENANCE kind, the label names the operator that produced the rows.
+    /// **Inherited** — the rows were RECOMBINED from two parents, so they are neither a fresh
+    /// partition (`Exclusive`) nor a fresh coin flip (`Random`): a per-port mix of two partitions
     Inherited,
 }
 
@@ -143,16 +124,6 @@ impl FeatureSplitPolicy {
 }
 
 /// Whether `rows` PARTITION the input: every feature belongs to exactly one port.
-///
-/// This is the one claim a split makes that can be checked against its own rows, and it
-/// is what `Exclusive` means — the doc block even promises "nothing is dropped and
-/// nothing is duplicated". So a row set that fails this CANNOT be labelled `Exclusive`:
-/// a cover-all port hands a feature to a second port (duplicated), and a feature no port
-/// keeps is dropped. Both arrive from padding — a port a rebuild added, or a port the
-/// donor rows did not cover — never from the draw itself.
-///
-/// Costs one pass over the rows (`input_dim × ports`), paid only where masks are
-/// installed or a rebuild renumbers ports.
 fn split_rows_are_partition(rows: &[Vec<u8>], input_dim: usize) -> bool {
     (0..input_dim).all(|feat| {
         rows.iter()
@@ -167,17 +138,19 @@ impl Default for TopologyOptions {
         TopologyOptions {
             topology_seed: 55,
             min_hidden_num_nodes: 2,
-            max_hidden_num_nodes: 5,
+            // The cartpole reference's caps, promoted to the engine defaults: the mins stay at 2
+            // bare chain still exists) and the maxes allow a genuinely wide net, which is what
+            max_hidden_num_nodes: 15,
             min_hidden_inputs_per_node: 2,
-            max_hidden_inputs_per_node: 5,
+            max_hidden_inputs_per_node: 15,
             min_hidden_outputs_per_node: 2,
-            max_hidden_outputs_per_node: 5,
+            max_hidden_outputs_per_node: 15,
             input_dim: None,
             output_dim: None,
-                // 0.0 keeps regularization opt-in per binary. Masks draw from libtorch's
-                // global RNG, which the engine seeds per (net_seed, step) — reproducible.
-            dropout_prob: 0.0,
+            // `0.25` — the cartpole reference's dropout, promoted to the engine default.
+            dropout_prob: 0.25,
             feature_split: None,
+            weight_seed: None,
         }
     }
 }
@@ -214,22 +187,23 @@ impl Connection {
     }
 }
 
-    // ── graph diagnostics ─────────────────────────────────────────────────
-    // Free functions live in `crate::utils::graph_utils`; methods delegate to them.
+// ── graph diagnostics ─────────────────────────────────────────────────
+// Free functions live in `crate::utils::graph_utils`; methods delegate to them.
 
-/// What one crossover operator actually exchanged — the operator's own answer,
-/// carried so the birth can say how much of the child came from the other parent.
-///
-/// `pairs` is the number of ALIGNED genes the operator could have flipped (for
-/// uniform: the hidden-node count, both parents walk in lock-step), `swaps` is how
-/// many coins said "take the other parent". A birth always has `swaps ≥ 1`: zero
-/// flips means the operator declined and no child is inserted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What one crossover operator actually exchanged — the operator's own answer, carried so the birth
+/// can say how much of the child came from the other parent.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CxReport {
     /// Genes taken from the other parent.
     pub swaps: usize,
     /// Genes the operator compared (the denominator of `3/6`).
     pub pairs: usize,
+    /// PROVENANCE, one slot per HIDDEN node in child order: `Some(i)` = this gene came from node
+    /// `i` of the other parent, `None` = it stayed with the kept parent.
+    pub moved: Vec<Option<usize>>,
+    /// The MIRROR of [`Self::moved`] for the reciprocal child (`b` after the cut): `Some(i)` =
+    /// slot came from node `i` of `a`, `None` = it stayed with `b`.
+    pub moved_b: Vec<Option<usize>>,
 }
 
 impl CxReport {
@@ -239,8 +213,8 @@ impl CxReport {
     }
 }
 
-    /// The blueprint of a gras network: pure data, no tensors — **who exists**
-    /// (`nodes`) and **who feeds whom** (`connections`). Inert until validated/built.
+/// The blueprint of a gras network: pure data, no tensors — **who exists**
+/// (`nodes`) and **who feeds whom** (`connections`). Inert until validated/built.
 #[derive(Clone, Debug, PartialEq)]
 // ── Topology — the graph blueprint ───────────────────────────────────────
 
@@ -262,8 +236,8 @@ pub struct Topology {
 impl Topology {
     // ── Creation ─────────────────────────────────────────────────────────────
 
-        /// Create an empty graph; `None` uses the default options. Add nodes with the
-        /// [`Node`] constructors + `graph.nodes.push(...)`.
+    /// Create an empty graph; `None` uses the default options. Add nodes
+    /// [`Node`] constructors + `graph.nodes.push(...)`.
     pub fn new(id: usize, options: Option<TopologyOptions>) -> Topology {
         // Create a new graph with the given id and options, or default options if None
         let opts = options.unwrap_or_default();
@@ -278,11 +252,11 @@ impl Topology {
         }
     }
 
-        /// Append one random hidden node whose port counts come from the options ranges;
-        /// its id is the current node count, so ids stay contiguous.
+    /// Append one random hidden node whose port counts come from the options ranges;
+    /// its id is the current node count, so ids stay contiguous.
     pub fn create_random_hidden_node(&mut self) {
-            // Random input/output counts within the options ranges:
-            // inputs ∈ [min,max]_hidden_inputs_per_node; outputs likewise.
+        // Random input/output counts within the options ranges:
+        // inputs ∈ [min,max]_hidden_inputs_per_node; outputs likewise.
         let num_inputs = self.rng.usize(
             self.options.min_hidden_inputs_per_node..=self.options.max_hidden_inputs_per_node,
         );
@@ -303,8 +277,8 @@ impl Topology {
         }
     }
 
-        /// Assign per-output-port activations to every hidden node from `pool`: port 0
-        /// mirrors the node-level activation, ports 1..n draw from the seeded RNG.
+    /// Assign per-output-port activations to every hidden node from `pool`: port 0
+    /// mirrors the node-level activation, ports 1..n draw from the seeded RNG.
     pub fn assign_port_activations(&mut self, pool: &[Activation]) {
         if pool.is_empty() {
             return;
@@ -313,10 +287,8 @@ impl Topology {
             if node.kind == NodeKind::Input || node.num_outputs <= 1 {
                 continue;
             }
-                // FILL-ONLY: a port's activation is genome, and `finalize` carries it
-                // through the port remap — so only ports that still have none (a fresh
-                // net, or a port the rebuild ADDED) draw a coin here. Re-drawing every
-                // port made an inherited activation survive at ~1/|pool| per port.
+            // FILL-ONLY: a port's activation is genome, and `finalize` carries it through the port
+            // remap — so only ports that still have none (a fresh net, or a port the rebuild ADDED)
             let mut ports: Vec<Option<Activation>> = node
                 .port_activations
                 .take()
@@ -331,19 +303,19 @@ impl Topology {
                     *slot = Some(pool[self.rng.usize(0..pool.len())]);
                 }
             }
-                // Port 0 mirrors the node-level activation by construction: that is the
-                // node gene, not a per-port one.
+            // Port 0 mirrors the node-level activation by construction:
+            // node gene, not a per-port one.
             ports[0] = Some(node.activation);
-            node.port_activations =
-                Some(ports.into_iter().map(|p| p.unwrap_or(node.activation)).collect());
+            node.port_activations = Some(
+                ports
+                    .into_iter()
+                    .map(|p| p.unwrap_or(node.activation))
+                    .collect(),
+            );
         }
     }
 
-        /// Assign per-output-port feature masks to the Input node from `policy` —
-        /// the feature split. MUST run **after** `finalize()`: the Input node's port
-        /// count is final only once `trim_orphaned_ports` compacted it (the same rule
-        /// `assign_port_activations` follows). A rebuild CARRIES existing rows through
-        /// the port remap; this is the creation path, which draws a fresh split.
+    /// Assign per-output-port feature masks to the Input node from `policy` — the feature split.
     pub fn assign_feature_masks(&mut self, policy: FeatureSplitPolicy) {
         let input_dim = self.options.input_dim.unwrap_or(1);
         let Some(input) = self.nodes.iter().position(|n| n.kind == NodeKind::Input) else {
@@ -359,19 +331,17 @@ impl Topology {
             // them, so drawing is a no-op rather than a guess at what they ''should'' be.
             FeatureSplitPolicy::Inherited => return,
             FeatureSplitPolicy::Exclusive => {
-                    // Each feature picks one random port: by construction every feature is
-                    // placed exactly once and none is shared. Naturally uneven, and a port
-                    // can end up empty (it then emits only the shared bias).
-                let owners: Vec<usize> = (0..input_dim)
-                    .map(|_| self.rng.usize(0..n_ports))
-                    .collect();
+                // Each feature picks one random port: by construction every feature is placed
+                // exactly once and none is shared.
+                let owners: Vec<usize> =
+                    (0..input_dim).map(|_| self.rng.usize(0..n_ports)).collect();
                 for (feat, &port) in owners.iter().enumerate() {
                     masks[port][feat] = 1;
                 }
             }
             FeatureSplitPolicy::Random => {
-                    // Independent coin flip per (port, feature): overlaps allowed, and some
-                    // features may go unused.
+                // Independent coin flip per (port, feature): overlaps allowed, and some
+                // features may go unused.
                 for mask in masks.iter_mut() {
                     for slot in mask.iter_mut() {
                         *slot = u8::from(self.rng.f32() < 0.5);
@@ -383,10 +353,8 @@ impl Topology {
         self.options.feature_split = Some(policy);
     }
 
-        /// The Input node's per-port feature masks, cloned (`None` when this
-        /// topology carries no split). Read AFTER a crossover (`cx_*` re-finalizes
-        /// both parents, and `finalize` carries the rows through its port remap), so
-        /// the rows and the ports they belong to agree.
+    /// The Input node's per-port feature masks, cloned (`None` when this topology carries no
+    /// split).
     pub fn input_feature_masks(&self) -> Option<Vec<Vec<u8>>> {
         self.nodes
             .iter()
@@ -394,18 +362,8 @@ impl Topology {
             .and_then(|n| n.feature_masks.clone())
     }
 
-        /// Install INHERITED masks on the Input node — the crossover path's
-        /// counterpart to [`Self::assign_feature_masks`]. Rows are mapped to ports by
-        /// index; a port the donor rows do not cover (the rebuild grew the port count)
-        /// starts UNMASKED, i.e. it sees every feature — a mask is never invented for a
-        /// port we hold no inherited data for. Truncates when the child has fewer ports.
-        ///
-        /// `policy` is the PROVENANCE of those rows (`None` → `Inherited`). The label
-        /// is written from the content here, in the one place masks are installed, so a
-        /// child can never carry rows under a policy that denies them.
-        ///
-        /// Deterministic by construction (no RNG): the same inherited rows always give
-        /// the same masks, so resume replays identically.
+    /// Install INHERITED masks on the Input node — the crossover path's counterpart
+    /// [`Self::assign_feature_masks`].
     pub fn install_input_feature_masks(
         &mut self,
         rows: &[Vec<u8>],
@@ -418,9 +376,8 @@ impl Topology {
         if input_dim == 0 {
             return;
         }
-            // Nothing inherited at all: keep the net UNSHARED (no rows, no masks) rather
-            // than materializing cover-all rows, which cost a real elementwise multiply
-            // at every forward pass to express "no split".
+        // Nothing inherited at all: keep the net UNSHARED (no rows, no masks) rather
+        // materializing cover-all rows, which cost a real elementwise multiply at every forward
         if rows.is_empty() {
             self.nodes[input].feature_masks = None;
             self.options.feature_split = policy;
@@ -430,14 +387,12 @@ impl Topology {
         let masks: Vec<Vec<u8>> = (0..n_ports)
             .map(|i| {
                 rows.get(i)
-                        // No inherited row for this port: every feature reaches it.
+                    // No inherited row for this port: every feature reaches
                     .cloned()
                     .unwrap_or_else(|| vec![1u8; input_dim])
             })
             .collect();
-        // PADDING BREAKS AN `Exclusive` CLAIM. A padded port is cover-all, so the rows
-        // now hand a feature to two ports — which `Exclusive` denies by definition. The
-        // label follows the content, here and nowhere else, so the docs can trust it.
+        // PADDING BREAKS AN `Exclusive` CLAIM.
         let partition = split_rows_are_partition(&masks, input_dim);
         self.nodes[input].feature_masks = Some(masks);
         self.options.feature_split = Some(match policy.unwrap_or(FeatureSplitPolicy::Inherited) {
@@ -446,11 +401,8 @@ impl Topology {
         });
     }
 
-        /// Reconcile a LOADED blueprint with the rule "rows present ⇒ policy present":
-        /// a record written before `Inherited` existed (or by the crossover bug it
-        /// fixes) can carry masks under `feature_split = None`. Read-time repair, not a
-        /// rewrite: the rows are the genome the build reads, so they win, and the label
-        /// becomes `Inherited` (the only true provenance we can state for them).
+    /// Reconcile a LOADED blueprint with the rule "rows present ⇒ policy present": a record written
+    /// before `Inherited` existed (or by the crossover bug it fixes) can carry masks under
     pub fn reconcile_split_policy(&mut self) {
         if self.options.feature_split.is_none()
             && self
@@ -461,10 +413,8 @@ impl Topology {
             self.options.feature_split = Some(FeatureSplitPolicy::Inherited);
             return;
         }
-            // And the other direction: a record can STATE `Exclusive` while carrying rows
-            // that are not a partition (a port the rebuild added, or one an older build
-            // padded). `Exclusive` is a checkable claim — every feature owned exactly
-            // once — so a loaded net is held to it too instead of being trusted.
+        // And the other direction: a record can STATE `Exclusive` while carrying rows
+        // a partition (a port the rebuild added, or one an older build padded).
         if self.options.feature_split == Some(FeatureSplitPolicy::Exclusive) {
             let input_dim = self.options.input_dim.unwrap_or(1);
             if let Some(masks) = self.input_feature_masks() {
@@ -475,8 +425,8 @@ impl Topology {
         }
     }
 
-        /// Assign every hidden node a random activation from `pool` (Input/Output stay
-        /// `Identity`). Refresh the port labels (`n1_i0`, `n2_o3`, …) for printing.
+    /// Assign every hidden node a random activation from `pool` (Input/Output stay
+    /// `Identity`). Refresh the port labels (`n1_i0`, `n2_o3`, …) for printing.
     pub fn renumber_ids(&mut self) {
         for (i, node) in self.nodes.iter_mut().enumerate() {
             node.id = i;
@@ -499,8 +449,8 @@ impl Topology {
         }
     }
 
-        /// Finalize the graph: scaffold the skeleton, wire every port, and auto-de-orphan
-        /// dangling outputs — one call turns a pile of nodes into a complete graph.
+    /// Finalize the graph: scaffold the skeleton, wire every port, and auto-de-orphan
+    /// dangling outputs — one call turns a pile of nodes into a complete graph.
     pub fn finalize(&mut self) {
         self.connections.clear();
 
@@ -597,12 +547,6 @@ impl Topology {
     }
 
     /// Step 5: Set input node output count = number of hidden nodes (at least).
-    /// Never shrinks — if the node already has more ports, keep them.
-    ///
-    /// The Input node is the one deliberate fan-out node: its ports are the features
-    /// (one per port, see the feature split), and each port may feed several targets —
-    /// that is what `validate`'s Input exemption and `dedup_input_connections` below
-    /// are for. Every other node stays 1:1 on both sides.
     fn set_input_fanout(&mut self) {
         let n_hidden = self
             .nodes
@@ -617,8 +561,8 @@ impl Topology {
         input_node.num_outputs = input_node.num_outputs.max(n_hidden).max(1);
     }
 
-        /// Step 6: wire orphaned input ports to the input node's output ports, cycling
-        /// through available ports (the combine op merges shared ones).
+    /// Step 6: wire orphaned input ports to the input node's output ports, cycling
+    /// through available ports (the combine op merges shared ones).
     fn rewire_orphaned_inputs(&mut self) {
         let input_id = self
             .nodes
@@ -653,15 +597,8 @@ impl Topology {
         }
     }
 
-        /// The Input node is the one deliberate fan-out node (its ports are the features,
-        /// and each may feed several targets), so ONE target must not be fed by two Input
-        /// ports: every Input port is Identity, which would make the second wire a value
-        /// duplicate of the first — twice the same signal, straight into the combine op.
-        ///
-        /// This is the whole of the old `dedup_value_wires` for the only case that could
-        /// still arise: `wire_ports` and `rewire_orphaned_outputs` both refuse to feed one
-        /// target twice from the same source node, so a same-source duplicate can only come
-        /// from here. Keeping the first wire is what the old pass did, decided once.
+    /// The Input node is the one deliberate fan-out node (its ports are the features, and each may
+    /// feed several targets), so ONE target must not be fed by two Input ports: every Input port
     fn dedup_input_connections(&mut self) {
         let input_id = self
             .nodes
@@ -684,8 +621,8 @@ impl Topology {
         }
     }
 
-        /// Human-readable connection labels, e.g. `("n0_o0", "n1_i0")` — a string view of
-        /// `self.connections`, handy for debugging/DSL rendering.
+    /// Human-readable connection labels, e.g. `("n0_o0", "n1_i0")` — a string view
+    /// `self.connections`, handy for debugging/DSL rendering.
     pub fn connection_labels(&self) -> Vec<(String, String)> {
         self.connections
             .iter()
@@ -693,8 +630,8 @@ impl Topology {
             .collect()
     }
 
-        /// Check the graph is executable before building: contiguous ids, forward-only
-        /// wires, in-range ports, output 1:1, no orphaned inputs. `Network::build` calls it.
+    /// Check the graph is executable before building: contiguous ids, forward-only
+    /// wires, in-range ports, output 1:1, no orphaned inputs. `Network::build` calls
     pub fn validate(&self) -> Result<(), TopologyError> {
         // 1. Options sanity
         if self.options.input_dim == Some(0) || self.options.output_dim == Some(0) {
@@ -723,8 +660,8 @@ impl Topology {
                     "node n{i} has hidden_dim 0"
                 )));
             }
-                // Per-port activations: length must match the port count, and Input nodes
-                // keep their ports raw (Identity) — activating raw data is a bug.
+            // Per-port activations: length must match the port count, and Input nodes
+            // keep their ports raw (Identity) — activating raw data is a bug.
             if let Some(ports) = &node.port_activations {
                 if ports.len() != node.num_outputs {
                     return Err(TopologyError::InvalidOptions(format!(
@@ -783,9 +720,7 @@ impl Topology {
             ));
         }
 
-            // 3. Connections: forward-only, known nodes, in-range ports, and 1:1 on BOTH
-            // sides — one wire per input port (fan-in is extra ports, see `rewire_orphaned_outputs`)
-            // and one wire per non-Input output port.
+        // 3.
         let mut used_sources: Vec<Port> = Vec::new();
         let mut used_targets: Vec<Port> = Vec::new();
         for conn in &self.connections {
@@ -821,14 +756,14 @@ impl Topology {
             used_targets.push(conn.to);
         }
 
-            // 4. Feature-dim consistency per node: with per-node hidden_dim + port
-            // projections, all source dim combinations are valid. No check needed.
+        // 4. Feature-dim consistency per node: with per-node hidden_dim + port
+        // projections, all source dim combinations are valid. No check needed.
 
         Ok(())
     }
 
-        /// Count orphaned ports: `(orphaned_inputs, orphaned_outputs)`. An orphaned input
-        /// is fed `net_input` at execution; the graph-output node's ports are excluded.
+    /// Count orphaned ports: `(orphaned_inputs, orphaned_outputs)`. An orphaned input
+    /// is fed `net_input` at execution; the graph-output node's ports are excluded.
     pub fn orphan_counts(&self) -> (usize, usize) {
         node_orphan_counts(&self.nodes, &self.connections, self.nodes.len() - 1)
     }
@@ -840,8 +775,8 @@ impl Topology {
         node.hidden_dim.unwrap_or(8)
     }
 
-        /// The effective hidden dim for orphan projections: the max output dim across all
-        /// nodes, so orphans project straight to the widest dim (no double projection).
+    /// The effective hidden dim for orphan projections: the max output dim across
+    /// nodes, so orphans project straight to the widest dim (no double projection).
     fn effective_hidden_dim(&self) -> usize {
         self.nodes
             .iter()
@@ -850,8 +785,8 @@ impl Topology {
             .unwrap_or(8)
     }
 
-        /// Derived per-node feature dims `(in_dim, out_dim)` indexed by node id — the same
-        /// derivation `Network::build` uses. Orphan/no-source nodes read `hidden_dim`.
+    /// Derived per-node feature dims `(in_dim, out_dim)` indexed by node id — the same
+    /// derivation `Network::build` uses. Orphan/no-source nodes read `hidden_dim`.
     pub fn node_dims(&self) -> Vec<(usize, usize)> {
         let num_inputs: Vec<usize> = self.nodes.iter().map(|n| n.num_inputs).collect();
         let sources = build_node_sources(&self.connections, &num_inputs);
@@ -874,8 +809,8 @@ impl Topology {
             .collect()
     }
 
-        /// Orphaned ports of one node: `(orphaned input indices, orphaned output indices)`.
-        /// The graph-output node's own ports are the answer, not orphans.
+    /// Orphaned ports of one node: `(orphaned input indices, orphaned output indices)`.
+    /// The graph-output node's own ports are the answer, not orphans.
     pub fn orphan_ports(&self, node: usize) -> (Vec<usize>, Vec<usize>) {
         let mut ins = Vec::new();
         let mut outs = Vec::new();
@@ -894,9 +829,8 @@ impl Topology {
         (ins, outs)
     }
 
-        /// Every input port that carries more than one wire, with its wire count —
-        /// `[]` is the healthy answer. The wiring model in one sentence: **a port is a
-        /// socket, not a bucket**; fan-in is extra input ports.
+    /// Every input port that carries more than one wire, with its wire count — `[]` is the healthy
+    /// answer.
     pub fn input_ports_with_multiple_wires(&self) -> Vec<(Port, usize)> {
         let mut counts: Vec<(Port, usize)> = Vec::new();
         for c in &self.connections {
@@ -909,18 +843,8 @@ impl Topology {
         counts
     }
 
-        /// Give a blueprint the one-wire-per-port shape: every input port that carries
-        /// several wires is split into that many ports. Called on load
-        /// ([`Topology::from_json`]) — a run recorded before the wiring refactor is
-        /// otherwise unloadable, and the engine's inheritance path reads the previous
-        /// run's `nets/*.json` automatically.
-        ///
-        /// Values: wire order within a port is preserved, so **Add and Mean are
-        /// unchanged** (the old port sum / count equals the new wire sum / port count).
-        /// The folding ops (`Max/Min/Mul/Sub/Div`) now see one operand per wire instead
-        /// of one per port sum — that is the point of the refactor, not a side effect.
-        /// No-op on a current blueprint, and announced at info level when it fires: a
-        /// rewritten blueprint is something the log should admit to.
+    /// Give a blueprint the one-wire-per-port shape: every input port that carries several wires
+    /// split into that many ports.
     pub(crate) fn unstack_input_ports(&mut self) {
         let stacked = self.input_ports_with_multiple_wires();
         if stacked.is_empty() {
@@ -953,8 +877,8 @@ impl Topology {
         );
     }
 
-        /// Panic unless the wiring invariant holds: every input port has exactly one
-        /// wire (test helper — `validate` enforces the same rule).
+    /// Panic unless the wiring invariant holds: every input port has exactly one
+    /// wire (test helper — `validate` enforces the same rule).
     pub fn assert_one_wire_per_port(&self) {
         let multi = self.input_ports_with_multiple_wires();
         assert!(multi.is_empty(), "input ports with >1 wire: {multi:?}");
@@ -980,14 +904,14 @@ impl Topology {
         node_degrees(&self.nodes, &self.connections)
     }
 
-        /// Longest path from an `Input` node per node id — a topological level. Input nodes
-        /// sit at 0; others are `1 + max` over wired sources. Ascending ids are a valid order.
+    /// Longest path from an `Input` node per node id — a topological level. Input nodes
+    /// sit at 0; others are `1 + max` over wired sources. Ascending ids are a valid order.
     pub fn depths(&self) -> Vec<usize> {
         node_depths(&self.nodes, &self.connections)
     }
 
-        /// Estimated total learnable elements (weights + biases) without building — the
-        /// input projection plus every node's `in·out + out`. Matches a built `Network`.
+    /// Estimated total learnable elements (weights + biases) without building —
+    /// input projection plus every node's `in·out + out`. Matches a built `Network`.
     pub fn param_estimate(&self) -> usize {
         let dims = self.node_dims();
         let mut total = 0;
@@ -1009,8 +933,8 @@ impl Topology {
         node_activation_counts(&self.nodes)
     }
 
-        /// Ensure the canonical skeleton: at least one `Input` node and exactly one `Output`
-        /// node. Idempotent; called as phase 1 of `finalize`. More than one Output is rejected.
+    /// Ensure the canonical skeleton: at least one `Input` node and exactly one `Output`
+    /// node. Idempotent; called as phase 1 of `finalize`. More than one Output is rejected.
     pub fn ensure_scaffold(&mut self) {
         // 1. At least one Input node (single output port; net_input feeds
         //    the rest of the graph).
@@ -1025,10 +949,7 @@ impl Topology {
             }
         }
 
-            // 2. Exactly one Output node: append the projection (`hidden_dim → output_dim`);
-            // with auto-detected output_dim there's no need for multiple Output nodes.
-            // It starts with ONE input socket and gains the rest in
-            // `rewire_orphaned_outputs` — its fan-in is its port count, like any node.
+        // 2.
         let has_output = self.nodes.iter().any(|n| n.kind == NodeKind::Output);
         if !has_output {
             let mut out = Node::new_output(self.nodes.len(), 1, 1);
@@ -1037,13 +958,8 @@ impl Topology {
         }
     }
 
-        /// Re-wire orphaned output ports into random *later* nodes — the de-orphaning rule,
-        /// called at the end of `finalize`. Deterministic per `options.topology_seed`.
-        ///
-        /// **One wire per input port:** the rescued wire takes a socket that is still
-        /// free; only when every socket of every candidate is taken does the target
-        /// grow a new input port. This is the single place fan-in is created, and it
-        /// now creates it in the only shape the runtime understands.
+    /// Re-wire orphaned output ports into random *later* nodes — the de-orphaning rule, called
+    /// the end of `finalize`.
     pub fn rewire_orphaned_outputs(&mut self) -> usize {
         // Collect the orphaned output ports (graph-output node excluded).
         // The Output node is always the last node (created by ensure_scaffold).
@@ -1084,12 +1000,7 @@ impl Topology {
             if targets.is_empty() {
                 continue;
             }
-            // Target choice, in order of preference:
-            //   1. a node with a free socket — port counts stay exactly as born;
-            //   2. a node allowed to grow (a Hidden node still under
-            //      `max_hidden_inputs_per_node`, or the Output node, whose fan-in *is*
-            //      its port count);
-            //   3. nobody — leave the wire unplaced rather than break the invariant.
+            // Target choice, in order of preference: 1.
             let free: Vec<usize> = targets
                 .iter()
                 .copied()
@@ -1111,9 +1022,7 @@ impl Topology {
             let port = match self.free_input_port(target) {
                 Some(i) => i,
                 None => {
-                        // Every socket is taken: add one. The wire count and the port
-                        // count stay equal, which is what lets the runtime keep one
-                        // source per port instead of a list per port.
+                    // Every socket is taken: add one.
                     let node = &mut self.nodes[target];
                     let i = node.num_inputs;
                     node.num_inputs += 1;
@@ -1132,9 +1041,7 @@ impl Topology {
         added
     }
 
-        /// Whether `node` may take another input port. Hidden nodes stay inside the
-        /// birth band (`max_hidden_inputs_per_node`); the Output node has no ceiling —
-        /// its fan-in is whatever reaches it, one socket per wire.
+    /// Whether `node` may take another input port.
     fn may_grow_inputs(&self, node: usize) -> bool {
         match self.nodes[node].kind {
             NodeKind::Hidden => {
@@ -1154,14 +1061,7 @@ impl Topology {
         })
     }
 
-    /// Remove orphaned ports and renumber connections to close gaps. The Output node
-    /// keeps all of its output ports (they are the network output).
-    ///
-    /// The input side is compacted too, and for one reason only: `dedup_input_connections`
-    /// DROPS a wire (the second Input wire into a target), which empties the port it used,
-    /// and an empty input port may not survive (`validate` wants every one wired). Nothing
-    /// else can empty an input port — `wire_ports` and `rewire_orphaned_inputs` fill them
-    /// all, and `rewire_orphaned_outputs` adds ports as it needs them.
+    /// Remove orphaned ports and renumber connections to close gaps.
     fn trim_orphaned_ports(&mut self) {
         let output_id = self
             .nodes
@@ -1241,8 +1141,8 @@ impl Topology {
                     .filter(|&&v| v != usize::MAX)
                     .count()
                     .max(1);
-                    // Compact port_activations alongside the port remap — the vec must always
-                    // match num_outputs (`validate()` enforces it). Input ports stay Identity.
+                // Compact port_activations alongside the port remap — the vec must always
+                // match num_outputs (`validate()` enforces it). Input ports stay Identity.
                 if let Some(ports) = &mut node.port_activations {
                     let mut compacted: Vec<crate::graph::node::Activation> = out_remap[i]
                         .iter()
@@ -1258,10 +1158,8 @@ impl Topology {
                     );
                     *ports = compacted;
                 }
-                    // Feature masks are port-bound too: carry each row with the port it
-                    // belongs to, drop the rows of ports the rebuild removed, and leave a
-                    // port the rebuild ADDED unmasked (every feature reaches it) rather
-                    // than inventing a row here — the policy draw is the caller's job.
+                // Feature masks are port-bound too: carry each row with the port it belongs
+                // drop the rows of ports the rebuild removed, and leave a port the rebuild ADDED
                 if let Some(masks) = &mut node.feature_masks {
                     let mut kept: Vec<Vec<u8>> = Vec::with_capacity(node.num_outputs);
                     for &old in &out_remap[i] {
@@ -1284,10 +1182,8 @@ impl Topology {
                 node.num_inputs = connected_in;
             }
         }
-            // The rebuild can ADD an Input port, and a port the rebuild added keeps every
-            // feature — so a partition plus a cover-all port is no longer "each feature in
-            // exactly one port". Restamp BEFORE anything writes the blueprint, or the file
-            // records a policy its own rows contradict.
+        // The rebuild can ADD an Input port, and a port the rebuild added keeps every feature —
+        // a partition plus a cover-all port is no longer "each feature in exactly one port".
         if self.options.feature_split == Some(FeatureSplitPolicy::Exclusive) {
             let input_dim = self.options.input_dim.unwrap_or(1);
             if let Some(masks) = self.input_feature_masks() {
@@ -1298,14 +1194,14 @@ impl Topology {
         }
     }
 
-        /// Serialize the whole blueprint (options, nodes, labels, connections) to JSON
-        /// (see [`crate::spec::Spec`]); the RNG is not stored.
+    /// Serialize the whole blueprint (options, nodes, labels, connections) to JSON
+    /// (see [`crate::spec::Spec`]); the RNG is not stored.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
 
-        /// Deserialize a blueprint from JSON (see `to_json`). The RNG is re-seeded from
-        /// `options.topology_seed`, so loaded graphs wire identically; weights are fresh.
+    /// Deserialize a blueprint from JSON (see `to_json`). The RNG is re-seeded
+    /// `options.topology_seed`, so loaded graphs wire identically; weights are fresh.
     pub fn from_json(s: &str) -> Result<Topology, serde_json::Error> {
         let mut topo: Topology = serde_json::from_str(s)?;
         // Every loaded net (live, tombstone, resumed or imported) passes through here:
@@ -1316,8 +1212,8 @@ impl Topology {
 
     // ── Crossover ──────────────────────────────────────────────────────────
 
-        /// Find a hidden node with the same interface in both topologies
-        /// (`num_inputs`/`num_outputs`); returns indices into each hidden-only list.
+    /// Find a hidden node with the same interface in both topologies
+    /// (`num_inputs`/`num_outputs`); returns indices into each hidden-only list.
     fn find_matching_node(a: &Topology, b: &Topology, rng: &mut Rng) -> Option<(usize, usize)> {
         let ha: Vec<usize> = a
             .nodes
@@ -1334,8 +1230,8 @@ impl Topology {
             .map(|(i, _)| i)
             .collect();
 
-            // Collect all matching pairs — only the structural interface matters;
-            // finalize() handles wiring, so activations/combine ops may differ freely.
+        // Collect all matching pairs — only the structural interface matters;
+        // finalize() handles wiring, so activations/combine ops may differ freely.
         let mut matches: Vec<(usize, usize)> = Vec::new();
         for (ai, &a_idx) in ha.iter().enumerate() {
             let an = &a.nodes[a_idx];
@@ -1354,9 +1250,19 @@ impl Topology {
         }
     }
 
-        /// Crossover: find a matching-node pivot (same port counts), swap everything from
-        /// that pivot onward, then finalize both. Returns true if a swap happened.
+    /// Crossover: find a matching-node pivot (same port counts), swap everything
+    /// that pivot onward, then finalize both. Returns true if a swap happened.
     pub fn cx_one_point(a: &mut Topology, b: &mut Topology, rng: &mut Rng) -> bool {
+        Self::cx_one_point_with_report(a, b, rng).is_some()
+    }
+
+    /// [`Self::cx_one_point`] carrying the provenance the weights need: one entry per hidden node
+    /// of the returned `a` — `None` when it kept its own gene, `Some(index)` naming the donor NODE
+    pub fn cx_one_point_with_report(
+        a: &mut Topology,
+        b: &mut Topology,
+        rng: &mut Rng,
+    ) -> Option<CxReport> {
         let ha: Vec<usize> = a
             .nodes
             .iter()
@@ -1373,7 +1279,7 @@ impl Topology {
             .collect();
 
         if ha.is_empty() || hb.is_empty() {
-            return false;
+            return None;
         }
 
         // Only crossover if a matching-node pivot exists — no random cuts
@@ -1390,23 +1296,28 @@ impl Topology {
             a.finalize();
             b.renumber_ids();
             b.finalize();
+            let mut moved = vec![None; ha.len()];
+            let mut moved_b = vec![None; hb.len()];
+            for offset in 0..len {
+                moved[pivot_a + offset] = Some(hb[pivot_b + offset]);
+                moved_b[pivot_b + offset] = Some(ha[pivot_a + offset]);
+            }
             debug!(
                 "cx_one_point: pivot hidden[{}] <-> hidden[{}], swapped {} nodes",
                 pivot_a, pivot_b, len
             );
-            return true;
+            return Some(CxReport {
+                swaps: len,
+                pairs: ha.len(),
+                moved,
+                moved_b,
+            });
         }
         debug!("cx_one_point: no matching node found, skipping");
-        false
+        None
     }
 
-        /// Uniform crossover: per-node independent swap, requiring equal hidden counts.
-        ///
-        /// `Some(CxReport)` when at least one gene moved (the child is `a`), `None`
-        /// when the operator declined — mismatched hidden counts, or every coin said
-        /// "keep". The REPORT is what makes `3/6` printable: the count used to exist
-        /// only inside a `debug!` line, so nothing downstream could say how much of
-        /// the child actually came from the other parent.
+    /// Uniform crossover: per-node independent swap, requiring equal hidden counts.
     pub fn cx_uniform(
         a: &mut Topology,
         b: &mut Topology,
@@ -1439,10 +1350,17 @@ impl Topology {
         }
 
         let mut swaps = 0usize;
-        for (&ai, &bi) in ha.iter().zip(hb.iter()) {
+        let mut moved = vec![None; ha.len()];
+        let mut moved_b = vec![None; hb.len()];
+        for (slot, (&ai, &bi)) in ha.iter().zip(hb.iter()).enumerate() {
             if rng.f32() < swap_prob {
                 std::mem::swap(&mut a.nodes[ai], &mut b.nodes[bi]);
+                moved[slot] = Some(bi);
                 swaps += 1;
+            } else {
+                // No coin: the reciprocal child took THIS parent's node,
+                // provenance names the donor
+                moved_b[slot] = Some(ai);
             }
         }
 
@@ -1457,6 +1375,8 @@ impl Topology {
         Some(CxReport {
             swaps,
             pairs: ha.len(),
+            moved,
+            moved_b,
         })
     }
 }
@@ -1473,8 +1393,8 @@ pub(crate) mod test_strategies {
     use super::*;
     use proptest::prelude::*;
 
-        /// Valid random `TopologyOptions`: non-zero dims and non-inverted ranges —
-        /// exactly what `validate()` rejects is what we never generate.
+    /// Valid random `TopologyOptions`: non-zero dims and non-inverted ranges —
+    /// exactly what `validate()` rejects is what we never generate.
     pub(crate) fn topology_options_strategy() -> impl Strategy<Value = TopologyOptions> {
         (
             0usize..10_000, //  seed
@@ -1496,12 +1416,13 @@ pub(crate) mod test_strategies {
                     output_dim: Some(output_dim),
                     dropout_prob: 0.0,
                     feature_split: None,
+                    weight_seed: None,
                 },
             )
     }
 
-        /// A random graph: input + 0..5 hidden + output, fully wired through the standard
-        /// pipeline (`refresh_labels` + `finalize`, which auto-de-orphans).
+    /// A random graph: input + 0..5 hidden + output, fully wired through the standard
+    /// pipeline (`refresh_labels` + `finalize`, which auto-de-orphans).
     pub(crate) fn topology_strategy() -> impl Strategy<Value = Topology> {
         (topology_options_strategy(), 0usize..6).prop_map(|(opts, n_hidden)| {
             let mut graph = Topology::new(0, Some(opts));
@@ -1552,7 +1473,7 @@ mod tests {
         let graph = Topology::new(1, None);
         assert_eq!(graph.nodes.len(), 0);
         assert_eq!(graph.options.min_hidden_num_nodes, 2);
-        assert_eq!(graph.options.max_hidden_num_nodes, 5);
+        assert_eq!(graph.options.max_hidden_num_nodes, 15);
     }
 
     #[test]
@@ -1569,6 +1490,7 @@ mod tests {
             output_dim: Some(10),
             dropout_prob: 0.0,
             feature_split: None,
+            weight_seed: None,
         };
         let graph = Topology::new(1, Some(opts));
         assert_eq!(graph.nodes.len(), 0);
@@ -1616,8 +1538,8 @@ mod tests {
 
     #[test]
     fn test_trim_orphaned_ports_compacts_port_activations() {
-            // An orphaned output port must compact port_activations along with num_outputs,
-            // or finalize's validate() rejects the length mismatch.
+        // An orphaned output port must compact port_activations along with num_outputs,
+        // or finalize's validate() rejects the length mismatch.
         let mut g = Topology::new(0, Some(TopologyOptions::default()));
         g.nodes.push(Node::new_input(0, 1));
         let mut n1 = Node::new_hidden(1, 1, 3);
@@ -1636,8 +1558,8 @@ mod tests {
         });
         g.finalize();
         let n1 = &g.nodes[1];
-            // Core invariant: port_activations always matches num_outputs after trim —
-            // exactly what validate() enforces.
+        // Core invariant: port_activations always matches num_outputs after trim —
+        // exactly what validate() enforces.
         let ports = n1.port_activations.as_ref().unwrap();
         assert_eq!(
             ports.len(),
@@ -1705,8 +1627,8 @@ mod tests {
         graph.nodes.push(Node::new_hidden(2, 2, 1));
         graph.finalize();
 
-            // Output ports stay 1:1; input ports may hold several wires because finalize
-            // auto-de-orphans (stacks extra sources into later nodes, even occupied ports).
+        // Output ports stay 1:1; input ports may hold several wires because finalize
+        // auto-de-orphans (stacks extra sources into later nodes, even occupied ports).
         let mut seen_from: Vec<Port> = Vec::new();
         let input_id = graph
             .nodes
@@ -1826,8 +1748,8 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_multi_wired_input_port() {
-            // A port is a socket, not a bucket: fan-in is expressed as extra ports, so a
-            // freshly built graph may not stack two wires on one input port.
+        // A port is a socket, not a bucket: fan-in is expressed as extra ports,
+        // freshly built graph may not stack two wires on one input port.
         let graph = stacked_input_port_graph();
         assert_eq!(
             graph.validate(),
@@ -1840,10 +1762,8 @@ mod tests {
 
     #[test]
     fn legacy_stacked_blueprint_loads_as_one_port_per_wire() {
-            // A run recorded before the refactor can stack wires on one input port, and
-            // LOADING is the only way such wiring re-enters the process (engine inheritance
-            // reads the previous run's `nets/*.json` automatically). It must be usable:
-            // the port is split, no wire is dropped, and the result validates.
+        // A run recorded before the refactor can stack wires on one input port, and LOADING
+        // only way such wiring re-enters the process (engine inheritance reads the previous run's
         let mut graph = Topology::new(
             9,
             Some(TopologyOptions {
@@ -1904,8 +1824,8 @@ mod tests {
 
     #[test]
     fn test_orphan_counts() {
-            // n1 has 3 inputs, only i2 wired → 2 orphaned inputs. n2's output has no wire
-            // → 1 orphaned output. n3 is the network output: its port is the answer, not an orphan.
+        // n1 has 3 inputs, only i2 wired → 2 orphaned inputs. n2's output has no wire
+        // → 1 orphaned output. n3 is the network output: its port is the answer, not an orphan.
         let mut graph = Topology::new(1, None);
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_hidden(1, 3, 2));
@@ -1934,8 +1854,8 @@ mod tests {
 
     #[test]
     fn test_derived_diagnostics() {
-            // n0 input (2 outs) → n1 hidden (3 in, 2 out) → n2 hidden (2 in, 1 out) → n3
-            // output. Wired sparsely on purpose so orphaned ports stay orphaned.
+        // n0 input (2 outs) → n1 hidden (3 in, 2 out) → n2 hidden (2 in, 1 out) → n3
+        // output. Wired sparsely on purpose so orphaned ports stay orphaned.
         let mut g = Topology::new(1, None);
         g.nodes.push(Node::new_input(0, 2));
         g.nodes.push(Node::new_hidden(1, 3, 2));
@@ -1955,7 +1875,7 @@ mod tests {
         });
 
         // Per-node orphaned port indices (raw — the output node's own port
-        // is counted here, unlike orphan_counts which excludes it).
+        // is counted here, unlike orphan_counts which excludes
         assert_eq!(g.orphan_ports(0), (vec![], vec![1]));
         assert_eq!(g.orphan_ports(1), (vec![1, 2], vec![1]));
         assert_eq!(g.orphan_ports(2), (vec![1], vec![]));
@@ -1990,8 +1910,8 @@ mod tests {
 
     #[test]
     fn test_node_dims_with_override() {
-            // Chain with a widened middle node: n1 emits 32, so n2's in_dim re-derives to
-            // 32; n0 (orphan) gets effective hidden_dim = 32 so projections go straight there.
+        // Chain with a widened middle node: n1 emits 32, so n2's in_dim re-derives
+        // 32; n0 (orphan) gets effective hidden_dim = 32 so projections go straight there.
         let mut g = Topology::new(1, None);
         g.nodes.push(Node::new_input(0, 1));
         let mut wide = Node::new_hidden(1, 1, 1);
@@ -2006,15 +1926,15 @@ mod tests {
             from: Port { node: 1, index: 0 },
             to: Port { node: 2, index: 0 },
         });
-            // n0: input, in_dim = input_dim (1), out_dim = template (8); n1: wired from n0
-            // (out=8), out_dim = 32; n2: wired from n1 (out=32), out_dim = template (8).
+        // n0: input, in_dim = input_dim (1), out_dim = template (8); n1: wired from n0
+        // (out=8), out_dim = 32; n2: wired from n1 (out=32), out_dim = template (8).
         assert_eq!(g.node_dims(), vec![(1, 8), (8, 32), (32, 8)]);
     }
 
     #[test]
     fn test_rewire_orphaned_outputs() {
-            // n2_o0 is orphaned; de-orphaning must wire it into the only later node (n3),
-            // whose input port is already wired — fine, tensors are summed.
+        // n2_o0 is orphaned; de-orphaning must wire it into the only later node (n3),
+        // whose input port is already wired — fine, tensors are summed.
         let mut graph = Topology::new(1, None);
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_hidden(1, 3, 2));
@@ -2054,8 +1974,8 @@ mod tests {
 
     #[test]
     fn test_rewire_orphaned_outputs_rewires_even_with_dim_mismatch() {
-            // n1 widens 8 → 32 and its output is orphaned; port projections bridge any dim
-            // mismatch, so the orphan is still rewired.
+        // n1 widens 8 → 32 and its output is orphaned; port projections bridge any dim
+        // mismatch, so the orphan is still rewired.
         let mut graph = Topology::new(1, None);
         graph.nodes.push(Node::new_input(0, 1));
         let mut wide = Node::new_hidden(1, 1, 1);
@@ -2097,8 +2017,8 @@ mod tests {
 
     #[test]
     fn test_finalize_auto_de_orphans() {
-            // finalize alone must leave zero orphaned *outputs* (the graph-output node's
-            // own ports are the answer) and always validate.
+        // finalize alone must leave zero orphaned *outputs* (the graph-output node's
+        // own ports are the answer) and always validate.
         let mut graph = Topology::new(0, None);
         graph.nodes.push(Node::new_input(0, 2));
         graph.nodes.push(Node::new_hidden(1, 3, 2));
@@ -2152,7 +2072,7 @@ mod tests {
 
     #[test]
     fn test_ensure_scaffold_adds_input_and_output() {
-        // A hidden-only graph (what random generation produces) gets the
+        // A hidden-only graph (what random generation produces) gets
         // canonical skeleton: prepend Input (single port), append Output.
         let mut graph = Topology::new(0, None);
         graph.create_random_hidden_nodes(3);
@@ -2212,7 +2132,7 @@ mod tests {
 
     proptest! {
         /// Any random graph produced by the standard pipeline must validate —
-        /// the invariant the whole design leans on.
+        /// the invariant the whole design leans
         #[test]
         fn prop_random_graphs_always_validate(graph in topology_strategy()) {
             prop_assert!(
@@ -2237,7 +2157,7 @@ mod tests {
         fn prop_wiring_invariants(graph in topology_strategy()) {
             let mut seen: Vec<Port> = Vec::new();
             let input_id = graph.nodes.iter().find(|n| n.kind == NodeKind::Input).map(|n| n.id);
-                // One wire per input port — the invariant that lets the runtime keep a
+                // One wire per input port — the invariant that lets the runtime keep
                 // single source per port instead of a list per port.
             prop_assert!(
                 graph.input_ports_with_multiple_wires().is_empty(),
@@ -2334,8 +2254,8 @@ mod finalize_order_tests {
 
     #[test]
     fn finalize_is_not_idempotent_so_never_run_it_on_loaded_topologies() {
-            // Guardrail bug of record: loading a saved topology and calling `finalize()` threw
-            // the wiring away and regenerated a DIFFERENT graph. Assert from_json preserves wiring.
+        // Guardrail bug of record: loading a saved topology and calling `finalize()` threw
+        // the wiring away and regenerated a DIFFERENT graph. Assert from_json preserves wiring.
         for seed in 0..25 {
             let mut original = Topology::new(seed, Some(TopologyOptions::default()));
             original.finalize();
@@ -2380,9 +2300,7 @@ mod finalize_order_tests {
 
     #[test]
     fn finalize_wires_every_input_port_exactly_once() {
-            // The wiring model: a port is a socket, not a bucket. After `finalize` every
-            // input port carries exactly one wire — including crossover children, whose
-            // parents were both finalized from a different (possibly richer) shape.
+        // The wiring model: a port is a socket, not a bucket.
         for seed in 0..40 {
             let opts = TopologyOptions {
                 topology_seed: seed,
@@ -2394,9 +2312,8 @@ mod finalize_order_tests {
             a.create_random_hidden_nodes(4);
             a.finalize();
             a.assert_one_wire_per_port();
-                // The Input node is the one fan-out node, but it may not feed one target
-                // twice: every Input port is Identity, so the second wire would be the
-                // same signal twice, straight into the combine op.
+            // The Input node is the one fan-out node, but it may not feed one target twice:
+            // Input port is Identity, so the second wire would be the same signal twice, straight
             let input_id = a
                 .nodes
                 .iter()
@@ -2425,9 +2342,8 @@ mod finalize_order_tests {
         }
     }
 
-    /// The uniform operator REPORTS what it exchanged: every coin at 1.0 flips every
-    /// aligned gene, every coin at 0.0 flips none and is a declined pairing (no child),
-    /// and the denominator is the hidden count both parents share.
+    /// The uniform operator REPORTS what it exchanged: every coin at 1.0 flips every aligned gene,
+    /// every coin at 0.0 flips none and is a declined pairing (no child), and the denominator
     #[test]
     fn cx_uniform_reports_the_genes_it_exchanged() {
         let opts = TopologyOptions::default();
@@ -2446,6 +2362,16 @@ mod finalize_order_tests {
             .expect("every coin flips, so the operator reports");
         assert_eq!((all.swaps, all.pairs), (4, 4));
         assert_eq!(all.label(), "4/4");
+        assert_eq!(
+            all.moved,
+            vec![Some(1), Some(2), Some(3), Some(4)],
+            "every gene reports WHICH donor NODE it came from (index 1..4 = the hidden ones)"
+        );
+        assert_eq!(
+            all.moved_b,
+            vec![None; 4],
+            "the reciprocal kept every gene, so its provenance is all `None`"
+        );
 
         let (mut a, mut b) = pair();
         assert!(
@@ -2463,11 +2389,48 @@ mod finalize_order_tests {
         assert!(Topology::cx_uniform(&mut a, &mut b, 1.0, &mut Rng::with_seed(5)).is_none());
     }
 
+    /// A cut reports BOTH children: the swapped tail names the donor node on each side,
+    /// so the engine can follow provenance whichever reciprocal it ends up keeping.
+    #[test]
+    fn cx_one_point_reports_provenance_for_both_sides() {
+        let opts = TopologyOptions::default();
+        let mut a = Topology::new(21, Some(opts.clone()));
+        a.create_random_hidden_nodes(4);
+        a.finalize();
+        let mut b = Topology::new(22, Some(opts));
+        b.create_random_hidden_nodes(4);
+        b.finalize();
+
+        let rep = Topology::cx_one_point_with_report(&mut a, &mut b, &mut Rng::with_seed(9))
+            .expect("equal port counts always leave a pivot to cut at");
+        assert_eq!(rep.pairs, 4);
+        assert!(rep.swaps >= 1, "a cut that swaps nothing is declined");
+        assert_eq!(rep.moved.len(), 4, "one slot per hidden node of `a`");
+        assert_eq!(rep.moved_b.len(), 4, "one slot per hidden node of `b`");
+        // A cut moves a CONTIGUOUS TAIL on each side; every slot before it kept its own.
+        let is_tail =
+            |m: &[Option<usize>]| m.iter().skip_while(|s| s.is_none()).all(|s| s.is_some());
+        assert!(
+            rep.moved.iter().any(|s| s.is_some()) && is_tail(&rep.moved),
+            "a's moved slots are a tail: {:?}",
+            rep.moved
+        );
+        assert!(
+            rep.moved_b.iter().any(|s| s.is_some()) && is_tail(&rep.moved_b),
+            "b's moved slots are a tail: {:?}",
+            rep.moved_b
+        );
+        assert_eq!(
+            rep.moved.iter().flatten().count(),
+            rep.moved_b.iter().flatten().count(),
+            "one swap moves one node on each side"
+        );
+    }
+
     #[test]
     fn orphan_rescue_grows_a_port_rather_than_stacking() {
-            // Every candidate socket is taken, so the rescue has exactly one legal move:
-            // give the target another input port. Stacking on the taken one is now refused
-            // by `validate`.
+        // Every candidate socket is taken, so the rescue has exactly one legal move: give
+        // target another input port.
         let mut graph = Topology::new(3, Some(TopologyOptions::default()));
         graph.nodes.push(Node::new_input(0, 1));
         graph.nodes.push(Node::new_hidden(1, 1, 2));
@@ -2488,7 +2451,11 @@ mod finalize_order_tests {
             },
         ];
 
-        assert_eq!(graph.rewire_orphaned_outputs(), 1, "n1_o1 is the only orphan");
+        assert_eq!(
+            graph.rewire_orphaned_outputs(),
+            1,
+            "n1_o1 is the only orphan"
+        );
 
         assert!(
             graph.input_ports_with_multiple_wires().is_empty(),
@@ -2502,9 +2469,8 @@ mod finalize_order_tests {
 
     #[test]
     fn finalize_leaves_no_orphaned_input_output_ports() {
-            // Regression: dedup used to run AFTER trim_orphaned_ports, stranding ports whose
-            // only wire got dropped (mermaid `identity (orphan)` stubs). The order still
-            // matters for the same reason: dedup DROPS a wire, trim removes the emptied port.
+        // Regression: dedup used to run AFTER trim_orphaned_ports, stranding ports whose only wire
+        // got dropped (mermaid `identity (orphan)` stubs).
         for seed in 0..40 {
             let mut g = Topology::new(seed, Some(TopologyOptions::default()));
             g.finalize();
@@ -2560,8 +2526,8 @@ mod fanout_bounds_tests {
 
     #[test]
     fn finalize_respects_max_inputs_per_node() {
-            // The setters bound CREATION; verify finalize never grows a node's declared input
-            // count past the configured maximum (fan-in rescue only uses declared ports).
+        // The setters bound CREATION; verify finalize never grows a node's declared input
+        // count past the configured maximum (fan-in rescue only uses declared ports).
         for seed in 0..60 {
             let opts = TopologyOptions {
                 min_hidden_inputs_per_node: 2,
@@ -2588,8 +2554,8 @@ mod fanout_bounds_tests {
 
     #[test]
     fn exclusive_feature_masks_partition_without_sharing() {
-            // Exclusive is a true partition: every feature lands in exactly one port, so
-            // no two branches can ever see the same feature.
+        // Exclusive is a true partition: every feature lands in exactly one port,
+        // no two branches can ever see the same feature.
         let opts = TopologyOptions {
             input_dim: Some(6),
             output_dim: Some(1),
@@ -2616,8 +2582,8 @@ mod fanout_bounds_tests {
 
     #[test]
     fn random_feature_masks_are_per_port_and_may_overlap() {
-            // Random flips an independent coin per (port, feature): no exclusivity, so the
-            // only guarantees are the shape and that it is not degenerate.
+        // Random flips an independent coin per (port, feature): no exclusivity,
+        // only guarantees are the shape and that it is not degenerate.
         let opts = TopologyOptions {
             input_dim: Some(8),
             output_dim: Some(1),
@@ -2631,7 +2597,10 @@ mod fanout_bounds_tests {
         let input = g.nodes.iter().find(|n| n.kind == NodeKind::Input).unwrap();
         let masks = input.feature_masks.as_ref().expect("masks assigned");
         assert_eq!(masks.len(), input.num_outputs);
-        assert!(masks.iter().all(|m| m.len() == 8), "every mask spans input_dim");
+        assert!(
+            masks.iter().all(|m| m.len() == 8),
+            "every mask spans input_dim"
+        );
         assert!(masks.iter().flatten().all(|b| *b <= 1), "masks are 0/1");
         let ones: usize = masks
             .iter()
@@ -2650,7 +2619,7 @@ mod fanout_bounds_tests {
             output_dim: Some(1),
             ..Default::default()
         };
-            // Wrong width: a mask must span exactly `input_dim`.
+        // Wrong width: a mask must span exactly `input_dim`.
         let mut g = Topology::new(5, Some(opts));
         g.create_random_hidden_nodes(2);
         g.finalize();
@@ -2666,7 +2635,7 @@ mod fanout_bounds_tests {
             "a feature mask of the wrong width must be refused"
         );
 
-            // Masks on a non-Input node: the split is an Input-side feature.
+        // Masks on a non-Input node: the split is an Input-side feature.
         let mut g2 = Topology::new(5, Some(opts));
         g2.create_random_hidden_nodes(2);
         g2.finalize();
@@ -2684,10 +2653,8 @@ mod fanout_bounds_tests {
 
     #[test]
     fn finalize_carries_masks_through_the_port_remap() {
-            // Crossover re-finalizes both parents, and those parents already carry masks
-            // from their own build. The rebuild re-counts and renumbers ports, so the rows
-            // must travel through the SAME remap the wires did instead of being wiped —
-            // otherwise every child inherits an arbitrary permutation, or nothing.
+        // Crossover re-finalizes both parents, and those parents already carry masks from their own
+        // build.
         let opts = TopologyOptions {
             input_dim: Some(4),
             output_dim: Some(1),
@@ -2704,11 +2671,7 @@ mod fanout_bounds_tests {
         let after = g
             .input_feature_masks()
             .expect("finalize must carry the split, not wipe it");
-        let input = g
-            .nodes
-            .iter()
-            .find(|n| n.kind == NodeKind::Input)
-            .unwrap();
+        let input = g.nodes.iter().find(|n| n.kind == NodeKind::Input).unwrap();
         assert_eq!(after.len(), input.num_outputs, "one row per final port");
         assert!(
             after.iter().all(|m| m.len() == 4),
@@ -2720,9 +2683,8 @@ mod fanout_bounds_tests {
 
     #[test]
     fn feature_masks_survive_the_blueprint_round_trip() {
-            // The split is genome, so the masks must come back identical from the
-            // blueprint JSON — that file (not the weights) is also the Python side of
-            // the contract, so the field has to travel.
+        // The split is genome, so the masks must come back identical from the blueprint JSON —
+        // file (not the weights) is also the Python side of the contract, so the field has
         let opts = TopologyOptions {
             input_dim: Some(4),
             output_dim: Some(1),
@@ -2749,19 +2711,21 @@ mod fanout_bounds_tests {
             "masks must round-trip byte for byte"
         );
 
-            // Old JSON predates the field: it must load as "no split".
+        // Old JSON predates the field: it must load as "no split".
         let legacy: Node = serde_json::from_value(serde_json::json!({
             "id": 0, "num_inputs": 0, "num_outputs": 2, "kind": "Input",
             "hidden_dim": null, "activation": "Identity",
             "port_activations": null, "combine_op": null, "standardize": null,
         }))
         .unwrap();
-        assert_eq!(legacy.feature_masks, None, "serde default keeps old JSON loadable");
+        assert_eq!(
+            legacy.feature_masks, None,
+            "serde default keeps old JSON loadable"
+        );
     }
 
-        /// The crossover path's installer: an inherited row lands on its own port, a
-        /// port with no inherited row starts UNMASKED (every feature reaches it), and
-        /// the result always validates against the final port count.
+    /// The crossover path's installer: an inherited row lands on its own port, a port with no
+    /// inherited row starts UNMASKED (every feature reaches it), and the result always validates
     #[test]
     fn install_feature_masks_maps_rows_and_leaves_new_ports_unmasked() {
         let opts = TopologyOptions {
@@ -2776,7 +2740,10 @@ mod fanout_bounds_tests {
             t.nodes.iter().find(|n| n.kind == NodeKind::Input).unwrap()
         }
         let ports = input_of(&g).num_outputs;
-        assert!(ports >= 2, "fixture needs at least two input ports, got {ports}");
+        assert!(
+            ports >= 2,
+            "fixture needs at least two input ports, got {ports}"
+        );
 
         g.install_input_feature_masks(&[vec![0, 1, 1, 1]], None);
         let masks = input_of(&g)
@@ -2797,9 +2764,8 @@ mod fanout_bounds_tests {
         );
     }
 
-        /// No inherited rows at all (neither parent carried a split, no policy): the
-        /// input stays genuinely unmasked — no rows, no policy — rather than getting
-        /// cover-all rows (which would be a real multiply per forward pass for nothing).
+    /// No inherited rows at all (neither parent carried a split, no policy): the input stays
+    /// genuinely unmasked — no rows, no policy — rather than getting cover-all rows (which would be
     #[test]
     fn install_feature_masks_with_no_rows_leaves_the_net_unsplit() {
         let opts = TopologyOptions {
@@ -2819,10 +2785,8 @@ mod fanout_bounds_tests {
         g.validate().expect("unmasked topology must validate");
     }
 
-        /// The LABEL follows the CONTENT, in the one place rows are installed: an
-        /// inherited row set with no stated provenance is `Inherited`, never `None`.
-        /// This is the bug a real run showed (2 of 12 nets carried masks under
-        /// `feature_split = None`) reduced to its smallest form.
+    /// The LABEL follows the CONTENT, in the one place rows are installed: an inherited row set
+    /// with no stated provenance is `Inherited`, never `None`.
     #[test]
     fn installing_inherited_rows_stamps_a_matching_policy() {
         let opts = TopologyOptions {
@@ -2851,10 +2815,7 @@ mod fanout_bounds_tests {
         // A fresh draw stamps the policy it drew under, too.
         let mut g = build();
         g.assign_feature_masks(FeatureSplitPolicy::Exclusive);
-        assert_eq!(
-            g.options.feature_split,
-            Some(FeatureSplitPolicy::Exclusive)
-        );
+        assert_eq!(g.options.feature_split, Some(FeatureSplitPolicy::Exclusive));
 
         // And `Inherited` is never drawable: it does not invent rows.
         let mut g = build();
@@ -2867,10 +2828,8 @@ mod fanout_bounds_tests {
         assert!(!FeatureSplitPolicy::Inherited.is_drawable());
     }
 
-        /// `Exclusive` is the one checkable claim a split makes — every feature owned
-        /// EXACTLY once — so a row set that fails it cannot wear the label. A cover-all
-        /// port beside a partition (what a rebuild's added port, or a padded install,
-        /// leaves) restamps to `Inherited`; a true partition keeps its label untouched.
+    /// `Exclusive` is the one checkable claim a split makes — every feature owned EXACTLY once —
+    /// a row set that fails it cannot wear the label.
     #[test]
     fn a_cover_all_port_beside_a_partition_is_not_labelled_exclusive() {
         let opts = TopologyOptions {
@@ -2887,7 +2846,7 @@ mod fanout_bounds_tests {
             .position(|n| n.kind == NodeKind::Input)
             .unwrap();
 
-        // 2 | 0 | 1 | 1 over 4 features: every feature in exactly one port, so the
+        // 2 | 0 | 1 | 1 over 4 features: every feature in exactly one port,
         // accounting is 100% and the label stands.
         g.options.feature_split = Some(FeatureSplitPolicy::Exclusive);
         g.nodes[input].feature_masks = Some(vec![
@@ -2920,9 +2879,7 @@ mod fanout_bounds_tests {
         );
     }
 
-        /// Old records (and nets written by the crossover bug) load with rows under a
-        /// `None` policy. `from_json` repairs the LABEL at read time; the rows win,
-        /// because they are the genome the network build actually reads.
+    /// Old records (and nets written by the crossover bug) load with rows under a `None` policy.
     #[test]
     fn loading_a_topology_with_rows_and_no_policy_repairs_the_label() {
         let opts = TopologyOptions {
@@ -2940,7 +2897,10 @@ mod fanout_bounds_tests {
             .unwrap()
             .remove("feature_split"); // exactly what the old crossover path persisted
         let loaded = Topology::from_json(&json.to_string()).unwrap();
-        assert_eq!(loaded.options.feature_split, Some(FeatureSplitPolicy::Inherited));
+        assert_eq!(
+            loaded.options.feature_split,
+            Some(FeatureSplitPolicy::Inherited)
+        );
         assert!(loaded.input_feature_masks().is_some());
 
         // An honest blueprint is left untouched.
