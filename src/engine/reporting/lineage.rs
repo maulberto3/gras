@@ -1,21 +1,11 @@
-//! The ancestry renderer: the per-elite mermaid diagram, drawn from ONE
-//! `LineageFacts` walker (split out of `reporting` by AGENTS.md rule 19). The
-//! stop-time ASCII card was REMOVED on 2026-11-01: the final field table is the
-//! console's last word, and the ancestry it drew is already in `history.csv`
-//! (`origin` carries `parents=`) and in every `nets/<hash>.json` (`created_from`).
-//! The mermaid section inside `elite-<hash>.md` stays — a doc outlives the run dir.
+//! The ancestry renderer: the per-elite mermaid diagram, drawn from ONE `LineageFacts` walker
+//! (split out of `reporting` by AGENTS.md rule 19).
 
 use super::*;
 
 impl CoreEngine {
-    /// The `## Ancestry` section of ONE elite's markdown file (`elite-<hash>.md`): the
-    /// same recorded lineage the stop card draws, as a mermaid `graph TB` a doc viewer
-    /// renders. The card is the console's answer; this is the per-net artifact's, so the
-    /// elite file explains its own birth long after the run's log is gone.
-    ///
-    /// A founder (random draw / inherited `seed:` blueprint) has no recorded parents and
-    /// comes out as the single box the reader expects; a crossover converges parent →
-    /// child, with the parents at the top and this net at the bottom.
+    /// The `## Ancestry` section of ONE elite's markdown file (`elite-<hash>.md`): the same
+    /// recorded lineage the stop card draws, as a mermaid `graph TB` a doc viewer renders.
     pub(crate) fn lineage_markdown(&self, root: &str, root_role: &str) -> String {
         let mut tree = LineageTree::new(self);
         let has_parents = tree
@@ -39,9 +29,7 @@ impl CoreEngine {
     }
 }
 
-/// The three paints a lineage box can wear. Kept as consts (not `classDef` strings) so
-/// the inline `style` line, the label's `<span>` and the class all read the SAME values
-/// — three channels that cannot drift apart.
+/// The three paints a lineage box can wear.
 #[derive(Clone, Copy)]
 struct LineagePaint {
     fill: &'static str,
@@ -50,7 +38,7 @@ struct LineagePaint {
     width: &'static str,
 }
 
-/// The net the file is about (`elite-<hash>.md` / `worst-<hash>.md`).
+/// The net the file is about (`elite-<hash>.md`).
 const FOCUS: LineagePaint = LineagePaint {
     fill: "#fff3cf",
     stroke: "#8a5a00",
@@ -66,7 +54,7 @@ const LIVE: LineagePaint = LineagePaint {
     width: "1.5px",
 };
 
-/// An ancestor that was culled (its `†clock` says when).
+/// An ancestor that was culled (its `†clock` says
 const CULLED: LineagePaint = LineagePaint {
     fill: "#ededed",
     stroke: "#5f5f5f",
@@ -74,18 +62,14 @@ const CULLED: LineagePaint = LineagePaint {
     width: "1.5px",
 };
 
-/// How many generations the elite files' mermaid diagram walks. A DOC can afford more
-/// than a terminal card: mermaid lays the graph out itself, so depth costs nodes, not
-/// screen width.
+/// How many generations the elite files' mermaid diagram walks.
 const LINEAGE_MD_MAX_DEPTH: usize = 6;
-/// The most nodes one elite diagram may name. Beyond this the walk stops and the
+/// The most nodes one elite diagram may name. Beyond this the walk stops
 /// markdown says so, rather than shipping a 500-node graph in a per-net file.
 const LINEAGE_MD_NODE_BUDGET: usize = 150;
 
 /// The hashes named by a lineage string — `crossover-one-point:parents=<h1>,<h2>[+mut]`
-/// or `clone:parents=<h1>` — as the parent list, oldest first. Founders (`random`,
-/// `founder-N`) and inherited nets (`seed:<run>:<hash>`) name no in-run parents and come
-/// back empty, which is what makes them the roots of a tree.
+/// `clone:parents=<h1>` — as the parent list, oldest first.
 pub(super) fn lineage_parents(created_from: Option<&str>) -> Vec<String> {
     let Some(raw) = created_from else {
         return Vec::new();
@@ -103,13 +87,13 @@ pub(super) fn lineage_parents(created_from: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// The first 8 hex of a hash — the width every other stop-time identity prints at.
+/// The first 8 hex of a hash — the width every other stop-time identity prints
 pub(super) fn short_hash(hash: &str) -> String {
     hash[..8.min(hash.len())].to_string()
 }
 
 /// One node's mermaid label: identity, origin, fit, and what happened to it (the root
-/// says `ELITE`; an ancestor says `live` or the clock it was culled at).
+/// says `ELITE`; an ancestor says `live` or the clock it was culled
 pub(super) fn mermaid_node_label(
     hash: &str,
     facts: Option<&LineageFacts>,
@@ -125,8 +109,8 @@ pub(super) fn mermaid_node_label(
     if let Some(fit) = facts.fit {
         parts.push(format!("fit {}", fmt_cell(fit)));
     }
-    // The root says what the FILE says it is (`ELITE` in `elite-<hash>.md`, `WORST` in
-    // `worst-<hash>.md`) — one renderer serves both ends, so the role is the caller's.
+    // The root says what the FILE says it is (`ELITE` in `elite-<hash>.md`) — one
+    // renderer, so the role stays the caller's.
     if let Some(role) = root_role {
         parts.push(role.to_string());
     } else if facts.alive {
@@ -137,13 +121,7 @@ pub(super) fn mermaid_node_label(
     parts.join("<br/>")
 }
 
-/// One net's ancestry facts, whether it is LIVE or a culled tombstone. One shape for
-/// both is what lets the tree cross a cull (`final_risk_score` for a tombstone is the
-/// same ranking value a live net reads from its window).
-///
-/// Only what a mermaid node says: identity, origin, ranking fit, and how the net left
-/// the race. The window mean/spread stay in `nets/<hash>.json` — they are the TABLE's
-/// business.
+/// One net's ancestry facts, whether it is LIVE or a culled tombstone.
 #[derive(Clone, Debug)]
 pub(super) struct LineageFacts {
     /// The recorded lineage string (`created_from`), kept verbatim for [`origin_cell`].
@@ -174,9 +152,8 @@ impl<'a> LineageTree<'a> {
         }
     }
 
-    /// One net's facts: the live state first (a parent may still be alive), then the
-    /// `nets/<hash>.json` tombstone a cull leaves behind. `None` when neither exists —
-    /// e.g. a parent inherited from another run's directory.
+    /// One net's facts: the live state first (a parent may still be alive),
+    /// `nets/<hash>.json` tombstone a cull leaves behind.
     fn facts(&mut self, hash: &str) -> Option<LineageFacts> {
         if let Some(hit) = self.cache.get(hash) {
             return hit.clone();
@@ -196,7 +173,7 @@ impl<'a> LineageTree<'a> {
                 Ok(state) => Some(LineageFacts {
                     origin: state.created_from.clone(),
                     born: state.entered_at_step,
-                    // A legacy tombstone may predate `final_risk_score`; the window mean is
+                    // A legacy tombstone may predate `final_risk_score`; the window mean
                     // then the only level it recorded, so it is read as the fit.
                     fit: state
                         .final_risk_score
@@ -213,13 +190,8 @@ impl<'a> LineageTree<'a> {
         facts
     }
 
-    /// This net's ancestry as a mermaid `graph TB`: parents at the TOP, the net at the
-    /// BOTTOM, one arrow per parent → child edge. Shared ancestors are ONE node (mermaid
-    /// keys by id), so a DAG converges instead of being repeated the way the console
-    /// tree's `↺` avoids; a founder comes out as a single box.
-    ///
-    /// Returns the fenced diagram and whether the walk was cut short (depth or node
-    /// budget), which the caller states in the section's prose.
+    /// This net's ancestry as a mermaid `graph TB`: parents at the TOP, the net at the BOTTOM, one
+    /// arrow per parent → child edge.
     fn mermaid(&mut self, root: &str, root_role: &str) -> (String, bool) {
         let mut nodes: Vec<String> = Vec::new();
         let mut edges: Vec<(String, String, usize, usize)> = Vec::new();
@@ -258,32 +230,14 @@ impl<'a> LineageTree<'a> {
             crate::utils::fitness::Direction::Minimize => -v,
         };
         // ── Contrast: every box is LIGHT, every label states its own near-black ink ──
-        //
-        // This diagram shipped twice before with a readable-on-paper palette that a real
-        // viewer disagreed with, so the ink is now stated on THREE independent channels:
-        // an inline `style … color:` (an attribute, so it outranks a theme's CSS rule), a
-        // `<span style="color:…">` inside the label (survives a viewer that repaints label
-        // text wholesale — the exact failure that ate the first two palettes), and the
-        // `classDef`'s own `color:`. A LIGHT fill is what makes the fallback safe: if all
-        // three are ignored, the theme's own text colour still lands on a light box, which
-        // is dark-on-light in every theme. The previous palette used dark fills with white
-        // labels, so a theme that kept its near-white text produced white words on a white
-        // page — dark boxes only read if the label colour WINS, and that is the one thing a
-        // viewer is free to override.
-        //
-        // `htmlLabels` and the rest of the theme are pinned in `init` so the graph does not
-        // half-inherit a dark theme (canvas, edges, edge-label background).
+        // diagram shipped twice before with a readable-on-paper palette that a real viewer
         let mut out = String::from("```mermaid\n");
         out.push_str(
             "%%{init: {\"theme\": \"base\", \"flowchart\": {\"htmlLabels\": true, \"curve\": \"basis\"}, \"themeVariables\": {\"background\": \"#ffffff\", \"primaryColor\": \"#e6f1fb\", \"primaryTextColor\": \"#0d2538\", \"primaryBorderColor\": \"#2f6fa8\", \"lineColor\": \"#3d6b96\", \"textColor\": \"#0d2538\", \"edgeLabelBackground\": \"#ffffff\", \"fontSize\": \"14px\"}}}%%\n",
         );
         out.push_str("graph TB\n");
         // Classes first, so a viewer that only reads classes never sees an unstyled box.
-        for (name, paint) in [
-            ("focus", FOCUS),
-            ("live", LIVE),
-            ("culled", CULLED),
-        ] {
+        for (name, paint) in [("focus", FOCUS), ("live", LIVE), ("culled", CULLED)] {
             out.push_str(&format!(
                 "    classDef {name} fill:{},stroke:{},stroke-width:{},color:{}\n",
                 paint.fill, paint.stroke, paint.width, paint.ink
@@ -314,8 +268,8 @@ impl<'a> LineageTree<'a> {
             out.push_str(&format!("    class n_{id} {class}\n"));
         }
         for (parent, child, slot, n) in &edges {
-            // A parent beyond the node budget was never declared: drop the edge with the
-            // cut instead of letting mermaid invent a blank node for it.
+            // A parent beyond the node budget was never declared: drop the edge
+            // cut instead of letting mermaid invent a blank node
             if !known.contains(parent) || !known.contains(child) {
                 cut = true;
                 continue;
@@ -347,5 +301,4 @@ impl<'a> LineageTree<'a> {
         out.push_str("```\n");
         (out, cut)
     }
-
 }
