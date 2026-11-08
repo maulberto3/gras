@@ -5,7 +5,8 @@
 //! ```text
 //! step_one_net(hash, clock)
 //!   ├─ seat freeze check (ANTI-DEVOLUTION A) → act-and-measure pass (NoopOptimizer)
-//!   ├─ train-eval lottery denies the ticket   → idle pass (no train, no eval)
+//!   ├─ train-eval lottery denies the ticket   → idle pass (no train, no eval), or the
+//!   │                                           act-only pass under `train_merit_learn_only`
 //!   └─ run_trainer_step_with_real_optimizer(hash, clock)
 //!        └─ run_trainer_step(hash, clock, optimizer)
 //!             ├─ seed_step_randomness(net_seed, clock)   (fastrand + libtorch)
@@ -70,7 +71,14 @@ impl CoreEngine {
             // `draws_at` is the same draw the wrapper would make, with `p` already
             // hand — one merit read per net per clock, not two.
             if !forced && !self.train_lottery_draws_at(hash, clock, p) {
-                return self.idle_step(hash, clock);
+                // LEARN-ONLY: the coin withholds the UPDATE, never the STEP — the net runs its
+                // real trainer through the no-op optimizer, so it acts and is MEASURED on a fresh
+                // batch every clock and only the weight write is lost. OFF: the clock idles.
+                return if self.config.train_merit_learn_only {
+                    self.act_only_step(hash, clock, "NO TICKET (act-only)")
+                } else {
+                    self.idle_step(hash, clock)
+                };
             }
         }
         // One step = whatever the caller's training scheme does; the engine
@@ -369,7 +377,7 @@ impl CoreEngine {
         Ok((f, youth, fraction))
     }
 
-    /// Whether the lottery's AGE leg is armed (`set_run_train_age`). `false` = the ticket
+    /// Whether the lottery's AGE leg is armed (`set_run_train_merit_age`). `false` = the ticket
     /// follows the fitness place alone.
     pub(crate) fn train_age(&self) -> bool {
         self.config.train_age

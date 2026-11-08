@@ -44,6 +44,12 @@ impl Novelty {
         self.d_min
     }
 
+    /// Blueprints archived so far: founders, every child, every immigrant — the number the
+    /// novelty reading is judged against, so a report can say `Δ 0.46 over 214 seen`.
+    pub(crate) fn len(&self) -> usize {
+        self.refs.len()
+    }
+
     /// Archive one topology; every birth path calls this, so a cull never forgets a blueprint.
     pub(crate) fn push(&mut self, topo: &Topology) {
         self.refs.push(shape_of(topo));

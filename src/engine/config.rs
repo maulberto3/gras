@@ -85,9 +85,15 @@ pub const DEFAULT_TRAIN_MERIT: f32 = 0.75;
 /// MOST tickets, i.e.
 pub const DEFAULT_TRAIN_MERIT_INVERTED: bool = true;
 
-/// Default for the lottery's AGE leg (`set_run_train_age`): `true` = ARMED, so the graded fraction
+/// Default for the lottery's AGE leg (`set_run_train_merit_age`): `true` = ARMED, so the graded fraction
 /// is the PRODUCT `Fm × Ym` (the min-max fitness place times the youth fraction, `1`
 pub const DEFAULT_TRAIN_AGE: bool = true;
+
+/// Default for the lottery's LEARN-ONLY switch (`set_run_train_merit_learn_only`): `false` = a lost
+/// ticket idles the net (no train, no eval, nothing measured). `true` = every net still ACTS and
+/// MEASURES every clock — fresh batch, honest reading — and only the weight UPDATE is gated, so
+/// fitness stays expressive while learning stays ticketed.
+pub const DEFAULT_TRAIN_MERIT_LEARN_ONLY: bool = false;
 
 /// Steps between population checkpoints — the cadence the stream's era rotation and the CSV flush
 /// key off.
@@ -347,6 +353,10 @@ pub struct RaceConfig {
     /// INVERT the lottery's merit ordering (`set_run_train_merit_inverted`): the LEAST fit net
     /// earns the MOST tickets and the best earns the fewest.
     pub train_merit_inverted: bool,
+    /// LEARN-ONLY lottery (`set_run_train_merit_learn_only`): `true` = a lost ticket costs the
+    /// weight UPDATE, not the STEP — the net runs its trainer with a no-op optimizer, so it acts,
+    /// is measured, and its fitness moves every clock. `false` = the clock idles. Default `false`.
+    pub train_merit_learn_only: bool,
     /// Share of the dataset held out for EVAL (`eval_share`): the rows a net is SCORED on and never
     /// trained
     pub eval_share: f32,
@@ -361,7 +371,7 @@ pub struct RaceConfig {
     /// How the window's readings are averaged into the ranking centre (`set_run_mean_type`):
     /// [`MeanType::Arithmetic`] (default, the pre-knob ranking), [`MeanType::SignedLog`]
     pub mean_type: MeanType,
-    /// Age leg of the lottery (`set_run_train_age`): `true` ARMS the product `Fm × Ym`, `Ym` = `1`
+    /// Age leg of the lottery (`set_run_train_merit_age`): `true` ARMS the product `Fm × Ym`, `Ym` = `1`
     /// at the youngest graded net.
     pub train_age: bool,
     /// Mode-specific knobs (tabular vs RL) — the arm is carried in the type. The engine
@@ -609,6 +619,7 @@ impl RaceConfig {
             train_merit_p_min: DEFAULT_TRAIN_MERIT_P_MIN,
             train_merit_p_max: DEFAULT_TRAIN_MERIT_P_MAX,
             train_merit_inverted: DEFAULT_TRAIN_MERIT_INVERTED,
+            train_merit_learn_only: DEFAULT_TRAIN_MERIT_LEARN_ONLY,
             eval_share: DEFAULT_EVAL_SHARE,
             seat_join_probation_steps: DEFAULT_SEAT_JOIN_PROBATION,
             seat_lifetime_steps: DEFAULT_CROWN_LIFETIME,
@@ -694,6 +705,7 @@ impl RaceConfig {
         cfg.train_merit_p_min = snap.train_merit_p_min;
         cfg.train_merit_p_max = snap.train_merit_p_max;
         cfg.train_merit_inverted = snap.train_merit_inverted;
+        cfg.train_merit_learn_only = snap.train_merit_learn_only;
         cfg.drift_prob = snap.drift_prob;
         cfg.champion_previous_load = snap.champion_previous_load;
         cfg.champion_previous_dir = snap
@@ -905,6 +917,13 @@ impl RaceConfigBuilder {
         self.cfg.train_merit_inverted = yes;
         self
     }
+    /// LEARN-ONLY lottery (default `false`): `true` keeps every net ACTING and MEASURING every
+    /// clock and gates only the weight update on the ticket, so a net's reading never goes stale.
+    /// `false` keeps the pre-flag contract — a lost ticket idles the net outright.
+    pub fn set_run_train_merit_learn_only(mut self, yes: bool) -> Self {
+        self.cfg.train_merit_learn_only = yes;
+        self
+    }
     /// DRIFT on a crossover child's inherited genes (default `0.0` = exact inheritance).
     pub fn set_topology_drift(mut self, p: f32) -> Self {
         self.cfg.drift_prob = if p.is_finite() {
@@ -920,11 +939,20 @@ impl RaceConfigBuilder {
         self.cfg.smoothing_window = k.max(1);
         self
     }
-    /// Recency ramp r for the smoothing window (`window_recency`).
-    pub fn set_run_train_age(mut self, armed: bool) -> Self {
+    /// The lottery's AGE leg (`train_age`): `true` (default) ARMS the product `Fm × Ym`, so a young
+    /// net's ticket is lifted; `false` makes the ticket follow the fitness place alone. The leg
+    /// multiplies the MERIT fraction, which is what the name says.
+    pub fn set_run_train_merit_age(mut self, armed: bool) -> Self {
         self.cfg.train_age = armed;
         self
     }
+    /// Deprecated spelling of [`Self::set_run_train_merit_age`] — the leg multiplies the lottery's
+    /// merit fraction, not the run's age. Kept so existing callers keep compiling.
+    #[deprecated(note = "use set_run_train_merit_age")]
+    pub fn set_run_train_age(self, armed: bool) -> Self {
+        self.set_run_train_merit_age(armed)
+    }
+    /// Recency ramp r for the smoothing window (`window_recency`).
 
     pub fn set_run_window_recency(mut self, r: f32) -> Self {
         self.cfg.window_recency = if r.is_finite() {

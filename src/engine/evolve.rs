@@ -211,6 +211,7 @@ impl CoreEngine {
             }
         };
         if self.state.net(&child.state.hash).is_some() {
+            self.births.duplicates += 1;
             // Duplicate of a live topology → the roll is spent: discard, no
             // replacement. Random whole nets enter only via mutation.
             self.record_attempt(
@@ -497,6 +498,9 @@ impl CoreEngine {
         self.cull_net(&victim, clock, "immigrant-slot")?;
         let idx = self.next_child_ordinal(clock);
         let draw = self.generate_random_at(clock, idx)?;
+        // The gate's reading is only taken at birth, so the tally is taken here — the one place
+        // the Δ and the candidates spent are both in hand.
+        self.births.record_draw(draw.delta, draw.draws);
         let novelty_note = match (draw.delta, self.novelty.enabled()) {
             (Some(d), true) => format!(
                 " │ novelty Δ {d:.2} · draw {} of {}",
