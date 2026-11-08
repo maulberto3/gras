@@ -119,7 +119,9 @@ pub struct StepEnv {
     /// Live nets in the population right now.
     pub live_count: usize,
     /// Checkpoint cadence — the durability tick (frontier + champion weight snapshots)
-    /// stream's eval-permutation era fire every N steps.
+    /// fires every N steps. The tabular stream's eval-permutation era keys off it, and so
+    /// does an RL exam built with `Reinforce::with_per_clock_exam(false)`; the default
+    /// (per-clock) RL exam ignores it.
     pub checkpoint_every: usize,
     /// The per-net fitness smoothing window, in steps (K).
     pub smoothing_window: usize,

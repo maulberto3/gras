@@ -18,9 +18,9 @@
 //! 3. One optimizer step on the REINFORCE objective
 //!    `−Σ_t Â_t · log π(a_t | s_t)`, where the log-probability is a **normalized**
 //!    `log_softmax` of the policy's own forward — the graph a gradient needs.
-//! 4. Play `eval_matches_per_step` EVAL episodes from SHARED, ERA-SCOPED seeds
-//!    and report their mean outcome as the fitness — the only ranking input
-//!    engine gets.
+//! 4. Play `eval_matches_per_step` EVAL episodes from SHARED seeds — the same
+//!    games for every net, freshly drawn at every clock — and report their mean
+//!    outcome as the fitness: the only ranking input the engine gets.
 //!
 //! # Exploration
 //!
@@ -41,11 +41,15 @@
 //! per net, so nets of one population explore different worlds, and blended
 //! the run seed so an inherited champion does not replay its parent's exact
 //! trajectories. The EVAL base is `run_seed` alone ([`eval_seed_base`]): shared,
-//! because every net has to sit the same exam — and the exam's step axis
-//! ERA ([`eval_era_of`]), not the clock, so nets measured inside one era sit
-//! identical games and a newborn's first reading is comparable with a parent's
-//! reading from earlier in that era. The era still rotates, so no population
-//! overfits one set of start states.
+//! because every net has to sit the same exam, and its step axis is the CLOCK —
+//! a fresh set of start states every clock, so a reading moves when the POLICY
+//! moves rather than when an era happens to end, and the spread across a
+//! clock's games is a robustness signal the ranking can charge for. The ERA
+//! axis ([`eval_era_of`], `checkpoint_every` clocks wide) is opt-in
+//! (`with_per_clock_exam(false)`): it makes nets measured inside one era sit
+//! identical games — a newborn is then comparable with a parent read earlier in
+//! that era — at the cost of replaying one exam for a whole era, which is what
+//! froze a champion's reading to a constant.
 //!
 //! # Modes
 //!
@@ -197,6 +201,9 @@ pub struct Reinforce<E: Env> {
     matches_per_step: usize,
     /// EVAL episodes per net per step (the exam).
     eval_matches_per_step: usize,
+    /// Whether the exam is drawn per CLOCK (default) rather than per era — see
+    /// [`Self::with_per_clock_exam`].
+    per_clock_exam: bool,
     /// What the returns and the fitness are derived
     signal: Signal,
     /// The PAST handed to the net alongside the instant (`None` = the observation alone).
@@ -224,6 +231,7 @@ impl<E: Env> Reinforce<E> {
             grad_clip: DEFAULT_GRAD_CLIP,
             matches_per_step: DEFAULT_MATCHES_PER_STEP,
             eval_matches_per_step: DEFAULT_EVAL_MATCHES_PER_STEP,
+            per_clock_exam: true,
             signal: Signal::Turns,
             obs_memory: ObsMemory::None,
             challenge_prob: DEFAULT_CHALLENGE_PROB,
@@ -257,6 +265,17 @@ impl<E: Env> Reinforce<E> {
     /// Set the EVAL episodes per step (default 5) — the exam the fitness is measured
     pub fn with_eval_matches_per_step(mut self, n: usize) -> Self {
         self.eval_matches_per_step = n;
+        self
+    }
+
+    /// Draw the EVAL exam per CLOCK (default `true`) instead of per era — see the
+    /// module docs' replay contract. Per-clock is what makes a net's robustness
+    /// visible: every clock draws a fresh set of start states (the same set for
+    /// every net, so the comparison stays paired), so a frozen policy's reading
+    /// still moves and the within-clock spread becomes real. `false` restores the
+    /// pre-2026-11-08 era-scoped exam (`checkpoint_every` clocks share one).
+    pub fn with_per_clock_exam(mut self, on: bool) -> Self {
+        self.per_clock_exam = on;
         self
     }
 
@@ -442,6 +461,16 @@ impl<E: Env> Reinforce<E> {
         )
     }
 
+    /// The exam's step axis for `step`: the clock (default), or the era when
+    /// era-scoping was asked for. One place, so the two axes cannot drift apart.
+    fn exam_axis(&self, step: usize, era_len: usize) -> usize {
+        if self.per_clock_exam {
+            step
+        } else {
+            eval_era_of(step, era_len)
+        }
+    }
+
     /// Score the run's informative metrics on the step's EVAL outcomes.
     fn score_metrics(&self, metrics: &[Metric], outcomes: &[f32]) -> Result<Vec<f32>> {
         if metrics.is_empty() {
@@ -479,6 +508,9 @@ impl<E: Env> RlStep for Reinforce<E> {
             "signal": self.signal,
             "matches_per_step": self.matches_per_step,
             "eval_matches_per_step": self.eval_matches_per_step,
+            // The exam's step axis, by name: a resume that flipped it would replay
+            // different eval games from the very next clock.
+            "exam": if self.per_clock_exam { "per_clock" } else { "era" },
             "learning_rate": self.learning_rate,
             "grad_clip": self.grad_clip,
             // The challenge trigger is TRAINER-owned, so this blob
@@ -560,7 +592,7 @@ impl<E: Env> RlStep for Reinforce<E> {
 
         // 3.
         let eval_base = eval_seed_base(ctx.env.run_seed);
-        let exam = eval_era_of(step, ctx.env.checkpoint_every);
+        let exam = self.exam_axis(step, ctx.env.checkpoint_every);
         let mut outcomes: Vec<f32> = Vec::with_capacity(self.eval_matches_per_step);
         let mut eval_turns = 0usize;
         for match_i in 0..self.eval_matches_per_step {
@@ -602,8 +634,11 @@ fn eval_seed_base(run_seed: u64) -> u64 {
     run_seed.wrapping_add(EVAL_SEED_OFFSET)
 }
 
-/// The exam a clock sits: `era_len` clocks share one, so a net read at clock 118 and a newborn read
-/// at 121 are graded on the identical games whenever both land in the same era.
+/// The ERA a clock sits: `era_len` clocks share one — the opt-in axis
+/// (`with_per_clock_exam(false)`), where a net read at clock 118 and a newborn read at 121 are
+/// graded on the identical games whenever both land in the same era. The same arithmetic the
+/// tabular stream rotates its eval permutation on. `era_len == 0` (no tick recorded) reads as
+/// per-clock, never a divide by zero.
 fn eval_era_of(step: usize, era_len: usize) -> usize {
     if era_len == 0 { step } else { step / era_len }
 }
@@ -958,14 +993,51 @@ mod tests {
         assert_ne!(
             last_exam_seed(100, 3),
             last_exam_seed(100, 4),
-            "with no era recorded (checkpoint_every = 0) a fresh clock draws fresh games"
+            "a fresh clock draws fresh games — the default per-clock exam"
         );
     }
 
-    /// The exam is ERA-scoped: clocks inside one era sit the identical games, so a net born mid-era
-    /// is ranked on what its parents were ranked on; a new era is a new exam.
+    /// The DEFAULT exam is per-clock: even with a tick cadence recorded, two clocks draw
+    /// different games (and every net sits the same ones) — so a reading that does not move
+    /// means a frozen POLICY, not a frozen exam.
     #[test]
-    fn the_exam_is_stable_within_an_era_and_rotates_between_them() {
+    fn the_default_exam_draws_fresh_games_every_clock() {
+        let fitness = Fitness::reported(Direction::Maximize, "turns");
+        let last_exam_seed = |net_seed: u64, step: usize| {
+            let mut trainer =
+                Reinforce::new(ToyEnv::new(2, 5), Device::CPU).with_eval_matches_per_step(1);
+            let mut net = tiny_net(2, 0.0);
+            let mut optimizer = trainer.make_optimizer(&net);
+            let mut c = ctx(&fitness, net_seed, 7, step);
+            // Every real run records a cadence; the default exam must ignore it.
+            c.env.checkpoint_every = 4;
+            trainer
+                .train_step(&mut net, &mut *optimizer, step, &c)
+                .unwrap();
+            trainer.env().last_seed()
+        };
+        assert_eq!(
+            last_exam_seed(100, 5),
+            episode_start_seed(eval_seed_base(7), 5, 0),
+            "the exam's step axis is the CLOCK"
+        );
+        assert_ne!(
+            last_exam_seed(100, 5),
+            last_exam_seed(100, 7),
+            "two clocks inside one era are two exams"
+        );
+        assert_eq!(
+            last_exam_seed(100, 5),
+            last_exam_seed(999, 5),
+            "and it is still one exam for every net"
+        );
+    }
+
+    /// The era exam is OPT-IN ([`Reinforce::with_per_clock_exam`] `false`): clocks inside one era
+    /// sit the identical games, so a net born mid-era is ranked on what its parents were ranked on;
+    /// a new era is a new exam.
+    #[test]
+    fn the_era_exam_is_stable_within_an_era_and_rotates_between_them() {
         assert_eq!(eval_era_of(0, 20), 0);
         assert_eq!(eval_era_of(19, 20), 0, "the era's last clock");
         assert_eq!(eval_era_of(20, 20), 1, "the next era's first clock");
@@ -977,8 +1049,9 @@ mod tests {
         // game, and a clock in the next era must
         let fitness = Fitness::reported(Direction::Maximize, "turns");
         let last_exam_seed = |step: usize| {
-            let mut trainer =
-                Reinforce::new(ToyEnv::new(2, 5), Device::CPU).with_eval_matches_per_step(1);
+            let mut trainer = Reinforce::new(ToyEnv::new(2, 5), Device::CPU)
+                .with_eval_matches_per_step(1)
+                .with_per_clock_exam(false);
             let mut net = tiny_net(2, 0.0);
             let mut optimizer = trainer.make_optimizer(&net);
             let mut c = ctx(&fitness, 7, 7, step);
@@ -1128,10 +1201,12 @@ mod tests {
         assert_eq!(blob["challenge_decay"], "custom:0.5");
         assert_eq!(blob["matches_per_step"], 1);
         assert_eq!(blob["eval_matches_per_step"], 5);
+        assert_eq!(blob["exam"], "per_clock");
 
         let changed = trainer
             .with_signal(Signal::Return { discount: 0.5 })
             .with_matches_per_step(3)
+            .with_per_clock_exam(false)
             .with_learning_rate(2e-3)
             .with_challenge(0.0, ChallengePolicy::Random, ChallengeDecay::Linear)
             .describe()
@@ -1146,5 +1221,6 @@ mod tests {
         assert_eq!(changed["signal"]["discount"], 0.5);
         assert_eq!(changed["challenge_policy"], "random");
         assert_eq!(changed["challenge_decay"], "linear");
+        assert_eq!(changed["exam"], "era", "the axis is recorded by name");
     }
 }
