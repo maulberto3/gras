@@ -49,7 +49,7 @@ tracks population and clocks, not how long you leave it running.
   `mean ∓ λ × spread` over its recent readings, `λ = 1` by default — so a
   reliable net outranks an occasionally brilliant one. `λ = 0` gives you the
   plain mean back.
-- **Runs compound.** Each run ends with a ranked `elites.json`; a compatible next
+- **Runs compound.** Each run ends with a ranked `champions.json`; a compatible next
   run can start from its champions instead of from scratch.
 - **A whole recipe by name.** 9 losses, 7 optimizers, 8 learning-rate schedules
   and 14 metrics/fitnesses ship built in — enums and closures in Rust, strings in
@@ -69,7 +69,7 @@ table all read that same number, which is why a lucky net cannot hold a place a
 steady net deserves.
 
 A run ends with its **final table** — every net, measured, ranked — written to
-`final-field.csv` and `elites.json`. A compatible next run can seed its founders
+`final-field.csv` and `champions.json`. A compatible next run can seed its founders
 from that ranking, and a killed run resumes from its directory with the same
 seed, search space and trainer recipe. Both doors are first-class in Rust and in
 Python.
@@ -129,7 +129,7 @@ the name menus, artifacts and limits live in
 - **Artifacts are the interface.** `engine.json` records the run; `history.csv`
   every measured clock; `nets/<hash>.json` each blueprint (genome, feature masks
   and port activations included); `nets/<hash>.safetensors` / `.optim` its
-  state; `elites.json` the ranking the next run inherits; `final-field.csv` the
+  state; `champions.json` the ranking the next run inherits; `final-field.csv` the
   stopping table.
 - **The lottery ships a tuned default.** Ω = 0.75, the inverted ordering (tickets
   go to the least fit net) and the age leg (`F × Y`) are ON unless a run says
