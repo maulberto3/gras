@@ -1,10 +1,10 @@
-//! gras — neural architecture search over random topologies, run as a
+//! gras — neural architecture search over random topologies, run
 //! continuous step-race.
 //!
 //! One global step clock: every live net trains and evaluates on the same
 //! shared batch each step. Divergence over the population's smoothed fitness
 //! culls the worst net and births a caught-up replacement. Blueprints
-//! ([`Topology`]) are compiled into executable [`Network`]s; you supply the
+//! ([`Topology`]) are compiled into executable [`Network`]s; you supply
 //! loss and fitness as plain closures.
 //!
 //! Quick start:
@@ -26,16 +26,16 @@ pub mod trainer;
 pub mod utils;
 
 // ── flat paths — the folders are an implementation detail ─────────────
-pub use utils::fitness;
 pub use evolution::{crossover, mutation, pools, selection};
 pub use graph::{network, node, topology};
+pub use utils::fitness;
 pub use utils::markdown;
 pub use utils::tabular_data;
 
 // ── engine — the step-race loop ──────────────────────────────────────
 pub use engine::{
-    RLSpec, RaceConfig, RaceSnapshot, RlConfig, RlEngine, RlRaceConfig, RunMode,
-    RunSpec, StopReason, TabularConfig, TabularEngine, TabularRaceConfig, TabularSpec,
+    RLSpec, RaceConfig, RaceSnapshot, RlConfig, RlEngine, RlRaceConfig, RunMode, RunSpec,
+    StopReason, TabularConfig, TabularEngine, TabularRaceConfig, TabularSpec,
     rl_race_config_builder, tabular_race_config_builder,
 };
 // Scoring vocabulary lives in `utils`, not `engine`: a training scheme must be
@@ -54,12 +54,11 @@ pub use evolution::selection::SelectionMethod;
 
 // ── trainer — shared deterministic batching ──────────────────────────
 pub use trainer::stream::{BatchStream, PoolSplit};
-// The library ships the CONTRACT (`TabularStep`/`RlStep`) *and* one reference
-// tabular scheme (`TabularTrainer`): the classic recipe every consumer used to
-// copy. Anything more specific — an environment, an exotic scheme — stays yours.
+// The library ships the CONTRACT (`TabularStep`/`RlStep`) *and* one reference tabular scheme
+// (`TabularTrainer`): the classic recipe every consumer used to copy.
 pub use trainer::{
-    AnyTrainer, Env, LossFn, RlContext, RlStep, RlStepMeta, RunData, StepEnv, StepReport, StreamShape,
-    TabularContext, TabularStep, TabularTrainer,
+    AnyTrainer, Env, LossFn, RlContext, RlStep, RlStepMeta, RunData, StepEnv, StepReport,
+    StreamShape, TabularContext, TabularStep, TabularTrainer,
 };
 
 // The name→recipe tables: which LOSS trains, which FITNESS ranks, which METRIC
@@ -99,33 +98,25 @@ pub use flodl;
 
 /// One import for the common surface: `use gras::prelude::*;`.
 pub mod prelude {
-    //! The common surface: engine entry points, fitness/direction types, trainer
-    //! contracts + reports, the batch stream, graph types, config enums, and the
-    //! tensor/device re-exports.
-    //!
-    //! Everything else stays reachable by module path (`gras::engine::config::*`,
-    //! `gras::utils::*`), so a glob import here stays legible. Deliberately NOT
-    //! re-exported: `flodl::tensor::Result` (a glob-imported `Result` would
-    //! collide with `std::result::Result`), the low-level scoring helpers, and
-    //! the `DataFormat`/loader family.
+    //! The common surface: engine entry points, fitness/direction types, trainer contracts +
+    //! reports, the batch stream, graph types, config enums, and the tensor/device re-exports.
     // Engine config + entry points.
     pub use crate::engine::config::{
         CrossCullPolicy, LogLevel, MutationCullPolicy, RaceConfig, RaceConfigBuilder, RaceSnapshot,
-        RlConfig, RlRaceConfig, RunMode, StopReason,
-        TabularConfig, TabularRaceConfig, rl_race_config_builder, tabular_race_config_builder,
+        RlConfig, RlRaceConfig, RunMode, StopReason, TabularConfig, TabularRaceConfig,
+        rl_race_config_builder, tabular_race_config_builder,
     };
     // Scoring vocabulary is `utils`-resident: shared with any training scheme.
-    pub use crate::utils::fitness::{Direction, Fitness, FitnessLabel, Metric};
     pub use crate::engine::{RLSpec, RlEngine, RunSpec, TabularEngine, TabularSpec};
+    pub use crate::utils::fitness::{Direction, Fitness, FitnessLabel, Metric};
 
     // Trainer contracts + report types.
     pub use crate::trainer::{
         AnyTrainer, BoxedLossFn, ChallengeDecay, ChallengePolicy, Env, ForcedAction, Loss, LossFn,
-        ObsMemory, Reinforce, RlContext, RlStep, RlStepMeta, RlStepReport, RunData, Signal, StepEnv,
-        StepReport,
-        StreamShape, TabularContext, TabularStep, TabularStepReport, TabularTrainer, TargetKind,
-        challenge_fires, effective_challenge_prob, episode_start_seed, fitness_for, forced_action,
-        least_action, metric_for, metrics_for,
+        ObsMemory, Reinforce, RlContext, RlStep, RlStepMeta, RlStepReport, RunData, Signal,
+        StepEnv, StepReport, StreamShape, TabularContext, TabularStep, TabularStepReport,
+        TabularTrainer, TargetKind, challenge_fires, effective_challenge_prob, episode_start_seed,
+        fitness_for, forced_action, least_action, metric_for, metrics_for,
     };
 
     // Shared deterministic batching.
