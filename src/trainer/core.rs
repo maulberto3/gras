@@ -118,7 +118,7 @@ pub struct StepEnv {
     pub pop_size: usize,
     /// Live nets in the population right now.
     pub live_count: usize,
-    /// Checkpoint cadence — the durability tick (frontier + elite weight snapshots)
+    /// Checkpoint cadence — the durability tick (frontier + champion weight snapshots)
     /// stream's eval-permutation era fire every N steps.
     pub checkpoint_every: usize,
     /// The per-net fitness smoothing window, in steps (K).
