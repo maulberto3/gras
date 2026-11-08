@@ -462,6 +462,7 @@ impl CoreEngine {
             recency: self.config.window_recency,
             mean_type: self.config.mean_type,
             inverted: self.config.train_merit_inverted,
+            age_leg: self.train_age(),
             omega: self.train_merit_omega(),
             p_min: self.train_merit_p_min(),
             p_max: self.train_merit_p_max(),
@@ -612,17 +613,18 @@ impl CoreEngine {
     /// how it is RANKED (fit and its min-max place) → what the coin paid it (`age`, the youth leg,
     fn stop_header(&self, columns: &[&'static str], has_eval: bool) -> Vec<String> {
         let mut header: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
-        // The PLACE names the tilt the ticket is paid
-        if self.config.train_merit_inverted {
-            // The place is mirrored and its equation is the one the ticket multiplies, so BOTH
-            // cells name the mirror: a reader recomputing the best-first formulas would get `1 − Fm`.
-            let (place, ticket) = (fit_minmax_column(true), ticket_column(true));
-            for cell in header.iter_mut() {
-                if cell == COL_FIT_MINMAX {
-                    *cell = place.to_string();
-                } else if cell == COL_TICKET {
-                    *cell = ticket.to_string();
-                }
+        // TWO setters shape these cells, so BOTH are read here: the tilt mirrors the place, and
+        // the age leg decides whether `Ym` is a factor at all. One helper per cell, so the header
+        // cannot name a symbol the row does not print.
+        let (place, ticket) = (
+            fit_minmax_column(self.config.train_merit_inverted),
+            ticket_column(self.config.train_merit_inverted, self.train_age()),
+        );
+        for cell in header.iter_mut() {
+            if cell == COL_FIT_MINMAX {
+                *cell = place.to_string();
+            } else if cell == COL_TICKET {
+                *cell = ticket.to_string();
             }
         }
         if has_eval {
@@ -995,7 +997,7 @@ impl CoreEngine {
                 &rows.into_iter().map(|(_, _, row)| row).collect::<Vec<_>>(),
             ),
             Some(&format!(
-                "F = the net's smoothed risk-adjusted score (K-reading mean of window avg ∓ λ × window spread, the ranking's number) · M = clocks the net was measured on, real updates + crown act passes · `F ÷ U` = F ÷ its update count (this debug view only — the final table carries no efficiency column): informational — what one optimizer step bought, so a cheap net reads from an expensive one · field THIS clock drew from: best {} worst {} · T = where the net's SCORE sits between those two bounds as the graded fraction f = the product above (Fm × Ym, or Fm with the age leg off; Fm = 1 at the BEST end, 0 at the worst — unless the tilt says otherwise, and this run is {}), then paid between the two ends Ω leaves — `lo = 1 − Ω·(1 − p_min {})`, `hi = 1 − Ω·(1 − p_max {})`, `p = lo + (hi − lo) × f` — so Ω < 1 lifts every net toward 1 = always train · ticket? = yes if THIS clock sells it the step (train + eval), no if it IDLES instead (no train, no eval, nothing measured) · exempt nets (crown, born shield) always run and grade 1.00 — but a crown reads no, because the crown's act pass outranks the lottery · idle = clocks the lottery left it idle BEFORE this clock ({} across the run); the step's lottery line names this clock's count",
+                "F = the net's smoothed risk-adjusted score (K-reading mean of window avg ∓ λ × window spread, the ranking's number) · M = clocks the net was measured on, real updates + crown act passes · `F ÷ U` = F ÷ its update count (this debug view only — the final table carries no efficiency column): informational — what one optimizer step bought, so a cheap net reads from an expensive one · field THIS clock drew from: best {} worst {} · T = where the net's SCORE sits between those two bounds as the graded fraction f = the product above (Fm × Ym, or Fm with the age leg off; Fm = 1 at the BEST end, 0 at the worst — unless the tilt says otherwise, and this run is {}), then paid between the two ends Ω leaves — `lo = 1 − Ω·(1 − p_min {})`, `hi = 1 − Ω·(1 − p_max {})`, `p = lo + (hi − lo) × f` — so Ω < 1 lifts every net toward 1 = always train · the coin is a seeded `fastrand` draw `d ∈ [0,1)` compared to `p`: `d < p` sells the ticket, otherwise the clock idles · ticket? = yes if THIS clock sells it the step (train + eval), no if it IDLES instead (no train, no eval, nothing measured) · exempt nets (crown, born shield) always run and grade 1.00 — but a crown reads no, because the crown's act pass outranks the lottery · idle = clocks the lottery left it idle BEFORE this clock ({} across the run); the step's lottery line names this clock's count",
                 fmt_cfg(best),
                 fmt_cfg(worst),
                 self.lottery_tilt(),
@@ -1152,13 +1154,14 @@ impl CoreEngine {
             budgeted,
         );
         info!(
-            "step {} │ lottery (Ω {}, {}, band [{}, {}], so ticket T = 1 − {} × (1 − f)) │ {}",
+            "step {} │ lottery (Ω {}, {}, band [{}, {}], so ticket T = lo + (hi − lo) × f with lo {} and hi {}) │ {}",
             clock,
             fmt_cfg(omega),
             self.lottery_tilt(),
             fmt_cfg(floor),
             fmt_cfg(ceiling),
-            fmt_cfg(omega),
+            fmt_cfg(1.0 - omega * (1.0 - floor)),
+            fmt_cfg(1.0 - omega * (1.0 - ceiling)),
             body,
         );
     }
@@ -1187,10 +1190,15 @@ const COL_FIT_MINMAX: &str = "fit minmax (Fm)";
 const COL_FIT_MINMAX_TILTED: &str = "fit minmax (Fm⁻)";
 const COL_AGE: &str = "age (A)";
 const COL_YOUTH: &str = "youth minmax (Ym)";
-const COL_TICKET: &str = "ticket (T = lo + (hi − lo) × Fm × Ym)";
+const COL_TICKET: &str = "ticket minmax (T = lo + (hi − lo) × Fm × Ym)";
 /// The ticket under the INVERTED ordering: it multiplies the MIRRORED place, so the equation must
 /// name the cell actually on its left (`Fm⁻`), not the best-first `Fm` it no longer reads.
-const COL_TICKET_TILTED: &str = "ticket (T = lo + (hi − lo) × Fm⁻ × Ym)";
+const COL_TICKET_TILTED: &str = "ticket minmax (T = lo + (hi − lo) × Fm⁻ × Ym)";
+/// The ticket with the AGE leg OFF (`set_run_train_age(false)`): nothing multiplies the place, so
+/// the equation must not name a `Ym` the table does not print.
+const COL_TICKET_NO_AGE: &str = "ticket minmax (T = lo + (hi − lo) × Fm)";
+/// The no-age ticket under the inverted ordering.
+const COL_TICKET_NO_AGE_TILTED: &str = "ticket minmax (T = lo + (hi − lo) × Fm⁻)";
 
 /// The place cell this run prints — ONE function, so the header and its legend key cannot drift.
 fn fit_minmax_column(inverted: bool) -> &'static str {
@@ -1201,12 +1209,14 @@ fn fit_minmax_column(inverted: bool) -> &'static str {
     }
 }
 
-/// The ticket cell this run prints — named after the place it actually multiplies.
-fn ticket_column(inverted: bool) -> &'static str {
-    if inverted {
-        COL_TICKET_TILTED
-    } else {
-        COL_TICKET
+/// The ticket cell this run prints — named after the place it actually multiplies and the legs
+/// the setters actually armed (`set_run_train_merit_inverted`, `set_run_train_age`).
+fn ticket_column(inverted: bool, age_leg: bool) -> &'static str {
+    match (inverted, age_leg) {
+        (false, true) => COL_TICKET,
+        (true, true) => COL_TICKET_TILTED,
+        (false, false) => COL_TICKET_NO_AGE,
+        (true, false) => COL_TICKET_NO_AGE_TILTED,
     }
 }
 const COL_UPDATES: &str = "updates (U)";
@@ -1281,6 +1291,9 @@ struct LegendCtx<'a> {
     mean_type: crate::engine::config::MeanType,
     /// Worst-first: the place is mirrored, so the place cell and the ticket equation name `Fm⁻`.
     inverted: bool,
+    /// The age leg (`set_run_train_age`): ARMED, `Ym` is a column and a factor; OFF, the ticket
+    /// equation names the place alone, because a factor the table does not print cannot be read.
+    age_leg: bool,
 
     /// The last clock the lottery dealt — which clock the ticket column is read
     /// against.
@@ -1383,16 +1396,32 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
             ),
         ),
         (
-            ticket_column(ctx.inverted).to_string(),
+            ticket_column(ctx.inverted, ctx.age_leg).to_string(),
             match ctx.lottery.as_ref() {
-                Some(_) => format!(
-                    "the chance the coin gave this net on the LAST clock it dealt (clock {}): `T = lo + (hi − lo) × {} × Ym`, the product of the two cells on its LEFT (`{}` × `Ym`), between the two ends Ω leaves (`lo`, `hi` stated with their numbers in the `F field · Ω` row). With the leg OFF `Ym` is `1` and the same equation is one step from `{}`. `—` when the coin was not thrown for this net: the lottery is off or was never armed, it holds a crown seat (the act pass outranks the coin), it is inside its born shield, it has no reading yet, or the graded field had no spread to place it in. Those nets always run, but a number here would claim a draw they never took part in. Under tilt {} this column FALLS as `fit (F)` rises, and with the age leg armed it also falls as a net gets older",
-                    ctx.dealt_clock,
-                    place,
-                    place,
-                    minmax,
-                    ctx.tilt
-                ),
+                Some(_) => {
+                    // The equation names EXACTLY the cells the table prints: `Ym` is a column
+                    // only while the age leg is armed, so its factor cannot be stated blind.
+                    let eq = if ctx.age_leg {
+                        format!("`T = lo + (hi − lo) × {place} × Ym`")
+                    } else {
+                        format!("`T = lo + (hi − lo) × {place}`")
+                    };
+                    let legs = if ctx.age_leg {
+                        format!("the product of the two cells on its LEFT (`{place}` × `Ym`)")
+                    } else {
+                        format!("the single leg on its LEFT (`{place}`)")
+                    };
+                    let arm = if ctx.age_leg {
+                        "The age leg is ARMED (`set_run_train_age(true)`), so `Ym` multiplies the place and an older net's cell falls"
+                    } else {
+                        "The age leg is OFF (`set_run_train_age(false)`), so nothing multiplies the place and the cell is one step from it"
+                    };
+                    format!(
+                        "the chance the coin gave this net on the LAST clock it dealt (clock {}): {eq}, {legs}, between the two ends Ω leaves (`lo`, `hi` stated with their numbers in the `F field · Ω` row) — and `T` is the probability ITSELF, on the coin's own line: the draw is `d = fastrand ∈ [0,1)` and the net trains iff `d < T`, so `lo` and `hi` are the share of the unit interval the field's chances cover (`T = 1` trains every clock, `T = 0` never). {arm}. `—` when the coin was not thrown for this net: the lottery is off or was never armed, it holds a crown seat (the act pass outranks the coin), it is inside its born shield, it has no reading yet, or the graded field had no spread to place it in. Those nets always run, but a number here would claim a draw they never took part in. Under tilt {} this column FALLS as `fit (F)` rises",
+                        ctx.dealt_clock,
+                        ctx.tilt
+                    )
+                }
                 None => "the chance the coin gave this net on the last clock: `—` on every row, because there was no field to grade (Ω = 0, or the lottery was never armed)".to_string(),
             },
         ),
@@ -1525,6 +1554,7 @@ mod stop_legend_tests {
             recency: 0.0,
             mean_type: crate::engine::config::MeanType::Arithmetic,
             inverted: false,
+            age_leg: true,
             dealt_clock: 0,
             omega: 0.0,
             p_min: 0.0,
@@ -1576,7 +1606,39 @@ mod stop_legend_tests {
         assert!(COL_TICKET.contains("× Fm × Ym"));
         // The header rewrite and the legend key read the SAME helper, so the cell and its row agree.
         assert_eq!(fit_minmax_column(true), COL_FIT_MINMAX_TILTED);
-        assert_eq!(ticket_column(false), COL_TICKET);
+        assert_eq!(ticket_column(false, true), COL_TICKET);
+    }
+
+    /// TWO setters shape the ticket cell: the tilt swaps `Fm` for `Fm⁻`, the age leg decides
+    /// whether `Ym` is a factor at all — so each of the four combinations has its own equation,
+    /// and the header a reader sees is the key its legend row carries.
+    #[test]
+    fn the_ticket_equation_follows_the_tilt_and_the_age_leg() {
+        let mut headers: Vec<&'static str> = Vec::new();
+        for inverted in [false, true] {
+            for age_leg in [false, true] {
+                let mut c = ctx();
+                c.inverted = inverted;
+                c.age_leg = age_leg;
+                let header = ticket_column(inverted, age_leg);
+                let rows = stop_legend_rows(&c);
+                assert!(
+                    rows.iter().any(|(k, _)| k == header),
+                    "`{header}` has no legend row — keys: {:?}",
+                    rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()
+                );
+                assert_eq!(header.contains("Ym"), age_leg, "{header}");
+                assert_eq!(header.contains("Fm⁻"), inverted, "{header}");
+                headers.push(header);
+            }
+        }
+        headers.sort_unstable();
+        headers.dedup();
+        assert_eq!(
+            headers.len(),
+            4,
+            "the four setter combinations must print four different equations: {headers:?}"
+        );
     }
 
     /// Each mean family prints ITS OWN equation, and that exact string is the legend key:
