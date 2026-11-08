@@ -31,11 +31,11 @@ impl SelectionMethod {
         scores: &[f32],
         direction: Direction,
         rng: &mut fastrand::Rng,
-        elite_count: usize,
+        champion_count: usize,
     ) -> Vec<usize> {
         match self {
             Self::Tournament { tournament_size } => {
-                tournament_select(scores, direction, rng, *tournament_size, elite_count)
+                tournament_select(scores, direction, rng, *tournament_size, champion_count)
             }
             Self::Roulette => roulette_select(scores, direction, rng),
         }
@@ -112,13 +112,13 @@ fn roulette_select(scores: &[f32], direction: Direction, rng: &mut fastrand::Rng
     vec![weights.len() - 1]
 }
 /// Tournament selection with elitism: returns `scores.len()` indices, top
-/// `elite_count` always kept, the rest a `tournament`-way draw.
+/// `champion_count` always kept, the rest a `tournament`-way draw.
 fn tournament_select(
     scores: &[f32],
     direction: Direction,
     rng: &mut fastrand::Rng,
     tournament: usize,
-    elite_count: usize,
+    champion_count: usize,
 ) -> Vec<usize> {
     let n = scores.len();
     if n == 0 {
@@ -127,10 +127,10 @@ fn tournament_select(
     let tournament = tournament.max(1);
     let mut chosen = Vec::with_capacity(n);
 
-    // Elitism: the top `elite_count` individuals survive untouched.
+    // Elitism: the top `champion_count` individuals survive untouched.
     let mut ranked: Vec<(usize, f32)> = scores.iter().enumerate().map(|(i, &s)| (i, s)).collect();
     ranked.sort_by(|a, b| direction.cmp(a.1, b.1).reverse());
-    let elite_n = elite_count.min(n);
+    let elite_n = champion_count.min(n);
     for &(idx, _) in ranked.iter().take(elite_n) {
         chosen.push(idx);
     }
