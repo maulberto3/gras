@@ -1,13 +1,20 @@
-//! Run artifacts: the champion (elite) and anti-champion (worst) dumps.
+//! Run artifacts: the CHAMPION ranking and the anti-champion (worst) dumps.
+//!
+//! Three words, three jobs, no overlap: a CHAMPION is a net in the saved, inheritable top-k
+//! ranking; a SEAT is the frozen act-only switch the crown deals (`freeze_seats`); the GUARD
+//! is cull immunity for the same top-k while the run is still going.
 
 use super::core::CoreEngine;
 use super::format::{ReadingStyle, fmt_reading};
 use flodl::tensor::Result;
 
 impl CoreEngine {
-    /// Write the MACHINE-READABLE elite ranking — `elites.json`, best first,
-    /// k = `elite_count`. UNCONDITIONAL: an inheritance receipt, not a log line.
-    pub(crate) fn write_elite_index(&mut self) -> Result<()> {
+    /// Write the MACHINE-READABLE champion ranking — `champions.json`, best first,
+    /// k = `champion_count`. UNCONDITIONAL: an inheritance receipt, not a log line.
+    ///
+    /// A legacy `elites.json` with the same bytes is written beside it for one release, so a
+    /// reader built before the rename keeps working; the reader prefers `champions.json`.
+    pub(crate) fn write_champion_index(&mut self) -> Result<()> {
         self.record_champions();
         // `fitness` stays the RANKING value (the key the next run and this file's readers already
         // agree on); the reading behind it is written out in full so "ranked 1st because
@@ -31,11 +38,14 @@ impl CoreEngine {
                 })
             })
             .collect();
-        let path = self.run_dir.join("elites.json");
+        let path = self.run_dir.join("champions.json");
         let body = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
+        // The legacy name, same bytes, one release. Writing it here (not in a second card) keeps
+        // the two files from ever disagreeing.
+        let _ = std::fs::write(self.run_dir.join("elites.json"), &body);
         if let Err(source) = std::fs::write(&path, body) {
             tracing::warn!(
-                "elite index write failed: {}",
+                "champion index write failed: {}",
                 crate::utils::error::EngineError::Io {
                     path: path.display().to_string(),
                     source,
@@ -43,7 +53,7 @@ impl CoreEngine {
             );
         } else if self.verbose_detail() {
             crate::utils::cfy::emit(&crate::utils::cfy::card(
-                "Elite index",
+                "Champion index",
                 &crate::utils::cfy::kv(&[
                     ("file".to_string(), path.display().to_string()),
                     ("ranked".to_string(), entries.len().to_string()),
@@ -54,16 +64,16 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Write the top-k elites' topology markdown, one file per elite
-    /// (`elite-<hash>.md`). UNCONDITIONAL at every log level.
+    /// Write the top-k champions' topology markdown, one file per champion
+    /// (`champion-<hash>.md`). UNCONDITIONAL at every log level.
     pub(crate) fn write_champion_markdown(&mut self) -> Result<()> {
-        if !self.config.elite_save_topology {
+        if !self.config.champion_save_topology {
             return Ok(());
         }
         self.record_champions();
         // The champion count is known without consuming the iterator — read
         // it from the config (the same k the iterator caps
-        let k = self.config.elite_count.max(1);
+        let k = self.config.champion_count.max(1);
         // CFY: rows of the written files, emitted as one table after the loop.
         let mut written: Vec<Vec<String>> = Vec::new();
         for (rank, (hash, fitness)) in self.champion_ranked().enumerate() {
@@ -74,11 +84,11 @@ impl CoreEngine {
                 continue;
             };
             let short = &hash[..8.min(hash.len())];
-            let path = self.run_dir.join(format!("elite-{short}.md"));
+            let path = self.run_dir.join(format!("champion-{short}.md"));
             let label = if k <= 1 {
-                "Elite".to_string()
+                "Champion".to_string()
             } else {
-                format!("Elite #{}", rank + 1)
+                format!("Champion #{}", rank + 1)
             };
             // The header names both legs: the score it ranked by, and the reading it was charged
             // from — `μ ±σ (SE, n)` in the same spelling as the logs, so a reader never has
@@ -106,7 +116,7 @@ impl CoreEngine {
                 crate::utils::markdown::topology_markdown(&topo, None),
                 // The net's own birth, as a mermaid graph: a founder is one box,
                 // crossover draws its parents above and converges down to this net.
-                self.lineage_markdown(&hash, "ELITE"),
+                self.lineage_markdown(&hash, "CHAMPION"),
             );
             match std::fs::write(&path, &md) {
                 Ok(()) => {
@@ -117,7 +127,7 @@ impl CoreEngine {
                     ]);
                 }
                 Err(source) => tracing::warn!(
-                    "elite markdown write failed: {}",
+                    "champion markdown write failed: {}",
                     crate::utils::error::EngineError::Io {
                         path: path.display().to_string(),
                         source,
@@ -127,7 +137,7 @@ impl CoreEngine {
         }
         if self.verbose_detail() && !written.is_empty() {
             crate::utils::cfy::emit(&crate::utils::cfy::card(
-                "Elite topology (markdown)",
+                "Champion topology (markdown)",
                 &crate::utils::cfy::table(&["#", "hash", "file"], &written),
                 Some("ready to view"),
             ));
@@ -215,21 +225,21 @@ impl CoreEngine {
         }
     }
 
-    /// Full hashes of the elite set exported at stop — the single source
+    /// Full hashes of the champion set exported at stop — the single source
     /// truth for "which nets are the champions" (never file mtimes/glob order).
     pub fn champion_hashes(&self) -> &[String] {
         &self.champions
     }
 
-    /// The champion set: top-`elite_count` live hashes by smoothed fitness.
-    /// ONE ranking all elite writers consume, so they can never disagree.
+    /// The champion set: top-`champion_count` live hashes by smoothed fitness.
+    /// ONE ranking all champion writers consume, so they can never disagree.
     fn champion_ranked(&self) -> impl Iterator<Item = (String, f32)> {
         self.champion_slice(&self.ranked_live()).into_iter()
     }
 
     /// [`Self::champion_ranked`] over a ranking the caller already holds.
     pub(crate) fn champion_slice(&self, ranked: &[(String, f32)]) -> Vec<(String, f32)> {
-        let k = self.config.elite_count.max(1);
+        let k = self.config.champion_count.max(1);
         ranked.iter().take(k).cloned().collect()
     }
 

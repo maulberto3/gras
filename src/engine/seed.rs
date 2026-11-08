@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::graph::topology::Topology;
 use crate::state::RunHeader;
 
-/// Root searched when `set_elite_previous_dir` is unset — the engine's own
+/// Root searched when `set_champion_previous_dir` is unset — the engine's own
 /// output directory.
 pub const DEFAULT_RESULTS_ROOT: &str = "results";
 
@@ -145,12 +145,12 @@ pub fn resolve_plan(
         }
     }
     // ── 3.
-    let ranked: Vec<(usize, String)> = match read_elite_index(dir) {
+    let ranked: Vec<(usize, String)> = match read_champion_index(dir) {
         Some(entries) if !entries.is_empty() => entries,
         _ => {
             return SeedOutcome::Skipped(format!(
-                "run {source_run_id} has no elites.json (its final table was not recorded, or it \
-                 predates the index)"
+                "run {source_run_id} has no champions.json (nor a legacy elites.json — its final \
+                 table was not recorded, or it predates the index)"
             ));
         }
     };
@@ -166,7 +166,7 @@ pub fn resolve_plan(
                 let why = if rank == 1 {
                     format!("champion {short} of run {source_run_id}: {e}")
                 } else {
-                    format!("elite #{rank} {short} of run {source_run_id}: {e}")
+                    format!("champion #{rank} {short} of run {source_run_id}: {e}")
                 };
                 first_failure.get_or_insert(why);
                 continue;
@@ -199,8 +199,9 @@ pub fn resolve_plan(
         // Nothing loadable. The champion's own failure keeps the old message
         // shape (and the old "nothing here was proven" contract).
         return SeedOutcome::Skipped(
-            first_failure
-                .unwrap_or_else(|| format!("run {source_run_id} has no loadable elite blueprint")),
+            first_failure.unwrap_or_else(|| {
+                format!("run {source_run_id} has no loadable champion blueprint")
+            }),
         );
     }
     SeedOutcome::Seeded(Box::new(SeedPlan {
@@ -210,10 +211,15 @@ pub fn resolve_plan(
     }))
 }
 
-/// Read a source run's `elites.json` as `(rank, hash)` pairs, best first. `None`
+/// Read a source run's `champions.json` as `(rank, hash)` pairs, best first. `None`
 /// when absent/unparsable (the source predates the index); duplicates collapse.
-fn read_elite_index(dir: &Path) -> Option<Vec<(usize, String)>> {
-    let raw = std::fs::read_to_string(dir.join("elites.json")).ok()?;
+///
+/// A run written before the rename still carries `elites.json`, so that name is the fallback:
+/// inheritance must not break just because a word changed.
+fn read_champion_index(dir: &Path) -> Option<Vec<(usize, String)>> {
+    let raw = std::fs::read_to_string(dir.join("champions.json"))
+        .or_else(|_| std::fs::read_to_string(dir.join("elites.json")))
+        .ok()?;
     let mut entries: Vec<EliteIndexEntry> = serde_json::from_str(&raw).ok()?;
     entries.retain(|e| !e.hash.is_empty());
     // The file is written ranked already; sorting makes the reader
@@ -469,7 +475,7 @@ mod tests {
             SeedOutcome::Skipped(r) => r,
             SeedOutcome::Seeded(_) => panic!("a run with no elites.json must be skipped"),
         };
-        assert!(reason.contains("no elites.json"), "{reason}");
+        assert!(reason.contains("no champions.json"), "{reason}");
     }
 
     #[test]

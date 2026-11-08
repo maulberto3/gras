@@ -108,12 +108,12 @@ pub const DEFAULT_MUTATE_ROLLS: usize = 2;
 pub const DEFAULT_CROSSOVER_PROB: f32 = 0.5;
 pub const DEFAULT_MUTATE_PROB: f32 = 0.2;
 
-/// Default elite guard: the reference's `pop / 10`, read at the conservative default population
+/// Default champion guard: the reference's `pop / 10`, read at the conservative default population
 /// 10 — one seat.
-pub const DEFAULT_ELITE_COUNT: usize = 1;
+pub const DEFAULT_CHAMPION_COUNT: usize = 1;
 
 /// Default clocks a net must have lived before it may take an elite seat: `5`, the guarded value.
-pub const DEFAULT_ELITE_JOIN_PROBATION: usize = 5;
+pub const DEFAULT_SEAT_JOIN_PROBATION: usize = 5;
 
 /// Default clocks a crown seat may sit at peak: `5`, the guarded value (a seated net
 /// rotates out on its term). The cartpole reference disarms the term (`0`).
@@ -140,6 +140,13 @@ pub const EVAL_SHARE_MAX: f32 = 0.9;
 /// Default chance that ONE inherited drift slot moves on a crossover child (`set_topology_drift`):
 /// a mask bit flips, or a hidden node's activation / combine / standardize is re-drawn
 pub const DEFAULT_TOPOLOGY_DRIFT: f32 = 0.1;
+
+/// Default novelty floor `d_min` for a mutation draw (`set_mutation_novelty_min`): the clone
+/// band — unrelated nets sit near Δ 0.67, while a net's NEAREST neighbour sits near 0.17.
+pub const DEFAULT_MUTATION_NOVELTY_MIN: f32 = 0.2;
+
+/// Default candidates ONE mutation may spend before the most novel is taken anyway.
+pub const DEFAULT_MUTATION_NOVELTY_DRAWS: usize = 5;
 
 // `DEFAULT_LR` moved to `crate::utils::training`: a training scheme reads it (the reference trainer
 // and the example both do), so it belongs below both layers rather than in the engine's config
@@ -322,12 +329,13 @@ pub struct RaceConfig {
     /// Who a firing mutation roll evicts (mutation-only; crossover children follow
     /// `crossover_cull_policy`).
     pub mutation_cull_policy: MutationCullPolicy,
-    /// Elite guard: the top-k nets by smoothed fitness are immune to ALL culls (minimum
-    /// 1). "Elite" is a rank, not an identity.
-    pub elite_count: usize,
+    /// CHAMPION guard: the top-k nets by smoothed fitness are immune to ALL culls (minimum
+    /// 1). A champion is a rank — the saved, inheritable set — not an identity, and the
+    /// frozen SEATS below are a separate switch that this k sizes but does not mean.
+    pub champion_count: usize,
     /// Anti-devolution A: the top-k nets act-and-measure without weight
-    /// updates (see [`RaceConfigBuilder::set_elite_freeze`]). Default `true`.
-    pub freeze_elites: bool,
+    /// updates (see [`RaceConfigBuilder::set_seat_freeze`]). Default `true`.
+    pub freeze_seats: bool,
     /// Train-eval lottery strength, Ω (`set_run_train_merit`): how much of this clock's budget
     /// merit decides.
     pub train_merit: f32,
@@ -395,6 +403,11 @@ pub struct RaceConfig {
     /// Per-roll chance a mutation roll FIRES and inserts a random immigrant.
     /// `mutate_rolls` controls rolls per step; this controls how often each fires.
     pub mutate_prob: f32,
+    /// Novelty floor `d_min` on a mutation draw (`set_mutation_novelty_min`): the minimum Δ to
+    /// the NEAREST blueprint this run already made. `0.0` = off.
+    pub mutation_novelty_min: f32,
+    /// Candidates one mutation may spend clearing that floor (`set_mutation_novelty_draws`).
+    pub mutation_novelty_draws: usize,
     /// Pluggable stop criterion **in addition** to the built-ins (Iter 5
     /// contract). When `None`, only the built-ins apply.
     pub custom_stop: StopFn,
@@ -414,30 +427,30 @@ pub struct RaceConfig {
     /// Whether to write `history.csv` (one row per live net per clock it was TRAINED AND SCORED
     /// — an idle lottery clock has nothing to record) and `attempts.csv` (per evolution attempt) —
     pub csv_export: bool,
-    /// At stop, save the elite's topology markdown (`elite-<hash>.md`).
-    /// Default true — the champion's blueprint is the run's headline artifact.
-    pub elite_save_topology: bool,
+    /// At stop, save each champion's topology markdown (`champion-<hash>.md`).
+    /// Default true — the ranking's blueprint is the run's headline artifact.
+    pub champion_save_topology: bool,
     /// Human label for the experiment, recorded verbatim in `engine.json`
     /// `"run_name"`. Informational — does not affect the results folder name.
     pub run_name: Option<String>,
-    /// AUTOMATIC inheritance: load the newest compatible PREVIOUS experiment's elites into
+    /// AUTOMATIC inheritance: load the newest compatible PREVIOUS experiment's CHAMPIONS into
     /// first founder slots (topology-only).
-    pub elite_previous_load: bool,
-    /// Where `elite_previous_load` looks: a run dir or a dir of run dirs (newest run id
+    pub champion_previous_load: bool,
+    /// Where `champion_previous_load` looks: a run dir or a dir of run dirs (newest run id
     /// wins). `None` ⇒ the default `results/` folder.
-    pub elite_previous_dir: Option<std::path::PathBuf>,
+    pub champion_previous_dir: Option<std::path::PathBuf>,
     /// Mutation probation: a random immigrant is cull-IMMUNE for its first
     /// `mutation_probation_steps` clocks.
     pub mutation_probation_steps: usize,
     /// Crossover probation: a crossover-born net is cull-IMMUNE for its first
     /// `crossover_probation_steps` clocks.
     pub crossover_probation_steps: usize,
-    /// Elite join probation: a net cannot join the elite set until it has aged
-    /// `elite_join_probation_steps` clocks since arrival. Default `5`.
-    pub elite_join_probation_steps: usize,
-    /// Elite crown lifetime: a net on the frozen crown is culled out after
-    /// `elite_crown_lifetime_steps` clocks. Default `5`; zero = permanent until rank moves.
-    pub elite_crown_lifetime_steps: usize,
+    /// Seat join probation: a net cannot take a SEAT until it has aged
+    /// `seat_join_probation_steps` clocks since arrival. Default `5`.
+    pub seat_join_probation_steps: usize,
+    /// Seat lifetime: a net on the frozen crown is rotated out after
+    /// `seat_lifetime_steps` clocks. Default `5`; zero = permanent until its rank moves.
+    pub seat_lifetime_steps: usize,
 }
 
 // `run_progress` and `DEFAULT_LR` live in `crate::utils::training` — the run
@@ -590,15 +603,15 @@ impl RaceConfig {
             mutate_rolls: DEFAULT_MUTATE_ROLLS,
             crossover_cull_policy: CrossCullPolicy::default(),
             mutation_cull_policy: MutationCullPolicy::default(),
-            elite_count: DEFAULT_ELITE_COUNT,
-            freeze_elites: true,
+            champion_count: DEFAULT_CHAMPION_COUNT,
+            freeze_seats: true,
             train_merit: DEFAULT_TRAIN_MERIT,
             train_merit_p_min: DEFAULT_TRAIN_MERIT_P_MIN,
             train_merit_p_max: DEFAULT_TRAIN_MERIT_P_MAX,
             train_merit_inverted: DEFAULT_TRAIN_MERIT_INVERTED,
             eval_share: DEFAULT_EVAL_SHARE,
-            elite_join_probation_steps: DEFAULT_ELITE_JOIN_PROBATION,
-            elite_crown_lifetime_steps: DEFAULT_CROWN_LIFETIME,
+            seat_join_probation_steps: DEFAULT_SEAT_JOIN_PROBATION,
+            seat_lifetime_steps: DEFAULT_CROWN_LIFETIME,
             smoothing_window: SMOOTHING_WINDOW,
             risk_aversion: RISK_AVERSION,
             window_recency: DEFAULT_WINDOW_RECENCY,
@@ -619,6 +632,8 @@ impl RaceConfig {
             topology_options: crate::graph::topology::TopologyOptions::default(),
             crossover_prob: DEFAULT_CROSSOVER_PROB,
             mutate_prob: DEFAULT_MUTATE_PROB,
+            mutation_novelty_min: DEFAULT_MUTATION_NOVELTY_MIN,
+            mutation_novelty_draws: DEFAULT_MUTATION_NOVELTY_DRAWS,
             custom_stop: None,
             metrics: Vec::new(),
             log_level: LogLevel::default(),
@@ -626,10 +641,10 @@ impl RaceConfig {
             save_optim: true,
             mode: RunMode::Tabular,
             csv_export: true,
-            elite_save_topology: true,
+            champion_save_topology: true,
             run_name: None,
-            elite_previous_load: true,
-            elite_previous_dir: None,
+            champion_previous_load: true,
+            champion_previous_dir: None,
             mutation_probation_steps: 5,
             crossover_probation_steps: 5,
         }
@@ -656,7 +671,10 @@ impl RaceConfig {
         cfg.mutate_rolls = snap.mutate_rolls;
         cfg.crossover_prob = snap.crossover_prob;
         cfg.mutate_prob = snap.mutate_prob;
-        cfg.elite_count = snap.elite_count;
+        // A header written before the gate recorded no floor: `0.0` replays it unchanged.
+        cfg.mutation_novelty_min = snap.mutation_novelty_min;
+        cfg.mutation_novelty_draws = snap.mutation_novelty_draws.max(1);
+        cfg.champion_count = snap.champion_count;
         cfg.crossover_ops_pool = snap.crossover_ops_pool.clone();
         cfg.crossover_fitter_base = snap.crossover_fitter_base;
         cfg.max_steps = snap.max_steps;
@@ -671,22 +689,22 @@ impl RaceConfig {
         cfg.csv_export = snap.csv_export;
         cfg.save_optim = snap.save_optim;
         cfg.run_name = snap.run_name.clone();
-        cfg.freeze_elites = snap.freeze_elites;
+        cfg.freeze_seats = snap.freeze_seats;
         cfg.train_merit = snap.train_merit;
         cfg.train_merit_p_min = snap.train_merit_p_min;
         cfg.train_merit_p_max = snap.train_merit_p_max;
         cfg.train_merit_inverted = snap.train_merit_inverted;
         cfg.drift_prob = snap.drift_prob;
-        cfg.elite_previous_load = snap.elite_previous_load;
-        cfg.elite_previous_dir = snap
-            .elite_previous_dir
+        cfg.champion_previous_load = snap.champion_previous_load;
+        cfg.champion_previous_dir = snap
+            .champion_previous_dir
             .as_ref()
             .map(std::path::PathBuf::from);
-        cfg.elite_save_topology = snap.elite_save_topology;
+        cfg.champion_save_topology = snap.champion_save_topology;
         cfg.mutation_probation_steps = snap.mutation_probation_steps;
         cfg.crossover_probation_steps = snap.crossover_probation_steps;
-        cfg.elite_join_probation_steps = snap.elite_join_probation_steps;
-        cfg.elite_crown_lifetime_steps = snap.elite_crown_lifetime_steps;
+        cfg.seat_join_probation_steps = snap.seat_join_probation_steps;
+        cfg.seat_lifetime_steps = snap.seat_lifetime_steps;
         // The replay-relevant enums, matched on their recorded SPELLING — the snapshots store
         // `Display` output (`"worst"`, `"tournament(size=2)"`, `"split_random"`), so a `contains`
         let cull = snap.crossover_cull_policy.to_ascii_lowercase();
@@ -846,14 +864,14 @@ impl RaceConfigBuilder {
     }
     /// Elite guard: top-k nets are immune to ALL culls. Minimum 1; elites hold rank,
     /// identity.
-    pub fn set_elite_count(mut self, n: usize) -> Self {
-        self.cfg.elite_count = n.max(1);
+    pub fn set_champion_count(mut self, n: usize) -> Self {
+        self.cfg.champion_count = n.max(1);
         self
     }
-    /// ANTI-DEVOLUTION A — elite freeze: the top-`elite_count` nets are exempt
+    /// ANTI-DEVOLUTION A — elite freeze: the top-`champion_count` nets are exempt
     /// trainer call (frozen, but still scored/ranked/parents). Default `true`.
-    pub fn set_elite_freeze(mut self, yes: bool) -> Self {
-        self.cfg.freeze_elites = yes;
+    pub fn set_seat_freeze(mut self, yes: bool) -> Self {
+        self.cfg.freeze_seats = yes;
         self
     }
     /// The train-eval lottery's strength Ω (default [`DEFAULT_TRAIN_MERIT`] = `0.75`; `0.0` = OFF,
@@ -1111,14 +1129,27 @@ impl RaceConfigBuilder {
     }
     /// Opt in/out of the automatic inheritance of the newest compatible previous experiment's
     /// elites (topology-only).
-    pub fn set_elite_previous_load(mut self, enabled: bool) -> Self {
-        self.cfg.elite_previous_load = enabled;
+    pub fn set_champion_previous_load(mut self, enabled: bool) -> Self {
+        self.cfg.champion_previous_load = enabled;
         self
     }
     /// Where the automatic inheritance looks: a run dir or a dir of run dirs
     /// (newest id wins). Unset ⇒ the default `results/`.
-    pub fn set_elite_previous_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
-        self.cfg.elite_previous_dir = Some(dir.into());
+    pub fn set_champion_previous_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.cfg.champion_previous_dir = Some(dir.into());
+        self
+    }
+    /// Mutation novelty floor `d_min`: the minimum Δ a random immigrant must hold against the
+    /// NEAREST blueprint the run already made. `0.0` turns the gate OFF entirely (no parse, no
+    /// redraw); the built-in default is [`DEFAULT_MUTATION_NOVELTY_MIN`].
+    pub fn set_mutation_novelty_min(mut self, d_min: f32) -> Self {
+        self.cfg.mutation_novelty_min = d_min.max(0.0);
+        self
+    }
+    /// Candidates ONE mutation may spend clearing the novelty floor before the most novel draw
+    /// is taken anyway. Default [`DEFAULT_MUTATION_NOVELTY_DRAWS`].
+    pub fn set_mutation_novelty_draws(mut self, draws: usize) -> Self {
+        self.cfg.mutation_novelty_draws = draws.max(1);
         self
     }
     /// Mutation probation steps: cull-immunity for a random immigrant's first
@@ -1133,22 +1164,22 @@ impl RaceConfigBuilder {
         self.cfg.crossover_probation_steps = k;
         self
     }
-    /// Elite join probation steps: a net cannot become an elite until it has aged `k`
+    /// Seat join probation: a net cannot take a seat until it has aged `k`
     /// clocks since arrival. Default `5`.
-    pub fn set_elite_join_probation_steps(mut self, k: usize) -> Self {
-        self.cfg.elite_join_probation_steps = k;
+    pub fn set_seat_join_probation_steps(mut self, k: usize) -> Self {
+        self.cfg.seat_join_probation_steps = k;
         self
     }
-    /// Elite crown lifetime: how long a net may stay at peak on the frozen crown before
-    /// age-elimination. Default `5`.
-    pub fn set_elite_crown_lifetime_steps(mut self, k: usize) -> Self {
-        self.cfg.elite_crown_lifetime_steps = k;
+    /// Seat lifetime: how long a net may stay at peak on the frozen crown before
+    /// age-rotation. Default `5`.
+    pub fn set_seat_lifetime_steps(mut self, k: usize) -> Self {
+        self.cfg.seat_lifetime_steps = k;
         self
     }
-    /// At stop, save the elite's topology markdown (`elite-<hash>.md`).
+    /// At stop, save each champion's topology markdown (`champion-<hash>.md`).
     /// Default true.
-    pub fn set_elite_save_topology(mut self, enabled: bool) -> Self {
-        self.cfg.elite_save_topology = enabled;
+    pub fn set_champion_save_topology(mut self, enabled: bool) -> Self {
+        self.cfg.champion_save_topology = enabled;
         self
     }
     /// Finish and return the configured [`RaceConfig`].

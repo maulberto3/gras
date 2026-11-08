@@ -7,6 +7,7 @@ use super::child::RaceChild;
 use super::core::{CoreEngine, RollOutcome};
 use super::format::csv_field;
 use super::smoothing::RollingBuffer;
+use crate::engine::diversity::shape_of;
 use crate::state::write_net_state;
 
 /// Whether a lineage string names a crossover-born net (`crossover-one-point`,
@@ -30,6 +31,16 @@ pub(crate) enum RollKind {
 const ROLL_STREAM_CROSSOVER: u64 = 0x5A5A_0000_0000_00C1;
 /// Stream tag for the mutation roll lane.
 const ROLL_STREAM_MUTATION: u64 = 0x5A5A_0000_0000_003D;
+
+/// One mutation draw's outcome: the accepted child, its nearest-Δ reading and the draws spent.
+pub(crate) struct RandomDraw {
+    /// The accepted candidate.
+    pub(crate) child: RaceChild,
+    /// Δ to the NEAREST archived blueprint; `None` when the gate is off or it cannot be read.
+    pub(crate) delta: Option<f32>,
+    /// Candidates spent (one when the gate is off).
+    pub(crate) draws: usize,
+}
 
 impl RollKind {
     /// The seed a fire check (or victim draw) for this roll derives from —
@@ -91,27 +102,69 @@ impl CoreEngine {
         );
     }
 
-    /// A guaranteed-fresh random child (mutation path): roll `random_child`
-    /// directly (the caller already resolved the branch), re-rolling on duplicates.
-    fn generate_random_at(&mut self, clock: usize, start_idx: usize) -> Result<RaceChild> {
-        for attempt in 0..8 {
+    /// One mutation draw: up to `draws` candidates, each its own seed ordinal. The first that
+    /// clears the novelty floor wins; when none does, the most novel candidate is taken anyway.
+    fn generate_random_at(&mut self, clock: usize, start_idx: usize) -> Result<RandomDraw> {
+        let draws = self.novelty.draws();
+        let mut best: Option<(RaceChild, f32)> = None;
+        let mut used = 0;
+        for attempt in 0..draws {
+            used = attempt + 1;
             let child = self.random_child(clock, start_idx + attempt)?;
-            if !self.state.net(&child.state.hash).is_some() {
-                // consume the ordinal(s) we used
-                *self.children_born_at_clock.get_mut(&clock).unwrap() = start_idx + attempt + 1;
-                return Ok(child);
+            if self.state.net(&child.state.hash).is_some() {
+                if self.verbose_detail() {
+                    info!(
+                        "step {} │ random child {} is a duplicate topology → re-rolling unique seed",
+                        clock,
+                        &child.state.hash[..8],
+                    );
+                }
+                continue;
             }
-            if self.verbose_detail() {
-                info!(
-                    "step {} │ random child {} is a duplicate topology → re-rolling unique seed",
-                    clock,
-                    &child.state.hash[..8],
-                );
+            // Gate off: the first fresh candidate wins and no blueprint is parsed.
+            if !self.novelty.enabled() {
+                *self.children_born_at_clock.get_mut(&clock).unwrap() = start_idx + used;
+                return Ok(RandomDraw {
+                    child,
+                    delta: None,
+                    draws: used,
+                });
+            }
+            let Some(shape) = child.state.topology().ok().map(|t| shape_of(&t)) else {
+                // An unreadable blueprint cannot be judged: take it rather than shorten the pop.
+                *self.children_born_at_clock.get_mut(&clock).unwrap() = start_idx + used;
+                return Ok(RandomDraw {
+                    child,
+                    delta: None,
+                    draws: used,
+                });
+            };
+            if self.novelty.admits(&shape) {
+                let delta = self.novelty.nearest(&shape);
+                *self.children_born_at_clock.get_mut(&clock).unwrap() = start_idx + used;
+                return Ok(RandomDraw {
+                    child,
+                    delta,
+                    draws: used,
+                });
+            }
+            // Keep the most novel refusal so a cap cannot leave the slot empty.
+            let d = self.novelty.nearest(&shape).unwrap_or(1.0);
+            if best.as_ref().map_or(true, |(_, b)| d > *b) {
+                best = Some((child, d));
             }
         }
-        Err(TensorError::new(
-            "race: could not generate a unique random child after 8 attempts",
-        ))
+        let Some((child, delta)) = best else {
+            return Err(TensorError::new(
+                "race: could not generate a unique random child",
+            ));
+        };
+        *self.children_born_at_clock.get_mut(&clock).unwrap() = start_idx + used;
+        Ok(RandomDraw {
+            child,
+            delta: Some(delta),
+            draws: used,
+        })
     }
 
     /// Insert a newborn child into the live maps (state, network, optimizer; its rolling
@@ -119,6 +172,11 @@ impl CoreEngine {
     fn insert_child(&mut self, child: RaceChild, _clock: usize, _group: &str) {
         // NO per-event log here: inserts are reported on the calling roll's
         // single line — one roll, one line.
+        // Every birth lands in the novelty archive — crossover children too, so a mutation
+        // cannot re-invent what recombination already made.
+        if let Ok(topo) = child.state.topology() {
+            self.novelty.push(&topo);
+        }
         let child_fitness = child.state.last_metrics.as_ref().map(|m| m.fitness);
         self.state.insert(child.state.clone(), child_fitness);
         self.networks.insert(child.state.hash.clone(), child.net);
@@ -163,6 +221,7 @@ impl CoreEngine {
                 None,
                 "duplicate-discarded",
                 "rejected_duplicate",
+                None,
                 None,
                 None,
                 None,
@@ -217,6 +276,7 @@ impl CoreEngine {
                 None,
                 victim_for_log.as_deref(),
                 victim_net_seed,
+                None,
             );
             // The population the victim was the worst OF — read before the cull,
             // because `cull_net` shrinks
@@ -269,6 +329,10 @@ impl CoreEngine {
 
     /// Append one evolution-event row to the `attempts.csv` buffer: every attempt
     /// is recorded (inserted or rejected), so the failed-draw rate stays queryable.
+    ///
+    /// `gate` is the novelty reading for a row that has one — `(Δ to the nearest archived
+    /// blueprint, candidates spent)` — and `None` everywhere else, because a crossover child is
+    /// never judged and the reading only exists at birth, not per clock.
     #[allow(clippy::too_many_arguments)] // one row of the attempt ledger — fields, not logic
     pub(crate) fn record_attempt(
         &mut self,
@@ -282,14 +346,15 @@ impl CoreEngine {
         child_fitness: Option<f32>,
         victim: Option<&str>,
         victim_net_seed: Option<usize>,
+        gate: Option<(f32, usize)>,
     ) {
         if !self.config.csv_export {
             return;
         }
         // `attempts.csv` columns (see `flush_csv_exports`) with FULL hashes +
         // net_seed — (hash, net_seed) is the unique individual key.
-        let row = format!(
-            "{},{},{},{},{},{},{},{},{},{},{}\n",
+        let mut row = format!(
+            "{},{},{},{},{},{},{},{},{},{},{}",
             step,
             branch,
             attempt,
@@ -302,11 +367,22 @@ impl CoreEngine {
             victim_net_seed.map(|s| s.to_string()).unwrap_or_default(),
             self.state.live_count(),
         );
+        // The gate's reading, appended LAST so every existing column keeps its position: the Δ to
+        // the NEAREST archived blueprint, the candidates this draw spent, and the floor it was
+        // judged against. A Δ BELOW the floor says the cap ran out and the most novel refusal was
+        // taken anyway; blank cells say the row was never judged (crossover, or the gate off).
+        match gate {
+            Some((delta, draws)) => {
+                row.push_str(&format!(",{delta},{draws},{}", self.novelty.min()))
+            }
+            None => row.push_str(",,,"),
+        }
+        row.push('\n');
         self.attempts_csv_buffer.push_str(&row);
     }
 
     /// Uniformly random **cullable** live net (the `Random` arm of both policies):
-    /// deterministic in `(run_seed, clock, salt)`; elites/probation excluded.
+    /// deterministic in `(run_seed, clock, salt)`; champions/probation excluded.
     fn select_random_victim_at(&self, clock: usize, salt: usize) -> Result<Option<String>> {
         let elite = self.elite_hashes();
         // The param `clock` is the SALTED seed input; the probation check needs
@@ -355,7 +431,7 @@ impl CoreEngine {
             self.config.mutation_probation_steps
         };
         format!(
-            "no cull-eligible net — every non-elite net is inside its {branch} cull shield window (k={k}) or elite; roll spent, nothing culled/born"
+            "no cull-eligible net — every non-champion net is inside its {branch} cull shield window (k={k}) or elite; roll spent, nothing culled/born"
         )
     }
 
@@ -420,14 +496,23 @@ impl CoreEngine {
         };
         self.cull_net(&victim, clock, "immigrant-slot")?;
         let idx = self.next_child_ordinal(clock);
-        let mut child = self.generate_random_at(clock, idx)?;
+        let draw = self.generate_random_at(clock, idx)?;
+        let novelty_note = match (draw.delta, self.novelty.enabled()) {
+            (Some(d), true) => format!(
+                " │ novelty Δ {d:.2} · draw {} of {}",
+                draw.draws,
+                self.novelty.draws()
+            ),
+            _ => String::new(),
+        };
+        let mut child = draw.child;
         self.pre_insert_buffer(&child.state.hash);
         // A newborn immigrant joins fresh: step 0, no replay. Empty buffers mean "no
         // verdict yet"; its first optimizer update is the next group step.
         child.state.step = 0;
         child.state.last_metrics = None;
         let detail = format!(
-            "culled {} │ mutation {} born (fresh, first step at {clock})",
+            "culled {} │ mutation {} born (fresh, first step at {clock}){novelty_note}",
             &victim[..8.min(victim.len())],
             &child.state.hash[..8.min(child.state.hash.len())],
         );
@@ -443,6 +528,9 @@ impl CoreEngine {
             child.state.last_metrics.as_ref().map(|m| m.fitness),
             Some(&victim),
             victim_net_seed,
+            // The gate's own reading: `None` when it is off, else the Δ of the accepted draw
+            // (or of the most novel refusal, once the cap is spent) and its candidate count.
+            draw.delta.map(|d| (d, draw.draws)),
         );
         self.insert_child(child, clock, "mutation");
         Ok(Some(detail))

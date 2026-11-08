@@ -8,6 +8,7 @@ pub mod evolve;
 pub mod exam;
 pub mod format;
 pub mod logging;
+pub mod novelty;
 pub mod pool;
 pub mod population;
 pub mod reporting;

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! step_one_net(hash, clock)
-//!   ├─ elite freeze check (ANTI-DEVOLUTION A) → act-and-measure pass (NoopOptimizer)
+//!   ├─ seat freeze check (ANTI-DEVOLUTION A) → act-and-measure pass (NoopOptimizer)
 //!   ├─ train-eval lottery denies the ticket   → idle pass (no train, no eval)
 //!   └─ run_trainer_step_with_real_optimizer(hash, clock)
 //!        └─ run_trainer_step(hash, clock, optimizer)
@@ -57,10 +57,10 @@ impl CoreEngine {
         frame: Option<LotteryFrame>,
         forced: bool,
     ) -> Result<()> {
-        // ANTI-DEVOLUTION A — elite freeze: the crown holds the nets that skip
+        // ANTI-DEVOLUTION A — seat freeze: the crown holds the nets that skip
         // the trainer update this step; scoring proceeds off carried metrics.
         if self.frozen_crown.contains(hash) {
-            return self.act_only_step(hash, clock, "FROZEN (elite)");
+            return self.act_only_step(hash, clock, "FROZEN (seat)");
         }
         // TRAIN-EVAL LOTTERY (experimental, off by default): a non-crown net may be denied
         // clock's ticket.
