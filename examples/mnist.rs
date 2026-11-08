@@ -60,7 +60,7 @@ mod cli {
 
         /// Elites kept safe from culls AND exported at stop.
         #[arg(long, value_name = "N")]
-        pub elite_count: Option<usize>,
+        pub champion_count: Option<usize>,
 
         /// FIT risk aversion λ: window-σs a net pays for its own spread before it is
         /// ranked (0 = rank on the plain window mean). Replay-relevant.
@@ -98,6 +98,17 @@ mod cli {
         /// Mutation rolls per step.
         #[arg(long, value_name = "N")]
         pub mutate_rolls: Option<usize>,
+
+        /// Mutation NOVELTY floor Δ: a random immigrant must sit at least this far
+        /// (Jaccard distance on the gene multiset) from the nearest blueprint the
+        /// run has ever made. `0` turns the gate off — one draw, the pre-gate path.
+        #[arg(long, value_name = "DELTA")]
+        pub novelty_min: Option<f32>,
+
+        /// Candidates ONE mutation may spend clearing `--novelty-min` before the most
+        /// novel refusal is taken anyway (a culled seat is never left empty).
+        #[arg(long, value_name = "N")]
+        pub novelty_draws: Option<usize>,
 
         /// Log level: `none`, `summ`, `minimal`, or `debug`/`trace` (which keep the
         /// `summ` shape and additionally let the engine's per-roll detail through).
@@ -140,11 +151,11 @@ mod cli {
         #[arg(long)]
         pub no_elite_save: bool,
 
-        /// Anti-devolution A: top-elite_count nets act-and-measure without
+        /// Anti-devolution A: top-champion_count nets act-and-measure without
         /// weight updates (default on). Pass --no-freeze-elites to let elites
         /// keep training.
         #[arg(long = "no-freeze-elites", action = clap::ArgAction::SetFalse)]
-        pub freeze_elites: bool,
+        pub freeze_seats: bool,
     }
 
     /// RL-only engine flags — the mode-specific twin of [`EngineArgs`]. No RL-only
@@ -200,8 +211,8 @@ mod cli {
             if let Some(steps) = self.max_steps {
                 b = b.set_stop_max_steps(steps);
             }
-            if let Some(k) = self.elite_count {
-                b = b.set_elite_count(k);
+            if let Some(k) = self.champion_count {
+                b = b.set_champion_count(k);
             }
             if let Some(n) = self.checkpoint_every {
                 b = b.set_run_checkpoint_every(n);
@@ -214,14 +225,20 @@ mod cli {
             }
             if let Some(dir) = &self.founders_from {
                 b = b
-                    .set_elite_previous_load(true)
-                    .set_elite_previous_dir(dir.clone());
+                    .set_champion_previous_load(true)
+                    .set_champion_previous_dir(dir.clone());
             }
             if let Some(p) = self.crossover_prob {
                 b = b.set_crossover_prob(p);
             }
             if let Some(p) = self.mutate_prob {
                 b = b.set_mutate_prob(p);
+            }
+            if let Some(d) = self.novelty_min {
+                b = b.set_mutation_novelty_min(d);
+            }
+            if let Some(n) = self.novelty_draws {
+                b = b.set_mutation_novelty_draws(n);
             }
             if let Some(n) = self.crossover_rolls {
                 b = b.set_crossover_rolls(n);
@@ -243,7 +260,7 @@ mod cli {
             if let Some(name) = &self.run_name {
                 b = b.set_run_name(name.clone());
             }
-            b = b.set_elite_freeze(self.freeze_elites);
+            b = b.set_seat_freeze(self.freeze_seats);
             if let Some(policy) = &self.crossover_cull_policy {
                 b = b.set_crossover_cull_policy(
                     match policy.trim().to_ascii_lowercase().as_str() {
@@ -276,7 +293,7 @@ mod cli {
             });
             }
             if self.no_elite_save {
-                b = b.set_elite_save_topology(false);
+                b = b.set_champion_save_topology(false);
             }
             b
         }
@@ -658,6 +675,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_mutation_cull_policy(MutationCullPolicy::Worst)
         .set_mutate_prob(0.5) // per-roll chance a random immigrant is inserted
         .set_mutation_probation_steps(5)
+        .set_mutation_novelty_min(0.2) // Δ ≥ 0.2 from the nearest blueprint; 0 = the gate off
+        .set_mutation_novelty_draws(5) // candidates one mutation may spend before taking the best
         // --- Challenge (anti-plateau): TRAINER-owned since 2026-10-10 —
         // `CHALLENGE_PROB` lives on the trainer and rolls inside `train_step`
         // via `gras::trainer::effective_challenge_prob`. No engine knob.
@@ -678,12 +697,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // .set_topology_feature_split(FEATURE_SPLIT)
         // --- Exports ---
         // --- Evolution: the elite/founder rules (mode-agnostic) ---
-        .set_elite_freeze(true)
-        .set_elite_count(pop / 10)
-        .set_elite_previous_load(true) // on by default
-        .set_elite_join_probation_steps(5)
-        .set_elite_crown_lifetime_steps(5)
-        .set_elite_save_topology(true);
+        .set_seat_freeze(true)
+        .set_champion_count(pop / 10)
+        .set_champion_previous_load(true) // on by default
+        .set_seat_join_probation_steps(5)
+        .set_seat_lifetime_steps(5)
+        .set_champion_save_topology(true);
     // Every CLI flag is an OVERLAY: a user-passed value wins, anything unset
     // keeps the const above. This is also where `--history-flush`, `--train-merit`
     // and `--founders-from` become engine config instead of being silently dropped.

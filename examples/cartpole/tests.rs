@@ -98,7 +98,8 @@ mod tests {
     /// the wiring is checkable without running a race.
     #[test]
     fn trainer_wiring_is_recorded_in_the_blob() {
-        let t = trainer(gras::auto_device());
+        // Memoryless: the knob is `--obs-memory`, and `none` is the engine as it was.
+        let t = trainer(gras::auto_device(), ObsMemory::None);
         let blob = t.describe().expect("Reinforce describes itself");
         assert_eq!(blob["trainer"], "reinforce");
         // `Signal` is a tagged enum, so the name lives one level down.

@@ -344,6 +344,18 @@ struct Cli {
     /// Mutation fire probability per roll (example default 0.5). `0` turns the channel off.
     #[arg(long, value_name = "P")]
     mutate_prob: Option<f32>,
+    /// Mutation NOVELTY floor Δ (`set_mutation_novelty_min`, example default 0.2): a random
+    /// immigrant must sit at least this far from the NEAREST blueprint the run has ever made
+    /// (founders, crossover children and earlier mutations alike), measured as Jaccard Δ on
+    /// the gene multiset — the same reading the diversity cards print. `0` turns the gate OFF:
+    /// one draw, the pre-gate behaviour, no archive walk.
+    #[arg(long, value_name = "DELTA")]
+    novelty_min: Option<f32>,
+    /// Candidates ONE mutation may spend clearing `--novelty-min` (`set_mutation_novelty_draws`,
+    /// example default 5). When the cap runs out the most novel REFUSAL is taken anyway, so a
+    /// culled seat is never left empty — the gate biases the draw, it never blocks a birth.
+    #[arg(long, value_name = "N")]
+    novelty_draws: Option<usize>,
     /// Crossover cull policy (`set_crossover_cull_policy`): `unfed` (default — evict the
     /// net the LOTTERY starves: lowest merit `P × Y`, the fitness ordering times the age
     /// leg, with the tilt ignored so an inverted run does not evict its champion),
@@ -391,11 +403,11 @@ struct Cli {
     /// re-rolled, so a good parent cannot pass its wiring down.
     #[arg(long, value_name = "P")]
     drift: Option<f32>,
-    /// Hold the top `elite_count` nets out of the weight update (the anti-devolution
+    /// Hold the top `champion_count` nets out of the weight update (the anti-devolution
     /// guard: they still act, score and sire). The example's default is OFF; the runs
     /// that reached 350+ turns had it ON.
     #[arg(long)]
-    freeze_elites: bool,
+    freeze_seats: bool,
     /// Where a NEW run writes (default: `results/<timestamp>`). Output only —
     /// continuing an existing run is `--resume`.
     #[arg(long, value_name = "DIR")]
@@ -477,6 +489,8 @@ fn main() {
         .set_mutate_rolls(2)
         .set_mutation_cull_policy(MutationCullPolicy::Unfed)
         .set_mutation_probation_steps(5)
+        .set_mutation_novelty_min(cli.novelty_min.unwrap_or(0.2))
+        .set_mutation_novelty_draws(cli.novelty_draws.unwrap_or(5))
         // TOPOLOGY
         .set_topology_drift(cli.drift.unwrap_or(0.1))
         .set_topology_min_hidden_num_nodes(2)
@@ -495,13 +509,13 @@ fn main() {
         // .set_topology_activation_pool(["ReLU", "Tanh", …]) // if not specified, use all
         // .set_topology_standardize_op_pool(["LayerNorm", …]) // if not specified, use all
         // ELITES
-        .set_elite_freeze(false) // frozen elites still score, rank and sire
-        .set_elite_count(pop / 10)
-        .set_elite_previous_load(true) // on by default
-        .set_elite_join_probation_steps(0) // age before a net may join the elite set (A/B re-checked 2026-10-26: 5 wins both fast seeds — see DONE.md)
-        .set_elite_crown_lifetime_steps(0) // how long the frozen crown may sit at peak
-        .set_elite_save_topology(true) // elite-<hash>.md at stop
-        // .set_elite_previous_dir("assets/1792211580845_2_*_500")
+        .set_seat_freeze(false) // frozen elites still score, rank and sire
+        .set_champion_count(pop / 10)
+        .set_champion_previous_load(true) // on by default
+        .set_seat_join_probation_steps(0) // age before a net may join the elite set (A/B re-checked 2026-10-26: 5 wins both fast seeds — see DONE.md)
+        .set_seat_lifetime_steps(0) // how long the frozen crown may sit at peak
+        .set_champion_save_topology(true) // elite-<hash>.md at stop
+        // .set_champion_previous_dir("assets/1792211580845_2_*_500")
         // The mins are `TopologyOptions::default`; the max_* twins above are raised by
         // this example, so the sampler still varies topology width.
         .build();
