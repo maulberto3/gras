@@ -102,7 +102,7 @@ pub struct ConfigSnapshot {
     /// `"arithmetic"` | `"signed_log"` | `"median"`).
     #[serde(default)]
     pub mean_type: String,
-    /// Whether the lottery's AGE leg is armed (`set_run_train_age`).
+    /// Whether the lottery's AGE leg is armed (`set_run_train_merit_age`).
     #[serde(
         default,
         alias = "train_merit_age_mix",
@@ -139,6 +139,11 @@ pub struct ConfigSnapshot {
     /// the tickets go bottom-up.
     #[serde(default)]
     pub train_merit_inverted: bool,
+    /// LEARN-ONLY lottery (`set_run_train_merit_learn_only`): `true` = a lost ticket costs the
+    /// weight update, not the clock (the net acts and is measured anyway). `default` = `false`,
+    /// which is exactly what every header written before the flag recorded.
+    #[serde(default)]
+    pub train_merit_learn_only: bool,
     /// Fitter parent as the crossover base (`set_crossover_fitter_base`): `true` (the default)
     /// orders both drawn parents best-first, so the child keeps the BETTER one's skeleton.
     #[serde(default)]
@@ -253,6 +258,7 @@ impl ConfigSnapshot {
             train_merit_p_min: cfg.train_merit_p_min,
             train_merit_p_max: cfg.train_merit_p_max,
             train_merit_inverted: cfg.train_merit_inverted,
+            train_merit_learn_only: cfg.train_merit_learn_only,
             train_age: cfg.train_age,
             crossover_fitter_base: cfg.crossover_fitter_base,
             legacy_train_lottery: None,
@@ -419,7 +425,8 @@ pub struct RunAccounting {
     pub uniform_cx_pairs: usize,
     /// Random immigrants inserted.
     pub immigrants: usize,
-    /// Culls by the slot they freed (`crossover` / `immigrant-slot`).
+    /// Culls by the slot they freed — `crossover` (any policy: `crossover-random`,
+    /// `crossover-unfed`, …) or `immigrant-slot`; the two parts sum to this total.
     pub culls: usize,
     /// Culls that freed a slot for a crossover child.
     pub culls_crossover: usize,
@@ -805,7 +812,8 @@ pub struct NetState {
     /// Step this net was culled (`None` while alive).
     #[serde(default)]
     pub culled_at_step: Option<usize>,
-    /// Why it left (`"crossover"` | `"immigrant-slot"`).
+    /// Why it left (`"crossover"` | `"crossover-random"` | `"crossover-unfed"` |
+    /// `"immigrant-slot"` — the crossover arm names the cull policy that chose it).
     #[serde(default)]
     pub cull_reason: Option<String>,
     /// Its window fitness MEAN at culling (or at stop for a live net — same three legs, same row
