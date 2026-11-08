@@ -87,7 +87,7 @@ impl CoreEngine {
             if elites.is_empty() {
                 String::new()
             } else {
-                let j = self.config.elite_crown_lifetime_steps;
+                let j = self.config.seat_lifetime_steps;
                 let names: Vec<String> = elites
                     .iter()
                     .map(|h| {
@@ -283,7 +283,7 @@ impl CoreEngine {
         // Anti-devolution row — only when a knob is on (zero noise by default):
         // elite set and/or the current demotion count.
         let mut guard_cells: Vec<String> = Vec::new();
-        if self.config.freeze_elites || self.config.elite_count > 0 {
+        if self.config.freeze_seats || self.config.champion_count > 0 {
             let elites = self.elite_hashes();
             let mut names: Vec<String> = elites
                 .iter()
@@ -293,7 +293,7 @@ impl CoreEngine {
             // An armed crown with no members (pop too small for a seat) must not print
             // a labelled empty row.
             if !names.is_empty() {
-                guard_cells.push(format!("elite: {}", names.join(" ")));
+                guard_cells.push(format!("champion: {}", names.join(" ")));
             }
         }
         if !guard_cells.is_empty() {
@@ -408,15 +408,15 @@ impl CoreEngine {
         if rows.is_empty() {
             return;
         }
-        let k = self.config.elite_count.max(1); // report at least the champion
+        let k = self.config.champion_count.max(1); // report at least the champion
         let top: Vec<(String, f32)> = self.champion_slice(&ranked);
         let mut marks: std::collections::HashMap<String, &'static str> =
             std::collections::HashMap::new();
         // ONE glyph answers "what did the run do with this net", and the crown is part
-        // answer: `★` = saved as an elite AND seated in the acting crown (it acted), `☆` = saved,
+        // answer: `★` = saved as a CHAMPION AND seated in the acting crown (it acted), `☆` = saved,
         let mut barred = 0usize;
         for (hash, _) in &top {
-            let seated = !self.config.freeze_elites || self.frozen_crown.contains(hash);
+            let seated = !self.config.freeze_seats || self.frozen_crown.contains(hash);
             if !seated {
                 barred += 1;
             }
@@ -473,8 +473,8 @@ impl CoreEngine {
             dealt_clock: plan.dealt_clock,
             crossover_probation: self.config.crossover_probation_steps,
             mutation_probation: self.config.mutation_probation_steps,
-            join_probation: self.config.elite_join_probation_steps,
-            crown_lifetime: self.config.elite_crown_lifetime_steps,
+            join_probation: self.config.seat_join_probation_steps,
+            crown_lifetime: self.config.seat_lifetime_steps,
         };
         // A column that is not printed has no legend row: an explanation for a cell the reader
         // cannot find is noise.
@@ -523,18 +523,18 @@ impl CoreEngine {
             ),
             &format!("{legend}\n{table}"),
             Some(&format!(
-                "Δcrown = mean multiset-Jaccard distance to the {} reported champion(s): 0.00 = structurally identical to one of them, 1.00 = shares no gene with any · Δpop = mean distance to every other live net: 0.00 = a clone of the crowd, 1.00 = unlike everything alive · read the two AGAINST the baseline: Δcrown ≈ Δpop means the elite is structurally ordinary (selection is ranking numbers, not designs), Δcrown below it means the elite is a structural cluster · {} · {baseline} · crown {}/{} seats · {} eligible · {} gated (join window or cull shield, {} clocks) · {} age-blocked ({} clocks) · stopped at clock {clock} · run seed {run_seed} (`--seed {run_seed}` replays this run bit-for-bit) · the same table is written to `final-field.csv` ({} row(s) under this header) · {exam_note}",
+                "Δcrown = mean multiset-Jaccard distance to the {} reported champion(s): 0.00 = structurally identical to one of them, 1.00 = shares no gene with any · Δpop = mean distance to every other live net: 0.00 = a clone of the crowd, 1.00 = unlike everything alive · read the two AGAINST the baseline: Δcrown ≈ Δpop means the champion is structurally ordinary (selection is ranking numbers, not designs), Δcrown below it means the champions are a structural cluster · {} · {baseline} · crown {}/{} seats · {} eligible · {} gated (join window or cull shield, {} clocks) · {} age-blocked ({} clocks) · stopped at clock {clock} · run seed {run_seed} (`--seed {run_seed}` replays this run bit-for-bit) · the same table is written to `final-field.csv` ({} row(s) under this header) · {exam_note}",
                 plan.crown.len(),
                 stats.line(),
                 self.frozen_crown.len(),
                 self.config
-                    .elite_count
+                    .champion_count
                     .min(self.state.live_count().saturating_sub(1)),
                 eligible,
                 probation,
-                self.config.elite_join_probation_steps,
+                self.config.seat_join_probation_steps,
                 age_blocked,
-                self.config.elite_crown_lifetime_steps,
+                self.config.seat_lifetime_steps,
                 grid.len(),
             )),
         );
@@ -729,9 +729,9 @@ impl CoreEngine {
         let shielded = self.on_probation(row.hash, row.plan.dealt_clock);
         let gate_born = if shielded { "b" } else { "" };
         let mut gate_seat = String::new();
-        if self.config.freeze_elites {
-            let join_k = self.config.elite_join_probation_steps;
-            let term_j = self.config.elite_crown_lifetime_steps;
+        if self.config.freeze_seats {
+            let join_k = self.config.seat_join_probation_steps;
+            let term_j = self.config.seat_lifetime_steps;
             if let Some(s) = state {
                 // `j` is suppressed while the born shield is on: the two windows run on the same
                 // clock, so `bj` was two letters for one bar — and it read as "born AND already
@@ -1326,7 +1326,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         ),
         (
             "hash".to_string(),
-            "the first 8 hex of the blueprint's xxh3 — the net's identity in `nets/<hash>.json`, `elites.json` and this table"
+            "the first 8 hex of the blueprint's xxh3 — the net's identity in `nets/<hash>.json`, `champions.json` and this table"
                 .to_string(),
         ),
         // ── what this net IS ────────────────────────────────────────────
@@ -1504,7 +1504,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         (
             "mark".to_string(),
             format!(
-                "the verdict glyph, INLINE in the console card — `★` saved as elite (top-{} by `fit (F)`) and holding a crown seat · `☆` saved as elite but barred from the seat (the `j` or `t` beside it names the gate) · `·` neither; with the crown off nobody sits, so every saved elite reads `★`. It sits inside the column that decided it (`★`/`☆`/`j`/`t` on `fit (F)`, `b` on `age (A)`); `final-field.csv` carries no mark cell, its columns stay plain values",
+                "the verdict glyph, INLINE in the console card — `★` saved as CHAMPION (top-{} by `fit (F)`) and holding a crown SEAT · `☆` saved as champion but barred from the seat (the `j` or `t` beside it names the gate) · `·` neither; with the seats off nobody sits, so every champion reads `★`. Champion and seat are different questions: the first is the saved, inheritable ranking, the second the frozen act-only switch. It sits inside the column that decided it (`★`/`☆`/`j`/`t` on `fit (F)`, `b` on `age (A)`); `final-field.csv` carries no mark cell, its columns stay plain values",
                 ctx.k
             ),
         ),
@@ -1527,7 +1527,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         // the whole band: its cells are as dynamic as the caller's `set_run_metrics(...)` list,
         (
             "m:<name>".to_string(),
-            "an informative METRIC you registered with `set_run_metrics` — `m:` marks it as measured but NEVER ranked: computed on the same eval batch as `fit (F)`, recorded in `history.csv`, and read by no ranking, elite seat, lottery draw or cull. `<name>` is the label you gave `Metric::custom(...)`, verbatim, and the columns are appended after `exam (X)` in config order"
+            "an informative METRIC you registered with `set_run_metrics` — `m:` marks it as measured but NEVER ranked: computed on the same eval batch as `fit (F)`, recorded in `history.csv`, and read by no ranking, champion, seat, lottery draw or cull. `<name>` is the label you gave `Metric::custom(...)`, verbatim, and the columns are appended after `exam (X)` in config order"
                 .to_string(),
         ),
     ];

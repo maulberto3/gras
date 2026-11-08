@@ -4,7 +4,7 @@
 use super::*;
 
 impl CoreEngine {
-    /// The `## Ancestry` section of ONE elite's markdown file (`elite-<hash>.md`): the same
+    /// The `## Ancestry` section of ONE champion's markdown file (`champion-<hash>.md`): the same
     /// recorded lineage the stop card draws, as a mermaid `graph TB` a doc viewer renders.
     pub(crate) fn lineage_markdown(&self, root: &str, root_role: &str) -> String {
         let mut tree = LineageTree::new(self);
@@ -38,7 +38,7 @@ struct LineagePaint {
     width: &'static str,
 }
 
-/// The net the file is about (`elite-<hash>.md`).
+/// The net the file is about (`champion-<hash>.md`).
 const FOCUS: LineagePaint = LineagePaint {
     fill: "#fff3cf",
     stroke: "#8a5a00",
@@ -109,7 +109,7 @@ pub(super) fn mermaid_node_label(
     if let Some(fit) = facts.fit {
         parts.push(format!("fit {}", fmt_cell(fit)));
     }
-    // The root says what the FILE says it is (`ELITE` in `elite-<hash>.md`) — one
+    // The root says what the FILE says it is (`CHAMPION` in `champion-<hash>.md`) — one
     // renderer, so the role stays the caller's.
     if let Some(role) = root_role {
         parts.push(role.to_string());
