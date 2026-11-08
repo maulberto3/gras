@@ -58,6 +58,88 @@ pub(crate) struct StepEvolve {
     pub mutate_fired: usize,
 }
 
+/// What the mutation gate bought at every birth: how DIFFERENT each immigrant was from every
+/// blueprint the run had already archived, and how many candidates the draw had to spend to get
+/// there. In memory only — `attempts.csv` keeps the per-row ledger, this is the tally the stop
+/// card reads, so a run can say "Δ 0.46 per birth, 1.3 of 5 candidates" without parsing a CSV.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BirthLedger {
+    /// Immigrants the mutation channel admitted.
+    pub births: usize,
+    /// Candidates spent across those births.
+    pub draws: usize,
+    /// Births whose FIRST candidate was refused, so another had to be drawn.
+    pub redrawn: usize,
+    /// Most candidates any single birth spent.
+    pub draws_max: usize,
+    /// Sum of Δ-to-nearest-archive over the births that carried a reading.
+    pub delta_sum: f64,
+    /// Births that carried a Δ reading (the gate was on and the blueprint parsed).
+    pub delta_births: usize,
+    /// Smallest Δ of any admitted immigrant.
+    pub delta_min: Option<f32>,
+    /// Crossover rolls discarded because the child duplicated a live topology.
+    pub duplicates: usize,
+}
+
+impl BirthLedger {
+    /// One admitted immigrant: the gate's reading (`None` when it was never judged) and the
+    /// candidates that draw spent. A refused candidate is not a birth — it is a draw.
+    pub(crate) fn record_draw(&mut self, delta: Option<f32>, draws: usize) {
+        self.births += 1;
+        self.draws += draws;
+        self.draws_max = self.draws_max.max(draws);
+        if draws > 1 {
+            self.redrawn += 1;
+        }
+        if let Some(d) = delta {
+            self.delta_sum += d as f64;
+            self.delta_births += 1;
+            self.delta_min = Some(self.delta_min.map_or(d, |m| m.min(d)));
+        }
+    }
+
+    /// Δ per birth — the gate's headline. `None` until a judged birth lands.
+    pub(crate) fn mean_delta(&self) -> Option<f32> {
+        (self.delta_births > 0).then(|| (self.delta_sum / self.delta_births as f64) as f32)
+    }
+
+    /// Candidates per birth (`0.0` when nothing was born; `1.0` means the first draw always won).
+    pub(crate) fn draws_per_birth(&self) -> f32 {
+        if self.births == 0 {
+            0.0
+        } else {
+            self.draws as f32 / self.births as f32
+        }
+    }
+}
+
+#[cfg(test)]
+mod birth_ledger_tests {
+    use super::BirthLedger;
+
+    #[test]
+    fn the_ledger_tallies_candidates_and_delta() {
+        let mut b = BirthLedger::default();
+        assert_eq!(b.mean_delta(), None, "nothing judged ⇒ no headline");
+        assert_eq!(b.draws_per_birth(), 0.0, "nothing born ⇒ no rate");
+        b.record_draw(Some(0.6), 1); // the first candidate cleared the floor
+        b.record_draw(Some(0.3), 3); // two refusals, then admitted
+        b.record_draw(None, 1); // gate off: a birth with no reading
+        assert_eq!((b.births, b.draws, b.draws_max), (3, 5, 3));
+        assert_eq!(
+            b.redrawn, 1,
+            "only the draw that spent more than one candidate"
+        );
+        assert!(
+            (b.mean_delta().unwrap() - 0.45).abs() < 1e-6,
+            "mean over JUDGED births only"
+        );
+        assert_eq!(b.delta_min, Some(0.3));
+        assert!((b.draws_per_birth() - 5.0 / 3.0).abs() < 1e-6);
+    }
+}
+
 /// A do-nothing optimizer — the freeze pass runs the net's normal trainer step
 /// through this: gradients compute, nothing applies, the real optimizer is untouched.
 pub(crate) struct NoopOptimizer;

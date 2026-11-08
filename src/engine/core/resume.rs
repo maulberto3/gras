@@ -69,7 +69,7 @@ impl CoreEngine {
             "train_age",
             if recorded.train_age { "armed" } else { "off" }.to_string(),
             if current.train_age { "armed" } else { "off" }.to_string(),
-            format!("set_run_train_age({})", recorded.train_age),
+            format!("set_run_train_merit_age({})", recorded.train_age),
         );
         // `""` = a header written before the knob drew roulette, the default.
         let rec_selection = if recorded.crossover_selection.is_empty() {
@@ -116,6 +116,18 @@ impl CoreEngine {
             format!(
                 "set_run_train_merit_inverted({})",
                 recorded.train_merit_inverted
+            ),
+        );
+        // The coin's CONSEQUENCE: the same draw writes a different ledger (idle clocks vs act-only
+        // spans) and a different fitness series, so a resume under the other value is not the same
+        // run. Recorded default `false` = the pre-flag contract, so an old header compares equal.
+        push(
+            "train_merit_learn_only",
+            recorded.train_merit_learn_only.to_string(),
+            current.train_merit_learn_only.to_string(),
+            format!(
+                "set_run_train_merit_learn_only({})",
+                recorded.train_merit_learn_only
             ),
         );
         // Crossover's base choice decides WHICH child a roll yields (same draw, different

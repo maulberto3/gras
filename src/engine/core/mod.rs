@@ -125,6 +125,9 @@ pub struct CoreEngine {
     pub(crate) attempts_csv_buffer: String,
     /// Append-only novelty archive: every blueprint this run made, judged by mutation draws.
     pub(crate) novelty: crate::engine::novelty::Novelty,
+    /// What that gate bought at each birth — Δ to the nearest archive, candidates spent
+    /// (see [`BirthLedger`]). In memory; the stop card renders it, `attempts.csv` keeps rows.
+    pub(crate) births: BirthLedger,
 }
 
 /// The inputs a constructor actually CHOOSES.
@@ -191,6 +194,7 @@ impl CoreEngine {
             history_csv_buffer: String::new(),
             attempts_csv_buffer: String::new(),
             novelty,
+            births: BirthLedger::default(),
         }
     }
 }
@@ -567,6 +571,7 @@ impl CoreEngine {
             history_csv_buffer: String::new(),
             attempts_csv_buffer: String::new(),
             novelty,
+            births: BirthLedger::default(),
             networks: HashMap::new(),
             optimizers: HashMap::new(),
             rolling_fitness: HashMap::new(),
@@ -856,6 +861,10 @@ impl CoreEngine {
                 (
                     "freeze_seats".to_string(),
                     self.config.freeze_seats.to_string(),
+                ),
+                (
+                    "train_merit_learn_only".to_string(),
+                    self.config.train_merit_learn_only.to_string(),
                 ),
                 (
                     "train_merit (Ω)".to_string(),
@@ -1442,10 +1451,17 @@ impl CoreEngine {
                     }
                 }
             }
-            let idle_before: Vec<usize> = if lottery_line_on {
+            // BOTH ledgers, snapshotted before the loop: the idle one answers "who got no
+            // ticket" under the default contract, the act-only one under learn-only.
+            let ledger_before: Vec<(usize, usize)> = if lottery_line_on {
                 hashes
                     .iter()
-                    .map(|h| self.state.net(h).map(|s| s.idle_clocks()).unwrap_or(0))
+                    .map(|h| {
+                        self.state
+                            .net(h)
+                            .map(|s| (s.idle_clocks(), s.frozen_clocks()))
+                            .unwrap_or((0, 0))
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -1488,7 +1504,7 @@ impl CoreEngine {
 
             // One line per GROUP step, printed LAST so it lands at the bottom of the terminal; what
             // each field means is documented once on `step_rollup_line`.
-            let (trained, withheld) = self.lottery_clock_report(&hashes, &idle_before);
+            let (trained, withheld) = self.lottery_clock_report(&hashes, &ledger_before);
             let lottery_skips = withheld.len();
 
             if rollup_on {
@@ -1511,7 +1527,11 @@ impl CoreEngine {
                         tracing::debug!(
                             "step {} │ lottery │ {}",
                             clock,
-                            lottery_who_line(&trained, &withheld)
+                            lottery_who_line(
+                                &trained,
+                                &withheld,
+                                self.config.train_merit_learn_only,
+                            )
                         );
                     }
                 }
@@ -1560,6 +1580,9 @@ impl CoreEngine {
             // Same cadence, same reason: the mixing rate is a slow reading, and it sits
             // above the rollup so the clock still ends on its summary line.
             self.log_crossover_mix(clock);
+            // Same cadence: how different the DRAW's children turned out to be, and what the
+            // novelty floor cost them — the number the mutation channel is judged by.
+            self.log_birth_draws(clock);
             if self.log_level != crate::engine::config::LogLevel::None {
                 self.log_step_rollup(clock);
             }
@@ -1684,8 +1707,12 @@ pub(crate) struct StepVitals {
     pub frozen: usize,
     /// Nets that WOULD have updated without the lottery (`group - crown`).
     pub would_train: usize,
-    /// Updates the training lottery withheld this clock (0 when it is off).
+    /// Updates the training lottery withheld this clock (0 when it is off). Under
+    /// `train_merit_learn_only` these nets ACTED — the count is act-only clocks, not idle ones.
     pub lottery_skips: usize,
+    /// Whether a lost ticket cost only the update (`train_merit_learn_only`), which is what the
+    /// line's `act-only` wording and its arithmetic key off.
+    pub learn_only: bool,
     /// Nets that entered the pool this clock; they train from the NEXT clock.
     pub newborn: usize,
     /// Nets that served the join window and are not age-blocked: seat-eligible.
@@ -1708,7 +1735,9 @@ pub(crate) struct StepVitals {
 
 /// WHO the ticket lottery graded this clock, in one compact line: both counts are always stated,
 /// and the SMALLER side is listed in full (capped at [`LOTTERY_LIST_MAX`]) so the other side
-fn lottery_who_line(trained: &[String], withheld: &[String]) -> String {
+fn lottery_who_line(trained: &[String], withheld: &[String], act_only: bool) -> String {
+    // The same count under two contracts: idled (nothing ran) or act-only (ran, never learned).
+    let lost = if act_only { "acted-only" } else { "idled" };
     /// Hashes listed before the `+N` tail.
     const LOTTERY_LIST_MAX: usize = 12;
     let list = |v: &[String]| {
@@ -1725,23 +1754,25 @@ fn lottery_who_line(trained: &[String], withheld: &[String]) -> String {
     };
     if withheld.len() <= trained.len() {
         format!(
-            "{} trained · {} idled: {}",
+            "{} trained · {} {}: {}",
             trained.len(),
             withheld.len(),
+            lost,
             list(withheld)
         )
     } else {
         format!(
-            "{} trained: {} · {} idled",
+            "{} trained: {} · {} {}",
             trained.len(),
             list(trained),
-            withheld.len()
+            withheld.len(),
+            lost
         )
     }
 }
 
 /// The per-step participation line, every composite printed with the arithmetic that produced
-/// `ran A of L = T ticketed + C crown`, `held back H = …`, `L = A + H`, the seat gate
+/// `ran A of L = T ticketed + D act-only + C crown`, `held back H = …`, `L = A + H`, the seat gate
 fn step_rollup_line(v: &StepVitals) -> String {
     let mut parts = Vec::new();
     // `ticketed` and `updating` are the same number: the nets that got a real
@@ -1751,28 +1782,37 @@ fn step_rollup_line(v: &StepVitals) -> String {
     } else {
         "updating"
     };
+    // Under learn-only the denied nets RAN (act + measure, no update), so the head must name
+    // them or `ran` would not add up against `live`.
+    let acted_only = if v.learn_only { v.lottery_skips } else { 0 };
+    let act_term = if acted_only > 0 {
+        format!(" + {acted_only} act-only")
+    } else {
+        String::new()
+    };
     let head = if v.frozen > 0 {
         format!(
-            "ran {} of {} = {} {} + {} crown",
-            v.stepped, v.live, v.trained, update_word, v.frozen
+            "ran {} of {} = {} {}{} + {} crown",
+            v.stepped, v.live, v.trained, update_word, act_term, v.frozen
         )
     } else {
         format!(
-            "ran {} of {} = {} {}",
-            v.stepped, v.live, v.trained, update_word
+            "ran {} of {} = {} {}{}",
+            v.stepped, v.live, v.trained, update_word, act_term
         )
     };
     parts.push(head);
-    // Nets that did not RUN at all: the lottery's idle clocks and the newborns
-    // sitting their birth clock out. The crown is absent by construction (it acted).
+    // Nets that did not RUN at all: the idled (default contract) and the newborns sitting their
+    // birth clock out. Under learn-only the denied nets acted, so they are not held back.
+    let idled = if v.learn_only { 0 } else { v.lottery_skips };
     let mut not_run = Vec::new();
-    if v.lottery_skips > 0 {
-        not_run.push(format!("{} idled (no train, no eval)", v.lottery_skips));
+    if idled > 0 {
+        not_run.push(format!("{idled} idled (no train, no eval)"));
     }
     if v.newborn > 0 {
         not_run.push(format!("{} newborn (first step next clock)", v.newborn));
     }
-    let held = v.lottery_skips + v.newborn;
+    let held = idled + v.newborn;
     if !not_run.is_empty() {
         parts.push(format!("held back {} = {}", held, not_run.join(" + ")));
     }
@@ -1801,10 +1841,17 @@ fn step_rollup_line(v: &StepVitals) -> String {
     if v.lottery_skips > 0 {
         // The lottery's budget, in its own units: the ticketed plus the idled
         // exactly the nets that would have trained without
-        parts.push(format!(
-            "would-train {} = {} ticketed + {} idled",
-            v.would_train, v.trained, v.lottery_skips
-        ));
+        if v.learn_only {
+            parts.push(format!(
+                "would-train {} = {} ticketed + {} act-only (no weight update)",
+                v.would_train, v.trained, v.lottery_skips
+            ));
+        } else {
+            parts.push(format!(
+                "would-train {} = {} ticketed + {} idled",
+                v.would_train, v.trained, v.lottery_skips
+            ));
+        }
     }
     parts.join(" │ ")
 }

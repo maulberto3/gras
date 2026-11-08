@@ -349,21 +349,33 @@ impl CoreEngine {
         armed && self.log_level == crate::engine::config::LogLevel::Summ
     }
 
-    /// Split one clock's nets into `(trained, idled)` from the IDLE-ledger snapshot taken BEFORE
-    /// the clock ran: a net whose `idle_clocks` grew got no ticket, everyone else in the group ran
+    /// Split one clock's nets into `(trained, withheld)` from the LEDGER snapshot taken BEFORE the
+    /// clock ran: a net whose idle clocks grew got no ticket, and under `train_merit_learn_only`
+    /// so did a net whose ACT-ONLY clocks grew (it ran and was measured, it just never learned).
+    /// Everyone else in the group updated its weights.
     pub(crate) fn lottery_clock_report(
         &self,
         group: &[String],
-        idle_before: &[usize],
+        ledger_before: &[(usize, usize)],
     ) -> (Vec<String>, Vec<String>) {
         let mut trained: Vec<String> = Vec::new();
         let mut withheld: Vec<String> = Vec::new();
         for (i, h) in group.iter().enumerate() {
-            let Some(&before) = idle_before.get(i) else {
+            // `(idle_clocks, frozen_clocks)` as they stood BEFORE this clock's group loop.
+            let Some(&(idle_before, frozen_before)) = ledger_before.get(i) else {
                 continue;
             };
-            let now = self.state.net(h).map(|s| s.idle_clocks()).unwrap_or(0);
-            if now > before {
+            let Some(state) = self.state.net(h) else {
+                continue;
+            };
+            // TWO ledgers answer "did the coin withhold this clock": the idle one under the
+            // default contract (nothing ran), and the act-only one under learn-only (the net ran
+            // and was measured, so only `frozen_spans` grew). A crown seat holds neither.
+            let denied = state.idle_clocks() > idle_before
+                || (self.config.train_merit_learn_only
+                    && !self.frozen_crown.contains(h)
+                    && state.frozen_clocks() > frozen_before);
+            if denied {
                 withheld.push(h[..8.min(h.len())].to_string());
             } else if !self.frozen_crown.contains(h) {
                 trained.push(h[..8.min(h.len())].to_string());
@@ -390,10 +402,15 @@ impl CoreEngine {
         let would_train = group.len().saturating_sub(frozen);
         let (eligible, probation, age_blocked) = self.elite_gate_counts(clock);
         StepVitals {
-            // An idle net did not step at all (no train, no eval): `stepped` counts
-            // updaters plus the crown's act-and-measure passes
-            stepped: group.len().saturating_sub(lottery_skips),
+            // Under learn-only a denied net still RUNS (act + measure, no update), so `stepped`
+            // only loses the denied clocks that actually idled; the crown is always in it.
+            stepped: if self.config.train_merit_learn_only {
+                group.len()
+            } else {
+                group.len().saturating_sub(lottery_skips)
+            },
             trained: would_train.saturating_sub(lottery_skips),
+            learn_only: self.config.train_merit_learn_only,
             live,
             frozen,
             would_train,

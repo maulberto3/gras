@@ -3992,7 +3992,7 @@ fn lottery_clock_report_splits_by_idle_delta_and_excludes_the_crown() {
     assert!(t.is_empty() && w.is_empty());
     // hashes[1] had already idled twice; this clock it idles again and hashes[2]
     // idles for the first time. hashes[0] trains.
-    let before = [0usize, 2, 1];
+    let before = [(0usize, 0usize), (2, 0), (1, 0)];
     eng.state.net_mut(&hashes[1]).unwrap().record_idle_step(0);
     eng.state.net_mut(&hashes[1]).unwrap().record_idle_step(1);
     eng.state.net_mut(&hashes[2]).unwrap().record_idle_step(0);
@@ -5300,6 +5300,142 @@ fn crossover_probation_shields_crossover_children_with_its_own_window() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+/// A two-net fixture whose coin can NEVER be won: `p_min = p_max = 0` collapses BOTH ends of the
+/// Ω band to `0`, so `p_eff = 0` and every draw is lost. Both founders are out of their born
+/// shield (the probation windows are 0) and carry a reading, so the lottery is armed.
+fn zero_ticket_engine(dir: &std::path::Path, learn_only: bool) -> crate::TabularEngine {
+    let mut eng = engine(dir, 31).unwrap();
+    eng.config.train_merit = 1.0;
+    eng.config.train_merit_p_min = 0.0;
+    eng.config.train_merit_p_max = 0.0;
+    eng.config.train_merit_learn_only = learn_only;
+    eng.config.mutation_probation_steps = 0;
+    eng.config.crossover_probation_steps = 0;
+    eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+        .unwrap();
+    for h in eng.state.live_hashes() {
+        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        buf.push(100.0);
+        *eng.rolling_fitness.get_mut(&h).unwrap() = buf;
+        eng.state.net_mut(&h).unwrap().step = 1;
+    }
+    eng
+}
+
+/// LEARN-ONLY: the lost ticket costs the UPDATE, not the STEP — the net runs its real trainer
+/// through the no-op optimizer, so it acts, is measured on a fresh batch, and its reading moves;
+/// only the weight write (and the update counter) is lost.
+#[test]
+fn learn_only_turns_a_lost_ticket_into_an_act_only_pass() {
+    let dir = std::env::temp_dir().join("gras-learn-only-on");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = zero_ticket_engine(&dir, true);
+    let hashes = eng.state.live_hashes();
+    let frame = eng.lottery_frame(6).expect("armed");
+    assert_eq!(
+        eng.train_lottery_p_eff(&hashes[0], 6, Some(frame)),
+        0.0,
+        "the coin is pinned to a certain loss"
+    );
+    eng.step_one_net_in_frame(&hashes[0], 6, Some(frame), false)
+        .expect("act-only step");
+    let state = eng.state.net(&hashes[0]).unwrap();
+    assert_eq!(state.step, 1, "a lost ticket buys no weight update");
+    let metrics = state.last_metrics.as_ref().expect("the net acted anyway");
+    assert_eq!(metrics.step, 6, "and was measured on this clock");
+    assert!(metrics.frozen, "the pass is act-only");
+    assert_eq!(
+        state.frozen_clocks(),
+        1,
+        "the clock lands in the act-only ledger"
+    );
+    assert_eq!(state.idle_clocks(), 0, "nothing idled");
+    assert_eq!(state.measured_clocks(), 2, "M = one update + this act");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The default contract is untouched: with the flag off the same pinned coin still IDLES the net —
+/// no trainer call, no metric row, no reading.
+#[test]
+fn learn_only_off_keeps_the_idle_path() {
+    let dir = std::env::temp_dir().join("gras-learn-only-off");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = zero_ticket_engine(&dir, false);
+    let hashes = eng.state.live_hashes();
+    let frame = eng.lottery_frame(6).expect("armed");
+    eng.step_one_net_in_frame(&hashes[0], 6, Some(frame), false)
+        .expect("idle step");
+    let state = eng.state.net(&hashes[0]).unwrap();
+    assert_eq!(state.step, 1, "idle does not advance the training clock");
+    assert!(state.last_metrics.is_none(), "idle records no metric row");
+    assert_eq!(state.idle_clocks(), 1, "the clock lands in the idle ledger");
+    assert_eq!(state.frozen_clocks(), 0, "nothing acted");
+    assert_eq!(state.measured_clocks(), 1, "M did not move");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The rollup must stay an identity under learn-only: the denied nets RAN, so they are named in
+/// the head and are not held back — only the newborns are.
+#[test]
+fn learn_only_rollup_names_the_act_only_nets() {
+    let line = step_rollup_line(&StepVitals {
+        stepped: 10,
+        trained: 6,
+        live: 12,
+        frozen: 1,
+        would_train: 9,
+        lottery_skips: 3,
+        learn_only: true,
+        newborn: 2,
+        eligible: 7,
+        probation: 3,
+        age_blocked: 0,
+        seats_held: 1,
+        seats_capacity: 1,
+        join_k: 5,
+        lifetime_j: 5,
+        crown_armed: true,
+    });
+    assert!(
+        line.contains("ran 10 of 12 = 6 ticketed + 3 act-only + 1 crown"),
+        "{line}"
+    );
+    assert!(
+        line.contains("held back 2 = 2 newborn"),
+        "the coin held nothing back: {line}"
+    );
+    assert!(!line.contains("idled"), "{line}");
+    assert!(
+        line.contains("would-train 9 = 6 ticketed + 3 act-only"),
+        "{line}"
+    );
+    assert!(line.contains("12 = 10 + 2"), "{line}");
+}
+
+/// The flag round-trips through `engine.json`, and a header written BEFORE it existed reads back
+/// `false` — the idle contract those runs actually used.
+#[test]
+fn learn_only_round_trips_and_legacy_headers_mean_off() {
+    let mut cfg = RaceConfig::defaults();
+    cfg.train_merit_learn_only = true;
+    let snap = ConfigSnapshot::from_config(&cfg, None, None);
+    let json = serde_json::to_string(&snap).unwrap();
+    let back: ConfigSnapshot = serde_json::from_str(&json).unwrap();
+    assert!(back.train_merit_learn_only, "the flag survives the header");
+
+    let mut obj = serde_json::from_str::<serde_json::Value>(&json)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+    obj.remove("train_merit_learn_only");
+    let old: ConfigSnapshot = serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+    assert!(
+        !old.train_merit_learn_only,
+        "a pre-flag header means the idle contract"
+    );
+}
+
 /// The lottery's DEBUG who-line: both counts always stated, and the side the reader needs
 /// smaller one) listed in full — the other is its complement.
 #[test]
@@ -5307,18 +5443,18 @@ fn lottery_who_line_names_the_smaller_side_and_caps_the_list() {
     let owned = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     // Few trained, many idled → name the trained ones.
     assert_eq!(
-        lottery_who_line(&owned(&["a", "b"]), &owned(&["c", "d", "e"])),
+        lottery_who_line(&owned(&["a", "b"]), &owned(&["c", "d", "e"]), false),
         "2 trained: a b · 3 idled"
     );
     // Few idled → name those instead.
     assert_eq!(
-        lottery_who_line(&owned(&["a", "b", "c", "d", "e"]), &owned(&["z"])),
+        lottery_who_line(&owned(&["a", "b", "c", "d", "e"]), &owned(&["z"]), false),
         "5 trained · 1 idled: z"
     );
     // Long lists are capped with a `+N` tail on the named side
     let trained: Vec<String> = (0..13).map(|i| format!("t{i}")).collect();
     let withheld: Vec<String> = (0..20).map(|i| format!("w{i}")).collect();
-    let line = lottery_who_line(&trained, &withheld);
+    let line = lottery_who_line(&trained, &withheld, false);
     assert!(line.starts_with("13 trained: t0 t1 "), "{line}");
     assert!(line.ends_with(" +1 · 20 idled"), "{line}");
 }
@@ -5338,6 +5474,7 @@ fn step_rollup_line_accounts_for_every_live_net() {
             trained: s[0].saturating_sub(s[2]),
             would_train: s[0].saturating_sub(s[2]),
             lottery_skips: 0,
+            learn_only: false,
             newborn: s[3],
             eligible: s[4],
             probation: s[5],
@@ -5392,6 +5529,7 @@ fn step_rollup_line_accounts_for_every_live_net() {
         frozen: 1,
         would_train: 9,
         lottery_skips: 4,
+        learn_only: false,
         newborn: 0,
         eligible: 9,
         probation: 1,
@@ -5435,6 +5573,7 @@ fn step_rollup_line_accounts_for_every_live_net() {
         frozen: 0,
         would_train: 20,
         lottery_skips: 0,
+        learn_only: false,
         newborn: 4,
         eligible: 24,
         probation: 0,
