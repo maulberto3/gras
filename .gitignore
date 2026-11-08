@@ -40,6 +40,9 @@ proptest-regressions/
 # holds the explainers, design plans and measurements, indexed by
 # `notes/README.md`. Ignore rules never affect an already-tracked file.
 /notes/
+
+# Comment-sweep backups: a local before-picture, never source (once tracked, ignore
+# rules do not untrack it — that takes `git rm --cached`).
 AGENTS.md
 ARCHITECTURE.md
 CONVENTIONS.md
