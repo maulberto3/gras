@@ -163,7 +163,9 @@ impl CoreEngine {
         // The window's other two legs (`fitness` above stays the RAW per-step value):
         // the risk-adjusted score the net ranked by, and its spread `σ`.
         history_header.push_str(",fitness_smooth,fitness_smooth_std");
-        let attempts_header = "step,branch,attempt,outcome,child_hash,child_net_seed,child_origin,child_fitness,victim,victim_net_seed,pop_size";
+        // The last three are the mutation novelty gate's reading: Δ, candidates spent, floor.
+        // Appended, never inserted, so every existing column keeps its position.
+        let attempts_header = "step,branch,attempt,outcome,child_hash,child_net_seed,child_origin,child_fitness,victim,victim_net_seed,pop_size,novelty_delta,novelty_draws,novelty_min";
         let history_body = std::mem::take(&mut self.history_csv_buffer);
         let attempts_body = std::mem::take(&mut self.attempts_csv_buffer);
         self.append_csv_file("history.csv", &history_header, &history_body)?;

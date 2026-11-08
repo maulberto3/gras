@@ -91,7 +91,7 @@ impl CoreEngine {
         self.ranked_live_impl(false)
     }
 
-    /// The elite set: the top `config.elite_count` live nets by smoothed fitness
+    /// The elite set: the top `config.champion_count` live nets by smoothed fitness
     /// pass the gate (probation `≥ k`, seat age `< j`); any seat exit resets probation.
     pub(crate) fn elite_hashes(&self) -> Vec<String> {
         self.elite_hashes_from(&self.ranked_live())
@@ -101,13 +101,13 @@ impl CoreEngine {
     pub(crate) fn elite_hashes_from(&self, ranked: &[(String, f32)]) -> Vec<String> {
         let k = self
             .config
-            .elite_count
+            .champion_count
             .min(self.state.live_count().saturating_sub(1));
         if k == 0 {
             return Vec::new();
         }
-        let probation = self.config.elite_join_probation_steps;
-        let lifetime = self.config.elite_crown_lifetime_steps;
+        let probation = self.config.seat_join_probation_steps;
+        let lifetime = self.config.seat_lifetime_steps;
         // The REGULAR shield is a precondition, checked first: a net may not be elite
         // before it could be culled (same born-based channel window).
         let clock = self.step_clock();
@@ -131,7 +131,7 @@ impl CoreEngine {
     /// KISS crown refresh (the FREEZE-ELITES model, in one place): the crown
     /// elite take(k) set, recomputed each step; the diff prints one line per transition.
     pub(crate) fn refresh_crown(&mut self, clock: usize) {
-        let enabled = self.config.freeze_elites;
+        let enabled = self.config.freeze_seats;
         // ONE ranking for the whole deal.
         let ranked = self.ranked_live();
         let positions: std::collections::HashMap<&str, usize> = ranked
@@ -167,7 +167,7 @@ impl CoreEngine {
             )
         });
         // 3.
-        let lifetime = self.config.elite_crown_lifetime_steps;
+        let lifetime = self.config.seat_lifetime_steps;
         let mut exit_info: std::collections::HashMap<String, (usize, &'static str)> =
             std::collections::HashMap::new();
         for h in &leaving {
@@ -194,7 +194,7 @@ impl CoreEngine {
         let seat = self.frozen_crown.len();
         let capacity = self
             .config
-            .elite_count
+            .champion_count
             .min(self.state.live_count().saturating_sub(1));
         // ELITE RANK: the crown ordered by score, 1 = the best SEATED net.
         let mut crown_order: Vec<&str> = self.frozen_crown.iter().map(String::as_str).collect();
@@ -311,7 +311,7 @@ impl CoreEngine {
     /// Why `hash` — a net in the elite RANKING — holds no seat right now: barred
     /// the join window (`a/k`) or the cull shield, or `outranked` (the seats ran out).
     pub(crate) fn unseated_reason(&self, hash: &str, clock: usize) -> String {
-        let k = self.config.elite_join_probation_steps;
+        let k = self.config.seat_join_probation_steps;
         match self.state.net(hash) {
             Some(s) if s.elite_probation_age < k => {
                 format!("join window {}/{k}", s.elite_probation_age)
@@ -325,8 +325,8 @@ impl CoreEngine {
     /// The elite gate in numbers over the live population: `(eligible, on_probation,
     /// age_blocked)`. `clock` MUST be the deal's clock, never `step_clock()`.
     pub(crate) fn elite_gate_counts(&self, clock: usize) -> (usize, usize, usize) {
-        let k = self.config.elite_join_probation_steps;
-        let j = self.config.elite_crown_lifetime_steps;
+        let k = self.config.seat_join_probation_steps;
+        let j = self.config.seat_lifetime_steps;
         let (mut eligible, mut probation, mut age_blocked) = (0, 0, 0);
         for h in self.state.live_hashes() {
             let Some(s) = self.state.net(&h) else {
@@ -404,10 +404,10 @@ impl CoreEngine {
             age_blocked,
             // The crown IS the seat set, so the seats held are the frozen nets.
             seats_held: frozen,
-            seats_capacity: self.config.elite_count.min(live.saturating_sub(1)),
-            join_k: self.config.elite_join_probation_steps,
-            lifetime_j: self.config.elite_crown_lifetime_steps,
-            crown_armed: self.config.freeze_elites,
+            seats_capacity: self.config.champion_count.min(live.saturating_sub(1)),
+            join_k: self.config.seat_join_probation_steps,
+            lifetime_j: self.config.seat_lifetime_steps,
+            crown_armed: self.config.freeze_seats,
         }
     }
 
@@ -431,7 +431,7 @@ impl CoreEngine {
     /// Uses the live smoothed fitness; only cullable nets are candidates.
     pub(crate) fn worst_nets_by_smoothed_fitness(&self, count: usize) -> Result<Vec<String>> {
         // The elite guard applies HERE too: this selector feeds the crossover-Worst
-        // victim, and an elite must never be a victim under either policy.
+        // victim, and a champion must never be a victim under either policy.
         let elite = self.elite_hashes();
         // `ranked_live()` is best-first, so the worst is its reverse.
         Ok(self

@@ -72,7 +72,7 @@ pub struct CoreEngine {
     /// Run-total of the TRAIN turns (live path only — a resume's replay mirrors
     /// history and does not re-count): the denominator for `turns/match` / `ms/turn`.
     pub(crate) total_train_turns: usize,
-    /// Full hashes of the elite set exported at stop (top-`elite_count` by smoothed
+    /// Full hashes of the champion set exported at stop (top-`champion_count` by smoothed
     /// fitness) — the single source of truth for "which nets are the champions".
     pub(crate) champions: Vec<String>,
     /// In-memory state of the live population (topology JSON, seed, step,
@@ -123,6 +123,8 @@ pub struct CoreEngine {
     /// Buffer for evolution-event rows — its own `attempts.csv` with its own header:
     /// the two row kinds share no columns, and padding shifted every later column.
     pub(crate) attempts_csv_buffer: String,
+    /// Append-only novelty archive: every blueprint this run made, judged by mutation draws.
+    pub(crate) novelty: crate::engine::novelty::Novelty,
 }
 
 /// The inputs a constructor actually CHOOSES.
@@ -146,6 +148,11 @@ impl CoreEngine {
     /// Assemble the engine from the chosen parts; every scratch field is initialised HERE, so a new
     /// field cannot be added to one engine and forgotten in the other.
     pub(crate) fn assemble(p: CoreEngineParts) -> Self {
+        let novelty = crate::engine::novelty::Novelty::new(
+            p.config.pop_size,
+            p.config.mutation_novelty_min,
+            p.config.mutation_novelty_draws,
+        );
         Self {
             run_dir: p.run_dir,
             header: p.header,
@@ -183,6 +190,7 @@ impl CoreEngine {
             minimal_prev_means: None,
             history_csv_buffer: String::new(),
             attempts_csv_buffer: String::new(),
+            novelty,
         }
     }
 }
@@ -398,7 +406,7 @@ impl CoreEngine {
         // deduped and re-rolled so the population always lands at `pop_size`.
         let mut founders: Vec<crate::graph::topology::Topology> = Vec::with_capacity(1);
         let mut seed_source: Option<crate::state::SeedSourceRecord> = None;
-        if config.elite_previous_load {
+        if config.champion_previous_load {
             // The compatibility gate reads the candidate's engine.json header,
             // so this run's own header (mode, dims, trainer name) is the input.
             let trainer_name = header
@@ -409,7 +417,7 @@ impl CoreEngine {
             // `max_seeds = pop_size`: the WHOLE elite list comes over in rank order,
             // founders are the source's own ranking, never a reshuffle
             match super::seed::resolve_plan(
-                config.elite_previous_dir.as_deref(),
+                config.champion_previous_dir.as_deref(),
                 // This run's own dir already exists on disk (the header
                 // written above), so it would otherwise be "the newest run".
                 Some(run_dir.as_path()),
@@ -474,7 +482,7 @@ impl CoreEngine {
                     crate::utils::cfy::emit_always(&crate::utils::cfy::card(
                         "Inheritance",
                         &crate::utils::cfy::kv(&[(
-                            "elite_previous_load".to_string(),
+                            "champion_previous_load".to_string(),
                             "skipped".to_string(),
                         )]),
                         Some(&format!("{why} — starting from an all-random population")),
@@ -539,6 +547,11 @@ impl CoreEngine {
             run_seed,
         };
 
+        let novelty = crate::engine::novelty::Novelty::new(
+            config.pop_size,
+            config.mutation_novelty_min,
+            config.mutation_novelty_draws,
+        );
         let mut engine = CoreEngine {
             run_dir,
             header,
@@ -553,6 +566,7 @@ impl CoreEngine {
             state: RaceState::new(),
             history_csv_buffer: String::new(),
             attempts_csv_buffer: String::new(),
+            novelty,
             networks: HashMap::new(),
             optimizers: HashMap::new(),
             rolling_fitness: HashMap::new(),
@@ -663,6 +677,8 @@ impl CoreEngine {
                 .unwrap_or_else(|| format!("founder-{ordinal}"));
             let mut state = NetState::new(topo, 0, Some(origin))?;
             state.stamp_meta(&net, &self.meta_ctx);
+            // Founders are the first guests on the novelty list: a mutation must not clone one.
+            self.novelty.push(topo);
             let hash = state.hash.clone();
             let opt = self.trainer.make_optimizer(&net);
             self.networks.insert(hash.clone(), net);
@@ -834,12 +850,12 @@ impl CoreEngine {
                 ),
                 ("mutate_prob".to_string(), fmt_cfg(self.config.mutate_prob)),
                 (
-                    "elite_count".to_string(),
-                    self.config.elite_count.to_string(),
+                    "champion_count".to_string(),
+                    self.config.champion_count.to_string(),
                 ),
                 (
-                    "freeze_elites".to_string(),
-                    self.config.freeze_elites.to_string(),
+                    "freeze_seats".to_string(),
+                    self.config.freeze_seats.to_string(),
                 ),
                 (
                     "train_merit (Ω)".to_string(),
@@ -913,7 +929,10 @@ impl CoreEngine {
                     "mutation_cull_policy",
                     self.config.mutation_cull_policy.to_string(),
                 ),
-                ("elite_save", self.config.elite_save_topology.to_string()),
+                (
+                    "champion_save",
+                    self.config.champion_save_topology.to_string(),
+                ),
                 (
                     "probation_steps",
                     self.config.mutation_probation_steps.to_string(),
@@ -923,12 +942,12 @@ impl CoreEngine {
                     self.config.crossover_probation_steps.to_string(),
                 ),
                 (
-                    "elite_join_probation_steps",
-                    self.config.elite_join_probation_steps.to_string(),
+                    "seat_join_probation_steps",
+                    self.config.seat_join_probation_steps.to_string(),
                 ),
                 (
-                    "elite_crown_lifetime_steps",
-                    self.config.elite_crown_lifetime_steps.to_string(),
+                    "seat_lifetime_steps",
+                    self.config.seat_lifetime_steps.to_string(),
                 ),
             ] {
                 manifest.push((k.to_string(), v));
@@ -967,12 +986,12 @@ impl CoreEngine {
                 ),
                 (
                     "counts".to_string(),
-                    "ran = ticketed + crown · ticketed = won + exempt · graded = won + idled · live = ran + held back · expected = graded × avg ticket chance, drawn = won · ★ = elite rank + seat term"
+                    "ran = ticketed + crown · ticketed = won + exempt · graded = won + idled · live = ran + held back · expected = graded × avg ticket chance, drawn = won · ★ = champion rank + seat term"
                         .to_string(),
                 ),
                 (
                     "seats".to_string(),
-                    "seat = an elite reserve · wait = clocks to serve before sitting · term = clocks a seat may be held; a completed term is a scheduled rotation, not a loss"
+                    "seat = a champion reserve · wait = clocks to serve before sitting · term = clocks a seat may be held; a completed term is a scheduled rotation, not a loss"
                         .to_string(),
                 ),
                 (
@@ -1115,7 +1134,7 @@ impl CoreEngine {
                     let shielded = self.config.crossover_probation_steps >= clock
                         || self.config.mutation_probation_steps >= clock;
                     info!(
-                        "step {} │ evolution deferred: no cull-eligible net — every non-elite net is inside its cull shield window (crossover k={}, mutation k={}) or elite ({} crossover + {} mutation roll(s) forgone; nothing culled/born){}",
+                        "step {} │ evolution deferred: no cull-eligible net — every non-champion net is inside its cull shield window (crossover k={}, mutation k={}) or champion ({} crossover + {} mutation roll(s) forgone; nothing culled/born){}",
                         clock,
                         self.config.crossover_probation_steps,
                         self.config.mutation_probation_steps,
@@ -1477,7 +1496,7 @@ impl CoreEngine {
                 info!("step {} │ {}", clock, step_rollup_line(&vitals));
             }
             // The who-line rides the LOTTERY's gate, not the rollup's: a run with the elite crown
-            // off (`freeze_elites = false`) still reports which nets got no ticket.
+            // off (`freeze_seats = false`) still reports which nets got no ticket.
             if lottery_line_on {
                 if let Some(frame) = lottery {
                     // The Summ view is the aggregate: `p̄` vs the realized `won`,
@@ -1557,7 +1576,7 @@ impl CoreEngine {
     fn finish_race(&mut self, reason: StopReason, clock: usize) -> Result<StopReason> {
         // The champion markdown dump is an ARTIFACT, not a log line —
         // it must land on disk at every log level, even `None`.
-        self.write_elite_index()?;
+        self.write_champion_index()?;
         self.write_champion_markdown()?;
         // `None` mode stays silent until the caller's final stop print.
         if self.verbose_detail() {
@@ -1671,19 +1690,19 @@ pub(crate) struct StepVitals {
     pub newborn: usize,
     /// Nets that served the join window and are not age-blocked: seat-eligible.
     pub eligible: usize,
-    /// Nets still inside the join window (`elite_join_probation_steps`).
+    /// Nets still inside the join window (`seat_join_probation_steps`).
     pub probation: usize,
-    /// Nets past the crown lifetime (`elite_crown_lifetime_steps`); 0 disarms
+    /// Nets past the crown lifetime (`seat_lifetime_steps`); 0 disarms
     pub age_blocked: usize,
     /// Seats actually dealt this clock (the crown's size).
     pub seats_held: usize,
-    /// Dealable seats: `elite_count`, capped by the cullable population.
+    /// Dealable seats: `champion_count`, capped by the cullable population.
     pub seats_capacity: usize,
     /// The join window `k` this clock was graded against.
     pub join_k: usize,
     /// The crown lifetime `j` this clock was graded against (`0` = disarmed).
     pub lifetime_j: usize,
-    /// Whether the crown is armed at all (`freeze_elites`).
+    /// Whether the crown is armed at all (`freeze_seats`).
     pub crown_armed: bool,
 }
 
@@ -1762,7 +1781,7 @@ fn step_rollup_line(v: &StepVitals) -> String {
         // No crown ⇒ no seats and no gates: the two legs below would print a tally
         // restriction that is not in force (and a `seats 0 of k` that reads like a bug).
         parts.push(format!(
-            "crown off (freeze_elites = false): 0 of {} seats, no gate — every live net is seat-eligible",
+            "crown off (freeze_seats = false): 0 of {} seats, no gate — every live net is seat-eligible",
             v.live
         ));
     } else {

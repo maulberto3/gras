@@ -149,6 +149,26 @@ impl CoreEngine {
             fmt_cfg(current.drift_prob),
             format!("set_topology_drift({})", fmt_cfg(recorded.drift_prob)),
         );
+        // The novelty floor decides how many candidates a mutation may spend, so it is as
+        // behavioural as drift: a different floor is a different search.
+        push(
+            "mutation_novelty_min",
+            fmt_cfg(recorded.mutation_novelty_min),
+            fmt_cfg(current.mutation_novelty_min),
+            format!(
+                "set_mutation_novelty_min({})",
+                fmt_cfg(recorded.mutation_novelty_min)
+            ),
+        );
+        push(
+            "mutation_novelty_draws",
+            recorded.mutation_novelty_draws.to_string(),
+            current.mutation_novelty_draws.to_string(),
+            format!(
+                "set_mutation_novelty_draws({})",
+                recorded.mutation_novelty_draws
+            ),
+        );
         push(
             "feature_split_pool",
             rec_pool.join(","),
@@ -198,16 +218,16 @@ impl CoreEngine {
                 current.crossover_probation_steps,
             ),
             (
-                "elite_join_probation_steps",
-                "set_elite_join_probation_steps",
-                recorded.elite_join_probation_steps,
-                current.elite_join_probation_steps,
+                "seat_join_probation_steps",
+                "set_seat_join_probation_steps",
+                recorded.seat_join_probation_steps,
+                current.seat_join_probation_steps,
             ),
             (
-                "elite_crown_lifetime_steps",
-                "set_elite_crown_lifetime_steps",
-                recorded.elite_crown_lifetime_steps,
-                current.elite_crown_lifetime_steps,
+                "seat_lifetime_steps",
+                "set_seat_lifetime_steps",
+                recorded.seat_lifetime_steps,
+                current.seat_lifetime_steps,
             ),
         ] {
             push(
@@ -235,6 +255,9 @@ impl CoreEngine {
             );
         }
         let run_dir = self.run_dir.clone();
+        // The archive is born again from the record: every blueprint this run WROTE counts,
+        // tombstones included, or a resume would let mutation re-draw a culled design.
+        self.novelty.rebuild_from_nets(&run_dir);
         let nets_dir = run_dir.join("nets");
         let mut loaded = 0usize;
         // The frontier as a SET, when the run recorded one (`ckpt.json`). Handled
