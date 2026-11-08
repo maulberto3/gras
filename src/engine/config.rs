@@ -95,6 +95,18 @@ pub const DEFAULT_TRAIN_AGE: bool = true;
 /// fitness stays expressive while learning stays ticketed.
 pub const DEFAULT_TRAIN_MERIT_LEARN_ONLY: bool = false;
 
+/// Default for POLICY-SCOPED window stats (`set_run_policy_stats`): `false` = the window averages
+/// the last K READINGS, whatever weights produced them (the pre-flag contract). `true` = it averages
+/// only the readings taken on the weights the net holds NOW, so `n = 1` means "one datapoint of one
+/// policy" and a net that keeps earning tickets keeps accumulating evidence of the SAME policy.
+pub const DEFAULT_POLICY_STATS: bool = false;
+
+/// Default for the ANTI-CHAMPION dump (`set_worst_save_topology`): `false` = no `worst-*.md` files.
+/// `true` writes the top-`champion_count` nets by TICKET CHANCE at stop — the least fit and, with
+/// the age leg armed, the oldest — as topology + mermaid + lineage markdown, so the nets the coin
+/// keeps feeding can be read structurally instead of guessed at from a hash.
+pub const DEFAULT_WORST_SAVE_TOPOLOGY: bool = false;
+
 /// Steps between population checkpoints — the cadence the stream's era rotation and the CSV flush
 /// key off.
 pub const DEFAULT_CHECKPOINT_EVERY: usize = 20;
@@ -371,6 +383,13 @@ pub struct RaceConfig {
     /// How the window's readings are averaged into the ranking centre (`set_run_mean_type`):
     /// [`MeanType::Arithmetic`] (default, the pre-knob ranking), [`MeanType::SignedLog`]
     pub mean_type: MeanType,
+    /// POLICY-SCOPED window stats (`set_run_policy_stats`): `true` makes the mean/spread/n describe
+    /// the CURRENT weights — readings taken since the net's last real update — instead of the last K
+    /// readings across every weight set. Default `false` (the pre-flag window).
+    pub policy_stats: bool,
+    /// ANTI-CHAMPION dump (`set_worst_save_topology`): `true` writes `worst-<hash>.md` +
+    /// `worst.md` at stop for the nets with the HIGHEST ticket chance (least fit, oldest).
+    pub worst_save_topology: bool,
     /// Age leg of the lottery (`set_run_train_merit_age`): `true` ARMS the product `Fm × Ym`, `Ym` = `1`
     /// at the youngest graded net.
     pub train_age: bool,
@@ -627,6 +646,8 @@ impl RaceConfig {
             risk_aversion: RISK_AVERSION,
             window_recency: DEFAULT_WINDOW_RECENCY,
             mean_type: DEFAULT_MEAN_TYPE,
+            policy_stats: DEFAULT_POLICY_STATS,
+            worst_save_topology: DEFAULT_WORST_SAVE_TOPOLOGY,
             train_age: DEFAULT_TRAIN_AGE,
             mode_specific: ModeConfig::Tabular(TabularConfig::default()),
             crossover_ops_pool: Vec::new(),
@@ -706,6 +727,8 @@ impl RaceConfig {
         cfg.train_merit_p_max = snap.train_merit_p_max;
         cfg.train_merit_inverted = snap.train_merit_inverted;
         cfg.train_merit_learn_only = snap.train_merit_learn_only;
+        cfg.policy_stats = snap.policy_stats;
+        cfg.worst_save_topology = snap.worst_save_topology;
         cfg.drift_prob = snap.drift_prob;
         cfg.champion_previous_load = snap.champion_previous_load;
         cfg.champion_previous_dir = snap
@@ -922,6 +945,21 @@ impl RaceConfigBuilder {
     /// `false` keeps the pre-flag contract — a lost ticket idles the net outright.
     pub fn set_run_train_merit_learn_only(mut self, yes: bool) -> Self {
         self.cfg.train_merit_learn_only = yes;
+        self
+    }
+    /// POLICY-SCOPED window stats (default `false`): `true` averages only the readings taken on the
+    /// weights the net holds now, so the mean describes a POLICY rather than a mix of K clocks. A
+    /// net that updates every clock reports one datapoint (its value, no spread); a net that rarely
+    /// earns a ticket reports many readings of the same policy and a tight mean.
+    pub fn set_run_policy_stats(mut self, yes: bool) -> Self {
+        self.cfg.policy_stats = yes;
+        self
+    }
+    /// ANTI-CHAMPION dump (default `false`): `true` writes `worst-<hash>.md` for the top-
+    /// `champion_count` nets by TICKET CHANCE at stop (least fit × oldest) plus a `worst.md` index,
+    /// each with its topology, mermaid graph and lineage — the mirror of `champion_save_topology`.
+    pub fn set_worst_save_topology(mut self, enabled: bool) -> Self {
+        self.cfg.worst_save_topology = enabled;
         self
     }
     /// DRIFT on a crossover child's inherited genes (default `0.0` = exact inheritance).

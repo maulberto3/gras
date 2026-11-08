@@ -5,7 +5,7 @@
 //! is cull immunity for the same top-k while the run is still going.
 
 use super::core::CoreEngine;
-use super::format::{ReadingStyle, fmt_reading};
+use super::format::{ReadingStyle, fmt_cfg, fmt_reading};
 use flodl::tensor::Result;
 
 impl CoreEngine {
@@ -179,7 +179,128 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Delete `nets/*.safetensors` whose hash is not live.
+    /// The anti-champion dump: the nets the LIVE lottery favours MOST at the stop clock — the
+    /// highest ticket chance, which at these defaults means the LEAST fit and the OLDEST (the cake
+    /// is the merit fraction times the youth fraction, inverted). One file per net
+    /// (`worst-<hash>.md`: topology + mermaid graph + lineage) plus a `worst.md` index, so the nets
+    /// the coin keeps feeding can be read structurally instead of guessed at from a hash.
+    pub(crate) fn write_worst_markdown(&mut self, clock: usize) -> Result<()> {
+        if !self.config.worst_save_topology {
+            return Ok(());
+        }
+        // The SAME frame the coin dealt from: the ticket chance printed here is the number the
+        // next clock would compare against, not a second opinion.
+        let frame = self.lottery_frame(clock);
+        let ages: Vec<usize> = self
+            .state
+            .live_hashes()
+            .iter()
+            .filter_map(|h| self.lottery_age_of(h, clock))
+            .collect();
+        let younger = ages.iter().min().copied().unwrap_or(1);
+        let older = ages.iter().max().copied().unwrap_or(1);
+        let rows: Vec<(String, f32, usize)> = self
+            .ranked_live()
+            .into_iter()
+            .map(|(hash, score)| {
+                let merit = Self::merit_from(Some(score));
+                let fraction = self.train_lottery_p_from(&hash, clock, frame, merit);
+                let age = self.lottery_age_of(&hash, clock).unwrap_or(0);
+                (hash, fraction, age)
+            })
+            .collect();
+        let mut rows = worst_order(rows);
+        let k = self.config.champion_count.max(1).min(rows.len());
+        rows.truncate(k);
+        let mut written: Vec<Vec<String>> = Vec::new();
+        let mut index = String::from(
+            "| # | hash | ticket p | merit | age | youth | file |\n|---|---|---|---|---|---|---|\n",
+        );
+        for (rank, (hash, _fraction, age)) in rows.iter().enumerate() {
+            let Some(state) = self.state.net(hash) else {
+                continue;
+            };
+            let Ok(topo) = state.topology() else {
+                continue;
+            };
+            let short = &hash[..8.min(hash.len())];
+            let p = self.train_lottery_p_eff(hash, clock, frame);
+            let merit = self.merit(hash);
+            let youth = Self::youth_fraction(*age, younger, older);
+            let reading = self.race_reading_of(hash).map_or_else(
+                || "—".to_string(),
+                |r| {
+                    fmt_reading(
+                        Some(r.mean),
+                        (r.n > 1).then_some(r.std),
+                        r.n,
+                        ReadingStyle::Doc,
+                    )
+                },
+            );
+            let file = format!("worst-{short}.md");
+            let md = format!(
+                "**Worst #{} · ticket chance {} (Ω {}) · merit {} · age {} clocks (youth {}) · window {} · λ={} · run seed {} · net seed {}**\n\n{}\n\n{}",
+                rank + 1,
+                fmt_cfg(p),
+                fmt_cfg(self.train_merit_omega()),
+                merit.map_or_else(|| "—".to_string(), fmt_cfg),
+                age,
+                fmt_cfg(youth),
+                reading,
+                fmt_cfg(self.config.risk_aversion),
+                self.header.run_seed,
+                state.net_seed,
+                crate::utils::markdown::topology_markdown(&topo, None),
+                self.lineage_markdown(hash, "WORST"),
+            );
+            match std::fs::write(self.run_dir.join(&file), &md) {
+                Ok(()) => {
+                    index.push_str(&format!(
+                        "| {} | {short} | {} | {} | {age} | {} | [{file}]({file}) |\n",
+                        rank + 1,
+                        fmt_cfg(p),
+                        merit.map_or_else(|| "—".to_string(), fmt_cfg),
+                        fmt_cfg(youth),
+                    ));
+                    written.push(vec![(rank + 1).to_string(), short.to_string(), file]);
+                }
+                Err(source) => tracing::warn!(
+                    "worst markdown write failed: {}",
+                    crate::utils::error::EngineError::Io {
+                        path: self.run_dir.join(&file).display().to_string(),
+                        source,
+                    }
+                ),
+            }
+        }
+        if !written.is_empty() {
+            let body = format!(
+                "# Anti-champion field at clock {clock}\n\nThe layers the train-eval lottery favours MOST: highest ticket chance = least fit × oldest. Every row is one net's topology + mermaid graph + lineage.\n\n{index}"
+            );
+            let path = self.run_dir.join("worst.md");
+            if let Err(source) = std::fs::write(&path, body) {
+                tracing::warn!(
+                    "worst index write failed: {}",
+                    crate::utils::error::EngineError::Io {
+                        path: path.display().to_string(),
+                        source,
+                    }
+                );
+            }
+            if self.verbose_detail() {
+                crate::utils::cfy::emit(&crate::utils::cfy::card(
+                    "Anti-champion topology (markdown)",
+                    &crate::utils::cfy::table(&["#", "hash", "file"], &written),
+                    Some(
+                        "the nets with the HIGHEST ticket chance — least fit, oldest; see worst.md for the ranking",
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn sweep_stale_net_weights(&self) {
         let live: std::collections::HashSet<String> =
             self.state.live_hashes().into_iter().collect();
@@ -250,6 +371,18 @@ impl CoreEngine {
     }
 }
 
+/// Anti-champion order: WORST-FIRST by the coin's own 0..1 fraction (least fit; oldest once the age
+/// leg is armed), then by age descending, then by hash — a TOTAL order, so the files, the index and
+/// the card can never disagree about which net is #1.
+pub(crate) fn worst_order(mut rows: Vec<(String, f32, usize)>) -> Vec<(String, f32, usize)> {
+    rows.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| b.2.cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    rows
+}
+
 /// One CSV line from already-formatted cells, RFC4180-quoted by [`csv_field`].
 fn csv_row(cells: &[String]) -> String {
     cells
@@ -261,10 +394,27 @@ fn csv_row(cells: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::csv_row;
+    use super::{csv_row, worst_order};
 
     /// The export is a CSV, not a `join` with a comma: cells carrying a comma are quoted,
     /// cells carrying a quote are escaped, and no row grows or loses a column.
+    #[test]
+    fn the_anti_champion_order_is_chance_then_age_then_hash() {
+        let rows = vec![
+            ("b".to_string(), 0.9, 3),
+            ("a".to_string(), 0.9, 3),
+            ("c".to_string(), 0.9, 9),
+            ("d".to_string(), 0.1, 99),
+        ];
+        let ordered = worst_order(rows);
+        let got: Vec<&str> = ordered.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            got,
+            vec!["c", "a", "b", "d"],
+            "ticket chance first, then the older net, then the hash — never input order"
+        );
+    }
+
     #[test]
     fn csv_row_quotes_only_the_cells_that_need_it() {
         let row = csv_row(&[

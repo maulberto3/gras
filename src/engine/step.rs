@@ -110,6 +110,9 @@ impl CoreEngine {
         if let Some(buf) = self.rolling_fitness.get_mut(hash) {
             buf.push(metrics.fitness);
         }
+        // This reading describes the weights the update just produced: under `policy_stats` it is
+        // reading ONE of a new epoch, which is what keeps the window on the current policy.
+        self.rolling_epoch.insert(hash.to_string(), 1);
         if let Some(buf) = self.rolling_train.get_mut(hash) {
             buf.push(metrics.train_loss);
         }
@@ -163,6 +166,10 @@ impl CoreEngine {
         if let Some(buf) = self.rolling_fitness.get_mut(hash) {
             buf.push(metrics.fitness);
         }
+        // Same weights, one more reading: the epoch counter is what lets a rarely-ticketed net
+        // show many readings OF ITS POLICY instead of a mix.
+        let entry = self.rolling_epoch.entry(hash.to_string()).or_insert(1);
+        *entry = entry.saturating_add(1);
         if let Some(buf) = self.rolling_train.get_mut(hash) {
             buf.push(metrics.train_loss);
         }

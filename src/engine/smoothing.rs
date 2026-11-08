@@ -167,6 +167,37 @@ pub fn rolling_stats_with(
     recency: f32,
     family: MeanType,
 ) -> Option<WindowStats> {
+    rolling_stats_all(buf, recency, family)
+}
+
+/// [`rolling_stats_with`] over the LAST `take` readings only — the EPOCH-SCOPED window
+/// (`set_run_policy_stats`): the readings taken on the weights the net holds right now. `take`
+/// clamps to the buffer; `0` is `None` (nothing measured on this policy yet), and `1` is that
+/// value with zero spread, so `mean ∓ λ·0` stays clean instead of claiming a confidence nobody has.
+pub fn rolling_stats_tail(
+    buf: &RollingBuffer,
+    take: usize,
+    recency: f32,
+    family: MeanType,
+) -> Option<WindowStats> {
+    let take = take.min(buf.len());
+    if take == 0 {
+        return None;
+    }
+    if take == buf.len() {
+        return rolling_stats_all(buf, recency, family);
+    }
+    // A private tail buffer keeps ONE implementation of the weighted mean/spread: the epoch is
+    // just a shorter window, never a second arithmetic.
+    let mut tail = RollingBuffer::new(take);
+    for v in buf.iter().skip(buf.len() - take) {
+        tail.push(*v);
+    }
+    rolling_stats_all(&tail, recency, family)
+}
+
+/// The one rolling-stats arithmetic both entry points share.
+fn rolling_stats_all(buf: &RollingBuffer, recency: f32, family: MeanType) -> Option<WindowStats> {
     if buf.is_empty() {
         return None;
     }
@@ -256,6 +287,36 @@ pub use crate::engine::config::SMOOTHING_WINDOW;
 mod tests {
     use super::*;
     use crate::engine::config::MeanType;
+
+    /// The epoch window is the SAME arithmetic over a shorter tail — never a second formula.
+    #[test]
+    fn rolling_stats_tail_reads_only_the_last_take() {
+        let buf = RollingBuffer::from_values(5, &[10.0, 10.0, 10.0, 4.0, 6.0]);
+        let all = rolling_stats_with(&buf, 0.0, MeanType::Arithmetic).unwrap();
+        assert_eq!(
+            (all.n, all.mean),
+            (5, 8.0),
+            "the whole buffer is the old reading"
+        );
+        let epoch = rolling_stats_tail(&buf, 2, 0.0, MeanType::Arithmetic).unwrap();
+        assert_eq!((epoch.n, epoch.mean, epoch.std), (2, 5.0, 1.0));
+        assert_eq!(
+            epoch.latest, 6.0,
+            "the tail keeps the newest reading, not the tail's own order"
+        );
+        assert_eq!(
+            rolling_stats_tail(&buf, 0, 0.0, MeanType::Arithmetic),
+            None,
+            "no reading on this policy ⇒ no reading, never a fabricated 0"
+        );
+        // ONE reading: its value IS the mean, and zero spread keeps `mean ∓ λ·0` clean.
+        let one = rolling_stats_tail(&buf, 1, 0.0, MeanType::Arithmetic).unwrap();
+        assert_eq!((one.n, one.mean, one.std), (1, 6.0, 0.0));
+        assert_eq!(
+            one.score(crate::utils::fitness::Direction::Maximize, 0.5),
+            6.0
+        );
+    }
 
     #[test]
     fn rolling_mean_empty_is_zero() {

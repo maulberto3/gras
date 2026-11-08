@@ -100,6 +100,8 @@ impl CoreEngine {
             hash.to_string(),
             RollingBuffer::new(self.config.smoothing_window),
         );
+        // Born: no reading has been taken on these weights yet.
+        self.rolling_epoch.insert(hash.to_string(), 0);
     }
 
     /// One mutation draw: up to `draws` candidates, each its own seed ordinal. The first that
@@ -260,6 +262,7 @@ impl CoreEngine {
                 self.rolling_fitness.remove(&child.state.hash);
                 self.rolling_train.remove(&child.state.hash);
                 self.rolling_eval.remove(&child.state.hash);
+                self.rolling_epoch.remove(&child.state.hash);
                 return Ok(RollOutcome::no_slot(self.no_cull_roll_detail("crossover")));
             }
             let victim_net_seed = victim_for_log
@@ -585,6 +588,7 @@ impl CoreEngine {
         self.rolling_fitness.remove(hash);
         self.rolling_train.remove(hash);
         self.rolling_eval.remove(hash);
+        self.rolling_epoch.remove(hash);
         // Decision-lag state dies with the net (shadow + promotion clock
         // per-individual); a culled frozen elite leaves the crown.
         self.frozen_crown.remove(hash);
