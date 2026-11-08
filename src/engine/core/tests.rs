@@ -305,6 +305,46 @@ fn cull_tombstone_records_mean_spread_and_risk_score() {
     assert_eq!(state.cull_reason.as_deref(), Some("crossover"));
 }
 
+/// Every cull lands in exactly ONE slot row. The crossover call site spells the reason with
+/// the cull policy that chose the victim (`crossover-random`, `crossover-unfed`), so an
+/// exact-string attribution leaves those culls inside `culls` and outside both slot rows —
+/// the stop table then reads `culled 90` over `0 + 51`, which is what a default (`Unfed`) run
+/// printed.
+#[test]
+fn every_cull_is_attributed_to_one_slot() {
+    let dir = std::env::temp_dir().join("gras-cull-attribution");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = engine(&dir, 5).unwrap();
+    eng.seed_population_internal(
+        vec![
+            tiny_topology(7),
+            tiny_topology(8),
+            tiny_topology(9),
+            tiny_topology(10),
+        ],
+        Some(0.5),
+    )
+    .unwrap();
+    let hashes = eng.state.live_hashes();
+    // One cull per reason the two channels actually pass: the `Worst`, `Random` and `Unfed`
+    // crossover arms, then the mutation immigrant slot.
+    eng.cull_net(&hashes[0], 3, "crossover").unwrap();
+    eng.cull_net(&hashes[1], 3, "crossover-random").unwrap();
+    eng.cull_net(&hashes[2], 3, "crossover-unfed").unwrap();
+    eng.cull_net(&hashes[3], 3, "immigrant-slot").unwrap();
+    assert_eq!(eng.accounting.culls, 4, "the funnel counted every cull");
+    assert_eq!(
+        eng.accounting.culls_crossover, 3,
+        "all three crossover arms free a crossover slot"
+    );
+    assert_eq!(eng.accounting.culls_immigrant, 1);
+    assert_eq!(
+        eng.accounting.culls,
+        eng.accounting.culls_crossover + eng.accounting.culls_immigrant,
+        "the slot rows are a partition of the cull total"
+    );
+}
+
 #[test]
 fn champion_hashes_match_ranked_elites() {
     // Regression guard for the guardrail bug: post-race tooling must read

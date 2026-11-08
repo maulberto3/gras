@@ -553,10 +553,13 @@ impl CoreEngine {
         let risk_score = self.smoothed_fitness_of(hash);
         let samples = reading.map(|r| r.n).unwrap_or(0);
         // The run's accounting tallies culls by the slot freed — the one funnel
-        // every cull passes through.
+        // every cull passes through. The reason carries the POLICY that picked the
+        // victim (`crossover-random`, `crossover-unfed`, …), so the slot is matched
+        // by prefix: an exact-spelling match here leaves those culls in the total
+        // and out of both slot rows, and the stop table stops adding up.
         self.accounting.culls += 1;
         match reason {
-            "crossover" => self.accounting.culls_crossover += 1,
+            r if r.starts_with("crossover") => self.accounting.culls_crossover += 1,
             "immigrant-slot" => self.accounting.culls_immigrant += 1,
             _ => {}
         }
