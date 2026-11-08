@@ -54,8 +54,10 @@ pub struct ConfigSnapshot {
     /// own knob — it decides which net a fresh immigrant replaces, so a reader cannot reconstruct
     #[serde(default = "default_mutation_cull_policy")]
     pub mutation_cull_policy: String,
-    /// Elite guard size: top-k nets by smoothed fitness immune to all culls.
-    pub elite_count: usize,
+    /// Champion guard size: top-k nets by smoothed fitness immune to all culls.
+    /// `champion_count` is the ranking's k; `freeze_seats` is the SEPARATE seat switch.
+    #[serde(default, alias = "elite_count")]
+    pub champion_count: usize,
     /// Crossover operator pool (`"one_point"`/`"uniform"`); empty ⇒ both.
     pub crossover_ops_pool: Vec<String>,
     /// Crossover parent-selection method, as its `Display` label (`"roulette"` /
@@ -117,10 +119,10 @@ pub struct ConfigSnapshot {
     /// Human label for the experiment (`set_run_name`), verbatim. Purely
     /// informative — never affects the results folder name.
     pub run_name: Option<String>,
-    /// Anti-devolution A (`set_elite_freeze`): top-k nets skip the trainer call.
-    /// Replay-relevant, so it must match on resume.
-    #[serde(default)]
-    pub freeze_elites: bool,
+    /// Seats (`set_seat_freeze`): the top-k nets act-and-measure without a trainer call — the
+    /// anti-devolution switch, independent of how many nets are CHAMPIONS. Replay-relevant.
+    #[serde(default, alias = "freeze_elites")]
+    pub freeze_seats: bool,
     /// Training lottery strength Ω (`set_run_train_merit`): how much of the merit tilt the coin
     /// applies — `p_eff = 1 − Ω·(1 − p)`.
     #[serde(default)]
@@ -150,8 +152,15 @@ pub struct ConfigSnapshot {
     #[serde(default, rename = "evolution_train_lottery", skip_serializing)]
     pub legacy_train_lottery: Option<bool>,
     /// The two end-of-run TOPOLOGY switches (`*_save_topology`).
-    #[serde(default = "default_true")]
-    pub elite_save_topology: bool,
+    #[serde(default = "default_true", alias = "elite_save_topology")]
+    pub champion_save_topology: bool,
+    /// Novelty floor `d_min` for a mutation draw (`set_mutation_novelty_min`). Replay-relevant:
+    /// `0.0` is what a header written before the gate recorded.
+    #[serde(default)]
+    pub mutation_novelty_min: f32,
+    /// Candidates one mutation may spend clearing that floor (`set_mutation_novelty_draws`).
+    #[serde(default)]
+    pub mutation_novelty_draws: usize,
     /// Mutation probation steps: cull-immunity for an immigrant's first k clocks.
     /// Replay-relevant.
     #[serde(default)]
@@ -160,14 +169,14 @@ pub struct ConfigSnapshot {
     /// Replay-relevant.
     #[serde(default)]
     pub crossover_probation_steps: usize,
-    /// Elite join probation steps: clocks a fresh net must train before it may hold
-    /// seat. Replay-relevant.
-    #[serde(default)]
-    pub elite_join_probation_steps: usize,
-    /// Elite crown lifetime steps: a net on the crown is culled out of it after k clocks
-    /// at peak (`0` disables). Replay-relevant.
-    #[serde(default)]
-    pub elite_crown_lifetime_steps: usize,
+    /// Seat join probation: clocks a fresh net must train before it may hold a SEAT.
+    /// Replay-relevant.
+    #[serde(default, alias = "elite_join_probation_steps")]
+    pub seat_join_probation_steps: usize,
+    /// Seat lifetime: a net is rotated out of the crown after k clocks at peak (`0`
+    /// disables) — a completed term is a scheduled rotation, not a loss. Replay-relevant.
+    #[serde(default, alias = "elite_crown_lifetime_steps")]
+    pub seat_lifetime_steps: usize,
     /// The input feature-split policy the run drew masks from (`"split_exclusive"` /
     /// `"split_random"`); `None` = no split
     #[serde(default)]
@@ -176,13 +185,13 @@ pub struct ConfigSnapshot {
     /// `"split_random"`, `"split_exclusive"`).
     #[serde(default)]
     pub feature_split_pool: Vec<String>,
-    /// Load the newest compatible previous experiment's elites as the first founders.
-    #[serde(default, alias = "seed_previous_run")]
-    pub elite_previous_load: bool,
+    /// Load the newest compatible previous experiment's CHAMPIONS as the first founders.
+    #[serde(default, alias = "elite_previous_load", alias = "seed_previous_run")]
+    pub champion_previous_load: bool,
     /// Where that previous experiment is looked up: a run dir or a dir of run dirs
     /// (newest wins). `None` ⇒ `results/`.
-    #[serde(default, alias = "seed_previous_run_dir")]
-    pub elite_previous_dir: Option<String>,
+    #[serde(default, alias = "elite_previous_dir", alias = "seed_previous_run_dir")]
+    pub champion_previous_dir: Option<String>,
     /// One-line identity of the binary that produced the run (version, profile, exe
     /// path, build time). Diagnostics
     #[serde(default)]
@@ -212,11 +221,13 @@ impl ConfigSnapshot {
             mutate_rolls: cfg.mutate_rolls,
             crossover_cull_policy: cfg.crossover_cull_policy.to_string(),
             mutation_cull_policy: cfg.mutation_cull_policy.to_string(),
-            elite_count: cfg.elite_count,
+            champion_count: cfg.champion_count,
             crossover_ops_pool: cfg.crossover_ops_pool.clone(),
             crossover_selection: cfg.crossover_selection.to_string(),
             crossover_prob: cfg.crossover_prob,
             mutate_prob: cfg.mutate_prob,
+            mutation_novelty_min: cfg.mutation_novelty_min,
+            mutation_novelty_draws: cfg.mutation_novelty_draws,
             max_steps: cfg.max_steps,
             has_custom_stop: cfg.custom_stop.is_some(),
             log_level: format!("{:?}", cfg.log_level).to_lowercase(),
@@ -237,7 +248,7 @@ impl ConfigSnapshot {
             csv_export: cfg.csv_export,
             save_optim: cfg.save_optim,
             run_name: cfg.run_name.clone(),
-            freeze_elites: cfg.freeze_elites,
+            freeze_seats: cfg.freeze_seats,
             train_merit: cfg.train_merit,
             train_merit_p_min: cfg.train_merit_p_min,
             train_merit_p_max: cfg.train_merit_p_max,
@@ -245,16 +256,16 @@ impl ConfigSnapshot {
             train_age: cfg.train_age,
             crossover_fitter_base: cfg.crossover_fitter_base,
             legacy_train_lottery: None,
-            elite_previous_load: cfg.elite_previous_load,
-            elite_previous_dir: cfg
-                .elite_previous_dir
+            champion_previous_load: cfg.champion_previous_load,
+            champion_previous_dir: cfg
+                .champion_previous_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
-            elite_save_topology: cfg.elite_save_topology,
+            champion_save_topology: cfg.champion_save_topology,
             mutation_probation_steps: cfg.mutation_probation_steps,
             crossover_probation_steps: cfg.crossover_probation_steps,
-            elite_join_probation_steps: cfg.elite_join_probation_steps,
-            elite_crown_lifetime_steps: cfg.elite_crown_lifetime_steps,
+            seat_join_probation_steps: cfg.seat_join_probation_steps,
+            seat_lifetime_steps: cfg.seat_lifetime_steps,
             feature_split: split_single,
             feature_split_pool: split_pool,
             drift_prob: cfg.drift_prob,
@@ -845,11 +856,11 @@ pub struct NetState {
     #[serde(skip)]
     pub last_update_step: usize,
     /// Elite probation clock: starts at 0 on birth and any seat exit, ticked +1 per clock;
-    /// a seat needs `elite_probation_age >= elite_join_probation_steps`.
+    /// a seat needs `elite_probation_age >= seat_join_probation_steps`.
     #[serde(default)]
     pub elite_probation_age: usize,
     /// Elite seat clock: 0 while unseated, +1 per seated clock;
-    /// `elite_crown_lifetime_steps` the net ages out (`0` disables).
+    /// `seat_lifetime_steps` the net ages out (`0` disables).
     #[serde(default)]
     pub elite_seat_age: usize,
     /// LEGACY: clocks an older lottery ACTED but did not update (they sit in `frozen_spans`,
@@ -1733,13 +1744,13 @@ mod tests {
     fn config_snapshot_records_artifact_flags() {
         use crate::engine::config::RaceConfig;
         let mut cfg = RaceConfig::defaults();
-        cfg.elite_save_topology = false;
+        cfg.champion_save_topology = false;
         let snap = ConfigSnapshot::from_config(&cfg, None, None);
-        assert!(!snap.elite_save_topology);
+        assert!(!snap.champion_save_topology);
 
         // A pre-field header must read the defaults those runs actually ran
         let legacy: ConfigSnapshot = serde_json::from_str("{}").expect("empty snapshot loads");
-        assert!(legacy.elite_save_topology);
+        assert!(legacy.champion_save_topology);
     }
 
     /// A header written before the field existed must read as the policy those runs actually used
