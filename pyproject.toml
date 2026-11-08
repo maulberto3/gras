@@ -1,12 +1,15 @@
 [project]
-name = "gras"
-version = "0.1.0"
-# TODO(publish): the PyPI NAME "gras" is taken by an unrelated package
-# (GRAScanning), so pick a free distribution name before the first upload.
-# The import name stays `gras` (see module-name below), so no Python code
-# changes — only this line does.
+# Distribution name only: `import gras` stays (see module-name below), because
+# the PyPI name "gras" belongs to an unrelated package (GRAScanning).
+name = "gras-nn"
+# Single source of truth: maturin reads `package.version` from
+# gras-py/Cargo.toml, which is also what `gras.__version__` reports
+# (`env!("CARGO_PKG_VERSION")`). Bump one file, not two.
+dynamic = ["version"]
 description = "Neural architecture search by genetic programming: a step-race that evolves, trains and ranks flodl networks"
-readme = "README.md"
+# The Python package has its own README, which is what PyPI renders; the root
+# README is the Rust crate's (and the crate's own `readme` is that one).
+readme = "python/README.md"
 requires-python = ">=3.12"
 authors = [
     { name = "Mauricio Maroto", email = "maulberto3@hotmail.com" }
@@ -38,6 +41,11 @@ classifiers = [
 # tests imports them, and shipping them would install a Kaggle client for every
 # user of a NAS library.
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/maulberto3/gras"
+Repository = "https://github.com/maulberto3/gras"
+Documentation = "https://docs.rs/gras"
 
 [project.optional-dependencies]
 # The checks in python/tests/ read run artifacts back with pandas.
