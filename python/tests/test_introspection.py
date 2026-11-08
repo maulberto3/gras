@@ -37,7 +37,7 @@ SEED = 21
 def run(tmp: Path, name: str, **overrides) -> tuple[RaceEngine, Path, pd.DataFrame]:
     """One blobs race; return (engine, run dir, history)."""
     run_dir = tmp / name
-    cfg = RaceConfig(pop_size=POP, elite_count=1, max_steps=STEPS,
+    cfg = RaceConfig(pop_size=POP, champion_count=1, max_steps=STEPS,
                      log_level="none", **overrides)
     engine = RaceEngine(BLOBS, cfg, seed=SEED, run_dir=run_dir)
     engine.run()
@@ -62,7 +62,7 @@ def test_live_count_matches_the_artifacts() -> None:
         run_dir = Path(tmp) / "live"
         engine = RaceEngine(
             BLOBS,
-            RaceConfig(pop_size=POP, elite_count=1, max_steps=STEPS,
+            RaceConfig(pop_size=POP, champion_count=1, max_steps=STEPS,
                        log_level="none"),
             seed=SEED,
             run_dir=run_dir,

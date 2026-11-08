@@ -51,7 +51,7 @@ def run_once(seed: int, steps: int = 3, pop: int = 4) -> str:
     with tempfile.TemporaryDirectory(prefix="gras-py-test-") as tmp:
         # `none`: the default is `summ`, whose per-step tables would bury this
         # test's one-line verdict.
-        cfg = RaceConfig(pop_size=pop, elite_count=1, max_steps=steps, log_level="none")
+        cfg = RaceConfig(pop_size=pop, champion_count=1, max_steps=steps, log_level="none")
         engine = RaceEngine(DATA_DIR, cfg, seed=seed, run_dir=tmp)
         assert engine.run_seed == seed, f"seed recorded: {engine.run_seed}"
         reason = engine.run()
@@ -83,7 +83,7 @@ def check_trainer_knobs() -> None:
     assert "r2" in metrics(), metrics()
     assert "mae" in fitnesses(), fitnesses()
     with tempfile.TemporaryDirectory(prefix="gras-py-knobs-") as tmp:
-        cfg = RaceConfig(pop_size=4, elite_count=1, max_steps=2, log_level="none")
+        cfg = RaceConfig(pop_size=4, champion_count=1, max_steps=2, log_level="none")
         engine = RaceEngine(
             DATA_DIR,
             cfg,
@@ -112,9 +112,9 @@ def check_engine_knobs() -> None:
     else starts at the crate's `RaceConfig::defaults()`.
     """
     cfg = RaceConfig()
-    assert (cfg.risk_aversion, cfg.elite_previous_load) == (0.0, False), cfg
-    assert (cfg.pop_size, cfg.elite_count, cfg.max_steps) == (10, 1, 10), cfg
-    assert (cfg.pop_size, cfg.elite_count, cfg.smoothing_window) == (10, 1, 5), cfg
+    assert (cfg.risk_aversion, cfg.champion_previous_load) == (0.0, False), cfg
+    assert (cfg.pop_size, cfg.champion_count, cfg.max_steps) == (10, 1, 10), cfg
+    assert (cfg.pop_size, cfg.champion_count, cfg.smoothing_window) == (10, 1, 5), cfg
     assert cfg.mean_type == "arithmetic", cfg
     # Floats are stored as f32, so compare with a tolerance: 0.2 is not exact.
     assert (cfg.crossover_prob, round(cfg.mutate_prob, 6)) == (0.5, 0.2), cfg
@@ -138,20 +138,20 @@ def check_engine_knobs() -> None:
     assert (
         cfg.mutation_probation_steps,
         cfg.crossover_probation_steps,
-        cfg.elite_join_probation_steps,
-        cfg.elite_crown_lifetime_steps,
+        cfg.seat_join_probation_steps,
+        cfg.seat_lifetime_steps,
     ) == (5, 5, 5, 5), cfg
 
     with tempfile.TemporaryDirectory(prefix="gras-py-engine-knobs-") as tmp:
         cfg = RaceConfig(
             pop_size=4,
-            elite_count=1,
+            champion_count=1,
             max_steps=2,
             log_level="none",
             crossover_prob=0.25,
             mutate_prob=0.75,
             mean_type="median",
-            freeze_elites=False,
+            freeze_seats=False,
             crossover_cull_policy="random",
             mutation_cull_policy="inverse_fitness",
             crossover_selection="tournament",
@@ -160,8 +160,8 @@ def check_engine_knobs() -> None:
             checkpoint_every=3,
             mutation_probation_steps=2,
             crossover_probation_steps=3,
-            elite_join_probation_steps=1,
-            elite_crown_lifetime_steps=7,
+            seat_join_probation_steps=1,
+            seat_lifetime_steps=7,
             hidden_dim_pool=(8, 16),
             hidden_dim_stride=8,
             hidden_nodes_pool=(3, 4),
@@ -182,7 +182,7 @@ def check_engine_knobs() -> None:
         assert sub["crossover_prob"] == 0.25, sub
         assert sub["mutate_prob"] == 0.75, sub
         assert sub["mean_type"] == "median", sub
-        assert sub["freeze_elites"] is False, sub
+        assert sub["freeze_seats"] is False, sub
         assert sub["crossover_cull_policy"] == "random", sub
         assert sub["mutation_cull_policy"] == "inverse_fitness", sub
         assert sub["crossover_selection"].startswith("tournament"), sub
@@ -191,8 +191,8 @@ def check_engine_knobs() -> None:
         assert sub["checkpoint_every"] == 3, sub
         assert sub["mutation_probation_steps"] == 2, sub
         assert sub["crossover_probation_steps"] == 3, sub
-        assert sub["elite_join_probation_steps"] == 1, sub
-        assert sub["elite_crown_lifetime_steps"] == 7, sub
+        assert sub["seat_join_probation_steps"] == 1, sub
+        assert sub["seat_lifetime_steps"] == 7, sub
         # Artifacts + label.
         assert sub["trace_file"] is True, sub
         assert sub["run_name"] == "knob-check", sub
@@ -248,7 +248,7 @@ def check_defaults_agree() -> None:
     cfg = RaceConfig()
     pairs = {
         "pop_size": cfg.pop_size,
-        "elite_count": cfg.elite_count,
+        "champion_count": cfg.champion_count,
         "max_steps": cfg.max_steps,
         "checkpoint_every": cfg.checkpoint_every,
         "eval_share": cfg.eval_share,
@@ -263,24 +263,24 @@ def check_defaults_agree() -> None:
         "mutate_rolls": cfg.mutate_rolls,
         "crossover_prob": cfg.crossover_prob,
         "mutate_prob": cfg.mutate_prob,
-        "freeze_elites": cfg.freeze_elites,
+        "freeze_seats": cfg.freeze_seats,
         "crossover_cull_policy": cfg.crossover_cull_policy,
         "mutation_cull_policy": cfg.mutation_cull_policy,
         "crossover_ops_pool": cfg.crossover_ops_pool,
         "mutation_probation_steps": cfg.mutation_probation_steps,
         "crossover_probation_steps": cfg.crossover_probation_steps,
-        "elite_join_probation_steps": cfg.elite_join_probation_steps,
-        "elite_crown_lifetime_steps": cfg.elite_crown_lifetime_steps,
+        "seat_join_probation_steps": cfg.seat_join_probation_steps,
+        "seat_lifetime_steps": cfg.seat_lifetime_steps,
         "hidden_dim_stride": cfg.hidden_dim_stride,
         "activation_pool": cfg.activation_pool,
         "combine_op_pool": cfg.combine_op_pool,
         "standardize_op_pool": cfg.standardize_op_pool,
         "csv_export": cfg.csv_export,
         "trace_file": cfg.trace_file,
-        "elite_save_topology": cfg.elite_save_topology,
+        "champion_save_topology": cfg.champion_save_topology,
         "run_name": cfg.run_name,
-        "elite_previous_load": cfg.elite_previous_load,
-        "elite_previous_dir": cfg.elite_previous_dir,
+        "champion_previous_load": cfg.champion_previous_load,
+        "champion_previous_dir": cfg.champion_previous_dir,
     }
     for key, got in pairs.items():
         want = d[key]
@@ -325,7 +325,7 @@ def check_from_arrays() -> None:
     def digest_from_arrays(y, dtype_x):
         with tempfile.TemporaryDirectory(prefix="gras-py-arrays-") as tmp:
             data = Path(tmp) / "data"
-            cfg = RaceConfig(pop_size=4, elite_count=1, max_steps=2, log_level="none")
+            cfg = RaceConfig(pop_size=4, champion_count=1, max_steps=2, log_level="none")
             engine = RaceEngine.from_arrays(
                 dtype_x(x), y, data, cfg, seed=11, run_dir=tmp
             )
@@ -350,7 +350,7 @@ def check_from_arrays() -> None:
     # The directory form reads what the on-ramp wrote — one data format, two doors.
     with tempfile.TemporaryDirectory(prefix="gras-py-arrays-dir-") as tmp:
         data = Path(tmp) / "data"
-        cfg = RaceConfig(pop_size=4, elite_count=1, max_steps=2, log_level="none")
+        cfg = RaceConfig(pop_size=4, champion_count=1, max_steps=2, log_level="none")
         a_dir, b_dir = Path(tmp) / "a", Path(tmp) / "b"
         a_dir.mkdir()
         b_dir.mkdir()
@@ -408,7 +408,7 @@ def check_tasks_and_algos() -> None:
     assert algos() == ["reinforce"], algos()
 
     with tempfile.TemporaryDirectory(prefix="gras-py-task-") as tmp:
-        cfg = RaceConfig(pop_size=4, elite_count=1, max_steps=2, log_level="none")
+        cfg = RaceConfig(pop_size=4, champion_count=1, max_steps=2, log_level="none")
         engine = RaceEngine(DATA_DIR, cfg, seed=3, run_dir=tmp, task="regression")
         assert engine.run() == "MaxSteps"
         recorded = json.loads((Path(tmp) / "engine.json").read_text())["trainer"]
@@ -427,7 +427,7 @@ def check_scripted_env() -> None:
 
     def digest() -> str:
         with tempfile.TemporaryDirectory(prefix="gras-py-rl-") as tmp:
-            cfg = RaceConfig(pop_size=2, elite_count=1, max_steps=2, log_level="none")
+            cfg = RaceConfig(pop_size=2, champion_count=1, max_steps=2, log_level="none")
             engine = RaceEngine.gym(ScriptedEnv(), cfg, seed=5, run_dir=tmp, lr=2e-3)
             assert engine.run() == "MaxSteps"
             meta = json.loads((Path(tmp) / "engine.json").read_text())
@@ -444,7 +444,7 @@ def check_scripted_env() -> None:
     # The objective knob reaches the crate: a discount switches the signal from
     # survival turns to discounted episode return (and records that it did).
     with tempfile.TemporaryDirectory(prefix="gras-py-rl-return-") as tmp:
-        cfg = RaceConfig(pop_size=2, elite_count=1, max_steps=1, log_level="none")
+        cfg = RaceConfig(pop_size=2, champion_count=1, max_steps=1, log_level="none")
         engine = RaceEngine.gym(
             ScriptedEnv(), cfg, seed=5, run_dir=tmp, discount=0.9, challenge_prob=0.0
         )
@@ -470,7 +470,7 @@ def check_cartpole_if_available() -> None:
     with tempfile.TemporaryDirectory(prefix="gras-py-cartpole-") as tmp:
         # One clock, two nets: enough to prove the adapter drives a real
         # environment (ndarray observations, 5-tuple steps, spec.max_episode_steps).
-        cfg = RaceConfig(pop_size=2, elite_count=1, max_steps=1, log_level="none")
+        cfg = RaceConfig(pop_size=2, champion_count=1, max_steps=1, log_level="none")
         engine = RaceEngine.gym(gymnasium.make("CartPole-v1"), cfg, seed=11, run_dir=tmp)
         assert engine.run() == "MaxSteps"
         recorded = json.loads((Path(tmp) / "engine.json").read_text())["trainer"]
@@ -524,7 +524,7 @@ def smoke(cfg_kw=None, engine_kw=None, env=None) -> tuple[dict, list[str]]:
     """
     with tempfile.TemporaryDirectory(prefix="gras-py-menu-") as tmp:
         cfg = RaceConfig(
-            pop_size=2, elite_count=1, max_steps=1, log_level="none", **(cfg_kw or {})
+            pop_size=2, champion_count=1, max_steps=1, log_level="none", **(cfg_kw or {})
         )
         if env is None:
             engine = RaceEngine(DATA_DIR, cfg, seed=1, run_dir=tmp, **(engine_kw or {}))

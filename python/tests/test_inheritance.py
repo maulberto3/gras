@@ -1,8 +1,8 @@
 """Inheritance reads the source run's FINAL TABLE.
 
-Every run ends with `elites.json` — `[{rank, hash, ...}]`, best first, ranked by the
-risk-adjusted fitness the run printed. `RaceConfig(elite_previous_load=True,
-elite_previous_dir=<run>)` seeds the next run's founder slots from exactly that list,
+Every run ends with `champions.json` — `[{rank, hash, ...}]`, best first, ranked by the
+risk-adjusted fitness the run printed. `RaceConfig(champion_previous_load=True,
+champion_previous_dir=<run>)` seeds the next run's founder slots from exactly that list,
 topology only (weights restart from the blueprint's seed). There is no exam and no
 certification step: the table is the verdict.
 
@@ -44,11 +44,11 @@ def make_run(run_dir: Path, seed: int, inherit_from: Path | None = None) -> Race
         BLOBS,
         RaceConfig(
             pop_size=POP,
-            elite_count=1,
+            champion_count=1,
             max_steps=STEPS,
             log_level="none",
-            elite_previous_load=inherit_from is not None,
-            elite_previous_dir=inherit_from,
+            champion_previous_load=inherit_from is not None,
+            champion_previous_dir=inherit_from,
         ),
         seed=seed,
         run_dir=run_dir,
@@ -60,7 +60,7 @@ def test_the_final_table_is_written_and_ranked() -> None:
         run_dir = Path(tmp) / "source"
         engine = make_run(run_dir, 11)
         engine.run()
-        index = json.loads((run_dir / "elites.json").read_text())
+        index = json.loads((run_dir / "champions.json").read_text())
         assert index, "a finished run must write its final table"
         assert index[0]["rank"] == 1, f"the table is not ranked: {index[:2]}"
         assert len(index[0]["hash"]) == 16, f"not a full hash: {index[0]['hash']}"
@@ -72,7 +72,7 @@ def test_the_table_seeds_the_next_run() -> None:
         source_engine = make_run(source, 11)
         source_engine.run()
         source_id = source_engine.run_id
-        champion = json.loads((source / "elites.json").read_text())[0]["hash"]
+        champion = json.loads((source / "champions.json").read_text())[0]["hash"]
         champion_topo = topologies(source)[champion]
 
         child_dir = Path(tmp) / "child"
@@ -90,6 +90,9 @@ def test_a_source_without_a_table_seeds_nothing() -> None:
     with tempfile.TemporaryDirectory(prefix="gras-inherit-none-") as tmp:
         source = Path(tmp) / "no-table"
         make_run(source, 11).run()
+        # Both names go: the legacy alias is a fallback, so leaving `elites.json` behind
+        # would look like a source that still has a table.
+        (source / "champions.json").unlink()
         (source / "elites.json").unlink()
 
         child_dir = Path(tmp) / "child"
@@ -100,7 +103,7 @@ def test_a_source_without_a_table_seeds_nothing() -> None:
             for p in (child_dir / "nets").glob("*.json")
         ]
         assert not [b for b in born if b.startswith("seed:")], (
-            "a source with no elites.json must inherit nothing"
+            "a source with no champions.json must inherit nothing"
         )
 
 

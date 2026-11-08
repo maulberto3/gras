@@ -10,7 +10,7 @@ Determinism is the product: the same seed and config produce the same
 Example
 -------
 >>> from gras import RaceConfig, RaceEngine
->>> cfg = RaceConfig(pop_size=8, elite_count=1, max_steps=3)
+>>> cfg = RaceConfig(pop_size=8, champion_count=1, max_steps=3)
 >>> engine = RaceEngine("data/blobs", cfg, seed=42)
 >>> engine.run()
 'MaxSteps'

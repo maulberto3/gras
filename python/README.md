@@ -19,10 +19,10 @@ pip install gras-nn
 ```python
 import gras
 
-cfg = gras.RaceConfig(pop_size=10, elite_count=1, max_steps=5)
+cfg = gras.RaceConfig(pop_size=10, champion_count=1, max_steps=5)
 engine = gras.RaceEngine("data/mnist", cfg, seed=42)
 engine.run()                # 'MaxSteps'
-print(engine.run_dir)       # results/<timestamp>/ — history.csv, nets/, elites.json
+print(engine.run_dir)       # results/<timestamp>/ — history.csv, nets/, champions.json
 ```
 
 ## Requirements
@@ -98,10 +98,10 @@ build, not universal — CPU and CUDA kernels are different arithmetic.
 |---|---|
 | `engine.json` | the run: seed, clocks, search space, trainer recipe, data dir |
 | `history.csv` | every measured clock: net, fitness, loss, your metric columns |
-| `attempts.csv` | every evolution roll, including the ones that did nothing |
+| `attempts.csv` | every evolution roll, including the ones that did nothing — the last three columns are the mutation novelty gate: Δ to the nearest blueprint, candidates spent, the floor |
 | `nets/<hash>.json` | one blueprint: genome, feature masks, per-port activations |
 | `nets/<hash>.safetensors` / `.optim` | its weights / its optimizer moments |
-| `elites.json` | the ranking a compatible next run can inherit as founders |
+| `champions.json` | the ranking a compatible next run can inherit as founders (a legacy `elites.json` copy rides beside it for one release) |
 | `final-field.csv` | the stopping table — the report you read |
 | `ckpt.json` | the resume frontier |
 

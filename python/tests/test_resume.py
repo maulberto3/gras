@@ -39,7 +39,7 @@ MORE = 5  # the ABSOLUTE budget the resume asks for
 def first_run(tmp: Path) -> tuple[Path, str]:
     """One blobs race; return (run dir, the history it wrote)."""
     run_dir = tmp / "origin"
-    cfg = RaceConfig(pop_size=POP, elite_count=1, max_steps=STEPS, log_level="none")
+    cfg = RaceConfig(pop_size=POP, champion_count=1, max_steps=STEPS, log_level="none")
     RaceEngine(BLOBS, cfg, seed=SEED, run_dir=run_dir).run()
     return run_dir, (run_dir / "history.csv").read_text()
 
@@ -103,7 +103,7 @@ def test_rl_resume_continues_the_recorded_run() -> None:
 
     with tempfile.TemporaryDirectory(prefix="gras-resume-rl-") as tmp:
         run_dir = Path(tmp) / "rl"
-        cfg = RaceConfig(pop_size=2, elite_count=1, max_steps=1, log_level="none")
+        cfg = RaceConfig(pop_size=2, champion_count=1, max_steps=1, log_level="none")
         RaceEngine.gym(gymnasium.make("CartPole-v1"), cfg, seed=SEED, run_dir=run_dir).run()
         before = (run_dir / "history.csv").read_text()
 
@@ -133,7 +133,7 @@ def test_rl_resume_needs_its_environment() -> None:
 
     with tempfile.TemporaryDirectory(prefix="gras-resume-rl-env-") as tmp:
         run_dir = Path(tmp) / "rl"
-        cfg = RaceConfig(pop_size=2, elite_count=1, max_steps=1, log_level="none")
+        cfg = RaceConfig(pop_size=2, champion_count=1, max_steps=1, log_level="none")
         RaceEngine.gym(gymnasium.make("CartPole-v1"), cfg, seed=SEED, run_dir=run_dir).run()
         try:
             RaceEngine.resume(str(run_dir))
