@@ -1,14 +1,17 @@
 //! `RaceConfig`: the engine knobs a Python caller turns.
 //!
 //! The defaults ARE the crate's (`RaceConfig::defaults()`), with two documented
-//! exceptions: λ `0.0` (rank on the plain window mean) and `elite_previous_load`
+//! exceptions: λ `0.0` (rank on the plain window mean) and `champion_previous_load`
 //! off (a Python run never inherits elites from whatever `results/` sits in the
 //! caller's cwd). Anything this class does not expose still inherits the crate
 //! default, because [`PyRaceConfig::into_inner`] starts from `RaceConfig::defaults()`.
 
 use std::path::PathBuf;
 
-use gras::engine::config::{DEFAULT_CHECKPOINT_EVERY, SMOOTHING_WINDOW};
+use gras::engine::config::{
+    DEFAULT_CHECKPOINT_EVERY, DEFAULT_MUTATION_NOVELTY_DRAWS, DEFAULT_MUTATION_NOVELTY_MIN,
+    SMOOTHING_WINDOW,
+};
 use gras::evolution::selection::SelectionMethod;
 use gras::prelude::*;
 use pyo3::exceptions::PyValueError;
@@ -61,7 +64,7 @@ const DEFAULT_EVAL_SHARE: f32 = 0.2;
 ///
 /// Two choices are the binding's own, both to keep a Python run neutral until it
 /// asks otherwise: `risk_aversion` is `0.0` (rank on the plain mean, no charge
-/// for spread) and `elite_previous_load` is `false` (all-random founders).
+/// for spread) and `champion_previous_load` is `false` (all-random founders).
 #[pyclass(name = "RaceConfig", module = "gras._core")]
 #[derive(Clone)]
 pub struct PyRaceConfig {
@@ -69,7 +72,7 @@ pub struct PyRaceConfig {
     #[pyo3(get, set)]
     pub pop_size: usize,
     #[pyo3(get, set)]
-    pub elite_count: usize,
+    pub champion_count: usize,
     /// Step budget. `None` = no cap (the race then stops only on Ctrl+C or a
     /// custom stop); the crate's default, mirrored here, is 10 clocks.
     #[pyo3(get, set)]
@@ -129,9 +132,21 @@ pub struct PyRaceConfig {
     pub crossover_prob: f32,
     #[pyo3(get, set)]
     pub mutate_prob: f32,
+    /// Mutation NOVELTY floor Δ: how far a random immigrant must sit from the NEAREST
+    /// blueprint the run has ever made (founders, crossover children and earlier mutants),
+    /// as a Jaccard distance on the gene multiset — the reading the diversity cards print.
+    /// **`0.0` = the gate off**: one draw, no archive walk, the pre-gate path exactly. The
+    /// crate's default is `0.2` (unrelated nets sit near Δ 0.67; a nearest neighbour 0.17).
+    #[pyo3(get, set)]
+    pub mutation_novelty_min: f32,
+    /// Candidates ONE mutation may spend clearing `mutation_novelty_min` before the most
+    /// novel refusal is taken anyway, so a culled seat is never left empty. The gate biases
+    /// the draw; it never blocks a birth. Crate default `5`.
+    #[pyo3(get, set)]
+    pub mutation_novelty_draws: usize,
     /// The top-k nets act and measure without weight updates.
     #[pyo3(get, set)]
-    pub freeze_elites: bool,
+    pub freeze_seats: bool,
     /// Who a surviving crossover child evicts: `unfed` (default), `worst`, or `random`.
     #[pyo3(get, set)]
     pub crossover_cull_policy: String,
@@ -167,11 +182,11 @@ pub struct PyRaceConfig {
     pub crossover_probation_steps: usize,
     /// A net cannot become an elite until it has aged k clocks since arrival.
     #[pyo3(get, set)]
-    pub elite_join_probation_steps: usize,
+    pub seat_join_probation_steps: usize,
     /// How long a net may stay at peak on the frozen crown before age-elimination;
     /// `0` = permanent until its rank moves.
     #[pyo3(get, set)]
-    pub elite_crown_lifetime_steps: usize,
+    pub seat_lifetime_steps: usize,
 
     // ── search space ────────────────────────────────────────────────────
     /// Hidden-dim sampling range as `(min, max)` inclusive. `None` keeps the
@@ -227,7 +242,7 @@ pub struct PyRaceConfig {
     #[pyo3(get, set)]
     pub trace_file: bool,
     #[pyo3(get, set)]
-    pub elite_save_topology: bool,
+    pub champion_save_topology: bool,
     /// Human label recorded in `engine.json` as `"run_name"`.
     #[pyo3(get, set)]
     pub run_name: Option<String>,
@@ -237,10 +252,10 @@ pub struct PyRaceConfig {
     /// unless the caller asks: the crate's default looks in `results/` relative
     /// to the cwd, which for a notebook is whatever the kernel was started in.
     #[pyo3(get, set)]
-    pub elite_previous_load: bool,
-    /// Where `elite_previous_load` looks: a run dir or a dir of run dirs.
+    pub champion_previous_load: bool,
+    /// Where `champion_previous_load` looks: a run dir or a dir of run dirs.
     #[pyo3(get, set)]
-    pub elite_previous_dir: Option<PathBuf>,
+    pub champion_previous_dir: Option<PathBuf>,
 }
 
 #[pymethods]
@@ -249,7 +264,7 @@ impl PyRaceConfig {
     #[pyo3(signature = (
         // population + ranking
         pop_size = DEFAULT_POP_SIZE,
-        elite_count = 1,
+        champion_count = 1,
         max_steps = DEFAULT_MAX_STEPS,
         eval_share = DEFAULT_EVAL_SHARE,
         smoothing_window = SMOOTHING_WINDOW,
@@ -258,14 +273,16 @@ impl PyRaceConfig {
         train_merit = DEFAULT_TRAIN_MERIT,
         train_merit_p_min = DEFAULT_TRAIN_MERIT_P_MIN,
         drift_prob = DEFAULT_DRIFT_PROB,
-        elite_previous_load = false,
+        champion_previous_load = false,
         log_level = String::from("summ"),
         // evolution
         crossover_rolls = DEFAULT_CROSSOVER_ROLLS,
         mutate_rolls = DEFAULT_MUTATE_ROLLS,
         crossover_prob = DEFAULT_CROSSOVER_PROB,
         mutate_prob = DEFAULT_MUTATE_PROB,
-        freeze_elites = true,
+        mutation_novelty_min = DEFAULT_MUTATION_NOVELTY_MIN,
+        mutation_novelty_draws = DEFAULT_MUTATION_NOVELTY_DRAWS,
+        freeze_seats = true,
         crossover_cull_policy = String::from("unfed"),
         mutation_cull_policy = String::from("unfed"),
         crossover_selection = String::from("tournament"),
@@ -275,8 +292,8 @@ impl PyRaceConfig {
         checkpoint_every = DEFAULT_CHECKPOINT_EVERY,
         mutation_probation_steps = DEFAULT_PROBATION_STEPS,
         crossover_probation_steps = DEFAULT_PROBATION_STEPS,
-        elite_join_probation_steps = DEFAULT_PROBATION_STEPS,
-        elite_crown_lifetime_steps = DEFAULT_PROBATION_STEPS,
+        seat_join_probation_steps = DEFAULT_PROBATION_STEPS,
+        seat_lifetime_steps = DEFAULT_PROBATION_STEPS,
         // search space
         hidden_dim_pool = None,
         hidden_dim_stride = DEFAULT_HIDDEN_DIM_STRIDE,
@@ -292,9 +309,9 @@ impl PyRaceConfig {
         // artifacts
         csv_export = true,
         trace_file = false,
-        elite_save_topology = true,
+        champion_save_topology = true,
         run_name = None,
-        elite_previous_dir = None,
+        champion_previous_dir = None,
     ))]
     // A config's kwargs ARE its API: bundling them into an object would buy the
     // lint nothing and cost the caller a line per knob. Explicitly out of scope
@@ -302,7 +319,7 @@ impl PyRaceConfig {
     #[allow(clippy::too_many_arguments)]
     fn new(
         pop_size: usize,
-        elite_count: usize,
+        champion_count: usize,
         max_steps: Option<usize>,
         eval_share: f32,
         smoothing_window: usize,
@@ -311,13 +328,15 @@ impl PyRaceConfig {
         train_merit: f32,
         train_merit_p_min: f32,
         drift_prob: f32,
-        elite_previous_load: bool,
+        champion_previous_load: bool,
         log_level: String,
         crossover_rolls: usize,
         mutate_rolls: usize,
         crossover_prob: f32,
         mutate_prob: f32,
-        freeze_elites: bool,
+        mutation_novelty_min: f32,
+        mutation_novelty_draws: usize,
+        freeze_seats: bool,
         crossover_cull_policy: String,
         mutation_cull_policy: String,
         crossover_selection: String,
@@ -326,8 +345,8 @@ impl PyRaceConfig {
         checkpoint_every: usize,
         mutation_probation_steps: usize,
         crossover_probation_steps: usize,
-        elite_join_probation_steps: usize,
-        elite_crown_lifetime_steps: usize,
+        seat_join_probation_steps: usize,
+        seat_lifetime_steps: usize,
         hidden_dim_pool: Option<(usize, usize)>,
         hidden_dim_stride: usize,
         hidden_nodes_pool: Option<(usize, usize)>,
@@ -341,13 +360,13 @@ impl PyRaceConfig {
         feature_split_pool: Vec<String>,
         csv_export: bool,
         trace_file: bool,
-        elite_save_topology: bool,
+        champion_save_topology: bool,
         run_name: Option<String>,
-        elite_previous_dir: Option<PathBuf>,
+        champion_previous_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             pop_size,
-            elite_count,
+            champion_count,
             max_steps,
             eval_share,
             smoothing_window,
@@ -358,7 +377,7 @@ impl PyRaceConfig {
             drift_prob,
             // OFF by default: a Python run must not silently inherit elites from
             // whatever `results/` happens to sit in the caller's cwd.
-            elite_previous_load,
+            champion_previous_load,
             // `summ` matches every Rust example's default: a race reports one
             // line per step instead of running silently.
             log_level,
@@ -366,7 +385,9 @@ impl PyRaceConfig {
             mutate_rolls,
             crossover_prob,
             mutate_prob,
-            freeze_elites,
+            mutation_novelty_min,
+            mutation_novelty_draws,
+            freeze_seats,
             crossover_cull_policy,
             mutation_cull_policy,
             crossover_selection,
@@ -375,8 +396,8 @@ impl PyRaceConfig {
             checkpoint_every,
             mutation_probation_steps,
             crossover_probation_steps,
-            elite_join_probation_steps,
-            elite_crown_lifetime_steps,
+            seat_join_probation_steps,
+            seat_lifetime_steps,
             hidden_dim_pool,
             hidden_dim_stride,
             hidden_nodes_pool,
@@ -390,9 +411,9 @@ impl PyRaceConfig {
             feature_split_pool,
             csv_export,
             trace_file,
-            elite_save_topology,
+            champion_save_topology,
             run_name,
-            elite_previous_dir,
+            champion_previous_dir,
         }
     }
 
@@ -400,16 +421,84 @@ impl PyRaceConfig {
     /// `engine.json`; printing 39 of them would bury the ones people change.
     fn __repr__(&self) -> String {
         format!(
-            "RaceConfig(pop_size={}, elite_count={}, max_steps={:?}, smoothing_window={}, \
-             risk_aversion={}, elite_previous_load={}, log_level={:?})",
+            "RaceConfig(pop_size={}, champion_count={}, max_steps={:?}, smoothing_window={}, \
+             risk_aversion={}, champion_previous_load={}, log_level={:?})",
             self.pop_size,
-            self.elite_count,
+            self.champion_count,
             self.max_steps,
             self.smoothing_window,
             self.risk_aversion,
-            self.elite_previous_load,
+            self.champion_previous_load,
             self.log_level
         )
+    }
+
+    // ── deprecated spellings (one release) ──────────────────────────────
+    // The vocabulary split three ways: CHAMPIONS (the saved, inheritable ranking), SEATS (the
+    // frozen act-only switch) and the guard. These properties keep a notebook written before
+    // the rename working, so the words can change without breaking a caller's cell.
+    /// Deprecated: use `champion_count`.
+    #[getter(elite_count)]
+    fn get_elite_count_legacy(&self) -> usize {
+        self.champion_count
+    }
+    #[setter(elite_count)]
+    fn set_elite_count_legacy(&mut self, value: usize) {
+        self.champion_count = value;
+    }
+    /// Deprecated: use `freeze_seats`.
+    #[getter(freeze_elites)]
+    fn get_freeze_elites_legacy(&self) -> bool {
+        self.freeze_seats
+    }
+    #[setter(freeze_elites)]
+    fn set_freeze_elites_legacy(&mut self, value: bool) {
+        self.freeze_seats = value;
+    }
+    /// Deprecated: use `seat_join_probation_steps`.
+    #[getter(elite_join_probation_steps)]
+    fn get_elite_join_probation_steps_legacy(&self) -> usize {
+        self.seat_join_probation_steps
+    }
+    #[setter(elite_join_probation_steps)]
+    fn set_elite_join_probation_steps_legacy(&mut self, value: usize) {
+        self.seat_join_probation_steps = value;
+    }
+    /// Deprecated: use `seat_lifetime_steps`.
+    #[getter(elite_crown_lifetime_steps)]
+    fn get_elite_crown_lifetime_steps_legacy(&self) -> usize {
+        self.seat_lifetime_steps
+    }
+    #[setter(elite_crown_lifetime_steps)]
+    fn set_elite_crown_lifetime_steps_legacy(&mut self, value: usize) {
+        self.seat_lifetime_steps = value;
+    }
+    /// Deprecated: use `champion_save_topology`.
+    #[getter(elite_save_topology)]
+    fn get_elite_save_topology_legacy(&self) -> bool {
+        self.champion_save_topology
+    }
+    #[setter(elite_save_topology)]
+    fn set_elite_save_topology_legacy(&mut self, value: bool) {
+        self.champion_save_topology = value;
+    }
+    /// Deprecated: use `champion_previous_load`.
+    #[getter(elite_previous_load)]
+    fn get_elite_previous_load_legacy(&self) -> bool {
+        self.champion_previous_load
+    }
+    #[setter(elite_previous_load)]
+    fn set_elite_previous_load_legacy(&mut self, value: bool) {
+        self.champion_previous_load = value;
+    }
+    /// Deprecated: use `champion_previous_dir`.
+    #[getter(elite_previous_dir)]
+    fn get_elite_previous_dir_legacy(&self) -> Option<PathBuf> {
+        self.champion_previous_dir.clone()
+    }
+    #[setter(elite_previous_dir)]
+    fn set_elite_previous_dir_legacy(&mut self, value: Option<PathBuf>) {
+        self.champion_previous_dir = value;
     }
 }
 
@@ -530,7 +619,7 @@ impl PyRaceConfig {
 
         let mut cfg = gras::RaceConfig::defaults();
         cfg.pop_size = self.pop_size;
-        cfg.elite_count = self.elite_count;
+        cfg.champion_count = self.champion_count;
         cfg.max_steps = self.max_steps;
         // Same bounds the crate's setter enforces: outside them a pool can round
         // to empty (`split_indices` then hands the whole dataset to eval).
@@ -559,13 +648,21 @@ impl PyRaceConfig {
         } else {
             0.0
         };
-        cfg.elite_previous_load = self.elite_previous_load;
+        cfg.champion_previous_load = self.champion_previous_load;
         cfg.log_level = log_level;
         cfg.crossover_rolls = self.crossover_rolls;
         cfg.mutate_rolls = self.mutate_rolls;
         cfg.crossover_prob = self.crossover_prob;
         cfg.mutate_prob = self.mutate_prob;
-        cfg.freeze_elites = self.freeze_elites;
+        // The gate's two numbers take the same bounds the crate's setters enforce, so a typed
+        // slip reads as "off" / "one draw" in both languages instead of a mid-race surprise.
+        cfg.mutation_novelty_min = if self.mutation_novelty_min.is_finite() {
+            self.mutation_novelty_min.max(0.0)
+        } else {
+            0.0
+        };
+        cfg.mutation_novelty_draws = self.mutation_novelty_draws.max(1);
+        cfg.freeze_seats = self.freeze_seats;
         cfg.crossover_cull_policy = crossover_cull_policy;
         cfg.mutation_cull_policy = mutation_cull_policy;
         cfg.crossover_selection = crossover_selection;
@@ -573,8 +670,8 @@ impl PyRaceConfig {
         cfg.checkpoint_every = self.checkpoint_every;
         cfg.mutation_probation_steps = self.mutation_probation_steps;
         cfg.crossover_probation_steps = self.crossover_probation_steps;
-        cfg.elite_join_probation_steps = self.elite_join_probation_steps;
-        cfg.elite_crown_lifetime_steps = self.elite_crown_lifetime_steps;
+        cfg.seat_join_probation_steps = self.seat_join_probation_steps;
+        cfg.seat_lifetime_steps = self.seat_lifetime_steps;
         if let Some(pool) = hidden_dim_pool {
             cfg.hidden_dim_pool = Some(pool);
         }
@@ -610,9 +707,9 @@ impl PyRaceConfig {
         cfg.validate_search_pools().map_err(PyValueError::new_err)?;
         cfg.csv_export = self.csv_export;
         cfg.trace_file = self.trace_file;
-        cfg.elite_save_topology = self.elite_save_topology;
+        cfg.champion_save_topology = self.champion_save_topology;
         cfg.run_name = self.run_name;
-        cfg.elite_previous_dir = self.elite_previous_dir;
+        cfg.champion_previous_dir = self.champion_previous_dir;
 
         Ok((cfg, verbosity))
     }

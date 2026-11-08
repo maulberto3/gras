@@ -7,7 +7,7 @@
 //! `RaceConfig::defaults()`, with the two deliberate Python divergences applied and
 //! re-stated in `binding_overrides`: a Python run ranks on the plain mean
 //! (`risk_aversion = 0.0`, not the crate's FIT 1.0) and starts all-random
-//! (`elite_previous_load = false`).
+//! (`champion_previous_load = false`).
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -30,13 +30,13 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
 
     // ── run / ranking ───────────────────────────────────────────────────
     d.set_item("pop_size", cfg.pop_size)?;
-    d.set_item("elite_count", cfg.elite_count)?;
+    d.set_item("champion_count", cfg.champion_count)?;
     d.set_item("max_steps", cfg.max_steps)?;
     d.set_item("checkpoint_every", cfg.checkpoint_every)?;
     // The EVAL share of a single-pool dataset (0.2 = 80/20). A `train/`+`test/`
     // dir states its own split, so this is the "gras decides" default.
     d.set_item("eval_share", round32(cfg.eval_share))?;
-    d.set_item("freeze_elites", cfg.freeze_elites)?;
+    d.set_item("freeze_seats", cfg.freeze_seats)?;
     d.set_item("smoothing_window", cfg.smoothing_window)?;
     d.set_item("mean_type", cfg.mean_type.to_string())?;
     // The BINDING's values: the two knobs a Python run does not inherit from the crate.
@@ -53,6 +53,10 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("mutate_rolls", cfg.mutate_rolls)?;
     d.set_item("crossover_prob", round32(cfg.crossover_prob))?;
     d.set_item("mutate_prob", round32(cfg.mutate_prob))?;
+    // The mutation novelty gate: `0.0` is OFF (one draw), so the default 0.2 is a real
+    // setting, not a neutral zero — it is the crate's measured clone band.
+    d.set_item("mutation_novelty_min", round32(cfg.mutation_novelty_min))?;
+    d.set_item("mutation_novelty_draws", cfg.mutation_novelty_draws)?;
     d.set_item("crossover_selection", cfg.crossover_selection.to_string())?;
     d.set_item(
         "crossover_cull_policy",
@@ -62,8 +66,8 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("crossover_ops_pool", cfg.crossover_ops_pool.clone())?;
     d.set_item("mutation_probation_steps", cfg.mutation_probation_steps)?;
     d.set_item("crossover_probation_steps", cfg.crossover_probation_steps)?;
-    d.set_item("elite_join_probation_steps", cfg.elite_join_probation_steps)?;
-    d.set_item("elite_crown_lifetime_steps", cfg.elite_crown_lifetime_steps)?;
+    d.set_item("seat_join_probation_steps", cfg.seat_join_probation_steps)?;
+    d.set_item("seat_lifetime_steps", cfg.seat_lifetime_steps)?;
 
     // ── search space (the blueprint the Python surface only shows as `None`) ──
     d.set_item(
@@ -103,12 +107,12 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("csv_export", cfg.csv_export)?;
     d.set_item("trace_file", cfg.trace_file)?;
     d.set_item("save_optim", cfg.save_optim)?;
-    d.set_item("elite_save_topology", cfg.elite_save_topology)?;
+    d.set_item("champion_save_topology", cfg.champion_save_topology)?;
     d.set_item("run_name", cfg.run_name.clone())?;
-    d.set_item("elite_previous_load", false)?;
+    d.set_item("champion_previous_load", false)?;
     d.set_item(
-        "elite_previous_dir",
-        cfg.elite_previous_dir
+        "champion_previous_dir",
+        cfg.champion_previous_dir
             .as_ref()
             .map(|p| p.display().to_string()),
     )?;
@@ -122,10 +126,10 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
         kv.set_item("crate", round32(gras::engine::config::RISK_AVERSION))?;
         kv
     })?;
-    overrides.set_item("elite_previous_load", {
+    overrides.set_item("champion_previous_load", {
         let kv = PyDict::new(py);
         kv.set_item("binding", false)?;
-        kv.set_item("crate", cfg.elite_previous_load)?;
+        kv.set_item("crate", cfg.champion_previous_load)?;
         kv
     })?;
     d.set_item("binding_overrides", overrides)?;
