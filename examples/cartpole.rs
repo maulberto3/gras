@@ -264,7 +264,7 @@ const RISK_AVERSION: f32 = 0.5;
 // the probability of a net being selected for training in each step.
 /// A value between 0.0 and 1.0, where 1.0 means every net has a chance to be
 //  selected for training, and 0.0 means no net is selected.
-const TRAIN_LOTTERY: f32 = 0.75;
+const TRAIN_LOTTERY: f32 = 0.95;
 const CHECKPOINT_EVERY: usize = 20;
 
 /// The smoke-test CLI: `--pop`, `--max-steps`, `--seed`, `--log-level`,
@@ -457,7 +457,7 @@ fn main() {
         .set_run_risk_aversion(cli.risk_aversion.unwrap_or(RISK_AVERSION))
         .set_run_train_merit(cli.train_lottery.unwrap_or(TRAIN_LOTTERY))
         .set_run_train_merit_p_min(cli.merit_p_min.unwrap_or(0.05))
-        .set_run_train_merit_p_max(cli.merit_p_max.unwrap_or(0.4))
+        .set_run_train_merit_p_max(cli.merit_p_max.unwrap_or(0.95))
         .set_run_train_merit_inverted(cli.invert_merit.unwrap_or(true))
         .set_run_train_age(cli.train_age.unwrap_or(true))
         // .set_run_metrics(vec![Metric::custom("eval_survival_min", f)]) — extra history.csv column
