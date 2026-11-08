@@ -7,7 +7,7 @@
 //!
 //! ```python
 //! from safetensors.torch import load_file
-//! tensors = load_file("elite-0b9891b7.safetensors")
+//! tensors = load_file("champion-0b9891b7.safetensors")
 //! ```
 //!
 //! Naming convention — **two families**, both required:
