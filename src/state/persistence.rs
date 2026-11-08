@@ -144,6 +144,15 @@ pub struct ConfigSnapshot {
     /// which is exactly what every header written before the flag recorded.
     #[serde(default)]
     pub train_merit_learn_only: bool,
+    /// POLICY-SCOPED window stats (`set_run_policy_stats`): `true` = mean/spread/n describe the
+    /// CURRENT weights. `default` = `false`, which is exactly what every header written before the
+    /// flag recorded (the last-K-readings window).
+    #[serde(default)]
+    pub policy_stats: bool,
+    /// ANTI-CHAMPION dump (`set_worst_save_topology`): `true` writes the top-ticket-chance nets'
+    /// markdown at stop. `default` = `false` for every header written before the knob.
+    #[serde(default)]
+    pub worst_save_topology: bool,
     /// Fitter parent as the crossover base (`set_crossover_fitter_base`): `true` (the default)
     /// orders both drawn parents best-first, so the child keeps the BETTER one's skeleton.
     #[serde(default)]
@@ -259,6 +268,8 @@ impl ConfigSnapshot {
             train_merit_p_max: cfg.train_merit_p_max,
             train_merit_inverted: cfg.train_merit_inverted,
             train_merit_learn_only: cfg.train_merit_learn_only,
+            policy_stats: cfg.policy_stats,
+            worst_save_topology: cfg.worst_save_topology,
             train_age: cfg.train_age,
             crossover_fitter_base: cfg.crossover_fitter_base,
             legacy_train_lottery: None,
