@@ -377,6 +377,56 @@ impl CoreEngine {
             ),
         ));
 
+        // What the DRAW did, not just what it cost: the novelty gate's own reading at birth.
+        if self.births.births > 0 || self.births.duplicates > 0 {
+            let b = &self.births;
+            let dash = || "—".to_string();
+            let rows = vec![
+                ("immigrants born".to_string(), b.births.to_string()),
+                (
+                    "candidates spent".to_string(),
+                    format!(
+                        "{} = {:.2} per birth · max {}",
+                        b.draws,
+                        b.draws_per_birth(),
+                        b.draws_max
+                    ),
+                ),
+                (
+                    "re-drawn (first refused)".to_string(),
+                    b.redrawn.to_string(),
+                ),
+                (
+                    "Δ to nearest archive".to_string(),
+                    match (b.mean_delta(), b.delta_min) {
+                        (Some(mean), Some(min)) => format!(
+                            "mean {} · min {} over {} judged",
+                            fmt_cfg(mean),
+                            fmt_cfg(min),
+                            b.delta_births
+                        ),
+                        _ => dash(),
+                    },
+                ),
+                ("novelty floor (Δ)".to_string(), fmt_cfg(self.novelty.min())),
+                (
+                    "archive (blueprints seen)".to_string(),
+                    self.novelty.len().to_string(),
+                ),
+                (
+                    "crossover duplicate(s) discarded".to_string(),
+                    b.duplicates.to_string(),
+                ),
+            ];
+            crate::utils::cfy::emit(&crate::utils::cfy::card(
+                "Births & novelty",
+                &crate::utils::cfy::kv(&rows),
+                Some(
+                    "Δ = multiset-Jaccard distance from the child's blueprint to the CLOSEST one the run has ever seen (0 = identical, 1 = nothing in common); a mutation draw spends up to `mutation_novelty_draws` candidates to clear the floor and takes the most novel refusal when it cannot",
+                ),
+            ));
+        }
+
         // NOT here: the final-field TABLE is an artifact first — it is written at every log level,
         // `None` included — so `finish_race` renders it after this block, gating only the card
         Ok(())
@@ -997,7 +1047,7 @@ impl CoreEngine {
                 &rows.into_iter().map(|(_, _, row)| row).collect::<Vec<_>>(),
             ),
             Some(&format!(
-                "F = the net's smoothed risk-adjusted score (K-reading mean of window avg ∓ λ × window spread, the ranking's number) · M = clocks the net was measured on, real updates + crown act passes · `F ÷ U` = F ÷ its update count (this debug view only — the final table carries no efficiency column): informational — what one optimizer step bought, so a cheap net reads from an expensive one · field THIS clock drew from: best {} worst {} · T = where the net's SCORE sits between those two bounds as the graded fraction f = the product above (Fm × Ym, or Fm with the age leg off; Fm = 1 at the BEST end, 0 at the worst — unless the tilt says otherwise, and this run is {}), then paid between the two ends Ω leaves — `lo = 1 − Ω·(1 − p_min {})`, `hi = 1 − Ω·(1 − p_max {})`, `p = lo + (hi − lo) × f` — so Ω < 1 lifts every net toward 1 = always train · the coin is a seeded `fastrand` draw `d ∈ [0,1)` compared to `p`: `d < p` sells the ticket, otherwise the clock idles · ticket? = yes if THIS clock sells it the step (train + eval), no if it IDLES instead (no train, no eval, nothing measured) · exempt nets (crown, born shield) always run and grade 1.00 — but a crown reads no, because the crown's act pass outranks the lottery · idle = clocks the lottery left it idle BEFORE this clock ({} across the run); the step's lottery line names this clock's count",
+                "F = the net's smoothed risk-adjusted score (K-reading mean of window avg ∓ λ × window spread, the ranking's number) · M = clocks the net was measured on: real updates + act-only passes (the crown's, and every ticket the coin denied while `train_merit_learn_only` is on) · `F ÷ U` = F ÷ its update count (this debug view only — the final table carries no efficiency column): informational — what one optimizer step bought, so a cheap net reads from an expensive one · field THIS clock drew from: best {} worst {} · T = where the net's SCORE sits between those two bounds as the graded fraction f = the product above (Fm × Ym, or Fm with the age leg off; Fm = 1 at the BEST end, 0 at the worst — unless the tilt says otherwise, and this run is {}), then paid between the two ends Ω leaves — `lo = 1 − Ω·(1 − p_min {})`, `hi = 1 − Ω·(1 − p_max {})`, `p = lo + (hi − lo) × f` — so Ω < 1 lifts every net toward 1 = always train · the coin is a seeded `fastrand` draw `d ∈ [0,1)` compared to `p`: `d < p` sells the ticket, otherwise the coin withholds the weight UPDATE — with `train_merit_learn_only` on the net still acts and measures on a fresh batch, with it off the clock idles (no train, no eval, nothing measured) · ticket? = yes if THIS clock sells it the weight update; `no` means it did not learn, which with the flag off means it did nothing at all · exempt nets (crown, born shield) always run and grade 1.00 — but a crown reads no, because the crown's act pass outranks the lottery · idle = clocks the lottery left it idle BEFORE this clock ({} across the run); the step's lottery line names this clock's count",
                 fmt_cfg(best),
                 fmt_cfg(worst),
                 self.lottery_tilt(),
@@ -1064,6 +1114,48 @@ impl CoreEngine {
             100.0 * a.uniform_cx_swaps as f32 / a.uniform_cx_pairs as f32,
             a.uniform_cx_swaps as f32 / births,
             a.uniform_cx_pairs as f32 / births,
+        );
+    }
+
+    /// The mutation gate's reading, cumulative: how DIFFERENT the immigrants that were born turned
+    /// out to be (Δ to the nearest archived blueprint) and what each birth cost in candidates. The
+    /// same numbers the stop card's `Births & novelty` table prints, so a watched run and a finished
+    /// one cannot disagree.
+    pub(crate) fn log_birth_draws(&self, clock: usize) {
+        let every = self.config.checkpoint_every;
+        if every == 0
+            || self.log_level == crate::engine::config::LogLevel::None
+            || clock % every != 0
+        {
+            return;
+        }
+        let b = &self.births;
+        if b.births == 0 && b.duplicates == 0 {
+            return;
+        }
+        let delta = match (b.mean_delta(), b.delta_min) {
+            (Some(mean), Some(min)) => format!(
+                "mean Δ {} · min {} over {} judged birth(s) · floor {}",
+                fmt_cfg(mean),
+                fmt_cfg(min),
+                b.delta_births,
+                fmt_cfg(self.novelty.min())
+            ),
+            // Gate off (or every blueprint unreadable): say WHICH, never a fake Δ.
+            _ if self.novelty.enabled() => "no Δ reading (blueprint unreadable)".to_string(),
+            _ => "no Δ reading (novelty gate off)".to_string(),
+        };
+        info!(
+            "step {} │ births │ {} immigrant(s) │ {} candidate(s) spent ({:.2} per birth, max {}) · re-drawn {} │ {} │ {} seen │ {} crossover duplicate(s) discarded",
+            clock,
+            b.births,
+            b.draws,
+            b.draws_per_birth(),
+            b.draws_max,
+            b.redrawn,
+            delta,
+            self.novelty.len(),
+            b.duplicates,
         );
     }
 
@@ -1135,10 +1227,18 @@ impl CoreEngine {
         // `won` is what it actually produced. The gap is the coin, not a bug.
         let expected = p_bar.map_or_else(|| "—".to_string(), |p| fmt_line(p * graded as f32));
         let omega = self.config.train_merit;
+        // Under learn-only the denied nets RAN and were measured: the same count is named
+        // "act-only" — it is the coin's loss, not a missing row.
+        let lost = if self.config.train_merit_learn_only {
+            "act-only"
+        } else {
+            "idled"
+        };
         let body = format!(
-            "graded {} = won {} + idled {} │ ticketed {} = won {} + exempt {} │ avg ticket chance {} over the {} graded → expected {}, drawn {} │ field: best {} worst {} │ avg updates {} and avg tickets {} over the {} measured nets │ exempt = crown or born shield (always run)",
+            "graded {} = won {} + {} {} │ ticketed {} = won {} + exempt {} │ avg ticket chance {} over the {} graded → expected {}, drawn {} │ field: best {} worst {} │ avg updates {} and avg tickets {} over the {} measured nets │ exempt = crown or born shield (always run)",
             graded,
             won,
+            lost,
             idled,
             ticketed,
             won,
@@ -1194,7 +1294,7 @@ const COL_TICKET: &str = "ticket minmax (T = lo + (hi − lo) × Fm × Ym)";
 /// The ticket under the INVERTED ordering: it multiplies the MIRRORED place, so the equation must
 /// name the cell actually on its left (`Fm⁻`), not the best-first `Fm` it no longer reads.
 const COL_TICKET_TILTED: &str = "ticket minmax (T = lo + (hi − lo) × Fm⁻ × Ym)";
-/// The ticket with the AGE leg OFF (`set_run_train_age(false)`): nothing multiplies the place, so
+/// The ticket with the AGE leg OFF (`set_run_train_merit_age(false)`): nothing multiplies the place, so
 /// the equation must not name a `Ym` the table does not print.
 const COL_TICKET_NO_AGE: &str = "ticket minmax (T = lo + (hi − lo) × Fm)";
 /// The no-age ticket under the inverted ordering.
@@ -1210,7 +1310,7 @@ fn fit_minmax_column(inverted: bool) -> &'static str {
 }
 
 /// The ticket cell this run prints — named after the place it actually multiplies and the legs
-/// the setters actually armed (`set_run_train_merit_inverted`, `set_run_train_age`).
+/// the setters actually armed (`set_run_train_merit_inverted`, `set_run_train_merit_age`).
 fn ticket_column(inverted: bool, age_leg: bool) -> &'static str {
     match (inverted, age_leg) {
         (false, true) => COL_TICKET,
@@ -1291,7 +1391,7 @@ struct LegendCtx<'a> {
     mean_type: crate::engine::config::MeanType,
     /// Worst-first: the place is mirrored, so the place cell and the ticket equation name `Fm⁻`.
     inverted: bool,
-    /// The age leg (`set_run_train_age`): ARMED, `Ym` is a column and a factor; OFF, the ticket
+    /// The age leg (`set_run_train_merit_age`): ARMED, `Ym` is a column and a factor; OFF, the ticket
     /// equation names the place alone, because a factor the table does not print cannot be read.
     age_leg: bool,
 
@@ -1412,12 +1512,12 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
                         format!("the single leg on its LEFT (`{place}`)")
                     };
                     let arm = if ctx.age_leg {
-                        "The age leg is ARMED (`set_run_train_age(true)`), so `Ym` multiplies the place and an older net's cell falls"
+                        "The age leg is ARMED (`set_run_train_merit_age(true)`), so `Ym` multiplies the place and an older net's cell falls"
                     } else {
-                        "The age leg is OFF (`set_run_train_age(false)`), so nothing multiplies the place and the cell is one step from it"
+                        "The age leg is OFF (`set_run_train_merit_age(false)`), so nothing multiplies the place and the cell is one step from it"
                     };
                     format!(
-                        "the chance the coin gave this net on the LAST clock it dealt (clock {}): {eq}, {legs}, between the two ends Ω leaves (`lo`, `hi` stated with their numbers in the `F field · Ω` row) — and `T` is the probability ITSELF, on the coin's own line: the draw is `d = fastrand ∈ [0,1)` and the net trains iff `d < T`, so `lo` and `hi` are the share of the unit interval the field's chances cover (`T = 1` trains every clock, `T = 0` never). {arm}. `—` when the coin was not thrown for this net: the lottery is off or was never armed, it holds a crown seat (the act pass outranks the coin), it is inside its born shield, it has no reading yet, or the graded field had no spread to place it in. Those nets always run, but a number here would claim a draw they never took part in. Under tilt {} this column FALLS as `fit (F)` rises",
+                        "the chance the coin gave this net on the LAST clock it dealt (clock {}): {eq}, {legs}, between the two ends Ω leaves (`lo`, `hi` stated with their numbers in the `F field · Ω` row) — and `T` is the probability ITSELF, on the coin's own line: the draw is `d = fastrand ∈ [0,1)` and the net LEARNS iff `d < T` — a lost draw still acts and measures when `train_merit_learn_only` is on, so `lo` and `hi` are the share of the unit interval the field's chances cover (`T = 1` trains every clock, `T = 0` never). {arm}. `—` when the coin was not thrown for this net: the lottery is off or was never armed, it holds a crown seat (the act pass outranks the coin), it is inside its born shield, it has no reading yet, or the graded field had no spread to place it in. Those nets always run, but a number here would claim a draw they never took part in. Under tilt {} this column FALLS as `fit (F)` rises",
                         ctx.dealt_clock,
                         ctx.tilt
                     )
