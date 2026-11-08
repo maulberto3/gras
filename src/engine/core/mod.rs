@@ -16,7 +16,7 @@ pub(crate) use crate::utils::fitness::{Fitness, FitnessLabel, Metric};
 
 pub(crate) use super::config::{RaceConfig, StopReason};
 pub(crate) use super::format::{build_stamp, csv_field, fmt_cfg, fmt_line};
-pub(crate) use super::smoothing::{RollingBuffer, WindowStats, rolling_stats_with};
+pub(crate) use super::smoothing::{RollingBuffer, WindowStats, rolling_stats_tail};
 
 // ── CoreEngine ───────────────────────────────────────────────────────────────
 
@@ -89,6 +89,10 @@ pub struct CoreEngine {
     pub(crate) rolling_fitness: HashMap<String, RollingBuffer>,
     pub(crate) rolling_train: HashMap<String, RollingBuffer>,
     pub(crate) rolling_eval: HashMap<String, RollingBuffer>,
+    /// Readings pushed since the net's last REAL weight update — the epoch `policy_stats` averages
+    /// over. A missing entry (a test pushing straight into the buffer) reads the WHOLE buffer,
+    /// which is the flag-off behaviour, so no caller can silently get an empty window.
+    pub(crate) rolling_epoch: HashMap<String, usize>,
     /// The ticket probability the coin last COMPARED for each net, captured AT THE DRAW
     /// (`step_one_net_in_frame`).
     pub(crate) last_ticket_p: HashMap<String, f32>,
@@ -181,6 +185,7 @@ impl CoreEngine {
             rolling_fitness: HashMap::new(),
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
+            rolling_epoch: HashMap::new(),
             last_ticket_p: HashMap::new(),
             started_at_wall: std::time::Instant::now(),
             elapsed_base_secs: 0,
@@ -577,6 +582,7 @@ impl CoreEngine {
             rolling_fitness: HashMap::new(),
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
+            rolling_epoch: HashMap::new(),
             last_ticket_p: HashMap::new(),
             started_at_wall: std::time::Instant::now(),
             elapsed_base_secs: 0,
@@ -700,6 +706,7 @@ impl CoreEngine {
                 hash.clone(),
                 RollingBuffer::new(self.config.smoothing_window),
             );
+            self.rolling_epoch.insert(hash.clone(), 0);
             self.state.insert(state, initial_fitness);
         }
         let count = self.state.live_count();
@@ -980,8 +987,13 @@ impl CoreEngine {
                 (
                     "reading".to_string(),
                     format!(
-                        "avg = mean of the last K={} readings · spread = how variable those readings are · SE = spread/√n = how well the mean is known · n = readings behind it",
-                        self.config.smoothing_window
+                        "avg = mean of the last K={} readings{} · spread = how variable those readings are · SE = spread/√n = how well the mean is known · n = readings behind it",
+                        self.config.smoothing_window,
+                        if self.config.policy_stats {
+                            " taken on the CURRENT weights (policy_stats: n resets at every real update, so `n = 1` is one datapoint of one policy, no spread)"
+                        } else {
+                            ""
+                        }
                     ),
                 ),
                 (
@@ -1601,6 +1613,8 @@ impl CoreEngine {
         // it must land on disk at every log level, even `None`.
         self.write_champion_index()?;
         self.write_champion_markdown()?;
+        // The mirror artifact: the nets the coin is FEEDING, not the ones it crowned.
+        self.write_worst_markdown(clock)?;
         // `None` mode stays silent until the caller's final stop print.
         if self.verbose_detail() {
             // CFY: the stop banner is a table too.

@@ -44,6 +44,12 @@ impl CoreEngine {
             format!("set_run_risk_aversion({})", fmt_cfg(recorded.risk_aversion)),
         );
         push(
+            "policy_stats",
+            recorded.policy_stats.to_string(),
+            current.policy_stats.to_string(),
+            format!("set_run_policy_stats({})", recorded.policy_stats),
+        );
+        push(
             "window_recency (r)",
             fmt_cfg(recorded.window_recency),
             fmt_cfg(current.window_recency),
@@ -533,9 +539,14 @@ impl CoreEngine {
                 }
             }
         }
+        // The replayed readings are counted as the CURRENT policy: the row's step says when it was
+        // read, not whether the weights had moved, and the net's next real update opens a fresh
+        // epoch anyway — so a resumed run never reads an empty window where a live one would not.
+        let epoch = buf.len();
         self.rolling_fitness.insert(hash.clone(), buf);
         self.rolling_train.insert(hash.clone(), train_buf);
         self.rolling_eval.insert(hash.clone(), eval_buf);
+        self.rolling_epoch.insert(hash.clone(), epoch);
         (hash, step)
     }
 

@@ -5837,3 +5837,73 @@ fn resume_refuses_a_different_exam_store() {
         "the refusal names the recorded size: {err}"
     );
 }
+
+/// The anti-champion dump is a real ARTIFACT, not a card: `worst-<hash>.md` per top-k net by ticket
+/// chance plus a `worst.md` index, each file carrying the topology, the mermaid graph and the
+/// lineage — the mirror of the champion markdown.
+#[test]
+fn the_worst_dump_writes_the_highest_ticket_chance_nets() {
+    let dir = std::env::temp_dir().join("gras-worst-dump");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = engine(&dir, 11).unwrap();
+    eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+        .unwrap();
+    eng.config.worst_save_topology = true;
+    eng.config.champion_count = 1;
+    for (i, h) in eng.state.live_hashes().iter().enumerate() {
+        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        buf.push(if i == 0 { 0.1 } else { 0.9 });
+        *eng.rolling_fitness.get_mut(h).unwrap() = buf;
+    }
+    eng.write_worst_markdown(1).unwrap();
+    let index = std::fs::read_to_string(dir.join("worst.md")).unwrap();
+    assert!(index.contains("Anti-champion"), "{index}");
+    let files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("worst-") && n.ends_with(".md"))
+        .collect();
+    assert_eq!(files.len(), 1, "one file per champion_count slot");
+    let body = std::fs::read_to_string(dir.join(&files[0])).unwrap();
+    assert!(
+        body.contains("```mermaid"),
+        "the mermaid graph rides the file"
+    );
+    assert!(body.contains("WORST"), "and the lineage root is marked");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// POLICY-SCOPED window (`policy_stats`): `n` counts the readings taken on the CURRENT weights, so
+/// a net that updates every clock reports ONE datapoint (its value, no spread) instead of K readings
+/// from K different policies — while the flag off keeps the pre-flag window byte for byte.
+#[test]
+fn policy_stats_scopes_the_reading_to_the_current_weights() {
+    let dir = std::env::temp_dir().join("gras-policy-stats");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = engine(&dir, 11).unwrap();
+    eng.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+        .unwrap();
+    let h = eng.state.live_hashes()[0].clone();
+    for v in [0.2, 0.4, 0.9] {
+        eng.rolling_fitness.get_mut(&h).unwrap().push(v);
+    }
+    // The last reading was taken on the weights a real update had just produced.
+    eng.rolling_epoch.insert(h.clone(), 1);
+    let off = eng.race_reading_of(&h).unwrap();
+    assert_eq!(off.n, 3, "flag off: the whole buffer, exactly as before");
+    assert!((off.mean - 0.5).abs() < 1e-6, "mean was {}", off.mean);
+    eng.config.policy_stats = true;
+    let on = eng.race_reading_of(&h).unwrap();
+    assert_eq!(
+        (on.n, on.mean, on.std),
+        (1, 0.9, 0.0),
+        "flag on: one datapoint of one policy, no spread"
+    );
+    assert_eq!(
+        on.score(eng.fitness.direction(), eng.config.risk_aversion),
+        0.9,
+        "λ·0 leaves the single reading clean"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
