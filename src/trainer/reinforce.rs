@@ -11,8 +11,9 @@
 //!
 //! Per net, per clock:
 //!
-//! 1. Play `matches_per_step` TRAIN episodes with the greedy head (argmax over
-//!    the policy's action values), recording every `(observation, action)` turn.
+//! 1. Play `matches_per_step` TRAIN episodes with the acting rule ([`ACTION_RULE`]:
+//!    the greedy head — argmax over the policy's action values — by default, or a
+//!    seeded softmax sample), recording every `(observation, action)` turn.
 //! 2. Score them: a per-turn return `G_t` from the episode's own outcome
 //!    ([`Signal`]), a batch-mean baseline, advantages scaled to unit variance.
 //! 3. One optimizer step on the REINFORCE objective
@@ -24,12 +25,17 @@
 //!
 //! # Exploration
 //!
-//! The head is greedy everywhere, so exploration comes from the anti-plateau
-//! challenge ([`challenge_fires`]): on a fired step the trainer forces an action
-//! on every TRAIN turn through [`ChallengePolicy`], and EVAL games stay clean
-//! the exam still measures the net's own policy. That is why the default knob
-//! non-zero: a greedy head replays the same episode from every seed until
-//! weights move, so a purely greedy batch carries no action diversity
+//! [`ACTION_RULE`] is the switch: `Argmax` (the default) plays the net's own
+//! preference, `Softmax` draws from `softmax(values / SOFTMAX_TEMPERATURE)` with a
+//! generator seeded from the episode's OWN seed — the replay contract, not a hidden
+//! RNG. Under the default head there is no sampling, so exploration comes from the
+//! anti-plateau challenge ([`challenge_fires`]): on a fired step the trainer forces
+//! an action on every TRAIN turn through [`ChallengePolicy`], and EVAL games stay
+//! clean, so the exam still measures the net's own policy. The default probability
+//! is non-zero for that reason: a greedy head never tries a second action in the
+//! state it is in. The matches of a batch are still different GAMES — each index
+//! draws its own seed, and `Env::reset` draws the start state from it — so a greedy
+//! batch differs in where it starts, never in what the policy attempts.
 //!
 //! # The replay contract
 //!
@@ -92,7 +98,11 @@ const DEFAULT_CHALLENGE_PROB: f32 = 0.1;
 const DEFAULT_CHALLENGE_DECAY: ChallengeDecay = ChallengeDecay::Custom { exponent: 0.5 };
 
 /// The seed offset that separates a step's EVAL exam from its TRAIN episodes —
-/// a plain add, so the two bases can never collide for any run seed.
+/// a plain add on the run seed, so the two bases sit that constant apart for any run
+/// seed. The BASES are not guaranteed distinct from a net's, though: a net seed that
+/// folds onto the offset (`net_seed ^ run_seed == run_seed + EVAL_SEED_OFFSET`, e.g.
+/// `net_seed` 1000 on a run seed whose low bits do not carry) makes one of its TRAIN
+/// games coincide with the exam game in the same slot.
 const EVAL_SEED_OFFSET: u64 = 1000;
 
 /// The guardrail's games stay on a fixed seed forever: a verdict has to be
@@ -219,6 +229,10 @@ pub struct Reinforce<E: Env> {
     lr_schedule: Option<crate::trainer::LrSchedule>,
     /// Which update the optimizer makes (`adam`, the reference recipe).
     optimizer: crate::trainer::OptimizerKind,
+    /// How the acting forward pass turns action values into a move, and the temperature
+    /// [`ActionRule::Softmax`] draws at — the build consts unless a caller sets them.
+    action_rule: ActionRule,
+    softmax_temperature: f32,
 }
 
 impl<E: Env> Reinforce<E> {
@@ -239,6 +253,8 @@ impl<E: Env> Reinforce<E> {
             challenge_decay: DEFAULT_CHALLENGE_DECAY,
             lr_schedule: None,
             optimizer: crate::trainer::OptimizerKind::default(),
+            action_rule: ACTION_RULE,
+            softmax_temperature: SOFTMAX_TEMPERATURE,
         }
     }
 
@@ -284,6 +300,26 @@ impl<E: Env> Reinforce<E> {
     pub fn with_signal(mut self, signal: Signal) -> Self {
         self.signal = signal;
         self
+    }
+
+    /// Set the ACTING rule and its temperature (defaults [`ACTION_RULE`] /
+    /// [`SOFTMAX_TEMPERATURE`]): what both the TRAIN episodes and the EVAL exam act under. A
+    /// `Softmax` run explores inside its own policy, drawn from each episode's seeded generator,
+    /// so a seed still replays the same moves. A non-positive or non-finite temperature falls back
+    /// to `1.0`, and the value is recorded by `describe()` whenever it is not the default.
+    pub fn with_action_rule(mut self, rule: ActionRule, temperature: f32) -> Self {
+        self.action_rule = rule;
+        self.softmax_temperature = if temperature.is_finite() && temperature > 0.0 {
+            temperature
+        } else {
+            1.0
+        };
+        self
+    }
+
+    /// How the acting forward pass picks a move.
+    pub fn action_rule(&self) -> (ActionRule, f32) {
+        (self.action_rule, self.softmax_temperature)
     }
     /// Feed the net a MEMORY of the trajectory as well as the instant ([`ObsMemory`]): `[obs, obs −
     /// prev]` for a velocity-like derivative, or `[obs, ema]` for a smooth past.
@@ -349,6 +385,9 @@ impl<E: Env> Reinforce<E> {
         // A policy rollout, not a training forward: dropout stays off,
         // set here so the mode never depends on what the last caller left behind.
         net.eval();
+        // The acting sampler's generator, seeded from the episode's OWN seed so a
+        // `Softmax` run replays exactly what it played. `Argmax` never reads it.
+        let mut rng = fastrand::Rng::with_seed(start_seed ^ ACTION_RULE_SEED_SALT);
         let max_turns = self.env.max_turns();
         let mut episode = Episode::default();
         let mut obs = self.env.reset(start_seed)?;
@@ -366,7 +405,12 @@ impl<E: Env> Reinforce<E> {
                 .to_f32_vec()?;
             let action = match forced {
                 Some(forced) => forced.resolve(&values),
-                None => greedy_action(&values),
+                None => choose_action(
+                    self.action_rule,
+                    self.softmax_temperature,
+                    &values,
+                    &mut rng,
+                ),
             };
             let (next, reward, done) = self.env.step(action)?;
             episode.turns.push((fed, action));
@@ -535,6 +579,16 @@ impl<E: Env> RlStep for Reinforce<E> {
         if self.optimizer != crate::trainer::OptimizerKind::default() {
             blob["optimizer"] = serde_json::Value::String(self.optimizer.label().to_string());
         }
+        // The acting rule can be the build const OR a per-run setter, so the resume guard must see
+        // it: a run recorded under `softmax` cannot resume into an `argmax` trainer. Omitted while
+        // it is the reference recipe, so every run recorded before the switch existed still
+        // resumes unchanged.
+        if self.action_rule != ActionRule::Argmax {
+            blob["action_rule"] = serde_json::Value::String(self.action_rule.as_str().to_string());
+            if self.softmax_temperature != SOFTMAX_TEMPERATURE {
+                blob["softmax_temperature"] = serde_json::json!(self.softmax_temperature);
+            }
+        }
         Some(blob)
     }
 
@@ -568,11 +622,15 @@ impl<E: Env> RlStep for Reinforce<E> {
         }
 
         // 1. TRAIN episodes: per-net seeds, run seed blended in so an inherited
-        //    champion does not replay its source run's exact trajectories.
+        //    champion does not replay its source run's exact trajectories. A recovery retry on a
+        //    FRESH draw (`env.attempt`) walks the NEXT block of starts; under the default
+        //    same-draw streak `attempt` is `0`, so the retry replays this clock's episodes exactly
+        //    and answers whether the fall was the update's fault.
         let train_base = ctx.net_seed ^ ctx.env.run_seed;
+        let attempt_block = ctx.env.attempt.wrapping_mul(self.matches_per_step as u64);
         let mut episodes: Vec<Episode> = Vec::with_capacity(self.matches_per_step);
         for match_i in 0..self.matches_per_step {
-            let seed = episode_start_seed(train_base, step, match_i as u64);
+            let seed = episode_start_seed(train_base, step, attempt_block + match_i as u64);
             episodes.push(self.play_episode(net, seed, forced)?);
         }
         let total: usize = episodes.iter().map(Episode::len).sum();
@@ -659,6 +717,103 @@ fn greedy_action(values: &[f32]) -> usize {
         }
     }
     best
+}
+
+/// How the ACTING forward pass turns a net's action values into a move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionRule {
+    /// The greedy head: argmax over the action values, ties to the lowest index. The
+    /// policy plays its own preference, so a fixed game set replayed on fixed weights
+    /// plays the identical episode — the exam's spread is then the POLICY's, never a
+    /// sampler's.
+    Argmax,
+    /// Sample from `softmax(values / SOFTMAX_TEMPERATURE)`. Exploration inside the
+    /// acting policy itself, drawn from the episode's seeded generator, so a seed
+    /// still replays the same moves.
+    Softmax,
+}
+
+impl ActionRule {
+    /// The name `describe()` records in `engine.json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActionRule::Argmax => "argmax",
+            ActionRule::Softmax => "softmax",
+        }
+    }
+}
+
+/// THE default acting switch: [`ActionRule::Argmax`] (default) or [`ActionRule::Softmax`].
+///
+/// This is the build-wide default; a caller can override it per runner with
+/// [`Reinforce::with_action_rule`] (an example spells it out as a const or a flag). Either way
+/// the choice is recorded by `describe()` and diffed by the resume guard, because it changes
+/// every episode the run plays — it is never threaded through the engine, which only ever sees
+/// the fitness.
+pub const ACTION_RULE: ActionRule = ActionRule::Argmax;
+
+/// Temperature for [`ActionRule::Softmax`]: `π ∝ exp(values / T)`. `1.0` keeps the
+/// net's own scale; smaller sharpens toward [`ActionRule::Argmax`], larger flattens.
+pub const SOFTMAX_TEMPERATURE: f32 = 1.0;
+
+/// Salt for the acting generator, so the sampler's stream is independent of the
+/// episode's `Env::reset` stream (both start from the same seed).
+const ACTION_RULE_SEED_SALT: u64 = 0xA5A5_5A5A_C3C3_3C3C;
+
+/// One action under `rule` at `temperature`: the greedy head, or a seeded softmax draw.
+fn choose_action(
+    rule: ActionRule,
+    temperature: f32,
+    values: &[f32],
+    rng: &mut fastrand::Rng,
+) -> usize {
+    match rule {
+        ActionRule::Argmax => greedy_action(values),
+        ActionRule::Softmax => softmax_action(values, temperature, rng),
+    }
+}
+
+/// Sample one action from `softmax(values / temperature)`: subtract the max (so the
+/// exponentials cannot overflow), draw uniformly in `[0, Σ)`, take the first bucket
+/// whose cumulative mass passes it. A NaN value gets zero mass — never preferred; a
+/// non-positive or non-finite temperature falls back to `1.0`, and an all-zero mass
+/// (every value NaN) falls back to the greedy head rather than dividing by zero.
+fn softmax_action(values: &[f32], temperature: f32, rng: &mut fastrand::Rng) -> usize {
+    let t = if temperature.is_finite() && temperature > 0.0 {
+        temperature
+    } else {
+        1.0
+    };
+    let max = values
+        .iter()
+        .copied()
+        .filter(|v| !v.is_nan())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let max = if max.is_finite() { max } else { 0.0 };
+    let mass: Vec<f32> = values
+        .iter()
+        .map(|v| {
+            if v.is_nan() {
+                0.0
+            } else {
+                ((v - max) / t).exp()
+            }
+        })
+        .collect();
+    let total: f32 = mass.iter().sum();
+    if !(total > 0.0) {
+        return greedy_action(values);
+    }
+    let draw = rng.f32() * total;
+    let mut acc = 0.0;
+    for (i, w) in mass.iter().enumerate() {
+        acc += w;
+        if draw < acc {
+            return i;
+        }
+    }
+    // Float drift on the last bucket: the last action with any mass.
+    mass.iter().rposition(|w| *w > 0.0).unwrap_or(0)
 }
 
 /// The mean of a slice; `0.0` for an empty one (no exam configured
@@ -767,6 +922,7 @@ mod tests {
                 checkpoint_every: 0,
                 smoothing_window: 1,
                 max_steps: Some(10),
+                attempt: 0,
             },
             net_hash: "test-net",
             net_seed,
@@ -895,6 +1051,65 @@ mod tests {
         assert_eq!(greedy_action(&[]), 0);
     }
 
+    /// Softmax sampling is a pure function of the seed — same seed, same moves — and
+    /// it can leave the argmax (otherwise it is a slower argmax).
+    #[test]
+    fn softmax_sampling_replays_from_its_seed() {
+        let values = [0.0, 0.0, 0.0];
+        let draw = |seed: u64| {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            (0..64)
+                .map(|_| softmax_action(&values, 1.0, &mut rng))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(draw(7), draw(7), "the same seed replays the same moves");
+        assert_ne!(draw(7), draw(8), "a different seed is a different draw");
+        let moves = draw(7);
+        assert!(
+            moves.iter().any(|&a| a != moves[0]),
+            "a flat policy must explore: {moves:?}"
+        );
+    }
+
+    /// The switch: `Argmax` plays the preference and ignores the draw, `Softmax`
+    /// follows it, NaN never wins, and a degenerate temperature is not a divide by zero.
+    #[test]
+    fn the_acting_rule_selects_argmax_or_softmax() {
+        let sharp = [0.0, 40.0, 0.0];
+        for seed in 0..32u64 {
+            let mut rng = fastrand::Rng::with_seed(seed);
+            assert_eq!(softmax_action(&sharp, 1.0, &mut rng), 1, "seed {seed}");
+            let mut rng = fastrand::Rng::with_seed(seed);
+            assert_eq!(choose_action(ActionRule::Argmax, 1.0, &sharp, &mut rng), 1);
+        }
+        let mut rng = fastrand::Rng::with_seed(3);
+        assert_eq!(softmax_action(&[f32::NAN, 1.0], 1.0, &mut rng), 1);
+        // Every value NaN: no mass anywhere, so the greedy fallback decides.
+        let mut rng = fastrand::Rng::with_seed(3);
+        assert_eq!(softmax_action(&[f32::NAN, f32::NAN], 1.0, &mut rng), 0);
+        // A non-positive temperature is the plain softmax, never an inverted or infinite one.
+        let mut rng = fastrand::Rng::with_seed(5);
+        assert_eq!(softmax_action(&sharp, 0.0, &mut rng), 1);
+        // The shipped default: the exam is measured on the net's OWN policy.
+        assert_eq!(ACTION_RULE, ActionRule::Argmax);
+        assert_eq!(ACTION_RULE.as_str(), "argmax");
+        assert_eq!(ActionRule::Softmax.as_str(), "softmax");
+    }
+
+    /// The blob records the acting rule ONLY when it is not the reference recipe — the
+    /// same convention the named schedule and the optimizer follow, so every run recorded
+    /// before the switch existed still resumes.
+    #[test]
+    fn describe_omits_the_acting_rule_while_it_is_the_default() {
+        let trainer = Reinforce::new(ToyEnv::new(2, 5), Device::CPU);
+        let blob = trainer.describe().expect("reinforce records a blob");
+        assert_eq!(blob["trainer"], serde_json::json!("reinforce"));
+        assert!(
+            blob.get("action_rule").is_none(),
+            "the reference recipe adds no key, so old runs still resume: {blob}"
+        );
+    }
+
     /// The two signals, on one hand-built episode: `Turns` credits survival,
     /// `Return` credits discounted reward, and the outcome matches its name.
     #[test]
@@ -994,6 +1209,44 @@ mod tests {
             last_exam_seed(100, 3),
             last_exam_seed(100, 4),
             "a fresh clock draws fresh games — the default per-clock exam"
+        );
+    }
+
+    /// Every match inside ONE clock draws its own game — TRAIN and EVAL alike. The world
+    /// draws its start state from that seed (`Env::reset`), so K matches that shared a seed
+    /// would be K identical trajectories: one episode's compute, paid K times.
+    #[test]
+    fn every_match_inside_one_clock_draws_its_own_game() {
+        let step = 3usize;
+        for (kind, base) in [("train", 100 ^ 7), ("eval", eval_seed_base(7))] {
+            let seeds: Vec<u64> = (0..5).map(|i| episode_start_seed(base, step, i)).collect();
+            let unique: std::collections::HashSet<u64> = seeds.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                5,
+                "{kind}: five matches, five games: {seeds:?}"
+            );
+        }
+        // ...and the trainer hands `match_i` over, it does not loop one seed: with the exam
+        // off, the world's last seed is the LAST train game, index `matches_per_step - 1`.
+        let fitness = Fitness::reported(Direction::Maximize, "turns");
+        let mut trainer = Reinforce::new(ToyEnv::new(2, 5), Device::CPU)
+            .with_matches_per_step(3)
+            .with_eval_matches_per_step(0);
+        let mut net = tiny_net(2, 0.0);
+        let mut optimizer = trainer.make_optimizer(&net);
+        trainer
+            .train_step(
+                &mut net,
+                &mut *optimizer,
+                step,
+                &ctx(&fitness, 100, 7, step),
+            )
+            .unwrap();
+        assert_eq!(
+            trainer.env().last_seed(),
+            episode_start_seed(100 ^ 7, step, 2),
+            "the third train match of the clock played its own seed"
         );
     }
 

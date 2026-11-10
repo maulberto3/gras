@@ -189,12 +189,15 @@ impl TabularStep for TabularTrainer {
         let loss_fn: crate::trainer::LossFn<'_> = &*self.loss_fn; // our own loss
 
         // call_index = hash of the net's name, so each net sees distinct
-        // dropout at one step (live nets vs catching-up children too).
+        // dropout at one step (live nets vs catching-up children too). The
+        // recovery retry index rides on top (`0` under the default same-draw
+        // streak, so the retry re-seeds exactly what the clock seeded).
         let h: u64 = ctx
             .net_hash
             .bytes()
-            .fold(0u64, |a, b| a.wrapping_add(b as u64));
-        let batch: (Tensor, Tensor) = ctx.data.train_batch(step as u64)?;
+            .fold(0u64, |a, b| a.wrapping_add(b as u64))
+            .wrapping_add(ctx.env.attempt);
+        let batch: (Tensor, Tensor) = ctx.data.train_batch_at(step as u64, ctx.env.attempt)?;
         // LR schedule first (pure function of step — replay-safe),
         // deterministic train step (seeds the RNG, then forward/backward).
         if let Some(lr) = self.scheduled_lr(step, ctx.env.max_steps) {

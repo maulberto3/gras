@@ -148,9 +148,20 @@ impl BatchStream {
         (0..batch_size).map(|i| pool[(offset + i) % n]).collect()
     }
 
-    /// The **train** batch for `step` — what every live net trains on. Pure
-    /// function of `(run_seed, step)`; call it anywhere, any number of times.
+    /// The **train** batch for `step` — the clock's own pass; see [`Self::train_batch_at`].
     pub fn train_batch(&self, dataset: &Dataset, step: u64) -> Result<(Tensor, Tensor)> {
+        self.train_batch_at(dataset, step, 0)
+    }
+
+    /// The **train** batch for `step`'s `attempt`: `0` is the clock's own pass, `1..` a recovery
+    /// retry on `set_recovery_same_seed(false)`, each one batch further along the permutation. Still
+    /// a pure function of `(run_seed, step, attempt)` — nothing is consumed — so a replay asks again.
+    pub fn train_batch_at(
+        &self,
+        dataset: &Dataset,
+        step: u64,
+        attempt: u64,
+    ) -> Result<(Tensor, Tensor)> {
         // One seeded permutation of the train pool, derived from the run
         // seed only — steps walk it round-robin via a step-derived offset.
         let perm_seed = derive_seed(self.run_seed, 0);
@@ -160,7 +171,10 @@ impl BatchStream {
             let j = rng.usize(0..=i);
             perm.swap(i, j);
         }
-        let offset = (step as usize).wrapping_mul(self.batch_size);
+        // A retry takes the NEXT window, so it sees rows the clock's own pass did not.
+        let offset = (step as usize)
+            .wrapping_mul(self.batch_size)
+            .wrapping_add((attempt as usize).wrapping_mul(self.batch_size));
         Self::gather(dataset, &Self::window(&perm, self.batch_size, offset))
     }
 
@@ -293,6 +307,32 @@ mod tests {
         // Eval comes from the eval pool — a train batch row set must never
         // appear as the eval batch at the same step.
         assert_ne!(tx.to_f32_vec().unwrap(), ex.to_f32_vec().unwrap());
+    }
+
+    /// A recovery retry walks ONE batch further: attempt 0 is the clock's own draw, so the
+    /// default streak re-trains the same rows bit for bit.
+    #[test]
+    fn retry_attempt_walks_the_next_batch() {
+        let ds = small_dataset();
+        let s = BatchStream::new(99, 8, PoolSplit::of(&ds, 0.25, 99));
+        let (own, _) = s.train_batch(&ds, 5).unwrap();
+        let (zero, _) = s.train_batch_at(&ds, 5, 0).unwrap();
+        assert_eq!(
+            own.to_f32_vec().unwrap(),
+            zero.to_f32_vec().unwrap(),
+            "attempt 0 IS the clock's own draw"
+        );
+        let (first, _) = s.train_batch_at(&ds, 5, 1).unwrap();
+        assert_ne!(
+            own.to_f32_vec().unwrap(),
+            first.to_f32_vec().unwrap(),
+            "a retry on a fresh draw trains different rows"
+        );
+        assert_eq!(
+            first.to_f32_vec().unwrap(),
+            s.train_batch_at(&ds, 5, 1).unwrap().0.to_f32_vec().unwrap(),
+            "pure function of (seed, step, attempt) — a replay asks again"
+        );
     }
 
     #[test]

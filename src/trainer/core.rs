@@ -128,6 +128,11 @@ pub struct StepEnv {
     /// The run's step budget (`None` = unbounded), carried so a trainer can anneal
     /// schedules without a new config knob or a private counter.
     pub max_steps: Option<usize>,
+    /// Retry index INSIDE this clock: `0` = the clock's own pass, `1..` = a recovery retry. Only a
+    /// run with `set_recovery_same_seed(false)` ever hands a non-zero value, so a trainer that keys
+    /// every draw off `(net_seed, step)` alone replays bit-for-bit under the default. A trainer that
+    /// wants the variety arm mixes it in — see [`RunData::train_batch_at`].
+    pub attempt: u64,
 }
 
 impl StepEnv {
@@ -151,6 +156,16 @@ impl RunData<'_> {
     /// Draw a training batch for the given step.
     pub fn train_batch(&self, step: u64) -> flodl::tensor::Result<(flodl::Tensor, flodl::Tensor)> {
         self.stream.train_batch(self.dataset, step)
+    }
+
+    /// Draw the batch for `step`'s `attempt` — `0` is the clock's own pass, `1..` a recovery retry
+    /// on `set_recovery_same_seed(false)`, each one batch further along the stream.
+    pub fn train_batch_at(
+        &self,
+        step: u64,
+        attempt: u64,
+    ) -> flodl::tensor::Result<(flodl::Tensor, flodl::Tensor)> {
+        self.stream.train_batch_at(self.dataset, step, attempt)
     }
 
     /// Draw an evaluation batch for the given step.
@@ -586,6 +601,7 @@ mod tests {
             checkpoint_every: 10,
             smoothing_window: 5,
             max_steps: Some(100),
+            attempt: 0,
         };
         assert_eq!(env.progress(), Some(0.25));
         // Past the budget clamps rather than overshooting.

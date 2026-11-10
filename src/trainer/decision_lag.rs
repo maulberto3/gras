@@ -318,6 +318,7 @@ mod tests {
                 checkpoint_every: 100,
                 smoothing_window: 10,
                 max_steps: Some(100),
+                attempt: 0,
             },
             net_hash: "probe",
             net_seed: 7,
