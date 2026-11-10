@@ -89,8 +89,8 @@ pub struct CoreEngine {
     pub(crate) rolling_fitness: HashMap<String, RollingBuffer>,
     pub(crate) rolling_train: HashMap<String, RollingBuffer>,
     pub(crate) rolling_eval: HashMap<String, RollingBuffer>,
-    /// Readings pushed since the net's last REAL weight update — the epoch `policy_stats` averages
-    /// over. A missing entry (a test pushing straight into the buffer) reads the WHOLE buffer,
+    /// Readings pushed since the net's last REAL weight update — the epoch a policy-scoped fitness
+    /// window averages over. A missing entry (a test pushing straight into the buffer) reads the WHOLE buffer,
     /// which is the flag-off behaviour, so no caller can silently get an empty window.
     pub(crate) rolling_epoch: HashMap<String, usize>,
     /// The ticket probability the coin last COMPARED for each net, captured AT THE DRAW
@@ -874,10 +874,6 @@ impl CoreEngine {
                     self.config.train_merit_learn_only.to_string(),
                 ),
                 (
-                    "train_merit (Ω)".to_string(),
-                    fmt_cfg(self.config.train_merit),
-                ),
-                (
                     "train_merit_p_min (p_min)".to_string(),
                     fmt_cfg(self.config.train_merit_p_min),
                 ),
@@ -989,8 +985,8 @@ impl CoreEngine {
                     format!(
                         "avg = mean of the last K={} readings{} · spread = how variable those readings are · SE = spread/√n = how well the mean is known · n = readings behind it",
                         self.config.smoothing_window,
-                        if self.config.policy_stats {
-                            " taken on the CURRENT weights (policy_stats: n resets at every real update, so `n = 1` is one datapoint of one policy, no spread)"
+                        if self.config.policy_scoped_fitness {
+                            " taken on the CURRENT weights (policy-scoped fitness: n resets at every real update, so `n = 1` is one datapoint of one policy, no spread)"
                         } else {
                             ""
                         }
@@ -1147,26 +1143,35 @@ impl CoreEngine {
                 let mutate_total = self.config.mutate_rolls;
                 // The cull shield is a POPULATION-level fact: when nobody is cull-eligible,
                 // roll would be spent for nothing — say it once. Derived draws shift no later roll.
-                let evolve_allowed = self.has_cull_eligible();
+                let evolve_allowed = self.evolution_allowed(clock);
                 if !evolve_allowed {
                     self.accounting.deferred_clocks += 1;
-                    // The windows are NAMED, with their lengths: "no cull-eligible net" alone reads
-                    // as a stuck engine, while `k=5` at clock 3 makes it arithmetic — the shield
-                    let shielded = self.config.crossover_probation_steps >= clock
-                        || self.config.mutation_probation_steps >= clock;
-                    info!(
-                        "step {} │ evolution deferred: no cull-eligible net — every non-champion net is inside its cull shield window (crossover k={}, mutation k={}) or champion ({} crossover + {} mutation roll(s) forgone; nothing culled/born){}",
-                        clock,
-                        self.config.crossover_probation_steps,
-                        self.config.mutation_probation_steps,
-                        cross_total,
-                        mutate_total,
-                        if shielded {
-                            " · a window is at least as long as the run so far, so no clock could evolve yet"
-                        } else {
-                            ""
-                        },
-                    );
+                    // THE INIT PROBATION (`set_run_init_probation_steps`) is DECLARED, not
+                    // emergent: while the clock is inside it the rolls are withheld by the run's
+                    // own arithmetic, so the line names the probation, not the cull shield.
+                    if clock < self.config.init_probation_steps {
+                        info!(
+                            "step {} │ evolution deferred: init probation — the run opens with {} clock(s) of no culls or births, so evolution starts at clock {} ({} crossover + {} mutation roll(s) forgone)",
+                            clock,
+                            self.config.init_probation_steps,
+                            self.config.init_probation_steps,
+                            cross_total,
+                            mutate_total,
+                        );
+                    } else {
+                        // The windows are NAMED, with their lengths: "no cull-eligible net" alone reads
+                        // as a stuck engine, while `k=5` beside it makes it arithmetic. The shield is
+                        // served in UPDATES, so the one way it outlasts the run is a net nobody feeds —
+                        // say that instead of the old clock arithmetic.
+                        info!(
+                            "step {} │ evolution deferred: no cull-eligible net — every non-champion net is inside its cull shield window (crossover k={}, mutation k={} updates) or champion ({} crossover + {} mutation roll(s) forgone; nothing culled/born) · the shield is served by UPDATES, not clocks, so it outlasts the run only if its net never trains",
+                            clock,
+                            self.config.crossover_probation_steps,
+                            self.config.mutation_probation_steps,
+                            cross_total,
+                            mutate_total,
+                        );
+                    }
                 }
                 // The initial batch is whatever is alive at the FIRST evolve clock — nothing
                 // inserted yet and this clock's culls come later, so it is the founder batch.
@@ -1518,9 +1523,11 @@ impl CoreEngine {
             // each field means is documented once on `step_rollup_line`.
             let (trained, withheld) = self.lottery_clock_report(&hashes, &ledger_before);
             let lottery_skips = withheld.len();
+            // Of those denied clocks, the ones that did not run AT ALL (a never-learned net).
+            let idled_skips = self.idled_since(&hashes, &ledger_before);
 
             if rollup_on {
-                let vitals = self.step_vitals(clock, &hashes, lottery_skips);
+                let vitals = self.step_vitals(&hashes, lottery_skips, idled_skips);
                 info!("step {} │ {}", clock, step_rollup_line(&vitals));
             }
             // The who-line rides the LOTTERY's gate, not the rollup's: a run with the elite crown
@@ -1722,8 +1729,13 @@ pub(crate) struct StepVitals {
     /// Nets that WOULD have updated without the lottery (`group - crown`).
     pub would_train: usize,
     /// Updates the training lottery withheld this clock (0 when it is off). Under
-    /// `train_merit_learn_only` these nets ACTED — the count is act-only clocks, not idle ones.
+    /// `train_merit_learn_only` these nets ACTED — except the never-learned ones, so this is the
+    /// denied TOTAL: `idled_skips` names how much of it did not run.
     pub lottery_skips: usize,
+    /// Denied clocks that did NOT run at all: a net that has never learned (`U = 0`) is skipped
+    /// outright even under learn-only, so `lottery_skips` is not all act-only. Always equal to
+    /// `lottery_skips` when the learn-only flag is off.
+    pub idled_skips: usize,
     /// Whether a lost ticket cost only the update (`train_merit_learn_only`), which is what the
     /// line's `act-only` wording and its arithmetic key off.
     pub learn_only: bool,
@@ -1797,8 +1809,13 @@ fn step_rollup_line(v: &StepVitals) -> String {
         "updating"
     };
     // Under learn-only the denied nets RAN (act + measure, no update), so the head must name
-    // them or `ran` would not add up against `live`.
-    let acted_only = if v.learn_only { v.lottery_skips } else { 0 };
+    // them or `ran` would not add up against `live`. A never-learned net (`U = 0`) is the exception:
+    // it is skipped outright, so it is held back instead of counted as an act.
+    let acted_only = if v.learn_only {
+        v.lottery_skips.saturating_sub(v.idled_skips)
+    } else {
+        0
+    };
     let act_term = if acted_only > 0 {
         format!(" + {acted_only} act-only")
     } else {
@@ -1817,8 +1834,13 @@ fn step_rollup_line(v: &StepVitals) -> String {
     };
     parts.push(head);
     // Nets that did not RUN at all: the idled (default contract) and the newborns sitting their
-    // birth clock out. Under learn-only the denied nets acted, so they are not held back.
-    let idled = if v.learn_only { 0 } else { v.lottery_skips };
+    // birth clock out. Under learn-only the denied nets acted — EXCEPT the never-learned ones, which
+    // are skipped outright and so are held back exactly like an idle net.
+    let idled = if v.learn_only {
+        v.idled_skips
+    } else {
+        v.lottery_skips
+    };
     let mut not_run = Vec::new();
     if idled > 0 {
         not_run.push(format!("{idled} idled (no train, no eval)"));
@@ -1848,7 +1870,7 @@ fn step_rollup_line(v: &StepVitals) -> String {
             format!("{}-clock lifetime", v.lifetime_j)
         };
         parts.push(format!(
-            "seat gates, over all {} nets: {} may sit = {} − {} in a join window or cull shield ({} clocks) − {} age-blocked ({})",
+            "seat gates, over all {} nets: {} may sit = {} − {} in a join window or cull shield ({} join clocks; the shield counts updates) − {} age-blocked ({})",
             v.live, v.eligible, v.live, v.probation, v.join_k, v.age_blocked, lifetime
         ));
     }

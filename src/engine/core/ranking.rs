@@ -34,12 +34,13 @@ impl CoreEngine {
     /// step readings are behind it and how far apart they were ([`WindowStats`]).
     pub(crate) fn race_reading_of(&self, hash: &str) -> Option<WindowStats> {
         self.rolling_fitness.get(hash).and_then(|buf| {
-            // POLICY-SCOPED (`set_run_policy_stats`): average only the readings taken on the
-            // CURRENT weights — `rolling_epoch` counts them since the net's last real update, so
-            // a learner that updates every clock reports ONE datapoint (its value, zero spread)
-            // while a net that rarely earns a ticket reports many readings of the same policy.
-            // OFF: the whole buffer, exactly as before (readings from different weight sets mix).
-            let take = if self.config.policy_stats {
+            // POLICY-SCOPED FITNESS (`set_run_policy_scoped_fitness`): average only the readings
+            // taken on the CURRENT weights — `rolling_epoch` counts them since the net's last real
+            // update, so a learner that updates every clock reports ONE datapoint (its value, zero
+            // spread) while a net that rarely earns a ticket reports many readings of the same
+            // policy. OFF: the whole buffer, exactly as before (readings from different weight sets
+            // mix).
+            let take = if self.config.policy_scoped_fitness {
                 self.rolling_epoch
                     .get(hash)
                     .copied()
@@ -123,14 +124,13 @@ impl CoreEngine {
         let probation = self.config.seat_join_probation_steps;
         let lifetime = self.config.seat_lifetime_steps;
         // The REGULAR shield is a precondition, checked first: a net may not be elite
-        // before it could be culled (same born-based channel window).
-        let clock = self.step_clock();
+        // before it could be culled (same per-channel window, served in updates).
         ranked
             .iter()
             .filter(|(h, _)| {
                 self.state.net(h).is_some_and(|s| {
-                    // (a) cull shield passed (born-based, never resets) — Rust `on_probation`.
-                    !self.on_probation(h, clock)
+                    // (a) cull shield passed (`U >= k`, never resets) — Rust `on_probation`.
+                    !self.on_probation(h)
                         // (b) join window served (resets on every seat exit) — Rust `elite_probation_age`.
                         && s.elite_probation_age >= probation
                         // (c) seat still inside its lifetime (0 = no lifetime).
@@ -288,13 +288,7 @@ impl CoreEngine {
                 .iter()
                 .filter(|(h, _)| !crown.contains(h))
                 .take(3)
-                .map(|(h, _)| {
-                    format!(
-                        "{} ({})",
-                        &h[..8.min(h.len())],
-                        self.unseated_reason(h, clock)
-                    )
-                })
+                .map(|(h, _)| format!("{} ({})", &h[..8.min(h.len())], self.unseated_reason(h)))
                 .collect();
             if !shown.is_empty() {
                 let more = unseated_total.saturating_sub(shown.len());
@@ -324,21 +318,21 @@ impl CoreEngine {
 
     /// Why `hash` — a net in the elite RANKING — holds no seat right now: barred
     /// the join window (`a/k`) or the cull shield, or `outranked` (the seats ran out).
-    pub(crate) fn unseated_reason(&self, hash: &str, clock: usize) -> String {
+    pub(crate) fn unseated_reason(&self, hash: &str) -> String {
         let k = self.config.seat_join_probation_steps;
         match self.state.net(hash) {
             Some(s) if s.elite_probation_age < k => {
                 format!("join window {}/{k}", s.elite_probation_age)
             }
-            Some(_) if self.on_probation(hash, clock) => "cull shield".to_string(),
+            Some(_) if self.on_probation(hash) => "cull shield".to_string(),
             Some(_) => "outranked".to_string(),
             None => "no state".to_string(),
         }
     }
 
     /// The elite gate in numbers over the live population: `(eligible, on_probation,
-    /// age_blocked)`. `clock` MUST be the deal's clock, never `step_clock()`.
-    pub(crate) fn elite_gate_counts(&self, clock: usize) -> (usize, usize, usize) {
+    /// age_blocked)`.
+    pub(crate) fn elite_gate_counts(&self) -> (usize, usize, usize) {
         let k = self.config.seat_join_probation_steps;
         let j = self.config.seat_lifetime_steps;
         let (mut eligible, mut probation, mut age_blocked) = (0, 0, 0);
@@ -346,7 +340,7 @@ impl CoreEngine {
             let Some(s) = self.state.net(&h) else {
                 continue;
             };
-            if self.on_probation(&h, clock) || s.elite_probation_age < k {
+            if self.on_probation(&h) || s.elite_probation_age < k {
                 probation += 1;
             } else if j > 0 && s.elite_seat_age >= j {
                 age_blocked += 1;
@@ -366,7 +360,8 @@ impl CoreEngine {
     /// Split one clock's nets into `(trained, withheld)` from the LEDGER snapshot taken BEFORE the
     /// clock ran: a net whose idle clocks grew got no ticket, and under `train_merit_learn_only`
     /// so did a net whose ACT-ONLY clocks grew (it ran and was measured, it just never learned).
-    /// Everyone else in the group updated its weights.
+    /// Everyone else in the group updated its weights. A never-learned net (`U = 0`) denied the coin
+    /// lands in the IDLE branch under either setting — its clock was skipped, not spent acting.
     pub(crate) fn lottery_clock_report(
         &self,
         group: &[String],
@@ -398,13 +393,31 @@ impl CoreEngine {
         (trained, withheld)
     }
 
+    /// Group nets whose IDLE clock grew since the ledger snapshot — the clocks that did not run at
+    /// all. Under learn-only most denied nets still act-and-measure, but a net that has never
+    /// learned (`U = 0`) is skipped outright, so the rollup must not count that clock as spent
+    /// acting. An empty snapshot (lottery off, or the line off) claims nothing.
+    pub(crate) fn idled_since(&self, group: &[String], ledger_before: &[(usize, usize)]) -> usize {
+        group
+            .iter()
+            .enumerate()
+            .filter(|(i, h)| {
+                ledger_before.get(*i).is_some_and(|&(idle_before, _)| {
+                    self.state
+                        .net(h)
+                        .is_some_and(|s| s.idle_clocks() > idle_before)
+                })
+            })
+            .count()
+    }
+
     /// Every count the per-step rollup needs, from ONE walk of the live population plus the seats
     /// the crown knows: `newborn = live − group.len()` (a net born this clock sits the clock out
     pub(crate) fn step_vitals(
         &self,
-        clock: usize,
         group: &[String],
         lottery_skips: usize,
+        idled_skips: usize,
     ) -> StepVitals {
         let live = self.state.live_count();
         // The crown's seats take the act-only path, so they are outside `would_train`
@@ -414,16 +427,15 @@ impl CoreEngine {
             .filter(|h| self.frozen_crown.contains(*h))
             .count();
         let would_train = group.len().saturating_sub(frozen);
-        let (eligible, probation, age_blocked) = self.elite_gate_counts(clock);
+        let (eligible, probation, age_blocked) = self.elite_gate_counts();
         StepVitals {
-            // Under learn-only a denied net still RUNS (act + measure, no update), so `stepped`
-            // only loses the denied clocks that actually idled; the crown is always in it.
-            stepped: if self.config.train_merit_learn_only {
-                group.len()
-            } else {
-                group.len().saturating_sub(lottery_skips)
-            },
+            // The one honest count in BOTH contracts: subtract the clocks that actually IDLED.
+            // Under the default contract that is every denied net; under learn-only it is only the
+            // never-learned (`U = 0`) ones — everyone else acted and was measured.
+            stepped: group.len().saturating_sub(idled_skips.min(lottery_skips)),
             trained: would_train.saturating_sub(lottery_skips),
+            // Clamped: a stray idle delta can never make the denied split exceed the denied total.
+            idled_skips: idled_skips.min(lottery_skips),
             learn_only: self.config.train_merit_learn_only,
             live,
             frozen,

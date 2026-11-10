@@ -406,6 +406,15 @@ fn race_config_defaults_are_the_cartpole_loop() {
     );
     assert_eq!(cfg.mutation_probation_steps, 5);
     assert_eq!(cfg.crossover_probation_steps, 5);
+    // The recovery streak: `0` retries by default — the VALUE is the switch, so a run that says
+    // nothing never rescues (it was armed at 5 before, a mechanic nobody asked for). A run that
+    // arms it re-tests the clock's OWN draw unless it asks for fresh rows.
+    assert_eq!(cfg.recovery_retries, 0);
+    assert_eq!(cfg.recovery_tolerance, 0.0);
+    assert!(
+        cfg.recovery_same_seed,
+        "a retry is the same draw by default"
+    );
     // The ELITE rules: the born shield is the only gate, the crown term is OFF,
     // guard is the reference's `pop / 10` read at the conservative population of 10.
     assert_eq!(cfg.seat_join_probation_steps, 5);
@@ -416,13 +425,15 @@ fn race_config_defaults_are_the_cartpole_loop() {
     assert_eq!(cfg.smoothing_window, 5);
     assert_eq!(cfg.risk_aversion, 0.5);
     assert_eq!(cfg.drift_prob, 0.1);
-    // The lottery's tuned defaults: the coin is ON at Ω 0.75, the ordering is INVERTED
-    // (probes go to the least fit net) and the age leg is armed.
+    // The lottery's tuned defaults: the ordering is INVERTED (probes go to the least fit net),
+    // the band IS the payout (Ω retired to its identity `1.0`), the U leg is armed and the youth
+    // leg is off — the final table prints `Um`, not `Ym`.
     assert_eq!(cfg.train_merit, crate::engine::config::DEFAULT_TRAIN_MERIT);
-    assert_eq!(cfg.train_merit, 0.75);
+    assert_eq!(cfg.train_merit, 1.0, "the retired Ω is the identity");
     assert!(cfg.train_merit_inverted);
     assert_eq!(cfg.train_age, crate::engine::config::DEFAULT_TRAIN_AGE);
-    assert!(cfg.train_age, "the age leg is armed");
+    assert!(!cfg.train_age, "the youth leg is off by default");
+    assert!(cfg.train_merit_updates, "the U leg is armed by default");
     assert_eq!(cfg.train_merit_p_min, 0.05);
     assert_eq!(cfg.train_merit_p_max, 0.4);
     // batch_size lives on RunSpec::stream (engine infrastructure),
@@ -712,7 +723,7 @@ fn dethroned_elite_resumes_stepping_without_replay() {
     // the crown must be dealable on the first refresh.
     open_crown(&mut eng);
     // No train lottery: every clock IS a training clock for a non-crown net.
-    eng.config.train_merit = 0.0;
+    eng.config.train_merit_p_min = 1.0;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     let hs = eng.state.live_hashes();
@@ -2053,6 +2064,9 @@ fn resume_replays_nets_with_metric_parity() {
     let dir = std::env::temp_dir().join("race_resume_parity");
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 99).unwrap();
+    // One update per clock: this test pins `state.step == clocks`. The streak's extra updates are
+    // covered by `recovery_streak_*`.
+    engine.config.recovery_retries = 0;
     engine
         .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
@@ -2545,14 +2559,19 @@ fn the_novelty_gate_spends_its_cap_and_never_leaves_the_slot_empty() {
         pop,
         "a capped draw must still fill the emptied seat"
     );
-    // The gate's reading lands in the attempt ledger, appended LAST: Δ, candidates spent, and
-    // the floor they were judged against — a Δ below that floor is the capped fallback itself.
+    // The gate's reading lands in the attempt ledger: Δ, candidates spent, and the floor they
+    // were judged against — a Δ below that floor is the capped fallback itself. The culled net's
+    // score closes the row, AFTER them.
     eng.flush_csv_exports().unwrap();
     let attempts = std::fs::read_to_string(dir.join("attempts.csv")).unwrap();
     let header = attempts.lines().next().expect("attempts header");
     assert!(
-        header.ends_with(",novelty_delta,novelty_draws,novelty_min"),
-        "the gate's three columns close the header: {header}"
+        header.contains(",novelty_delta,novelty_draws,novelty_min,"),
+        "the gate's three columns stay together: {header}"
+    );
+    assert!(
+        header.ends_with(",victim_fitness"),
+        "the culled net's score closes the header: {header}"
     );
     let last: Vec<&str> = attempts
         .lines()
@@ -2561,12 +2580,19 @@ fn the_novelty_gate_spends_its_cap_and_never_leaves_the_slot_empty() {
         .split(',')
         .collect();
     let n = last.len();
-    assert_eq!(last[n - 2], "5", "the capped draw spent all 5 candidates");
-    assert_eq!(last[n - 1], "2", "the floor it failed rides the same row");
+    // The culled net's score closes the row; every live net was pushed 0.5, so it must read 0.5.
+    assert_eq!(
+        last[n - 1].parse::<f32>().unwrap(),
+        0.5,
+        "the victim's score rides the same row: {:?}",
+        last[n - 1]
+    );
+    assert_eq!(last[n - 3], "5", "the capped draw spent all 5 candidates");
+    assert_eq!(last[n - 2], "2", "the floor it failed rides the same row");
     assert!(
-        last[n - 3].parse::<f32>().unwrap() < 2.0,
+        last[n - 4].parse::<f32>().unwrap() < 2.0,
         "a Δ below the floor means the refusal was taken anyway: {:?}",
-        last[n - 3]
+        last[n - 4]
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3162,7 +3188,6 @@ fn inverted_lottery_grades_the_worst_net_best() {
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = 1;
     }
-    eng.config.train_merit = 1.0;
     eng.config.train_merit_p_min = 0.0;
     // The MERIT ordering is the fixture on this side of the test (the engine default
     // inverted now, so the test states which ordering it is grading).
@@ -3185,13 +3210,11 @@ fn inverted_lottery_grades_the_worst_net_best() {
     // p_min still lifts the starved end by the same arithmetic…
     eng.config.train_merit_p_min = 0.5;
     assert!((eng.train_lottery_p_eff(&hashes[0], 5, Some(frame)) - 0.5).abs() < 1e-6);
-    // …and Ω still blends toward "always train" instead of inverting anything else.
+    // …and the band is the payout, with no second dial under it.
     eng.config.train_merit_p_min = 0.0;
-    eng.config.train_merit = 0.5;
-    assert!((eng.train_lottery_p_eff(&hashes[0], 5, Some(frame)) - 0.5).abs() < 1e-6);
+    assert!((eng.train_lottery_p_eff(&hashes[0], 5, Some(frame)) - 0.0).abs() < 1e-6);
     // …and p_max caps the map: with p_min = 0 the inverted field's worst net is held at 0.45
     // instead of 1.0, which is how a bottom-heavy mirror is run at the merit ordering's ticket
-    eng.config.train_merit = 1.0;
     eng.config.train_merit_p_min = 0.0;
     eng.config.train_merit_p_max = 0.45;
     assert!((eng.train_lottery_p_eff(&hashes[2], 5, Some(frame)) - 0.45).abs() < 1e-6);
@@ -3247,7 +3270,6 @@ fn the_age_leg_multiplies_the_fit_leg() {
     for (h, born) in [(&hashes[0], 2usize), (&hashes[1], 4), (&hashes[2], 0)] {
         eng.state.net_mut(h).unwrap().entered_at_step = born;
     }
-    eng.config.train_merit = 1.0;
     eng.config.train_merit_p_min = 0.0;
     eng.config.train_merit_inverted = true;
     // The OFF side of the leg is pinned here, not inherited: the engine default arms
@@ -3298,9 +3320,7 @@ fn an_ungraded_net_names_why_and_the_ticket_is_one_step_from_the_product() {
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = 1;
     }
-    // A band that is NOT the identity, with Ω between off and on: the two ends the chance
-    // is paid between are then neither 1 nor the band itself.
-    eng.config.train_merit = 0.5;
+    // A band that is NOT the identity: every net is paid between the two ends the run set.
     eng.config.train_merit_p_min = 0.1;
     eng.config.train_merit_p_max = 0.6;
     let frame = eng.lottery_frame(5).expect("armed at clock 5");
@@ -3317,7 +3337,10 @@ fn an_ungraded_net_names_why_and_the_ticket_is_one_step_from_the_product() {
     assert!((y - 1.0).abs() < 1e-6, "one age in the field: Y is 1");
     assert!((m - f * y).abs() < 1e-6, "the product the row prints");
     let p = eng.train_lottery_p_eff(&hashes[0], 5, Some(frame));
-    assert!((p - (0.55 + 0.25 * m)).abs() < 1e-6, "lo + (hi − lo) × F");
+    assert!(
+        (p - (0.1 + 0.5 * m)).abs() < 1e-6,
+        "p_min + (p_max − p_min) × F"
+    );
 
     // One gate, one answer: a reason is present exactly when the grade is absent.
     for h in &hashes {
@@ -3352,10 +3375,12 @@ fn an_ungraded_net_names_why_and_the_ticket_is_one_step_from_the_product() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The `unfed` cull reads the SAME merit the coin reads — lowest `P × Y`, "old and not learning
-/// loses its place" — but NOT the tilt.
+/// The `unfed` cull is DETERMINISTIC and reads the coin's OWN number: the net with the highest
+/// ticket chance `p` leaves, so under the shipped setters (worst-first × `Um`) it evicts the least
+/// fit, most spent net — and a tilt change moves the cull WITH the tickets, because the victim IS
+/// the highest `p`. Nets the lottery does not grade are never victims.
 #[test]
-fn unfed_cull_evicts_the_same_net_in_both_tilts() {
+fn unfed_cull_evicts_the_highest_ticket_chance() {
     let dir = std::env::temp_dir().join("gras-unfed-cull");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
@@ -3378,13 +3403,13 @@ fn unfed_cull_evicts_the_same_net_in_both_tilts() {
     for (h, born) in [(&hashes[0], 5usize), (&hashes[1], 4), (&hashes[2], 0)] {
         eng.state.net_mut(h).unwrap().entered_at_step = born;
     }
-    eng.config.train_merit = 1.0;
     eng.config.train_merit_p_min = 0.0;
-    eng.config.train_age = true;
+    // The shipped legs: the U leg says "spent", the youth leg is off.
+    eng.config.train_age = false;
+    eng.config.train_merit_updates = true;
     eng.config.crossover_cull_policy = crate::engine::config::CrossCullPolicy::Unfed;
 
-    // Best-first: the worst net has F = 0 and is the oldest (Y = 0), so the product is 0
-    // — the least fed net in the field — and it is the one evicted.
+    // Worst-first (the default): the worst net has the highest `p`, so it is the one evicted.
     assert_eq!(
         eng.select_unfed_victim(5).unwrap().as_deref(),
         Some(hashes[2].as_str())
@@ -3397,28 +3422,29 @@ fn unfed_cull_evicts_the_same_net_in_both_tilts() {
         Some(hashes[2].as_str())
     );
 
-    // Inverted: the COIN now feeds the worst net, but the cull does not follow it there —
-    // un-mirrors the fitness leg, so the same old worst net still leaves.
-    eng.config.train_merit_inverted = true;
+    // Best-first: the coin now feeds the BEST net, and the cull follows it there — the victim is
+    // the highest chance, not a second, quietly different ranking.
+    eng.config.train_merit_inverted = false;
     assert_eq!(
         eng.select_unfed_victim(5).unwrap().as_deref(),
-        Some(hashes[2].as_str())
+        Some(hashes[0].as_str())
     );
     assert_eq!(
         eng.select_mutation_victim(5, 0).unwrap().as_deref(),
-        Some(hashes[2].as_str())
+        Some(hashes[0].as_str())
     );
+    eng.config.train_merit_inverted = true;
 
     // With the lottery OFF there is no merit to sort on: the policy degrades to `worst`
     // instead of inventing a ranking from an unbounded field.
-    eng.config.train_merit = 0.0;
+    eng.config.train_merit_p_min = 1.0;
     assert_eq!(
         eng.select_unfed_victim(5).unwrap(),
-        eng.select_crossover_worst_victim(5).unwrap()
+        eng.select_crossover_worst_victim().unwrap()
     );
     assert_eq!(
         eng.select_mutation_victim(5, 0).unwrap(),
-        eng.select_crossover_worst_victim(5).unwrap()
+        eng.select_crossover_worst_victim().unwrap()
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -3452,7 +3478,6 @@ fn the_tilt_mirrors_fitness_but_never_age() {
     for (h, born) in [(&hashes[0], 5usize), (&hashes[1], 0), (&hashes[2], 3)] {
         eng.state.net_mut(h).unwrap().entered_at_step = born;
     }
-    eng.config.train_merit = 1.0;
     eng.config.train_merit_p_min = 0.0;
     eng.config.train_age = true;
     let frame = eng.lottery_frame(5).expect("armed at clock 5");
@@ -3519,7 +3544,6 @@ fn train_lottery_arms_after_the_born_shield_and_grades_level_per_ticket() {
 
     // OFF: no field, everybody trains.
     assert!(eng.lottery_frame(50).is_none());
-    eng.config.train_merit = 1.0;
     // This test asserts the RAW fractions and the p = 0 coin, so pin the miss-floor
     // the MERIT ordering (the engine default is inverted).
     eng.config.train_merit_p_min = 0.0;
@@ -3535,16 +3559,23 @@ fn train_lottery_arms_after_the_born_shield_and_grades_level_per_ticket() {
         eng.state.net_mut(h).unwrap().step = 1;
     }
 
-    // ON: still disarmed while the founders are inside their born shield (same data,
-    // different clock — the arming is what changes)…
+    // ON: still disarmed while the founders are inside their born shield — which is served in
+    // UPDATES, so the clock the field is asked about cannot arm it…
     eng.config.mutation_probation_steps = 5;
     eng.config.crossover_probation_steps = 5;
     assert!(
         eng.lottery_frame(4).is_none(),
-        "founders are shielded until clock 5"
+        "founders at U = 1 are shielded"
     );
-    // …and armed once every founder is out
-    let frame = eng.lottery_frame(5).expect("armed at clock 5");
+    assert!(
+        eng.lottery_frame(50).is_none(),
+        "…and waiting does not serve the shield: only updates do"
+    );
+    // …and armed once every founder has spent k updates (`U`).
+    for h in &hashes {
+        eng.state.net_mut(h).unwrap().step = 5;
+    }
+    let frame = eng.lottery_frame(5).expect("armed at U = 5");
     // The fixture fitness is Minimize: the LOWEST level-per-ticket is the best.
     let p = |eng: &CoreEngine, h: &str| eng.train_lottery_p(h, 5, Some(frame));
     assert!((p(&eng, &hashes[0]) - 1.0).abs() < 1e-6);
@@ -3565,22 +3596,86 @@ fn train_lottery_arms_after_the_born_shield_and_grades_level_per_ticket() {
     eng.step_one_net_in_frame(&hashes[2], 5, Some(frame), false)
         .expect("idle step");
     let worst = eng.state.net(&hashes[2]).unwrap();
-    assert_eq!(worst.step, 1, "idle does not advance the training clock");
+    assert_eq!(worst.step, 5, "idle does not advance `U`");
     assert!(worst.last_metrics.is_none(), "idle records no metric row");
     assert_eq!(worst.idle_clocks(), 1, "the clock lands in the idle ledger");
     assert!(worst.idle_spans.contains(&(5, 5)), "as this clock's span");
 
-    // A newborn keeps its own shield: it trains regardless of how it grades.
-    eng.state.net_mut(&hashes[2]).unwrap().entered_at_step = 5;
+    // A newborn keeps its own shield: at `U = 0` it trains regardless of how it grades.
+    eng.state.net_mut(&hashes[2]).unwrap().step = 0;
     assert_eq!(eng.train_lottery_p(&hashes[2], 5, Some(frame)), 1.0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Ω is a dial on the WITHHOLDING, not a scale on the merit: `p_eff = 1 − Ω(1 − p)`.
+/// THE BORN TICKET (`set_run_train_merit_born_ticket`): the born shield hands a fresh net a
+/// FRACTION of `1.0`, and the Ω band folds that to `hi` — so without the flag the coin can idle a
+/// net whose shield is served only by TRAINING. Armed, `U = 0` is paid `p = 1.0` outright and the
+/// first update lands on the first live clock.
 #[test]
-fn train_merit_omega_blends_the_withholding_linearly() {
-    let dir = std::env::temp_dir().join("gras-train-merit-omega");
+fn born_ticket_gives_a_never_trained_net_its_first_update() {
+    let dir = std::env::temp_dir().join("gras-born-ticket");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = engine(&dir, 21).unwrap();
+    eng.seed_population_internal(
+        vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+        Some(0.5),
+    )
+    .unwrap();
+    let mut hashes = eng.state.live_hashes();
+    hashes.sort();
+    // A band whose TOP is 0: `hi = lo = 0`, so no draw can sell a clock — only the born ticket can.
+    eng.config.train_merit_p_min = 0.0;
+    eng.config.train_merit_p_max = 0.0;
+    eng.config.train_merit_inverted = false;
+    for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
+        let h = &hashes[i];
+        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        buf.push(mean);
+        *eng.rolling_fitness.get_mut(h).unwrap() = buf;
+        eng.state.net_mut(h).unwrap().step = 5;
+    }
+    // Every founder has served its shield, so the clock's field exists…
+    let frame = eng.lottery_frame(5).expect("armed at U = 5");
+    // …and one net goes back to `U = 0`: born-shielded again, inside a band that pays 0.
+    let h = hashes[2].clone();
+    eng.state.net_mut(&h).unwrap().step = 0;
+    assert!(!eng.config.train_merit_born_ticket, "the pre-flag contract");
+    assert_eq!(
+        eng.train_lottery_p_eff(&h, 5, Some(frame)),
+        0.0,
+        "the shield's fraction 1.0 folds to hi through the band"
+    );
+    eng.step_one_net_in_frame(&h, 5, Some(frame), false)
+        .expect("idle step");
+    assert_eq!(
+        eng.state.net(&h).unwrap().step,
+        0,
+        "off: the coin idled a net that has never trained"
+    );
+    // ON: the same net, the same clock's field — its FIRST update is granted, not drawn, and the
+    // chance stays the folded number: the flag skips the DRAW, it does not fake `p = 1.0`.
+    eng.config.train_merit_born_ticket = true;
+    assert_eq!(
+        eng.train_lottery_p_eff(&h, 6, Some(frame)),
+        0.0,
+        "the born ticket SKIPS the draw: the chance the coin would have had is unchanged"
+    );
+    eng.step_one_net_in_frame(&h, 6, Some(frame), false)
+        .expect("train step");
+    assert_eq!(
+        eng.state.net(&h).unwrap().step,
+        1,
+        "on: the first update lands on the first live clock"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The ticket is paid from the BAND alone — `p = p_min + (p_max − p_min) × f` — with no second
+/// dial: Ω is retired to a legacy identity, so what a run sets is what a run pays.
+#[test]
+fn the_ticket_is_paid_from_the_band_alone() {
+    let dir = std::env::temp_dir().join("gras-train-merit-band");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
     eng.config.mutation_probation_steps = 0;
@@ -3599,11 +3694,11 @@ fn train_merit_omega_blends_the_withholding_linearly() {
         eng.state.net_mut(h).unwrap().step = 1;
     }
 
-    // OFF: no field at all, so every net trains and no draw is consumed.
-    eng.config.train_merit = 0.0;
+    // A floor of 1.0 is the OFF switch now that Ω is gone: no field, every net trains.
+    eng.config.train_merit_p_min = 1.0;
     assert!(
         eng.lottery_frame(5).is_none(),
-        "Ω = 0 must not build a field"
+        "a band of 1.0 grades nobody"
     );
     for h in &hashes {
         assert_eq!(eng.train_lottery_p_eff(h, 5, None), 1.0);
@@ -3612,45 +3707,37 @@ fn train_merit_omega_blends_the_withholding_linearly() {
 
     // Fixture fitness is Minimize with merits 100/200/300 per ticket: raw fractions
     // are 1, 0.5 and 0 — the best, the middle and the worst.
-    eng.config.train_merit = 1.0;
-    // Ω is the only dial under test here — and the ordering is the MERIT one.
     eng.config.train_merit_p_min = 0.0;
-    // Open the ceiling too: with the default cap, Ω = 1 would not be the raw fraction.
-    eng.config.train_merit_p_max = 1.0;
     eng.config.train_merit_p_max = 1.0;
     eng.config.train_merit_inverted = false;
     let frame = eng.lottery_frame(5).expect("armed at clock 5");
-    let raw: Vec<f32> = hashes
-        .iter()
-        .map(|h| eng.train_lottery_p(h, 5, Some(frame)))
-        .collect();
-    assert!((raw[0] - 1.0).abs() < 1e-6);
-    assert!((raw[1] - 0.5).abs() < 1e-6);
-    assert!((raw[2] - 0.0).abs() < 1e-6);
     let eff = |eng: &CoreEngine, i: usize| eng.train_lottery_p_eff(&hashes[i], 5, Some(frame));
+    // A full band IS the raw fraction: nothing lifts or folds it.
+    assert!((eff(&eng, 0) - 1.0).abs() < 1e-6);
+    assert!((eff(&eng, 1) - 0.5).abs() < 1e-6);
+    assert!((eff(&eng, 2) - 0.0).abs() < 1e-6);
 
-    // Ω = 1 is exactly the raw fraction — today's behavior, unchanged.
-    for i in 0..3 {
-        assert!((eff(&eng, i) - raw[i]).abs() < 1e-6);
-    }
-    // Half strength: the middle net withholds half as often (0.75, not 0.5),
-    // worst keeps a standing 0.5 chance instead of the permanent p = 0.
-    eng.config.train_merit = 0.5;
-    assert!((eff(&eng, 0) - 1.0).abs() < 1e-6, "the best always trains");
-    assert!((eff(&eng, 1) - 0.75).abs() < 1e-6);
-    assert!((eff(&eng, 2) - 0.5).abs() < 1e-6);
-    // A quarter strength is a quarter of the withholding.
-    eng.config.train_merit = 0.25;
-    assert!((eff(&eng, 1) - 0.875).abs() < 1e-6);
-    assert!((eff(&eng, 2) - 0.75).abs() < 1e-6);
-    // The dial does not make a coin flip at p_eff = 1: the best net consumes none.
-    eng.config.train_merit = 0.5;
+    // A genuine band: 0.2 at the worst end, 0.6 at the best, linear between.
+    eng.config.train_merit_p_min = 0.2;
+    eng.config.train_merit_p_max = 0.6;
+    assert!(
+        (eff(&eng, 0) - 0.6).abs() < 1e-6,
+        "the best net takes p_max"
+    );
+    assert!((eff(&eng, 1) - 0.4).abs() < 1e-6, "the middle sits halfway");
+    assert!((eff(&eng, 2) - 0.2).abs() < 1e-6, "the worst keeps p_min");
+    // The retired field moves nothing: the band is the only dial left.
+    eng.config.train_merit = 0.0;
+    assert!(
+        (eff(&eng, 2) - 0.2).abs() < 1e-6,
+        "Ω is inert, the band is literal"
+    );
+    // `p = 1` sells without consuming a draw; `p = 0` never sells.
+    eng.config.train_merit_p_min = 1.0;
     assert!(eng.train_lottery_draws(&hashes[0], 5, Some(frame)));
-    // Out-of-range strengths are clamped, so a bad flag cannot invert the dial.
-    eng.config.train_merit = 4.0;
-    assert!((eff(&eng, 2) - 0.0).abs() < 1e-6, "Ω clamps to 1");
-    eng.config.train_merit = -1.0;
-    assert!((eff(&eng, 2) - 1.0).abs() < 1e-6, "Ω clamps to 0");
+    eng.config.train_merit_p_min = 0.0;
+    eng.config.train_merit_p_max = 0.0;
+    assert!(!eng.train_lottery_draws(&hashes[0], 5, Some(frame)));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3677,7 +3764,6 @@ fn train_merit_p_min_floors_only_the_bottom_of_the_field() {
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = 1;
     }
-    eng.config.train_merit = 1.0;
     eng.config.train_merit_p_min = 0.05;
     eng.config.train_merit_p_max = 1.0;
     // The floor is a BOTTOM floor in the MERIT ordering (the engine default is inverted).
@@ -3697,16 +3783,18 @@ fn train_merit_p_min_floors_only_the_bottom_of_the_field() {
     // Bottom-ONLY: the gap between the best and the middle shrank by the 0.95 factor,
     // not by a constant, so the field's order and relative shape survive.
     assert!((eff(&eng, 0) - eff(&eng, 1) - 0.475).abs() < 1e-6);
-    // Under Ω the floor is blended toward 1, never multiplied away.
+    // No second dial: the floor stays the floor, whatever the retired field says.
     eng.config.train_merit = 0.5;
-    assert!((eff(&eng, 2) - 0.525).abs() < 1e-6, "1 − 0.5·(1 − 0.05)");
-    assert!((eff(&eng, 1) - 0.7625).abs() < 1e-6, "1 − 0.5·(1 − 0.525)");
-    // Ω = 0 is still fully off, floor
-    eng.config.train_merit = 0.0;
+    assert!((eff(&eng, 2) - 0.05).abs() < 1e-6, "the band is literal");
+    assert!(
+        (eff(&eng, 1) - 0.525).abs() < 1e-6,
+        "p_min + (p_max − p_min) × f"
+    );
+    // A floor of 1.0 is the OFF switch now.
+    eng.config.train_merit_p_min = 1.0;
     assert!(eng.lottery_frame(5).is_none());
     assert!((eff(&eng, 2) - 1.0).abs() < 1e-6);
     // A floor of 0.0 reproduces the pre-floor numbers exactly.
-    eng.config.train_merit = 1.0;
     eng.config.train_merit_p_min = 0.0;
     assert!((eff(&eng, 2) - 0.0).abs() < 1e-6);
     assert!((eff(&eng, 1) - 0.5).abs() < 1e-6);
@@ -3720,9 +3808,11 @@ fn lottery_merit_is_the_score_itself_not_a_rate() {
     let dir = std::env::temp_dir().join("gras-lottery-tickets");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
-    eng.config.train_merit = 1.0;
     // The MERIT ordering is the fixture (the engine default is inverted).
     eng.config.train_merit_inverted = false;
+    // Fitness place alone: this test is about the divisor, so neither leg multiplies it.
+    eng.config.train_age = false;
+    eng.config.train_merit_updates = false;
     // No shields: this test is about the divisor, not the born gate.
     eng.config.mutation_probation_steps = 0;
     eng.config.crossover_probation_steps = 0;
@@ -3779,7 +3869,6 @@ fn an_idle_clock_leaves_the_merit_bit_identical() {
     let dir = std::env::temp_dir().join("gras-lottery-idle-invariant");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
-    eng.config.train_merit = 1.0;
     eng.config.mutation_probation_steps = 0;
     eng.config.crossover_probation_steps = 0;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
@@ -3821,6 +3910,8 @@ fn resume_does_not_replay_idle_clocks() {
     let dir = std::env::temp_dir().join("race_resume_idle");
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 99).unwrap();
+    // `step == 3` below counts TICKETS; a recovery streak would add updates inside a clock.
+    engine.config.recovery_retries = 0;
     engine
         .seed_population_internal(vec![tiny_topology(7)], Some(0.5))
         .unwrap();
@@ -3848,6 +3939,8 @@ fn resume_does_not_replay_idle_clocks() {
         {
             let mut c = RaceConfig::defaults();
             c.pop_size = 1;
+            // This test pins one update per clock, so the streak must stay off on BOTH sides.
+            c.recovery_retries = 0;
             c
         },
         fitness(),
@@ -4019,7 +4112,6 @@ fn lottery_coin_is_seeded_by_run_seed_and_net_hash_not_net_seed() {
     let dir = std::env::temp_dir().join("gras-lottery-coin-seed");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
-    eng.config.train_merit = 1.0;
     // The midpoint coin is the point of this test, so no floor lifts it to 0.525.
     eng.config.train_merit_p_min = 0.0;
     eng.config.mutation_probation_steps = 5;
@@ -4077,8 +4169,8 @@ fn lottery_coin_is_seeded_by_run_seed_and_net_hash_not_net_seed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// R6: Ω is BEHAVIOURAL — it decides which clocks were idle from here on — so a resume at another
-/// strength WARNS with both values instead of refusing.
+/// R6: the ticket BAND is BEHAVIOURAL — it decides which clocks were idle from here on — so a
+/// resume at another band WARNS with both values instead of refusing.
 #[test]
 fn resume_warns_on_a_train_merit_mismatch() {
     let dir = std::env::temp_dir().join("race_resume_train_merit");
@@ -4096,7 +4188,7 @@ fn resume_warns_on_a_train_merit_mismatch() {
     // before the knob was set for this test).
     let raw = std::fs::read_to_string(dir.join("engine.json")).unwrap();
     let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    json["config"]["train_merit"] = serde_json::json!(0.5);
+    json["config"]["train_merit_p_max"] = serde_json::json!(0.6);
     std::fs::write(dir.join("engine.json"), json.to_string()).unwrap();
     engine.write_live_net_weights().unwrap();
     drop(engine);
@@ -4112,37 +4204,39 @@ fn resume_warns_on_a_train_merit_mismatch() {
     };
     let mut off = RaceConfig::defaults();
     off.pop_size = 2;
-    // The recorded header says Ω 0.5; the resume runs FULLY OFF. The default is 0.75,
-    // the off arm is pinned here.
-    off.train_merit = 0.0;
-    let resumed = resume(off).expect("Ω is behavioural: warn, never refuse");
+    // The recorded header says p_max 0.6; the resume runs the default 0.4.
+    off.train_merit_p_max = 0.4;
+    let resumed = resume(off).expect("the band is behavioural: warn, never refuse");
     let drift = resumed.behavioural_drift();
     let row = drift
         .iter()
-        .find(|d| d.label == "train_merit (Ω)")
+        .find(|d| d.label == "train_merit_p_max (p_max)")
         .expect("the drift is named");
-    assert_eq!(row.recorded, "0.50");
-    assert_eq!(row.current, "0.00");
-    assert!(row.undo.contains("set_run_train_merit(0.50)"), "{drift:?}");
+    assert_eq!(row.recorded, "0.60");
+    assert_eq!(row.current, "0.40");
+    assert!(
+        row.undo.contains("set_run_train_merit_p_max(0.60)"),
+        "{drift:?}"
+    );
     drop(resumed);
 
-    // On/off is not the only mismatch a dial can have.
+    // The band's other end is drift too.
     let mut full = RaceConfig::defaults();
     full.pop_size = 2;
-    full.train_merit = 1.0;
+    full.train_merit_p_max = 1.0;
     let resumed = resume(full).expect("0.5 vs 1.0 is drift, not a refusal");
     assert!(
         resumed
             .behavioural_drift()
             .iter()
-            .any(|d| d.label == "train_merit (Ω)" && d.current == "1.00"),
-        "the dial's neighbouring value is drift too"
+            .any(|d| d.label == "train_merit_p_max (p_max)" && d.current == "1.00"),
+        "the band's neighbouring value is drift too"
     );
     drop(resumed);
 
     let mut recorded = RaceConfig::defaults();
     recorded.pop_size = 2;
-    recorded.train_merit = 0.5;
+    recorded.train_merit_p_max = 0.6;
     let resumed = resume(recorded).expect("the recorded setting must resume");
     assert!(resumed.behavioural_drift().is_empty());
 
@@ -4487,7 +4581,6 @@ fn an_all_idle_clock_still_advances_the_race() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 11).unwrap();
     eng.config.max_steps = Some(3);
-    eng.config.train_merit = 1.0;
     eng.config.train_merit_p_min = 0.0;
     eng.config.train_merit_p_max = 0.0;
     eng.seed_population_internal(
@@ -4930,7 +5023,7 @@ fn every_live_net_gets_weights_at_every_tick_and_at_stop() {
         );
     }
     // The retired writers left no WEIGHTS behind under their old names (the topology
-    // markdown `champion-<hash>.md` stays — that flag is untouched).
+    // markdown `champion-<hash>-<fitness>.md` stays — that flag is untouched).
     assert!(dir.join("champions.json").exists());
     // One release of compatibility: the legacy name carries the same bytes.
     assert!(dir.join("elites.json").exists());
@@ -4986,10 +5079,230 @@ fn zero_checkpoint_every_skips_the_tick_but_still_finishes_the_run() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── Recovery streak (post-update retries) ─────────────────────────
+
+/// Reports a SCRIPTED fitness per train call, ignoring the weights: the streak reads exactly
+/// `report.fitness`, so a test can hand it a fall, a deeper fall and a recovery without a real
+/// loss surface. `eval_loss` stays `None` so the debug re-score probe stays out of the way.
+struct ScriptedTrainer {
+    inner: crate::trainer::TabularTrainer,
+    script: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>,
+}
+
+impl ScriptedTrainer {
+    fn new(script: &[f32]) -> Self {
+        Self {
+            inner: crate::trainer::TabularTrainer::new(loss_fn()),
+            script: std::sync::Arc::new(std::sync::Mutex::new(script.iter().copied().collect())),
+        }
+    }
+}
+
+impl crate::trainer::TabularStep for ScriptedTrainer {
+    fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer> {
+        self.inner.make_optimizer(net)
+    }
+    fn describe(&self) -> Option<serde_json::Value> {
+        self.inner.describe()
+    }
+    fn loss(&self) -> crate::trainer::LossFn<'_> {
+        self.inner.loss()
+    }
+    fn train_step(
+        &mut self,
+        _net: &mut Network,
+        _optimizer: &mut dyn flodl::nn::optim::Optimizer,
+        _step: usize,
+        _ctx: &crate::trainer::TabularContext<'_>,
+    ) -> Result<crate::trainer::TabularStepReport> {
+        let fitness = self
+            .script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("the script ran out: the streak took more updates than the test wrote");
+        Ok(crate::trainer::TabularStepReport {
+            train_loss: fitness,
+            eval_loss: None,
+            fitness,
+            informative: Vec::new(),
+        })
+    }
+}
+
+/// A race whose only job is to run the streak: lottery OFF (every clock is a real update), no CSV,
+/// no checkpoints, one seeded net.
+fn streak_engine(
+    dir: &std::path::Path,
+    tweak: impl FnOnce(&mut RaceConfig),
+    script: &[f32],
+) -> (crate::engine::TabularEngine, String) {
+    let mut config = RaceConfig {
+        pop_size: 0,
+        train_merit: 0.0,
+        csv_export: false,
+        checkpoint_every: 0,
+        ..RaceConfig::defaults()
+    };
+    tweak(&mut config);
+    let mut eng =
+        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+            tiny_dataset_dir("recovery-streak"),
+            config,
+            fitness(),
+            ScriptedTrainer::new(script),
+            Some(11),
+            Some(dir.to_path_buf()),
+        ))
+        .unwrap();
+    eng.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+        .unwrap();
+    eng.config.pop_size = 1;
+    let hash = eng.state.live_hashes()[0].clone();
+    (eng, hash)
+}
+
+/// The mechanic: a reading WORSE than the net's standing buys the next update in the SAME clock,
+/// and the streak stops the moment the net is back where it was going in. Minimize, so a HIGHER
+/// reading is a fall.
+#[test]
+fn recovery_streak_retries_until_the_reading_is_back() {
+    let dir = std::env::temp_dir().join("gras-recovery-streak");
+    let _ = std::fs::remove_dir_all(&dir);
+    // Clock 0 sets the standing at 1.0 (no prior reading, so no streak). Clock 1 reads 3.0 — a
+    // fall — then 2.5 — still short — then 0.5, which is back. Two retries, and the 1.5 that would
+    // have been the third is never taken.
+    let (mut eng, hash) = streak_engine(
+        &dir,
+        |c| {
+            c.recovery_retries = 5;
+            c.recovery_tolerance = 0.0;
+        },
+        &[1.0, 3.0, 2.5, 0.5, 1.5],
+    );
+    eng.step_one_net(&hash, 0).unwrap();
+    assert_eq!(
+        eng.state.net(&hash).unwrap().step,
+        1,
+        "with no standing there is nothing to fall from: one update, no streak"
+    );
+    eng.step_one_net(&hash, 1).unwrap();
+    let state = eng.state.net(&hash).unwrap();
+    assert_eq!(
+        state.step, 4,
+        "1 clock + 2 rescue retries, and every retry counts in U"
+    );
+    let last = state.last_metrics.clone().unwrap();
+    assert_eq!(
+        last.fitness, 0.5,
+        "the streak stopped on the recovered reading"
+    );
+    assert_eq!(last.step, 1, "every retry is recorded at the SAME clock");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The streak is OFF inside the run's INIT PROBATION: those clocks judge the founders on the draw
+/// every net shares, so a fall there is recorded, not rescued — and the gate lifts with evolution.
+#[test]
+fn recovery_never_fires_inside_the_init_probation() {
+    let dir = std::env::temp_dir().join("gras-recovery-probation");
+    let _ = std::fs::remove_dir_all(&dir);
+    // Clock 0 sets the standing (1.0). Clock 1 is INSIDE the probation and reads 3.0 — a fall with a
+    // 5-retry budget armed, and still no retry. Clock 2 is past the probation and falls again (5.0
+    // against a 2.0 standing), so the SAME budget now buys exactly one retry, back at 1.0.
+    let (mut eng, hash) = streak_engine(
+        &dir,
+        |c| {
+            c.recovery_retries = 5;
+            c.recovery_tolerance = 0.0;
+            c.init_probation_steps = 2;
+        },
+        &[1.0, 3.0, 5.0, 1.0],
+    );
+    eng.step_one_net(&hash, 0).unwrap();
+    eng.step_one_net(&hash, 1).unwrap();
+    let state = eng.state.net(&hash).unwrap();
+    assert_eq!(
+        state.step, 2,
+        "inside the probation a fall buys NO retry: one update per clock"
+    );
+    assert_eq!(state.recovery_retries(), 0, "and no ledger entry either");
+    assert_eq!(
+        state.last_metrics.as_ref().unwrap().fitness,
+        3.0,
+        "the clock ends on the falling reading"
+    );
+    // One clock later the probation is over: the same budget fires and rescues the net.
+    eng.step_one_net(&hash, 2).unwrap();
+    let state = eng.state.net(&hash).unwrap();
+    assert_eq!(state.step, 4, "clock 2's update + one rescue retry");
+    assert_eq!(state.recovery_retries(), 1, "the retry is in the ledger");
+    assert_eq!(
+        state.last_metrics.as_ref().unwrap().fitness,
+        1.0,
+        "the streak stopped on the recovered reading"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The cap is a cap: a policy that never comes back spends exactly `recovery_retries` retries and
+/// the clock ends wherever it stands — it is not chased forever.
+#[test]
+fn recovery_streak_is_capped() {
+    let dir = std::env::temp_dir().join("gras-recovery-cap");
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut eng, hash) = streak_engine(
+        &dir,
+        |c| {
+            c.recovery_retries = 2;
+            c.recovery_tolerance = 0.0;
+        },
+        &[1.0, 3.0, 4.0, 5.0],
+    );
+    eng.step_one_net(&hash, 0).unwrap();
+    eng.step_one_net(&hash, 1).unwrap();
+    let state = eng.state.net(&hash).unwrap();
+    assert_eq!(
+        state.step, 4,
+        "clock 0's update + clock 1's update + the 2-retry cap, then the clock ends"
+    );
+    assert_eq!(
+        state.last_metrics.as_ref().unwrap().fitness,
+        5.0,
+        "it ends on the LAST retry's reading, not on a rescue that never came"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The tolerance band is the point of the knob: a dip a fifth of the standing is noise and buys no
+/// extra update at all (`recovery_tolerance` 0.2 here, a tenth below).
+#[test]
+fn recovery_tolerance_absorbs_a_small_dip() {
+    let dir = std::env::temp_dir().join("gras-recovery-tolerance");
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut eng, hash) = streak_engine(
+        &dir,
+        |c| {
+            c.recovery_retries = 5;
+            c.recovery_tolerance = 0.2;
+        },
+        &[1.0, 1.1, 9.0],
+    );
+    eng.step_one_net(&hash, 0).unwrap();
+    eng.step_one_net(&hash, 1).unwrap();
+    let state = eng.state.net(&hash).unwrap();
+    assert_eq!(
+        state.step, 2,
+        "a tenth below the standing is inside the fifth-wide band: no retry"
+    );
+    assert_eq!(state.last_metrics.as_ref().unwrap().fitness, 1.1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── Mutation probation ─────────────────────────────────────────────
 
 #[test]
-fn probation_shields_fresh_nets_from_inverse_roulette() {
+fn probation_shields_fresh_nets_until_they_have_trained() {
     let dir = std::env::temp_dir().join("gras-probation-shield");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 7).unwrap();
@@ -5008,42 +5321,66 @@ fn probation_shields_fresh_nets_from_inverse_roulette() {
         buf.push(0.5 + i as f32 * 0.1);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
     }
-    eng.state.net_mut(&hashes[2]).unwrap().entered_at_step = 10; // fresh
-    // Advance the ENGINE clock to 11: the probation check reads `step_clock()`,
-    // not the `clock` argument, and pushing buffers alone leaves it at 0.
+    // The shield is served by UPDATES, not clocks: the two old nets carry k = 3 real updates
+    // behind them, the third is a newborn at `U = 0` however long the race runs.
     for h in [&hashes[0], &hashes[1]] {
-        eng.state
-            .record_step(
-                h,
-                crate::state::NetMetrics {
-                    step: 10,
-                    train_loss: 0.0,
-                    eval_loss: None,
-                    fitness: 0.5,
-                    informative: vec![],
-                    frozen: false,
-                },
-            )
-            .unwrap();
+        eng.state.net_mut(h).unwrap().step = 3;
     }
-    assert_eq!(eng.step_clock(), 11, "engine clock matches the test's");
-    let clock = 11; // within the 3-step window
     for _ in 0..20 {
         let victim = eng
-            .select_mutation_victim(clock, 0)
+            .select_mutation_victim(11, 0)
             .unwrap()
             .expect("the two off-probation nets remain cullable");
         assert_ne!(
             victim, hashes[2],
-            "a net inside its probation steps must never be the victim"
+            "a net inside its probation window must never be the victim"
         );
     }
-    // Past the window the protection lifts and the net is eligible again — assert
-    // via the predicate, since the roulette draw is probabilistic.
-    let late = 13; // 13 − 10 = 3 ≥ window 3
+    // WAITING does not spend the shield — only training does. The old clock rule had it expire
+    // at clock 13 whatever this net did; a net the lottery never feeds keeps it.
     assert!(
-        !eng.on_probation(&hashes[2], late),
-        "protection expires after k clocks"
+        eng.on_probation(&hashes[2]),
+        "0 updates is still shielded, at any clock"
+    );
+    // k = 3 updates and the protection lifts, so the net is eligible again. Assert via the
+    // predicate, since the roulette draw is probabilistic.
+    eng.state.net_mut(&hashes[2]).unwrap().step = 3;
+    assert!(
+        !eng.on_probation(&hashes[2]),
+        "the shield is served in updates: k = 3 lifts it"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE INIT PROBATION (`set_run_init_probation_steps`): the opening no-evolution window is a
+/// DECLARED number of clocks instead of a side effect of every founder sitting in its cull shield.
+#[test]
+fn init_probation_holds_the_rolls_then_hands_them_over() {
+    let dir = std::env::temp_dir().join("gras-evolution-start");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = engine(&dir, 7).unwrap();
+    // No cull shields: inside this test the ONLY thing that can defer a roll is the probation.
+    eng.config.mutation_probation_steps = 0;
+    eng.config.crossover_probation_steps = 0;
+    eng.seed_population_internal(
+        vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
+        Some(0.5),
+    )
+    .unwrap();
+    assert_eq!(
+        eng.config.init_probation_steps, 0,
+        "the default withholds nothing beyond the shields"
+    );
+    assert!(
+        eng.evolution_allowed(1),
+        "unarmed: a cull-eligible clock evolves from the first one"
+    );
+    eng.config.init_probation_steps = 3;
+    assert!(!eng.evolution_allowed(1), "inside the probation");
+    assert!(!eng.evolution_allowed(2), "…still inside it");
+    assert!(
+        eng.evolution_allowed(3),
+        "the probation lifts on its own clock, shields or not"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5096,6 +5433,9 @@ fn probation_steps_is_recorded_in_engine_json() {
     let config = RaceConfig {
         mutation_probation_steps: 4,
         crossover_probation_steps: 6,
+        recovery_retries: 2,
+        recovery_tolerance: 0.25,
+        recovery_same_seed: false,
         seat_join_probation_steps: 5,
         seat_lifetime_steps: 5,
         ..RaceConfig::defaults()
@@ -5114,6 +5454,12 @@ fn probation_steps_is_recorded_in_engine_json() {
     assert_eq!(header.config.crossover_probation_steps, 6);
     assert_eq!(header.config.seat_join_probation_steps, 5);
     assert_eq!(header.config.seat_lifetime_steps, 5);
+    assert_eq!(header.config.recovery_retries, 2);
+    assert_eq!(header.config.recovery_tolerance, 0.25);
+    assert!(
+        !header.config.recovery_same_seed,
+        "the retry draw is recorded, so a resume can diff it"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5267,36 +5613,39 @@ fn crossover_probation_shields_crossover_children_with_its_own_window() {
     .unwrap();
     let mut hashes = eng.state.live_hashes();
     hashes.sort();
-    // Same birth clock for all three; only the ORIGIN picks the window.
+    // All three start untrained; only the ORIGIN picks the window.
     for h in &hashes {
-        eng.state.net_mut(h).unwrap().entered_at_step = 10;
+        eng.state.net_mut(h).unwrap().step = 0;
     }
     eng.state.net_mut(&hashes[0]).unwrap().created_from =
         Some("crossover-one-point:parents=a,b".into());
     eng.state.net_mut(&hashes[1]).unwrap().created_from = Some("random".into());
     eng.state.net_mut(&hashes[2]).unwrap().created_from = Some("founder-2".into());
 
-    // 1 clock fresh: each net's own window covers
-    assert!(eng.on_probation(&hashes[0], 11), "crossover window is 7");
-    assert!(eng.on_probation(&hashes[1], 11), "mutation window is 3");
-    // 3 clocks fresh: the mutation window has expired, the crossover one has
-    let c = 13;
+    // 0 updates: each net's own window covers.
+    assert!(eng.on_probation(&hashes[0]), "crossover window is 7");
+    assert!(eng.on_probation(&hashes[1]), "mutation window is 3");
+    // 3 updates: the mutation window is served, the crossover one is not.
+    for h in [&hashes[1], &hashes[2]] {
+        eng.state.net_mut(h).unwrap().step = 3;
+    }
     assert!(
-        eng.on_probation(&hashes[0], c),
-        "crossover child still fresh at 3 (window 7)"
+        eng.on_probation(&hashes[0]),
+        "crossover child still short at 3 of 7"
     );
     assert!(
-        !eng.on_probation(&hashes[1], c),
-        "random immigrant's 3-clock window is done"
+        !eng.on_probation(&hashes[1]),
+        "random immigrant's 3-update window is served"
     );
     assert!(
-        !eng.on_probation(&hashes[2], c),
+        !eng.on_probation(&hashes[2]),
         "a founder uses the mutation window, not the crossover one"
     );
-    // 7 clocks fresh: the crossover window expires too.
+    // 7 updates: the crossover window is served too.
+    eng.state.net_mut(&hashes[0]).unwrap().step = 7;
     assert!(
-        !eng.on_probation(&hashes[0], 17),
-        "crossover window expires after k clocks"
+        !eng.on_probation(&hashes[0]),
+        "crossover window lifts after k updates"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5305,7 +5654,6 @@ fn crossover_probation_shields_crossover_children_with_its_own_window() {
 /// shield (the probation windows are 0) and carry a reading, so the lottery is armed.
 fn zero_ticket_engine(dir: &std::path::Path, learn_only: bool) -> crate::TabularEngine {
     let mut eng = engine(dir, 31).unwrap();
-    eng.config.train_merit = 1.0;
     eng.config.train_merit_p_min = 0.0;
     eng.config.train_merit_p_max = 0.0;
     eng.config.train_merit_learn_only = learn_only;
@@ -5374,6 +5722,44 @@ fn learn_only_off_keeps_the_idle_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A net that has NEVER learned (`U = 0`) is skipped outright, flag or no flag: no act, no eval, no
+/// fitness, no metric row. There is no learned policy to measure, so the rollout would only buy a
+/// reading for weights learning has never touched. Its sibling with one update still takes the
+/// act-only pass on the SAME pinned coin, so the skip is the `U = 0` case and not the flag.
+#[test]
+fn learn_only_skips_a_net_that_has_never_learned() {
+    let dir = std::env::temp_dir().join("gras-learn-only-never-trained");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = zero_ticket_engine(&dir, true);
+    let hashes = eng.state.live_hashes();
+    let frame = eng.lottery_frame(6).expect("armed");
+    eng.state.net_mut(&hashes[0]).unwrap().step = 0;
+    eng.state.net_mut(&hashes[1]).unwrap().step = 1;
+    assert_eq!(
+        eng.train_lottery_p_eff(&hashes[0], 6, Some(frame)),
+        0.0,
+        "the coin is pinned to a certain loss for both nets"
+    );
+    eng.step_one_net_in_frame(&hashes[0], 6, Some(frame), false)
+        .expect("never-trained step");
+    let never = eng.state.net(&hashes[0]).unwrap();
+    assert_eq!(never.step, 0, "a skipped clock cannot lift a net off zero");
+    assert!(never.last_metrics.is_none(), "no act ⇒ no metric row");
+    assert_eq!(never.frozen_clocks(), 0, "nothing acted");
+    assert_eq!(never.idle_clocks(), 1, "the clock idles instead");
+    assert_eq!(never.measured_clocks(), 0, "M never moved");
+
+    eng.step_one_net_in_frame(&hashes[1], 6, Some(frame), false)
+        .expect("act-only step");
+    let learned = eng.state.net(&hashes[1]).unwrap();
+    assert!(
+        learned.last_metrics.is_some(),
+        "U = 1 still acts and is measured"
+    );
+    assert_eq!(learned.frozen_clocks(), 1, "its clock is the act-only one");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The rollup must stay an identity under learn-only: the denied nets RAN, so they are named in
 /// the head and are not held back — only the newborns are.
 #[test]
@@ -5385,6 +5771,7 @@ fn learn_only_rollup_names_the_act_only_nets() {
         frozen: 1,
         would_train: 9,
         lottery_skips: 3,
+        idled_skips: 0,
         learn_only: true,
         newborn: 2,
         eligible: 7,
@@ -5412,6 +5799,44 @@ fn learn_only_rollup_names_the_act_only_nets() {
     assert!(line.contains("12 = 10 + 2"), "{line}");
 }
 
+/// A never-learned net (`U = 0`) denied the coin does NOT run — even under learn-only, where every
+/// other denied net acts. The line must hold that clock back, not count it as an act-only pass, and
+/// the population identity is the check: `live = ran + held back`.
+#[test]
+fn learn_only_rollup_holds_back_a_never_learned_clock() {
+    let line = step_rollup_line(&StepVitals {
+        stepped: 9,
+        trained: 6,
+        live: 12,
+        frozen: 1,
+        would_train: 9,
+        lottery_skips: 3,
+        idled_skips: 1,
+        learn_only: true,
+        newborn: 2,
+        eligible: 7,
+        probation: 3,
+        age_blocked: 0,
+        seats_held: 1,
+        seats_capacity: 1,
+        join_k: 5,
+        lifetime_j: 5,
+        crown_armed: true,
+    });
+    assert!(
+        line.contains("ran 9 of 12 = 6 ticketed + 2 act-only + 1 crown"),
+        "the U = 0 net is not an act: {line}"
+    );
+    assert!(
+        line.contains("held back 3 = 1 idled (no train, no eval) + 2 newborn"),
+        "{line}"
+    );
+    assert!(
+        line.contains("12 = 9 + 3"),
+        "live = ran + held back: {line}"
+    );
+}
+
 /// The flag round-trips through `engine.json`, and a header written BEFORE it existed reads back
 /// `false` — the idle contract those runs actually used.
 #[test]
@@ -5433,6 +5858,66 @@ fn learn_only_round_trips_and_legacy_headers_mean_off() {
     assert!(
         !old.train_merit_learn_only,
         "a pre-flag header means the idle contract"
+    );
+}
+
+/// The two 2026-11-09 knobs round-trip through `engine.json`, and a header written BEFORE them
+/// reads back the pre-flag behaviour: no born ticket, no init probation.
+#[test]
+fn born_ticket_and_init_probation_round_trip_and_legacy_headers_mean_off() {
+    let mut cfg = RaceConfig::defaults();
+    cfg.train_merit_born_ticket = true;
+    cfg.init_probation_steps = 3;
+    let snap = ConfigSnapshot::from_config(&cfg, None, None);
+    let json = serde_json::to_string(&snap).unwrap();
+    let back: ConfigSnapshot = serde_json::from_str(&json).unwrap();
+    assert!(back.train_merit_born_ticket, "the born ticket survives");
+    assert_eq!(back.init_probation_steps, 3, "the probation survives");
+
+    let mut obj = serde_json::from_str::<serde_json::Value>(&json)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+    obj.remove("train_merit_born_ticket");
+    obj.remove("init_probation_steps");
+    let old: ConfigSnapshot = serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+    assert!(
+        !old.train_merit_born_ticket,
+        "a pre-flag header has no born ticket"
+    );
+    assert_eq!(
+        old.init_probation_steps, 0,
+        "…and no init probation: nothing withheld beyond the shields"
+    );
+}
+
+/// The renamed window knob round-trips under its new key, and a header written while it was called
+/// `policy_stats` still reads back as the same field.
+#[test]
+fn policy_scoped_fitness_round_trips_and_reads_its_old_key() {
+    let mut cfg = RaceConfig::defaults();
+    cfg.policy_scoped_fitness = true;
+    let snap = ConfigSnapshot::from_config(&cfg, None, None);
+    let json = serde_json::to_string(&snap).unwrap();
+    let back: ConfigSnapshot = serde_json::from_str(&json).unwrap();
+    assert!(back.policy_scoped_fitness, "the flag survives the header");
+    assert!(
+        json.contains("\"policy_scoped_fitness\""),
+        "the header carries the name the knob means: {json}"
+    );
+
+    let mut obj = serde_json::from_str::<serde_json::Value>(&json)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+    let v = obj.remove("policy_scoped_fitness").unwrap();
+    obj.insert("policy_stats".to_string(), v);
+    let old: ConfigSnapshot = serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+    assert!(
+        old.policy_scoped_fitness,
+        "the knob's old key still reads as this one"
     );
 }
 
@@ -5474,6 +5959,7 @@ fn step_rollup_line_accounts_for_every_live_net() {
             trained: s[0].saturating_sub(s[2]),
             would_train: s[0].saturating_sub(s[2]),
             lottery_skips: 0,
+            idled_skips: 0,
             learn_only: false,
             newborn: s[3],
             eligible: s[4],
@@ -5491,7 +5977,7 @@ fn step_rollup_line_accounts_for_every_live_net() {
     let line = rollup([84, 100, 10, 16, 74, 26, 0, 10, 10, 5, 5]);
     assert_eq!(
         line,
-        "ran 84 of 100 = 74 updating + 10 crown │ held back 16 = 16 newborn (first step next clock) │ 100 = 84 + 16 │ seats 10 of 10 │ seat gates, over all 100 nets: 74 may sit = 100 − 26 in a join window or cull shield (5 clocks) − 0 age-blocked (5-clock lifetime)"
+        "ran 84 of 100 = 74 updating + 10 crown │ held back 16 = 16 newborn (first step next clock) │ 100 = 84 + 16 │ seats 10 of 10 │ seat gates, over all 100 nets: 74 may sit = 100 − 26 in a join window or cull shield (5 join clocks; the shield counts updates) − 0 age-blocked (5-clock lifetime)"
     );
     // The rollup is ONE log line: the crown tally rides inline, never an indent.
     assert!(!line.contains('\n'), "rollup stays one line: {line}");
@@ -5529,6 +6015,7 @@ fn step_rollup_line_accounts_for_every_live_net() {
         frozen: 1,
         would_train: 9,
         lottery_skips: 4,
+        idled_skips: 0,
         learn_only: false,
         newborn: 0,
         eligible: 9,
@@ -5561,7 +6048,7 @@ fn step_rollup_line_accounts_for_every_live_net() {
     let clean = rollup([4, 4, 0, 0, 0, 4, 0, 0, 1, 5, 5]);
     assert_eq!(
         clean,
-        "ran 4 of 4 = 4 updating │ 4 = 4 + 0 │ seats 0 of 1 │ seat gates, over all 4 nets: 0 may sit = 4 − 4 in a join window or cull shield (5 clocks) − 0 age-blocked (5-clock lifetime)"
+        "ran 4 of 4 = 4 updating │ 4 = 4 + 0 │ seats 0 of 1 │ seat gates, over all 4 nets: 0 may sit = 4 − 4 in a join window or cull shield (5 join clocks; the shield counts updates) − 0 age-blocked (5-clock lifetime)"
     );
 
     // Crown OFF: the line still prints — the budget and the population identity are not the crown's
@@ -5573,6 +6060,7 @@ fn step_rollup_line_accounts_for_every_live_net() {
         frozen: 0,
         would_train: 20,
         lottery_skips: 0,
+        idled_skips: 0,
         learn_only: false,
         newborn: 4,
         eligible: 24,
@@ -5838,11 +6326,11 @@ fn resume_refuses_a_different_exam_store() {
     );
 }
 
-/// The anti-champion dump is a real ARTIFACT, not a card: `worst-<hash>.md` per top-k net by ticket
-/// chance plus a `worst.md` index, each file carrying the topology, the mermaid graph and the
-/// lineage — the mirror of the champion markdown.
+/// The anti-champion dump is a real ARTIFACT, not a card: `worst-<hash>-<fit>.md` for the
+/// `champion_count` LOWEST-`fit (F)` nets — the same ranking `final-field.csv` prints last — plus a
+/// `worst.md` index, each file carrying the topology, the mermaid graph and the lineage.
 #[test]
-fn the_worst_dump_writes_the_highest_ticket_chance_nets() {
+fn the_worst_dump_writes_the_lowest_fit_nets() {
     let dir = std::env::temp_dir().join("gras-worst-dump");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 11).unwrap();
@@ -5850,11 +6338,25 @@ fn the_worst_dump_writes_the_highest_ticket_chance_nets() {
         .unwrap();
     eng.config.worst_save_topology = true;
     eng.config.champion_count = 1;
-    for (i, h) in eng.state.live_hashes().iter().enumerate() {
+    let hashes = eng.state.live_hashes();
+    for (i, h) in hashes.iter().enumerate() {
         let mut buf = RollingBuffer::new(eng.config.smoothing_window);
         buf.push(if i == 0 { 0.1 } else { 0.9 });
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
     }
+    // The expectation is the CONTRACT, not a hard-coded direction: the dump's #1 is the live net
+    // with the lowest `fit (F)` (ties: the older net, then the hash — `worst_order`).
+    let worst = hashes
+        .iter()
+        .min_by(|a, b| {
+            let (sa, sb) = (
+                eng.smoothed_fitness_of(a).unwrap(),
+                eng.smoothed_fitness_of(b).unwrap(),
+            );
+            sa.total_cmp(&sb).then_with(|| a.cmp(b))
+        })
+        .cloned()
+        .unwrap();
     eng.write_worst_markdown(1).unwrap();
     let index = std::fs::read_to_string(dir.join("worst.md")).unwrap();
     assert!(index.contains("Anti-champion"), "{index}");
@@ -5865,6 +6367,11 @@ fn the_worst_dump_writes_the_highest_ticket_chance_nets() {
         .filter(|n| n.starts_with("worst-") && n.ends_with(".md"))
         .collect();
     assert_eq!(files.len(), 1, "one file per champion_count slot");
+    assert!(
+        files[0].starts_with(&format!("worst-{}", &worst[..8.min(worst.len())])),
+        "the dump's file is the net the table ranks last: {} vs {worst}",
+        files[0]
+    );
     let body = std::fs::read_to_string(dir.join(&files[0])).unwrap();
     assert!(
         body.contains("```mermaid"),
@@ -5874,12 +6381,13 @@ fn the_worst_dump_writes_the_highest_ticket_chance_nets() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// POLICY-SCOPED window (`policy_stats`): `n` counts the readings taken on the CURRENT weights, so
-/// a net that updates every clock reports ONE datapoint (its value, no spread) instead of K readings
-/// from K different policies — while the flag off keeps the pre-flag window byte for byte.
+/// POLICY-SCOPED FITNESS (`policy_scoped_fitness`): `n` counts the readings taken on the CURRENT
+/// weights, so a net that updates every clock reports ONE datapoint (its value, no spread) instead
+/// of K readings from K different policies — while the flag off keeps the pre-flag window byte for
+/// byte.
 #[test]
-fn policy_stats_scopes_the_reading_to_the_current_weights() {
-    let dir = std::env::temp_dir().join("gras-policy-stats");
+fn policy_scoped_fitness_reads_only_the_current_weights() {
+    let dir = std::env::temp_dir().join("gras-policy-scoped-fitness");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 11).unwrap();
     eng.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
@@ -5893,7 +6401,7 @@ fn policy_stats_scopes_the_reading_to_the_current_weights() {
     let off = eng.race_reading_of(&h).unwrap();
     assert_eq!(off.n, 3, "flag off: the whole buffer, exactly as before");
     assert!((off.mean - 0.5).abs() < 1e-6, "mean was {}", off.mean);
-    eng.config.policy_stats = true;
+    eng.config.policy_scoped_fitness = true;
     let on = eng.race_reading_of(&h).unwrap();
     assert_eq!(
         (on.n, on.mean, on.std),

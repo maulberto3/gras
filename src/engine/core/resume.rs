@@ -44,10 +44,13 @@ impl CoreEngine {
             format!("set_run_risk_aversion({})", fmt_cfg(recorded.risk_aversion)),
         );
         push(
-            "policy_stats",
-            recorded.policy_stats.to_string(),
-            current.policy_stats.to_string(),
-            format!("set_run_policy_stats({})", recorded.policy_stats),
+            "policy_scoped_fitness",
+            recorded.policy_scoped_fitness.to_string(),
+            current.policy_scoped_fitness.to_string(),
+            format!(
+                "set_run_policy_scoped_fitness({})",
+                recorded.policy_scoped_fitness
+            ),
         );
         push(
             "window_recency (r)",
@@ -89,29 +92,24 @@ impl CoreEngine {
             current.crossover_selection.to_string(),
             format!("set_crossover_selection({rec_selection})"),
         );
-        push(
-            "train_merit (Ω)",
-            fmt_cfg(recorded.train_merit),
-            fmt_cfg(current.train_merit),
-            format!("set_run_train_merit({})", fmt_cfg(recorded.train_merit)),
+        // The band IS the payout now (Ω retired), so a pre-retirement header's Ω is folded into
+        // the band it RECORDED before the comparison: an old run resumes at the chances it paid.
+        let (rec_min, rec_max) = crate::engine::config::fold_omega(
+            recorded.train_merit,
+            recorded.train_merit_p_min,
+            recorded.train_merit_p_max,
         );
         push(
             "train_merit_p_min (p_min)",
-            fmt_cfg(recorded.train_merit_p_min),
+            fmt_cfg(rec_min),
             fmt_cfg(current.train_merit_p_min),
-            format!(
-                "set_run_train_merit_p_min({})",
-                fmt_cfg(recorded.train_merit_p_min)
-            ),
+            format!("set_run_train_merit_p_min({})", fmt_cfg(rec_min)),
         );
         push(
             "train_merit_p_max (p_max)",
-            fmt_cfg(recorded.train_merit_p_max),
+            fmt_cfg(rec_max),
             fmt_cfg(current.train_merit_p_max),
-            format!(
-                "set_run_train_merit_p_max({})",
-                fmt_cfg(recorded.train_merit_p_max)
-            ),
+            format!("set_run_train_merit_p_max({})", fmt_cfg(rec_max)),
         );
         // Which END of the field the tickets favour. The same idle ledger means
         // different search under the other order, so it is named like Ω.
@@ -134,6 +132,19 @@ impl CoreEngine {
             format!(
                 "set_run_train_merit_learn_only({})",
                 recorded.train_merit_learn_only
+            ),
+        );
+        // The BORN TICKET decides whether a net's FIRST update is drawn or granted: the same seed
+        // writes a different `U`, a different idle ledger and a different shield life, so a resume
+        // under the other value is not the same run. Recorded default `false` = the pre-flag
+        // contract, so an old header compares equal.
+        push(
+            "train_merit_born_ticket",
+            recorded.train_merit_born_ticket.to_string(),
+            current.train_merit_born_ticket.to_string(),
+            format!(
+                "set_run_train_merit_born_ticket({})",
+                recorded.train_merit_born_ticket
             ),
         );
         // Crossover's base choice decides WHICH child a roll yields (same draw, different
@@ -236,6 +247,18 @@ impl CoreEngine {
                 current.crossover_probation_steps,
             ),
             (
+                "init_probation_steps",
+                "set_run_init_probation_steps",
+                recorded.init_probation_steps,
+                current.init_probation_steps,
+            ),
+            (
+                "recovery_retries",
+                "set_recovery_retries",
+                recorded.recovery_retries,
+                current.recovery_retries,
+            ),
+            (
                 "seat_join_probation_steps",
                 "set_seat_join_probation_steps",
                 recorded.seat_join_probation_steps,
@@ -248,6 +271,40 @@ impl CoreEngine {
                 current.seat_lifetime_steps,
             ),
         ] {
+            push(
+                label,
+                rec.to_string(),
+                cur.to_string(),
+                format!("{setter}({rec})"),
+            );
+        }
+        for (label, setter, rec, cur) in [
+            (
+                "train_merit_updates",
+                "set_run_train_merit_updates",
+                recorded.train_merit_updates,
+                current.train_merit_updates,
+            ),
+            (
+                "recovery_same_seed",
+                "set_recovery_same_seed",
+                recorded.recovery_same_seed,
+                current.recovery_same_seed,
+            ),
+        ] {
+            push(
+                label,
+                rec.to_string(),
+                cur.to_string(),
+                format!("{setter}({rec})"),
+            );
+        }
+        for (label, setter, rec, cur) in [(
+            "recovery_tolerance",
+            "set_recovery_tolerance",
+            recorded.recovery_tolerance,
+            current.recovery_tolerance,
+        )] {
             push(
                 label,
                 rec.to_string(),
