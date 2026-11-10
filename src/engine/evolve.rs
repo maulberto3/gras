@@ -16,6 +16,11 @@ fn is_crossover_origin(created_from: Option<&str>) -> bool {
     created_from.is_some_and(|s| s.starts_with("crossover"))
 }
 
+/// A score as the roll lines print it: one decimal, `—` when the net had no reading yet.
+fn fmt_score(score: Option<f32>) -> String {
+    score.map_or_else(|| "—".to_string(), |s| format!("{s:.1}"))
+}
+
 /// Which roll group a roll belongs to. Kept apart so a crossover roll
 /// mutation roll at the same `(clock, roll)` never draw the same number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,6 +233,7 @@ impl CoreEngine {
                 None,
                 None,
                 None,
+                None,
             );
             return Ok(RollOutcome::spent(format!(
                 "child {} duplicates a live topology → discarded",
@@ -249,7 +255,7 @@ impl CoreEngine {
                 .unwrap_or_else(|| "?".into());
             let victim_for_log: Option<String> = match self.config.crossover_cull_policy {
                 crate::engine::config::CrossCullPolicy::Worst => {
-                    self.select_crossover_worst_victim(clock)?
+                    self.select_crossover_worst_victim()?
                 }
                 crate::engine::config::CrossCullPolicy::Random => {
                     self.select_random_victim(clock)?
@@ -269,6 +275,11 @@ impl CoreEngine {
                 .as_ref()
                 .and_then(|v| self.state.net(v))
                 .map(|s| s.net_seed);
+            // The victim's own score, read while it is STILL live: `cull_net` below drops its
+            // rolling window, and with it the reading the ranking priced the victim by.
+            let victim_fitness = victim_for_log
+                .as_deref()
+                .and_then(|v| self.smoothed_fitness_of(v));
             self.record_attempt(
                 clock,
                 "crossover",
@@ -281,6 +292,7 @@ impl CoreEngine {
                 victim_for_log.as_deref(),
                 victim_net_seed,
                 None,
+                victim_fitness,
             );
             // The population the victim was the worst OF — read before the cull,
             // because `cull_net` shrinks
@@ -320,13 +332,14 @@ impl CoreEngine {
                 }
             };
             return Ok(RollOutcome::survived(format!(
-                "child {} ({}) │ culled {} ({victim_note}) │ first step at {clock}",
+                "child {} ({}) │ culled {} (F {}, {victim_note}) │ first step at {clock}",
                 inserted_hash,
                 lineage_note(&lineage),
                 victim_for_log
                     .as_deref()
                     .map(|v| v[..8.min(v.len())].to_string())
                     .unwrap_or_else(|| "none".into()),
+                fmt_score(victim_fitness),
             )));
         }
     }
@@ -351,6 +364,10 @@ impl CoreEngine {
         victim: Option<&str>,
         victim_net_seed: Option<usize>,
         gate: Option<(f32, usize)>,
+        // The culled net's score AT CULL TIME (`smoothed_fitness_of` — the risk-adjusted number
+        // the ranking reads, the same one `final-field.csv` prints), `None` when it had no reading
+        // yet. Read by the CALLER before the cull, which is the last moment the net exists.
+        victim_fitness: Option<f32>,
     ) {
         if !self.config.csv_export {
             return;
@@ -381,6 +398,12 @@ impl CoreEngine {
             }
             None => row.push_str(",,,"),
         }
+        // The culled net's score, appended LAST for the same reason as the gate's columns: every
+        // existing column keeps its position. Blank when the victim had no reading at cull time.
+        row.push_str(&format!(
+            ",{}",
+            victim_fitness.map(|v| v.to_string()).unwrap_or_default()
+        ));
         row.push('\n');
         self.attempts_csv_buffer.push_str(&row);
     }
@@ -389,14 +412,13 @@ impl CoreEngine {
     /// deterministic in `(run_seed, clock, salt)`; champions/probation excluded.
     fn select_random_victim_at(&self, clock: usize, salt: usize) -> Result<Option<String>> {
         let elite = self.elite_hashes();
-        // The param `clock` is the SALTED seed input; the probation check needs
-        // the CURRENT race clock.
-        let now = self.step_clock();
+        // `clock` here is the SALTED seed input only: the shield is read off the net's own `U`,
+        // so no clock has to be looked up for it.
         let hashes: Vec<String> = self
             .state
             .live_hashes()
             .into_iter()
-            .filter(|h| !elite.contains(h) && !self.on_probation(h, now))
+            .filter(|h| !elite.contains(h) && !self.on_probation(h))
             .collect();
         if hashes.is_empty() {
             return Ok(None);
@@ -419,11 +441,10 @@ impl CoreEngine {
     /// probation). Consulted before building a child, so the check saves work.
     pub(crate) fn has_cull_eligible(&self) -> bool {
         let elite = self.elite_hashes();
-        let now = self.step_clock();
         self.state
             .live_hashes()
             .iter()
-            .any(|h| !elite.contains(h) && !self.on_probation(h, now))
+            .any(|h| !elite.contains(h) && !self.on_probation(h))
     }
 
     /// The one-line detail for a roll skipped by the hard shield — shared
@@ -435,7 +456,7 @@ impl CoreEngine {
             self.config.mutation_probation_steps
         };
         format!(
-            "no cull-eligible net — every non-champion net is inside its {branch} cull shield window (k={k}) or elite; roll spent, nothing culled/born"
+            "no cull-eligible net — every non-champion net is inside its {branch} cull shield window (k={k} updates) or elite; roll spent, nothing culled/born"
         )
     }
 
@@ -467,12 +488,11 @@ impl CoreEngine {
     /// Mutation victim last resorts: worst by smoothed fitness, else first live
     /// hash. `None` only when the population is empty.
     fn mutation_victim_fallback(&self) -> Option<String> {
-        let clock = self.step_clock();
         let elite = self.elite_hashes();
         // `&str` over `&String`: the closures only look up the hash, and `elite`
         // a tiny Vec — a linear `iter().any` beats forcing `Vec::contains`.
         let eligible = |h: &str| !elite.iter().any(|e| e == h);
-        let off_probation = |h: &str| !self.on_probation(h, clock);
+        let off_probation = |h: &str| !self.on_probation(h);
         let live = self.state.live_hashes();
         // The worst non-elite net that has ALSO served its channel probation; no
         // "first live" fallback — when nobody qualifies the caller SKIPS the roll.
@@ -498,6 +518,14 @@ impl CoreEngine {
         let Some(victim) = self.select_mutation_victim(clock, roll)? else {
             return Ok(None);
         };
+        // Identity and score are read BEFORE the cull: `cull_net` drops the net from every live map
+        // (its rolling window included), so both are gone afterwards — which is why mutation rows
+        // used to leave `victim_net_seed` blank.
+        let victim_net_seed = self.state.net(&victim).map(|s| s.net_seed);
+        let victim_fitness = self.smoothed_fitness_of(&victim);
+        // The population the victim was the worst OF — read before the cull shrinks it, exactly as
+        // the crossover line does, so both channels price their eviction the same way.
+        let live_before = self.state.live_count();
         self.cull_net(&victim, clock, "immigrant-slot")?;
         let idx = self.next_child_ordinal(clock);
         let draw = self.generate_random_at(clock, idx)?;
@@ -518,12 +546,27 @@ impl CoreEngine {
         // verdict yet"; its first optimizer update is the next group step.
         child.state.step = 0;
         child.state.last_metrics = None;
+        // The same shape the crossover line prints — `culled <hash> (F <score>, <why this net>)` —
+        // so a reader can weigh what the field GAVE UP for an immigrant. `F —` is honest: a newborn
+        // victim that never got a reading has no score to report, and the note still says the policy.
+        let victim_note = match self.config.mutation_cull_policy {
+            crate::engine::config::MutationCullPolicy::Worst => {
+                format!("lowest score of {live_before}")
+            }
+            crate::engine::config::MutationCullPolicy::InverseFitness => {
+                format!("fitness-inverse draw of {live_before}")
+            }
+            crate::engine::config::MutationCullPolicy::Random => "random draw".to_string(),
+            crate::engine::config::MutationCullPolicy::Unfed => {
+                format!("fewest tickets of {live_before}")
+            }
+        };
         let detail = format!(
-            "culled {} │ mutation {} born (fresh, first step at {clock}){novelty_note}",
+            "culled {} (F {}, {victim_note}) │ mutation {} born (fresh, first step at {clock}){novelty_note}",
             &victim[..8.min(victim.len())],
+            fmt_score(victim_fitness),
             &child.state.hash[..8.min(child.state.hash.len())],
         );
-        let victim_net_seed = self.state.net(&victim).map(|s| s.net_seed);
         self.record_attempt(
             clock,
             "mutation",
@@ -538,6 +581,7 @@ impl CoreEngine {
             // The gate's own reading: `None` when it is off, else the Δ of the accepted draw
             // (or of the most novel refusal, once the cap is spent) and its candidate count.
             draw.delta.map(|d| (d, draw.draws)),
+            victim_fitness,
         );
         self.insert_child(child, clock, "mutation");
         Ok(Some(detail))
@@ -613,13 +657,12 @@ impl CoreEngine {
         }
         let direction = self.fitness.direction();
         let elite = self.elite_hashes();
-        let clock = self.step_clock();
         // Inverse fitness: weight = (adjusted best) − (adjusted value) ≥ 0 — the worst net gets
         // largest weight, the best gets zero.
         let scored: Vec<(String, f32)> = hashes
             .iter()
             .filter(|h| !elite.contains(h))
-            .filter(|h| !self.on_probation(h, clock))
+            .filter(|h| !self.on_probation(h))
             .filter_map(|h| self.smoothed_fitness_of(h).map(|s| (h.clone(), s)))
             .collect();
         if scored.len() < 2 {
@@ -666,9 +709,24 @@ impl CoreEngine {
         fastrand::Rng::with_seed(kind.seed(self.header.run_seed, clock, roll)).f32() < p
     }
 
-    /// Whether `hash` is still under its **cull shield** at `clock` — what the log calls `cull
-    /// shield` (NOT the elite `join window`, which is `elite_probation_age`): cull-IMMUNE
-    pub(crate) fn on_probation(&self, hash: &str, clock: usize) -> bool {
+    /// Whether this clock may EVOLVE at all: the run's INIT PROBATION has passed (`clock >=
+    /// init_probation_steps`) AND somebody is cull-eligible. Clock 0 never evolves, so the
+    /// probation reads as "the opening clocks with no culls and no births", and `0` (the default)
+    /// withholds nothing beyond the born shields — the pre-knob behaviour, bit for bit.
+    pub(crate) fn evolution_allowed(&self, clock: usize) -> bool {
+        clock >= self.config.init_probation_steps && self.has_cull_eligible()
+    }
+
+    /// Whether `hash` is still under its **cull shield** — what the log calls `cull shield` (NOT
+    /// the elite `join window`, which is `elite_probation_age`): cull-IMMUNE until the net has spent
+    /// `k` UPDATES (`U`, real optimizer steps), `k` being its channel's window.
+    ///
+    /// Counted in UPDATES, not clocks: the shield exists to buy a newcomer enough TRAINING to be
+    /// judged, so a net nobody fed keeps it (waiting is not evidence) and one that trains hard — a
+    /// recovery streak — serves it inside a single clock. `U` is the same counter the lottery's `Um`
+    /// leg and the stop card's `updates (U)` column read, so the shield lifts on exactly the number
+    /// printed beside it.
+    pub(crate) fn on_probation(&self, hash: &str) -> bool {
         let Some(state) = self.state.net(hash) else {
             return false;
         };
@@ -677,51 +735,60 @@ impl CoreEngine {
         } else {
             self.config.mutation_probation_steps
         };
-        window > 0 && clock.saturating_sub(state.entered_at_step) < window
+        window > 0 && state.step < window
     }
 
-    /// The **Unfed** victim, shared by both channels' `Unfed` arm: the net with the least claim
-    /// the grid — the lowest **merit** `Fm × Ym`, the fitness place in the MERIT ordering (best =
+    /// The **Unfed** victim, shared by both channels' `Unfed` arm: the net with the HIGHEST ticket
+    /// chance `p` this clock — deterministic, taken from the coin's own number, so it is the least
+    /// fit AND most spent net whenever the setters arm it that way (worst-first `Fm⁻` × `Um`).
+    /// Excluded: the elite set, the crown, and every net the lottery does not grade (born shield,
+    /// no reading, flat field). `None` when that leaves nobody — the roll is spent, nothing culled.
     pub(crate) fn select_unfed_victim(&self, clock: usize) -> Result<Option<String>> {
         let Some(frame) = self.lottery_frame(clock) else {
-            return self.select_crossover_worst_victim(clock);
+            return self.select_crossover_worst_victim();
         };
         let elite = self.elite_hashes();
-        let age_leg = self.train_age();
-        let mut scored: Vec<(String, f32)> = self
-            .state
-            .live_hashes()
-            .into_iter()
-            .filter(|h| !elite.contains(h))
-            // `train_lottery_parts` is `None` for the crown, a net inside its born shield, a net
-            // with no reading, or a flat field — all of them un-gradable, so none of them can be
-            .filter_map(|h| {
-                self.train_lottery_parts(&h, clock, Some(frame), self.merit(&h))
-                    .map(|(f, youth, _)| {
-                        // The tilt is a plain mirror of the fitness leg (`p = 1 − f`),
-                        // so flipping it back recovers the merit ordering exactly.
-                        let fitness = if self.config.train_merit_inverted {
-                            1.0 - f
-                        } else {
-                            f
-                        };
-                        (h, if age_leg { fitness * youth } else { fitness })
-                    })
-            })
-            .collect();
-        if scored.is_empty() {
-            return self.select_crossover_worst_victim(clock);
+        // THE HIGHEST TICKET CHANCE GOES: the victim is the net the coin is about to pay the most,
+        // read off the SAME `p = p_min + (p_max − p_min) × f` the step draws against. No draw, no
+        // second score, hash tie-break — so "least fit, most spent" is evicted exactly when the
+        // setters say so (worst-first plus `Um`), and the cull can never disagree with the coin.
+        let mut worst: Option<(String, f32)> = None;
+        for h in self.state.live_hashes() {
+            if elite.contains(&h) {
+                continue;
+            }
+            let merit = self.merit(&h);
+            // `None` = not graded (crown, born shield, no reading, flat field): such a net has no
+            // ticket chance to rank, so it is not a victim either.
+            if self
+                .train_lottery_parts(&h, clock, Some(frame), merit)
+                .is_none()
+            {
+                continue;
+            }
+            let p = self.train_lottery_p_eff_from(&h, clock, Some(frame), merit);
+            let better = match &worst {
+                None => true,
+                Some((held, top)) => p > *top || (p == *top && h < *held),
+            };
+            if better {
+                worst = Some((h, p));
+            }
         }
-        scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        Ok(Some(scored.swap_remove(0).0))
+        // Nobody graded (a flat field, or every candidate inside its shield): the policy degrades
+        // to `worst` instead of inventing a ranking — what it did before the lottery existed.
+        match worst {
+            Some((h, _)) => Ok(Some(h)),
+            None => self.select_crossover_worst_victim(),
+        }
     }
 
     /// The crossover Worst-policy victim: the worst non-elite net that has served
     /// its crossover probation. `None` when nobody is cullable (shield is HARD).
-    pub(crate) fn select_crossover_worst_victim(&self, clock: usize) -> Result<Option<String>> {
+    pub(crate) fn select_crossover_worst_victim(&self) -> Result<Option<String>> {
         Ok(self
             .worst_nets_by_smoothed_fitness(self.state.live_count())?
             .into_iter()
-            .find(|h| !self.on_probation(h, clock)))
+            .find(|h| !self.on_probation(h)))
     }
 }

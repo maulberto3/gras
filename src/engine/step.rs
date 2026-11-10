@@ -7,6 +7,8 @@
 //!   ├─ seat freeze check (ANTI-DEVOLUTION A) → act-and-measure pass (NoopOptimizer)
 //!   ├─ train-eval lottery denies the ticket   → idle pass (no train, no eval), or the
 //!   │                                           act-only pass under `train_merit_learn_only`
+//!   │                                           — never for a net with `U = 0`, which idles
+//!   │                                           unless the born ticket hands it the clock
 //!   └─ run_trainer_step_with_real_optimizer(hash, clock)
 //!        └─ run_trainer_step(hash, clock, optimizer)
 //!             ├─ seed_step_randomness(net_seed, clock)   (fastrand + libtorch)
@@ -40,6 +42,10 @@ pub(crate) struct LotteryFrame {
     pub youngest: usize,
     /// Clocks lived by the OLDEST graded net.
     pub oldest: usize,
+    /// Fewest UPDATES (`U`) any graded net has spent — the U leg's `1.0` end.
+    pub fewest_updates: usize,
+    /// Most updates any graded net has spent — the U leg's `0.0` end.
+    pub most_updates: usize,
 }
 
 impl CoreEngine {
@@ -68,13 +74,24 @@ impl CoreEngine {
         if let Some(_frame) = frame {
             let p = self.train_lottery_p_eff(hash, clock, frame);
             self.last_ticket_p.insert(hash.to_string(), p);
+            // THE BORN TICKET (`set_run_train_merit_born_ticket`): a net that has never trained
+            // SKIPS the draw outright — its first update is granted, not paid, so it cannot idle
+            // its own shield away. `p` is left as the chance the coin would have given it (the
+            // born shield's fraction folds to `hi`); nothing pretends the probability was 1.0.
+            let born = self.config.train_merit_born_ticket && self.never_trained(hash);
             // `draws_at` is the same draw the wrapper would make, with `p` already
             // hand — one merit read per net per clock, not two.
-            if !forced && !self.train_lottery_draws_at(hash, clock, p) {
+            if !forced && !born && !self.train_lottery_draws_at(hash, clock, p) {
                 // LEARN-ONLY: the coin withholds the UPDATE, never the STEP — the net runs its
                 // real trainer through the no-op optimizer, so it acts and is MEASURED on a fresh
                 // batch every clock and only the weight write is lost. OFF: the clock idles.
-                return if self.config.train_merit_learn_only {
+                // A net that has NEVER learned (`U = 0`) is skipped EITHER WAY: no optimizer update
+                // has ever landed on it, so there is no learned policy to measure and a rollout
+                // would only buy a fresh number for weights untouched by learning. No act, no eval,
+                // no fitness, no RNG — the clock costs it one ledger entry. The BORN TICKET
+                // (`set_run_train_merit_born_ticket`) is what keeps such a net out of here: it is
+                // paid `p = 1.0` directly, so the skip cannot rob a net of its FIRST ticket.
+                return if self.config.train_merit_learn_only && !self.never_trained(hash) {
                     self.act_only_step(hash, clock, "NO TICKET (act-only)")
                 } else {
                     self.idle_step(hash, clock)
@@ -90,37 +107,125 @@ impl CoreEngine {
             ))
             .into());
         }
-        let report = self.run_trainer_step_with_real_optimizer(hash, clock)?;
+        // The net's standing BEFORE this clock's update: the level its new reading has to reach
+        // for the update to have done no harm. Read NOW, while the window still holds the
+        // PRE-update policy — `record_update` below resets the epoch, and with it the level.
+        let before = self.race_reading_of(hash).map(|r| r.mean);
+        // `call_index` is the recovery streak's retry counter: 0 is the clock's own update, 1.. the
+        // retries. Under the default `recovery_same_seed` a retry is the clock's OWN draw again (a
+        // true retry, which asks whether the fall was the update's fault); with the switch off,
+        // `call_index` rides into `StepEnv::attempt` so the retry trains on the NEXT draw.
+        let mut call_index = 0u64;
+        let mut report = self.run_trainer_step_with_real_optimizer(hash, clock, call_index)?;
         if let Some(rl) = &report.rl {
             self.total_train_turns += rl.train_turns;
         }
-        let metrics = NetMetrics {
-            step: clock,
-            train_loss: report.train_loss,
-            eval_loss: report.eval_loss,
-            fitness: report.fitness,
-            informative: report.informative,
-            frozen: false,
+        let mut metrics = self.record_update(hash, clock, &report)?;
+        // RECOVERY STREAK (`recovery_retries`): an update that lands WORSE than the net's standing
+        // bought a bad READING, which is not yet a bad policy — the two differ by one more update,
+        // and near the crown that difference is a seat. So take the next update NOW, in this same
+        // clock, and stop the moment the net is back where it was going in. Every retry is a REAL
+        // update: its own RNG stream, its own optimizer step, its own `U`. The streak is CAPPED —
+        // after `recovery_retries` failures the clock ends wherever the policy stands, so a policy
+        // that cannot be rescued is not chased forever.
+        //
+        // …and the streak is OFF for the run's INIT PROBATION (`set_run_init_probation_steps`): those
+        // opening clocks are for judging what the founders ARE, on draws every net shares. A retry
+        // there would hand one net extra updates the rest never got, in exactly the window whose
+        // whole point is that nobody evolves — the verdict would measure who was rescued, not who
+        // was born right. The same clock arithmetic `evolution_allowed` uses, so the gate lifts
+        // with the culls and births it protects.
+        let in_init_probation = clock < self.config.init_probation_steps;
+        let cap = if in_init_probation {
+            0
+        } else {
+            self.config.recovery_retries
         };
-        // record_step owns the clock bookkeeping end-to-end (metrics snapshot +
-        // local step advance); a second advance would double-count.
-        self.state.record_step(hash, metrics.clone())?;
-        // A challenge is just another step: its forced-action fitness ranks like
-        // any other — the user's semantics.
-        if let Some(buf) = self.rolling_fitness.get_mut(hash) {
-            buf.push(metrics.fitness);
-        }
-        // This reading describes the weights the update just produced: under `policy_stats` it is
-        // reading ONE of a new epoch, which is what keeps the window on the current policy.
-        self.rolling_epoch.insert(hash.to_string(), 1);
-        if let Some(buf) = self.rolling_train.get_mut(hash) {
-            buf.push(metrics.train_loss);
-        }
-        if let Some(buf) = self.rolling_eval.get_mut(hash) {
-            if let Some(e) = metrics.eval_loss {
-                buf.push(e);
+        let mut retries = 0usize;
+        // The readings the streak walks: the update that fell, then every retry's verdict. Only a
+        // streak pushes, so a clean clock allocates nothing and the RNG never sees this.
+        let mut walk: Vec<f32> = Vec::new();
+        let first_bad = metrics.fitness;
+        while retries < cap && before.is_some_and(|was| self.fell_from(was, metrics.fitness)) {
+            if retries == 0 {
+                walk.push(metrics.fitness);
             }
+            retries += 1;
+            call_index += 1;
+            report = self.run_trainer_step_with_real_optimizer(hash, clock, call_index)?;
+            if let Some(rl) = &report.rl {
+                self.total_train_turns += rl.train_turns;
+            }
+            metrics = self.record_update(hash, clock, &report)?;
+            walk.push(metrics.fitness);
         }
+        // The retries go in the NET's ledger, not in a counter: a resumed run re-walks them at this
+        // same clock, and without the entry its weights would land somewhere the record never did.
+        if retries > 0 {
+            self.state.record_recovery(hash, clock, retries)?;
+        }
+        // RECOVERY, on its own line: a streak is the one event that buys a net updates it never had
+        // clocks for, so it is not folded into the per-net debug line (which a watch run never
+        // shows). Who needed it, for what — the standing it had to climb back to and how far it
+        // actually fell against the tolerance — and how much it cost, all on one row. The DRAW is
+        // named too: `same draw` re-tests the update that fell, `fresh draw` fights on new rows.
+        if let (Some(was), false) = (before, walk.is_empty()) {
+            let direction = self.fitness.direction();
+            let drop = match direction {
+                crate::utils::fitness::Direction::Maximize => was - first_bad,
+                crate::utils::fitness::Direction::Minimize => first_bad - was,
+            };
+            let pct = drop / was.abs().max(f32::EPSILON) * 100.0;
+            let steps: String = walk
+                .iter()
+                .skip(1)
+                .enumerate()
+                .map(|(i, f)| format!("r{} {}", i + 1, fmt_line(*f)))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            // Back = the retry that ended it; capped = the last reading the streak could buy.
+            let verdict = if self.fell_from(was, metrics.fitness) {
+                format!(
+                    "CAP SPENT, ends at {} (still {:.1}% short)",
+                    fmt_line(metrics.fitness),
+                    (match direction {
+                        crate::utils::fitness::Direction::Maximize => was - metrics.fitness,
+                        crate::utils::fitness::Direction::Minimize => metrics.fitness - was,
+                    }) / was.abs().max(f32::EPSILON)
+                        * 100.0
+                )
+            } else {
+                format!(
+                    "back at the standing on {} · stopped there",
+                    fmt_line(metrics.fitness)
+                )
+            };
+            tracing::info!(
+                "step {} │ recovery │ net {} │ standing {} fell to {} ({:.1}% > tolerance {:.1}%) │ {} │ {} │ {} │ {} of {} retr{} used",
+                clock,
+                &hash[..8.min(hash.len())],
+                fmt_line(was),
+                fmt_line(first_bad),
+                pct,
+                self.config.recovery_tolerance * 100.0,
+                if steps.is_empty() {
+                    "no retry".to_string()
+                } else {
+                    steps
+                },
+                verdict,
+                if self.config.recovery_same_seed {
+                    "same draw"
+                } else {
+                    "fresh draw"
+                },
+                retries,
+                cap,
+                if cap == 1 { "y" } else { "ies" },
+            );
+        }
+        // The one reading this clock ranks by: the policy the streak ended on.
+        self.record_reading(hash, &metrics);
         // Per-net detail is debug-only (Plan A: the user log shows one rollup line per step — see
         // `run`).
         let extra: String = self
@@ -137,8 +242,16 @@ impl CoreEngine {
             })
             .collect();
         let dir = self.fitness.direction().arrow();
+        // A streak is the one per-net event the clock cannot show any other way: `U` gained updates
+        // this net never had clocks for.
+        let recovery = match (retries, before) {
+            (0, _) | (_, None) => String::new(),
+            // The same `r<n>` the stop table prints on `updates (U)`, so the live log and the
+            // finished card name the streak with one spelling.
+            (n, Some(was)) => format!(" │ r{n} (standing {})", fmt_line(was)),
+        };
         tracing::debug!(
-            "step {} │ net {} │ train_loss↓ {} │ eval_loss↓ {} │ fitness{} {}{}",
+            "step {} │ net {} │ train_loss↓ {} │ eval_loss↓ {} │ fitness{} {}{}{}",
             clock,
             &hash[..8.min(hash.len())],
             fmt_line(metrics.train_loss),
@@ -146,15 +259,87 @@ impl CoreEngine {
             dir,
             fmt_line(metrics.fitness),
             extra,
+            recovery,
         );
         Ok(())
+    }
+
+    /// Fold ONE real update into the state and the ledgers: the metrics snapshot + local step
+    /// advance (so `U` counts this update). The READING is deliberately not pushed here — a
+    /// streak's intermediate verdicts are search detail, and the window holds one reading per
+    /// clock ([`Self::record_reading`]), which is the series `history.csv` records and a resume
+    /// rebuilds.
+    fn record_update(
+        &mut self,
+        hash: &str,
+        clock: usize,
+        report: &crate::trainer::StepReport,
+    ) -> Result<NetMetrics> {
+        let metrics = NetMetrics {
+            step: clock,
+            train_loss: report.train_loss,
+            eval_loss: report.eval_loss,
+            fitness: report.fitness,
+            informative: report.informative.clone(),
+            frozen: false,
+        };
+        // record_step owns the clock bookkeeping end-to-end (metrics snapshot +
+        // local step advance); a second advance would double-count.
+        self.state.record_step(hash, metrics.clone())?;
+        Ok(metrics)
+    }
+
+    /// Push the clock's FINAL reading — ONE per clock, streak or not. The window and `history.csv`
+    /// (one row per clock) must describe the same series: a resume rebuilds its window from those
+    /// rows, so a streak that pushed every intermediate value would leave the resumed twin with a
+    /// window the live run never had.
+    fn record_reading(&mut self, hash: &str, metrics: &NetMetrics) {
+        // A challenge is just another step: its forced-action fitness ranks like
+        // any other — the user's semantics.
+        if let Some(buf) = self.rolling_fitness.get_mut(hash) {
+            buf.push(metrics.fitness);
+        }
+        // This reading describes the weights the update just produced: under a policy-scoped
+        // fitness window it is reading ONE of a new epoch, which keeps the window on the current
+        // policy.
+        self.rolling_epoch.insert(hash.to_string(), 1);
+        if let Some(buf) = self.rolling_train.get_mut(hash) {
+            buf.push(metrics.train_loss);
+        }
+        if let Some(buf) = self.rolling_eval.get_mut(hash) {
+            if let Some(e) = metrics.eval_loss {
+                buf.push(e);
+            }
+        }
+    }
+
+    /// `U == 0`: no optimizer update has ever landed on this net. It holds no learned policy, so a
+    /// denied clock has nothing to measure — the one predicate under which the learn-only pass is
+    /// skipped and the net idles outright.
+    fn never_trained(&self, hash: &str) -> bool {
+        self.state.net(hash).is_some_and(|s| s.step == 0)
+    }
+
+    /// Whether `after` fell BEYOND the tolerance from `before` — the recovery streak's trigger.
+    /// A `NaN` on either side never triggers: an unreadable number is not a fall. The tolerance is
+    /// a FRACTION of the standing (`0.2` = a fifth is absorbed), so one number holds for a loss and
+    /// for turns survived alike; the band is strict, so a drop of exactly `tolerance` is kept.
+    fn fell_from(&self, before: f32, after: f32) -> bool {
+        if !before.is_finite() || !after.is_finite() {
+            return false;
+        }
+        let drop = match self.fitness.direction() {
+            crate::utils::fitness::Direction::Maximize => before - after,
+            crate::utils::fitness::Direction::Minimize => after - before,
+        };
+        drop > self.config.recovery_tolerance * before.abs()
     }
 
     /// The CROWN's act-and-measure pass: the net plays a real step (fresh batch, honest standing)
     /// and its weight update is DISCARDED (no-op optimizer).
     fn act_only_step(&mut self, hash: &str, clock: usize, why: &str) -> Result<()> {
         let mut noop = NoopOptimizer;
-        let report = self.run_trainer_step(hash, clock, &mut noop)?;
+        let report = self.run_trainer_step(hash, clock, 0, &mut noop)?;
         let metrics = NetMetrics {
             step: clock,
             train_loss: report.train_loss,
@@ -225,7 +410,8 @@ impl CoreEngine {
     /// The clock's lottery field: the best/worst merit among the nets the lottery actually grades
     /// (live, non-crown, out of their born shield, with a reading).
     pub(crate) fn lottery_frame(&self, clock: usize) -> Option<LotteryFrame> {
-        if self.train_merit_omega() <= 0.0 || !self.lottery_armed(clock) {
+        // A band whose FLOOR is 1.0 sells every clock to every net: there is nothing to grade.
+        if self.train_merit_p_min() >= 1.0 || !self.lottery_armed() {
             return None;
         }
         let direction = self.fitness.direction();
@@ -235,9 +421,10 @@ impl CoreEngine {
         };
         let (mut best, mut worst) = (f32::NEG_INFINITY, f32::INFINITY);
         let (mut youngest, mut oldest) = (usize::MAX, 0usize);
+        let (mut fewest_updates, mut most_updates) = (usize::MAX, 0usize);
         let mut any = false;
         for h in self.state.live_hashes() {
-            if self.frozen_crown.contains(&h) || self.on_probation(&h, clock) {
+            if self.frozen_crown.contains(&h) || self.on_probation(&h) {
                 continue;
             }
             if let Some(m) = self.merit(&h) {
@@ -250,6 +437,11 @@ impl CoreEngine {
                     youngest = youngest.min(age);
                     oldest = oldest.max(age);
                 }
+                // The U bounds ride it too: `U` is the age leg's twin on updates.
+                if let Some(state) = self.state.net(&h) {
+                    fewest_updates = fewest_updates.min(state.step);
+                    most_updates = most_updates.max(state.step);
+                }
                 any = true;
             }
         }
@@ -257,22 +449,31 @@ impl CoreEngine {
             return None;
         }
         let youngest = if youngest == usize::MAX { 0 } else { youngest };
+        let fewest_updates = if fewest_updates == usize::MAX {
+            0
+        } else {
+            fewest_updates
+        };
         Some(LotteryFrame {
             best,
             worst,
             youngest,
             oldest,
+            fewest_updates,
+            most_updates,
         })
     }
 
     /// Whether the lottery is ARMED yet.
-    fn lottery_armed(&self, clock: usize) -> bool {
+    fn lottery_armed(&self) -> bool {
         self.state.live_hashes().iter().all(|h| {
             // Only the STARTING population gates the arming; `entered_at_step == 0`
             // founder/seeded-batch contract (`NetState::new` stamps `step` as the entry step
+            // while the lottery stays disarmed everyone is handed `p = 1.0` and trains, which is
+            // what serves a founder's shield — the gate opens by TRAINING, never by waiting.
             match self.state.net(h) {
                 Some(s) if s.entered_at_step != 0 => true,
-                Some(_) => !self.on_probation(h, clock),
+                Some(_) => !self.on_probation(h),
                 None => true,
             }
         })
@@ -301,7 +502,7 @@ impl CoreEngine {
         let Some(frame) = frame else {
             return 1.0; // lottery off (or no field this clock)
         };
-        if self.frozen_crown.contains(hash) || self.on_probation(hash, clock) {
+        if self.frozen_crown.contains(hash) || self.on_probation(hash) {
             return 1.0;
         }
         let Some((_, _, mix)) = self.train_lottery_parts(hash, clock, Some(frame), merit) else {
@@ -347,7 +548,7 @@ impl CoreEngine {
         if self.frozen_crown.contains(hash) {
             return Err("crown");
         }
-        if self.on_probation(hash, clock) {
+        if self.on_probation(hash) {
             return Err("shield");
         }
         let Some(mine) = merit else {
@@ -374,14 +575,28 @@ impl CoreEngine {
             frame.worst,
             self.config.train_merit_inverted,
         );
-        let youth = self
-            .lottery_age_of(hash, clock)
-            .map(|age| Self::youth_fraction(age, frame.youngest, frame.oldest))
-            .unwrap_or(1.0);
-        // The age leg ARMS the product: OFF, nothing multiplies `Ym`, so the fraction is `Fm`
-        // itself — the pre-knob lottery, bit for bit.
-        let fraction = if self.train_age() { f * youth } else { f };
-        Ok((f, youth, fraction))
+        let youth = if self.train_age() {
+            self.lottery_age_of(hash, clock)
+                .map(|age| Self::youth_fraction(age, frame.youngest, frame.oldest))
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        // The U leg is the age leg's TWIN on updates rather than clocks: a net that has spent its
+        // updates is the older one, so it too runs `1.0` at the field's fewest to `0.0` at its
+        // most. Armed beside the age leg the ticket is `Fm × Ym × Um`; alone it is `Fm × Um`.
+        let updates = if self.config.train_merit_updates {
+            self.state
+                .net(hash)
+                .map(|s| Self::youth_fraction(s.step, frame.fewest_updates, frame.most_updates))
+                .unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        // Both legs are neutral at `1.0`, so a disarmed lottery multiplies by exactly `1.0` — the
+        // pre-knob fraction, bit for bit.
+        let leg = youth * updates;
+        Ok((f, leg, f * leg))
     }
 
     /// Whether the lottery's AGE leg is armed (`set_run_train_merit_age`). `false` = the ticket
@@ -407,11 +622,6 @@ impl CoreEngine {
         1.0 - (age.saturating_sub(youngest) as f32 / span).clamp(0.0, 1.0)
     }
 
-    /// The lottery's strength Ω (`set_run_train_merit`), clamped to `[0, 1]`.
-    pub(crate) fn train_merit_omega(&self) -> f32 {
-        self.config.train_merit.clamp(0.0, 1.0)
-    }
-
     /// The lottery's merit floor `p_min` (`set_run_train_merit_p_min`), clamped to `[0, 1]`.
     pub(crate) fn train_merit_p_min(&self) -> f32 {
         self.config.train_merit_p_min.clamp(0.0, 1.0)
@@ -435,8 +645,8 @@ impl CoreEngine {
         }
     }
 
-    /// [`Self::train_lottery_p`] with the clock's Ω blend applied — the number the coin actually
-    /// compares against, and the one the logs print.
+    /// [`Self::train_lottery_p`] paid out of the band `[p_min, p_max]` — the number the coin
+    /// actually compares against, and the one the logs print.
     pub(crate) fn train_lottery_p_eff(
         &self,
         hash: &str,
@@ -456,11 +666,12 @@ impl CoreEngine {
         merit: Option<f32>,
     ) -> f32 {
         let fraction = self.train_lottery_p_from(hash, clock, frame, merit);
-        // TWO ENDS, one affine step.
-        let omega = self.train_merit_omega();
-        let lo = 1.0 - omega * (1.0 - self.train_merit_p_min());
-        let hi = 1.0 - omega * (1.0 - self.train_merit_p_max());
-        lo + (hi - lo) * fraction
+        // ONE BAND, no second dial: `p_min` is the chance the WORST-graded net gets each clock and
+        // `p_max` the chance the BEST-graded one gets, and every net plays in between. Ω used to
+        // fold this band toward 1; it is retired, so what a run sets is what a run pays.
+        let p_min = self.train_merit_p_min();
+        let p_max = self.train_merit_p_max();
+        p_min + (p_max - p_min) * fraction
     }
 
     /// The lottery's coin: did this net EARN a train-eval ticket this clock?
@@ -510,13 +721,14 @@ impl CoreEngine {
         &mut self,
         hash: &str,
         clock: usize,
+        call_index: u64,
     ) -> Result<crate::trainer::StepReport> {
         let mut optimizer = self.optimizers.remove(hash).ok_or_else(|| {
             crate::utils::error::EngineError::InvalidOptions(format!(
                 "race: net {hash} not live (no Optimizer in memory)"
             ))
         })?;
-        let report = self.run_trainer_step(hash, clock, optimizer.as_mut())?;
+        let report = self.run_trainer_step(hash, clock, call_index, optimizer.as_mut())?;
         self.optimizers.insert(hash.to_string(), optimizer);
         Ok(report)
     }
@@ -527,6 +739,7 @@ impl CoreEngine {
         &mut self,
         hash: &str,
         clock: usize,
+        call_index: u64,
         optimizer: &mut dyn flodl::nn::optim::Optimizer,
     ) -> Result<crate::trainer::StepReport> {
         let net_seed = self.state.net(hash).map(|s| s.net_seed as u64).unwrap_or(0);
@@ -537,6 +750,14 @@ impl CoreEngine {
             .as_ref()
             .zip(self.stream.as_ref())
             .map(|(dataset, stream)| crate::trainer::RunData { dataset, stream });
+        // The retry's DRAW index: the default `recovery_same_seed` hands out `0`, so a retry is the
+        // clock's own draw again — the trainer re-derives the same seeds and the stream hands back
+        // the same rows. The variety arm hands out the retry counter instead.
+        let attempt = if self.config.recovery_same_seed {
+            0
+        } else {
+            call_index
+        };
         let env = crate::trainer::StepEnv {
             step: clock,
             run_seed: self.header.run_seed,
@@ -545,6 +766,7 @@ impl CoreEngine {
             checkpoint_every: self.config.checkpoint_every,
             smoothing_window: self.config.smoothing_window,
             max_steps: self.config.max_steps,
+            attempt,
         };
         let net = self.networks.get_mut(hash).ok_or_else(|| {
             crate::utils::error::EngineError::InvalidOptions(format!(
@@ -553,7 +775,7 @@ impl CoreEngine {
         })?;
         // Seed BOTH RNGs for this (net, step) before the trainer runs (fastrand +
         // libtorch), or dropout masks differ on replay and resume parity breaks.
-        crate::utils::race_steps::seed_step_randomness(net_seed, clock as u64, 0);
+        crate::utils::race_steps::seed_step_randomness(net_seed, clock as u64, call_index);
         let report = self.trainer.train_step(
             net,
             crate::trainer::StepCtx {
@@ -597,7 +819,10 @@ impl CoreEngine {
         // RL volume: the trainer's reported env work accumulates across the group
         // so the rollup shows the step's real workload.
         if let Some(rl) = report.rl {
-            self.step_rl.nets += 1;
+            // A recovery retry is another UPDATE of the same net, never another net on the clock.
+            if call_index == 0 {
+                self.step_rl.nets += 1;
+            }
             self.step_rl.matches += rl.matches;
             self.step_rl.train_turns += rl.train_turns;
             self.step_rl.eval_turns += rl.eval_turns;

@@ -65,7 +65,8 @@ impl CoreEngine {
     }
 
     /// Write the top-k champions' topology markdown, one file per champion
-    /// (`champion-<hash>.md`). UNCONDITIONAL at every log level.
+    /// (`champion-<hash>-<fitness>.md`, the suffix being the risk-adjusted score the file ranked
+    /// by, rounded to an integer). UNCONDITIONAL at every log level.
     pub(crate) fn write_champion_markdown(&mut self) -> Result<()> {
         if !self.config.champion_save_topology {
             return Ok(());
@@ -84,7 +85,10 @@ impl CoreEngine {
                 continue;
             };
             let short = &hash[..8.min(hash.len())];
-            let path = self.run_dir.join(format!("champion-{short}.md"));
+            // The name carries the number a reader came for: the same risk-adjusted score the
+            // header prints, rounded so `champion-8a3c262b-102.md` is findable without opening it.
+            let score = fitness.round() as i64;
+            let path = self.run_dir.join(format!("champion-{short}-{score}.md"));
             let label = if k <= 1 {
                 "Champion".to_string()
             } else {
@@ -179,11 +183,12 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// The anti-champion dump: the nets the LIVE lottery favours MOST at the stop clock — the
-    /// highest ticket chance, which at these defaults means the LEAST fit and the OLDEST (the cake
-    /// is the merit fraction times the youth fraction, inverted). One file per net
-    /// (`worst-<hash>.md`: topology + mermaid graph + lineage) plus a `worst.md` index, so the nets
-    /// the coin keeps feeding can be read structurally instead of guessed at from a hash.
+    /// The anti-champion dump: the nets at the BOTTOM of the final table — lowest `fit (F)`, the
+    /// same value `final-field.csv` ranks last — one file per net (`worst-<hash>-<fit>.md`:
+    /// topology + mermaid graph + lineage) plus a `worst.md` index. The ticket chance rides each
+    /// row as a COLUMN, never as the ordering: the ticket ranks merit × updates, so under the
+    /// shipped U leg the worst fit is usually paid the band's floor while a net that has barely
+    /// trained tops the chance — ordering by it filed champions as `Worst #2`.
     pub(crate) fn write_worst_markdown(&mut self, clock: usize) -> Result<()> {
         if !self.config.worst_save_topology {
             return Ok(());
@@ -199,22 +204,31 @@ impl CoreEngine {
             .collect();
         let younger = ages.iter().min().copied().unwrap_or(1);
         let older = ages.iter().max().copied().unwrap_or(1);
+        // The SAME number the table ranks by, ascending — so `worst.md`'s #1 is the last graded
+        // row of `final-field.csv` and the two artifacts cannot name different nets.
         let rows: Vec<(String, f32, usize)> = self
             .ranked_live()
             .into_iter()
             .map(|(hash, score)| {
-                let merit = Self::merit_from(Some(score));
-                let fraction = self.train_lottery_p_from(&hash, clock, frame, merit);
                 let age = self.lottery_age_of(&hash, clock).unwrap_or(0);
-                (hash, fraction, age)
+                (hash, score, age)
             })
             .collect();
+        // The coin's own favourite, named beside the list: the two questions differ, and hiding
+        // that is what let a champion be filed as an anti-champion.
+        let favourite = rows
+            .iter()
+            .filter_map(|(h, _, _)| {
+                self.train_lottery_parts(h, clock, frame, self.merit(h))
+                    .map(|_| (h.clone(), self.train_lottery_p_eff(h, clock, frame)))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)));
         let mut rows = worst_order(rows);
         let k = self.config.champion_count.max(1).min(rows.len());
         rows.truncate(k);
         let mut written: Vec<Vec<String>> = Vec::new();
         let mut index = String::from(
-            "| # | hash | ticket p | merit | age | youth | file |\n|---|---|---|---|---|---|---|\n",
+            "| # | hash | fit (F) | ticket p | merit | age | youth | file |\n|---|---|---|---|---|---|---|---|\n",
         );
         for (rank, (hash, _fraction, age)) in rows.iter().enumerate() {
             let Some(state) = self.state.net(hash) else {
@@ -224,7 +238,11 @@ impl CoreEngine {
                 continue;
             };
             let short = &hash[..8.min(hash.len())];
-            let p = self.train_lottery_p_eff(hash, clock, frame);
+            // `—` when the lottery cannot grade the net (no reading, flat field, shield): the table
+            // prints the same dash, because a neutral fraction is not a chance anybody is paid.
+            let p = self
+                .train_lottery_parts(hash, clock, frame, self.merit(hash))
+                .map(|_| self.train_lottery_p_eff(hash, clock, frame));
             let merit = self.merit(hash);
             let youth = Self::youth_fraction(*age, younger, older);
             let reading = self.race_reading_of(hash).map_or_else(
@@ -238,12 +256,17 @@ impl CoreEngine {
                     )
                 },
             );
-            let file = format!("worst-{short}.md");
+            // Same naming rule as the champion files: the risk-adjusted score rides the name, and
+            // it is the `fit (F)` the table prints, so the filename and the row agree.
+            let fit = self.smoothed_fitness_of(hash);
+            let file = format!("worst-{short}-{}.md", fit.map_or(0, |s| s.round() as i64));
+            let fit_cell = fit.map_or_else(|| "—".to_string(), fmt_cfg);
+            let ticket_cell = p.map_or_else(|| "—".to_string(), fmt_cfg);
             let md = format!(
-                "**Worst #{} · ticket chance {} (Ω {}) · merit {} · age {} clocks (youth {}) · window {} · λ={} · run seed {} · net seed {}**\n\n{}\n\n{}",
+                "**Worst #{} · fit (F) {} · ticket p {} · merit {} · age {} clocks (youth {}) · window {} · λ={} · run seed {} · net seed {}**\n\n{}\n\n{}",
                 rank + 1,
-                fmt_cfg(p),
-                fmt_cfg(self.train_merit_omega()),
+                fit_cell,
+                ticket_cell,
                 merit.map_or_else(|| "—".to_string(), fmt_cfg),
                 age,
                 fmt_cfg(youth),
@@ -257,13 +280,17 @@ impl CoreEngine {
             match std::fs::write(self.run_dir.join(&file), &md) {
                 Ok(()) => {
                     index.push_str(&format!(
-                        "| {} | {short} | {} | {} | {age} | {} | [{file}]({file}) |\n",
+                        "| {} | {short} | {fit_cell} | {ticket_cell} | {} | {age} | {} | [{file}]({file}) |\n",
                         rank + 1,
-                        fmt_cfg(p),
                         merit.map_or_else(|| "—".to_string(), fmt_cfg),
                         fmt_cfg(youth),
                     ));
-                    written.push(vec![(rank + 1).to_string(), short.to_string(), file]);
+                    written.push(vec![
+                        (rank + 1).to_string(),
+                        short.to_string(),
+                        fit_cell.clone(),
+                        file,
+                    ]);
                 }
                 Err(source) => tracing::warn!(
                     "worst markdown write failed: {}",
@@ -275,8 +302,17 @@ impl CoreEngine {
             }
         }
         if !written.is_empty() {
+            // The distinction the old dump hid, said out loud once: `fit (F)` picks the list, the
+            // ticket prices each row, and the coin's favourite is usually NOT the worst net.
+            let favourite_line = favourite.map_or_else(String::new, |(h, p)| {
+                format!(
+                    "The coin's own favourite is `{}` at ticket p = {} — the ticket ranks merit × updates, so it is a different question from `fit (F)`.\n\n",
+                    &h[..8.min(h.len())],
+                    fmt_cfg(p),
+                )
+            });
             let body = format!(
-                "# Anti-champion field at clock {clock}\n\nThe layers the train-eval lottery favours MOST: highest ticket chance = least fit × oldest. Every row is one net's topology + mermaid graph + lineage.\n\n{index}"
+                "# Anti-champion field at clock {clock}\n\nThe bottom of the final table: the `champion_count` lowest `fit (F)` nets, by the same ranking `final-field.csv` prints last. Every row is one net's topology + mermaid graph + lineage; `ticket p` is the chance the train-eval lottery gives that net on the NEXT clock (dash = not graded, so it has no chance to name).\n\n{favourite_line}{index}"
             );
             let path = self.run_dir.join("worst.md");
             if let Err(source) = std::fs::write(&path, body) {
@@ -291,9 +327,9 @@ impl CoreEngine {
             if self.verbose_detail() {
                 crate::utils::cfy::emit(&crate::utils::cfy::card(
                     "Anti-champion topology (markdown)",
-                    &crate::utils::cfy::table(&["#", "hash", "file"], &written),
+                    &crate::utils::cfy::table(&["#", "hash", "fit (F)", "file"], &written),
                     Some(
-                        "the nets with the HIGHEST ticket chance — least fit, oldest; see worst.md for the ranking",
+                        "the nets at the BOTTOM of the final table (lowest `fit (F)`); worst.md adds each one's ticket p",
                     ),
                 ));
             }
@@ -371,12 +407,12 @@ impl CoreEngine {
     }
 }
 
-/// Anti-champion order: WORST-FIRST by the coin's own 0..1 fraction (least fit; oldest once the age
-/// leg is armed), then by age descending, then by hash — a TOTAL order, so the files, the index and
-/// the card can never disagree about which net is #1.
+/// Anti-champion order: LOWEST `fit (F)` first — the same value the final table ranks by — then
+/// the older net, then the hash. A TOTAL order, so the files, the index and the table can never
+/// disagree about which net is #1.
 pub(crate) fn worst_order(mut rows: Vec<(String, f32, usize)>) -> Vec<(String, f32, usize)> {
     rows.sort_by(|a, b| {
-        b.1.total_cmp(&a.1)
+        a.1.total_cmp(&b.1)
             .then_with(|| b.2.cmp(&a.2))
             .then_with(|| a.0.cmp(&b.0))
     });
@@ -399,19 +435,19 @@ mod tests {
     /// The export is a CSV, not a `join` with a comma: cells carrying a comma are quoted,
     /// cells carrying a quote are escaped, and no row grows or loses a column.
     #[test]
-    fn the_anti_champion_order_is_chance_then_age_then_hash() {
+    fn the_anti_champion_order_is_fit_then_age_then_hash() {
         let rows = vec![
-            ("b".to_string(), 0.9, 3),
-            ("a".to_string(), 0.9, 3),
-            ("c".to_string(), 0.9, 9),
-            ("d".to_string(), 0.1, 99),
+            ("b".to_string(), -1.0, 3),
+            ("a".to_string(), -1.0, 3),
+            ("c".to_string(), -1.0, 9),
+            ("d".to_string(), 9.0, 99),
         ];
         let ordered = worst_order(rows);
         let got: Vec<&str> = ordered.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(
             got,
             vec!["c", "a", "b", "d"],
-            "ticket chance first, then the older net, then the hash — never input order"
+            "lowest fit first, then the older net, then the hash — never input order"
         );
     }
 

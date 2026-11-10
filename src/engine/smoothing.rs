@@ -170,8 +170,9 @@ pub fn rolling_stats_with(
     rolling_stats_all(buf, recency, family)
 }
 
-/// [`rolling_stats_with`] over the LAST `take` readings only — the EPOCH-SCOPED window
-/// (`set_run_policy_stats`): the readings taken on the weights the net holds right now. `take`
+/// [`rolling_stats_with`] over the LAST `take` readings only — the POLICY-SCOPED window
+/// (`set_run_policy_scoped_fitness`): the readings taken on the weights the net holds right now, so
+/// no reading from another policy enters the statistics. `take`
 /// clamps to the buffer; `0` is `None` (nothing measured on this policy yet), and `1` is that
 /// value with zero spread, so `mean ∓ λ·0` stays clean instead of claiming a confidence nobody has.
 pub fn rolling_stats_tail(
