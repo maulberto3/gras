@@ -45,7 +45,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             .unwrap_or_else(|| "?".into()),
     ));
 
-    // ── The two blueprint knobs that never appear in a box ── A reader diffing two `champion-*.md`
+    // ── The two blueprint knobs that never appear in a box ── A reader diffing two `champion-*-*.md`
     // files needs the split and the seed: the split decides WHICH features each branch can see,
     let mut knobs: Vec<String> = Vec::new();
     match graph.input_feature_masks() {

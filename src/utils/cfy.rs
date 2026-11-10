@@ -156,7 +156,7 @@ mod tests {
     /// dropped, and no line exceeds the requested width — not even for a single token longer
     #[test]
     fn wrap_breaks_on_words_and_respects_the_width() {
-        let text = "★ saved as elite (top-5 by A) · x saved as worst (bottom-5 by E) · · neither · b = inside its born cull shield (crossover 5 / mutation 5 clock(s)) · j = inside the elite join window (5 served) · t = past the crown term (5 clocks, age-blocked)";
+        let text = "★ saved as elite (top-5 by A) · x saved as worst (bottom-5 by E) · · neither · b = inside its born cull shield (crossover 5 / mutation 5 update(s)) · j = inside the elite join window (5 served) · t = past the crown term (5 clocks, age-blocked)";
         let lines = wrap(text, 60);
         assert!(lines.len() > 2, "a long sentence wraps: {lines:?}");
         for line in &lines {
