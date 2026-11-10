@@ -123,8 +123,11 @@ pub struct ConfigSnapshot {
     /// anti-devolution switch, independent of how many nets are CHAMPIONS. Replay-relevant.
     #[serde(default, alias = "freeze_elites")]
     pub freeze_seats: bool,
-    /// Training lottery strength Ω (`set_run_train_merit`): how much of the merit tilt the coin
-    /// applies — `p_eff = 1 − Ω·(1 − p)`.
+    /// LEGACY lottery strength Ω (`set_run_train_merit`, deprecated): retired as a second dial,
+    /// because `p_min`/`p_max` are the chance band now. New headers write `1.0` (the identity); a
+    /// header written before the retirement carries its value and `from_snapshot` folds it into
+    /// the band once — `lo = 1 − Ω(1 − p_min)`, `hi = 1 − Ω(1 − p_max)` — so the run resumes at
+    /// the chances it actually paid.
     #[serde(default)]
     pub train_merit: f32,
     /// Merit floor `p_min` (`set_run_train_merit_p_min`): the worst net's share of clocks even
@@ -144,11 +147,17 @@ pub struct ConfigSnapshot {
     /// which is exactly what every header written before the flag recorded.
     #[serde(default)]
     pub train_merit_learn_only: bool,
-    /// POLICY-SCOPED window stats (`set_run_policy_stats`): `true` = mean/spread/n describe the
-    /// CURRENT weights. `default` = `false`, which is exactly what every header written before the
-    /// flag recorded (the last-K-readings window).
+    /// BORN TICKET (`set_run_train_merit_born_ticket`): `true` pays a never-trained net `p = 1.0`,
+    /// so its first update lands on its first live clock. `default` = `false`, exactly what every
+    /// header written before the flag recorded. Replay-relevant.
     #[serde(default)]
-    pub policy_stats: bool,
+    pub train_merit_born_ticket: bool,
+    /// POLICY-SCOPED FITNESS (`set_run_policy_scoped_fitness`): `true` = mean/spread/n describe the
+    /// CURRENT weights, so no reading from another policy enters them. `default` = `false`, which
+    /// is exactly what every header written before the flag recorded (the last-K-readings window).
+    /// `policy_stats`, the knob's old name, still reads as this one.
+    #[serde(default, alias = "policy_stats")]
+    pub policy_scoped_fitness: bool,
     /// ANTI-CHAMPION dump (`set_worst_save_topology`): `true` writes the top-ticket-chance nets'
     /// markdown at stop. `default` = `false` for every header written before the knob.
     #[serde(default)]
@@ -175,14 +184,37 @@ pub struct ConfigSnapshot {
     /// Candidates one mutation may spend clearing that floor (`set_mutation_novelty_draws`).
     #[serde(default)]
     pub mutation_novelty_draws: usize,
-    /// Mutation probation steps: cull-immunity for an immigrant's first k clocks.
-    /// Replay-relevant.
+    /// Mutation probation steps: cull-immunity for an immigrant until it has spent k UPDATES
+    /// (`U`), not clocks. Replay-relevant.
     #[serde(default)]
     pub mutation_probation_steps: usize,
-    /// Crossover probation steps: cull-immunity for a crossover child's first k clocks.
-    /// Replay-relevant.
+    /// Crossover probation steps: cull-immunity for a crossover child until it has spent k UPDATES
+    /// (`U`). Replay-relevant.
     #[serde(default)]
     pub crossover_probation_steps: usize,
+    /// INIT PROBATION (`set_run_init_probation_steps`): opening clocks with no culls or births.
+    /// A header written before the knob reads `0` — nothing withheld beyond the born shields.
+    /// Replay-relevant.
+    #[serde(default)]
+    pub init_probation_steps: usize,
+    /// Post-update recovery streak cap (extra real updates in one clock). A header written
+    /// before the knob carries no field and reads `0` (off), so an old run replays unchanged.
+    /// Replay-relevant.
+    #[serde(default, alias = "recovery_updates")]
+    pub recovery_retries: usize,
+    /// Recovery tolerance: the fraction of the standing a reading may lose before a rescue. A
+    /// header written before the knob reads `0.0` (every drop triggers). Replay-relevant.
+    #[serde(default)]
+    pub recovery_tolerance: f32,
+    /// Recovery retry DRAW (`set_recovery_same_seed`): `true` = a retry repeats the clock's own
+    /// train draw. A header written before the knob reads `true` — the behaviour it had. Only
+    /// replay-relevant while `recovery_retries > 0`.
+    #[serde(default = "default_true")]
+    pub recovery_same_seed: bool,
+    /// The lottery's U leg (`set_run_train_merit_updates`): `true` multiplies the ticket by `Um`.
+    /// A header written before the knob reads `false` (the age-legged ticket). Replay-relevant.
+    #[serde(default)]
+    pub train_merit_updates: bool,
     /// Seat join probation: clocks a fresh net must train before it may hold a SEAT.
     /// Replay-relevant.
     #[serde(default, alias = "elite_join_probation_steps")]
@@ -268,7 +300,8 @@ impl ConfigSnapshot {
             train_merit_p_max: cfg.train_merit_p_max,
             train_merit_inverted: cfg.train_merit_inverted,
             train_merit_learn_only: cfg.train_merit_learn_only,
-            policy_stats: cfg.policy_stats,
+            train_merit_born_ticket: cfg.train_merit_born_ticket,
+            policy_scoped_fitness: cfg.policy_scoped_fitness,
             worst_save_topology: cfg.worst_save_topology,
             train_age: cfg.train_age,
             crossover_fitter_base: cfg.crossover_fitter_base,
@@ -281,6 +314,11 @@ impl ConfigSnapshot {
             champion_save_topology: cfg.champion_save_topology,
             mutation_probation_steps: cfg.mutation_probation_steps,
             crossover_probation_steps: cfg.crossover_probation_steps,
+            init_probation_steps: cfg.init_probation_steps,
+            recovery_retries: cfg.recovery_retries,
+            recovery_tolerance: cfg.recovery_tolerance,
+            recovery_same_seed: cfg.recovery_same_seed,
+            train_merit_updates: cfg.train_merit_updates,
             seat_join_probation_steps: cfg.seat_join_probation_steps,
             seat_lifetime_steps: cfg.seat_lifetime_steps,
             feature_split: split_single,
@@ -886,6 +924,11 @@ pub struct NetState {
     /// because that era re-ran them through a no-op optimizer).
     #[serde(default)]
     pub budget_skips: usize,
+    /// Clocks whose update was followed by a RECOVERY STREAK: `(clock, extra real updates)` in
+    /// clock order. Replay-relevant: a resumed run must take the same extra updates at the same
+    /// clock, or its weights — and every reading after them — diverge from the recorded race.
+    #[serde(default)]
+    pub recovery_ledger: Vec<(usize, usize)>,
 }
 
 /// Extend `spans` with `step`, merging into the previous span when contiguous.
@@ -1026,6 +1069,7 @@ impl NetState {
             elite_probation_age: 0,
             elite_seat_age: 0,
             budget_skips: 0,
+            recovery_ledger: Vec::new(),
         })
     }
 
@@ -1039,6 +1083,25 @@ impl NetState {
     /// eval, no metrics), extending the last span when contiguous.
     pub fn record_idle_step(&mut self, step: usize) {
         push_span(&mut self.idle_spans, step);
+    }
+
+    /// Record the `extras` extra updates ONE clock's recovery streak took, in clock order. This is
+    /// the ledger a replay re-walks: `U` is no longer derivable from the spans alone, because a
+    /// streak puts several updates inside one clock.
+    pub fn record_recovery(&mut self, step: usize, extras: usize) {
+        if extras == 0 {
+            return;
+        }
+        match self.recovery_ledger.last_mut() {
+            Some((last, n)) if *last == step => *n = (*n).max(extras),
+            _ => self.recovery_ledger.push((step, extras)),
+        }
+    }
+
+    /// Extra real updates this net took inside streaks — the part of `U` the clock ledger cannot
+    /// hold. One implementation for the replay ledger and the `U` column.
+    pub fn recovery_retries(&self) -> usize {
+        self.recovery_ledger.iter().map(|&(_, n)| n).sum()
     }
 
     /// Clocks this net spent ACTING without updating (the crown freeze): the length
@@ -1069,10 +1132,14 @@ impl NetState {
         };
         self.frozen_spans = clamp_spans(&self.frozen_spans, target);
         self.idle_spans = clamp_spans(&self.idle_spans, target);
+        self.recovery_ledger.retain(|&(clock, _)| clock <= target);
         let span = (target + 1).saturating_sub(start);
+        // The streak's extras ride ON TOP of one update per clock: without them a truncated record
+        // would undercount `U` by exactly the retries taken.
         self.step = span
             .saturating_sub(span_len(&self.frozen_spans))
-            .saturating_sub(span_len(&self.idle_spans));
+            .saturating_sub(span_len(&self.idle_spans))
+            + self.recovery_retries();
         if self.last_metrics.as_ref().is_some_and(|m| m.step > target) {
             self.last_metrics = None;
         }
@@ -1250,6 +1317,16 @@ impl RaceState {
             .entry(hash.to_string())
             .or_insert_with(|| TopologyLifetime::new(state.entered_at_step, fitness));
         entry.record_progress(metrics.step, fitness);
+        Ok(())
+    }
+
+    /// Record a clock's recovery retries on `hash` — the net's own ledger, not a run counter: a
+    /// time-travelled record clamps it and `U` is counted from it.
+    pub fn record_recovery(&mut self, hash: &str, step: usize, extras: usize) -> Result<()> {
+        let state = self.nets.get_mut(hash).ok_or_else(|| {
+            EngineError::InvalidOptions(format!("race state: net {hash} not live"))
+        })?;
+        state.record_recovery(step, extras);
         Ok(())
     }
 
