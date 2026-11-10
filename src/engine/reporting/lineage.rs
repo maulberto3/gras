@@ -4,7 +4,7 @@
 use super::*;
 
 impl CoreEngine {
-    /// The `## Ancestry` section of ONE champion's markdown file (`champion-<hash>.md`): the same
+    /// The `## Ancestry` section of ONE champion's markdown file (`champion-<hash>-<fitness>.md`): the same
     /// recorded lineage the stop card draws, as a mermaid `graph TB` a doc viewer renders.
     pub(crate) fn lineage_markdown(&self, root: &str, root_role: &str) -> String {
         let mut tree = LineageTree::new(self);
@@ -38,7 +38,7 @@ struct LineagePaint {
     width: &'static str,
 }
 
-/// The net the file is about (`champion-<hash>.md`).
+/// The net the file is about (`champion-<hash>-<fitness>.md`).
 const FOCUS: LineagePaint = LineagePaint {
     fill: "#fff3cf",
     stroke: "#8a5a00",
