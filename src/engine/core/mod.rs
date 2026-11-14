@@ -751,7 +751,7 @@ impl CoreEngine {
             .filter(|(_, label)| label.is_some())
             .count();
         // CFY: the init line is a table; inheritance provenance becomes its own rows.
-        let mut rows: Vec<(String, String)> = vec![
+        let rows: Vec<(String, String)> = vec![
             ("live nets".to_string(), count.to_string()),
             ("run dir".to_string(), self.run_dir.display().to_string()),
             ("seeded slots".to_string(), seeded_slots.to_string()),
@@ -852,22 +852,33 @@ impl CoreEngine {
                     self.config.checkpoint_every.to_string(),
                 ),
                 (
-                    "crossover_rolls".to_string(),
-                    self.config.crossover_rolls.to_string(),
+                    "crossover_turnover".to_string(),
+                    if self.config.crossover_share > 0.0 {
+                        format!(
+                            "{}% of pop per clock ({} roll(s))",
+                            fmt_cfg(self.config.crossover_share * 100.0),
+                            self.rolls_at(RollKind::Crossover)
+                        )
+                    } else {
+                        "off".to_string()
+                    },
                 ),
                 (
-                    "mutate_rolls".to_string(),
-                    self.config.mutate_rolls.to_string(),
-                ),
-                (
-                    "crossover_prob".to_string(),
-                    fmt_cfg(self.config.crossover_prob),
+                    "mutate_turnover".to_string(),
+                    if self.config.mutate_share > 0.0 {
+                        format!(
+                            "{}% of pop per clock ({} roll(s))",
+                            fmt_cfg(self.config.mutate_share * 100.0),
+                            self.rolls_at(RollKind::Mutation)
+                        )
+                    } else {
+                        "off".to_string()
+                    },
                 ),
                 (
                     "crossover_selection".to_string(),
                     self.config.crossover_selection.to_string(),
                 ),
-                ("mutate_prob".to_string(), fmt_cfg(self.config.mutate_prob)),
                 (
                     "champion_count".to_string(),
                     self.config.champion_count.to_string(),
@@ -1126,8 +1137,9 @@ impl CoreEngine {
                 let mut cross_attempts = 0usize;
                 let mut mutate_fired = 0usize;
                 let culls_before = self.culls;
-                let cross_total = self.config.crossover_rolls;
-                let mutate_total = self.config.mutate_rolls;
+                // A share supersedes the fixed rolls; `0.0` keeps the pre-knob path bit for bit.
+                let cross_total = self.rolls_at(RollKind::Crossover);
+                let mutate_total = self.rolls_at(RollKind::Mutation);
                 // The cull shield is a POPULATION-level fact: when nobody is cull-eligible,
                 // roll would be spent for nothing — say it once. Derived draws shift no later roll.
                 let evolve_allowed = self.evolution_allowed(clock);
@@ -1181,8 +1193,6 @@ impl CoreEngine {
                 self.accounting.crossover_rolls += cross_total;
                 self.accounting.mutation_rolls += mutate_total;
                 // 3a.
-                let mut cross_missed: Vec<usize> = Vec::new();
-                let mut mutate_missed: Vec<usize> = Vec::new();
                 for roll in 0..cross_total {
                     if !evolve_allowed {
                         break; // nobody to cull: the whole batch is forgone
@@ -1196,21 +1206,7 @@ impl CoreEngine {
                         );
                         break; // not enough population to evolve
                     }
-                    if self.roll_fires(RollKind::Crossover, clock, roll) {
-                        // roll fired — fall through to the attempt loop
-                    } else {
-                        // debug: a roll that missed is the NORMAL case (p < 1), so it is per-roll
-                        // detail, not a per-clock event; `--log-level debug` shows them
-                        cross_missed.push(roll + 1);
-                        debug!(
-                            "step {} │ crossover roll {} of {} missed (p={})",
-                            clock,
-                            roll + 1,
-                            cross_total,
-                            fmt_cfg(self.config.crossover_prob),
-                        );
-                        continue;
-                    }
+                    // Every dealt roll attempts: the turnover already decided the count.
                     cross_fired += 1;
                     // A crossover roll retries the FULL attempt (fresh parents) up
                     // fixed budget; a roll that still produces nothing is discarded.
@@ -1277,18 +1273,6 @@ impl CoreEngine {
                         );
                         break;
                     }
-                    if !self.roll_fires(RollKind::Mutation, clock, roll) {
-                        // Same as the crossover no-fire line: per-roll detail.
-                        mutate_missed.push(roll + 1);
-                        debug!(
-                            "step {} │ mutation roll {} of {} missed (p={})",
-                            clock,
-                            roll + 1,
-                            mutate_total,
-                            fmt_cfg(self.config.mutate_prob),
-                        );
-                        continue;
-                    }
                     match self.evolve_random_immigrant(clock, roll)? {
                         Some(detail) => {
                             mutate_fired += 1;
@@ -1315,36 +1299,6 @@ impl CoreEngine {
                             )
                         }
                     }
-                }
-                // The rolls that did NOT fire, named in one line: their absence
-                // the probability working, not dropped output.
-                if self.verbose_detail() && (!cross_missed.is_empty() || !mutate_missed.is_empty())
-                {
-                    let list = |v: &[usize]| {
-                        v.iter()
-                            .map(|n| n.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    };
-                    let mut bits = Vec::new();
-                    let plural = |v: &[usize]| if v.len() == 1 { "" } else { "s" };
-                    if !cross_missed.is_empty() {
-                        bits.push(format!(
-                            "crossover roll{} {} missed (p={})",
-                            plural(&cross_missed),
-                            list(&cross_missed),
-                            fmt_cfg(self.config.crossover_prob)
-                        ));
-                    }
-                    if !mutate_missed.is_empty() {
-                        bits.push(format!(
-                            "mutation roll{} {} missed (p={})",
-                            plural(&mutate_missed),
-                            list(&mutate_missed),
-                            fmt_cfg(self.config.mutate_prob)
-                        ));
-                    }
-                    info!("step {} │ {}", clock, bits.join(" │ "));
                 }
                 // The run's accounting rides the same counters the step
                 // summary uses — one place to update, no second bookkeeping.

@@ -235,6 +235,28 @@ impl CoreEngine {
                 format!("{setter}({rec})"),
             );
         }
+        // SHARES are floats, so they get their own table (the one above is `usize`).
+        for (label, setter, rec, cur) in [
+            (
+                "crossover_share",
+                "set_crossover_share",
+                recorded.crossover_share,
+                current.crossover_share,
+            ),
+            (
+                "mutate_share",
+                "set_mutate_share",
+                recorded.mutate_share,
+                current.mutate_share,
+            ),
+        ] {
+            push(
+                label,
+                fmt_cfg(rec),
+                fmt_cfg(cur),
+                format!("{setter}({})", fmt_cfg(rec)),
+            );
+        }
         for (label, setter, rec, cur) in [(
             "recovery_same_seed",
             "set_pop_recovery_same_seed",

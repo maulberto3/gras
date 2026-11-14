@@ -284,14 +284,11 @@ pub const DEFAULT_POP_SIZE: usize = 10;
 /// Default step budget, read at the same conservative scale as the population: `10` clocks.
 pub const DEFAULT_MAX_STEPS: usize = 10;
 
-/// Default rolls offered per step on each channel: the cartpole reference's two draws
-/// clock, on the crossover channel and on the mutation channel alike.
-pub const DEFAULT_CROSSOVER_ROLLS: usize = 2;
-pub const DEFAULT_MUTATE_ROLLS: usize = 2;
-
-/// Default share of an evolution attempt that fires: the cartpole reference's values.
-pub const DEFAULT_CROSSOVER_PROB: f32 = 0.5;
-pub const DEFAULT_MUTATE_PROB: f32 = 0.2;
+/// Default turnover per channel: the share of the live population replaced per clock. These are
+/// the cartpole reference's old `rolls × prob` rates read at the default population of 10 — one
+/// crossover replacement per clock (10%), and 0.4 on the mutation channel (4%).
+pub const DEFAULT_CROSSOVER_SHARE: f32 = 0.1;
+pub const DEFAULT_MUTATE_SHARE: f32 = 0.04;
 
 /// Default champion set: the reference's `pop / 10`, read at the conservative default population
 /// 10 — one saved net.
@@ -535,12 +532,17 @@ pub struct RaceConfig {
     /// Steps between population checkpoints (the stream's era rotation and the CSV flush cadence
     /// key off
     pub checkpoint_every: usize,
-    /// Independent crossover rolls per step; each fires with `crossover_prob`.
-    /// not-fired or failed roll is SPENT (no random fallback).
-    pub crossover_rolls: usize,
-    /// Independent mutation rolls per step; each fires with `mutate_prob` and culls one
-    /// net (by `mutation_cull_policy`), inserting a random immigrant.
-    pub mutate_rolls: usize,
+    /// CROSSOVER turnover — the channel's ONE knob — as a share of the live population per clock:
+    /// `0.1` = 10%, dealt as `round(share · pop)` rolls EVERY clock (at least one while the knob is
+    /// on). `0.0` switches the channel off.
+    ///
+    /// Every dealt roll attempts, so this is the fraction of the field replaced per clock, not an
+    /// attempt count — there is no probability to multiply into it. The count is the same every
+    /// clock, so nothing has to be persisted: a resume deals exactly the twin's rolls.
+    pub crossover_share: f32,
+    /// MUTATION turnover — the mutation channel's own knob — as a share of the live population per
+    /// clock. Same contract as [`RaceConfig::crossover_share`]; `0.0` switches the channel off.
+    pub mutate_share: f32,
     /// Who a surviving crossover child evicts (crossover-only; immigrants follow
     /// `mutation_cull_policy`).
     pub crossover_cull_policy: CrossCullPolicy,
@@ -623,11 +625,6 @@ pub struct RaceConfig {
     /// Topology template (input/output dims, hidden node ranges, dropout, etc.)
     /// shared by every individual in the run.
     pub topology_options: crate::graph::topology::TopologyOptions,
-    /// Chance a crossover roll fires.
-    pub crossover_prob: f32,
-    /// Per-roll chance a mutation roll FIRES and inserts a random immigrant.
-    /// `mutate_rolls` controls rolls per step; this controls how often each fires.
-    pub mutate_prob: f32,
     /// Novelty floor `d_min` on a mutation draw (`set_mutation_novelty_min`): the minimum Δ to
     /// the NEAREST blueprint this run already made. `0.0` = off.
     pub mutation_novelty_min: f32,
@@ -845,8 +842,8 @@ impl RaceConfig {
         RaceConfig {
             pop_size: DEFAULT_POP_SIZE,
             checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
-            crossover_rolls: DEFAULT_CROSSOVER_ROLLS,
-            mutate_rolls: DEFAULT_MUTATE_ROLLS,
+            crossover_share: DEFAULT_CROSSOVER_SHARE,
+            mutate_share: DEFAULT_MUTATE_SHARE,
             crossover_cull_policy: CrossCullPolicy::default(),
             mutation_cull_policy: MutationCullPolicy::default(),
             champion_count: DEFAULT_CHAMPION_COUNT,
@@ -873,8 +870,6 @@ impl RaceConfig {
             activation_pool: Vec::new(),
             standardize_op_pool: Vec::new(),
             topology_options: crate::graph::topology::TopologyOptions::default(),
-            crossover_prob: DEFAULT_CROSSOVER_PROB,
-            mutate_prob: DEFAULT_MUTATE_PROB,
             mutation_novelty_min: DEFAULT_MUTATION_NOVELTY_MIN,
             mutation_novelty_draws: DEFAULT_MUTATION_NOVELTY_DRAWS,
             custom_stop: None,
@@ -937,10 +932,27 @@ impl RaceConfig {
         let mut cfg = RaceConfig::defaults();
         cfg.pop_size = snap.pop_size;
         cfg.checkpoint_every = snap.checkpoint_every;
-        cfg.crossover_rolls = snap.crossover_rolls;
-        cfg.mutate_rolls = snap.mutate_rolls;
-        cfg.crossover_prob = snap.crossover_prob;
-        cfg.mutate_prob = snap.mutate_prob;
+        // TURNOVER: a header that recorded a share uses it. An OLDER header recorded fixed rolls and
+        // a fire probability instead, so its `rolls × prob` expected rolls per clock become the
+        // equivalent share (`/ pop_size`) — the run resumes at the rate it actually churned rather
+        // than freezing on a knob that no longer exists.
+        let legacy_share = |rolls: usize, prob: f32| {
+            if snap.pop_size == 0 {
+                0.0
+            } else {
+                rolls as f32 * prob / snap.pop_size as f32
+            }
+        };
+        cfg.crossover_share = if snap.crossover_share > 0.0 {
+            snap.crossover_share
+        } else {
+            legacy_share(snap.crossover_rolls, snap.crossover_prob)
+        };
+        cfg.mutate_share = if snap.mutate_share > 0.0 {
+            snap.mutate_share
+        } else {
+            legacy_share(snap.mutate_rolls, snap.mutate_prob)
+        };
         // A header written before the gate recorded no floor: `0.0` replays it unchanged.
         cfg.mutation_novelty_min = snap.mutation_novelty_min;
         cfg.mutation_novelty_draws = snap.mutation_novelty_draws.max(1);
@@ -1148,16 +1160,28 @@ impl RaceConfigBuilder {
         self.cfg.checkpoint_every = n;
         self
     }
-    /// Set crossover rolls per step.
-    pub fn set_crossover_rolls(mut self, n: usize) -> Self {
-        self.cfg.crossover_rolls = n;
+    /// Set crossover turnover as a SHARE of the live population per clock (`0.05` = 5%), dealt as
+    /// `round(share · pop)` rolls each clock. `0.0` = the channel OFF. Non-finite reads as off and
+    /// values above `1.0` are clamped.
+    pub fn set_crossover_share(mut self, share: f32) -> Self {
+        self.cfg.crossover_share = if share.is_finite() {
+            share.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         self
     }
-    /// Set mutation rolls per step.
-    pub fn set_mutate_rolls(mut self, n: usize) -> Self {
-        self.cfg.mutate_rolls = n;
+    /// Set mutation turnover as a SHARE of the live population per clock, with
+    /// `set_crossover_share`'s bounds. `0.0` = the channel OFF.
+    pub fn set_mutate_share(mut self, share: f32) -> Self {
+        self.cfg.mutate_share = if share.is_finite() {
+            share.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         self
     }
+
     /// Crossover replacement policy (crossover-only).
     pub fn set_crossover_cull_policy(mut self, policy: CrossCullPolicy) -> Self {
         self.cfg.crossover_cull_policy = policy;
@@ -1399,16 +1423,6 @@ impl RaceConfigBuilder {
     /// Set the output dimension.
     pub fn set_topology_output_dim(mut self, n: usize) -> Self {
         self.cfg.topology_options.output_dim = Some(n);
-        self
-    }
-    /// Set the crossover fire probability.
-    pub fn set_crossover_prob(mut self, v: f32) -> Self {
-        self.cfg.crossover_prob = v;
-        self
-    }
-    /// Set the mutation fire probability.
-    pub fn set_mutate_prob(mut self, v: f32) -> Self {
-        self.cfg.mutate_prob = v;
         self
     }
     /// Extra informative (non-ranking) metrics recorded in history.csv and engine.json.

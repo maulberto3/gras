@@ -31,12 +31,6 @@ pub(crate) enum RollKind {
     Mutation,
 }
 
-/// Stream tags folded into the run seed before `derive_seed`: each roll group
-/// gets its own lane, and none can collide with the child-seed lane.
-const ROLL_STREAM_CROSSOVER: u64 = 0x5A5A_0000_0000_00C1;
-/// Stream tag for the mutation roll lane.
-const ROLL_STREAM_MUTATION: u64 = 0x5A5A_0000_0000_003D;
-
 /// One mutation draw's outcome: the accepted child, its nearest-Δ reading and the draws spent.
 pub(crate) struct RandomDraw {
     /// The accepted candidate.
@@ -47,16 +41,20 @@ pub(crate) struct RandomDraw {
     pub(crate) draws: usize,
 }
 
-impl RollKind {
-    /// The seed a fire check (or victim draw) for this roll derives from —
-    /// `clock * 1024 + roll` in this roll group's lane, so skips don't shift.
-    fn seed(self, run_seed: u64, clock: usize, roll: usize) -> u64 {
-        let tag = match self {
-            RollKind::Crossover => ROLL_STREAM_CROSSOVER,
-            RollKind::Mutation => ROLL_STREAM_MUTATION,
-        };
-        crate::utils::seed::derive_seed(run_seed ^ tag, clock * 1024 + roll)
+/// How many rolls a SHARE-driven channel deals: `round(share · pop)`, the SAME count every clock —
+/// deterministic, no carry, nothing to persist.
+///
+/// `0.1` at pop 100 deals 10 rolls per clock; at pop 15 it deals 2 (`round(1.5)`). A live knob never
+/// deals ZERO: a share that would round below one roll still deals one, so `0.01` at pop 10 evolves
+/// instead of freezing the way `pop / 20` does. `0.0` is the only way to switch a channel off (it
+/// hands the channel back to its fixed rolls).
+///
+/// Floating-point rounding only, so the deal is identical on every platform and in every build.
+pub(crate) fn share_rolls(share: f32, pop: usize) -> usize {
+    if !share.is_finite() || share <= 0.0 || pop == 0 {
+        return 0;
     }
+    ((share.clamp(0.0, 1.0) * pop as f32).round() as usize).max(1)
 }
 
 /// The crossover line's parent note: the operator kind, the parents at the same 8-hex width
@@ -663,17 +661,14 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Whether a roll of `kind` in this `clock` FIRES, derived
-    /// `(run_seed, clock, roll)` rather than the process-global `fastrand` stream.
-    pub(crate) fn roll_fires(&self, kind: RollKind, clock: usize, roll: usize) -> bool {
-        let p = match kind {
-            RollKind::Crossover => self.config.crossover_prob,
-            RollKind::Mutation => self.config.mutate_prob,
+    /// The rolls this clock offers on `kind`: `round(share · pop)`, the SAME count every clock. A
+    /// share of `0.0` switches the channel off.
+    pub(crate) fn rolls_at(&self, kind: RollKind) -> usize {
+        let share = match kind {
+            RollKind::Crossover => self.config.crossover_share,
+            RollKind::Mutation => self.config.mutate_share,
         };
-        if p <= 0.0 {
-            return false; // p = 0 never fires, without consuming a draw
-        }
-        fastrand::Rng::with_seed(kind.seed(self.header.run_seed, clock, roll)).f32() < p
+        share_rolls(share, self.state.live_count())
     }
 
     /// Whether this clock may EVOLVE at all: the run's INIT PROBATION has passed (`clock >=

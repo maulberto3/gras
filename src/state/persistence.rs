@@ -24,10 +24,19 @@ pub struct ConfigSnapshot {
     pub pop_size: usize,
     /// Steps between population checkpoints.
     pub checkpoint_every: usize,
-    /// Crossover rolls offered per step.
+    /// Crossover rolls offered per step. LEGACY — the knob is gone (turnover is a share now).
+    /// Still READ so an old header migrates to its equivalent share, never written.
+    #[serde(default, skip_serializing)]
     pub crossover_rolls: usize,
-    /// Mutation (immigrant) rolls offered per step.
+    /// Mutation (immigrant) rolls offered per step. LEGACY, like `crossover_rolls`.
+    #[serde(default, skip_serializing)]
     pub mutate_rolls: usize,
+    /// Crossover turnover SHARE (`set_crossover_share`); `0.0` = the channel is off.
+    #[serde(default)]
+    pub crossover_share: f32,
+    /// Mutation turnover SHARE (`set_mutate_share`); `0.0` = off.
+    #[serde(default)]
+    pub mutate_share: f32,
     /// Crossover replacement policy (`"worst"` | `"random"`). Crossover-only —
     /// mutation channel has its own knob, recorded just below.
     pub crossover_cull_policy: String,
@@ -44,9 +53,12 @@ pub struct ConfigSnapshot {
     /// `"tournament(size=3)"`).
     #[serde(default)]
     pub crossover_selection: String,
-    /// Probability a crossover roll fires.
+    /// Probability a crossover roll fired. LEGACY — the knob is gone; read only, to migrate an
+    /// old header's `rolls × prob` rate into the equivalent share.
+    #[serde(default, skip_serializing)]
     pub crossover_prob: f32,
-    /// Probability a mutation roll fires.
+    /// Probability a mutation roll fired. LEGACY, like `crossover_prob`.
+    #[serde(default, skip_serializing)]
     pub mutate_prob: f32,
     /// Stop budget as configured (`None` = no limit). Duplicated at the header root;
     /// this copy is authoritative.
@@ -229,15 +241,19 @@ impl ConfigSnapshot {
         ConfigSnapshot {
             pop_size: cfg.pop_size,
             checkpoint_every: cfg.checkpoint_every,
-            crossover_rolls: cfg.crossover_rolls,
-            mutate_rolls: cfg.mutate_rolls,
+            // Legacy, never written: the turnover share below is the knob now.
+            crossover_rolls: 0,
+            mutate_rolls: 0,
+            crossover_share: cfg.crossover_share,
+            mutate_share: cfg.mutate_share,
             crossover_cull_policy: cfg.crossover_cull_policy.to_string(),
             mutation_cull_policy: cfg.mutation_cull_policy.to_string(),
             champion_count: cfg.champion_count,
             crossover_ops_pool: cfg.crossover_ops_pool.clone(),
             crossover_selection: cfg.crossover_selection.to_string(),
-            crossover_prob: cfg.crossover_prob,
-            mutate_prob: cfg.mutate_prob,
+            // Legacy, never written (see the snapshot's field docs).
+            crossover_prob: 0.0,
+            mutate_prob: 0.0,
             mutation_novelty_min: cfg.mutation_novelty_min,
             mutation_novelty_draws: cfg.mutation_novelty_draws,
             max_steps: cfg.max_steps,

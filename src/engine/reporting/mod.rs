@@ -322,9 +322,10 @@ impl CoreEngine {
         crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Run accounting",
             &accounting_body,
-            Some(
-                "built = nets admitted; discarded = crossover rolls that produced no viable child; blocked = mutation rolls stopped by the cull shield",
-            ),
+            Some(&format!(
+                "built = nets admitted; discarded = crossover rolls whose attempts ran out with no viable child; blocked = mutation rolls stopped by the cull shield; {} crossover child(ren) were separately rejected as duplicates of a live topology — the roll is spent, the attempt budget is not, which is why they are named here instead of `discarded` (the old `Births & novelty` row, merged)",
+                self.births.duplicates
+            )),
         ));
 
         // What the DRAW did, not just what it cost: the novelty gate's own reading at birth.
@@ -362,10 +363,6 @@ impl CoreEngine {
                 (
                     "archive (blueprints seen)".to_string(),
                     self.novelty.len().to_string(),
-                ),
-                (
-                    "crossover duplicate(s) discarded".to_string(),
-                    b.duplicates.to_string(),
                 ),
             ];
             crate::utils::cfy::emit(&crate::utils::cfy::card(

@@ -388,6 +388,102 @@ fn step_clock_continues_past_the_recorded_clock_not_the_training_count() {
 
 // ── Anti-devolution guards ──────────────────────────────────────────────
 
+// ── Turnover shares (percentage knobs) ──────────────────────────────────
+
+#[test]
+fn a_share_deals_a_rounded_count_of_the_population_every_clock() {
+    use crate::engine::evolve::share_rolls;
+    // 10% of pop 100 = 10 rolls, and the SAME 10 every clock: no carry, no cursor to persist, so
+    // a resumed run deals exactly the rolls its twin did.
+    assert_eq!(share_rolls(0.10, 100), 10);
+    assert_eq!(
+        (0..5).map(|_| share_rolls(0.10, 100)).collect::<Vec<_>>(),
+        vec![10; 5]
+    );
+    // Rounded to a whole net: 10% of pop 15 is 1.5 → 2.
+    assert_eq!(share_rolls(0.10, 15), 2);
+    // 0.5 rounds up, and a LIVE knob never deals zero: 1% of pop 10 (0.1 of a roll) still deals
+    // one, where `pop / 20`-style counts freeze the population permanently.
+    assert_eq!(share_rolls(0.05, 10), 1);
+    assert_eq!(share_rolls(0.01, 10), 1);
+    assert_eq!(share_rolls(1.0, 4), 4, "100% = one roll per live net");
+    assert_eq!(share_rolls(0.0, 10), 0, "share 0 = off");
+    assert_eq!(share_rolls(0.5, 0), 0, "empty population deals nothing");
+}
+
+#[test]
+fn the_share_is_the_only_turnover_knob_and_the_channels_are_independent() {
+    use crate::engine::evolve::RollKind;
+    let dir = std::env::temp_dir().join("gras_roll_share_wiring");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = engine(&dir, 32).unwrap();
+    eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+        .unwrap();
+    assert_eq!(eng.state.live_count(), 2);
+    eng.config.crossover_share = 0.0;
+    assert_eq!(
+        eng.rolls_at(RollKind::Crossover),
+        0,
+        "share 0 = the channel is off"
+    );
+    eng.config.crossover_share = 1.0;
+    assert_eq!(
+        eng.rolls_at(RollKind::Crossover),
+        2,
+        "100% share: one roll per live net"
+    );
+    // The mutation channel keeps its own number: `round(0.04 × 2)` rounds to zero, and a live
+    // knob still deals one roll.
+    assert_eq!(
+        eng.rolls_at(RollKind::Mutation),
+        1,
+        "the mutation channel is its own knob"
+    );
+    eng.config.mutate_share = 0.0;
+    assert_eq!(
+        eng.rolls_at(RollKind::Mutation),
+        0,
+        "and has its own off switch"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn turnover_shares_survive_the_config_snapshot_and_are_clamped() {
+    use crate::engine::config::RaceConfig;
+    let mut snap = crate::state::ConfigSnapshot::default();
+    snap.crossover_share = 0.05;
+    snap.mutate_share = 0.25;
+    let cfg = RaceConfig::from_snapshot(&snap);
+    assert_eq!((cfg.crossover_share, cfg.mutate_share), (0.05, 0.25));
+    // An OLD header carried fixed rolls and a fire probability instead of a share: the pair's
+    // expected rolls per clock become the equivalent share, so the run resumes at its real rate.
+    let mut old = crate::state::ConfigSnapshot::default();
+    old.pop_size = 100;
+    old.crossover_rolls = 3;
+    old.crossover_prob = 0.5;
+    old.mutate_rolls = 0; // a switched-off channel stays off
+    let migrated = RaceConfig::from_snapshot(&old);
+    assert_eq!(
+        (migrated.crossover_share, migrated.mutate_share),
+        (0.015, 0.0),
+        "3 rolls × 0.5 at pop 100 = 1.5%/clock"
+    );
+    let clamped = RaceConfig::builder()
+        .set_crossover_share(2.0)
+        .set_mutate_share(f32::NAN)
+        .build();
+    assert_eq!((clamped.crossover_share, clamped.mutate_share), (1.0, 0.0));
+    // Each channel's knob touches only itself: a one-sided set leaves the other channel at the
+    // crate default.
+    let one_sided = RaceConfig::builder().set_mutate_share(0.02).build();
+    assert_eq!(
+        (one_sided.crossover_share, one_sided.mutate_share),
+        (crate::engine::config::DEFAULT_CROSSOVER_SHARE, 0.02),
+        "the crossover default is untouched"
+    );
+}
+
 #[test]
 fn newborn_immigrant_starts_fresh_without_replay() {
     // A mutation immigrant joins at step 0 with no recorded metrics: there is no
@@ -395,7 +491,6 @@ fn newborn_immigrant_starts_fresh_without_replay() {
     let dir = std::env::temp_dir().join("gras_mutation_newborn_fresh");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 31).unwrap();
-    eng.config.mutate_rolls = 1;
     // Cull shield 0: this test pins the immigrant's fresh-insert bookkeeping,
     // and with the default window nobody would be cull-eligible yet.
     eng.config.mutation_probation_steps = 0;
@@ -484,8 +579,6 @@ fn stop_stamps_final_scores_on_live_nets() {
     let dir = std::env::temp_dir().join("race_final_stamp_test");
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 42).unwrap();
-    engine.config.crossover_prob = 0.0;
-    engine.config.mutate_prob = 0.0;
     engine
         .seed_population_internal(vec![tiny_topology(7)], Some(0.0))
         .unwrap();
@@ -989,8 +1082,6 @@ fn child_generation_is_deterministic_per_run_seed_and_clock() {
     let dir_b = std::env::temp_dir().join("race_child_det_b");
     let mut a = seed_two_parents(&dir_a, 123);
     let mut b = seed_two_parents(&dir_b, 123);
-    a.config.crossover_prob = 1.0;
-    b.config.crossover_prob = 1.0;
     // Determinism ⇒ the SAME outcome, including `None` (all pairing attempts
     // incompatible). The self-pairing redraw shares the rng, so it must too.
     let ca = a.generate_child(3, 0).unwrap();
@@ -1014,7 +1105,6 @@ fn child_generation_is_deterministic_per_run_seed_and_clock() {
 fn a_child_is_as_old_as_its_lineage() {
     let dir = std::env::temp_dir().join("race_child_lineage_born");
     let mut engine = seed_two_parents(&dir, 9);
-    engine.config.crossover_prob = 1.0;
     match engine.generate_child(6, 0).unwrap() {
         Some(child) => {
             assert_eq!(child.state.entered_at_step, 6, "its own age starts at 6");
@@ -1034,43 +1124,16 @@ fn a_child_is_as_old_as_its_lineage() {
 }
 
 #[test]
-fn crossover_prob_zero_means_spent_roll() {
-    let dir = std::env::temp_dir().join("race_child_cx0");
-    let mut engine = seed_two_parents(&dir, 7);
-    engine.config.crossover_prob = 0.0;
-    // crossover_prob=0 ⇒ the roll never fires ⇒ Ok(None) (spent roll).
-    // Random immigrants come only from the mutation rolls.
-    for clock in 0..4 {
-        let child = engine.generate_child(clock, 0).unwrap();
-        assert!(
-            child.is_none(),
-            "crossover_prob=0 ⇒ no child at clock {clock}"
-        );
-    }
-}
-
-#[test]
-fn mutation_prob_zero_and_one_flips_mut_suffix() {
+fn the_immigrant_path_never_carries_the_mut_suffix() {
     // The mutation roll belongs to the CROSSOVER branch only: the exploit path may
     // get a perturbation; the immigrant path never carries the '+mut' suffix.
-    let dir_no = std::env::temp_dir().join("race_child_mut0");
-    let mut no = seed_two_parents(&dir_no, 21);
-    no.config.mutate_prob = 0.0;
-    let c = no.random_child(1, 0).unwrap();
+    let dir = std::env::temp_dir().join("race_child_mut");
+    let mut engine = seed_two_parents(&dir, 21);
+    let c = engine.random_child(1, 0).unwrap();
     assert_eq!(
         c.state.created_from.as_deref(),
         Some("random"),
-        "no '+mut' suffix"
-    );
-
-    let dir_yes = std::env::temp_dir().join("race_child_mut1");
-    let mut yes = seed_two_parents(&dir_yes, 21);
-    yes.config.mutate_prob = 1.0;
-    let c = yes.random_child(1, 0).unwrap();
-    assert_eq!(
-        c.state.created_from.as_deref(),
-        Some("random"),
-        "immigrant path is mutation-free regardless of mutate_prob"
+        "no '+mut' suffix on an immigrant"
     );
 }
 
@@ -1121,8 +1184,6 @@ fn failed_crossover_after_three_attempts_is_a_noop() {
     engine
         .seed_population_internal(vec![flat_topology(7), flat_topology(8)], Some(0.5))
         .unwrap();
-    engine.config.crossover_prob = 1.0;
-    engine.config.mutate_prob = 0.0;
     let before = engine.state.live_count();
     let result = engine.generate_child(2, 0).unwrap();
     assert!(
@@ -1148,7 +1209,6 @@ fn crossover_never_self_pairs_the_same_net() {
             Some(0.5),
         )
         .unwrap();
-        eng.config.crossover_prob = 1.0;
         // Fixture is Minimize: make net 0 the overwhelming favorite.
         let hs = eng.state.live_hashes();
         for (i, h) in hs.iter().enumerate() {
@@ -1185,7 +1245,6 @@ fn fitter_base_puts_the_better_parent_first() {
             Some(0.5),
         )
         .unwrap();
-        eng.config.crossover_prob = 1.0;
         eng.config.crossover_fitter_base = true;
         // Minimize fixture: net 0 is the overwhelming favorite (0.01), net 2 the worst.
         let hs = eng.state.live_hashes();
@@ -1230,7 +1289,6 @@ fn crossover_children_inherit_the_parents_feature_split() {
     let mut eng = engine(&dir, 11).unwrap();
     eng.config.topology_options.feature_split =
         Some(crate::graph::topology::FeatureSplitPolicy::Random);
-    eng.config.crossover_prob = 1.0;
     eng.config.crossover_ops_pool = vec!["one_point".to_string()];
     // Drift flips inherited bits AFTER the cut and would hide the prefix/suffix law.
     eng.config.drift_prob = 0.0;
@@ -1684,8 +1742,7 @@ fn run_culls_continue_across_a_resume_boundary() {
     let cfg = |max_steps: Option<usize>, stop_after_clock_zero: bool| {
         let mut c = RaceConfig::defaults();
         c.pop_size = 2;
-        c.mutate_rolls = 1;
-        c.mutate_prob = 1.0; // every step's mutation roll fires → a cull per clock
+        c.mutate_share = 0.5; // pop 2 ⇒ one immigration per clock
         // defaults() shields founders for 5 clocks; the twin must be able to cull.
         c.mutation_probation_steps = 0;
         c.crossover_probation_steps = 0;

@@ -614,24 +614,19 @@ impl CoreEngine {
         let roll_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx);
         let mut rng = fastrand::Rng::with_seed(roll_seed);
 
-        // Every roll is a CROSSOVER roll now: a not-fired or failed roll is simply
-        // spent. Random whole nets enter only via mutation.
-        let try_crossover = rng.f32() < self.config.crossover_prob;
-
-        if try_crossover {
-            match self.evolved_child(clock, child_idx, &mut rng) {
-                // Crossover produced nothing viable: the roll does NOTHING (no random
-                // fallback). NO log here — the caller logs one line per roll.
-                Ok(None) => Ok(None),
-                other => other,
-            }
-        } else {
-            Ok(None) // probability roll said no — roll spent, no child
+        // Every dealt roll IS a crossover attempt: the channel's turnover decided how many rolls
+        // this clock, so there is no probability left to draw. A failed pairing is a SPENT roll (no
+        // random fallback) and random whole nets enter only via mutation.
+        match self.evolved_child(clock, child_idx, &mut rng) {
+            // Crossover produced nothing viable: the roll does NOTHING (no random
+            // fallback). NO log here — the caller logs one line per roll.
+            Ok(None) => Ok(None),
+            other => other,
         }
     }
 
-    /// The evolved branch: roulette parents → crossover → maybe mutate. Called
-    /// when `crossover_prob` fires; a failed pairing is a spent roll (no fallback).
+    /// The evolved branch: roulette parents → crossover → maybe mutate. Called for EVERY dealt
+    /// roll; a failed pairing is a spent roll (no fallback).
     fn evolved_child(
         &mut self,
         clock: usize,
@@ -800,7 +795,7 @@ impl CoreEngine {
         };
 
         // NO part-mutation anywhere: crossover exploits, mutation explores.
-        // `mutate_prob` gates the immigrant rolls in the race loop.
+        // The mutation channel's own turnover deals the immigrant rolls in the race loop.
 
         // Crossover children get per-port activations — the port pool
         // is part of the search space, not just the immigrant path.
