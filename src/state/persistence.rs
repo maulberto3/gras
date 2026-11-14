@@ -35,8 +35,7 @@ pub struct ConfigSnapshot {
     /// own knob — it decides which net a fresh immigrant replaces, so a reader cannot reconstruct
     #[serde(default = "default_mutation_cull_policy")]
     pub mutation_cull_policy: String,
-    /// Champion guard size: top-k nets by smoothed fitness immune to all culls.
-    /// `champion_count` is the ranking's k; `freeze_seats` is the SEPARATE seat switch.
+    /// Champion set size: the top-k live nets by smoothed fitness, saved at stop.
     #[serde(default, alias = "elite_count")]
     pub champion_count: usize,
     /// Crossover operator pool (`"one_point"`/`"uniform"`); empty ⇒ both.
@@ -90,10 +89,6 @@ pub struct ConfigSnapshot {
     /// Human label for the experiment (`set_run_name`), verbatim. Purely
     /// informative — never affects the results folder name.
     pub run_name: Option<String>,
-    /// Seats (`set_seat_freeze`): the top-k nets act-and-measure without a trainer call — the
-    /// anti-devolution switch, independent of how many nets are CHAMPIONS. Replay-relevant.
-    #[serde(default, alias = "freeze_elites")]
-    pub freeze_seats: bool,
     /// LEGACY lottery strength Ω (`set_run_train_merit`, deprecated): retired as a second dial,
     /// because `p_min`/`p_max` are the chance band now. New headers write `1.0` (the identity); a
     /// header written before the retirement carries its value and `from_snapshot` folds it into
@@ -189,14 +184,6 @@ pub struct ConfigSnapshot {
     /// written again. Drop it on the same schedule as `train_merit_inverted` above.
     #[serde(default, skip_serializing)]
     pub train_merit_updates: bool,
-    /// Seat join probation: clocks a fresh net must train before it may hold a SEAT.
-    /// Replay-relevant.
-    #[serde(default, alias = "elite_join_probation_steps")]
-    pub seat_join_probation_steps: usize,
-    /// Seat lifetime: a net is rotated out of the crown after k clocks at peak (`0`
-    /// disables) — a completed term is a scheduled rotation, not a loss. Replay-relevant.
-    #[serde(default, alias = "elite_crown_lifetime_steps")]
-    pub seat_lifetime_steps: usize,
     /// The input feature-split policy the run drew masks from (`"split_exclusive"` /
     /// `"split_random"`); `None` = no split
     #[serde(default)]
@@ -267,7 +254,6 @@ impl ConfigSnapshot {
             csv_export: cfg.csv_export,
             save_optim: cfg.save_optim,
             run_name: cfg.run_name.clone(),
-            freeze_seats: cfg.freeze_seats,
             train_merit: cfg.train_merit,
             train_merit_p_min: cfg.train_merit_p_min,
             train_merit_p_max: cfg.train_merit_p_max,
@@ -292,8 +278,6 @@ impl ConfigSnapshot {
             recovery_retries: cfg.recovery_retries,
             recovery_tolerance: cfg.recovery_tolerance,
             recovery_same_seed: cfg.recovery_same_seed,
-            seat_join_probation_steps: cfg.seat_join_probation_steps,
-            seat_lifetime_steps: cfg.seat_lifetime_steps,
             feature_split: split_single,
             feature_split_pool: split_pool,
             drift_prob: cfg.drift_prob,
@@ -885,14 +869,6 @@ pub struct NetState {
     /// never written to disk; rebuilt from `last_metrics` on resume.
     #[serde(skip)]
     pub last_update_step: usize,
-    /// Elite probation clock: starts at 0 on birth and any seat exit, ticked +1 per clock;
-    /// a seat needs `elite_probation_age >= seat_join_probation_steps`.
-    #[serde(default)]
-    pub elite_probation_age: usize,
-    /// Elite seat clock: 0 while unseated, +1 per seated clock;
-    /// `seat_lifetime_steps` the net ages out (`0` disables).
-    #[serde(default)]
-    pub elite_seat_age: usize,
     /// LEGACY: clocks an older lottery ACTED but did not update (they sit in `frozen_spans`,
     /// because that era re-ran them through a no-op optimizer).
     #[serde(default)]
@@ -974,7 +950,7 @@ pub struct NetMetrics {
     pub fitness: f32,
     /// Informative-only metric values, in the same order the run configured them.
     pub informative: Vec<f32>,
-    /// True when this step was the CROWN's act-and-measure pass (frozen elite).
+    /// True when this step was ACT-ONLY: the net ran and was measured on a no-op optimizer.
     #[serde(default)]
     pub frozen: bool,
 }
@@ -1039,8 +1015,6 @@ impl NetState {
             idle_spans: Vec::new(),
             meta: NetMeta::default(),
             last_update_step: step,
-            elite_probation_age: 0,
-            elite_seat_age: 0,
             budget_skips: 0,
             recovery_ledger: Vec::new(),
         })
@@ -1077,8 +1051,9 @@ impl NetState {
         self.recovery_ledger.iter().map(|&(_, n)| n).sum()
     }
 
-    /// Clocks this net spent ACTING without updating (the crown freeze): the length
-    /// `frozen_spans`. One implementation for the replay ledger and the `frozen` column.
+    /// Clocks this net spent ACTING without updating (a lottery denied the update while
+    /// `train_merit_learn_only` was on): the length of `frozen_spans`. One implementation for the
+    /// replay ledger and the `frozen` column.
     pub fn frozen_clocks(&self) -> usize {
         span_len(&self.frozen_spans)
     }
@@ -1089,8 +1064,8 @@ impl NetState {
         span_len(&self.idle_spans)
     }
 
-    /// Clocks this net actually ran the trainer and was scored: its real updates plus its crown
-    /// act-and-measure passes.
+    /// Clocks this net actually ran the trainer and was scored: its real updates plus its
+    /// act-only passes.
     pub fn measured_clocks(&self) -> usize {
         self.step + self.frozen_clocks()
     }
