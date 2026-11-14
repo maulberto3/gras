@@ -138,6 +138,67 @@ fn engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::Tabular
 
 /// The tombstone a cull writes records all three legs of the reading the net died
 /// with: the readable mean, its spread, and the score it was ranked
+/// Metrics can FEED the ranking (`set_selection_metric`): two nets tied on fitness are ordered by
+/// a registered metric's smoothed centre, a zero weight is exactly the fitness-only ranking, and
+/// the metric is read over the same window the table prints.
+#[test]
+fn a_selection_metric_reorders_a_fitness_tie_and_zero_weight_is_neutral() {
+    use crate::utils::fitness::{Metric, SelectionMetric};
+    let dir = std::env::temp_dir().join("gras-selection-metric");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = engine(&dir, 21).unwrap();
+    eng.metrics = vec![Metric::custom("r2", |_p, _y| Ok(0.0))];
+    eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
+        .unwrap();
+    let mut hs = eng.state.live_hashes();
+    hs.sort();
+    // Same fitness centre (10.0) for both; r2 differs 0.2 vs 0.8.
+    for (h, r2) in [(&hs[0], 0.2_f32), (&hs[1], 0.8)] {
+        let fit = eng.rolling_fitness.get_mut(h).unwrap();
+        fit.push(10.0);
+        fit.push(10.0);
+        let bufs = eng.rolling_metrics.get_mut(h).unwrap();
+        bufs[0].push(r2);
+        bufs[0].push(r2);
+    }
+    let plain = eng.ranked_live();
+    assert_eq!(
+        (plain[0].1, plain[1].1),
+        (10.0, 10.0),
+        "the fixture ties on fitness"
+    );
+
+    // Weight 0 = no term: the ranking is exactly the fitness-only one it was.
+    eng.config.selection_metrics = vec![SelectionMetric {
+        label: "r2".to_string(),
+        weight: 0.0,
+    }];
+    eng.apply_selection_metrics();
+    assert_eq!(eng.ranked_live(), plain, "a zero weight changes nothing");
+
+    // The fixture's fitness is MINIMIZE (lower is better), so a higher-is-better metric needs a
+    // NEGATIVE weight: 10 − 0.8 beats 10 − 0.2, whatever the tie-break said.
+    eng.config.selection_metrics = vec![SelectionMetric {
+        label: "r2".to_string(),
+        weight: -1.0,
+    }];
+    eng.apply_selection_metrics();
+    let ranked = eng.ranked_live();
+    assert_eq!(ranked[0].0, hs[1], "the better r2 wins the tie: {ranked:?}");
+    assert!(
+        (ranked[0].1 - 9.2).abs() < 1e-6,
+        "score was {}",
+        ranked[0].1
+    );
+    assert!(
+        (ranked[1].1 - 9.8).abs() < 1e-6,
+        "score was {}",
+        ranked[1].1
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn cull_tombstone_records_mean_spread_and_the_centre_it_ranked() {
     let dir = std::env::temp_dir().join("gras-fit-tombstone");

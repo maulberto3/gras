@@ -89,6 +89,14 @@ pub struct CoreEngine {
     pub(crate) rolling_fitness: HashMap<String, RollingBuffer>,
     pub(crate) rolling_train: HashMap<String, RollingBuffer>,
     pub(crate) rolling_eval: HashMap<String, RollingBuffer>,
+    /// Per-net windows for the run's informative metrics, one buffer per `config.metrics` entry
+    /// (the order `StepReport::informative` arrives in). Only the metrics named by
+    /// [`crate::engine::config::RaceConfig::selection_metrics`] are READ, but every metric keeps a
+    /// window so a term can be added without a shape change.
+    pub(crate) rolling_metrics: HashMap<String, Vec<RollingBuffer>>,
+    /// [`crate::engine::config::RaceConfig::selection_metrics`] resolved to `(index, weight)`
+    /// pairs over `metrics`. Empty = the fitness score IS the ranking value.
+    pub(crate) selection_terms: Vec<(usize, f32)>,
     /// Per-net WHOLE-RUN fitness trend — the least-squares line over every reading the net took
     /// (`smoothing::ReadingTrend`). Report-only: nothing ranks, draws a ticket or culls on it.
     pub(crate) rolling_trend: HashMap<String, crate::engine::smoothing::ReadingTrend>,
@@ -160,7 +168,7 @@ impl CoreEngine {
             p.config.mutation_novelty_min,
             p.config.mutation_novelty_draws,
         );
-        Self {
+        let mut engine = Self {
             run_dir: p.run_dir,
             header: p.header,
             config: p.config,
@@ -185,6 +193,8 @@ impl CoreEngine {
             rolling_fitness: HashMap::new(),
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
+            rolling_metrics: HashMap::new(),
+            selection_terms: Vec::new(),
             rolling_epoch: HashMap::new(),
             rolling_trend: HashMap::new(),
             last_ticket_p: HashMap::new(),
@@ -200,7 +210,26 @@ impl CoreEngine {
             attempts_csv_buffer: String::new(),
             novelty,
             births: BirthLedger::default(),
-        }
+        };
+        // The terms are resolved ONCE here, from the config + the metric list the run registered,
+        // so the ranking never reads a stale index.
+        engine.apply_selection_metrics();
+        engine
+    }
+
+    /// Recompute the resolved selection terms from `config.selection_metrics` + `metrics`.
+    /// Assembly calls it once; a test that flips the knob after construction calls it too, so the
+    /// ranking can never read terms that no longer match the config.
+    pub(crate) fn apply_selection_metrics(&mut self) {
+        self.selection_terms = self.config.selection_metric_terms(&self.metrics);
+    }
+
+    /// One empty window per configured informative metric, in `metrics` order.
+    pub(crate) fn metric_buffers(&self) -> Vec<RollingBuffer> {
+        self.metrics
+            .iter()
+            .map(|_| RollingBuffer::new(self.config.smoothing_window))
+            .collect()
     }
 }
 
@@ -582,6 +611,8 @@ impl CoreEngine {
             rolling_fitness: HashMap::new(),
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
+            rolling_metrics: HashMap::new(),
+            selection_terms: Vec::new(),
             rolling_epoch: HashMap::new(),
             rolling_trend: HashMap::new(),
             last_ticket_p: HashMap::new(),
@@ -706,6 +737,8 @@ impl CoreEngine {
                 hash.clone(),
                 RollingBuffer::new(self.config.smoothing_window),
             );
+            let metric_bufs = self.metric_buffers();
+            self.rolling_metrics.insert(hash.clone(), metric_bufs);
             self.rolling_epoch.insert(hash.clone(), 0);
             self.rolling_trend.insert(hash.clone(), Default::default());
             self.state.insert(state, initial_fitness);
@@ -723,21 +756,9 @@ impl CoreEngine {
             ("run dir".to_string(), self.run_dir.display().to_string()),
             ("seeded slots".to_string(), seeded_slots.to_string()),
         ];
-        if let Some(src) = self.header.run_topology_source.as_ref() {
-            rows.push(("source run".to_string(), src.source_run_id.clone()));
-            rows.push((
-                "champion".to_string(),
-                src.champion_hash[..8.min(src.champion_hash.len())].to_string(),
-            ));
-            rows.push((
-                "ranks inherited".to_string(),
-                if seeded_slots == 1 {
-                    "rank 1".to_string()
-                } else {
-                    format!("ranks 1..{seeded_slots}")
-                },
-            ));
-        }
+        // The inheritance receipt (source run, source dir, champion, ranks, founder slots) is the
+        // `Inheritance` card emitted when the plan resolves — repeating three of those rows here
+        // was the same receipt twice. `seeded slots` stays: it is this card's own count.
         crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Race init",
             &crate::utils::cfy::kv(&rows),
@@ -962,7 +983,7 @@ impl CoreEngine {
                 (
                     "score".to_string(),
                     format!(
-                        "score{} = the window CENTRE in `{}` (what the ranking sorts on; the rollup's `±` is the `σ` ACROSS the live scores, not one net's window spread). A row's `spread` is printed for diagnosis, not charged",
+                        "score{} = the window CENTRE in `{}`, plus any `selection_metrics` terms (each a metric's smoothed centre × its weight — `COMPOSITE` on the line when terms exist). What the ranking sorts on; the rollup's `±` is the `σ` ACROSS the live scores, not one net's window spread. A row's `spread` is printed for diagnosis, not charged",
                         self.fitness.direction().arrow(),
                         self.config.mean_type
                     ),
@@ -1596,7 +1617,7 @@ impl CoreEngine {
                 ]),
                 None,
             ));
-            self.log_stop_summary(clock)?;
+            self.log_stop_summary()?;
         }
         // After the stop cards, and OUTSIDE the gate: the final-field TABLE is an artifact, written
         // at every log level — `None` included, since that is the scripted caller who wants

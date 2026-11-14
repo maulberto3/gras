@@ -14,15 +14,46 @@ impl CoreEngine {
         self.state
             .live_hashes()
             .into_iter()
-            .filter_map(|h| self.race_reading_of(&h))
-            .map(|s| s.score())
+            .filter_map(|h| self.ranking_score_of(&h))
             .collect()
     }
 
-    /// The net's ranking value: the window score (the family CENTRE over
-    /// `smoothing_window` step fitnesses) — what every ranking decision reads.
+    /// The net's FITNESS value: the window score (the family CENTRE over
+    /// `smoothing_window` step fitnesses). With no `selection_metrics` this is also the ranking
+    /// value; [`Self::ranking_score_of`] is always the number the race sorts on.
     pub fn smoothed_fitness_of(&self, hash: &str) -> Option<f32> {
         self.race_reading_of(hash).map(|s| s.score())
+    }
+
+    /// One informative metric's smoothed centre for a net, read under the SAME mean family and
+    /// policy-scoped rule the fitness centre uses. `None` when the metric has no reading yet.
+    pub(crate) fn metric_center_of(&self, hash: &str, index: usize) -> Option<f32> {
+        let buf = self.rolling_metrics.get(hash)?.get(index)?;
+        let take = if self.config.policy_scoped_fitness {
+            self.rolling_epoch
+                .get(hash)
+                .copied()
+                .unwrap_or(buf.len())
+                .min(buf.len())
+        } else {
+            buf.len()
+        };
+        rolling_stats_tail(buf, take, self.config.mean_type).map(|s| s.score())
+    }
+
+    /// The net's RANKING value: the fitness window centre plus every `selection_metrics` term
+    /// (`weight × that metric's smoothed centre`). With no terms this is exactly
+    /// [`Self::smoothed_fitness_of`], so a run without the knob ranks byte-identically to before.
+    pub fn ranking_score_of(&self, hash: &str) -> Option<f32> {
+        let mut score = self.smoothed_fitness_of(hash)?;
+        for &(index, weight) in &self.selection_terms {
+            // A metric with no reading yet contributes nothing — the same contract the fitness
+            // side applies to a net that has not been measured (`0.0`).
+            if let Some(center) = self.metric_center_of(hash, index) {
+                score += weight * center;
+            }
+        }
+        Some(score)
     }
 
     /// The net's RACE READING with its own error bar: the smoothed mean plus how many
@@ -64,12 +95,17 @@ impl CoreEngine {
             .state
             .live_hashes()
             .into_iter()
-            .filter_map(|h| match self.race_reading_of(&h) {
-                Some(s) if !require_measured || s.n > 0 => Some((h, s.score())),
-                Some(_) => None,
-                // Never measured: the parent-selection contract counts it as 0.0.
-                None if !require_measured => Some((h, 0.0)),
-                None => None,
+            .filter_map(|h| {
+                let measured = self.race_reading_of(&h).filter(|s| s.n > 0);
+                match (measured, require_measured) {
+                    (Some(reading), _) => Some((
+                        h.clone(),
+                        self.ranking_score_of(&h).unwrap_or_else(|| reading.score()),
+                    )),
+                    (None, true) => None,
+                    // Never measured: the parent-selection contract counts it as 0.0.
+                    (None, false) => Some((h, 0.0)),
+                }
             })
             .map(|(h, score)| {
                 let params = self.net_params(&h).unwrap_or(i64::MAX);

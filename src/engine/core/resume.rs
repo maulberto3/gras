@@ -523,6 +523,7 @@ impl CoreEngine {
         // The whole-run trend: replayed from EVERY row, so a resumed twin's slope is the live
         // run's, not a line over the tail the window keeps.
         let mut trend = crate::engine::smoothing::ReadingTrend::default();
+        let mut metric_bufs = self.metric_buffers();
         match history.get(&hash) {
             // The recorded runway, oldest → newest: the same window the live run held.
             Some(replay) if !replay.window.is_empty() => {
@@ -534,6 +535,13 @@ impl CoreEngine {
                     }
                 }
                 trend = replay.trend;
+                for (label, series) in &replay.metric_windows {
+                    if let Some(i) = self.metrics.iter().position(|m| m.label == *label) {
+                        for v in series {
+                            metric_bufs[i].push(*v);
+                        }
+                    }
+                }
             }
             // No `history.csv` (csv_export off, or a run recorded before it): fall back
             // to the single last reading, which is all the net state carries.
@@ -545,6 +553,11 @@ impl CoreEngine {
                         eval_buf.push(e);
                     }
                     trend.push(m.fitness);
+                    for (i, v) in m.informative.iter().enumerate() {
+                        if let Some(buf) = metric_bufs.get_mut(i) {
+                            buf.push(*v);
+                        }
+                    }
                 }
             }
         }
@@ -555,6 +568,7 @@ impl CoreEngine {
         self.rolling_fitness.insert(hash.clone(), buf);
         self.rolling_train.insert(hash.clone(), train_buf);
         self.rolling_eval.insert(hash.clone(), eval_buf);
+        self.rolling_metrics.insert(hash.clone(), metric_bufs);
         self.rolling_epoch.insert(hash.clone(), epoch);
         self.rolling_trend.insert(hash.clone(), trend);
         (hash, step)
@@ -607,6 +621,26 @@ impl CoreEngine {
         ) else {
             return HashMap::new();
         };
+        // Every non-fixed column is an informative metric, under the label the run registered
+        // (the stop table spells it `m:<label>`, `history.csv` the bare label).
+        const FIXED: [&str; 10] = [
+            "step",
+            "hash",
+            "net_seed",
+            "origin",
+            "entered_at_step",
+            "train_loss",
+            "eval_loss",
+            "fitness",
+            "fitness_smooth",
+            "fitness_smooth_std",
+        ];
+        let metric_cols: Vec<(usize, String)> = cols
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !FIXED.iter().any(|f| **c == *f))
+            .map(|(i, c)| (i, c.trim_start_matches("m:").to_string()))
+            .collect();
         let mut out: HashMap<String, crate::engine::smoothing::HistoryReplay> = HashMap::new();
         for line in lines {
             let fields = crate::engine::format::csv_split_line(line);
@@ -627,6 +661,22 @@ impl CoreEngine {
             replay.window.push((fitness, train_loss, eval_loss));
             if replay.window.len() > window {
                 replay.window.remove(0);
+            }
+            for (col, label) in &metric_cols {
+                let Some(value) = fields.get(*col).and_then(|f| f.parse::<f32>().ok()) else {
+                    continue;
+                };
+                if !replay.metric_windows.iter().any(|(l, _)| l == label) {
+                    replay.metric_windows.push((label.clone(), Vec::new()));
+                }
+                if let Some((_, series)) =
+                    replay.metric_windows.iter_mut().find(|(l, _)| l == label)
+                {
+                    series.push(value);
+                    if series.len() > window {
+                        series.remove(0);
+                    }
+                }
             }
         }
         out

@@ -125,7 +125,7 @@ impl CoreEngine {
                     // FIT columns, appended LAST so every existing column keeps its position
                     // (positional readers stay valid): the risk-adjusted score this net ranked
                     // by, then the spread that score CHARGED — the family spread (`fam_spread`),
-                    // so `Δλ × this` equals the `ΔF` the charge moved in every family, not only
+                    // the diagnostic any post-hoc charge would use, not only
                     // under `arithmetic`.
                     let reading = self.race_reading_of(hash);
                     let score = self.smoothed_fitness_of(hash);
