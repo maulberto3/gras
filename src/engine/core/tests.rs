@@ -136,82 +136,13 @@ fn engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::Tabular
     ))
 }
 
-/// The OFF path in the direction that makes the penalty ADDITIVE: with λ = 0 a Minimize run must
-/// ignore spread completely (score == window mean, and the net with the better mean wins even
-#[test]
-fn minimize_with_lambda_zero_ignores_spread_entirely() {
-    let dir = std::env::temp_dir().join("gras-fit-minimize-off");
-    let _ = std::fs::remove_dir_all(&dir);
-    let mut eng = engine(&dir, 13).unwrap();
-    eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-        .unwrap();
-    let mut hashes = eng.state.live_hashes();
-    hashes.sort();
-    // Minimize (the test fitness): lower is better. `hashes[0]` has the BETTER mean
-    // (0.40) but is volatile; `hashes[1]` is perfectly steady at a worse 0.60.
-    for (h, values) in [
-        (&hashes[0], [0.20_f32, 0.60, 0.20, 0.60]),
-        (&hashes[1], [0.60_f32, 0.60, 0.60, 0.60]),
-    ] {
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
-        for v in values {
-            buf.push(v);
-        }
-        *eng.rolling_fitness.get_mut(h).unwrap() = buf;
-    }
-    // λ = 0 — also what a clamped negative λ becomes at the builder (pinned
-    // `config::tests::risk_aversion_defaults_on_and_clamps_at_off`).
-    eng.config.risk_aversion = 0.0;
-    let ranked = eng.ranked_live();
-    for (h, score) in &ranked {
-        let reading = eng.race_reading_of(h).unwrap();
-        assert!(score.is_finite(), "λ=0 must never produce a NaN score: {h}");
-        assert_eq!(*score, reading.mean, "λ=0 must score exactly the mean");
-    }
-    assert_eq!(
-        ranked[0].0, hashes[0],
-        "with the risk term off the better MEAN wins — steadiness earns nothing"
-    );
-    assert!(
-        (ranked[0].1 - 0.40).abs() < 1e-6,
-        "mean was {}",
-        ranked[0].1
-    );
-    assert!(
-        (ranked[1].1 - 0.60).abs() < 1e-6,
-        "mean was {}",
-        ranked[1].1
-    );
-    // Switched on, the same direction charges the spread ON TOP of the mean: the steady net's 0.60
-    // beats the volatile net's 0.40 + 0.20σ = 0.60 in a Minimize sort, and both readings
-    eng.config.risk_aversion = 1.0;
-    let ranked = eng.ranked_live();
-    assert!(
-        (ranked[1].1 - 0.60).abs() < 1e-6,
-        "volatile score was {}",
-        ranked[1].1
-    );
-    assert!(
-        (ranked[0].1 - 0.60).abs() < 1e-6,
-        "steady score was {}",
-        ranked[0].1
-    );
-    assert_eq!(
-        eng.race_reading_of(&hashes[0]).unwrap().mean,
-        0.40,
-        "the readable mean is not perturbed by λ"
-    );
-    assert_eq!(ranked.len(), 2, "a score tie drops nobody");
-}
-
 /// The tombstone a cull writes records all three legs of the reading the net died
 /// with: the readable mean, its spread, and the score it was ranked
 #[test]
-fn cull_tombstone_records_mean_spread_and_risk_score() {
+fn cull_tombstone_records_mean_spread_and_the_centre_it_ranked() {
     let dir = std::env::temp_dir().join("gras-fit-tombstone");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 11).unwrap();
-    eng.config.risk_aversion = 2.0;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     let hashes = eng.state.live_hashes();
@@ -226,9 +157,9 @@ fn cull_tombstone_records_mean_spread_and_risk_score() {
     let state = crate::state::load_net_state(&dir, &victim).unwrap();
     assert_eq!(state.final_fitness_mean, Some(0.50), "the mean is readable");
     assert_eq!(state.final_fitness_std, Some(0.30), "the spread is kept");
-    // Minimize at λ=2: 0.50 + 2(0.30) = 1.10 — the value that actually ranked
+    // The score is the window CENTRE: with no charge, Minimize ranks on the mean itself.
     let score = state.final_risk_score.unwrap();
-    assert!((score - 1.10).abs() < 1e-6, "risk score was {score}");
+    assert!((score - 0.50).abs() < 1e-6, "risk score was {score}");
     assert_eq!(state.final_fitness_samples, 4);
     assert_eq!(
         state.cull_reason.as_deref(),
@@ -482,41 +413,6 @@ fn worst_nets_culls_the_worst_under_both_directions() {
         "Maximize: lowest score is worst"
     );
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// λ must actually MOVE a decision, not just be carried around: the same two nets rank opposite
-/// ways at λ = 0 (mean decides) and λ = 2 (spread is charged).
-#[test]
-fn lambda_moves_the_cull_victim_from_the_low_mean_to_the_risky_net() {
-    let dir = std::env::temp_dir().join("race_lambda_cull_test");
-    let _ = std::fs::remove_dir_all(&dir);
-    let mut e = engine(&dir, 5).unwrap();
-    e.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-        .unwrap();
-    let hs = e.state.live_hashes();
-    e.fitness = Fitness::new(|_, _| Ok(0.0), Direction::Maximize, "fixture");
-    // Same population, two readings each: A steady at 10, B swinging 6↔16.
-    for (h, vals) in [(&hs[0], [10.0_f32, 10.0]), (&hs[1], [6.0, 16.0])] {
-        let buf = e.rolling_fitness.get_mut(h).unwrap();
-        for v in vals {
-            buf.push(v);
-        }
-    }
-    // λ = 0 ranks on the mean: 10 < 11, so the steady net is the worst.
-    e.config.risk_aversion = 0.0;
-    assert_eq!(
-        e.worst_nets_by_smoothed_fitness(1).unwrap()[0],
-        hs[0],
-        "λ=0: the plain mean decides, so the 10 is worst"
-    );
-    // λ = 2 charges 2σ: 11 − 2·5 = 1 < 10, so the RISKY net is now the worst.
-    e.config.risk_aversion = 2.0;
-    assert_eq!(
-        e.worst_nets_by_smoothed_fitness(1).unwrap()[0],
-        hs[1],
-        "λ=2: the spread charge flips the victim to the risky net"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2108,65 +2004,6 @@ fn resume_validates_pop_size_mismatch() {
     assert!(resumed.is_err());
     let err_msg = resumed.err().unwrap().to_string();
     assert!(err_msg.contains("resume: expected 3 live nets"));
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// R6: λ is BEHAVIOURAL.
-#[test]
-fn resume_warns_on_a_risk_aversion_mismatch_and_names_the_recorded_value() {
-    let dir = std::env::temp_dir().join("race_resume_risk_aversion");
-    let _ = std::fs::remove_dir_all(&dir);
-    let mut engine = engine(&dir, 99).unwrap();
-    engine
-        .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
-        .unwrap();
-    for h in engine.state.live_hashes() {
-        let state = engine.state.net(&h).cloned().unwrap();
-        crate::state::write_net_state(&dir, &state).unwrap();
-    }
-    engine.write_live_net_weights().unwrap();
-    drop(engine);
-
-    // Strip the field: exactly what an `engine.json` written before FIT looks like.
-    let raw = std::fs::read_to_string(dir.join("engine.json")).unwrap();
-    let mut json: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    json["config"]
-        .as_object_mut()
-        .unwrap()
-        .remove("risk_aversion");
-    std::fs::write(dir.join("engine.json"), json.to_string()).unwrap();
-
-    let resume = |config: RaceConfig| {
-        crate::engine::TabularEngine::resume(
-            dir.clone(),
-            tiny_dataset_dir("risk_aversion"),
-            config,
-            fitness(),
-            crate::trainer::TabularTrainer::new(loss_fn()),
-        )
-    };
-    let mut current = RaceConfig::defaults();
-    current.pop_size = 2;
-    current.risk_aversion = 1.0;
-    let resumed = resume(current).expect("λ is behavioural: warn, never refuse");
-    let drift = resumed.behavioural_drift();
-    assert_eq!(drift.len(), 1, "{drift:?}");
-    assert_eq!(drift[0].label, "risk_aversion (λ)");
-    assert_eq!(drift[0].recorded, "0.00");
-    assert_eq!(drift[0].current, "1.00");
-    assert!(
-        drift[0].undo.contains("set_fitness_risk_aversion(0.00)"),
-        "the warning must say how to reproduce the record: {drift:?}"
-    );
-    drop(resumed);
-
-    // …and the recorded λ leaves no drift
-    let mut legacy = RaceConfig::defaults();
-    legacy.pop_size = 2;
-    legacy.risk_aversion = 0.0;
-    let resumed = resume(legacy).expect("a pre-FIT run resumes at the λ it ranked with");
-    assert!(resumed.behavioural_drift().is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5321,9 +5158,9 @@ fn policy_scoped_fitness_reads_only_the_current_weights() {
         "flag on: one datapoint of one policy, no spread"
     );
     assert_eq!(
-        on.score(eng.fitness.direction(), eng.config.risk_aversion),
+        on.score(),
         0.9,
-        "λ·0 leaves the single reading clean"
+        "one reading is its own centre, with no spread to charge"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
