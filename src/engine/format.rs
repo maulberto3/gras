@@ -125,11 +125,6 @@ pub(crate) fn fmt_line_opt(v: &Option<f32>) -> String {
     v.as_ref().map_or_else(|| "—".into(), |x| fmt_line(*x))
 }
 
-/// Optional float, table-cell form — plain `—` when unset.
-pub(crate) fn fmt_cell_opt(v: &Option<f32>) -> String {
-    v.as_ref().map_or_else(|| "—".into(), |x| fmt_cell(*x))
-}
-
 /// Which sink a reading is rendered for — a console line and a table cell share one rule
 /// value's magnitude, [`fmt_band`]); only a document header still differs, at a flat 2dp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,6 +164,49 @@ pub fn fmt_reading(mean: Option<f32>, sigma: Option<f32>, n: usize, style: Readi
         // No observable spread yet (one reading) or none recorded: say so rather
         // than print `spread 0`, which would read as "perfectly steady".
         _ => format!("avg {} (n={n}, no spread yet)", f(mean)),
+    }
+}
+
+/// The FAMILY spelling of a sampled reading — the pair the score was actually charged from
+/// (`WindowStats::fam_center` / `fam_spread`), named as that family's centre and spread.
+///
+/// `arithmetic` delegates to [`fmt_reading`], so its bytes are unchanged
+/// (`avg 0.86 (spread 0.02; SE 0.01 = spread/√4, n=4)`). The other families have no `SE` to
+/// report: `1.4826·MAD` over a handful of readings is not a standard error, and printing
+/// `SE = spread/√n` beside it would invent a confidence nobody computed. A card that showed
+/// `avg`/`spread` beside a median score was a header a reader could not redo — the score charges
+/// `median − λ·1.4826·MAD`, not `mean − λ·σ`.
+pub(crate) fn fmt_family_reading(
+    centre: Option<f32>,
+    spread: Option<f32>,
+    n: usize,
+    style: ReadingStyle,
+    family: crate::engine::config::MeanType,
+) -> String {
+    use crate::engine::config::MeanType;
+    // Arithmetic is the ONLY family whose spread has a standard error, and its spelling is the
+    // pre-family one, byte for byte.
+    if family == MeanType::Arithmetic {
+        return fmt_reading(centre, spread, n, style);
+    }
+    let f = scalar(style);
+    let Some(centre) = centre else {
+        return "—".to_string();
+    };
+    let (centre_noun, spread_noun) = match family {
+        MeanType::Arithmetic => unreachable!("delegated above"),
+        // The header's spelling (`COL_FIT_MEDIAN`): `F = median ∓ λ·1.4826·MAD`.
+        MeanType::Median => ("window median", "1.4826·MAD"),
+        MeanType::SignedLog => ("window g-avg", "g-spread"),
+    };
+    match spread {
+        Some(s) if n > 0 => format!(
+            "{centre_noun} {} ({spread_noun} {}, n={n})",
+            f(centre),
+            f(s)
+        ),
+        // No observable spread yet (one reading): say so, never a `0` that reads as steadiness.
+        _ => format!("{centre_noun} {} (n={n}, no spread yet)", f(centre)),
     }
 }
 
@@ -216,6 +254,7 @@ mod tests {
         ReadingStyle, csv_field, fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_line_opt,
         fmt_reading, fmt_units,
     };
+    use crate::engine::format::fmt_family_reading;
 
     // ── the band rule: magnitude picks the precision ──────────────────────
 
@@ -372,6 +411,44 @@ mod tests {
             "avg 327.8 (n=1, no spread yet)"
         );
         assert_eq!(fmt_reading(None, None, 0, ReadingStyle::Line), "—");
+    }
+
+    /// A non-arithmetic run's card names ITS pair and refuses to invent an SE: the score charges
+    /// `median − λ·1.4826·MAD`, so a header saying `avg … (spread …; SE …)` could not be redone.
+    #[test]
+    fn a_family_reading_names_its_own_pair() {
+        use crate::engine::config::MeanType;
+        // Arithmetic stays byte-identical to the pre-family spelling.
+        assert_eq!(
+            fmt_family_reading(
+                Some(100.0),
+                Some(10.0),
+                4,
+                ReadingStyle::Doc,
+                MeanType::Arithmetic
+            ),
+            fmt_reading(Some(100.0), Some(10.0), 4, ReadingStyle::Doc)
+        );
+        let median = fmt_family_reading(
+            Some(0.84375),
+            Some(0.023166),
+            4,
+            ReadingStyle::Doc,
+            MeanType::Median,
+        );
+        assert_eq!(median, "window median 0.84 (1.4826·MAD 0.02, n=4)");
+        assert!(
+            !median.contains("SE"),
+            "a scaled MAD has no standard error: {median}"
+        );
+        assert_eq!(
+            fmt_family_reading(Some(0.5), None, 1, ReadingStyle::Doc, MeanType::SignedLog),
+            "window g-avg 0.50 (n=1, no spread yet)"
+        );
+        assert_eq!(
+            fmt_family_reading(None, None, 0, ReadingStyle::Line, MeanType::Median),
+            "—"
+        );
     }
 
     #[test]

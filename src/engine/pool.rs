@@ -139,8 +139,8 @@ pub(crate) struct CombineOpPool;
 impl SearchPool for CombineOpPool {
     type Choice = CombineOp;
     const LABEL: &'static str = "combine_op_pool";
-    // `mul` / `sub` / `div` are accepted but NOT in the default pool: unstable
-    // random weights, so a run must ask for them. The message lists what parses.
+    // Every operation the enum has: an EMPTY pool draws from all of them, and the message lists
+    // what parses, so an explicit pool can name any subset back (`add`, `mean`, ...).
     const ACCEPTED: &'static [&'static str] = &[
         "add", "mean", "max", "min", "mul", "multiply", "sub", "subtract", "div", "divide",
     ];
@@ -149,6 +149,7 @@ impl SearchPool for CombineOpPool {
         &cfg.combine_op_pool
     }
     fn default_choices() -> Vec<CombineOp> {
+        // ALL of them, not the conservative four: an empty pool means "no restriction".
         crate::evolution::pools::all_combine_ops()
     }
     fn parse(entry: &str) -> Option<CombineOp> {

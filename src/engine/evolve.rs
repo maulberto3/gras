@@ -13,7 +13,7 @@ use crate::state::write_net_state;
 /// Whether a lineage string names a crossover-born net (`crossover-one-point`,
 /// `crossover-uniform`, …). Founders/immigrants use the mutation probation.
 fn is_crossover_origin(created_from: Option<&str>) -> bool {
-    created_from.is_some_and(|s| s.starts_with("crossover"))
+    created_from.is_some_and(|s| s.starts_with("crossover-lowest-fitness"))
 }
 
 /// A score as the roll lines print it: one decimal, `—` when the net had no reading yet.
@@ -202,7 +202,9 @@ impl CoreEngine {
         // HARD SHIELD before any work: with no cull-eligible slot the child would
         // have nowhere to go, so the roll is spent up front.
         if !self.has_cull_eligible() {
-            return Ok(RollOutcome::no_slot(self.no_cull_roll_detail("crossover")));
+            return Ok(RollOutcome::no_slot(
+                self.no_cull_roll_detail("crossover-lowest-fitness"),
+            ));
         }
         let idx = self.next_child_ordinal(clock);
         // Ok(spent) = spent roll (crossover produced nothing viable
@@ -223,7 +225,7 @@ impl CoreEngine {
             // replacement. Random whole nets enter only via mutation.
             self.record_attempt(
                 clock,
-                "crossover",
+                "crossover-lowest-fitness",
                 attempt,
                 None,
                 None,
@@ -254,13 +256,18 @@ impl CoreEngine {
                 .clone()
                 .unwrap_or_else(|| "?".into());
             let victim_for_log: Option<String> = match self.config.crossover_cull_policy {
-                crate::engine::config::CrossCullPolicy::Worst => {
-                    self.select_crossover_worst_victim()?
+                crate::engine::config::CrossCullPolicy::LowestFitness => {
+                    self.select_lowest_fitness_victim()?
                 }
                 crate::engine::config::CrossCullPolicy::Random => {
                     self.select_random_victim(clock)?
                 }
-                crate::engine::config::CrossCullPolicy::Unfed => self.select_unfed_victim(clock)?,
+                crate::engine::config::CrossCullPolicy::HighestTicketChance => {
+                    self.select_highest_ticket_chance_victim()?
+                }
+                crate::engine::config::CrossCullPolicy::LowestFitnessMostUpdates => {
+                    self.select_lowest_fitness_most_updates_victim()?
+                }
             };
             // Defensive: a `None` victim means the selection filter disagreed —
             // discard the child and spend the roll (probation is never broken).
@@ -269,7 +276,9 @@ impl CoreEngine {
                 self.rolling_train.remove(&child.state.hash);
                 self.rolling_eval.remove(&child.state.hash);
                 self.rolling_epoch.remove(&child.state.hash);
-                return Ok(RollOutcome::no_slot(self.no_cull_roll_detail("crossover")));
+                return Ok(RollOutcome::no_slot(
+                    self.no_cull_roll_detail("crossover-lowest-fitness"),
+                ));
             }
             let victim_net_seed = victim_for_log
                 .as_ref()
@@ -282,7 +291,7 @@ impl CoreEngine {
                 .and_then(|v| self.smoothed_fitness_of(v));
             self.record_attempt(
                 clock,
-                "crossover",
+                "crossover-lowest-fitness",
                 attempt,
                 Some(&child.state.hash),
                 Some(child.state.net_seed),
@@ -298,9 +307,9 @@ impl CoreEngine {
             // because `cull_net` shrinks
             let live_before = self.state.live_count();
             match self.config.crossover_cull_policy {
-                crate::engine::config::CrossCullPolicy::Worst => {
+                crate::engine::config::CrossCullPolicy::LowestFitness => {
                     if let Some(victim) = &victim_for_log {
-                        self.cull_net(victim, clock, "crossover")?;
+                        self.cull_net(victim, clock, "crossover-lowest-fitness")?;
                     }
                 }
                 crate::engine::config::CrossCullPolicy::Random => {
@@ -308,9 +317,14 @@ impl CoreEngine {
                         self.cull_net(victim, clock, "crossover-random")?;
                     }
                 }
-                crate::engine::config::CrossCullPolicy::Unfed => {
+                crate::engine::config::CrossCullPolicy::HighestTicketChance => {
                     if let Some(victim) = &victim_for_log {
-                        self.cull_net(victim, clock, "crossover-unfed")?;
+                        self.cull_net(victim, clock, "crossover-highest-ticket-chance")?;
+                    }
+                }
+                crate::engine::config::CrossCullPolicy::LowestFitnessMostUpdates => {
+                    if let Some(victim) = &victim_for_log {
+                        self.cull_net(victim, clock, "crossover-lowest-fitness-most-updates")?;
                     }
                 }
             }
@@ -321,14 +335,17 @@ impl CoreEngine {
                 self.accounting.uniform_cx_swaps += rep.swaps;
                 self.accounting.uniform_cx_pairs += rep.pairs;
             }
-            self.insert_child(child, clock, "crossover");
+            self.insert_child(child, clock, "crossover-lowest-fitness");
             let victim_note = match self.config.crossover_cull_policy {
-                crate::engine::config::CrossCullPolicy::Worst => {
+                crate::engine::config::CrossCullPolicy::LowestFitness => {
                     format!("lowest score of {live_before}")
                 }
                 crate::engine::config::CrossCullPolicy::Random => "random draw".to_string(),
-                crate::engine::config::CrossCullPolicy::Unfed => {
+                crate::engine::config::CrossCullPolicy::HighestTicketChance => {
                     format!("fewest tickets of {live_before}")
+                }
+                crate::engine::config::CrossCullPolicy::LowestFitnessMostUpdates => {
+                    format!("most spent of {live_before}")
                 }
             };
             return Ok(RollOutcome::survived(format!(
@@ -450,7 +467,7 @@ impl CoreEngine {
     /// The one-line detail for a roll skipped by the hard shield — shared
     /// both channels so the log reads identically.
     pub(crate) fn no_cull_roll_detail(&self, branch: &str) -> String {
-        let k = if branch == "crossover" {
+        let k = if branch == "crossover-lowest-fitness" {
             self.config.crossover_probation_steps
         } else {
             self.config.mutation_probation_steps
@@ -472,10 +489,17 @@ impl CoreEngine {
             MutationCullPolicy::InverseFitness => self
                 .select_inverse_proportional_at(clock, roll)?
                 .or_else(|| self.mutation_victim_fallback()),
-            MutationCullPolicy::Worst => self.mutation_victim_fallback(),
+            MutationCullPolicy::LowestFitness => self.mutation_victim_fallback(),
             // The SAME selector the crossover channel's `Unfed` arm runs: the loop that starves
             // net closes on both channels, so a net the lottery never feeds loses its place
-            MutationCullPolicy::Unfed => self.select_unfed_victim(clock)?,
+            MutationCullPolicy::HighestTicketChance => {
+                self.select_highest_ticket_chance_victim()?
+            }
+            // And `Spent` is the same pairing on the evidence side: the worst net that has already
+            // spent its updates goes, whichever channel is looking for a slot.
+            MutationCullPolicy::LowestFitnessMostUpdates => {
+                self.select_lowest_fitness_most_updates_victim()?
+            }
             // Salt `roll + 1`: the crossover path draws with salt 0, so a mutation
             // roll never mirrors a crossover victim.
             MutationCullPolicy::Random => self
@@ -502,8 +526,9 @@ impl CoreEngine {
             .find(|h| eligible(h) && off_probation(h))
     }
 
-    /// One mutation roll: cull a net per `MutationCullPolicy` (worst, fitness-inverse, random
-    /// lottery-unfed) and insert a fully-random immigrant, fresh from the current clock.
+    /// One mutation roll: cull a net per `MutationCullPolicy` (worst, fitness-inverse, random,
+    /// lottery arms, lowest-fitness-most-updates) and insert a fully-random immigrant, fresh from
+    /// the current clock.
     pub(crate) fn evolve_random_immigrant(
         &mut self,
         clock: usize,
@@ -550,15 +575,18 @@ impl CoreEngine {
         // so a reader can weigh what the field GAVE UP for an immigrant. `F —` is honest: a newborn
         // victim that never got a reading has no score to report, and the note still says the policy.
         let victim_note = match self.config.mutation_cull_policy {
-            crate::engine::config::MutationCullPolicy::Worst => {
+            crate::engine::config::MutationCullPolicy::LowestFitness => {
                 format!("lowest score of {live_before}")
             }
             crate::engine::config::MutationCullPolicy::InverseFitness => {
                 format!("fitness-inverse draw of {live_before}")
             }
             crate::engine::config::MutationCullPolicy::Random => "random draw".to_string(),
-            crate::engine::config::MutationCullPolicy::Unfed => {
+            crate::engine::config::MutationCullPolicy::HighestTicketChance => {
                 format!("fewest tickets of {live_before}")
+            }
+            crate::engine::config::MutationCullPolicy::LowestFitnessMostUpdates => {
+                format!("most spent of {live_before}")
             }
         };
         let detail = format!(
@@ -743,9 +771,9 @@ impl CoreEngine {
     /// fit AND most spent net whenever the setters arm it that way (worst-first `Fm⁻` × `Um`).
     /// Excluded: the elite set, the crown, and every net the lottery does not grade (born shield,
     /// no reading, flat field). `None` when that leaves nobody — the roll is spent, nothing culled.
-    pub(crate) fn select_unfed_victim(&self, clock: usize) -> Result<Option<String>> {
-        let Some(frame) = self.lottery_frame(clock) else {
-            return self.select_crossover_worst_victim();
+    pub(crate) fn select_highest_ticket_chance_victim(&self) -> Result<Option<String>> {
+        let Some(frame) = self.lottery_frame() else {
+            return self.select_lowest_fitness_victim();
         };
         let elite = self.elite_hashes();
         // THE HIGHEST TICKET CHANCE GOES: the victim is the net the coin is about to pay the most,
@@ -760,13 +788,10 @@ impl CoreEngine {
             let merit = self.merit(&h);
             // `None` = not graded (crown, born shield, no reading, flat field): such a net has no
             // ticket chance to rank, so it is not a victim either.
-            if self
-                .train_lottery_parts(&h, clock, Some(frame), merit)
-                .is_none()
-            {
+            if self.train_lottery_parts(&h, Some(frame), merit).is_none() {
                 continue;
             }
-            let p = self.train_lottery_p_eff_from(&h, clock, Some(frame), merit);
+            let p = self.train_lottery_p_eff_from(&h, Some(frame), merit);
             let better = match &worst {
                 None => true,
                 Some((held, top)) => p > *top || (p == *top && h < *held),
@@ -779,13 +804,53 @@ impl CoreEngine {
         // to `worst` instead of inventing a ranking — what it did before the lottery existed.
         match worst {
             Some((h, _)) => Ok(Some(h)),
-            None => self.select_crossover_worst_victim(),
+            None => self.select_lowest_fitness_victim(),
+        }
+    }
+
+    /// The **LowestFitnessMostUpdates** victim, shared by both channels' arm of that name: the net
+    /// with the HIGHEST `Fm⁻ × (1 − Um)` — lowest-fitness AND most spent, so the evidence picks the
+    /// slot instead of the coin's next draw. UNLIKE `highest_ticket_chance`, the tilt does not move
+    /// it: that arm reads the coin's `p` (so best-first sends it after the BEST net), while this one
+    /// keeps the lowest-fitness-first place. A weak net with `U = 1` has not had its chance; a weak
+    /// net with `U = 18` has, and `highest_ticket_chance` would keep paying it. Excluded: the elite set, the crown, and every net the
+    /// lottery does not grade (born shield, no reading, flat field). `None` when that leaves
+    /// nobody — the roll is spent, nothing culled.
+    pub(crate) fn select_lowest_fitness_most_updates_victim(&self) -> Result<Option<String>> {
+        let Some(frame) = self.lottery_frame() else {
+            return self.select_lowest_fitness_victim();
+        };
+        let elite = self.elite_hashes();
+        let mut worst: Option<(String, f32)> = None;
+        for h in self.state.live_hashes() {
+            if elite.contains(&h) {
+                continue;
+            }
+            let merit = self.merit(&h);
+            // `None` = not graded, exactly the coin's own gates — so a net the lottery refuses to
+            // grade is never a victim of this arm either.
+            let Some(spent) = self.train_lottery_spent_fraction(&h, Some(frame), merit) else {
+                continue;
+            };
+            let better = match &worst {
+                None => true,
+                Some((held, top)) => spent > *top || (spent == *top && h < *held),
+            };
+            if better {
+                worst = Some((h, spent));
+            }
+        }
+        // Nobody graded: degrade to `lowest_fitness` rather than inventing a ranking, as the
+        // ticket arm does.
+        match worst {
+            Some((h, _)) => Ok(Some(h)),
+            None => self.select_lowest_fitness_victim(),
         }
     }
 
     /// The crossover Worst-policy victim: the worst non-elite net that has served
     /// its crossover probation. `None` when nobody is cullable (shield is HARD).
-    pub(crate) fn select_crossover_worst_victim(&self) -> Result<Option<String>> {
+    pub(crate) fn select_lowest_fitness_victim(&self) -> Result<Option<String>> {
         Ok(self
             .worst_nets_by_smoothed_fitness(self.state.live_count())?
             .into_iter()

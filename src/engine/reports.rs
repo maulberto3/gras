@@ -5,8 +5,12 @@
 //! is cull immunity for the same top-k while the run is still going.
 
 use super::core::CoreEngine;
-use super::format::{ReadingStyle, fmt_cfg, fmt_reading};
+use super::format::{ReadingStyle, fmt_cfg, fmt_family_reading};
 use flodl::tensor::Result;
+
+/// Why the list is not simply the bottom of `fit (F)`, stamped into every `worst-*.md`: the file
+/// outlives the run, and the criterion reads engine knobs a later reader cannot see.
+const WORST_PICK_NOTE: &str = "**Why this net.** The pick is the `spent` criterion the cross/mutation cull evicts on: `spent = Fm⁻ × (1 − Um)` — how badly the net grades (`Fm⁻`: 0.99 = the field's worst, 0.01 = its best) times how much of its updates it has already spent (`1 − Um`: 0.01 at the field's least-updated net, 0.99 at its most). So a weak net the lottery has NOT paid yet ranks BELOW a weak net that trained and stayed weak — the net worth reading, and the reason this list is not just the bottom of `fit (F)`. The place is UN-TILTED: the fit side of `ticket_legs` (worst-first / best-first) is undone as `1 − p` before the product, so that leg decides who the band PAYS and never which end counts as bad, while the `U` leg is read whether or not `ticket_legs` arms it for tickets. A net the lottery cannot grade (crown, shielded, unread, flat field, lottery off) prints `—` and falls to the tail of this index ordered by `fit (F)` — the pre-criterion dump.";
 
 impl CoreEngine {
     /// Write the MACHINE-READABLE champion ranking — `champions.json`, best first,
@@ -30,6 +34,12 @@ impl CoreEngine {
                     "fitness": fitness,
                     "fitness_mean": reading.map(|r| r.mean),
                     "fitness_std": reading.map(|r| r.std),
+                    // The arithmetic pair keeps its keys (readers already key on them); the pair the
+                    // SCORE was charged from is APPENDED beside it, so a `median` / `signed_log`
+                    // run's JSON can redo its own `fitness` (`centre ∓ λ·spread`) without a second
+                    // implementation and without redefining a key that says `mean`.
+                    "fitness_centre": reading.map(|r| r.fam_center),
+                    "fitness_spread": reading.map(|r| r.fam_spread),
                     "fitness_samples": reading.map(|r| r.n),
                     "risk_aversion": self.config.risk_aversion,
                     "mean_type": self.config.mean_type.to_string(),
@@ -99,11 +109,15 @@ impl CoreEngine {
             let reading = self.race_reading_of(&hash).map_or_else(
                 || "—".to_string(),
                 |r| {
-                    fmt_reading(
-                        Some(r.mean),
-                        (r.n > 1).then_some(r.std),
+                    // The pair the SCORE was charged from (`fam_center` / `fam_spread`), under
+                    // the family's own nouns — a median run's card redoes its own header instead
+                    // of printing an `avg`/`spread` the charge never touched.
+                    fmt_family_reading(
+                        Some(r.fam_center),
+                        (r.n > 1).then_some(r.fam_spread),
                         r.n,
                         ReadingStyle::Doc,
+                        self.config.mean_type,
                     )
                 },
             );
@@ -183,44 +197,47 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// The anti-champion dump: the nets at the BOTTOM of the final table — lowest `fit (F)`, the
-    /// same value `final-field.csv` ranks last — one file per net (`worst-<hash>-<fit>.md`:
-    /// topology + mermaid graph + lineage) plus a `worst.md` index. The ticket chance rides each
-    /// row as a COLUMN, never as the ordering: the ticket ranks merit × updates, so under the
-    /// shipped U leg the worst fit is usually paid the band's floor while a net that has barely
-    /// trained tops the chance — ordering by it filed champions as `Worst #2`.
+    /// The anti-champion dump: the nets worth READING, not merely the lowest `fit (F)` — one file
+    /// per net (`worst-<hash>-<fit>.md`: topology + mermaid graph + lineage) plus a `worst.md`
+    /// index.
+    ///
+    /// The pick is the SAME evidence the `spent` cross/mutation cull evicts on — `Fm⁻ × (1 − Um)`,
+    /// the net's badness times the share of its updates already burned — so the weak net the
+    /// lottery has NOT paid yet cannot crowd out the weak net that trained and stayed weak. The
+    /// place is un-tilted (`1 − p`) exactly as the cull does it, so the fit side of `ticket_legs`
+    /// moves the payouts and never which end of the field counts as bad. A net the lottery cannot grade
+    /// (crown, shield, unread, flat field, lottery off) has no `spent` and falls to the tail by
+    /// `fit (F)` — the pre-criterion dump, byte for byte.
     pub(crate) fn write_worst_markdown(&mut self, clock: usize) -> Result<()> {
         if !self.config.worst_save_topology {
             return Ok(());
         }
         // The SAME frame the coin dealt from: the ticket chance printed here is the number the
         // next clock would compare against, not a second opinion.
-        let frame = self.lottery_frame(clock);
-        let ages: Vec<usize> = self
-            .state
-            .live_hashes()
-            .iter()
-            .filter_map(|h| self.lottery_age_of(h, clock))
-            .collect();
-        let younger = ages.iter().min().copied().unwrap_or(1);
-        let older = ages.iter().max().copied().unwrap_or(1);
-        // The SAME number the table ranks by, ascending — so `worst.md`'s #1 is the last graded
-        // row of `final-field.csv` and the two artifacts cannot name different nets.
-        let rows: Vec<(String, f32, usize)> = self
+        let frame = self.lottery_frame();
+        // The SAME evidence the `spent` cull evicts on: `Fm⁻ × (1 − Um)`, bad AND already paid
+        // for. `None` = the lottery cannot grade the net, which is why the tail below still orders
+        // by `fit (F)` instead of inventing a score for a net nothing measured.
+        let rows: Vec<(String, f32, usize, Option<f32>)> = self
             .ranked_live()
             .into_iter()
             .map(|(hash, score)| {
-                let age = self.lottery_age_of(&hash, clock).unwrap_or(0);
-                (hash, score, age)
+                let age = self
+                    .state
+                    .net(&hash)
+                    .map(|s| clock.saturating_sub(s.entered_at_step) + 1)
+                    .unwrap_or(0);
+                let spent = self.train_lottery_spent_fraction(&hash, frame, self.merit(&hash));
+                (hash, score, age, spent)
             })
             .collect();
         // The coin's own favourite, named beside the list: the two questions differ, and hiding
         // that is what let a champion be filed as an anti-champion.
         let favourite = rows
             .iter()
-            .filter_map(|(h, _, _)| {
-                self.train_lottery_parts(h, clock, frame, self.merit(h))
-                    .map(|_| (h.clone(), self.train_lottery_p_eff(h, clock, frame)))
+            .filter_map(|(h, _, _, _)| {
+                self.train_lottery_parts(h, frame, self.merit(h))
+                    .map(|_| (h.clone(), self.train_lottery_p_eff(h, frame)))
             })
             .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)));
         let mut rows = worst_order(rows);
@@ -228,9 +245,9 @@ impl CoreEngine {
         rows.truncate(k);
         let mut written: Vec<Vec<String>> = Vec::new();
         let mut index = String::from(
-            "| # | hash | fit (F) | ticket p | merit | age | youth | file |\n|---|---|---|---|---|---|---|---|\n",
+            "| # | hash | spent | fit (F) | ticket p | merit | age | file |\n|---|---|---|---|---|---|---|---|\n",
         );
-        for (rank, (hash, _fraction, age)) in rows.iter().enumerate() {
+        for (rank, (hash, _fraction, age, spent)) in rows.iter().enumerate() {
             let Some(state) = self.state.net(hash) else {
                 continue;
             };
@@ -241,18 +258,21 @@ impl CoreEngine {
             // `—` when the lottery cannot grade the net (no reading, flat field, shield): the table
             // prints the same dash, because a neutral fraction is not a chance anybody is paid.
             let p = self
-                .train_lottery_parts(hash, clock, frame, self.merit(hash))
-                .map(|_| self.train_lottery_p_eff(hash, clock, frame));
+                .train_lottery_parts(hash, frame, self.merit(hash))
+                .map(|_| self.train_lottery_p_eff(hash, frame));
             let merit = self.merit(hash);
-            let youth = Self::youth_fraction(*age, younger, older);
             let reading = self.race_reading_of(hash).map_or_else(
                 || "—".to_string(),
                 |r| {
-                    fmt_reading(
-                        Some(r.mean),
-                        (r.n > 1).then_some(r.std),
+                    // The pair the SCORE was charged from (`fam_center` / `fam_spread`), under
+                    // the family's own nouns — a median run's card redoes its own header instead
+                    // of printing an `avg`/`spread` the charge never touched.
+                    fmt_family_reading(
+                        Some(r.fam_center),
+                        (r.n > 1).then_some(r.fam_spread),
                         r.n,
                         ReadingStyle::Doc,
+                        self.config.mean_type,
                     )
                 },
             );
@@ -262,28 +282,29 @@ impl CoreEngine {
             let file = format!("worst-{short}-{}.md", fit.map_or(0, |s| s.round() as i64));
             let fit_cell = fit.map_or_else(|| "—".to_string(), fmt_cfg);
             let ticket_cell = p.map_or_else(|| "—".to_string(), fmt_cfg);
+            let spent_cell = spent.map_or_else(|| "—".to_string(), fmt_cfg);
             let md = format!(
-                "**Worst #{} · fit (F) {} · ticket p {} · merit {} · age {} clocks (youth {}) · window {} · λ={} · run seed {} · net seed {}**\n\n{}\n\n{}",
+                "**Worst #{} · spent {} · fit (F) {} · ticket p {} · merit {} · age {} clocks · window {} · λ={} · run seed {} · net seed {}**\n\n{}\n\n{}\n\n{}",
                 rank + 1,
+                spent_cell,
                 fit_cell,
                 ticket_cell,
                 merit.map_or_else(|| "—".to_string(), fmt_cfg),
                 age,
-                fmt_cfg(youth),
                 reading,
                 fmt_cfg(self.config.risk_aversion),
                 self.header.run_seed,
                 state.net_seed,
+                WORST_PICK_NOTE,
                 crate::utils::markdown::topology_markdown(&topo, None),
                 self.lineage_markdown(hash, "WORST"),
             );
             match std::fs::write(self.run_dir.join(&file), &md) {
                 Ok(()) => {
                     index.push_str(&format!(
-                        "| {} | {short} | {fit_cell} | {ticket_cell} | {} | {age} | {} | [{file}]({file}) |\n",
+                        "| {} | {short} | {spent_cell} | {fit_cell} | {ticket_cell} | {} | {age} | [{file}]({file}) |\n",
                         rank + 1,
                         merit.map_or_else(|| "—".to_string(), fmt_cfg),
-                        fmt_cfg(youth),
                     ));
                     written.push(vec![
                         (rank + 1).to_string(),
@@ -306,13 +327,13 @@ impl CoreEngine {
             // ticket prices each row, and the coin's favourite is usually NOT the worst net.
             let favourite_line = favourite.map_or_else(String::new, |(h, p)| {
                 format!(
-                    "The coin's own favourite is `{}` at ticket p = {} — the ticket ranks merit × updates, so it is a different question from `fit (F)`.\n\n",
+                    "The coin's own favourite is `{}` at ticket p = {} — the ticket prices merit × updates and follows the tilt, while this list ranks badness × updates already spent, so the net with the fewest updates can top the chance and still stay out of the list.\n\n",
                     &h[..8.min(h.len())],
                     fmt_cfg(p),
                 )
             });
             let body = format!(
-                "# Anti-champion field at clock {clock}\n\nThe bottom of the final table: the `champion_count` lowest `fit (F)` nets, by the same ranking `final-field.csv` prints last. Every row is one net's topology + mermaid graph + lineage; `ticket p` is the chance the train-eval lottery gives that net on the NEXT clock (dash = not graded, so it has no chance to name).\n\n{favourite_line}{index}"
+                "# Anti-champion field at clock {clock}\n\nThese are the `champion_count` nets that already BURNED their updates and stayed bad — ranked by the `spent` criterion `Fm⁻ × (1 − Um)`, the same number the `spent` cross/mutation cull evicts on, not by `fit (F)` alone: a weak net the lottery has not paid yet ranks BELOW a weak net that trained and stayed weak. Every row is one net's topology + mermaid graph + lineage; `spent` is the ranking value, `ticket p` is the chance the train-eval lottery gives that net on the NEXT clock (dash = not graded, so it has no chance to name), and `fit (F)` rides along for comparison. A row with `—` spent was not graded and is listed after the graded ones, by `fit (F)` ascending.\n\n{favourite_line}{index}"
             );
             let path = self.run_dir.join("worst.md");
             if let Err(source) = std::fs::write(&path, body) {
@@ -329,7 +350,7 @@ impl CoreEngine {
                     "Anti-champion topology (markdown)",
                     &crate::utils::cfy::table(&["#", "hash", "fit (F)", "file"], &written),
                     Some(
-                        "the nets at the BOTTOM of the final table (lowest `fit (F)`); worst.md adds each one's ticket p",
+                        "the bad nets that already spent their updates (`Fm⁻ × (1 − Um)`); ungraded nets fall back to the lowest `fit (F)`",
                     ),
                 ));
             }
@@ -407,14 +428,27 @@ impl CoreEngine {
     }
 }
 
-/// Anti-champion order: LOWEST `fit (F)` first — the same value the final table ranks by — then
-/// the older net, then the hash. A TOTAL order, so the files, the index and the table can never
+/// Anti-champion order: the HIGHEST `spent` (`Fm⁻ × (1 − Um)`) first — the bad nets the field has
+/// already paid for — then the lowest `fit (F)`, the older net, the hash. Nets the lottery cannot
+/// grade carry `None` and follow the graded ones, ordered by `fit (F)` alone, which is exactly the
+/// pre-criterion dump. A TOTAL order, so the files, the index and the final table can never
 /// disagree about which net is #1.
-pub(crate) fn worst_order(mut rows: Vec<(String, f32, usize)>) -> Vec<(String, f32, usize)> {
-    rows.sort_by(|a, b| {
-        a.1.total_cmp(&b.1)
+pub(crate) fn worst_order(
+    mut rows: Vec<(String, f32, usize, Option<f32>)>,
+) -> Vec<(String, f32, usize, Option<f32>)> {
+    rows.sort_by(|a, b| match (a.3, b.3) {
+        (Some(x), Some(y)) => y
+            .total_cmp(&x)
+            .then_with(|| a.1.total_cmp(&b.1))
             .then_with(|| b.2.cmp(&a.2))
-            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.0.cmp(&b.0)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => {
+            a.1.total_cmp(&b.1)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.0.cmp(&b.0))
+        }
     });
     rows
 }
@@ -435,20 +469,34 @@ mod tests {
     /// The export is a CSV, not a `join` with a comma: cells carrying a comma are quoted,
     /// cells carrying a quote are escaped, and no row grows or loses a column.
     #[test]
-    fn the_anti_champion_order_is_fit_then_age_then_hash() {
+    fn the_anti_champion_order_is_spent_then_fit_then_age_then_hash() {
         let rows = vec![
-            ("b".to_string(), -1.0, 3),
-            ("a".to_string(), -1.0, 3),
-            ("c".to_string(), -1.0, 9),
-            ("d".to_string(), 9.0, 99),
+            ("b".to_string(), -1.0, 3, Some(0.5)),
+            ("a".to_string(), -1.0, 3, Some(0.5)),
+            ("c".to_string(), -1.0, 9, Some(0.5)),
+            ("d".to_string(), 9.0, 99, Some(0.9)),
+            ("e".to_string(), 0.0, 0, None),
+            ("f".to_string(), 2.0, 7, None),
         ];
         let ordered = worst_order(rows);
         let got: Vec<&str> = ordered.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(
             got,
-            vec!["c", "a", "b", "d"],
-            "lowest fit first, then the older net, then the hash — never input order"
+            vec!["d", "c", "a", "b", "e", "f"],
+            "highest spent first, then lowest fit, the older net, the hash; ungraded nets last"
         );
+    }
+
+    /// The fallback is not a tie: a net the lottery cannot grade never outranks a graded one, and
+    /// the ungraded tail keeps the pre-criterion order (`fit (F)` ascending).
+    #[test]
+    fn an_ungraded_net_never_outranks_a_graded_one() {
+        let rows = vec![
+            ("graded_bad".to_string(), 900.0, 1, Some(0.01)),
+            ("ungraded_worse_fit".to_string(), -50.0, 5, None),
+        ];
+        let ordered = worst_order(rows);
+        assert_eq!(ordered[0].0, "graded_bad");
     }
 
     #[test]

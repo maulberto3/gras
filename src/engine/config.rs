@@ -27,11 +27,7 @@ pub const SMOOTHING_WINDOW: usize = 5;
 /// spread.
 pub const RISK_AVERSION: f32 = 0.5;
 
-/// Default recency ramp r for the smoothing window: `0.0` = the plain arithmetic mean every run
-/// before this knob used.
-pub const DEFAULT_WINDOW_RECENCY: f32 = 0.0;
-
-/// How the smoothing window's readings are averaged into the ranking centre (`set_run_mean_type`).
+/// How the smoothing window's readings are averaged into the ranking centre (`set_fitness_mean_type`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MeanType {
     /// The weighted window mean — the plain average, and the default.
@@ -77,6 +73,172 @@ impl std::fmt::Display for MeanType {
 /// knob used.
 pub const DEFAULT_MEAN_TYPE: MeanType = MeanType::Arithmetic;
 
+/// The lottery's two LEGS (`set_ticket_legs`): which fit PLACE earns the most tickets, and which
+/// side of the UPDATES field the ticket multiplies in.
+///
+/// One spelling is the whole setting, and it is the value `engine.json` records, so a run is
+/// described in word-pairs a reader already knows: `least_fit_fewest_updates` pays the net that
+/// grades worst AND has trained least, `most_fit_most_updates` pays the one that grades best and
+/// has trained most. `most_fit` / `least_fit` are the place ALONE — the updates leg is off, so
+/// the ticket is exactly `Fm`, and no boolean pair can claim a state that does not exist.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TicketLegs {
+    /// The fittest net earns the most tickets; the updates leg is OFF (`Fm`).
+    MostFit,
+    /// The fittest net that has trained the LEAST earns the most tickets (`Fm × Um`).
+    MostFitFewestUpdates,
+    /// The fittest net that has trained the MOST earns the most tickets (`Fm × Um⁺`).
+    MostFitMostUpdates,
+    /// The LEAST fit net that has trained the LEAST earns the most tickets (`Fm⁻ × Um`) — the
+    /// engine default ([`DEFAULT_TICKET_LEGS`]) and the reference run's tuned leg.
+    #[default]
+    LeastFitFewestUpdates,
+    /// The LEAST fit net that has trained the MOST earns the most tickets (`Fm⁻ × Um⁺`).
+    LeastFitMostUpdates,
+    /// The LEAST fit net earns the most tickets; the updates leg is OFF (`Fm⁻`).
+    LeastFit,
+}
+
+impl TicketLegs {
+    /// Every leg, in the order the docs, the CLI help and the error messages list them — ONE
+    /// list, so a surface handed an unknown spelling names the real set instead of a retyped copy.
+    pub const ALL: [TicketLegs; 6] = [
+        TicketLegs::MostFit,
+        TicketLegs::MostFitFewestUpdates,
+        TicketLegs::MostFitMostUpdates,
+        TicketLegs::LeastFitFewestUpdates,
+        TicketLegs::LeastFitMostUpdates,
+        TicketLegs::LeastFit,
+    ];
+
+    /// [`Self::ALL`] as the spellings [`Self::as_str`] prints, for messages that list the choices.
+    pub const ALL_NAMES: [&str; 6] = [
+        "most_fit",
+        "most_fit_fewest_updates",
+        "most_fit_most_updates",
+        "least_fit_fewest_updates",
+        "least_fit_most_updates",
+        "least_fit",
+    ];
+
+    /// The spelling `engine.json` records, the CLI accepts and the log prints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TicketLegs::MostFit => "most_fit",
+            TicketLegs::MostFitFewestUpdates => "most_fit_fewest_updates",
+            TicketLegs::MostFitMostUpdates => "most_fit_most_updates",
+            TicketLegs::LeastFitFewestUpdates => "least_fit_fewest_updates",
+            TicketLegs::LeastFitMostUpdates => "least_fit_most_updates",
+            TicketLegs::LeastFit => "least_fit",
+        }
+    }
+
+    /// Parse a recorded or typed spelling: case, spaces and hyphens fold to `_`, so
+    /// `Least-Fit Fewest Updates` reads as `least_fit_fewest_updates`. `None` = not a leg, which
+    /// every caller reports instead of silently defaulting.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let key = raw.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        match key.as_str() {
+            "most_fit" | "best_fit" => Some(TicketLegs::MostFit),
+            "most_fit_most_updates" | "best_most" => Some(TicketLegs::MostFitMostUpdates),
+            "most_fit_fewest_updates" | "most_fit_least_updates" | "best_fewest" => {
+                Some(TicketLegs::MostFitFewestUpdates)
+            }
+            "least_fit" | "worst_fit" => Some(TicketLegs::LeastFit),
+            "least_fit_most_updates" | "worst_most" => Some(TicketLegs::LeastFitMostUpdates),
+            "least_fit_fewest_updates" | "least_fit_least_updates" | "worst_fewest" => {
+                Some(TicketLegs::LeastFitFewestUpdates)
+            }
+            _ => None,
+        }
+    }
+
+    /// Does the ticket pay the LEAST fit net? `true` mirrors the place (`Fm⁻`).
+    pub fn fitness_inverted(self) -> bool {
+        matches!(
+            self,
+            TicketLegs::LeastFit
+                | TicketLegs::LeastFitFewestUpdates
+                | TicketLegs::LeastFitMostUpdates
+        )
+    }
+
+    /// Does the updates leg multiply the place? `false` = place only.
+    pub fn updates_armed(self) -> bool {
+        !matches!(self, TicketLegs::MostFit | TicketLegs::LeastFit)
+    }
+
+    /// Which side of the updates field the ticket pays: `true` = the LEAST trained net
+    /// (`Um`, `1` at the field's fewest updates). Only meaningful while the leg is armed.
+    pub fn updates_inverted(self) -> bool {
+        matches!(
+            self,
+            TicketLegs::MostFitFewestUpdates | TicketLegs::LeastFitFewestUpdates
+        )
+    }
+
+    /// The same legs with the fit PLACE flipped (`most_fit` ↔ `least_fit`), updates side kept.
+    pub fn with_fitness_inverted(self, inverted: bool) -> Self {
+        match (inverted, self.updates_armed(), self.updates_inverted()) {
+            (false, false, _) => TicketLegs::MostFit,
+            (true, false, _) => TicketLegs::LeastFit,
+            (false, true, true) => TicketLegs::MostFitFewestUpdates,
+            (true, true, true) => TicketLegs::LeastFitFewestUpdates,
+            (false, true, false) => TicketLegs::MostFitMostUpdates,
+            (true, true, false) => TicketLegs::LeastFitMostUpdates,
+        }
+    }
+
+    /// The same place with the UPDATES leg armed or switched off. Arming a bare place picks
+    /// `fewest_updates` (the engine's default leg); a leg that already names its updates side
+    /// keeps it, so this is safe to call twice.
+    pub fn with_updates_armed(self, armed: bool) -> Self {
+        if !armed {
+            return if self.fitness_inverted() {
+                TicketLegs::LeastFit
+            } else {
+                TicketLegs::MostFit
+            };
+        }
+        match (
+            self.fitness_inverted(),
+            self.updates_armed(),
+            self.updates_inverted(),
+        ) {
+            (false, true, false) => TicketLegs::MostFitMostUpdates,
+            (true, true, false) => TicketLegs::LeastFitMostUpdates,
+            (false, _, _) => TicketLegs::MostFitFewestUpdates,
+            (true, _, _) => TicketLegs::LeastFitFewestUpdates,
+        }
+    }
+
+    /// The legs the two pre-enum booleans meant: `inverted` = which place, `updates_armed` = U
+    /// leg on or off (on means the LEAST trained net, the old `Um`).
+    pub fn from_bools(inverted: bool, updates_armed: bool) -> Self {
+        TicketLegs::default()
+            .with_fitness_inverted(inverted)
+            .with_updates_armed(updates_armed)
+    }
+}
+
+impl std::fmt::Display for TicketLegs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Default ticket LEGS (`set_ticket_legs`): the LEAST fit, LEAST trained net earns the most
+/// tickets — the ordering the reference run was tuned on.
+pub const DEFAULT_TICKET_LEGS: TicketLegs = TicketLegs::LeastFitFewestUpdates;
+
+/// The legs a HEADER records: its `ticket_legs` spelling when it carries one, else the legacy
+/// `(inverted, updates_armed)` pair it replaced — `true,true` = `least_fit_fewest_updates`.
+/// The ONE reader, so `from_snapshot` and the resume parity check cannot disagree about what an
+/// old header meant.
+pub fn ticket_legs_from_header(recorded: &str, inverted: bool, updates_armed: bool) -> TicketLegs {
+    TicketLegs::parse(recorded).unwrap_or_else(|| TicketLegs::from_bools(inverted, updates_armed))
+}
+
 /// LEGACY lottery strength Ω (`set_run_train_merit`, deprecated): retired as a second dial. `1.0`
 /// is the identity, so a config built on the defaults pays exactly the band it sets — and every
 /// header written since the retirement records `1.0`, which is why a resume never folds twice.
@@ -95,34 +257,25 @@ pub fn fold_omega(omega: f32, p_min: f32, p_max: f32) -> (f32, f32) {
     (1.0 - omega * (1.0 - p_min), 1.0 - omega * (1.0 - p_max))
 }
 
-/// Default lottery ORDERING (`set_run_train_merit_inverted`): `true` = the LEAST fit net earns
-/// MOST tickets, i.e.
-pub const DEFAULT_TRAIN_MERIT_INVERTED: bool = true;
-
-/// Default for the lottery's AGE leg (`set_run_train_merit_age`): `true` = ARMED, so the graded fraction
-/// is the PRODUCT `Fm × Ym` (the min-max fitness place times the youth fraction, `1`
-pub const DEFAULT_TRAIN_AGE: bool = false;
-
-/// Default for the lottery's LEARN-ONLY switch (`set_run_train_merit_learn_only`): `false` = a lost
+/// Default for the lottery's LEARN-ONLY switch (`set_ticket_learn_only`): `false` = a lost
 /// ticket idles the net (no train, no eval, nothing measured). `true` = every net still ACTS and
 /// MEASURES every clock — fresh batch, honest reading — and only the weight UPDATE is gated, so
-/// fitness stays expressive while learning stays ticketed. One exception, whichever way the switch
-/// reads: a net that has NEVER learned (`U = 0`) has no learned policy to measure, so a denied clock
-/// idles it outright rather than paying for a rollout over untouched weights — which is why the
-/// born ticket (`set_run_train_merit_born_ticket`) exists: it keeps the coin from denying that net
-/// in the first place.
+/// fitness stays expressive while learning stays ticketed. A net with `U = 0` never reaches the
+/// coin either way: its FIRST clock is granted outright, so every net the coin can deny already
+/// has a learned policy to measure.
 pub const DEFAULT_TRAIN_MERIT_LEARN_ONLY: bool = false;
 
-/// Default for POLICY-SCOPED FITNESS (`set_run_policy_scoped_fitness`): `false` = the window averages
+/// Default for POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): `false` = the window averages
 /// the last K READINGS, whatever weights produced them (the pre-flag contract). `true` = it averages
 /// only the readings taken on the weights the net holds NOW, so mean/spread/n describe ONE policy
 /// and no reading from another weight set enters the statistics.
 pub const DEFAULT_POLICY_SCOPED_FITNESS: bool = false;
 
 /// Default for the ANTI-CHAMPION dump (`set_worst_save_topology`): `false` = no `worst-*.md` files.
-/// `true` writes the top-`champion_count` nets by TICKET CHANCE at stop — the least fit and, with
-/// the age leg armed, the oldest — as topology + mermaid + lineage markdown, so the nets the coin
-/// keeps feeding can be read structurally instead of guessed at from a hash.
+/// `true` writes the `champion_count` nets at the BOTTOM of the final table by `fit (F)` (lowest
+/// first, ties to the older net, then the hash) as topology + mermaid + lineage markdown — the
+/// mirror of `elite-*.md`, so the two artifacts always name opposite ends of one ranking. Each row
+/// also prints the ticket `p` the coin would have paid it, which is a different question from `fit`.
 pub const DEFAULT_WORST_SAVE_TOPOLOGY: bool = false;
 
 /// Steps between population checkpoints — the cadence the stream's era rotation and the CSV flush
@@ -157,7 +310,7 @@ pub const DEFAULT_SEAT_JOIN_PROBATION: usize = 5;
 /// default) means off, any value above it arms the mechanic for that many retries.
 pub const DEFAULT_RECOVERY_RETRIES: usize = 0;
 
-/// Default retry DRAW for a recovery streak (`set_recovery_same_seed`): `true` = a retry re-runs
+/// Default retry DRAW for a recovery streak (`set_pop_recovery_same_seed`): `true` = a retry re-runs
 /// the SAME train draw the update fell on (same rows, same RNG stream) — a true retry, which asks
 /// "was the fall the update's fault?" rather than "would another batch have been kinder?".
 pub const DEFAULT_RECOVERY_SAME_SEED: bool = true;
@@ -166,17 +319,7 @@ pub const DEFAULT_RECOVERY_SAME_SEED: bool = true;
 /// still count as noise. `0.0` = any drop earns a rescue; `0.2` = a fifth is tolerated.
 pub const DEFAULT_RECOVERY_TOLERANCE: f32 = 0.0;
 
-/// Default U leg of the lottery: OFF, so the ticket stays the age-legged product `Fm × Ym` until a
-/// run arms it (`set_run_train_merit_updates(true)`).
-pub const DEFAULT_TRAIN_MERIT_UPDATES: bool = true;
-
-/// Default BORN TICKET (`set_run_train_merit_born_ticket`): `false` = the pre-flag contract, where
-/// the born shield's `1.0` fraction is still folded through Ω to `hi`, so the coin can idle a net
-/// that has never trained. `true` = a net with `U = 0` is paid `p = 1.0` and takes its FIRST update
-/// on its first live clock, so its shield is served the clock it is born.
-pub const DEFAULT_TRAIN_MERIT_BORN_TICKET: bool = false;
-
-/// Default INIT PROBATION (`set_run_init_probation_steps`): `0` = nothing is withheld beyond the
+/// Default INIT PROBATION (`set_pop_init_probation_steps`): `0` = nothing is withheld beyond the
 /// born shields, which is exactly what every run before the knob did. Any other value is the
 /// number of opening clocks with no culls and no births — evolution starts at that clock.
 pub const DEFAULT_INIT_PROBATION_STEPS: usize = 0;
@@ -266,18 +409,31 @@ impl LogLevel {
 
 /// Who gets evicted when a crossover child takes a slot.
 /// **Crossover-only** — the mutation channel has its own policy.
+///
+/// The variants name WHAT the victim is: `lowest_fitness` is the plain merit answer,
+/// `highest_ticket_chance` is the net the train-eval lottery pays most, and
+/// `lowest_fitness_most_updates` is the lowest-fitness net that has already spent its updates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CrossCullPolicy {
-    /// **Worst** — evict the current worst net by smoothed fitness; strictly
+    /// **LowestFitness** — evict the net with the lowest smoothed fitness; strictly
     /// merit-based. Risk: the population can ossify around one lineage.
-    Worst,
-    /// **Random** — evict a uniformly random live net; keeps slots turning over
+    LowestFitness,
+    /// **Random** — evict a uniformly random live net; keeps slots turning over and
     /// prevents a long-lived leader from starving diversity. Risk: losing a strong net.
     Random,
-    /// **Unfed** (default) — evict the net the coin pays MOST: the highest ticket chance
-    /// `p = p_min + (p_max − p_min) × f` among the graded nets, deterministic with the hash as
+    /// **HighestTicketChance** (default) — evict the net the coin pays MOST: the highest
+    /// ticket chance `p = p_min + (p_max - p_min) x f` among the graded nets, deterministic
+    /// with the hash as tie-break. Under the default inverted lottery that is the least fit,
+    /// least updated net, i.e. the one the next clock would feed again.
     #[default]
-    Unfed,
+    HighestTicketChance,
+    /// **LowestFitnessMostUpdates** — evict the net with the highest `Fm- x (1 - Um)`: the
+    /// lowest-fitness net that has ALSO spent its updates. A weak newcomer the band has barely
+    /// paid has not had its chance yet; a weak net that has already trained `U` times has, so
+    /// this arm culls on evidence instead of on the coin's next draw. It also ignores the
+    /// ticket TILT: the lowest-fitness net is the lowest-fitness net whichever end the band
+    /// pays. Deterministic (hash tie-break).
+    LowestFitnessMostUpdates,
 }
 
 impl std::fmt::Display for CrossCullPolicy {
@@ -285,9 +441,10 @@ impl std::fmt::Display for CrossCullPolicy {
     /// not the `Debug` casing): a header written today must read the same tomorrow.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Worst => "worst",
+            Self::LowestFitness => "lowest_fitness",
             Self::Random => "random",
-            Self::Unfed => "unfed",
+            Self::HighestTicketChance => "highest_ticket_chance",
+            Self::LowestFitnessMostUpdates => "lowest_fitness_most_updates",
         })
     }
 }
@@ -296,19 +453,25 @@ impl std::fmt::Display for CrossCullPolicy {
 /// **Mutation-only** — the crossover channel has its own policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MutationCullPolicy {
-    /// **Worst** — evict the worst net by smoothed fitness, deterministically (mirrors
-    /// [`CrossCullPolicy::Worst`]).
-    Worst,
+    /// **LowestFitness** — evict the net with the lowest smoothed fitness, deterministically
+    /// (mirrors [`CrossCullPolicy::LowestFitness`]).
+    LowestFitness,
     /// **InverseFitness** — a fitness-inverse roulette over non-elite nets (an opt-in:
     /// the worst net weighs most, the best is never drawn; chance is kept).
     InverseFitness,
     /// **Random** — evict a uniformly random live net, at the cost of occasionally
     /// losing a good one.
     Random,
-    /// **Unfed** (default) — the SAME selector as [`CrossCullPolicy::Unfed`]: evict the net the
-    /// train-eval lottery pays the most (the highest `p` among the graded nets).
+    /// **HighestTicketChance** (default) — the SAME selector as
+    /// [`CrossCullPolicy::HighestTicketChance`]: evict the net the train-eval lottery pays
+    /// the most (the highest `p` among the graded nets).
     #[default]
-    Unfed,
+    HighestTicketChance,
+    /// **LowestFitnessMostUpdates** — the SAME selector as
+    /// [`CrossCullPolicy::LowestFitnessMostUpdates`]: evict the net with the highest
+    /// `Fm- x (1 - Um)`, so the slot goes to evidence rather than to the coin's next draw.
+    /// Like the crossover arm it ignores the ticket tilt.
+    LowestFitnessMostUpdates,
 }
 
 impl std::fmt::Display for MutationCullPolicy {
@@ -316,9 +479,10 @@ impl std::fmt::Display for MutationCullPolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::InverseFitness => "inverse_fitness",
-            Self::Worst => "worst",
+            Self::LowestFitness => "lowest_fitness",
             Self::Random => "random",
-            Self::Unfed => "unfed",
+            Self::HighestTicketChance => "highest_ticket_chance",
+            Self::LowestFitnessMostUpdates => "lowest_fitness_most_updates",
         })
     }
 }
@@ -400,32 +564,28 @@ pub struct RaceConfig {
     /// frozen SEATS below are a separate switch that this k sizes but does not mean.
     pub champion_count: usize,
     /// Anti-devolution A: the top-k nets act-and-measure without weight
-    /// updates (see [`RaceConfigBuilder::set_seat_freeze`]). Default `true`.
+    /// updates (see [`RaceConfigBuilder::set_seat_freeze`]). Default `false`.
     pub freeze_seats: bool,
     /// LEGACY lottery strength Ω (`set_run_train_merit`, deprecated): the band below IS the payout
     /// now, so this number is only read when an old header is folded ([`fold_omega`]). A config
     /// built today carries `1.0` (the identity) and no live decision reads it.
     pub train_merit: f32,
-    /// FLOOR `p_min` of the ticket band (`set_run_train_merit_p_min`) — literally the chance the
+    /// FLOOR `p_min` of the ticket band (`set_ticket_p_min`) — literally the chance the
     /// WORST-graded net gets each clock (`1.0` = every clock, `0.0` = never).
     pub train_merit_p_min: f32,
-    /// CEILING `p_max` of the ticket band (`set_run_train_merit_p_max`) — literally the chance the
+    /// CEILING `p_max` of the ticket band (`set_ticket_p_max`) — literally the chance the
     /// best-graded net gets each clock; every net is paid between the floor and this.
     pub train_merit_p_max: f32,
-    /// INVERT the lottery's merit ordering (`set_run_train_merit_inverted`): the LEAST fit net
-    /// earns the MOST tickets and the best earns the fewest.
-    pub train_merit_inverted: bool,
-    /// LEARN-ONLY lottery (`set_run_train_merit_learn_only`): `true` = a lost ticket costs the
+    /// The lottery's two LEGS (`set_ticket_legs`): which fit place earns the ticket and which side
+    /// of the updates field it multiplies in. The ONE field the coin and the report both read, so
+    /// place-only and the two updates sides are spellings of a value, not of three booleans.
+    pub ticket_legs: TicketLegs,
+    /// LEARN-ONLY lottery (`set_ticket_learn_only`): `true` = a lost ticket costs the
     /// weight UPDATE, not the STEP — the net runs its trainer with a no-op optimizer, so it acts,
     /// is measured, and its fitness moves every clock. `false` = the clock idles. Default `false`.
     /// A net that has never learned (`U = 0`) idles under BOTH settings: there is no learned policy
     /// for the rollout to measure.
     pub train_merit_learn_only: bool,
-    /// BORN TICKET (`set_run_train_merit_born_ticket`): `true` pays a net that has never trained
-    /// (`U = 0`) `p = 1.0`, before the Ω band, so its FIRST update lands on its first live clock
-    /// whatever it grades. `false` = the pre-flag contract, where the shield's fraction `1.0` folds
-    /// to `hi` and the coin may idle a net that cannot spend its shield without training.
-    pub train_merit_born_ticket: bool,
     /// Share of the dataset held out for EVAL (`eval_share`): the rows a net is SCORED on and never
     /// trained
     pub eval_share: f32,
@@ -435,27 +595,18 @@ pub struct RaceConfig {
     /// Risk aversion λ (FIT): window standard deviations subtracted from (Maximize) or added
     /// (Minimize) a net's smoothed mean before ranking.
     pub risk_aversion: f32,
-    /// Recency ramp r for the smoothing window (`set_run_window_recency`): how much
-    pub window_recency: f32,
-    /// How the window's readings are averaged into the ranking centre (`set_run_mean_type`):
+    /// How the window's readings are averaged into the ranking centre (`set_fitness_mean_type`):
     /// [`MeanType::Arithmetic`] (default, the pre-knob ranking), [`MeanType::SignedLog`]
     pub mean_type: MeanType,
-    /// POLICY-SCOPED FITNESS (`set_run_policy_scoped_fitness`): `true` makes the mean/spread/n
+    /// POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): `true` makes the mean/spread/n
     /// describe the CURRENT weights — the readings taken since the net's last real update — so the
     /// statistics are of ONE policy and never a mix of policies. Default `false` (the pre-flag
     /// window, which averages the last K readings across every weight set).
     pub policy_scoped_fitness: bool,
     /// ANTI-CHAMPION dump (`set_worst_save_topology`): `true` writes `worst-<hash>-<fitness>.md` +
-    /// `worst.md` at stop for the nets with the HIGHEST ticket chance (least fit, oldest).
+    /// `worst.md` at stop for the nets ranked by `spent` (`Fm⁻ × (1 − Um)`): the bad nets that
+    /// already burned their updates, falling back to the lowest `fit (F)` for ungraded nets.
     pub worst_save_topology: bool,
-    /// Age leg of the lottery (`set_run_train_merit_age`): `true` ARMS the product `Fm × Ym`, `Ym` = `1`
-    /// at the youngest graded net.
-    pub train_age: bool,
-    /// U leg of the lottery (`set_run_train_merit_updates`): `true` ARMS `Um`, the age leg's twin on
-    /// UPDATES (`1.0` at the field's fewest, `0.0` at its most), so the ticket is `Fm × Ym × Um` and
-    /// a net that spent its updates is paid for out of its own future tickets. `false` = the
-    /// pre-knob product, bit for bit.
-    pub train_merit_updates: bool,
     /// Mode-specific knobs (tabular vs RL) — the arm is carried in the type. The engine
     /// core reads only the shared fields; mode branches match on this arm.
     pub mode_specific: ModeConfig,
@@ -537,7 +688,7 @@ pub struct RaceConfig {
     /// Crossover probation: a crossover-born net is cull-IMMUNE until it has spent
     /// `crossover_probation_steps` UPDATES (`U`) — not clocks. `0` = off.
     pub crossover_probation_steps: usize,
-    /// INIT PROBATION (`set_run_init_probation_steps`): clocks the run spends WITHOUT evolution —
+    /// INIT PROBATION (`set_pop_init_probation_steps`): clocks the run spends WITHOUT evolution —
     /// no culls, no births — however cull-eligible the population already is. Like the other
     /// probation steps it is a warm-up, but counted in CLOCKS: it is the RUN's opening, not one
     /// net's shield. `0` (the default) withholds nothing beyond the born shields.
@@ -552,7 +703,7 @@ pub struct RaceConfig {
     /// rescue, as a FRACTION of that standing (`0.2` = a fifth, so 268 may read down to 214).
     /// `0.0` = any drop triggers the streak; a wide band leaves the ordinary drop rate alone.
     pub recovery_tolerance: f32,
-    /// Recovery retry DRAW (`set_recovery_same_seed`): `true` (default) = every retry repeats the
+    /// Recovery retry DRAW (`set_pop_recovery_same_seed`): `true` (default) = every retry repeats the
     /// clock's OWN train draw — the same rows and the same RNG stream — so the streak re-tests the
     /// one update that fell instead of shopping for a kinder batch. `false` = each retry walks one
     /// draw further (the next tabular batch / the next block of RL match seeds), so the streak
@@ -718,24 +869,20 @@ impl RaceConfig {
             crossover_cull_policy: CrossCullPolicy::default(),
             mutation_cull_policy: MutationCullPolicy::default(),
             champion_count: DEFAULT_CHAMPION_COUNT,
-            freeze_seats: true,
+            freeze_seats: false,
             train_merit: DEFAULT_TRAIN_MERIT,
             train_merit_p_min: DEFAULT_TRAIN_MERIT_P_MIN,
             train_merit_p_max: DEFAULT_TRAIN_MERIT_P_MAX,
-            train_merit_inverted: DEFAULT_TRAIN_MERIT_INVERTED,
+            ticket_legs: DEFAULT_TICKET_LEGS,
             train_merit_learn_only: DEFAULT_TRAIN_MERIT_LEARN_ONLY,
-            train_merit_born_ticket: DEFAULT_TRAIN_MERIT_BORN_TICKET,
             eval_share: DEFAULT_EVAL_SHARE,
             seat_join_probation_steps: DEFAULT_SEAT_JOIN_PROBATION,
             seat_lifetime_steps: DEFAULT_CROWN_LIFETIME,
             smoothing_window: SMOOTHING_WINDOW,
             risk_aversion: RISK_AVERSION,
-            window_recency: DEFAULT_WINDOW_RECENCY,
             mean_type: DEFAULT_MEAN_TYPE,
             policy_scoped_fitness: DEFAULT_POLICY_SCOPED_FITNESS,
             worst_save_topology: DEFAULT_WORST_SAVE_TOPOLOGY,
-            train_age: DEFAULT_TRAIN_AGE,
-            train_merit_updates: DEFAULT_TRAIN_MERIT_UPDATES,
             mode_specific: ModeConfig::Tabular(TabularConfig::default()),
             crossover_ops_pool: Vec::new(),
             crossover_selection: SelectionMethod::Tournament { tournament_size: 2 },
@@ -805,11 +952,15 @@ impl RaceConfig {
         cfg.trace_file = snap.trace_file;
         cfg.smoothing_window = snap.smoothing_window;
         cfg.risk_aversion = snap.risk_aversion;
-        cfg.window_recency = snap.window_recency;
         // `""` = a header written before the knob, which averaged arithmetically.
         cfg.mean_type = MeanType::parse(&snap.mean_type).unwrap_or(DEFAULT_MEAN_TYPE);
-        cfg.train_age = snap.train_age;
-        cfg.train_merit_updates = snap.train_merit_updates;
+        // One spelling carries both legs: the `ticket_legs` key when the header has one, the
+        // legacy bool pair it replaced otherwise.
+        cfg.ticket_legs = ticket_legs_from_header(
+            &snap.ticket_legs,
+            snap.train_merit_inverted,
+            snap.train_merit_updates,
+        );
         cfg.csv_export = snap.csv_export;
         cfg.save_optim = snap.save_optim;
         cfg.run_name = snap.run_name.clone();
@@ -825,9 +976,7 @@ impl RaceConfig {
         cfg.train_merit = 1.0;
         cfg.train_merit_p_min = snap.train_merit_p_min;
         cfg.train_merit_p_max = snap.train_merit_p_max;
-        cfg.train_merit_inverted = snap.train_merit_inverted;
         cfg.train_merit_learn_only = snap.train_merit_learn_only;
-        cfg.train_merit_born_ticket = snap.train_merit_born_ticket;
         cfg.policy_scoped_fitness = snap.policy_scoped_fitness;
         cfg.worst_save_topology = snap.worst_save_topology;
         cfg.drift_prob = snap.drift_prob;
@@ -846,25 +995,33 @@ impl RaceConfig {
         cfg.seat_join_probation_steps = snap.seat_join_probation_steps;
         cfg.seat_lifetime_steps = snap.seat_lifetime_steps;
         // The replay-relevant enums, matched on their recorded SPELLING — the snapshots store
-        // `Display` output (`"worst"`, `"tournament(size=2)"`, `"split_random"`), so a `contains`
+        // `Display` output (`"lowest_fitness"`, `"tournament(size=2)"`, `"split_random"`), so a
+        // `contains` reads a resume across a rename. The pre-2026-11 spellings (`worst` / `unfed`
+        // / `spent`) are accepted too: an old header must still resume at the culls it paid.
         let cull = snap.crossover_cull_policy.to_ascii_lowercase();
-        cfg.crossover_cull_policy = if cull.contains("unfed") {
-            CrossCullPolicy::Unfed
-        } else if cull.contains("random") {
-            CrossCullPolicy::Random
-        } else {
-            CrossCullPolicy::Worst
-        };
+        cfg.crossover_cull_policy =
+            if cull.contains("lowest_fitness_most_updates") || cull.contains("spent") {
+                CrossCullPolicy::LowestFitnessMostUpdates
+            } else if cull.contains("highest_ticket_chance") || cull.contains("unfed") {
+                CrossCullPolicy::HighestTicketChance
+            } else if cull.contains("random") {
+                CrossCullPolicy::Random
+            } else {
+                CrossCullPolicy::LowestFitness
+            };
         let mcull = snap.mutation_cull_policy.to_ascii_lowercase();
-        cfg.mutation_cull_policy = if mcull.contains("unfed") {
-            MutationCullPolicy::Unfed
-        } else if mcull.contains("random") {
-            MutationCullPolicy::Random
-        } else if mcull.contains("worst") {
-            MutationCullPolicy::Worst
-        } else {
-            MutationCullPolicy::InverseFitness
-        };
+        cfg.mutation_cull_policy =
+            if mcull.contains("lowest_fitness_most_updates") || mcull.contains("spent") {
+                MutationCullPolicy::LowestFitnessMostUpdates
+            } else if mcull.contains("highest_ticket_chance") || mcull.contains("unfed") {
+                MutationCullPolicy::HighestTicketChance
+            } else if mcull.contains("random") {
+                MutationCullPolicy::Random
+            } else if mcull.contains("lowest_fitness") || mcull.contains("worst") {
+                MutationCullPolicy::LowestFitness
+            } else {
+                MutationCullPolicy::InverseFitness
+            };
         let selection = snap.crossover_selection.to_ascii_lowercase();
         cfg.crossover_selection = if selection.contains("tournament") {
             let k = selection
@@ -971,7 +1128,7 @@ pub struct RaceConfigBuilder {
 
 impl RaceConfigBuilder {
     /// Set the population size.
-    pub fn set_run_pop_size(mut self, n: usize) -> Self {
+    pub fn set_pop_size(mut self, n: usize) -> Self {
         self.cfg.pop_size = n;
         self
     }
@@ -1009,18 +1166,18 @@ impl RaceConfigBuilder {
         self
     }
     /// ANTI-DEVOLUTION A — elite freeze: the top-`champion_count` nets are exempt
-    /// trainer call (frozen, but still scored/ranked/parents). Default `true`.
+    /// trainer call (frozen, but still scored/ranked/parents). Default `false`.
     pub fn set_seat_freeze(mut self, yes: bool) -> Self {
         self.cfg.freeze_seats = yes;
         self
     }
     /// DEPRECATED — Ω is retired as a second dial: the band `p_min..p_max` IS the payout, so
-    /// `set_run_train_merit_p_min` / `set_run_train_merit_p_max` set what a net actually gets.
+    /// `set_ticket_p_min` / `set_ticket_p_max` set what a net actually gets.
     /// This setter still WORKS, once: it folds Ω into the band values configured so far
     /// ([`fold_omega`]), which is exactly the chances the old code paid. Being order-sensitive
     /// (`p_min`/`p_max` set AFTER it overwrite the fold), call it last — or, better, drop it.
     /// `0.0` still means "every net trains every clock" (it folds the band to `[1, 1]`).
-    #[deprecated(note = "omega is retired: set the band with set_run_train_merit_p_min / _p_max")]
+    #[deprecated(note = "omega is retired: set the band with set_ticket_p_min / _p_max")]
     pub fn set_run_train_merit(mut self, omega: f32) -> Self {
         let (lo, hi) = fold_omega(
             omega,
@@ -1033,7 +1190,7 @@ impl RaceConfigBuilder {
         self
     }
     /// The lottery's merit floor `p_min` (default `0.05`, `0.0` = the pre-floor arithmetic).
-    pub fn set_run_train_merit_p_min(mut self, p_min: f32) -> Self {
+    pub fn set_ticket_p_min(mut self, p_min: f32) -> Self {
         self.cfg.train_merit_p_min = if p_min.is_finite() {
             p_min.clamp(0.0, 1.0)
         } else {
@@ -1043,7 +1200,7 @@ impl RaceConfigBuilder {
     }
     /// CEILING `p_max` on the lottery fraction: the best-graded net's share of clocks (default
     /// `1.0` = no ceiling).
-    pub fn set_run_train_merit_p_max(mut self, p_max: f32) -> Self {
+    pub fn set_ticket_p_max(mut self, p_max: f32) -> Self {
         self.cfg.train_merit_p_max = if p_max.is_finite() {
             p_max.clamp(0.0, 1.0)
         } else {
@@ -1051,40 +1208,32 @@ impl RaceConfigBuilder {
         };
         self
     }
-    /// INVERT the lottery so the LEAST fit net earns the most tickets (default
-    /// [`DEFAULT_TRAIN_MERIT_INVERTED`] = `true`; `false` = the merit ordering).
-    pub fn set_run_train_merit_inverted(mut self, yes: bool) -> Self {
-        self.cfg.train_merit_inverted = yes;
+    /// The lottery's LEGS (`TicketLegs`): which fit place earns the ticket, and which side of the
+    /// updates field it multiplies in. Default [`DEFAULT_TICKET_LEGS`] =
+    /// `least_fit_fewest_updates`.
+    pub fn set_ticket_legs(mut self, legs: TicketLegs) -> Self {
+        self.cfg.ticket_legs = legs;
         self
     }
     /// LEARN-ONLY lottery (default `false`): `true` keeps every net ACTING and MEASURING every
     /// clock and gates only the weight update on the ticket, so a net's reading never goes stale.
     /// `false` keeps the pre-flag contract — a lost ticket idles the net outright. `U = 0` is exempt
     /// either way: a never-learned net idles a denied clock, since it has nothing to measure.
-    pub fn set_run_train_merit_learn_only(mut self, yes: bool) -> Self {
+    pub fn set_ticket_learn_only(mut self, yes: bool) -> Self {
         self.cfg.train_merit_learn_only = yes;
-        self
-    }
-    /// BORN TICKET (default `false`): `true` pays a net that has never trained (`U = 0`) `p = 1.0`
-    /// directly, before the Ω band folds its fraction. The shield already hands such a net a
-    /// fraction of `1.0`, but the band turns that into `hi` — so without the born ticket the coin
-    /// can idle a net that cannot spend its shield without training, and an idle clock buys it no
-    /// update. `false` keeps the pre-flag contract bit for bit.
-    pub fn set_run_train_merit_born_ticket(mut self, yes: bool) -> Self {
-        self.cfg.train_merit_born_ticket = yes;
         self
     }
     /// POLICY-SCOPED FITNESS (default `false`): `true` builds the mean/spread/n ONLY from readings
     /// taken on the weights the net holds now, so the statistics describe one POLICY and never a
     /// mix of policies. A net that updates every clock reports one datapoint (its value, no
     /// spread); a net that rarely earns a ticket reports many readings of the SAME policy.
-    pub fn set_run_policy_scoped_fitness(mut self, yes: bool) -> Self {
+    pub fn set_fitness_policy_scoped(mut self, yes: bool) -> Self {
         self.cfg.policy_scoped_fitness = yes;
         self
     }
-    /// ANTI-CHAMPION dump (default `false`): `true` writes `worst-<hash>-<fitness>.md` for the top-
-    /// `champion_count` nets by TICKET CHANCE at stop (least fit × oldest) plus a `worst.md` index,
-    /// each with its topology, mermaid graph and lineage — the mirror of `champion_save_topology`.
+    /// ANTI-CHAMPION dump (default `false`): `true` writes `worst-<hash>-<fitness>.md` for the
+    /// `champion_count` nets ranked by `spent` (`Fm⁻ × (1 − Um)`, the cull's own evidence: bad AND
+    /// already paid for) plus a `worst.md` index — the mirror of `champion_save_topology`.
     pub fn set_worst_save_topology(mut self, enabled: bool) -> Self {
         self.cfg.worst_save_topology = enabled;
         self
@@ -1100,49 +1249,18 @@ impl RaceConfigBuilder {
     }
     /// Per-net smoothed-fitness rolling window (K). Default [`SMOOTHING_WINDOW`] = 10.
     /// Replay-relevant: a resumed run must use the same value or construction fails parity.
-    pub fn set_run_smoothing_window(mut self, k: usize) -> Self {
+    pub fn set_fitness_smoothing_window(mut self, k: usize) -> Self {
         self.cfg.smoothing_window = k.max(1);
         self
     }
-    /// The lottery's AGE leg (`train_age`): `true` (default) ARMS the product `Fm × Ym`, so a young
-    /// net's ticket is lifted; `false` makes the ticket follow the fitness place alone. The leg
-    /// multiplies the MERIT fraction, which is what the name says.
-    pub fn set_run_train_merit_age(mut self, armed: bool) -> Self {
-        self.cfg.train_age = armed;
-        self
-    }
-    /// The lottery's U leg (`train_merit_updates`): `true` ARMS `Um`, the age leg's twin on updates
-    /// — `1.0` at the field's fewest updates, `0.0` at its most — so the ticket becomes
-    /// `Fm × Ym × Um` (`Fm × Um` with the age leg off). A net that spent its updates on rescue
-    /// retries is the OLD one here, and pays for them out of its own future tickets.
-    pub fn set_run_train_merit_updates(mut self, armed: bool) -> Self {
-        self.cfg.train_merit_updates = armed;
-        self
-    }
-    /// Deprecated spelling of [`Self::set_run_train_merit_age`] — the leg multiplies the lottery's
-    /// merit fraction, not the run's age. Kept so existing callers keep compiling.
-    #[deprecated(note = "use set_run_train_merit_age")]
-    pub fn set_run_train_age(self, armed: bool) -> Self {
-        self.set_run_train_merit_age(armed)
-    }
-    /// Recency ramp r for the smoothing window (`window_recency`).
-
-    pub fn set_run_window_recency(mut self, r: f32) -> Self {
-        self.cfg.window_recency = if r.is_finite() {
-            r.clamp(0.0, 1.0)
-        } else {
-            DEFAULT_WINDOW_RECENCY
-        };
-        self
-    }
     /// How the window's readings are averaged into the ranking centre (`mean_type`).
-    pub fn set_run_mean_type(mut self, mean_type: MeanType) -> Self {
+    pub fn set_fitness_mean_type(mut self, mean_type: MeanType) -> Self {
         self.cfg.mean_type = mean_type;
         self
     }
     /// Risk aversion λ (FIT) — how many window standard deviations a net pays for its own spread,
     /// so a steady net outranks a volatile one with the same window mean.
-    pub fn set_run_risk_aversion(mut self, lambda: f32) -> Self {
+    pub fn set_fitness_risk_aversion(mut self, lambda: f32) -> Self {
         self.cfg.risk_aversion = if lambda.is_finite() {
             lambda.max(0.0)
         } else {
@@ -1211,7 +1329,9 @@ impl RaceConfigBuilder {
         self
     }
     /// How a node merges its incoming wires (see [`crate::graph::node::CombineOp`]).
-    /// Empty ⇒ the full default pool. Accepts owned or borrowed strings.
+    /// Empty ⇒ EVERY combine op (`add`, `mean`, `max`, `min`, `mul`, `sub`, `div`): "all" is the
+    /// default, so a caller who wants the conservative four must name them. Accepts owned or
+    /// borrowed strings.
     pub fn set_topology_combine_op_pool<I, S>(mut self, pool: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -1372,7 +1492,7 @@ impl RaceConfigBuilder {
     /// founder sitting inside its cull shield. `0` withholds nothing beyond the born shields; to
     /// let evolution start EARLIER, shorten the shields themselves
     /// (`set_crossover_probation_steps` / `set_mutation_probation_steps`).
-    pub fn set_run_init_probation_steps(mut self, k: usize) -> Self {
+    pub fn set_pop_init_probation_steps(mut self, k: usize) -> Self {
         self.cfg.init_probation_steps = k;
         self
     }
@@ -1380,17 +1500,17 @@ impl RaceConfigBuilder {
     /// it just took left its reading worse than it was (see [`RaceConfig::recovery_retries`]).
     /// Default `0` = off; `k > 0` arms the streak.
     ///
-    /// The streak never fires inside the INIT PROBATION (`set_run_init_probation_steps`): those
+    /// The streak never fires inside the INIT PROBATION (`set_pop_init_probation_steps`): those
     /// clocks exist to judge what the founders are on draws every net shares, so extra updates
     /// nobody else got are withheld along with the culls and births (same clock arithmetic).
-    pub fn set_recovery_retries(mut self, k: usize) -> Self {
+    pub fn set_pop_recovery_retries(mut self, k: usize) -> Self {
         self.cfg.recovery_retries = k;
         self
     }
     /// Recovery tolerance: the FRACTION of the net's standing a reading may lose before the streak
     /// fires (`0.2` = a fifth is tolerated, more triggers). See
     /// [`RaceConfig::recovery_tolerance`]. Default `0.0` = every drop triggers.
-    pub fn set_recovery_tolerance(mut self, fraction: f32) -> Self {
+    pub fn set_pop_recovery_tol(mut self, fraction: f32) -> Self {
         self.cfg.recovery_tolerance = if fraction.is_finite() {
             fraction.max(0.0)
         } else {
@@ -1401,7 +1521,7 @@ impl RaceConfigBuilder {
     /// Recovery retry draw: `true` (default) = a retry repeats the clock's OWN train draw, so the
     /// streak re-tests the update that fell; `false` = each retry walks one draw further, so it
     /// fights on fresh evidence. See [`RaceConfig::recovery_same_seed`].
-    pub fn set_recovery_same_seed(mut self, same: bool) -> Self {
+    pub fn set_pop_recovery_same_seed(mut self, same: bool) -> Self {
         self.cfg.recovery_same_seed = same;
         self
     }
@@ -1626,7 +1746,7 @@ mod tests {
         assert!(RISK_AVERSION > 0.0, "the feature ships enabled");
         let set = |lambda: f32| {
             RaceConfig::builder()
-                .set_run_risk_aversion(lambda)
+                .set_fitness_risk_aversion(lambda)
                 .build()
                 .risk_aversion
         };

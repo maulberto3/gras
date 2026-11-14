@@ -86,7 +86,7 @@ pub struct WindowStats {
     /// that describes the weights the run actually ended
     pub latest: f32,
     /// The family [`Self::fam_center`] / [`Self::fam_spread`] are measured
-    /// (`set_run_mean_type`).
+    /// (`set_fitness_mean_type`).
     pub family: MeanType,
     /// The window's centre IN `family`'s space — what [`Self::score`] shifts by `λ`.
     pub fam_center: f32,
@@ -157,28 +157,24 @@ fn weighted_median(mut pairs: Vec<(f32, f32)>) -> f32 {
 /// Stats of a rolling buffer: `None` when it is empty (a net that was never measured has no
 /// reading, and must not read as a confident 0.0).
 pub fn rolling_stats(buf: &RollingBuffer) -> Option<WindowStats> {
-    rolling_stats_with(buf, 0.0, MeanType::Arithmetic)
+    rolling_stats_with(buf, MeanType::Arithmetic)
 }
 
-/// [`rolling_stats`] with a RECENCY ramp `r` (`set_run_window_recency`): readings are weighted
-/// linearly from `1` on the OLDEST to `1 + r·(n−1)` on the NEWEST, so a full window of K follows
-pub fn rolling_stats_with(
-    buf: &RollingBuffer,
-    recency: f32,
-    family: MeanType,
-) -> Option<WindowStats> {
-    rolling_stats_all(buf, recency, family)
+/// [`rolling_stats`] in `family`'s averaging space (`set_fitness_mean_type`): the centre and the spread
+/// are measured after the family's transform, so a spike cannot drag the level the way it drags the
+/// arithmetic mean.
+pub fn rolling_stats_with(buf: &RollingBuffer, family: MeanType) -> Option<WindowStats> {
+    rolling_stats_all(buf, family)
 }
 
 /// [`rolling_stats_with`] over the LAST `take` readings only — the POLICY-SCOPED window
-/// (`set_run_policy_scoped_fitness`): the readings taken on the weights the net holds right now, so
+/// (`set_fitness_policy_scoped`): the readings taken on the weights the net holds right now, so
 /// no reading from another policy enters the statistics. `take`
 /// clamps to the buffer; `0` is `None` (nothing measured on this policy yet), and `1` is that
 /// value with zero spread, so `mean ∓ λ·0` stays clean instead of claiming a confidence nobody has.
 pub fn rolling_stats_tail(
     buf: &RollingBuffer,
     take: usize,
-    recency: f32,
     family: MeanType,
 ) -> Option<WindowStats> {
     let take = take.min(buf.len());
@@ -186,7 +182,7 @@ pub fn rolling_stats_tail(
         return None;
     }
     if take == buf.len() {
-        return rolling_stats_all(buf, recency, family);
+        return rolling_stats_all(buf, family);
     }
     // A private tail buffer keeps ONE implementation of the weighted mean/spread: the epoch is
     // just a shorter window, never a second arithmetic.
@@ -194,70 +190,36 @@ pub fn rolling_stats_tail(
     for v in buf.iter().skip(buf.len() - take) {
         tail.push(*v);
     }
-    rolling_stats_all(&tail, recency, family)
+    rolling_stats_all(&tail, family)
 }
 
 /// The one rolling-stats arithmetic both entry points share.
-fn rolling_stats_all(buf: &RollingBuffer, recency: f32, family: MeanType) -> Option<WindowStats> {
+fn rolling_stats_all(buf: &RollingBuffer, family: MeanType) -> Option<WindowStats> {
     if buf.is_empty() {
         return None;
     }
     let n = buf.len();
-    let r = if recency.is_finite() {
-        recency.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    // Oldest gets 1, each newer reading adds `r`: a full window ramps 1 → 1+r·(K−1).
-    let weight = |i: usize| 1.0 + r * i as f32;
-    let wsum: f32 = (0..n).map(weight).sum();
-    let mean = if r == 0.0 {
-        rolling_mean(buf)
-    } else {
-        buf.iter()
-            .enumerate()
-            .map(|(i, v)| weight(i) * v)
-            .sum::<f32>()
-            / wsum
-    };
-    let var = buf
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let d = v - mean;
-            weight(i) * d * d
-        })
-        .sum::<f32>()
-        / wsum;
+    let mean = rolling_mean(buf);
+    let var = buf.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
     // The centre and the spread the SCORE is built from, in the family's own space.
     let (fam_center, fam_spread) = match family {
         MeanType::Arithmetic => (mean, var.sqrt()),
         MeanType::SignedLog => {
-            // One weight vector, one log further out: a spike enters `g` compressed, so it cannot
-            // drag the centre the way it drags the arithmetic mean, and λ charges the spread
-            let gmean = buf
-                .iter()
-                .enumerate()
-                .map(|(i, v)| weight(i) * family.transform(*v))
-                .sum::<f32>()
-                / wsum;
+            // One transform, one log further out: a spike enters `g` compressed, so it cannot drag
+            // the centre the way it drags the arithmetic mean, and λ charges the spread
+            let gmean = buf.iter().map(|v| family.transform(*v)).sum::<f32>() / n as f32;
             let gvar = buf
                 .iter()
-                .enumerate()
-                .map(|(i, v)| {
+                .map(|v| {
                     let d = family.transform(*v) - gmean;
-                    weight(i) * d * d
+                    d * d
                 })
                 .sum::<f32>()
-                / wsum;
+                / n as f32;
             (gmean, gvar.sqrt())
         }
         MeanType::Median => {
-            let pairs: Vec<(f32, f32)> = buf
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (*v, weight(i)))
-                .collect();
+            let pairs: Vec<(f32, f32)> = buf.iter().map(|v| (*v, 1.0)).collect();
             let center = weighted_median(pairs.clone());
             let mad = weighted_median(
                 pairs
@@ -293,25 +255,25 @@ mod tests {
     #[test]
     fn rolling_stats_tail_reads_only_the_last_take() {
         let buf = RollingBuffer::from_values(5, &[10.0, 10.0, 10.0, 4.0, 6.0]);
-        let all = rolling_stats_with(&buf, 0.0, MeanType::Arithmetic).unwrap();
+        let all = rolling_stats_with(&buf, MeanType::Arithmetic).unwrap();
         assert_eq!(
             (all.n, all.mean),
             (5, 8.0),
             "the whole buffer is the old reading"
         );
-        let epoch = rolling_stats_tail(&buf, 2, 0.0, MeanType::Arithmetic).unwrap();
+        let epoch = rolling_stats_tail(&buf, 2, MeanType::Arithmetic).unwrap();
         assert_eq!((epoch.n, epoch.mean, epoch.std), (2, 5.0, 1.0));
         assert_eq!(
             epoch.latest, 6.0,
             "the tail keeps the newest reading, not the tail's own order"
         );
         assert_eq!(
-            rolling_stats_tail(&buf, 0, 0.0, MeanType::Arithmetic),
+            rolling_stats_tail(&buf, 0, MeanType::Arithmetic),
             None,
             "no reading on this policy ⇒ no reading, never a fabricated 0"
         );
         // ONE reading: its value IS the mean, and zero spread keeps `mean ∓ λ·0` clean.
-        let one = rolling_stats_tail(&buf, 1, 0.0, MeanType::Arithmetic).unwrap();
+        let one = rolling_stats_tail(&buf, 1, MeanType::Arithmetic).unwrap();
         assert_eq!((one.n, one.mean, one.std), (1, 6.0, 0.0));
         assert_eq!(
             one.score(crate::utils::fitness::Direction::Maximize, 0.5),
@@ -383,47 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn recency_ramp_weights_the_newest_reading() {
-        // Five readings, four of them the old level and one the new one.
-        let buf = RollingBuffer::from_values(5, &[5.0, 5.0, 5.0, 5.0, 100.0]);
-        let flat = rolling_stats_with(&buf, 0.0, MeanType::Arithmetic).unwrap();
-        assert_eq!(flat.mean, 24.0);
-        assert_eq!(flat.mean, rolling_stats(&buf).unwrap().mean); // r = 0.25 ramps 1, 1.25, 1.5, 1.75, 2 (sum 7.5): (5·5.5 + 100·2) / 7.5.
-        let w = rolling_stats_with(&buf, 0.25, MeanType::Arithmetic).unwrap();
-        assert!((w.mean - 227.5 / 7.5).abs() < 1e-3, "mean was {}", w.mean);
-        // r = 1.0 ramps 1, 2, 3, 4, 5 (sum 15): (5·10 + 100·5) / 15.
-        let sharp = rolling_stats_with(&buf, 1.0, MeanType::Arithmetic).unwrap();
-        assert!(
-            (sharp.mean - 550.0 / 15.0).abs() < 1e-3,
-            "mean was {}",
-            sharp.mean
-        );
-        assert!(flat.mean < w.mean && w.mean < sharp.mean);
-        // The readable extremes and the latest reading do not depend on the ramp.
-        assert_eq!(flat.min, sharp.min);
-        assert_eq!(flat.max, sharp.max);
-        assert_eq!(flat.latest, 100.0);
-        // A non-finite ramp is "off", never an inverted weight vector.
-        assert_eq!(
-            rolling_stats_with(&buf, f32::NAN, MeanType::Arithmetic)
-                .unwrap()
-                .mean,
-            flat.mean
-        );
-    }
-
-    #[test]
-    fn recency_ramp_is_the_plain_mean_on_a_steady_window() {
-        // No change in level ⇒ nothing to follow: mean and std must be identical
-        // every ramp, so turning the knob on cannot reshuffle a field that isn't moving.
-        let buf = RollingBuffer::from_values(4, &[42.0; 4]);
-        for r in [0.0, 0.5, 1.0] {
-            let s = rolling_stats_with(&buf, r, MeanType::Arithmetic).unwrap();
-            assert_eq!((s.mean, s.std), (42.0, 0.0), "ramp {r}");
-        }
-    }
-
-    #[test]
     fn rolling_stats_empty_is_none() {
         assert_eq!(rolling_stats(&RollingBuffer::new(5)), None);
     }
@@ -463,8 +384,8 @@ mod tests {
     fn signed_log_damps_a_spike_without_dropping_it() {
         // The bimodal champion again: one 500 among four 40s.
         let buf = RollingBuffer::from_values(5, &[40.0, 500.0, 40.0, 40.0, 40.0]);
-        let arith = rolling_stats_with(&buf, 0.0, MeanType::Arithmetic).unwrap();
-        let damped = rolling_stats_with(&buf, 0.0, MeanType::SignedLog).unwrap();
+        let arith = rolling_stats_with(&buf, MeanType::Arithmetic).unwrap();
+        let damped = rolling_stats_with(&buf, MeanType::SignedLog).unwrap();
         let score = damped.score(Direction::Maximize, 0.0);
         assert!(
             score < arith.score(Direction::Maximize, 0.0),
@@ -475,12 +396,9 @@ mod tests {
         assert!(damped.score(Direction::Maximize, 1.0) < score);
         assert!(damped.score(Direction::Minimize, 1.0) > score);
         // One reading maps through `g` and back unchanged, negative readings included.
-        let single = rolling_stats_with(
-            &RollingBuffer::from_values(1, &[-3.5]),
-            0.0,
-            MeanType::SignedLog,
-        )
-        .unwrap();
+        let single =
+            rolling_stats_with(&RollingBuffer::from_values(1, &[-3.5]), MeanType::SignedLog)
+                .unwrap();
         assert!((single.score(Direction::Minimize, 0.0) + 3.5).abs() < 1e-4);
     }
 
@@ -489,7 +407,7 @@ mod tests {
         // Four 40s and one 500: the median is 40 and the MAD about it is 0, so NO λ charge
         // can move the score — a single jump cannot buy (or cost) a rank.
         let buf = RollingBuffer::from_values(5, &[40.0, 500.0, 40.0, 40.0, 40.0]);
-        let s = rolling_stats_with(&buf, 0.0, MeanType::Median).unwrap();
+        let s = rolling_stats_with(&buf, MeanType::Median).unwrap();
         assert_eq!(s.fam_center, 40.0);
         for lambda in [0.0, 0.5, 2.0] {
             for dir in [Direction::Maximize, Direction::Minimize] {
@@ -499,7 +417,7 @@ mod tests {
         // A genuinely split window: the median sits on the middle reading and the scaled
         // MAD reads the half-window it disagrees
         let mixed = RollingBuffer::from_values(3, &[10.0, 40.0, 90.0]);
-        let m = rolling_stats_with(&mixed, 0.0, MeanType::Median).unwrap();
+        let m = rolling_stats_with(&mixed, MeanType::Median).unwrap();
         assert_eq!(m.fam_center, 40.0);
         assert!(
             (m.fam_spread - 30.0 * 1.4826).abs() < 1e-3,
@@ -509,7 +427,7 @@ mod tests {
         // The default family is the pre-knob ranking, and `rolling_stats` is its shortcut.
         assert_eq!(MeanType::default(), MeanType::Arithmetic);
         assert_eq!(
-            rolling_stats_with(&buf, 0.0, MeanType::Arithmetic)
+            rolling_stats_with(&buf, MeanType::Arithmetic)
                 .unwrap()
                 .score(Direction::Maximize, 0.5),
             rolling_stats(&buf).unwrap().score(Direction::Maximize, 0.5)
