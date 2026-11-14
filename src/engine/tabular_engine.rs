@@ -21,7 +21,7 @@
 //! persisted header rather than your config.
 //!
 //! **Warned, not refused (R6)** — everything BEHAVIOURAL, i.e. it changes the draws
-//! from here on without making the record untrue: K, λ, Ω, the parent draw, both cull
+//! from here on without making the record untrue: K, Ω, the parent draw, both cull
 //! policies, the probation windows. `CoreEngine::behavioural_drift()`
 //! names each one with both values and the setter that reproduces the record.
 //!

@@ -80,6 +80,10 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(topos.len());
+    // The re-roll cursor lives PAST the batch and only moves FORWARD: a collision can never
+    // re-try an ordinal an earlier collision already spent (the old fixed `pop_size + attempt`
+    // window was consumed by the first few duplicates and every later one was doomed).
+    let mut cursor = pop_size + 64;
     for topo in topos.drain(..) {
         let hash = match topo.to_json() {
             Ok(json) => topo_hash(&json),
@@ -94,22 +98,11 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
             out.push(topo);
             continue;
         }
-        // CFY: the duplicate notice is a table, not a prose line.
-        crate::utils::cfy::emit(&crate::utils::cfy::card(
-            "Initial population",
-            &crate::utils::cfy::kv(&[(
-                "duplicate topology".to_string(),
-                hash[..8.min(hash.len())].to_string(),
-            )]),
-            Some("discarded, re-rolling a unique seed"),
-        ));
-        // Duplicate — re-roll at ordinals past the initial batch, bounded.
         let mut replaced = false;
         for attempt in 0..8 {
-            let candidate = draw_topology(config, run_seed, pop_size + attempt);
-            let json = match candidate.to_json() {
-                Ok(j) => j,
-                Err(_) => continue,
+            let candidate = draw_topology(config, run_seed, cursor + attempt);
+            let Ok(json) = candidate.to_json() else {
+                continue;
             };
             if seen.insert(topo_hash(&json)) {
                 out.push(candidate);
@@ -117,11 +110,16 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
                 break;
             }
         }
+        cursor += 8;
         if !replaced {
+            // The space really is smaller than the batch: keep the blueprint so the vector stays
+            // `pop_size` long, and say what that costs instead of claiming a unique slot.
             tracing::warn!(
-                "initial population: could not replace a duplicate topology after 8 attempts — \
-                 keeping it (the engine's hash map will dedupe; pop runs one short)"
+                "initial population: the topology space has fewer than {pop_size} unique draws — \
+                 kept duplicate {}; the engine dedupes it, so the population starts short",
+                &hash[..8.min(hash.len())]
             );
+            out.push(topo);
         }
     }
     out
@@ -139,8 +137,10 @@ pub fn fill_unique(
         return initial_population(config, run_seed);
     }
     let target = target.max(founders.len());
+    let founder_count = founders.len();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<Topology> = Vec::with_capacity(target);
+    let mut duplicate_imports = 0usize;
     for topo in founders {
         let json = match topo.to_json() {
             Ok(json) => json,
@@ -152,54 +152,69 @@ pub fn fill_unique(
         if seen.insert(topo_hash(&json)) {
             out.push(topo);
         } else {
-            tracing::warn!(
-                "founder batch: duplicate founder blueprint → dropped (the batch keeps its first copy)"
-            );
+            duplicate_imports += 1;
         }
     }
-    for topo in initial_population(config, run_seed) {
-        if out.len() >= target {
-            break;
-        }
-        let json = match topo.to_json() {
-            Ok(json) => json,
-            Err(_) => {
-                out.push(topo);
-                continue;
-            }
+    let imported = out.len();
+    // The random batch starts PAST the imported ordinals. An inherited batch's imports ARE
+    // ordinals 0..n of this run's own draw (a source run's rank-1..n blueprints, same run seed),
+    // so drawing them again is a guaranteed duplicate on every inherited run — the root cause of
+    // the per-event "duplicates a founder" cards.
+    let mut ordinal = imported;
+    let mut duplicate_draws = 0usize;
+    // Generous but BOUNDED: a run that collides this often is a space smaller than its batch.
+    let budget = (target.saturating_sub(out.len()) + 64) * 8;
+    let mut spent = 0usize;
+    while out.len() < target && spent < budget {
+        spent += 1;
+        let candidate = draw_topology(config, run_seed, ordinal);
+        ordinal += 1;
+        let Ok(json) = candidate.to_json() else {
+            continue;
         };
         if seen.insert(topo_hash(&json)) {
-            out.push(topo);
-            continue;
+            out.push(candidate);
+        } else {
+            // The cursor already moved past this ordinal: the next attempt is a new draw, never a
+            // re-try of one already consumed.
+            duplicate_draws += 1;
         }
+    }
+    // Still short ⇒ the topology space is smaller than the batch. Keep the colliding blueprints so
+    // every slot exists, and let the summary say exactly that (the engine dedupes them, so the run
+    // starts short by the count printed).
+    let mut kept_duplicates = 0usize;
+    while out.len() < target {
+        let candidate = draw_topology(config, run_seed, ordinal);
+        ordinal += 1;
+        kept_duplicates += 1;
+        out.push(candidate);
+    }
+    // ONE summary, after the batch is built — never a card per collision. Silent when every draw
+    // was unique and every import landed, so an ordinary run's log is unchanged.
+    if duplicate_imports + duplicate_draws + kept_duplicates > 0 {
         crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Founder batch",
-            &crate::utils::cfy::kv(&[(
-                "random draw".to_string(),
-                "duplicates a founder".to_string(),
-            )]),
-            Some("re-rolling a unique seed"),
+            &crate::utils::cfy::kv(&[
+                ("imported".to_string(), imported.to_string()),
+                ("duplicate draws".to_string(), duplicate_draws.to_string()),
+                ("re-rolled".to_string(), duplicate_draws.to_string()),
+                (
+                    "slots kept a duplicate".to_string(),
+                    kept_duplicates.to_string(),
+                ),
+                (
+                    "duplicate imports dropped".to_string(),
+                    duplicate_imports.to_string(),
+                ),
+            ]),
+            Some(&format!(
+                "{founder_count} imported · {duplicate_draws} draws repeated a blueprint and were \
+                 re-rolled (the cursor only moves forward) · {kept_duplicates} slots kept a \
+                 duplicate because the space is smaller than the batch — the engine dedupes those, \
+                 so the population starts short by that many"
+            )),
         ));
-        let mut replaced = false;
-        for attempt in 0..8 {
-            // Ordinals past `initial_population`'s own re-roll window
-            // (`pop_size + 0..8`) — the two re-roll sets must not overlap.
-            let candidate = draw_topology(config, run_seed, config.pop_size + 64 + attempt);
-            let Ok(json) = candidate.to_json() else {
-                continue;
-            };
-            if seen.insert(topo_hash(&json)) {
-                out.push(candidate);
-                replaced = true;
-                break;
-            }
-        }
-        if !replaced {
-            tracing::warn!(
-                "founder batch: could not replace a duplicate draw after 8 attempts — \
-                 population runs one short"
-            );
-        }
     }
     out
 }
@@ -292,6 +307,38 @@ mod tests {
             out[0].to_json().unwrap(),
             colliding.to_json().unwrap(),
             "imports keep the first slots"
+        );
+    }
+
+    /// A source run's rank-1..n blueprints ARE ordinals 0..n of the same run seed, so an inherited
+    /// batch must start its random draws PAST them: no draw collides, the batch is full and unique,
+    /// and the imports keep their slots (this is the shared-seed case that produced the old
+    /// per-event duplicate cards and the short population).
+    #[test]
+    fn an_inherited_batch_draws_past_the_imported_ordinals() {
+        let cfg = tiny_config(8);
+        let draws = initial_population(&cfg, 42);
+        let founders: Vec<Topology> = draws.iter().take(3).cloned().collect();
+        let out = fill_unique(&cfg, 42, founders.clone(), 8);
+        assert_eq!(out.len(), 8, "the batch lands on the target");
+        for (i, topo) in founders.iter().enumerate() {
+            assert_eq!(
+                out[i].to_json().unwrap(),
+                topo.to_json().unwrap(),
+                "import {i} keeps its slot"
+            );
+        }
+        let mut hashes: Vec<String> = out
+            .iter()
+            .map(|t| topo_hash(&t.to_json().unwrap()))
+            .collect();
+        let total = hashes.len();
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(
+            hashes.len(),
+            total,
+            "no random draw may repeat an imported blueprint"
         );
     }
 

@@ -105,6 +105,8 @@ impl CoreEngine {
             hash.to_string(),
             RollingBuffer::new(self.config.smoothing_window),
         );
+        let metric_bufs = self.metric_buffers();
+        self.rolling_metrics.insert(hash.to_string(), metric_bufs);
         // Born: no reading has been taken on these weights yet.
         self.rolling_epoch.insert(hash.to_string(), 0);
         self.rolling_trend
@@ -277,6 +279,7 @@ impl CoreEngine {
                 self.rolling_fitness.remove(&child.state.hash);
                 self.rolling_train.remove(&child.state.hash);
                 self.rolling_eval.remove(&child.state.hash);
+                self.rolling_metrics.remove(&child.state.hash);
                 self.rolling_epoch.remove(&child.state.hash);
                 self.rolling_trend.remove(&child.state.hash);
                 return Ok(RollOutcome::no_slot(
@@ -651,6 +654,7 @@ impl CoreEngine {
         self.rolling_fitness.remove(hash);
         self.rolling_train.remove(hash);
         self.rolling_eval.remove(hash);
+        self.rolling_metrics.remove(hash);
         self.rolling_epoch.remove(hash);
         self.rolling_trend.remove(hash);
         // Decision-lag state dies with the net (shadow + promotion clock

@@ -173,6 +173,9 @@ pub(crate) struct HistoryReplay {
     pub window: Vec<(f32, f32, Option<f32>)>,
     /// The least-squares line over every row the net ever recorded.
     pub trend: ReadingTrend,
+    /// The same tail of every informative-metric column, keyed by the metric's label — the series
+    /// a `selection_metrics` term ranks on, so a resumed twin rebuilds the window a live run held.
+    pub metric_windows: Vec<(String, Vec<f32>)>,
 }
 
 impl MeanType {
@@ -331,7 +334,7 @@ mod tests {
             None,
             "no reading on this policy ⇒ no reading, never a fabricated 0"
         );
-        // ONE reading: its value IS the mean, and zero spread keeps `mean ∓ λ·0` clean.
+        // ONE reading: its value IS the mean, and zero spread keeps the score clean.
         let one = rolling_stats_tail(&buf, 1, MeanType::Arithmetic).unwrap();
         assert_eq!((one.n, one.mean, one.std), (1, 6.0, 0.0));
         assert_eq!(one.score(), 6.0);

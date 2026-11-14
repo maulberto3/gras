@@ -100,6 +100,22 @@ impl CoreEngine {
                 "score{} avg — (no reading yet) │ {leg} —",
                 direction.arrow()
             )
+        } else if !self.config.selection_metrics.is_empty() {
+            // A COMPOSITE ranking: the fitness centre plus weighted metric centres. Printing the
+            // `= window avg …` identity here would be false, so the terms are named instead.
+            let terms: Vec<String> = self
+                .config
+                .selection_metrics
+                .iter()
+                .map(|t| format!("{}·{}", t.label, fmt_cfg(t.weight)))
+                .collect();
+            format!(
+                "score{} avg {} ± {} (σ over nets) = fitness centre + {} (COMPOSITE)",
+                direction.arrow(),
+                fmt_line(avg(&fits)),
+                &fits_spread,
+                terms.join(" + ")
+            )
         } else {
             step_score_cell(
                 avg(&fits),
@@ -264,33 +280,34 @@ impl CoreEngine {
 
     /// Stop-time summary: which JSONs were written as the live frontier
     /// the resume command to continue from here.
-    pub(crate) fn log_stop_summary(&self, clock: usize) -> flodl::tensor::Result<()> {
+    pub(crate) fn log_stop_summary(&self) -> flodl::tensor::Result<()> {
         let live = self.state.live_hashes();
         // CFY: the stop block is comfy tables — an artifact/resume card, the accounting matrix,
         // then the elite card.
+        // ONE row per fact. The live count is printed ONCE (the frontier row carries it and the
+        // pop_size a resume must pass), the stop clock lives on the `Stop` card above, and
+        // `checkpoint_every`/`pop_size` are in the run manifest — repeating them here was three
+        // spellings of numbers already on screen.
         let artifact_rows = vec![
             (
                 "frontier snapshots".to_string(),
-                format!("{} → nets/<hash>.json (one per live net)", live.len()),
+                format!(
+                    "{} → nets/<hash>.json (one per live net) · pass pop_size {} to resume",
+                    live.len(),
+                    live.len()
+                ),
             ),
-            ("live nets at stop".to_string(), live.len().to_string()),
-            ("stop step".to_string(), clock.to_string()),
             ("resume dir".to_string(), self.run_dir.display().to_string()),
-            ("resume pop_size".to_string(), live.len().to_string()),
             (
                 "smoothing_window (K)".to_string(),
                 self.config.smoothing_window.to_string(),
-            ),
-            (
-                "checkpoint_every".to_string(),
-                self.config.checkpoint_every.to_string(),
             ),
         ];
         crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Artifacts & resume",
             &crate::utils::cfy::kv(&artifact_rows),
             Some(
-                "resume parity: the one-argument resume takes every knob from engine.json — a STRUCTURAL mismatch (mode, pop_size, dataset, trainer blob) is refused, a BEHAVIOURAL one (K, λ, the ticket band, parent draw, cull policies, probation) resumes and warns with BOTH values, so a caller who wants a different race passes its own config (TabularEngine::resume(dir, data_dir, config, …)) and reads the warning",
+                "resume parity: the one-argument resume takes every knob from engine.json — a STRUCTURAL mismatch (mode, pop_size, dataset, trainer blob) is refused, a BEHAVIOURAL one (K, the mean family, any selection terms, the ticket band, parent draw, cull policies, probation) resumes and warns with BOTH values, so a caller who wants a different race passes its own config (TabularEngine::resume(dir, data_dir, config, …)) and reads the warning",
             ),
         ));
 
@@ -427,7 +444,7 @@ impl CoreEngine {
         let (table, stats, grid) = self.stop_card(&rows, &plan, &marks, &exam_scores, lottery);
         let baseline = self.stop_baseline(clock);
         // The legend is a TABLE that assigns each column its LETTER and states the relations
-        // those letters: `A = mean ∓ λ × spread` is checked against the `fit`, `mean` and `spread`
+        // those letters: `A` is checked against the `fit`, the centre leg and `spread`
         let legend_ctx = LegendCtx {
             window: self.config.smoothing_window,
             mean_type: self.config.mean_type,
@@ -483,10 +500,9 @@ impl CoreEngine {
             ),
             &format!("{legend}\n{table}"),
             Some(&format!(
-                "Δcrown = mean multiset-Jaccard distance to the {} reported champion(s): 0.00 = structurally identical to one of them, 1.00 = shares no gene with any · Δpop = mean distance to every other live net: 0.00 = a clone of the crowd, 1.00 = unlike everything alive · read the two AGAINST the baseline: Δcrown ≈ Δpop means the champion is structurally ordinary (selection is ranking numbers, not designs), Δcrown below it means the champions are a structural cluster · {} · {baseline} · stopped at clock {clock} · run seed {run_seed} (`--seed {run_seed}` replays this run bit-for-bit) · the same table is written to `final-field.csv` ({} row(s) under this header) · {exam_note}",
+                "Δcrown = mean multiset-Jaccard distance to the {} reported champion(s): 0.00 = structurally identical to one of them, 1.00 = shares no gene with any · Δpop = mean distance to every other live net: 0.00 = a clone of the crowd, 1.00 = unlike everything alive · read the two AGAINST the baseline: Δcrown ≈ Δpop means the champion is structurally ordinary (selection is ranking numbers, not designs), Δcrown below it means the champions are a structural cluster · {} · {baseline} · stopped at clock {clock} · run seed {run_seed} (`--seed {run_seed}` replays this run bit-for-bit) · the same table is written to `final-field.csv` under this header · {exam_note}",
                 plan.crown.len(),
                 stats.line(),
-                grid.len(),
             )),
         );
         if !verbose {
@@ -661,7 +677,9 @@ impl CoreEngine {
         // ONE window read for the whole row: the `fit (F)` cell, the `A/B` ratio derived
         // from it and the three window legs printed beside
         let reading = self.race_reading_of(row.hash);
-        let score = reading.map(|r| r.score()).or(row.fit);
+        // The RANKING value, not just the fitness half: with selection terms the two differ, and
+        // `fit (F)` must print the number the run actually sorted on.
+        let score = self.ranking_score_of(row.hash).or(row.fit);
         // The lottery's three grading numbers, derived ONCE for the three cells that print them;
         // `None` = the lottery did not grade this net (off, exempt, no reading, flat field),
         let parts = row
@@ -1434,7 +1452,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         (
             fit_column(ctx.mean_type).to_string(),
             format!(
-                "`F` = {} — the ranking value: the window's CENTRE in the `{}` family, with NO spread charge (risk aversion was removed 2026-11-14). The spread leg to its left is printed for diagnosis only, so `F ∓ λ × spread` can be re-applied by hand for any λ, but nothing in this build charges it. The two window legs beside it are `fam_center` / `fam_spread` under the family's own names — `mean`/`spread` for `arithmetic`, `window median`/`1.4826·MAD` for `median`, `window g-avg`/`window g-spread` for `signed_log` — so every row redoes its own `F` exactly. Geometric/harmonic averaging is not offered: their domain excludes a non-positive reading, and a reward or centred fitness can cross zero — `signed_log` is the no-cliff form of the same damping",
+                "`F` = {} — the ranking value: the window's CENTRE in the `{}` family, with NO spread charge (risk aversion was removed 2026-11-14). Any `selection_metrics` terms are ADDED to this centre (each a labelled metric's smoothed centre times its weight), so `F` is then composite and the Summ line names the terms. The spread leg to its left is printed for diagnosis only, so `F ∓ λ × spread` can be re-applied by hand for any λ, but nothing in this build charges it. The two window legs beside it are `fam_center` / `fam_spread` under the family's own names — `mean`/`spread` for `arithmetic`, `window median`/`1.4826·MAD` for `median`, `window g-avg`/`window g-spread` for `signed_log` — so every row redoes its own `F` exactly. Geometric/harmonic averaging is not offered: their domain excludes a non-positive reading, and a reward or centred fitness can cross zero — `signed_log` is the no-cliff form of the same damping",
                 match ctx.mean_type {
                     crate::engine::config::MeanType::Arithmetic => "the window mean",
                     crate::engine::config::MeanType::SignedLog => {
@@ -2229,7 +2247,7 @@ fn step_score_cell(
 }
 
 /// The `Minimal` frame's score cell: the population's mean score with the arithmetic that produced
-/// it (`score = window avg ∓ λ × window spread`).
+/// it (`score = the window centre`).
 fn minimal_score_cell(
     fit_m: f32,
     fit_delta: &str,

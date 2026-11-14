@@ -36,7 +36,7 @@ impl CoreEngine {
                     "fitness_std": reading.map(|r| r.std),
                     // The arithmetic pair keeps its keys (readers already key on them); the pair the
                     // SCORE was charged from is APPENDED beside it, so a `median` / `signed_log`
-                    // run's JSON can redo its own `fitness` (`centre ∓ λ·spread`) without a second
+                    // run's JSON can redo its own `fitness` (the centre) without a second
                     // implementation and without redefining a key that says `mean`.
                     "fitness_centre": reading.map(|r| r.fam_center),
                     "fitness_spread": reading.map(|r| r.fam_spread),

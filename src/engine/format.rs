@@ -175,7 +175,7 @@ pub fn fmt_reading(mean: Option<f32>, sigma: Option<f32>, n: usize, style: Readi
 /// report: `1.4826·MAD` over a handful of readings is not a standard error, and printing
 /// `SE = spread/√n` beside it would invent a confidence nobody computed. A card that showed
 /// `avg`/`spread` beside a median score was a header a reader could not redo — the score charges
-/// `median − λ·1.4826·MAD`, not `mean − λ·σ`.
+/// `median` and its scaled MAD, not `mean` and `σ`.
 pub(crate) fn fmt_family_reading(
     centre: Option<f32>,
     spread: Option<f32>,
@@ -195,7 +195,7 @@ pub(crate) fn fmt_family_reading(
     };
     let (centre_noun, spread_noun) = match family {
         MeanType::Arithmetic => unreachable!("delegated above"),
-        // The header's spelling (`COL_FIT_MEDIAN`): `F = median ∓ λ·1.4826·MAD`.
+        // The header's spelling (`COL_FIT_MEDIAN`): `F = median`.
         MeanType::Median => ("window median", "1.4826·MAD"),
         MeanType::SignedLog => ("window g-avg", "g-spread"),
     };
@@ -414,7 +414,7 @@ mod tests {
     }
 
     /// A non-arithmetic run's card names ITS pair and refuses to invent an SE: the score charges
-    /// `median − λ·1.4826·MAD`, so a header saying `avg … (spread …; SE …)` could not be redone.
+    /// the median and its scaled MAD, so a header saying `avg … (spread …; SE …)` could not be redone.
     #[test]
     fn a_family_reading_names_its_own_pair() {
         use crate::engine::config::MeanType;

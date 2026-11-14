@@ -313,6 +313,15 @@ impl CoreEngine {
                 buf.push(e);
             }
         }
+        // The informative metrics ride the same reading: a selection term ranks on exactly the
+        // series the table's `m:` cell prints, so they push at the same point.
+        if let Some(bufs) = self.rolling_metrics.get_mut(hash) {
+            for (i, buf) in bufs.iter_mut().enumerate() {
+                if let Some(v) = metrics.informative.get(i) {
+                    buf.push(*v);
+                }
+            }
+        }
     }
 
     /// `U == 0`: no optimizer update has ever landed on this net. It holds no learned policy, so a
@@ -368,6 +377,13 @@ impl CoreEngine {
                 buf.push(e);
             }
         }
+        if let Some(bufs) = self.rolling_metrics.get_mut(hash) {
+            for (i, buf) in bufs.iter_mut().enumerate() {
+                if let Some(v) = metrics.informative.get(i) {
+                    buf.push(*v);
+                }
+            }
+        }
         // Act-and-measure records WITHOUT advancing the clock: `state.step` counts
         // trainings, and `last_update_step` must not rotate.
         self.state.record_frozen_act(hash, metrics.clone())?;
@@ -400,7 +416,7 @@ impl CoreEngine {
 
     // ── The train-eval lottery ──────────────────────────────────────────────
 
-    /// A net's MERIT under the lottery: its risk-adjusted score ITSELF — the same `smt = μ ∓ λσ`
+    /// A net's MERIT under the lottery: its RANKING score ITSELF — the same `smt`
     /// the ranking decides on (`fit (F)` in the table), with no division.
     pub(crate) fn merit(&self, hash: &str) -> Option<f32> {
         Self::merit_from(self.smoothed_fitness_of(hash))

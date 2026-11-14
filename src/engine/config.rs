@@ -33,7 +33,7 @@ pub enum MeanType {
     /// score is mapped back, so one spike cannot dominate the window the way it does through
     SignedLog,
     /// The WEIGHTED MEDIAN: no single reading can move the centre at all; the spread is the medians
-    /// absolute deviation scaled by `1.4826`, so λ still reads in std-like units.
+    /// absolute deviation scaled by `1.4826`, so a median spread stays comparable with σ.
     Median,
 }
 
@@ -647,6 +647,11 @@ pub struct RaceConfig {
     /// Informative (non-ranking) metrics; their labels determine the extra per-net
     /// metric columns a reader may expect.
     pub metrics: Vec<Metric>,
+    /// Metrics that ALSO feed the ranking (`set_selection_metric`): each adds
+    /// `weight × the metric's smoothed window centre` to the fitness score, so
+    /// `score = fitness centre + Σ weight·metric centre`. Empty (the default) ranks on the
+    /// fitness alone, byte-identically to a run without the knob.
+    pub selection_metrics: Vec<crate::utils::fitness::SelectionMetric>,
     /// The training paradigm / problem space target.
     pub mode: RunMode,
     /// Whether to write `history.csv` (one row per live net per clock it was TRAINED AND SCORED
@@ -806,12 +811,12 @@ pub struct RaceSnapshot {
     pub live_count: usize,
     /// Current step.
     pub step: usize,
-    /// Best smoothed fitness — the RISK-ADJUSTED window score (FIT: `mean ∓ λσ`),
-    /// what the race actually ranks on. At λ = 0 this is the plain window mean again.
+    /// Best RANKING score — the window centre in the run's mean family, plus any
+    /// `selection_metrics` terms. This is what the race actually ranks on.
     pub best_smoothed_fitness: f32,
-    /// Worst smoothed fitness — the same risk-adjusted score, at the other end.
+    /// Worst ranking score — the same number, at the other end.
     pub worst_smoothed_fitness: f32,
-    /// Mean of the live risk-adjusted scores (a plain arithmetic mean OF the scores,
+    /// Mean of the live ranking scores (a plain arithmetic mean OF the scores,
     /// second smoothing pass).
     pub mean_smoothed_fitness: f32,
     /// Cumulative culls.
@@ -835,7 +840,7 @@ impl RaceConfig {
     }
 
     /// The loop the reference run was tuned on (`examples/cartpole.rs`): two rolls a clock on each
-    /// channel, tournament-2 crossover parents, a 5-reading window at λ 0.5, the inverted lottery
+    /// channel, tournament-2 crossover parents, a 5-reading window, the inverted lottery
     pub fn defaults() -> Self {
         RaceConfig {
             pop_size: DEFAULT_POP_SIZE,
@@ -874,6 +879,7 @@ impl RaceConfig {
             mutation_novelty_draws: DEFAULT_MUTATION_NOVELTY_DRAWS,
             custom_stop: None,
             metrics: Vec::new(),
+            selection_metrics: Vec::new(),
             log_level: LogLevel::default(),
             trace_file: false,
             save_optim: true,
@@ -890,6 +896,28 @@ impl RaceConfig {
             recovery_tolerance: DEFAULT_RECOVERY_TOLERANCE,
             recovery_same_seed: DEFAULT_RECOVERY_SAME_SEED,
         }
+    }
+
+    /// Resolve [`Self::selection_metrics`] labels to indices in `metrics`, in ranking order. A
+    /// label the run never registered is dropped ONCE with a warning: the ranking then never
+    /// reads a buffer that does not exist (and the log says why the term is missing).
+    pub fn selection_metric_terms(&self, metrics: &[Metric]) -> Vec<(usize, f32)> {
+        self.selection_metrics
+            .iter()
+            .filter_map(
+                |term| match metrics.iter().position(|m| m.label == term.label) {
+                    Some(index) => Some((index, term.weight)),
+                    None => {
+                        tracing::warn!(
+                            "selection_metric {:?}: no metric with that label was registered with \
+                         set_run_metrics — the term is ignored",
+                            term.label
+                        );
+                        None
+                    }
+                },
+            )
+            .collect()
     }
 
     /// The pool resolved to drawable policies (`empty ⇒ all three`, in the fixed order none →
@@ -945,6 +973,7 @@ impl RaceConfig {
         cfg.csv_export = snap.csv_export;
         cfg.save_optim = snap.save_optim;
         cfg.run_name = snap.run_name.clone();
+        cfg.selection_metrics = snap.selection_metrics.clone();
         // LEGACY Ω: folded into the band ONCE, with the same arithmetic the pre-retirement run
         // used — that is what lets an old run resume at the chances it actually paid. New headers
         // record `1.0`, for which this is the identity.
@@ -1383,9 +1412,31 @@ impl RaceConfigBuilder {
         self
     }
     /// Extra informative (non-ranking) metrics recorded in history.csv and engine.json.
-    /// Never affect selection — the ranking fitness is set separately via `Fitness`.
+    /// They affect selection ONLY when [`Self::set_selection_metric`] names them.
     pub fn set_run_metrics(mut self, metrics: Vec<Metric>) -> Self {
         self.cfg.metrics = metrics;
+        self
+    }
+
+    /// Make an informative metric count toward the RANKING: `score = fitness centre +
+    /// Σ weight × metric centre`. One term per label (a second call REPLACES its weight), and a
+    /// NEGATIVE weight favours a lower-is-better metric. The label must be one of the run's
+    /// `set_run_metrics` names; an unknown label is dropped with a warning rather than silently
+    /// contributing 0.0 forever.
+    pub fn set_selection_metric(mut self, label: impl Into<String>, weight: f32) -> Self {
+        let label = label.into();
+        match self
+            .cfg
+            .selection_metrics
+            .iter_mut()
+            .find(|m| m.label == label)
+        {
+            Some(term) => term.weight = weight,
+            None => self
+                .cfg
+                .selection_metrics
+                .push(crate::utils::fitness::SelectionMetric { label, weight }),
+        }
         self
     }
 
