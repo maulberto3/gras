@@ -230,7 +230,11 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             Some(FeatureSplitPolicy::Random) => format!(
                 "`random` flips one coin per (port, feature), so **above 100% is normal** (ports share features) and features can be missed entirely — {seen} of {input_dim} are seen by some port here."
             ),
-            Some(FeatureSplitPolicy::Inherited) => "`crossover` rows are a per-port blend of two parents' rows (which policy the blend came from is not recoverable, and inventing one would be a lie), so either side of 100% is legitimate — the label states provenance, not a draw rule."
+            // The label names PROVENANCE, and the sentence has to say so: a run whose pool is
+            // `exclusive` produces these children too, and calling one `exclusive` would claim a
+            // partition its rows do not have (hence a total above 100%). `crossover` is the
+            // mechanism, not a policy the pool can draw, so the label is the enum's own word.
+            Some(FeatureSplitPolicy::Inherited) => "`inherited` rows are a per-port **crossover blend** of two parents' masks, so this net does NOT carry the policy the run configured — a run drawing only `exclusive` still produces children like this. A blend of two partitions is not itself a partition (a feature can reach two ports, which is why the total may pass 100%), and which policy the blend came from is not recoverable, so claiming one would be a lie: the label states provenance, not a draw rule."
                 .to_string(),
             None => "No policy recorded, so read the rows themselves.".to_string(),
         };
@@ -396,7 +400,8 @@ fn kept_features(mask: &[u8], input_dim: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::topology::TopologyOptions;
+    use crate::graph::node::Node;
+    use crate::graph::topology::{Connection, Port, TopologyOptions};
 
     /// The topology graph curves its wires like the lineage graph does. Without the init
     /// directive every viewer picks its own default, and the two diagrams in one card disagreed
@@ -554,6 +559,53 @@ mod tests {
         assert!(
             md.contains("1 feature(s) reach no port (first `2`)"),
             "and so is the one left unowned:\n{md}"
+        );
+    }
+
+    /// A BLENDED child names itself `inherited`, not `crossover`: crossover is the MECHANISM,
+    /// and the run's `feature_split` pool never contains it (`FeatureSplitPolicy::is_drawable`),
+    /// so a policy-looking `crossover` label invited exactly the misreading this pins. The
+    /// mechanism is still named in the sentence, so a reader can tell what produced the rows.
+    #[test]
+    fn a_blended_split_is_labelled_inherited_not_crossover() {
+        let mut g = Topology::new(
+            0,
+            Some(TopologyOptions {
+                input_dim: Some(3),
+                output_dim: Some(1),
+                ..Default::default()
+            }),
+        );
+        g.nodes.push(Node::new_input(0, 2));
+        g.nodes.push(Node::new_hidden(1, 2, 1));
+        g.nodes.push(Node::new_output(2, 1, 1));
+        for (from, to) in [(0, 0), (1, 1)] {
+            g.connections.push(Connection {
+                from: Port {
+                    node: 0,
+                    index: from,
+                },
+                to: Port { node: 1, index: to },
+            });
+        }
+        g.connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 0 },
+        });
+        g.finalize();
+        // Two rows that share feature 1 and leave feature 2 unowned: exactly what a per-port
+        // blend of two partitions looks like, and why its total can pass 100%.
+        g.nodes[0].feature_masks = Some(vec![vec![1, 1, 0], vec![0, 1, 0]]);
+        g.options.feature_split = Some(FeatureSplitPolicy::Inherited);
+        let md = topology_markdown(&g, None);
+        assert!(md.contains("`inherited` over"), "{md}");
+        assert!(
+            !md.contains("`crossover` over"),
+            "`crossover` is the mechanism, never the label:\n{md}"
+        );
+        assert!(
+            md.contains("crossover blend"),
+            "the mechanism is still named so the reader knows what produced the rows:\n{md}"
         );
     }
 

@@ -9,7 +9,11 @@ pub(crate) fn split_policy_name(policy: Option<FeatureSplitPolicy>) -> &'static 
     match policy {
         Some(FeatureSplitPolicy::Exclusive) => "exclusive",
         Some(FeatureSplitPolicy::Random) => "random",
-        Some(FeatureSplitPolicy::Inherited) => "crossover",
+        // PROVENANCE, not a policy: the run's pool can only draw `exclusive` or `random`
+        // (`FeatureSplitPolicy::is_drawable`), so calling this `crossover` read like a third
+        // drawable arm — a reader who set `feature_split="exclusive"` saw "crossover" and
+        // thought the knob had been ignored. `engine.json` records the same word.
+        Some(FeatureSplitPolicy::Inherited) => "inherited",
         None => "rows",
     }
 }
