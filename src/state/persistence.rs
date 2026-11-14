@@ -80,6 +80,10 @@ pub struct ConfigSnapshot {
     /// `"arithmetic"` | `"signed_log"` | `"median"`).
     #[serde(default)]
     pub mean_type: String,
+    /// Metrics that feed the ranking (`set_selection_metric`): label + weight, in ranking order.
+    /// Empty = fitness only, which is every header written before the knob.
+    #[serde(default)]
+    pub selection_metrics: Vec<crate::utils::fitness::SelectionMetric>,
     /// Device the run executed on (`"cpu"` | `"cuda:0"`).
     pub device: String,
     /// Whether the lossless per-step `metrics.csv` was written.
@@ -246,6 +250,7 @@ impl ConfigSnapshot {
             smoothing_window: cfg.smoothing_window,
             risk_aversion: 0.0,
             mean_type: cfg.mean_type.to_string(),
+            selection_metrics: cfg.selection_metrics.clone(),
             device: if cfg!(feature = "cuda") {
                 "cuda:0"
             } else {
@@ -831,7 +836,7 @@ pub struct NetState {
     /// "always that good" from "one lucky step" at a glance; `None` on legacy tombstones.
     #[serde(default)]
     pub final_fitness_std: Option<f32>,
-    /// The RISK-ADJUSTED score (FIT: `mean ∓ λσ`) the net was actually ranked by at the moment
+    /// The RANKING score (the window centre, plus any selection terms) the net was actually ranked by at the moment
     /// culling.
     #[serde(default)]
     pub final_risk_score: Option<f32>,
@@ -1851,8 +1856,19 @@ mod tests {
         let json = serde_json::to_string(&snapshot).unwrap();
         let back: ConfigSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.risk_aversion, 0.0);
+        // A selection term rides the same record: label + weight survive the round trip, and a
+        // header without the key loads as fitness-only.
+        let mut cfg = crate::engine::config::RaceConfig::defaults();
+        cfg.selection_metrics = vec![crate::utils::fitness::SelectionMetric {
+            label: "r2".to_string(),
+            weight: -0.25,
+        }];
+        let snapshot = ConfigSnapshot::from_config(&cfg, None, None);
+        let back: ConfigSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        assert_eq!(back.selection_metrics, cfg.selection_metrics);
         // …and a value JSON with the key REMOVED (exactly a pre-FIT engine.json) loads
-        // as λ = 0.0 while every other knob still comes through.
+        // as 0.0 while every other knob still comes through.
         let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
         legacy.as_object_mut().unwrap().remove("risk_aversion");
         let loaded: ConfigSnapshot = serde_json::from_value(legacy).unwrap();

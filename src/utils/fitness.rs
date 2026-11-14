@@ -158,6 +158,18 @@ impl Fitness {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FitnessLabel(pub String);
 
+/// One informative metric's contribution to the RANKING (`RaceConfig::selection_metrics`): the
+/// metric's smoothed window centre times `weight`, added to the fitness score. The weight is in
+/// RANKING units, so a NEGATIVE weight favours a lower-is-better metric — the sign IS the
+/// direction, and no second enum is needed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SelectionMetric {
+    /// The metric's label, as registered in `RaceConfig::metrics`.
+    pub label: String,
+    /// Multiplier on the metric's smoothed window centre (`0.0` is allowed, and pointless).
+    pub weight: f32,
+}
+
 /// An informative (non-ranking) metric for a run — a label plus its closure;
 /// values live in `NetMetrics::informative` in the run's `Vec<Metric>` order.
 #[derive(Clone)]
