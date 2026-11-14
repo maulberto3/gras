@@ -26,15 +26,18 @@ pub fn all_activations() -> Vec<Activation> {
     ]
 }
 
-/// All built-in combine ops.
+/// All built-in combine ops — the pool an EMPTY `combine_op_pool` resolves to, so "all" here has to
+/// mean all of them, `mul`/`sub`/`div` included: a caller who wants the conservative four names
+/// them explicitly (`set_topology_combine_op_pool(["add", "mean", "max", "min"])`).
 pub fn all_combine_ops() -> Vec<CombineOp> {
     vec![
         CombineOp::Add,
         CombineOp::Mean,
         CombineOp::Max,
         CombineOp::Min,
-        // Multiply/Subtract/Divide stay out by default: numerically unstable
-        // random weights. Add them back via `.set_combine_op_pool(vec![..])`.
+        CombineOp::Multiply,
+        CombineOp::Subtract,
+        CombineOp::Divide,
     ]
 }
 

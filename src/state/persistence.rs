@@ -15,25 +15,6 @@ use crate::utils::seed::topo_hash;
 
 // ── Run header (engine.json) ───────────────────────────────────────────────
 
-/// Read the age leg from a header: a `bool` as itself, or the legacy float `w` it used to be
-/// recorded as (any value above zero armed
-fn de_age_leg<'de, D>(de: D) -> std::result::Result<bool, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    /// Either spelling the field has been written
-    #[derive(serde::Deserialize)]
-    #[serde(untagged)]
-    enum BoolOrFloat {
-        Bool(bool),
-        Float(f64),
-    }
-    Ok(match BoolOrFloat::deserialize(de)? {
-        BoolOrFloat::Bool(on) => on,
-        BoolOrFloat::Float(w) => w > 0.0,
-    })
-}
-
 /// The run's **complete** configuration, serialized into `engine.json` under
 /// `"config"` — the single source of truth; the file alone reproduces the run.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -95,20 +76,10 @@ pub struct ConfigSnapshot {
     /// mean.
     #[serde(default)]
     pub risk_aversion: f32,
-    /// Recency ramp r of the smoothing window (`set_run_window_recency`).
-    #[serde(default)]
-    pub window_recency: f32,
-    /// How the smoothing window was averaged into the ranking centre (`set_run_mean_type`:
+    /// How the smoothing window was averaged into the ranking centre (`set_fitness_mean_type`:
     /// `"arithmetic"` | `"signed_log"` | `"median"`).
     #[serde(default)]
     pub mean_type: String,
-    /// Whether the lottery's AGE leg is armed (`set_run_train_merit_age`).
-    #[serde(
-        default,
-        alias = "train_merit_age_mix",
-        deserialize_with = "de_age_leg"
-    )]
-    pub train_age: bool,
     /// Device the run executed on (`"cpu"` | `"cuda:0"`).
     pub device: String,
     /// Whether the lossless per-step `metrics.csv` was written.
@@ -130,35 +101,37 @@ pub struct ConfigSnapshot {
     /// the chances it actually paid.
     #[serde(default)]
     pub train_merit: f32,
-    /// Merit floor `p_min` (`set_run_train_merit_p_min`): the worst net's share of clocks even
+    /// Merit floor `p_min` (`set_ticket_p_min`): the worst net's share of clocks even
     /// `0` fraction, applied before Ω blends.
     #[serde(default)]
     pub train_merit_p_min: f32,
-    /// Merit CEILING `p_max` (`set_run_train_merit_p_max`): the best-graded net's share of clocks —
+    /// Merit CEILING `p_max` (`set_ticket_p_max`): the best-graded net's share of clocks —
     /// the upper end of `p = p_min + (p_max − p_min)·f`.
     #[serde(default = "default_p_max")]
     pub train_merit_p_max: f32,
-    /// Inverted lottery (`set_run_train_merit_inverted`): `true` grades the LEAST fit net best,
-    /// the tickets go bottom-up.
+    /// The lottery's two LEGS (`set_ticket_legs`) as ONE spelling — `least_fit_fewest_updates`,
+    /// `most_fit_most_updates`, `most_fit`, … `""` = a header written before the key, read out of
+    /// the two legacy bools below instead.
     #[serde(default)]
+    pub ticket_legs: String,
+    /// LEGACY, read-only: the pre-`ticket_legs` ordering bool (`true` = the LEAST fit net is paid).
+    /// Still READ so an old header resumes on the legs it actually ran; never written again.
+    /// Drop it once no surviving header predates `ticket_legs` — it is `skip_serializing`, so
+    /// every header written since is already clean.
+    #[serde(default, skip_serializing)]
     pub train_merit_inverted: bool,
-    /// LEARN-ONLY lottery (`set_run_train_merit_learn_only`): `true` = a lost ticket costs the
+    /// LEARN-ONLY lottery (`set_ticket_learn_only`): `true` = a lost ticket costs the
     /// weight update, not the clock (the net acts and is measured anyway). `default` = `false`,
     /// which is exactly what every header written before the flag recorded.
     #[serde(default)]
     pub train_merit_learn_only: bool,
-    /// BORN TICKET (`set_run_train_merit_born_ticket`): `true` pays a never-trained net `p = 1.0`,
-    /// so its first update lands on its first live clock. `default` = `false`, exactly what every
-    /// header written before the flag recorded. Replay-relevant.
-    #[serde(default)]
-    pub train_merit_born_ticket: bool,
-    /// POLICY-SCOPED FITNESS (`set_run_policy_scoped_fitness`): `true` = mean/spread/n describe the
+    /// POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): `true` = mean/spread/n describe the
     /// CURRENT weights, so no reading from another policy enters them. `default` = `false`, which
     /// is exactly what every header written before the flag recorded (the last-K-readings window).
     /// `policy_stats`, the knob's old name, still reads as this one.
     #[serde(default, alias = "policy_stats")]
     pub policy_scoped_fitness: bool,
-    /// ANTI-CHAMPION dump (`set_worst_save_topology`): `true` writes the top-ticket-chance nets'
+    /// ANTI-CHAMPION dump (`set_worst_save_topology`): `true` writes the `spent`-ranked nets'
     /// markdown at stop. `default` = `false` for every header written before the knob.
     #[serde(default)]
     pub worst_save_topology: bool,
@@ -192,7 +165,7 @@ pub struct ConfigSnapshot {
     /// (`U`). Replay-relevant.
     #[serde(default)]
     pub crossover_probation_steps: usize,
-    /// INIT PROBATION (`set_run_init_probation_steps`): opening clocks with no culls or births.
+    /// INIT PROBATION (`set_pop_init_probation_steps`): opening clocks with no culls or births.
     /// A header written before the knob reads `0` — nothing withheld beyond the born shields.
     /// Replay-relevant.
     #[serde(default)]
@@ -206,14 +179,15 @@ pub struct ConfigSnapshot {
     /// header written before the knob reads `0.0` (every drop triggers). Replay-relevant.
     #[serde(default)]
     pub recovery_tolerance: f32,
-    /// Recovery retry DRAW (`set_recovery_same_seed`): `true` = a retry repeats the clock's own
+    /// Recovery retry DRAW (`set_pop_recovery_same_seed`): `true` = a retry repeats the clock's own
     /// train draw. A header written before the knob reads `true` — the behaviour it had. Only
     /// replay-relevant while `recovery_retries > 0`.
     #[serde(default = "default_true")]
     pub recovery_same_seed: bool,
-    /// The lottery's U leg (`set_run_train_merit_updates`): `true` multiplies the ticket by `Um`.
-    /// A header written before the knob reads `false` (the age-legged ticket). Replay-relevant.
-    #[serde(default)]
+    /// LEGACY, read-only: the pre-`ticket_legs` U-leg bool (`true` = the ticket also multiplies
+    /// the updates fraction). Read to map an old header onto the legs spelling it means; never
+    /// written again. Drop it on the same schedule as `train_merit_inverted` above.
+    #[serde(default, skip_serializing)]
     pub train_merit_updates: bool,
     /// Seat join probation: clocks a fresh net must train before it may hold a SEAT.
     /// Replay-relevant.
@@ -283,7 +257,6 @@ impl ConfigSnapshot {
             eval_batch_size,
             smoothing_window: cfg.smoothing_window,
             risk_aversion: cfg.risk_aversion,
-            window_recency: cfg.window_recency,
             mean_type: cfg.mean_type.to_string(),
             device: if cfg!(feature = "cuda") {
                 "cuda:0"
@@ -298,12 +271,13 @@ impl ConfigSnapshot {
             train_merit: cfg.train_merit,
             train_merit_p_min: cfg.train_merit_p_min,
             train_merit_p_max: cfg.train_merit_p_max,
-            train_merit_inverted: cfg.train_merit_inverted,
+            ticket_legs: cfg.ticket_legs.to_string(),
+            // Legacy, read-only: written headers carry `ticket_legs` and nothing else.
+            train_merit_inverted: false,
+            train_merit_updates: false,
             train_merit_learn_only: cfg.train_merit_learn_only,
-            train_merit_born_ticket: cfg.train_merit_born_ticket,
             policy_scoped_fitness: cfg.policy_scoped_fitness,
             worst_save_topology: cfg.worst_save_topology,
-            train_age: cfg.train_age,
             crossover_fitter_base: cfg.crossover_fitter_base,
             legacy_train_lottery: None,
             champion_previous_load: cfg.champion_previous_load,
@@ -318,7 +292,6 @@ impl ConfigSnapshot {
             recovery_retries: cfg.recovery_retries,
             recovery_tolerance: cfg.recovery_tolerance,
             recovery_same_seed: cfg.recovery_same_seed,
-            train_merit_updates: cfg.train_merit_updates,
             seat_join_probation_steps: cfg.seat_join_probation_steps,
             seat_lifetime_steps: cfg.seat_lifetime_steps,
             feature_split: split_single,
@@ -861,7 +834,7 @@ pub struct NetState {
     /// Step this net was culled (`None` while alive).
     #[serde(default)]
     pub culled_at_step: Option<usize>,
-    /// Why it left (`"crossover"` | `"crossover-random"` | `"crossover-unfed"` |
+    /// Why it left (`"crossover-lowest-fitness"` | `"crossover-random"` | `"crossover-highest-ticket-chance"` |
     /// `"immigrant-slot"` — the crossover arm names the cull policy that chose it).
     #[serde(default)]
     pub cull_reason: Option<String>,
@@ -1643,24 +1616,6 @@ mod tests {
         dir
     }
 
-    /// The age leg has been spelled two ways in `engine.json`: a float `w` in every header written
-    /// before `train_age`, a bool since.
-    #[test]
-    fn the_age_leg_reads_both_header_spellings() {
-        let read = |json: &str| -> ConfigSnapshot { serde_json::from_str(json).unwrap() };
-        assert!(read(r#"{"pop_size": 3, "train_merit_age_mix": 1.0}"#).train_age);
-        assert!(
-            read(r#"{"pop_size": 3, "train_merit_age_mix": 0.5}"#).train_age,
-            "any w above zero armed the leg"
-        );
-        assert!(!read(r#"{"pop_size": 3, "train_merit_age_mix": 0.0}"#).train_age);
-        assert!(read(r#"{"pop_size": 3, "train_age": true}"#).train_age);
-        assert!(
-            !read(r#"{"pop_size": 3}"#).train_age,
-            "an absent field is the legacy fitness-only reading, not the armed default"
-        );
-    }
-
     /// The manifest is the frontier as a SET: it must round-trip, and a schema bump
     /// must be REFUSED by name rather than half-read.
     #[test]
@@ -1805,11 +1760,11 @@ mod tests {
         let snap = ConfigSnapshot::from_config(&cfg, None, None);
         assert_eq!(snap.crossover_cull_policy, "random");
         assert_eq!(snap.mutation_cull_policy, "inverse_fitness");
-        // …and the default run records the policy it actually culls with — `unfed`,
-        // enum's `#[default]` and the value `RaceConfig::defaults()` sets.
+        // …and the default run records the policy it actually culls with —
+        // `highest_ticket_chance`, the enum's `#[default]` and the defaults() value.
         let dflt = ConfigSnapshot::from_config(&RaceConfig::defaults(), None, None);
-        assert_eq!(dflt.mutation_cull_policy, "unfed");
-        assert_eq!(dflt.crossover_cull_policy, "unfed");
+        assert_eq!(dflt.mutation_cull_policy, "highest_ticket_chance");
+        assert_eq!(dflt.crossover_cull_policy, "highest_ticket_chance");
     }
 
     /// The tombstone's mean was renamed (`final_smoothed_fitness` →
