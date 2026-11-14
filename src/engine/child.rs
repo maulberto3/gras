@@ -1032,14 +1032,6 @@ impl CoreEngine {
     }
 }
 
-/// How many clocks sit inside `frozen_spans` — every ACT-ONLY pass: the crown's seat and every
-/// ticket the coin denied while `train_merit_learn_only` is on. The count does not separate those
-/// two sources (the live log names each); it is shared with the stop-time table's `a<n>` mark on
-/// `measured (M)`, so log and ledger cannot disagree.
-pub(crate) fn crown_act_count(state: &NetState) -> usize {
-    state.frozen_clocks()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

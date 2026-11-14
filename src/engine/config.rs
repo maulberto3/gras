@@ -297,8 +297,8 @@ pub const DEFAULT_MUTATE_ROLLS: usize = 2;
 pub const DEFAULT_CROSSOVER_PROB: f32 = 0.5;
 pub const DEFAULT_MUTATE_PROB: f32 = 0.2;
 
-/// Default champion guard: the reference's `pop / 10`, read at the conservative default population
-/// 10 — one seat.
+/// Default champion set: the reference's `pop / 10`, read at the conservative default population
+/// 10 — one saved net.
 pub const DEFAULT_CHAMPION_COUNT: usize = 1;
 
 /// Default clocks a net must have lived before it may take an elite seat: `5`, the guarded value.
@@ -323,10 +323,6 @@ pub const DEFAULT_RECOVERY_TOLERANCE: f32 = 0.0;
 /// born shields, which is exactly what every run before the knob did. Any other value is the
 /// number of opening clocks with no culls and no births — evolution starts at that clock.
 pub const DEFAULT_INIT_PROBATION_STEPS: usize = 0;
-
-/// Default clocks a crown seat may sit at peak: `5`, the guarded value (a seated net
-/// rotates out on its term). The cartpole reference disarms the term (`0`).
-pub const DEFAULT_CROWN_LIFETIME: usize = 5;
 
 /// Default hidden-width sampling range: the cartpole reference's `16..=64`,
 /// stride [`RaceConfig::defaults`] pins.
@@ -559,13 +555,10 @@ pub struct RaceConfig {
     /// Who a firing mutation roll evicts (mutation-only; crossover children follow
     /// `crossover_cull_policy`).
     pub mutation_cull_policy: MutationCullPolicy,
-    /// CHAMPION guard: the top-k nets by smoothed fitness are immune to ALL culls (minimum
-    /// 1). A champion is a rank — the saved, inheritable set — not an identity, and the
-    /// frozen SEATS below are a separate switch that this k sizes but does not mean.
+    /// CHAMPION set: the top-k live nets by smoothed fitness, saved and inheritable at stop
+    /// (minimum 1). A champion is a RANK — re-derived from the population, not an identity, and
+    /// the rank shields nothing from a cull.
     pub champion_count: usize,
-    /// Anti-devolution A: the top-k nets act-and-measure without weight
-    /// updates (see [`RaceConfigBuilder::set_seat_freeze`]). Default `false`.
-    pub freeze_seats: bool,
     /// LEGACY lottery strength Ω (`set_run_train_merit`, deprecated): the band below IS the payout
     /// now, so this number is only read when an old header is folded ([`fold_omega`]). A config
     /// built today carries `1.0` (the identity) and no live decision reads it.
@@ -710,12 +703,6 @@ pub struct RaceConfig {
     /// fights on fresh evidence. The EVAL side is keyed to the clock either way, so the reading
     /// stays comparable to the standing it has to climb back to.
     pub recovery_same_seed: bool,
-    /// Seat join probation: a net cannot take a SEAT until it has aged
-    /// `seat_join_probation_steps` clocks since arrival. Default `5`.
-    pub seat_join_probation_steps: usize,
-    /// Seat lifetime: a net on the frozen crown is rotated out after
-    /// `seat_lifetime_steps` clocks. Default `5`; zero = permanent until its rank moves.
-    pub seat_lifetime_steps: usize,
 }
 
 // `run_progress` and `DEFAULT_LR` live in `crate::utils::training` — the run
@@ -869,15 +856,12 @@ impl RaceConfig {
             crossover_cull_policy: CrossCullPolicy::default(),
             mutation_cull_policy: MutationCullPolicy::default(),
             champion_count: DEFAULT_CHAMPION_COUNT,
-            freeze_seats: false,
             train_merit: DEFAULT_TRAIN_MERIT,
             train_merit_p_min: DEFAULT_TRAIN_MERIT_P_MIN,
             train_merit_p_max: DEFAULT_TRAIN_MERIT_P_MAX,
             ticket_legs: DEFAULT_TICKET_LEGS,
             train_merit_learn_only: DEFAULT_TRAIN_MERIT_LEARN_ONLY,
             eval_share: DEFAULT_EVAL_SHARE,
-            seat_join_probation_steps: DEFAULT_SEAT_JOIN_PROBATION,
-            seat_lifetime_steps: DEFAULT_CROWN_LIFETIME,
             smoothing_window: SMOOTHING_WINDOW,
             risk_aversion: RISK_AVERSION,
             mean_type: DEFAULT_MEAN_TYPE,
@@ -964,7 +948,6 @@ impl RaceConfig {
         cfg.csv_export = snap.csv_export;
         cfg.save_optim = snap.save_optim;
         cfg.run_name = snap.run_name.clone();
-        cfg.freeze_seats = snap.freeze_seats;
         // LEGACY Ω: folded into the band ONCE, with the same arithmetic the pre-retirement run
         // used — that is what lets an old run resume at the chances it actually paid. New headers
         // record `1.0`, for which this is the identity.
@@ -992,8 +975,6 @@ impl RaceConfig {
         cfg.recovery_retries = snap.recovery_retries;
         cfg.recovery_tolerance = snap.recovery_tolerance;
         cfg.recovery_same_seed = snap.recovery_same_seed;
-        cfg.seat_join_probation_steps = snap.seat_join_probation_steps;
-        cfg.seat_lifetime_steps = snap.seat_lifetime_steps;
         // The replay-relevant enums, matched on their recorded SPELLING — the snapshots store
         // `Display` output (`"lowest_fitness"`, `"tournament(size=2)"`, `"split_random"`), so a
         // `contains` reads a resume across a rename. The pre-2026-11 spellings (`worst` / `unfed`
@@ -1159,16 +1140,10 @@ impl RaceConfigBuilder {
         self.cfg.mutation_cull_policy = policy;
         self
     }
-    /// Elite guard: top-k nets are immune to ALL culls. Minimum 1; elites hold rank,
-    /// identity.
+    /// Champion set size: the top-k live nets saved at stop. Minimum 1; a champion is a
+    /// rank, not an identity, and it shields nothing from a cull.
     pub fn set_champion_count(mut self, n: usize) -> Self {
         self.cfg.champion_count = n.max(1);
-        self
-    }
-    /// ANTI-DEVOLUTION A — elite freeze: the top-`champion_count` nets are exempt
-    /// trainer call (frozen, but still scored/ranked/parents). Default `false`.
-    pub fn set_seat_freeze(mut self, yes: bool) -> Self {
-        self.cfg.freeze_seats = yes;
         self
     }
     /// DEPRECATED — Ω is retired as a second dial: the band `p_min..p_max` IS the payout, so
@@ -1523,18 +1498,6 @@ impl RaceConfigBuilder {
     /// fights on fresh evidence. See [`RaceConfig::recovery_same_seed`].
     pub fn set_pop_recovery_same_seed(mut self, same: bool) -> Self {
         self.cfg.recovery_same_seed = same;
-        self
-    }
-    /// Seat join probation: a net cannot take a seat until it has aged `k`
-    /// clocks since arrival. Default `5`.
-    pub fn set_seat_join_probation_steps(mut self, k: usize) -> Self {
-        self.cfg.seat_join_probation_steps = k;
-        self
-    }
-    /// Seat lifetime: how long a net may stay at peak on the frozen crown before
-    /// age-rotation. Default `5`.
-    pub fn set_seat_lifetime_steps(mut self, k: usize) -> Self {
-        self.cfg.seat_lifetime_steps = k;
         self
     }
     /// At stop, save each champion's topology markdown (`champion-<hash>-<fitness>.md`).

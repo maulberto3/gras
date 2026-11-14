@@ -68,12 +68,7 @@ impl CoreEngine {
         frame: Option<LotteryFrame>,
         forced: bool,
     ) -> Result<()> {
-        // ANTI-DEVOLUTION A — seat freeze: the crown holds the nets that skip
-        // the trainer update this step; scoring proceeds off carried metrics.
-        if self.frozen_crown.contains(hash) {
-            return self.act_only_step(hash, clock, "FROZEN (seat)");
-        }
-        // TRAIN-EVAL LOTTERY (experimental, off by default): a non-crown net may be denied
+        // TRAIN-EVAL LOTTERY (experimental, off by default): a net may be denied the
         // clock's ticket.
         if let Some(_frame) = frame {
             let p = self.train_lottery_p_eff(hash, frame);
@@ -301,6 +296,11 @@ impl CoreEngine {
         if let Some(buf) = self.rolling_fitness.get_mut(hash) {
             buf.push(metrics.fitness);
         }
+        // The whole-run trend takes the same reading: the window is a ranking device, the trend is
+        // the series itself, so it is never cut to K.
+        if let Some(trend) = self.rolling_trend.get_mut(hash) {
+            trend.push(metrics.fitness);
+        }
         // This reading describes the weights the update just produced: under a policy-scoped
         // fitness window it is reading ONE of a new epoch, which keeps the window on the current
         // policy.
@@ -352,6 +352,9 @@ impl CoreEngine {
         };
         if let Some(buf) = self.rolling_fitness.get_mut(hash) {
             buf.push(metrics.fitness);
+        }
+        if let Some(trend) = self.rolling_trend.get_mut(hash) {
+            trend.push(metrics.fitness);
         }
         // Same weights, one more reading: the epoch counter is what lets a rarely-ticketed net
         // show many readings OF ITS POLICY instead of a mix.
@@ -410,7 +413,7 @@ impl CoreEngine {
     }
 
     /// The clock's lottery field: the best/worst merit among the nets the lottery actually grades
-    /// (live, non-crown, out of their born shield, with a reading).
+    /// (live, out of their born shield, with a reading).
     pub(crate) fn lottery_frame(&self) -> Option<LotteryFrame> {
         // A band whose FLOOR is 1.0 sells every clock to every net: there is nothing to grade.
         if self.train_merit_p_min() >= 1.0 || !self.lottery_armed() {
@@ -425,7 +428,7 @@ impl CoreEngine {
         let (mut fewest_updates, mut most_updates) = (usize::MAX, 0usize);
         let mut any = false;
         for h in self.state.live_hashes() {
-            if self.frozen_crown.contains(&h) || self.on_probation(&h) {
+            if self.on_probation(&h) {
                 continue;
             }
             if let Some(m) = self.merit(&h) {
@@ -489,7 +492,7 @@ impl CoreEngine {
         let Some(frame) = frame else {
             return 1.0; // lottery off (or no field this clock)
         };
-        if self.frozen_crown.contains(hash) || self.on_probation(hash) {
+        if self.on_probation(hash) {
             return 1.0;
         }
         let Some((_, _, mix)) = self.train_lottery_parts(hash, Some(frame), merit) else {
@@ -529,9 +532,6 @@ impl CoreEngine {
         let Some(frame) = frame else {
             return Err("off");
         };
-        if self.frozen_crown.contains(hash) {
-            return Err("crown");
-        }
         if self.on_probation(hash) {
             return Err("shield");
         }

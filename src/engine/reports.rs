@@ -1,8 +1,7 @@
 //! Run artifacts: the CHAMPION ranking and the anti-champion (worst) dumps.
 //!
-//! Three words, three jobs, no overlap: a CHAMPION is a net in the saved, inheritable top-k
-//! ranking; a SEAT is the frozen act-only switch the crown deals (`freeze_seats`); the GUARD
-//! is cull immunity for the same top-k while the run is still going.
+//! Two words, two jobs, no overlap: a CHAMPION is a net in the saved, inheritable top-k ranking;
+//! the GUARD is cull immunity for the same top-k while the run is still going.
 
 use super::core::CoreEngine;
 use super::format::{ReadingStyle, fmt_cfg, fmt_family_reading};
@@ -10,7 +9,7 @@ use flodl::tensor::Result;
 
 /// Why the list is not simply the bottom of `fit (F)`, stamped into every `worst-*.md`: the file
 /// outlives the run, and the criterion reads engine knobs a later reader cannot see.
-const WORST_PICK_NOTE: &str = "**Why this net.** The pick is the `spent` criterion the cross/mutation cull evicts on: `spent = Fm⁻ × (1 − Um)` — how badly the net grades (`Fm⁻`: 0.99 = the field's worst, 0.01 = its best) times how much of its updates it has already spent (`1 − Um`: 0.01 at the field's least-updated net, 0.99 at its most). So a weak net the lottery has NOT paid yet ranks BELOW a weak net that trained and stayed weak — the net worth reading, and the reason this list is not just the bottom of `fit (F)`. The place is UN-TILTED: the fit side of `ticket_legs` (worst-first / best-first) is undone as `1 − p` before the product, so that leg decides who the band PAYS and never which end counts as bad, while the `U` leg is read whether or not `ticket_legs` arms it for tickets. A net the lottery cannot grade (crown, shielded, unread, flat field, lottery off) prints `—` and falls to the tail of this index ordered by `fit (F)` — the pre-criterion dump.";
+const WORST_PICK_NOTE: &str = "**Why this net.** The pick is the `spent` criterion the cross/mutation cull evicts on: `spent = Fm⁻ × (1 − Um)` — how badly the net grades (`Fm⁻`: 0.99 = the field's worst, 0.01 = its best) times how much of its updates it has already spent (`1 − Um`: 0.01 at the field's least-updated net, 0.99 at its most). So a weak net the lottery has NOT paid yet ranks BELOW a weak net that trained and stayed weak — the net worth reading, and the reason this list is not just the bottom of `fit (F)`. The place is UN-TILTED: the fit side of `ticket_legs` (worst-first / best-first) is undone as `1 − p` before the product, so that leg decides who the band PAYS and never which end counts as bad, while the `U` leg is read whether or not `ticket_legs` arms it for tickets. A net the lottery cannot grade (shielded, unread, flat field, lottery off) prints `—` and falls to the tail of this index ordered by `fit (F)` — the pre-criterion dump.";
 
 impl CoreEngine {
     /// Write the MACHINE-READABLE champion ranking — `champions.json`, best first,
@@ -28,6 +27,7 @@ impl CoreEngine {
             .map(|(rank, (hash, fitness))| {
                 let state = self.state.net(&hash);
                 let reading = self.race_reading_of(&hash);
+                let trend = self.rolling_trend.get(&hash);
                 serde_json::json!({
                     "rank": rank + 1,
                     "hash": hash,
@@ -41,6 +41,13 @@ impl CoreEngine {
                     "fitness_centre": reading.map(|r| r.fam_center),
                     "fitness_spread": reading.map(|r| r.fam_spread),
                     "fitness_samples": reading.map(|r| r.n),
+                    // The WHOLE-RUN line beside the window's numbers: `fitness_samples` counts the
+                    // K-reading window, `fitness_readings` every reading the net ever took, and
+                    // `fitness_slope` is that whole series' least-squares slope per READING (raw
+                    // fitness units — which sign means "improving" is `direction` in `engine.json`).
+                    // Both are report-only: no ranking, ticket or cull reads them.
+                    "fitness_readings": trend.map(|t| t.len()),
+                    "fitness_slope": trend.and_then(|t| t.slope()),
                     "risk_aversion": self.config.risk_aversion,
                     "mean_type": self.config.mean_type.to_string(),
                     "params": state.and_then(|s| s.meta.params),
@@ -95,10 +102,14 @@ impl CoreEngine {
                 continue;
             };
             let short = &hash[..8.min(hash.len())];
-            // The name carries the number a reader came for: the same risk-adjusted score the
-            // header prints, rounded so `champion-8a3c262b-102.md` is findable without opening it.
-            let score = fitness.round() as i64;
-            let path = self.run_dir.join(format!("champion-{short}-{score}.md"));
+            // `champion-<rank>-<hash>-<F>`: the RANK orders a directory listing (the one thing a
+            // reader scrolls these files for), the hash is the identity, and the two decimals are
+            // the risk-adjusted score the header prints. The old rule rounded that score to an
+            // integer, which on a 0–1 fitness is the constant `1` for every champion — a suffix
+            // that named nothing and ordered nothing.
+            let path = self
+                .run_dir
+                .join(format!("champion-{:02}-{short}-{fitness:.2}.md", rank + 1));
             let label = if k <= 1 {
                 "Champion".to_string()
             } else {
@@ -206,7 +217,7 @@ impl CoreEngine {
     /// lottery has NOT paid yet cannot crowd out the weak net that trained and stayed weak. The
     /// place is un-tilted (`1 − p`) exactly as the cull does it, so the fit side of `ticket_legs`
     /// moves the payouts and never which end of the field counts as bad. A net the lottery cannot grade
-    /// (crown, shield, unread, flat field, lottery off) has no `spent` and falls to the tail by
+    /// (shield, unread, flat field, lottery off) has no `spent` and falls to the tail by
     /// `fit (F)` — the pre-criterion dump, byte for byte.
     pub(crate) fn write_worst_markdown(&mut self, clock: usize) -> Result<()> {
         if !self.config.worst_save_topology {
@@ -276,10 +287,13 @@ impl CoreEngine {
                     )
                 },
             );
-            // Same naming rule as the champion files: the risk-adjusted score rides the name, and
-            // it is the `fit (F)` the table prints, so the filename and the row agree.
+            // The same shape as the champion files — `worst-<rank>-<hash>-<F>` — so the two ends
+            // of one ranking are named alike and both listings sort by place. A net the lottery
+            // could not read prints `na` where the score goes: the old rule wrote `0`, which read
+            // as a measurement.
             let fit = self.smoothed_fitness_of(hash);
-            let file = format!("worst-{short}-{}.md", fit.map_or(0, |s| s.round() as i64));
+            let score = fit.map_or_else(|| "na".to_string(), |s| format!("{s:.2}"));
+            let file = format!("worst-{:02}-{short}-{score}.md", rank + 1);
             let fit_cell = fit.map_or_else(|| "—".to_string(), fmt_cfg);
             let ticket_cell = p.map_or_else(|| "—".to_string(), fmt_cfg);
             let spent_cell = spent.map_or_else(|| "—".to_string(), fmt_cfg);

@@ -107,6 +107,8 @@ impl CoreEngine {
         );
         // Born: no reading has been taken on these weights yet.
         self.rolling_epoch.insert(hash.to_string(), 0);
+        self.rolling_trend
+            .insert(hash.to_string(), Default::default());
     }
 
     /// One mutation draw: up to `draws` candidates, each its own seed ordinal. The first that
@@ -276,6 +278,7 @@ impl CoreEngine {
                 self.rolling_train.remove(&child.state.hash);
                 self.rolling_eval.remove(&child.state.hash);
                 self.rolling_epoch.remove(&child.state.hash);
+                self.rolling_trend.remove(&child.state.hash);
                 return Ok(RollOutcome::no_slot(
                     self.no_cull_roll_detail("crossover-lowest-fitness"),
                 ));
@@ -426,16 +429,15 @@ impl CoreEngine {
     }
 
     /// Uniformly random **cullable** live net (the `Random` arm of both policies):
-    /// deterministic in `(run_seed, clock, salt)`; champions/probation excluded.
+    /// deterministic in `(run_seed, clock, salt)`; probation nets excluded.
     fn select_random_victim_at(&self, clock: usize, salt: usize) -> Result<Option<String>> {
-        let elite = self.elite_hashes();
         // `clock` here is the SALTED seed input only: the shield is read off the net's own `U`,
         // so no clock has to be looked up for it.
         let hashes: Vec<String> = self
             .state
             .live_hashes()
             .into_iter()
-            .filter(|h| !elite.contains(h) && !self.on_probation(h))
+            .filter(|h| !self.on_probation(h))
             .collect();
         if hashes.is_empty() {
             return Ok(None);
@@ -454,14 +456,13 @@ impl CoreEngine {
         self.select_random_victim_at(clock, 0)
     }
 
-    /// Whether ANY live net is cull-eligible right now (non-elite AND past
+    /// Whether ANY live net is cull-eligible right now (past its channel
     /// probation). Consulted before building a child, so the check saves work.
     pub(crate) fn has_cull_eligible(&self) -> bool {
-        let elite = self.elite_hashes();
         self.state
             .live_hashes()
             .iter()
-            .any(|h| !elite.contains(h) && !self.on_probation(h))
+            .any(|h| !self.on_probation(h))
     }
 
     /// The one-line detail for a roll skipped by the hard shield — shared
@@ -473,7 +474,7 @@ impl CoreEngine {
             self.config.mutation_probation_steps
         };
         format!(
-            "no cull-eligible net — every non-champion net is inside its {branch} cull shield window (k={k} updates) or elite; roll spent, nothing culled/born"
+            "no cull-eligible net — every live net is inside its {branch} cull shield window (k={k} updates); roll spent, nothing culled/born"
         )
     }
 
@@ -512,18 +513,14 @@ impl CoreEngine {
     /// Mutation victim last resorts: worst by smoothed fitness, else first live
     /// hash. `None` only when the population is empty.
     fn mutation_victim_fallback(&self) -> Option<String> {
-        let elite = self.elite_hashes();
-        // `&str` over `&String`: the closures only look up the hash, and `elite`
-        // a tiny Vec — a linear `iter().any` beats forcing `Vec::contains`.
-        let eligible = |h: &str| !elite.iter().any(|e| e == h);
         let off_probation = |h: &str| !self.on_probation(h);
         let live = self.state.live_hashes();
-        // The worst non-elite net that has ALSO served its channel probation; no
-        // "first live" fallback — when nobody qualifies the caller SKIPS the roll.
+        // The worst net that has ALSO served its channel probation; no "first live"
+        // fallback — when nobody qualifies the caller SKIPS the roll.
         self.worst_nets_by_smoothed_fitness(live.len())
             .ok()?
             .into_iter()
-            .find(|h| eligible(h) && off_probation(h))
+            .find(|h| off_probation(h))
     }
 
     /// One mutation roll: cull a net per `MutationCullPolicy` (worst, fitness-inverse, random,
@@ -539,7 +536,7 @@ impl CoreEngine {
             return Ok(None);
         }
         // Pick a victim per the mutation cull policy (`Worst` default, `InverseFitness`, `Random`);
-        // the elite guard and probation shield apply in every arm.
+        // the probation shield applies in every arm.
         let Some(victim) = self.select_mutation_victim(clock, roll)? else {
             return Ok(None);
         };
@@ -661,15 +658,15 @@ impl CoreEngine {
         self.rolling_train.remove(hash);
         self.rolling_eval.remove(hash);
         self.rolling_epoch.remove(hash);
+        self.rolling_trend.remove(hash);
         // Decision-lag state dies with the net (shadow + promotion clock
-        // per-individual); a culled frozen elite leaves the crown.
-        self.frozen_crown.remove(hash);
+        // per-individual).
         self.culls += 1;
         Ok(())
     }
 
     /// Select a live net inversely-proportionate to smoothed fitness —
-    /// `InverseFitness` arm. Elites and probation nets are excluded; `None` = none.
+    /// `InverseFitness` arm. Probation nets are excluded; `None` = none.
     pub(crate) fn select_inverse_proportional_at(
         &self,
         clock: usize,
@@ -684,12 +681,10 @@ impl CoreEngine {
             return Ok(None);
         }
         let direction = self.fitness.direction();
-        let elite = self.elite_hashes();
         // Inverse fitness: weight = (adjusted best) − (adjusted value) ≥ 0 — the worst net gets
         // largest weight, the best gets zero.
         let scored: Vec<(String, f32)> = hashes
             .iter()
-            .filter(|h| !elite.contains(h))
             .filter(|h| !self.on_probation(h))
             .filter_map(|h| self.smoothed_fitness_of(h).map(|s| (h.clone(), s)))
             .collect();
@@ -746,7 +741,7 @@ impl CoreEngine {
     }
 
     /// Whether `hash` is still under its **cull shield** — what the log calls `cull shield` (NOT
-    /// the elite `join window`, which is `elite_probation_age`): cull-IMMUNE until the net has spent
+    /// the cull shield, which is the born/probation window): cull-IMMUNE until the net has spent
     /// `k` UPDATES (`U`, real optimizer steps), `k` being its channel's window.
     ///
     /// Counted in UPDATES, not clocks: the shield exists to buy a newcomer enough TRAINING to be
@@ -769,24 +764,20 @@ impl CoreEngine {
     /// The **Unfed** victim, shared by both channels' `Unfed` arm: the net with the HIGHEST ticket
     /// chance `p` this clock — deterministic, taken from the coin's own number, so it is the least
     /// fit AND most spent net whenever the setters arm it that way (worst-first `Fm⁻` × `Um`).
-    /// Excluded: the elite set, the crown, and every net the lottery does not grade (born shield,
-    /// no reading, flat field). `None` when that leaves nobody — the roll is spent, nothing culled.
+    /// Excluded: every net the lottery does not grade (born shield, no reading, flat field).
+    /// `None` when that leaves nobody — the roll is spent, nothing culled.
     pub(crate) fn select_highest_ticket_chance_victim(&self) -> Result<Option<String>> {
         let Some(frame) = self.lottery_frame() else {
             return self.select_lowest_fitness_victim();
         };
-        let elite = self.elite_hashes();
         // THE HIGHEST TICKET CHANCE GOES: the victim is the net the coin is about to pay the most,
         // read off the SAME `p = p_min + (p_max − p_min) × f` the step draws against. No draw, no
         // second score, hash tie-break — so "least fit, most spent" is evicted exactly when the
         // setters say so (worst-first plus `Um`), and the cull can never disagree with the coin.
         let mut worst: Option<(String, f32)> = None;
         for h in self.state.live_hashes() {
-            if elite.contains(&h) {
-                continue;
-            }
             let merit = self.merit(&h);
-            // `None` = not graded (crown, born shield, no reading, flat field): such a net has no
+            // `None` = not graded (born shield, no reading, flat field): such a net has no
             // ticket chance to rank, so it is not a victim either.
             if self.train_lottery_parts(&h, Some(frame), merit).is_none() {
                 continue;
@@ -813,19 +804,15 @@ impl CoreEngine {
     /// slot instead of the coin's next draw. UNLIKE `highest_ticket_chance`, the tilt does not move
     /// it: that arm reads the coin's `p` (so best-first sends it after the BEST net), while this one
     /// keeps the lowest-fitness-first place. A weak net with `U = 1` has not had its chance; a weak
-    /// net with `U = 18` has, and `highest_ticket_chance` would keep paying it. Excluded: the elite set, the crown, and every net the
-    /// lottery does not grade (born shield, no reading, flat field). `None` when that leaves
-    /// nobody — the roll is spent, nothing culled.
+    /// net with `U = 18` has, and `highest_ticket_chance` would keep paying it. Excluded: every
+    /// net the lottery does not grade (born shield, no reading, flat field). `None` when that
+    /// leaves nobody — the roll is spent, nothing culled.
     pub(crate) fn select_lowest_fitness_most_updates_victim(&self) -> Result<Option<String>> {
         let Some(frame) = self.lottery_frame() else {
             return self.select_lowest_fitness_victim();
         };
-        let elite = self.elite_hashes();
         let mut worst: Option<(String, f32)> = None;
         for h in self.state.live_hashes() {
-            if elite.contains(&h) {
-                continue;
-            }
             let merit = self.merit(&h);
             // `None` = not graded, exactly the coin's own gates — so a net the lottery refuses to
             // grade is never a victim of this arm either.
@@ -848,8 +835,8 @@ impl CoreEngine {
         }
     }
 
-    /// The crossover Worst-policy victim: the worst non-elite net that has served
-    /// its crossover probation. `None` when nobody is cullable (shield is HARD).
+    /// The crossover Worst-policy victim: the worst net that has served its
+    /// crossover probation. `None` when nobody is cullable (shield is HARD).
     pub(crate) fn select_lowest_fitness_victim(&self) -> Result<Option<String>> {
         Ok(self
             .worst_nets_by_smoothed_fitness(self.state.live_count())?

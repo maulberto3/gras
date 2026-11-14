@@ -116,6 +116,72 @@ impl WindowStats {
     }
 }
 
+/// A net's WHOLE-RUN fitness trend as a least-squares line — one point per reading, no window.
+///
+/// `x` is the READING INDEX (`0, 1, 2, …`), not the clock: readings exist only on the clocks a net
+/// ran, so a clock axis would charge a starved net for the gaps between its readings and read slow
+/// improvement where there was simply missing data. The slope is therefore "fitness change per
+/// EVAL", which is the one quantity two nets measured a different number of times can share.
+///
+/// Not a ranking input: `F` stays the K-reading window's business. The trend is accumulated in
+/// O(1) memory per net from the same pushes the window gets, so it covers the whole run without a
+/// second store (and a resume rebuilds it by replaying `history.csv`, exactly like the window).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ReadingTrend {
+    n: usize,
+    sum_x: f64,
+    sum_y: f64,
+    sum_xx: f64,
+    sum_xy: f64,
+}
+
+impl ReadingTrend {
+    /// Fold one reading in as the next point of the series. A non-finite reading is ignored: it
+    /// carries no trend, and letting it shift the index would misplace every point after it.
+    pub fn push(&mut self, y: f32) {
+        if !y.is_finite() {
+            return;
+        }
+        let x = self.n as f64;
+        let y = y as f64;
+        self.n += 1;
+        self.sum_x += x;
+        self.sum_y += y;
+        self.sum_xx += x * x;
+        self.sum_xy += x * y;
+    }
+
+    /// Readings folded in so far (the line's point count).
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    /// The least-squares slope in fitness units per READING. `None` under two points (a line needs
+    /// two) — a slope fitted to one point would be a claim nobody made.
+    pub fn slope(&self) -> Option<f32> {
+        if self.n < 2 {
+            return None;
+        }
+        let n = self.n as f64;
+        let denom = n * self.sum_xx - self.sum_x * self.sum_x;
+        if denom <= 0.0 {
+            return None;
+        }
+        Some(((n * self.sum_xy - self.sum_x * self.sum_y) / denom) as f32)
+    }
+}
+
+/// What a replayed net takes from `history.csv`: the tail its smoothing window is rebuilt from, and
+/// the whole-run line over EVERY row (so a resumed twin's trend is the live run's, never a line over
+/// whichever `window` rows happened to survive the load).
+#[derive(Default)]
+pub(crate) struct HistoryReplay {
+    /// The last `window` rows, oldest → newest.
+    pub window: Vec<(f32, f32, Option<f32>)>,
+    /// The least-squares line over every row the net ever recorded.
+    pub trend: ReadingTrend,
+}
+
 impl MeanType {
     /// Map one reading into the family's averaging space.
     fn transform(self, x: f32) -> f32 {
@@ -432,5 +498,46 @@ mod tests {
                 .score(Direction::Maximize, 0.5),
             rolling_stats(&buf).unwrap().score(Direction::Maximize, 0.5)
         );
+    }
+
+    /// x is the READING index: a perfect line gives its own per-reading step, and one point is not
+    /// a line (no slope to claim).
+    #[test]
+    fn the_trend_is_the_per_reading_least_squares_slope() {
+        let mut trend = ReadingTrend::default();
+        assert_eq!(trend.slope(), None, "one point is not a line");
+        trend.push(1.0);
+        assert_eq!(trend.slope(), None, "still one point");
+        for v in [2.0, 3.0, 4.0] {
+            trend.push(v);
+        }
+        assert_eq!(trend.len(), 4);
+        assert!(
+            (trend.slope().unwrap() - 1.0).abs() < 1e-6,
+            "slope was {:?}",
+            trend.slope()
+        );
+        // The same series reversed falls at the same rate.
+        let mut down = ReadingTrend::default();
+        for v in [4.0, 3.0, 2.0, 1.0] {
+            down.push(v);
+        }
+        assert!((down.slope().unwrap() + 1.0).abs() < 1e-6);
+    }
+
+    /// A non-finite reading is DROPPED, not folded in as a point: it would shift every later x.
+    #[test]
+    fn a_non_finite_reading_does_not_move_the_line() {
+        let mut clean = ReadingTrend::default();
+        let mut noisy = ReadingTrend::default();
+        for v in [2.0, 4.0, 6.0] {
+            clean.push(v);
+        }
+        noisy.push(2.0);
+        noisy.push(f32::NAN);
+        noisy.push(4.0);
+        noisy.push(6.0);
+        assert_eq!(clean.len(), noisy.len());
+        assert_eq!(clean.slope(), noisy.slope());
     }
 }
