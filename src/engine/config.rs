@@ -23,10 +23,6 @@ pub enum StopReason {
 /// Per-net smoothed-fitness rolling window (K) — the span every ranking decision averages over.
 pub const SMOOTHING_WINDOW: usize = 5;
 
-/// Default risk aversion (λ, FIT): how many window standard deviations a net is charged for its own
-/// spread.
-pub const RISK_AVERSION: f32 = 0.5;
-
 /// How the smoothing window's readings are averaged into the ranking centre (`set_fitness_mean_type`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MeanType {
@@ -581,9 +577,6 @@ pub struct RaceConfig {
     /// Per-net smoothed-fitness rolling window (K) — how many recent step fitnesses
     /// ranking decision averages over. Defaults to [`SMOOTHING_WINDOW`].
     pub smoothing_window: usize,
-    /// Risk aversion λ (FIT): window standard deviations subtracted from (Maximize) or added
-    /// (Minimize) a net's smoothed mean before ranking.
-    pub risk_aversion: f32,
     /// How the window's readings are averaged into the ranking centre (`set_fitness_mean_type`):
     /// [`MeanType::Arithmetic`] (default, the pre-knob ranking), [`MeanType::SignedLog`]
     pub mean_type: MeanType,
@@ -859,7 +852,6 @@ impl RaceConfig {
             train_merit_learn_only: DEFAULT_TRAIN_MERIT_LEARN_ONLY,
             eval_share: DEFAULT_EVAL_SHARE,
             smoothing_window: SMOOTHING_WINDOW,
-            risk_aversion: RISK_AVERSION,
             mean_type: DEFAULT_MEAN_TYPE,
             policy_scoped_fitness: DEFAULT_POLICY_SCOPED_FITNESS,
             worst_save_topology: DEFAULT_WORST_SAVE_TOPOLOGY,
@@ -931,7 +923,16 @@ impl RaceConfig {
         cfg.log_level = LogLevel::parse(&snap.log_level).unwrap_or(cfg.log_level);
         cfg.trace_file = snap.trace_file;
         cfg.smoothing_window = snap.smoothing_window;
-        cfg.risk_aversion = snap.risk_aversion;
+        // RISK AVERSION IS GONE (2026-11-14): the ranking is the window's centre, uncharged. A
+        // header that recorded a nonzero λ cannot be replayed at the ranks it recorded, so say so
+        // once here rather than letting the numbers move in silence.
+        if snap.risk_aversion != 0.0 {
+            tracing::warn!(
+                "engine.json recorded risk_aversion = {} but this build ranks on the window centre \
+                 (λ removed) — a resumed run will not rank the way that header recorded",
+                snap.risk_aversion
+            );
+        }
         // `""` = a header written before the knob, which averaged arithmetically.
         cfg.mean_type = MeanType::parse(&snap.mean_type).unwrap_or(DEFAULT_MEAN_TYPE);
         // One spelling carries both legs: the `ticket_legs` key when the header has one, the
@@ -1230,16 +1231,6 @@ impl RaceConfigBuilder {
     /// How the window's readings are averaged into the ranking centre (`mean_type`).
     pub fn set_fitness_mean_type(mut self, mean_type: MeanType) -> Self {
         self.cfg.mean_type = mean_type;
-        self
-    }
-    /// Risk aversion λ (FIT) — how many window standard deviations a net pays for its own spread,
-    /// so a steady net outranks a volatile one with the same window mean.
-    pub fn set_fitness_risk_aversion(mut self, lambda: f32) -> Self {
-        self.cfg.risk_aversion = if lambda.is_finite() {
-            lambda.max(0.0)
-        } else {
-            RISK_AVERSION
-        };
         self
     }
     /// A user-supplied stop predicate, consulted every step alongside `max_steps`;
@@ -1601,7 +1592,7 @@ impl RaceConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogLevel, RISK_AVERSION, RaceConfig};
+    use super::{LogLevel, RaceConfig};
 
     /// The examples' `--log-level` vocabulary must parse: handed to an `EnvFilter` verbatim, `summ`
     /// would be read as a module name and mute the whole run — this mapping is load-bearing.
@@ -1699,29 +1690,32 @@ mod tests {
         assert!(cfg.validate_search_pools().is_err());
     }
 
-    /// FIT's one knob: the default is the risk-adjusted ranking, `0.0` is the documented OFF switch
-    /// (the pre-FIT plain mean), negatives clamp to `0.0` (no risk-SEEKING ranking exists)
+    /// The ranking has no risk knob: the window score is the family CENTRE, so two nets
+    /// with the same centre tie here regardless of how volatile one of them was.
     #[test]
-    fn risk_aversion_defaults_on_and_clamps_at_off() {
-        // Default: the risk term
-        assert_eq!(RaceConfig::defaults().risk_aversion, RISK_AVERSION);
-        assert!(RISK_AVERSION > 0.0, "the feature ships enabled");
-        let set = |lambda: f32| {
-            RaceConfig::builder()
-                .set_fitness_risk_aversion(lambda)
-                .build()
-                .risk_aversion
-        };
-        // Off is expressible, and it is exactly the plain mean (λ = 0).
-        assert_eq!(set(0.0), 0.0);
-        // A stronger preference passes through unchanged.
-        assert_eq!(set(2.5), 2.5);
-        // Negative = risk-seeking: not offered, clamped to off.
-        assert_eq!(set(-3.0), 0.0);
-        // NaN / ∞ would make every score NaN (or worse, "best" undefined).
-        assert_eq!(set(f32::NAN), RISK_AVERSION);
-        assert_eq!(set(f32::INFINITY), RISK_AVERSION);
-        assert_eq!(set(f32::NEG_INFINITY), RISK_AVERSION);
+    fn the_ranking_score_is_the_centre_with_no_spread_charge() {
+        let cfg = RaceConfig::defaults();
+        let ran = crate::engine::smoothing::rolling_stats_with(
+            &crate::engine::smoothing::RollingBuffer::from_values(
+                5,
+                &[40.0, 500.0, 40.0, 40.0, 40.0],
+            ),
+            cfg.mean_type,
+        )
+        .unwrap();
+        let steady = crate::engine::smoothing::rolling_stats_with(
+            &crate::engine::smoothing::RollingBuffer::from_values(
+                5,
+                &[40.0, 40.0, 40.0, 40.0, 40.0],
+            ),
+            cfg.mean_type,
+        )
+        .unwrap();
+        assert!(
+            steady.score() <= ran.score(),
+            "the calm window is not penalised"
+        );
+        assert_eq!(ran.score(), ran.fam_center, "the score IS the centre");
     }
 
     /// The parent draw defaults to the reference loop's tournament of 2; the tournament arm must

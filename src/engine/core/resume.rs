@@ -5,13 +5,13 @@ use super::*;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct KnobDrift {
-    /// How the log names the knob: `smoothing_window (K)`, `risk_aversion (λ)`, …
+    /// How the log names the knob: `smoothing_window (K)`, `mean_type`, …
     pub(crate) label: &'static str,
     /// The value the run recorded, formatted as the reader will see
     pub(crate) recorded: String,
     /// The value the resume asked
     pub(crate) current: String,
-    /// The setter call that reproduces the record, e.g. `set_fitness_risk_aversion(0.00)`.
+    /// The setter call that reproduces the record, e.g. `set_fitness_mean_type(median)`.
     pub(crate) undo: String,
 }
 
@@ -38,15 +38,6 @@ impl CoreEngine {
             format!(
                 "set_fitness_smoothing_window({})",
                 recorded.smoothing_window
-            ),
-        );
-        push(
-            "risk_aversion (λ)",
-            fmt_cfg(recorded.risk_aversion),
-            fmt_cfg(current.risk_aversion),
-            format!(
-                "set_fitness_risk_aversion({})",
-                fmt_cfg(recorded.risk_aversion)
             ),
         );
         push(

@@ -6,28 +6,23 @@ use super::*;
 impl CoreEngine {
     // ── Smoothed fitness ────────────────────────────────────────────────────
 
-    /// Per-net RISK-ADJUSTED fitness over the live population, in `live_hashes()` order —
-    /// shared input for ranking and `RaceSnapshot` (FIT: the window mean charged `λ` window-stds
+    /// Per-net fitness over the live population, in `live_hashes()` order — shared input for
+    /// ranking and `RaceSnapshot` (the window's family CENTRE, uncharged).
     pub(crate) fn smoothed_fitness_values(&self) -> Vec<f32> {
         // Only nets with a non-empty rolling buffer get a value — a caught-up child
         // qualifies at once, and phantom 0.0 values never drag the mean down.
-        let direction = self.fitness.direction();
-        let lambda = self.config.risk_aversion;
         self.state
             .live_hashes()
             .into_iter()
             .filter_map(|h| self.race_reading_of(&h))
-            .map(|s| s.score(direction, lambda))
+            .map(|s| s.score())
             .collect()
     }
 
-    /// The net's ranking value (FIT): the risk-adjusted window score, `mean ∓ λ·σ` over
-    /// `smoothing_window` step fitnesses — what every ranking decision reads.
+    /// The net's ranking value: the window score (the family CENTRE over
+    /// `smoothing_window` step fitnesses) — what every ranking decision reads.
     pub fn smoothed_fitness_of(&self, hash: &str) -> Option<f32> {
-        let direction = self.fitness.direction();
-        let lambda = self.config.risk_aversion;
-        self.race_reading_of(hash)
-            .map(|s| s.score(direction, lambda))
+        self.race_reading_of(hash).map(|s| s.score())
     }
 
     /// The net's RACE READING with its own error bar: the smoothed mean plus how many
@@ -63,7 +58,6 @@ impl CoreEngine {
     /// best-first. `require_measured` is the eligibility contract (true = ranked_live).
     pub(crate) fn ranked_live_impl(&self, require_measured: bool) -> Vec<(String, f32)> {
         let direction = self.fitness.direction();
-        let lambda = self.config.risk_aversion;
         // `(hash, score, params)`: the size rides along so the comparator below is a pure function
         // of the tuple — ONE map lookup per net instead of two per comparison, and no borrow
         let mut ranked: Vec<(String, f32, i64)> = self
@@ -71,9 +65,7 @@ impl CoreEngine {
             .live_hashes()
             .into_iter()
             .filter_map(|h| match self.race_reading_of(&h) {
-                // FIT: the ranking value is the risk-adjusted score, so a net with a wild window
-                // pays for its spread before it is ever crowned, culled or drawn as a parent.
-                Some(s) if !require_measured || s.n > 0 => Some((h, s.score(direction, lambda))),
+                Some(s) if !require_measured || s.n > 0 => Some((h, s.score())),
                 Some(_) => None,
                 // Never measured: the parent-selection contract counts it as 0.0.
                 None if !require_measured => Some((h, 0.0)),

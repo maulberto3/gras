@@ -48,7 +48,6 @@ impl CoreEngine {
                     // Both are report-only: no ranking, ticket or cull reads them.
                     "fitness_readings": trend.map(|t| t.len()),
                     "fitness_slope": trend.and_then(|t| t.slope()),
-                    "risk_aversion": self.config.risk_aversion,
                     "mean_type": self.config.mean_type.to_string(),
                     "params": state.and_then(|s| s.meta.params),
                     "born": state.map(|s| s.entered_at_step),
@@ -135,11 +134,10 @@ impl CoreEngine {
             // The run seed rides the header: this file outlives the run dir, and the seed
             // one input a later replay cannot reconstruct from the net.
             let md = format!(
-                "**{label} · fitness {} (risk-adjusted) = {:.4} · window {} · λ={:.2} · run seed {} · net seed {}**\n\n{}\n\n{}",
+                "**{label} · fitness {} = {:.4} · window {} · run seed {} · net seed {}**\n\n{}\n\n{}",
                 self.fitness.direction().arrow(),
                 fitness,
                 reading,
-                self.config.risk_aversion,
                 self.header.run_seed,
                 state.net_seed,
                 crate::utils::markdown::topology_markdown(&topo, None),
@@ -298,7 +296,7 @@ impl CoreEngine {
             let ticket_cell = p.map_or_else(|| "—".to_string(), fmt_cfg);
             let spent_cell = spent.map_or_else(|| "—".to_string(), fmt_cfg);
             let md = format!(
-                "**Worst #{} · spent {} · fit (F) {} · ticket p {} · merit {} · age {} clocks · window {} · λ={} · run seed {} · net seed {}**\n\n{}\n\n{}\n\n{}",
+                "**Worst #{} · spent {} · fit (F) {} · ticket p {} · merit {} · age {} clocks · window {} · run seed {} · net seed {}**\n\n{}\n\n{}\n\n{}",
                 rank + 1,
                 spent_cell,
                 fit_cell,
@@ -306,7 +304,6 @@ impl CoreEngine {
                 merit.map_or_else(|| "—".to_string(), fmt_cfg),
                 age,
                 reading,
-                fmt_cfg(self.config.risk_aversion),
                 self.header.run_seed,
                 state.net_seed,
                 WORST_PICK_NOTE,

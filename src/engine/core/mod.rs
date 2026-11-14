@@ -825,10 +825,6 @@ impl CoreEngine {
                     "smoothing_window (K)".to_string(),
                     self.config.smoothing_window.to_string(),
                 ),
-                (
-                    "risk_aversion (λ)".to_string(),
-                    fmt_cfg(self.config.risk_aversion),
-                ),
                 ("mean_type".to_string(), self.config.mean_type.to_string()),
                 (
                     "checkpoint_every".to_string(),
@@ -946,10 +942,6 @@ impl CoreEngine {
             ));
             // The legend: every word and symbol the step lines use, defined ONCE next
             // arithmetic it names.
-            let sign = match self.fitness.direction() {
-                crate::utils::fitness::Direction::Maximize => "−",
-                crate::utils::fitness::Direction::Minimize => "+",
-            };
             let legend = crate::utils::cfy::kv(&[
                 (
                     "numbers".to_string(),
@@ -970,10 +962,9 @@ impl CoreEngine {
                 (
                     "score".to_string(),
                     format!(
-                        "score{} = window avg {} λ × window spread (what the ranking sorts on; the rollup's `±` is the `σ` ACROSS the live scores, not this window spread) · λ={}",
+                        "score{} = the window CENTRE in `{}` (what the ranking sorts on; the rollup's `±` is the `σ` ACROSS the live scores, not one net's window spread). A row's `spread` is printed for diagnosis, not charged",
                         self.fitness.direction().arrow(),
-                        sign,
-                        fmt_cfg(self.config.risk_aversion)
+                        self.config.mean_type
                     ),
                 ),
                 (

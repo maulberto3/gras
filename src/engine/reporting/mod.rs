@@ -51,13 +51,7 @@ impl CoreEngine {
             .filter_map(|h| self.race_reading_of(h))
             .collect();
         let direction = self.fitness.direction();
-        let lambda = self.config.risk_aversion;
-        let fits: Vec<f32> = readings
-            .iter()
-            .map(|r| r.score(direction, lambda))
-            .collect();
-        let windows: Vec<f32> = readings.iter().map(|r| r.mean).collect();
-        let spreads: Vec<f32> = readings.iter().map(|r| r.std).collect();
+        let fits: Vec<f32> = readings.iter().map(|r| r.score()).collect();
         // A window with n = 1 has no observable spread — `WindowStats::std` is 0 by construction
         // there, and printing that 0 as `window spread 0.0000` would claim a steadiness nobody
         let spread_readable = readings.iter().any(|r| r.n > 1);
@@ -78,18 +72,9 @@ impl CoreEngine {
             self.step_rl.label(step_secs)
         };
         // Per-step rollup: Summ = compact one-liner; Minimal = framed table (step 2+).
-        // `Minimal`'s frame restates the window with the plain arithmetic pair (its own cell says
-        // so), so those two legs are kept for it here.
-        let window_avg = avg(&windows);
-        let window_spread = if spread_readable {
-            avg(&spreads)
-        } else {
-            f32::NAN
-        };
-        // The `Summ` line's OWN legs: the FAMILY pair the score is built from (`fam_center` /
-        // `fam_spread`), so `score = window legs` closes in every family. The arithmetic pair
-        // above would not: a median run ranks on `median ∓ λ·1.4826·MAD`, not `mean ∓ λ·σ`
-        // (`smoothing::WindowStats::score`), and the printed identity would be a lie.
+        // The `Summ` line's OWN legs: the FAMILY pair the score is READ from (`fam_center` /
+        // `fam_spread`), so a median run prints its median and MAD, not the arithmetic pair that
+        // belongs to another score. `fam_spread` is diagnostic — nothing is charged.
         let centers: Vec<f32> = readings.iter().map(|r| r.fam_center).collect();
         let fam_spreads: Vec<f32> = readings.iter().map(|r| r.fam_spread).collect();
         let leg_center = avg(&centers);
@@ -122,12 +107,11 @@ impl CoreEngine {
                 leg_center,
                 leg_spread,
                 direction,
-                lambda,
                 self.config.mean_type,
             )
         };
         if self.log_level == crate::engine::config::LogLevel::Minimal {
-            self.log_minimal_table(&trains, &evals, &fits, window_avg, window_spread, step_secs);
+            self.log_minimal_table(&trains, &evals, &fits, step_secs);
         } else {
             info!(
                 "step {} │ nets {} │ loss↓ {} │ {} │ {} │ {}s{}",
@@ -182,8 +166,6 @@ impl CoreEngine {
         trains: &[f32],
         evals: &[f32],
         fits: &[f32],
-        window_mean: f32,
-        window_std: f32,
         step_secs: f32,
     ) {
         let mean = |v: &[f32]| {
@@ -240,14 +222,7 @@ impl CoreEngine {
             // line uses — the two sinks must not disagree.
             format!(
                 "{} │ culls {} │ inserts {}",
-                minimal_score_cell(
-                    fit_m,
-                    &delta(fit_m, Some(pf)),
-                    window_mean,
-                    window_std,
-                    self.fitness.direction(),
-                    self.config.risk_aversion,
-                ),
+                minimal_score_cell(fit_m, &delta(fit_m, Some(pf)), self.fitness.direction()),
                 e.culls,
                 e.inserts,
             ),
@@ -450,16 +425,10 @@ impl CoreEngine {
         // stepped
         let lottery = self.lottery_frame();
         let (table, stats, grid) = self.stop_card(&rows, &plan, &marks, &exam_scores, lottery);
-        let sign = match self.fitness.direction() {
-            crate::utils::fitness::Direction::Maximize => "−",
-            crate::utils::fitness::Direction::Minimize => "+",
-        };
         let baseline = self.stop_baseline(clock);
         // The legend is a TABLE that assigns each column its LETTER and states the relations
         // those letters: `A = mean ∓ λ × spread` is checked against the `fit`, `mean` and `spread`
         let legend_ctx = LegendCtx {
-            sign,
-            lambda: self.config.risk_aversion,
             window: self.config.smoothing_window,
             mean_type: self.config.mean_type,
             legs: self.config.ticket_legs,
@@ -692,9 +661,7 @@ impl CoreEngine {
         // ONE window read for the whole row: the `fit (F)` cell, the `A/B` ratio derived
         // from it and the three window legs printed beside
         let reading = self.race_reading_of(row.hash);
-        let score = reading
-            .map(|r| r.score(self.fitness.direction(), self.config.risk_aversion))
-            .or(row.fit);
+        let score = reading.map(|r| r.score()).or(row.fit);
         // The lottery's three grading numbers, derived ONCE for the three cells that print them;
         // `None` = the lottery did not grade this net (off, exempt, no reading, flat field),
         let parts = row
@@ -731,7 +698,7 @@ impl CoreEngine {
             // rule (`fmt_cell`) instead of a hand-picked `{:.1}` — a 3.5-wide net used to print
             shape.map(|s| fmt_cell(s.dim)).unwrap_or_else(dash),
             // ── how it is RANKED ─────────────────────────────────────── The window's THREE legs,
-            // one column each: `centre ∓ λ·spread` is redoable from the row.
+            // one column each: the pair `F` is the centre of, plus the spread any charge would use.
             // The pair is `fam_center`/`fam_spread` — the SAME pair `WindowStats::score` charges —
             // not the arithmetic `mean`/`std`. Printing the arithmetic pair beside a median score
             // made `F` show ABOVE the `mean` it supposedly came from (the charge is a subtraction
@@ -1002,7 +969,7 @@ impl CoreEngine {
                 &rows.into_iter().map(|(_, _, row)| row).collect::<Vec<_>>(),
             ),
             Some(&format!(
-                "F = the net's smoothed risk-adjusted score (K-reading mean of window avg ∓ λ × window spread, the ranking's number) · M = clocks the net was measured on: real updates + act-only passes (every ticket the coin denied while `train_merit_learn_only` is on) · `F ÷ U` = F ÷ its update count (this debug view only — the final table carries no efficiency column): informational — what one optimizer step bought, so a cheap net reads from an expensive one · field THIS clock drew from: best {} worst {} · T = where the net's SCORE sits between those two bounds as the graded fraction f = the product above (Fm × Um while the U leg is armed, otherwise Fm; Fm = 1 at the BEST end, 0 at the worst — unless the tilt says otherwise, and this run is {}), then paid INSIDE the band — `p = p_min + (p_max − p_min) × f` over [p_min {}, p_max {}] — so the floor is literally the worst-graded net's chance per clock and the ceiling the best-graded one's (Ω retired: the band IS the payout) · the coin is a seeded `fastrand` draw `d ∈ [0,1)` compared to `p`: `d < p` sells the ticket, otherwise the coin withholds the weight UPDATE — with `train_merit_learn_only` on the net still acts and measures on a fresh batch, with it off the clock idles (no train, no eval, nothing measured) · ticket? = yes if THIS clock sells it the weight update; `no` means it did not learn, which with the flag off means it did nothing at all · exempt nets (the born shield) always run and grade 1.00 · idle = clocks the lottery left it idle BEFORE this clock ({} across the run); the step's lottery line names this clock's count",
+                "F = the net's smoothed score (the K-reading window CENTRE, the ranking's number; the window spread is printed but never charged) · M = clocks the net was measured on: real updates + act-only passes (every ticket the coin denied while `train_merit_learn_only` is on) · `F ÷ U` = F ÷ its update count (this debug view only — the final table carries no efficiency column): informational — what one optimizer step bought, so a cheap net reads from an expensive one · field THIS clock drew from: best {} worst {} · T = where the net's SCORE sits between those two bounds as the graded fraction f = the product above (Fm × Um while the U leg is armed, otherwise Fm; Fm = 1 at the BEST end, 0 at the worst — unless the tilt says otherwise, and this run is {}), then paid INSIDE the band — `p = p_min + (p_max − p_min) × f` over [p_min {}, p_max {}] — so the floor is literally the worst-graded net's chance per clock and the ceiling the best-graded one's (Ω retired: the band IS the payout) · the coin is a seeded `fastrand` draw `d ∈ [0,1)` compared to `p`: `d < p` sells the ticket, otherwise the coin withholds the weight UPDATE — with `train_merit_learn_only` on the net still acts and measures on a fresh batch, with it off the clock idles (no train, no eval, nothing measured) · ticket? = yes if THIS clock sells it the weight update; `no` means it did not learn, which with the flag off means it did nothing at all · exempt nets (the born shield) always run and grade 1.00 · idle = clocks the lottery left it idle BEFORE this clock ({} across the run); the step's lottery line names this clock's count",
                 fmt_cfg(best),
                 fmt_cfg(worst),
                 self.lottery_tilt(),
@@ -1222,11 +1189,11 @@ impl CoreEngine {
 
 /// The printed column names, spelled ONCE: the header cell, the legend key, the glyph placement
 /// the CSV header all read these strings, so a rename cannot leave one of them on an old spelling.
-const COL_FIT: &str = "fit (F = mean ∓ λ·spread)";
+const COL_FIT: &str = "fit (F = mean)";
 /// The same column when the run averages in a SIGNED-LOG space (`MeanType::SignedLog`).
-const COL_FIT_SIGNED_LOG: &str = "fit (F = g⁻¹(ḡ ∓ λ·σ̄), g = sign(x)·ln(1+|x|))";
+const COL_FIT_SIGNED_LOG: &str = "fit (F = g⁻¹(ḡ), g = sign(x)·ln(1+|x|))";
 /// The same column for the order-statistic family (`MeanType::Median`).
-const COL_FIT_MEDIAN: &str = "fit (F = median ∓ λ·1.4826·MAD)";
+const COL_FIT_MEDIAN: &str = "fit (F = median)";
 
 /// The header cell for `fit (F)`, in the equation of the family this run averages
 /// ONE function, so the header, the glyph target and the legend key are the same string.
@@ -1245,13 +1212,12 @@ const COL_WINDOW_SPREAD: &str = "spread";
 
 /// The two window legs the field table prints, per family — the pair `F` is built from
 /// (`WindowStats::fam_center` / `fam_spread`). Arithmetic keeps `mean`/`spread`: there the score's
-/// centre IS the mean. The other families print their own centre and spread, so the row redoes its
-/// own `F` (`F = centre ∓ λ·spread`) instead of showing a charge that looks like a bonus.
+/// centre IS the mean. The other families print their own centre and spread, so the row redoes its    /// own `F` (the centre itself) instead of showing a leg the score does not use.
 fn window_cell_columns(mean_type: crate::engine::config::MeanType) -> (&'static str, &'static str) {
     use crate::engine::config::MeanType;
     match mean_type {
         MeanType::Arithmetic => (COL_WINDOW_MEAN, COL_WINDOW_SPREAD),
-        // The header's spelling (`COL_FIT_MEDIAN`): `F = median ∓ λ·1.4826·MAD`.
+        // The header's spelling (`COL_FIT_MEDIAN`): `F = median`.
         MeanType::Median => ("window median", "1.4826·MAD"),
         MeanType::SignedLog => ("window g-avg", "window g-spread"),
     }
@@ -1394,8 +1360,6 @@ const STOP_HEADER_FIXED: &[&str] = &[
 /// Everything the stop-time legend reads, bundled so its rows can be built (and checked
 /// against the header) without a live engine.
 struct LegendCtx<'a> {
-    sign: &'a str,
-    lambda: f32,
     window: usize,
     /// The family the window is averaged in — its header equation and its legend row
     /// picked by this, so the two cannot disagree (`set_fitness_mean_type`).
@@ -1470,31 +1434,27 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         (
             fit_column(ctx.mean_type).to_string(),
             format!(
-                "`F` = {} — the ranking value. This run charges `{} λ × spread` with λ = {} and averages in `{}`. The two window legs to its LEFT are the pair this charge is built from (`fam_center` / `fam_spread`), printed under the family's own names — `mean`/`spread` for `arithmetic`, `window median`/`1.4826·MAD` for `median`, `window g-avg`/`window g-spread` for `signed_log` — so every row redoes its own `F`, and with λ ≥ 0 `F` never sits above the centre it charges. Geometric/harmonic averaging is not offered: their domain excludes a non-positive reading, and a reward or centred fitness can cross zero — `signed_log` is the no-cliff form of the same damping",
+                "`F` = {} — the ranking value: the window's CENTRE in the `{}` family, with NO spread charge (risk aversion was removed 2026-11-14). The spread leg to its left is printed for diagnosis only, so `F ∓ λ × spread` can be re-applied by hand for any λ, but nothing in this build charges it. The two window legs beside it are `fam_center` / `fam_spread` under the family's own names — `mean`/`spread` for `arithmetic`, `window median`/`1.4826·MAD` for `median`, `window g-avg`/`window g-spread` for `signed_log` — so every row redoes its own `F` exactly. Geometric/harmonic averaging is not offered: their domain excludes a non-positive reading, and a reward or centred fitness can cross zero — `signed_log` is the no-cliff form of the same damping",
                 match ctx.mean_type {
-                    crate::engine::config::MeanType::Arithmetic => {
-                        "the window mean, charged for its own spread (`F = mean ∓ λ × spread`)"
-                    }
+                    crate::engine::config::MeanType::Arithmetic => "the window mean",
                     crate::engine::config::MeanType::SignedLog => {
-                        "the window average taken in `g(x) = sign(x)·ln(1+|x|)`, charged `λ` of the spread IN THAT SPACE, then mapped back with `g⁻¹`"
+                        "the window average taken in `g(x) = sign(x)·ln(1+|x|)`, then mapped back with `g⁻¹`"
                     }
                     crate::engine::config::MeanType::Median => {
-                        "the window's weighted MEDIAN, charged `λ × 1.4826 × MAD` (the median absolute deviation, scaled so λ still reads in std-like units) — one fluke cannot move it at all"
+                        "the window's weighted MEDIAN — one fluke cannot move it at all"
                     }
                 },
-                ctx.sign,
-                fmt_cfg(ctx.lambda),
                 ctx.mean_type.as_str(),
             ),
         ),
         (
             COL_SLOPE.to_string(),
-            "`S` — the LEAST-SQUARES slope of this net's own fitness through EVERY reading it ever took, in raw fitness units per READING (the sign follows `direction`: with maximize, `+` is improving). One point per eval pass (`evals (E)`), x = the reading's index 0, 1, 2… — never the clock, because a net the lottery starved has gaps and a clock x-axis would charge those gaps to its slope as if it had been getting worse. NOT charged the `λ × spread` the score takes: `F` is a level, `S` is a direction, and no net can be ranked by where it is going. It also ignores the `K` window on purpose — `K` is a ranking smoother, too short to call a trend — which is why `S` can disagree with `F`'s own recent move. Report-only: no ranking, champion, seat, lottery draw or cull reads it; `champions.json` carries the same number as `fitness_slope` beside `fitness_readings` (the count of readings the line was fit to). Four decimals, and a nonzero trend finer than that prints in exponent form rather than as a `0.0000` that would read as flat. `—` = fewer than two readings, so there is no line to fit".to_string(),
+            "`S` — the LEAST-SQUARES slope of this net's own fitness through EVERY reading it ever took, in raw fitness units per READING (the sign follows `direction`: with maximize, `+` is improving). One point per eval pass (`evals (E)`), x = the reading's index 0, 1, 2… — never the clock, because a net the lottery starved has gaps and a clock x-axis would charge those gaps to its slope as if it had been getting worse. `F` is a level, `S` is a direction, and no net can be ranked by where it is going. It also ignores the `K` window on purpose — `K` is a ranking smoother, too short to call a trend — which is why `S` can disagree with `F`'s own recent move. Report-only: no ranking, champion, seat, lottery draw or cull reads it; `champions.json` carries the same number as `fitness_slope` beside `fitness_readings` (the count of readings the line was fit to). Four decimals, and a nonzero trend finer than that prints in exponent form rather than as a `0.0000` that would read as flat. `—` = fewer than two readings, so there is no line to fit".to_string(),
         ),
         (
             window_cell_columns(ctx.mean_type).0.to_string(),
             format!(
-                "the window's CENTRE in the `{}` family — the number `F` is charged from, over the last `n = min(B, K)` results, K = {}. `arithmetic` prints it as `mean`; `median` prints the weighted median and `signed_log` the average in `g(x) = sign(x)·ln(1+|x|)`, because those are what `F` subtracts `λ × spread` from — a row that printed the arithmetic mean beside a median score showed `F` going UP from a charge that only ever subtracts. `n` gets no column of its own: it only falls short of K for a net born within K clocks of the stop, so it is read off `evals (E)`",
+                "the window's CENTRE in the `{}` family — the number `F` IS, over the last `n = min(B, K)` results, K = {}. `arithmetic` prints it as `mean`; `median` prints the weighted median and `signed_log` the average in `g(x) = sign(x)·ln(1+|x|)`. `n` gets no column of its own: it only falls short of K for a net born within K clocks of the stop, so it is read off `evals (E)`",
                 ctx.mean_type.as_str(),
                 ctx.window
             ),
@@ -1502,8 +1462,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         (
             window_cell_columns(ctx.mean_type).1.to_string(),
             format!(
-                "the spread across those same `n` results, in the SAME family as the centre — `σ` for `arithmetic`, `1.4826 × MAD` for `median`, the g-space spread for `signed_log` — so `F = centre ∓ λ × spread` (λ = {}) redoes the row exactly, and `0.0000` at `n = 1` is a charge of nothing rather than a claim of steadiness. A dash here would make the row's own arithmetic impossible to redo",
-                fmt_cfg(ctx.lambda)
+                "the spread across those same `n` results, in the SAME family as the centre — `σ` for `arithmetic`, `1.4826 × MAD` for `median`, the g-space spread for `signed_log`. DIAGNOSTIC: `F` is the centre and nothing is charged, so this leg is what a reader applies any `centre ∓ λ × spread` from. `0.0000` at `n = 1` means one reading, not steadiness; a dash here would make that re-application impossible",
             ),
         ),
         (
@@ -1672,8 +1631,6 @@ mod stop_legend_tests {
 
     fn ctx() -> LegendCtx<'static> {
         LegendCtx {
-            sign: "−",
-            lambda: 0.5,
             window: 10,
             mean_type: crate::engine::config::MeanType::Arithmetic,
             legs: crate::engine::config::TicketLegs::MostFit,
@@ -1709,14 +1666,13 @@ mod stop_legend_tests {
         );
     }
 
-    /// The window legs print the pair `F` is CHARGED from, so `F` can never sit above its own
-    /// centre column. A median run that printed `mean`/`σ` while charging `λ·1.4826·MAD` showed
-    /// `F` above the `mean` it supposedly came from — a subtraction that read as a bonus.
+    /// The window legs print the pair the score is READ from: `F` IS the family's centre, and the
+    /// spread beside it is the diagnostic any `centre ∓ λ × spread` would use. A median run must
+    /// print the median and the MAD — the arithmetic pair is a different number.
     #[test]
-    fn the_window_legs_are_the_pair_the_charge_is_built_from() {
+    fn the_window_legs_are_the_pair_the_centre_is_read_from() {
         use crate::engine::config::MeanType;
         use crate::engine::smoothing::{RollingBuffer, rolling_stats_with};
-        use crate::utils::fitness::Direction;
         // The window that started it: two good readings and one low one.
         let buf = RollingBuffer::from_values(10, &[0.828125, 0.859375, 0.859375]);
         let stats = rolling_stats_with(&buf, MeanType::Median).unwrap();
@@ -1736,14 +1692,8 @@ mod stop_legend_tests {
             (stats.mean - 0.8490).abs() < 1e-3,
             "the arithmetic mean is a DIFFERENT number, which is why printing it read as a rise"
         );
-        let fit = stats.score(Direction::Maximize, 0.5);
-        assert!(
-            fit <= stats.fam_center + 1e-6,
-            "F {fit} must never sit above the centre {} it charges",
-            stats.fam_center
-        );
-        // And the row's own arithmetic closes on the printed pair.
-        assert!((fit - (stats.fam_center - 0.5 * stats.fam_spread)).abs() < 1e-6);
+        let fit = stats.score();
+        assert_eq!(fit, stats.fam_center, "F is the centre, with no charge");
     }
 
     /// The clock columns are `age (A)` (beside the ticket) and `updates (U) | evals (E)` — `E` holds
@@ -2231,7 +2181,7 @@ fn window_legs(
     use crate::engine::config::MeanType;
     match family {
         MeanType::Arithmetic => ("=", "window avg", "window spread", "spread", ""),
-        // The header's spelling (`COL_FIT_MEDIAN`): `F = median ∓ λ·1.4826·MAD`.
+        // The header's spelling (`COL_FIT_MEDIAN`): `F = median`.
         MeanType::Median => ("=", "window median", "1.4826·MAD", "1.4826·MAD", ""),
         MeanType::SignedLog => (
             "≈",
@@ -2254,16 +2204,9 @@ fn step_score_cell(
     leg_center: f32,
     leg_spread: f32,
     direction: crate::utils::fitness::Direction,
-    lambda: f32,
     family: crate::engine::config::MeanType,
 ) -> String {
-    let (sep, leg, spread_noun, spread_short, note) = window_legs(family);
-    // Maximize charges the spread with a minus, minimize with a plus — the same operator
-    // `WindowStats::score` applies.
-    let sign = match direction {
-        crate::utils::fitness::Direction::Maximize => "−",
-        crate::utils::fitness::Direction::Minimize => "+",
-    };
+    let (sep, leg, spread_noun, _spread_short, note) = window_legs(family);
     // No net read twice ⇒ no observable spread: `—`, never a `0.0000` that reads as steadiness
     // (the same rule the arithmetic pair applies).
     let spread = if leg_spread.is_finite() {
@@ -2272,21 +2215,14 @@ fn step_score_cell(
         "—".to_string()
     };
     format!(
-        "score{} avg {} ± {} (σ over nets) {} {} {} {} {} × {} {} (λ={}) │ {} {} ({} {}){}",
+        "score{} avg {} ± {} (σ over nets) {} {} {} │ {} {}{}",
         direction.arrow(),
         fmt_line(fit_m),
         fit_spread,
         sep,
         leg,
         fmt_line(leg_center),
-        sign,
-        fmt_cfg(lambda),
         spread_noun,
-        spread,
-        fmt_cfg(lambda),
-        leg,
-        fmt_line(leg_center),
-        spread_short,
         spread,
         note,
     )
@@ -2297,33 +2233,16 @@ fn step_score_cell(
 fn minimal_score_cell(
     fit_m: f32,
     fit_delta: &str,
-    window_mean: f32,
-    window_std: f32,
     direction: crate::utils::fitness::Direction,
-    lambda: f32,
 ) -> String {
-    // Maximize charges the spread with a minus, minimize with a plus — the same
-    // operator `WindowStats::risk_adjusted` applies.
-    let sign = match direction {
-        crate::utils::fitness::Direction::Maximize => "−",
-        crate::utils::fitness::Direction::Minimize => "+",
-    };
-    // `n = 1` has no observable spread: the leg prints `—`, never a `0.0000` that would
-    // read as "perfectly steady" off a single reading (the same rule as the log line).
-    let spread = if window_std.is_finite() {
-        fmt_line(window_std)
-    } else {
-        "—".to_string()
-    };
+    // The score is the window centre: there is no charge to spell out, so the cell is the number
+    // plus its delta (the `Minimal` frame has no room for the diagnostic legs, and printing a
+    // charge that does not exist would be worse than printing none).
     format!(
-        "score{} {} = window avg {} {} {} × window spread {}{}",
+        "score{} {}{}",
         direction.arrow(),
         fmt_line(fit_m),
-        fmt_line(window_mean),
-        sign,
-        fmt_cfg(lambda),
-        spread,
-        fit_delta,
+        fit_delta
     )
 }
 
@@ -2361,10 +2280,10 @@ mod tests {
     }
 
     /// A for the `Summ` line: the legs it prints are the FAMILY pair the score came from, so the
-    /// identity closes in every family — not only `arithmetic`.
+    /// row stays readable — but no charge is printed, because the score IS the centre.
     #[test]
     fn the_step_score_cell_prints_the_legs_that_made_the_score() {
-        // Arithmetic: byte-for-byte the spelling the line had before the family legs landed.
+        // Arithmetic: the centre and its σ, with no `λ × spread` charge between them.
         assert_eq!(
             step_score_cell(
                 17.4,
@@ -2372,25 +2291,21 @@ mod tests {
                 18.8,
                 1.05,
                 Direction::Maximize,
-                2.0,
                 crate::engine::config::MeanType::Arithmetic
             ),
-            "score↑ avg 17.4 ± 18.9 (σ over nets) = window avg 18.8 − 2.00 × window spread 1.05 (λ=2.00) │ window avg 18.8 (spread 1.05)"
+            "score↑ avg 17.4 ± 18.9 (σ over nets) = window avg 18.8 │ window spread 1.05"
         );
-        // Minimize charges the spread with a plus, exactly as the ranking does.
+        // Direction no longer changes the arithmetic: there is no charge to sign.
         let minimized = step_score_cell(
             17.4,
             "18.9",
             18.8,
             1.05,
             Direction::Minimize,
-            2.0,
             crate::engine::config::MeanType::Arithmetic,
         );
-        assert!(
-            minimized.contains("= window avg 18.8 + 2.00 × window spread 1.05"),
-            "{minimized}"
-        );
+        assert!(minimized.contains("= window avg 18.8 │"), "{minimized}");
+        assert!(!minimized.contains('λ'), "no charge is named: {minimized}");
         // No net read twice (`leg_spread` = NaN): `—`, never a confident `0.0000`.
         let once = step_score_cell(
             17.4,
@@ -2398,15 +2313,14 @@ mod tests {
             18.8,
             f32::NAN,
             Direction::Maximize,
-            2.0,
             crate::engine::config::MeanType::Arithmetic,
         );
-        assert!(once.contains("× window spread —"), "{once}");
-        assert!(once.ends_with("(spread —)"), "{once}");
+        assert!(once.contains("window spread —"), "{once}");
+        assert!(once.ends_with("│ window spread —"), "{once}");
     }
 
-    /// A median run ranks on `median ∓ λ·1.4826·MAD`: the cell must print THOSE legs, not the
-    /// arithmetic pair, or the `=` beside the score would be false.
+    /// A median run ranks on the median: the cell must print THAT leg, not the arithmetic pair,
+    /// and the spread it prints beside it must be the MAD (diagnostic, never charged).
     #[test]
     fn the_median_step_cell_closes_on_the_median_not_the_mean() {
         use crate::engine::config::MeanType;
@@ -2417,80 +2331,66 @@ mod tests {
             MeanType::Median,
         )
         .unwrap();
-        let fit = stats.score(Direction::Maximize, 2.0);
-        // F = 12 − 2 · 1.4826 · 2 = 6.0696.
-        assert!((fit - 6.0696).abs() < 1e-3, "fit was {fit}");
+        let fit = stats.score();
+        assert!((fit - 12.0).abs() < 1e-3, "F is the centre: {fit}");
         let cell = step_score_cell(
             fit,
             "—",
             stats.fam_center,
             stats.fam_spread,
             Direction::Maximize,
-            2.0,
             MeanType::Median,
         );
         assert!(
-            cell.contains("= window median 12.0 − 2.00 × 1.4826·MAD 2.97"),
+            cell.contains("= window median 12.0 │ 1.4826·MAD 2.97"),
             "{cell}"
         );
-        // The printed legs redo F (2dp rounding is the only loss)...
-        assert!((12.0 - 2.0 * 2.97 - fit).abs() < 0.02, "{cell}");
-        // ...while the arithmetic pair the cell used to print lands ~9.9 away.
+        assert!(!cell.contains('λ'), "no charge is named: {cell}");
+        // The leg the cell prints is the score itself, and the MAD is the diagnostic beside it.
+        assert!((stats.fam_center - fit).abs() < 1e-6, "{cell}");
         assert!(
-            (stats.mean - 2.0 * stats.std - fit).abs() > 9.0,
-            "the arithmetic pair cannot be the printed legs"
+            (stats.mean - fit).abs() > 9.0,
+            "the arithmetic mean cannot be the printed centre"
         );
     }
 
     /// `signed_log` averages in `g`, where `g⁻¹` is nonlinear: the cell reads `≈` and names `g`
     /// rather than claiming an identity it cannot have.
     #[test]
-    fn the_signed_log_step_cell_is_an_approximation_and_says_so() {
+    fn the_signed_log_step_cell_names_the_space_it_averaged_in() {
         let cell = step_score_cell(
             41.2,
             "18.9",
             3.12,
             0.41,
             Direction::Maximize,
-            2.0,
             crate::engine::config::MeanType::SignedLog,
         );
-        assert!(
-            cell.contains("≈ window g-avg 3.12 − 2.00 × window g-spread 0.4100"),
-            "{cell}"
-        );
-        assert!(
-            cell.ends_with("│ window g-avg 3.12 (g-spread 0.4100) · F = g⁻¹(legs)"),
-            "{cell}"
-        );
+        assert!(cell.contains("≈ window g-avg 3.12"), "{cell}");
+        assert!(cell.contains("│ window g-spread 0.4100"), "{cell}");
+        assert!(cell.ends_with("· F = g⁻¹(legs)"), "{cell}");
+        assert!(!cell.contains('λ'), "no charge is named: {cell}");
     }
 
     #[test]
-    fn minimal_score_cell_prints_the_identity_it_was_built_from() {
-        // The worked example from LOG_CLARITY_PLAN.md 3.1: λ = 0.50, population
-        // score 37.4 out of a window level 48.9 with spread 23.0.
-        let cell = minimal_score_cell(37.4, "", 48.9, 23.0, Direction::Maximize, 0.5);
+    fn minimal_score_cell_prints_the_centre_it_ranked() {
+        // The Minimal frame has no room for the diagnostic legs, and there is no charge left to
+        // spell out: the cell is the score itself plus its delta.
+        let cell = minimal_score_cell(37.4, "", Direction::Maximize);
+        assert_eq!(cell, "score↑ 37.4");
+        // A step-over-step delta rides the score it belongs.
+        assert_eq!(cell_with_delta(), "score↑ 37.4 (∆+4.50)");
         assert_eq!(
-            cell,
-            "score↑ 37.4 = window avg 48.9 − 0.50 × window spread 23.0"
-        );
-        // The printed legs close the identity for this run's λ — the reason they
-        // are printed
-        assert!((48.9f32 - 0.5 * 23.0 - 37.4).abs() < 0.05);
-        // A step-over-step delta rides the score it belongs
-        assert!(cell_with_delta().ends_with("× window spread 23.0 (∆+4.50)"));
-        // Minimize charges the spread with a plus, exactly as the ranking does.
-        let minimized = minimal_score_cell(37.4, "", 48.9, 23.0, Direction::Minimize, 0.5);
-        assert!(
-            minimized.contains("window avg 48.9 + 0.50 × window spread 23.0"),
-            "{minimized}"
+            minimal_score_cell(37.4, "", Direction::Minimize),
+            "score↓ 37.4",
+            "the arrow is the only direction-dependent part left"
         );
     }
 
-    /// The delta case for the test above, kept separate so the primary assertion
-    /// reads as one golden string.
+    /// The delta case for the test above, kept separate so the primary assertion reads as one
+    /// golden string.
     fn cell_with_delta() -> String {
-        minimal_score_cell(37.4, " (∆+4.50)", 48.9, 23.0, Direction::Maximize, 0.5)
+        minimal_score_cell(37.4, " (∆+4.50)", Direction::Maximize)
     }
 
     use super::{accounting_population, accounting_rolls, summarize_rows};

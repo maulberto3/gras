@@ -71,8 +71,9 @@ pub struct ConfigSnapshot {
     pub eval_batch_size: Option<usize>,
     /// Per-net fitness smoothing window (K).
     pub smoothing_window: usize,
-    /// Risk aversion λ (FIT) the run ranked with — window stds charged against a net's smoothed
-    /// mean.
+    /// LEGACY: risk aversion λ, REMOVED from the engine on 2026-11-14. New records always write
+    /// `0.0`; the field is kept only so a header that recorded a charge is readable (and can be
+    /// reported by `RaceConfig::from_snapshot`) instead of silently changing what it means.
     #[serde(default)]
     pub risk_aversion: f32,
     /// How the smoothing window was averaged into the ranking centre (`set_fitness_mean_type`:
@@ -243,7 +244,7 @@ impl ConfigSnapshot {
             batch_size,
             eval_batch_size,
             smoothing_window: cfg.smoothing_window,
-            risk_aversion: cfg.risk_aversion,
+            risk_aversion: 0.0,
             mean_type: cfg.mean_type.to_string(),
             device: if cfg!(feature = "cuda") {
                 "cuda:0"
@@ -1838,19 +1839,18 @@ mod tests {
         assert_eq!(again.run_id, "run-2");
     }
 
-    /// FIT legacy contract: a run recorded BEFORE the λ knob carries no
-    /// `risk_aversion` in its `engine.json` — and it ranked on the PLAIN MEAN,
-    /// serde default must be `0.0`, NOT the new default `1.0`. Anything else would
-    /// silently re-rank a resumed legacy run against its recorded history.
+    /// `risk_aversion` is LEGACY: the knob was removed 2026-11-14, so every new record writes
+    /// `0.0`, while a header that carries a charge stays readable so `from_snapshot` can report it
+    /// rather than let the value silently change meaning.
     #[test]
-    fn legacy_config_snapshot_defaults_risk_aversion_to_the_plain_mean() {
+    fn risk_aversion_is_legacy_and_new_records_write_zero() {
         let snapshot =
             ConfigSnapshot::from_config(&crate::engine::config::RaceConfig::defaults(), None, None);
-        assert_eq!(snapshot.risk_aversion, crate::engine::config::RISK_AVERSION);
-        // Round-trips at the new default…
+        assert_eq!(snapshot.risk_aversion, 0.0, "no knob, no charge");
+        // Round-trips as written…
         let json = serde_json::to_string(&snapshot).unwrap();
         let back: ConfigSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.risk_aversion, crate::engine::config::RISK_AVERSION);
+        assert_eq!(back.risk_aversion, 0.0);
         // …and a value JSON with the key REMOVED (exactly a pre-FIT engine.json) loads
         // as λ = 0.0 while every other knob still comes through.
         let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
