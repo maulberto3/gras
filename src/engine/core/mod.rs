@@ -828,18 +828,7 @@ impl CoreEngine {
                     "risk_aversion (λ)".to_string(),
                     fmt_cfg(self.config.risk_aversion),
                 ),
-                (
-                    "window_recency (r)".to_string(),
-                    fmt_cfg(self.config.window_recency),
-                ),
                 ("mean_type".to_string(), self.config.mean_type.to_string()),
-                (
-                    "train_age".to_string(),
-                    match self.config.train_age {
-                        true => "armed".to_string(),
-                        false => "off".to_string(),
-                    },
-                ),
                 (
                     "checkpoint_every".to_string(),
                     self.config.checkpoint_every.to_string(),
@@ -881,16 +870,13 @@ impl CoreEngine {
                     "train_merit_p_max (p_max)".to_string(),
                     fmt_cfg(self.config.train_merit_p_max),
                 ),
-                // Which end of the field the tickets favour, spelled out so a reader
-                // does not have to interpret a bare `false`.
+                // Which NET the ticket favours, on both legs, spelled out so a reader does not
+                // have to interpret a pair of booleans.
                 (
-                    "lottery tilt".to_string(),
-                    if self.config.train_merit_inverted {
-                        "worst-first".to_string()
-                    } else {
-                        "best-first".to_string()
-                    },
+                    "ticket_legs".to_string(),
+                    self.config.ticket_legs.to_string(),
                 ),
+                ("lottery tilt".to_string(), self.lottery_tilt().to_string()),
                 (
                     "feature_split_pool".to_string(),
                     self.config.feature_split_pool_names().join(", "),
@@ -1146,7 +1132,7 @@ impl CoreEngine {
                 let evolve_allowed = self.evolution_allowed(clock);
                 if !evolve_allowed {
                     self.accounting.deferred_clocks += 1;
-                    // THE INIT PROBATION (`set_run_init_probation_steps`) is DECLARED, not
+                    // THE INIT PROBATION (`set_pop_init_probation_steps`) is DECLARED, not
                     // emergent: while the clock is inside it the rolls are withheld by the run's
                     // own arithmetic, so the line names the probation, not the cull shield.
                     if clock < self.config.init_probation_steps {
@@ -1423,12 +1409,12 @@ impl CoreEngine {
             }
             // One lottery field per clock, built BEFORE anyone steps: every net is graded against
             // the same pre-clock readings (order-independent) and the walk over live nets happens
-            let lottery = self.lottery_frame(clock);
+            let lottery = self.lottery_frame();
             // THE COIN NEVER STARVES THE WHOLE GROUP.
             let forced_ticket: Option<(String, f32)> = lottery.and_then(|frame| {
                 let mut best: Option<(String, f32)> = None;
                 for hash in &hashes {
-                    let p = self.train_lottery_p_eff(hash, clock, Some(frame));
+                    let p = self.train_lottery_p_eff(hash, Some(frame));
                     if self.train_lottery_draws_at(hash, clock, p) {
                         return None; // a real ticket exists: nothing to force
                     }
@@ -1448,7 +1434,7 @@ impl CoreEngine {
                     "step {} │ lottery │ every net in the group lost its draw — {} takes the clock on the highest chance (p={}) so the clock is not pinned",
                     clock,
                     &hash[..8.min(hash.len())],
-                    fmt_cfg(self.train_lottery_p_eff(hash, clock, lottery)),
+                    fmt_cfg(self.train_lottery_p_eff(hash, lottery)),
                 );
             }
             // The rollup is the only consumer of the skipped-update tally, so its two O(n) sums

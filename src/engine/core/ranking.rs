@@ -34,7 +34,7 @@ impl CoreEngine {
     /// step readings are behind it and how far apart they were ([`WindowStats`]).
     pub(crate) fn race_reading_of(&self, hash: &str) -> Option<WindowStats> {
         self.rolling_fitness.get(hash).and_then(|buf| {
-            // POLICY-SCOPED FITNESS (`set_run_policy_scoped_fitness`): average only the readings
+            // POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): average only the readings
             // taken on the CURRENT weights — `rolling_epoch` counts them since the net's last real
             // update, so a learner that updates every clock reports ONE datapoint (its value, zero
             // spread) while a net that rarely earns a ticket reports many readings of the same
@@ -49,7 +49,7 @@ impl CoreEngine {
             } else {
                 buf.len()
             };
-            rolling_stats_tail(buf, take, self.config.window_recency, self.config.mean_type)
+            rolling_stats_tail(buf, take, self.config.mean_type)
         })
     }
 

@@ -124,6 +124,9 @@ impl CoreEngine {
                     }
                     // FIT columns, appended LAST so every existing column keeps its position
                     // (positional readers stay valid): the risk-adjusted score this net ranked
+                    // by, then the spread that score CHARGED — the family spread (`fam_spread`),
+                    // so `Δλ × this` equals the `ΔF` the charge moved in every family, not only
+                    // under `arithmetic`.
                     let reading = self.race_reading_of(hash);
                     let score = self.smoothed_fitness_of(hash);
                     row.push(',');
@@ -135,7 +138,7 @@ impl CoreEngine {
                     row.push(',');
                     row.push_str(
                         &reading
-                            .map(|r| r.std.to_string())
+                            .map(|r| r.fam_spread.to_string())
                             .unwrap_or_else(|| "nan".to_string()),
                     );
                     row.push('\n');

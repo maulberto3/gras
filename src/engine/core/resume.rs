@@ -11,7 +11,7 @@ pub(crate) struct KnobDrift {
     pub(crate) recorded: String,
     /// The value the resume asked
     pub(crate) current: String,
-    /// The setter call that reproduces the record, e.g. `set_run_risk_aversion(0.00)`.
+    /// The setter call that reproduces the record, e.g. `set_fitness_risk_aversion(0.00)`.
     pub(crate) undo: String,
 }
 
@@ -35,30 +35,27 @@ impl CoreEngine {
             "smoothing_window (K)",
             recorded.smoothing_window.to_string(),
             current.smoothing_window.to_string(),
-            format!("set_run_smoothing_window({})", recorded.smoothing_window),
+            format!(
+                "set_fitness_smoothing_window({})",
+                recorded.smoothing_window
+            ),
         );
         push(
             "risk_aversion (λ)",
             fmt_cfg(recorded.risk_aversion),
             fmt_cfg(current.risk_aversion),
-            format!("set_run_risk_aversion({})", fmt_cfg(recorded.risk_aversion)),
+            format!(
+                "set_fitness_risk_aversion({})",
+                fmt_cfg(recorded.risk_aversion)
+            ),
         );
         push(
             "policy_scoped_fitness",
             recorded.policy_scoped_fitness.to_string(),
             current.policy_scoped_fitness.to_string(),
             format!(
-                "set_run_policy_scoped_fitness({})",
+                "set_fitness_policy_scoped({})",
                 recorded.policy_scoped_fitness
-            ),
-        );
-        push(
-            "window_recency (r)",
-            fmt_cfg(recorded.window_recency),
-            fmt_cfg(current.window_recency),
-            format!(
-                "set_run_window_recency({})",
-                fmt_cfg(recorded.window_recency)
             ),
         );
         // `""` = a header written before the knob: those runs averaged arithmetically,
@@ -72,13 +69,7 @@ impl CoreEngine {
             "mean_type",
             rec_mean.clone(),
             current.mean_type.to_string(),
-            format!("set_run_mean_type({rec_mean})",),
-        );
-        push(
-            "train_age",
-            if recorded.train_age { "armed" } else { "off" }.to_string(),
-            if current.train_age { "armed" } else { "off" }.to_string(),
-            format!("set_run_train_merit_age({})", recorded.train_age),
+            format!("set_fitness_mean_type({rec_mean})",),
         );
         // `""` = a header written before the knob drew roulette, the default.
         let rec_selection = if recorded.crossover_selection.is_empty() {
@@ -103,24 +94,27 @@ impl CoreEngine {
             "train_merit_p_min (p_min)",
             fmt_cfg(rec_min),
             fmt_cfg(current.train_merit_p_min),
-            format!("set_run_train_merit_p_min({})", fmt_cfg(rec_min)),
+            format!("set_ticket_p_min({})", fmt_cfg(rec_min)),
         );
         push(
             "train_merit_p_max (p_max)",
             fmt_cfg(rec_max),
             fmt_cfg(current.train_merit_p_max),
-            format!("set_run_train_merit_p_max({})", fmt_cfg(rec_max)),
+            format!("set_ticket_p_max({})", fmt_cfg(rec_max)),
         );
-        // Which END of the field the tickets favour. The same idle ledger means
-        // different search under the other order, so it is named like Ω.
+        // Which NET the ticket favours, on BOTH legs. The same idle ledger means a different
+        // search under another leg, so it is named like Ω — and a pre-`ticket_legs` header is
+        // mapped from its two bools, so an old run compares equal when it means the same leg.
+        let rec_legs = crate::engine::config::ticket_legs_from_header(
+            &recorded.ticket_legs,
+            recorded.train_merit_inverted,
+            recorded.train_merit_updates,
+        );
         push(
-            "train_merit inverted",
-            recorded.train_merit_inverted.to_string(),
-            current.train_merit_inverted.to_string(),
-            format!(
-                "set_run_train_merit_inverted({})",
-                recorded.train_merit_inverted
-            ),
+            "ticket_legs",
+            rec_legs.to_string(),
+            current.ticket_legs.to_string(),
+            format!("set_ticket_legs(\"{rec_legs}\")"),
         );
         // The coin's CONSEQUENCE: the same draw writes a different ledger (idle clocks vs act-only
         // spans) and a different fitness series, so a resume under the other value is not the same
@@ -129,23 +123,7 @@ impl CoreEngine {
             "train_merit_learn_only",
             recorded.train_merit_learn_only.to_string(),
             current.train_merit_learn_only.to_string(),
-            format!(
-                "set_run_train_merit_learn_only({})",
-                recorded.train_merit_learn_only
-            ),
-        );
-        // The BORN TICKET decides whether a net's FIRST update is drawn or granted: the same seed
-        // writes a different `U`, a different idle ledger and a different shield life, so a resume
-        // under the other value is not the same run. Recorded default `false` = the pre-flag
-        // contract, so an old header compares equal.
-        push(
-            "train_merit_born_ticket",
-            recorded.train_merit_born_ticket.to_string(),
-            current.train_merit_born_ticket.to_string(),
-            format!(
-                "set_run_train_merit_born_ticket({})",
-                recorded.train_merit_born_ticket
-            ),
+            format!("set_ticket_learn_only({})", recorded.train_merit_learn_only),
         );
         // Crossover's base choice decides WHICH child a roll yields (same draw, different
         // recipient), so adopting the header's value silently would change every birth from here
@@ -225,9 +203,9 @@ impl CoreEngine {
                 current.mutation_cull_policy.to_string(),
             ),
         ] {
-            // `""` = a header written before the field: those runs culled `worst`.
+            // `""` = a header written before the field: those runs culled the lowest fitness.
             let rec = if rec.is_empty() {
-                "worst".to_string()
+                "lowest_fitness".to_string()
             } else {
                 rec
             };
@@ -248,13 +226,13 @@ impl CoreEngine {
             ),
             (
                 "init_probation_steps",
-                "set_run_init_probation_steps",
+                "set_pop_init_probation_steps",
                 recorded.init_probation_steps,
                 current.init_probation_steps,
             ),
             (
                 "recovery_retries",
-                "set_recovery_retries",
+                "set_pop_recovery_retries",
                 recorded.recovery_retries,
                 current.recovery_retries,
             ),
@@ -278,20 +256,12 @@ impl CoreEngine {
                 format!("{setter}({rec})"),
             );
         }
-        for (label, setter, rec, cur) in [
-            (
-                "train_merit_updates",
-                "set_run_train_merit_updates",
-                recorded.train_merit_updates,
-                current.train_merit_updates,
-            ),
-            (
-                "recovery_same_seed",
-                "set_recovery_same_seed",
-                recorded.recovery_same_seed,
-                current.recovery_same_seed,
-            ),
-        ] {
+        for (label, setter, rec, cur) in [(
+            "recovery_same_seed",
+            "set_pop_recovery_same_seed",
+            recorded.recovery_same_seed,
+            current.recovery_same_seed,
+        )] {
             push(
                 label,
                 rec.to_string(),
@@ -301,7 +271,7 @@ impl CoreEngine {
         }
         for (label, setter, rec, cur) in [(
             "recovery_tolerance",
-            "set_recovery_tolerance",
+            "set_pop_recovery_tol",
             recorded.recovery_tolerance,
             current.recovery_tolerance,
         )] {
