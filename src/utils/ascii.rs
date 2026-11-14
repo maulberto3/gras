@@ -163,9 +163,13 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         1usize
     };
 
-    let max_width = 200usize;
+    // The canvas must be as wide as the layout it was computed for: `in_col` / `out_col` below
+    // are NOT clamped, so a narrower canvas either silently drops labels or slices out of
+    // bounds. `MAX_WIDTH` is a safety valve for pathological graphs, not a readability cap —
+    // this render goes into a markdown file, not a console.
+    const MAX_WIDTH: usize = 4096;
     let raw_width = lane_x0 + n_wires * lane_step + 2;
-    let width = raw_width.min(max_width);
+    let width = raw_width.min(MAX_WIDTH).max(1);
 
     let in_col = |q: usize| in_x0 + q * in_step;
     let out_col = |q: usize| out_x0 + q * out_step;
@@ -355,8 +359,10 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         let tgt = in_col(tgt_slot[j]) - 1;
         let lane = (lane_x0 + j * lane_step).min(width - 1);
 
-        // East run from source port to lane
-        for slot in canvas[src_track[j]][(src + 1)..lane.min(width)].iter_mut() {
+        // East run from source port to lane. Both ends are clamped: a column past the canvas
+        // edge was already dropped by `put`, and slicing past it would panic.
+        let east_end = lane.min(width);
+        for slot in canvas[src_track[j]][(src + 1).min(east_end)..east_end].iter_mut() {
             *slot = match *slot {
                 '│' => '┼',
                 ' ' => '─',
@@ -364,8 +370,12 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
             };
         }
 
-        // West run from lane to target port
-        for slot in canvas[tgt_track[j]][(tgt + 1)..lane].iter_mut().rev() {
+        // West run from lane back to the target port, clamped the same way.
+        let west_end = lane.min(width);
+        for slot in canvas[tgt_track[j]][(tgt + 1).min(west_end)..west_end]
+            .iter_mut()
+            .rev()
+        {
             *slot = match *slot {
                 '│' => '┼',
                 ' ' => '─',
@@ -414,4 +424,64 @@ pub(crate) fn edge_list(graph: &Topology) -> String {
         out.push_str(&format!("  {label}{marker}({dist}){tag}\n"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::topology::Port;
+
+    fn node(
+        id: usize,
+        kind: NodeKind,
+        num_inputs: usize,
+        num_outputs: usize,
+        in_wires: usize,
+        out_wires: usize,
+    ) -> AsciiNode {
+        AsciiNode {
+            id,
+            kind,
+            num_inputs,
+            num_outputs,
+            out_dim: Some(2),
+            in_wires,
+            out_wires,
+        }
+    }
+
+    /// A graph whose geometry alone needs more than the old 200-column canvas: 60 input ports
+    /// put `in_col(59)` well past 200, and Phase 3's west run sliced from `tgt + 1` (264) into a
+    /// 200-char row — `range start index ... out of range for slice of length 200`, which killed
+    /// the stop-time topology dump AFTER the race had finished. The layout is the authority on
+    /// width, so the render must cover it instead of truncating to a fixed cap.
+    #[test]
+    fn a_layout_wider_than_two_hundred_columns_renders_without_panicking() {
+        let nodes = [
+            node(0, NodeKind::Input, 1, 60, 1, 60),
+            node(1, NodeKind::Hidden, 60, 1, 60, 1),
+            node(2, NodeKind::Output, 1, 1, 1, 1),
+        ];
+        let mut connections: Vec<Connection> = (0..60)
+            .map(|p| Connection {
+                from: Port { node: 0, index: p },
+                to: Port { node: 1, index: p },
+            })
+            .collect();
+        connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 0 },
+        });
+
+        let out = render_wire_diagram(&nodes, &connections);
+        let widest = out.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(
+            widest > 200,
+            "the canvas must cover the computed layout, not stop at 200 columns (widest {widest})"
+        );
+        assert!(
+            out.lines().count() >= nodes.len() * 3,
+            "every node still gets its box rows"
+        );
+    }
 }

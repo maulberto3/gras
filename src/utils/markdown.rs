@@ -113,11 +113,21 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             } else {
                 sources.join(", ")
             };
+            let in_wires = graph
+                .connections
+                .iter()
+                .filter(|c| c.to.node == node.id)
+                .count();
+            let out_wires = graph
+                .connections
+                .iter()
+                .filter(|c| c.from.node == node.id)
+                .count();
             out.push_str(&format!(
                 "| {id} {kind}{marker} | {kind} | {ni} | {no} | {in_dim} → {out_dim} | {act} | {combine} | {std} | {src_str} |\n",
                 id = i,
-                ni = node.num_inputs,
-                no = node.num_outputs,
+                ni = ports_cell(node.num_inputs, in_wires),
+                no = ports_cell(node.num_outputs, out_wires),
             ));
         }
     } else {
@@ -134,11 +144,21 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             let combine = node.combine_op.map_or("—".into(), |op| format!("{op}"));
             let std = node.standardize.map_or("—".into(), |s| format!("{s}"));
             let (in_dim, out_dim) = graph.node_dims().get(node_id).copied().unwrap_or((0, 0));
+            let in_wires = graph
+                .connections
+                .iter()
+                .filter(|c| c.to.node == node.id)
+                .count();
+            let out_wires = graph
+                .connections
+                .iter()
+                .filter(|c| c.from.node == node.id)
+                .count();
             out.push_str(&format!(
                 "| {id} | {kind} | {ni} | {no} | {act} | {combine} | {std} | {in_dim}→{out_dim} |\n",
                 id = node.id,
-                ni = node.num_inputs,
-                no = node.num_outputs,
+                ni = ports_cell(node.num_inputs, in_wires),
+                no = ports_cell(node.num_outputs, out_wires),
             ));
         }
     }
@@ -159,17 +179,54 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
         // The accounting is the check a reader can do at a glance: `exclusive` is a partition,
         // the rows must add up to exactly one full vector (100%).
         let pct = 100.0 * total as f32 / input_dim as f32;
+        // A partition is a PER-FEATURE claim, so the total cannot prove it: rows `[1,1,0] [0,1,0]`
+        // add up to one full vector yet own feature 1 twice and feature 2 never. Count owners per
+        // feature and let the sentence name the offenders instead of trusting the sum.
+        let owned_by: Vec<usize> = (0..input_dim)
+            .map(|f| {
+                masks
+                    .iter()
+                    .filter(|m| m.get(f).copied().unwrap_or(0) != 0)
+                    .count()
+            })
+            .collect();
+        let shared: Vec<usize> = (0..input_dim).filter(|f| owned_by[*f] > 1).collect();
+        let unowned: Vec<usize> = (0..input_dim).filter(|f| owned_by[*f] == 0).collect();
+        // Capped so a 784-wide vector cannot turn one sentence into a wall of indices.
+        let name_features = |feats: &[usize]| -> String {
+            const CAP: usize = 8;
+            let mut shown: Vec<String> = feats.iter().take(CAP).map(|f| format!("`{f}`")).collect();
+            if feats.len() > CAP {
+                shown.push(format!("… +{}", feats.len() - CAP));
+            }
+            shown.join(", ")
+        };
         // The accounting means something DIFFERENT per policy, so the sentence says what this net's
         // own label makes of it: 100% is a partition, >100% is sharing, <100% is dropped features —
         let accounting = match graph.options.feature_split {
-            Some(FeatureSplitPolicy::Exclusive) => format!(
-                "`exclusive` is a partition, so this must account for exactly **100%** — {}",
-                if total == input_dim {
-                    "it does, every feature is owned by one port."
+            Some(FeatureSplitPolicy::Exclusive) => {
+                if shared.is_empty() && unowned.is_empty() {
+                    "`exclusive` is a partition, so this must account for exactly **100%** — it does: every feature is owned by exactly one port.".to_string()
                 } else {
-                    "it does not, so these rows are not a partition and carry the `inherited` label instead."
+                    let shared_note = if shared.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (first {})", name_features(&shared))
+                    };
+                    let unowned_note = if unowned.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (first {})", name_features(&unowned))
+                    };
+                    format!(
+                        "`exclusive` is a partition, so this must account for exactly **100%** — it does not: {} feature(s) are shared by two or more ports{} and {} feature(s) reach no port{}. A shared feature and an unowned one can cancel out in the total, so a 100% sum cannot prove a partition on its own.",
+                        shared.len(),
+                        shared_note,
+                        unowned.len(),
+                        unowned_note
+                    )
                 }
-            ),
+            }
             Some(FeatureSplitPolicy::Random) => format!(
                 "`random` flips one coin per (port, feature), so **above 100% is normal** (ports share features) and features can be missed entirely — {seen} of {input_dim} are seen by some port here."
             ),
@@ -194,6 +251,22 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             ));
         }
         out.push('\n');
+    } else {
+        // The other half of the consistency rule: a net WITHOUT the gene says so where a net WITH
+        // it lists its rows. The section used to vanish entirely, so "no split" was
+        // indistinguishable from "this file came from a build that did not record one".
+        let input_dim = graph.options.input_dim.unwrap_or(1).max(1);
+        let ports = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Input)
+            .map(|n| n.num_outputs.max(1))
+            .unwrap_or(1);
+        out.push_str("## Feature split\n\n");
+        out.push_str(&format!(
+            "`{}` over **{ports}** Input port(s) — no mask rows are recorded, so every port projects the FULL **{input_dim}**-feature vector and this net carries no split genome (`keeps` = {input_dim} on every port, 100% each). That is the ABSENCE of the gene, not a partition of it: an `exclusive` or `random` split writes one row per port, and those rows cross over with the ports that carry them.\n\n",
+            split_policy_name(graph.options.feature_split)
+        ));
     }
 
     // ── Edge list with distance markers ──
@@ -259,11 +332,26 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("\n| **Input box → second line** | the feature split when the net has one: `split <policy> · <ports>p · <seen>/<n> seen`. Present for ANY policy that carries rows (`exclusive`, `random`, `inherited`); absent for `none`, where every port already carries the full mixed vector — that is the common case, and why the box is usually one line. Per-port rows are in *Feature split* above. |");
     out.push_str("\n| **`—` in `Combine` / `Std`** | no per-node override, so the forward pass uses `Add` / no standardisation. `—` is not a missing gene: it is the gene spelled as its default (the diversity metric folds `None` and `Identity` into one token for the same reason). |");
     out.push_str("\n| **Nodes table → `Sources`** | which output port feeds each input port (`n1_o2` = output 2 of node 1), one entry per port in port order — the `k`-th entry feeds `i<k>`; `*` = an unwired port (never left behind by `finalize`). |");
+    out.push_str("\n| **Nodes table → `In` / `Out` with `(Nw)`** | PORT counts; a parenthesised wire count appears only where the two differ (`Out 2 (3w)` = 2 ports, 3 wires). Only the Input node fans out, so only it can differ — the wiring diagram draws one slot per WIRE, which is why its `Out` slots can outnumber its ports. |");
+    out.push_str("\n| **Nodes table → `In` / `Out`** | PORT counts. Only the Input node can fan out, so only its cell can read `2 (3w)` — two ports carrying three wires, the same numbers the wiring diagram labels `2o→3w` and the edge list shows as a repeated port (`n0_o0` twice). A hidden/output row reads plain numbers because an input port carries exactly one wire. |");
     out.push_str("\n| **Nodes table → `Combine` / `Std`** | how multiple inputs are merged / whether they're normalized first. |");
     out.push_str("\n| **Edge list & wiring diagram** | one line per wire, exact ports (`n0_o1 → n2_i0`); `<<<<` = long jump; `▶ ◀ *` = wired out / wired in / orphaned. |");
     out.push('\n');
 
     out
+}
+
+/// A node's `In` / `Out` cell: the PORT count, annotated with the wire count only when the node
+/// carries MORE wires than ports. That is exactly the Input node's fan-out — `2 (3w)` = two
+/// ports carrying three wires — which is the one case where the table and the wiring diagram's
+/// `2o→3w` label would otherwise look inconsistent. Fewer wires than ports is an ORPHAN port,
+/// drawn `*` in the diagram and named port-by-port by the `Sources` column, so it needs no note.
+fn ports_cell(ports: usize, wires: usize) -> String {
+    if wires > ports {
+        format!("{ports} ({wires}w)")
+    } else {
+        ports.to_string()
+    }
 }
 
 /// Above this `input_dim`, a mask row is printed as kept INDICES instead of a bit
@@ -310,6 +398,20 @@ mod tests {
     use super::*;
     use crate::graph::topology::TopologyOptions;
 
+    /// The topology graph curves its wires like the lineage graph does. Without the init
+    /// directive every viewer picks its own default, and the two diagrams in one card disagreed
+    /// (the lineage's smooth `Δfit` wires above a square-folded topology).
+    #[test]
+    fn the_topology_mermaid_curves_its_wires_like_the_lineage_graph() {
+        let m = super::topology_mermaid(&sample());
+        assert!(m.contains("\"curve\": \"basis\""), "{m}");
+        assert!(
+            m.contains("\nflowchart LR\n"),
+            "the init block only applies under the `flowchart` keyword: {m}"
+        );
+        assert!(!m.contains("graph LR"), "the legacy keyword is gone: {m}");
+    }
+
     fn sample() -> Topology {
         let mut g = Topology::new(
             7,
@@ -322,6 +424,26 @@ mod tests {
         g.create_random_hidden_nodes(3);
         g.finalize();
         g
+    }
+
+    /// The consistency rule: a net WITHOUT the gene names it in the same section a net WITH it
+    /// lists rows, instead of the section vanishing and leaving "no split" indistinguishable from
+    /// "an older file that did not record one".
+    #[test]
+    fn a_net_with_no_feature_split_still_gets_the_section() {
+        let md = topology_markdown(&sample(), None);
+        assert!(
+            md.contains("## Feature split"),
+            "the heading is unconditional: {md}"
+        );
+        assert!(
+            md.contains("no mask rows are recorded"),
+            "and it says why there are no rows: {md}"
+        );
+        assert!(
+            !md.contains("| port | keeps"),
+            "the rows table stays exclusive to nets that carry rows"
+        );
     }
 
     /// The allele the counts used to hide: a split row now names WHICH features it keeps,
@@ -380,6 +502,61 @@ mod tests {
         );
     }
 
+    /// A 100% total is NOT proof of a partition: rows `[1,1,0]` and `[0,1,0]` add up to a full
+    /// 3-wide vector while owning feature 1 twice and feature 2 never. The accounting sentence
+    /// used to read exactly that total and call it a partition.
+    #[test]
+    fn a_hundred_percent_total_does_not_make_an_exclusive_split_a_partition() {
+        use crate::graph::node::Node;
+        use crate::graph::topology::{Connection, Port};
+        let mut g = Topology::new(
+            11,
+            Some(TopologyOptions {
+                input_dim: Some(3),
+                output_dim: Some(1),
+                dropout_prob: 0.0,
+                ..Default::default()
+            }),
+        );
+        g.nodes.push(Node::new_input(0, 2));
+        g.nodes.push(Node::new_hidden(1, 2, 1));
+        g.nodes.push(Node::new_output(2, 1, 1));
+        for (from, to) in [(0, 0), (1, 1)] {
+            g.connections.push(Connection {
+                from: Port {
+                    node: 0,
+                    index: from,
+                },
+                to: Port { node: 1, index: to },
+            });
+        }
+        g.connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 0 },
+        });
+        g.finalize();
+        g.nodes[0].feature_masks = Some(vec![vec![1, 1, 0], vec![0, 1, 0]]);
+        g.options.feature_split = Some(FeatureSplitPolicy::Exclusive);
+
+        let md = topology_markdown(&g, None);
+        assert!(
+            md.contains("3 keeps = 100%"),
+            "the fixture is the trap: the totals DO read 100%:\n{md}"
+        );
+        assert!(
+            !md.contains("it does: every feature is owned by exactly one port"),
+            "a 100% total must not be reported as a partition:\n{md}"
+        );
+        assert!(
+            md.contains("1 feature(s) are shared by two or more ports (first `1`)"),
+            "the shared feature is named:\n{md}"
+        );
+        assert!(
+            md.contains("1 feature(s) reach no port (first `2`)"),
+            "and so is the one left unowned:\n{md}"
+        );
+    }
+
     /// Wide vectors switch to indices, and a mask past the cap says how many it trimmed
     /// rather than silently truncating into a lie about the row.
     #[test]
@@ -408,26 +585,50 @@ mod tests {
         );
     }
 
+    /// The Input node is the ONE fan-out, so its `Out` cell must carry both numbers: the port
+    /// count the topology declares and the wire count the diagram draws. The table printed the
+    /// port count alone, which read as a discrepancy against `2o→3w` and the three `o` labels.
     #[test]
-    fn wiring_diagram_wire_count_equals_port_count() {
-        // `Nw→Mi` on the input side of every box: with one wire per port the two numbers
-        // are the same, which is the visual statement of the invariant.
-        let g = sample();
-        let md = topology_markdown(&g, None);
-        for node in &g.nodes {
-            let in_wires = g
-                .connections
-                .iter()
-                .filter(|c| c.to.node == node.id)
-                .count();
-            assert_eq!(in_wires, node.num_inputs, "n{}", node.id);
-            assert!(
-                md.contains(&format!("{}w→{}i", node.num_inputs, node.num_inputs)),
-                "n{} should be labelled {}w→{}i:\n{md}",
-                node.id,
-                node.num_inputs,
-                node.num_inputs
-            );
+    fn a_fanning_input_names_its_wire_count_beside_its_ports() {
+        use crate::graph::node::Node;
+        use crate::graph::topology::{Connection, Port};
+        let mut g = Topology::new(
+            11,
+            Some(TopologyOptions {
+                input_dim: Some(4),
+                output_dim: Some(2),
+                ..Default::default()
+            }),
+        );
+        g.nodes.push(Node::new_input(0, 2));
+        g.nodes.push(Node::new_hidden(1, 2, 2));
+        g.nodes.push(Node::new_output(2, 1, 1));
+        // Two ports, three wires: port 0 feeds both the hidden and the output node.
+        for (from, to_node, to_index) in [(0usize, 1usize, 0usize), (0, 2, 0), (1, 1, 1)] {
+            g.connections.push(Connection {
+                from: Port {
+                    node: 0,
+                    index: from,
+                },
+                to: Port {
+                    node: to_node,
+                    index: to_index,
+                },
+            });
         }
+
+        let md = topology_markdown(&g, None);
+        assert!(
+            md.contains("| 0 | Input | 0 | 2 (3w) |"),
+            "the fan-out is named where the numbers differ:\n{md}"
+        );
+        assert!(
+            md.contains("PORT counts"),
+            "the legend must explain what the cells are:\n{md}"
+        );
+        assert!(
+            !md.contains("(1w)") && !md.contains("(0w)"),
+            "no annotation where wires do not exceed ports:\n{md}"
+        );
     }
 }

@@ -35,7 +35,13 @@ pub(crate) fn feature_split_cell(graph: &Topology) -> Option<String> {
 /// and can be exported via `mmdc`.
 pub fn topology_mermaid(graph: &Topology) -> String {
     let mut out = String::new();
-    out.push_str("```mermaid\ngraph LR\n");
+    out.push_str("```mermaid\n");
+    // The SAME curve the lineage graph asks for (`lineage.rs`): without an explicit directive every
+    // viewer picks its own default, so one card showed the smooth `Δfit` wires of the birth graph
+    // above a square-folded topology. `basis` is Mermaid's smooth interpolation, and the
+    // `flowchart` keyword is what makes an `init` block apply to the graph at all.
+    out.push_str("%%{init: {\"flowchart\": {\"curve\": \"basis\"}}}%%\n");
+    out.push_str("flowchart LR\n");
     // Per-net hidden-dim range for edge-thickness normalization (min/max
     // interpolate, same spirit as the planned ASCII box sizing).
     let dims: Vec<usize> = graph.nodes.iter().filter_map(|n| n.hidden_dim).collect();
