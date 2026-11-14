@@ -487,9 +487,6 @@ impl CoreEngine {
     ) -> Result<Option<String>> {
         use crate::engine::config::MutationCullPolicy;
         let picked = match self.config.mutation_cull_policy {
-            MutationCullPolicy::InverseFitness => self
-                .select_inverse_proportional_at(clock, roll)?
-                .or_else(|| self.mutation_victim_fallback()),
             MutationCullPolicy::LowestFitness => self.mutation_victim_fallback(),
             // The SAME selector the crossover channel's `Unfed` arm runs: the loop that starves
             // net closes on both channels, so a net the lottery never feeds loses its place
@@ -523,9 +520,9 @@ impl CoreEngine {
             .find(|h| off_probation(h))
     }
 
-    /// One mutation roll: cull a net per `MutationCullPolicy` (worst, fitness-inverse, random,
-    /// lottery arms, lowest-fitness-most-updates) and insert a fully-random immigrant, fresh from
-    /// the current clock.
+    /// One mutation roll: cull a net per `MutationCullPolicy` (worst, random, lottery arms,
+    /// lowest-fitness-most-updates) and insert a fully-random immigrant, fresh from the current
+    /// clock.
     pub(crate) fn evolve_random_immigrant(
         &mut self,
         clock: usize,
@@ -535,8 +532,8 @@ impl CoreEngine {
         if !self.has_cull_eligible() {
             return Ok(None);
         }
-        // Pick a victim per the mutation cull policy (`Worst` default, `InverseFitness`, `Random`);
-        // the probation shield applies in every arm.
+        // Pick a victim per the mutation cull policy (`Worst` default, `Random`, the lottery
+        // arms); the probation shield applies in every arm.
         let Some(victim) = self.select_mutation_victim(clock, roll)? else {
             return Ok(None);
         };
@@ -574,9 +571,6 @@ impl CoreEngine {
         let victim_note = match self.config.mutation_cull_policy {
             crate::engine::config::MutationCullPolicy::LowestFitness => {
                 format!("lowest score of {live_before}")
-            }
-            crate::engine::config::MutationCullPolicy::InverseFitness => {
-                format!("fitness-inverse draw of {live_before}")
             }
             crate::engine::config::MutationCullPolicy::Random => "random draw".to_string(),
             crate::engine::config::MutationCullPolicy::HighestTicketChance => {
@@ -663,60 +657,6 @@ impl CoreEngine {
         // per-individual).
         self.culls += 1;
         Ok(())
-    }
-
-    /// Select a live net inversely-proportionate to smoothed fitness —
-    /// `InverseFitness` arm. Probation nets are excluded; `None` = none.
-    pub(crate) fn select_inverse_proportional_at(
-        &self,
-        clock: usize,
-        roll: usize,
-    ) -> Result<Option<String>> {
-        // The roulette draw comes from the MUTATION roll lane, like the fire check:
-        // same (clock, roll), same lane, no shift when the batch is skipped.
-        let mut rng =
-            fastrand::Rng::with_seed(RollKind::Mutation.seed(self.header.run_seed, clock, roll));
-        let hashes = self.state.live_hashes();
-        if hashes.len() < 2 {
-            return Ok(None);
-        }
-        let direction = self.fitness.direction();
-        // Inverse fitness: weight = (adjusted best) − (adjusted value) ≥ 0 — the worst net gets
-        // largest weight, the best gets zero.
-        let scored: Vec<(String, f32)> = hashes
-            .iter()
-            .filter(|h| !self.on_probation(h))
-            .filter_map(|h| self.smoothed_fitness_of(h).map(|s| (h.clone(), s)))
-            .collect();
-        if scored.len() < 2 {
-            return Ok(None);
-        }
-        let adjusted = |v: f32| match direction {
-            crate::utils::fitness::Direction::Maximize => v,
-            crate::utils::fitness::Direction::Minimize => -v,
-        };
-        let adj_best = scored
-            .iter()
-            .map(|(_, v)| adjusted(*v))
-            .fold(f32::NEG_INFINITY, f32::max);
-        let weights: Vec<(String, f32)> = scored
-            .into_iter()
-            .map(|(h, v)| (h, adj_best - adjusted(v)))
-            .collect();
-        let total: f32 = weights.iter().map(|(_, w)| w).sum();
-        if total <= 0.0 {
-            // All-equal (non-elite) population: uniform draw.
-            let i = rng.usize(0..weights.len());
-            return Ok(weights.into_iter().nth(i).map(|(h, _)| h));
-        }
-        let mut pick = rng.f32() * total;
-        for (h, w) in &weights {
-            pick -= w;
-            if pick <= 0.0 {
-                return Ok(Some(h.clone()));
-            }
-        }
-        Ok(weights.last().map(|(h, _)| h.clone()))
     }
 
     /// Whether a roll of `kind` in this `clock` FIRES, derived

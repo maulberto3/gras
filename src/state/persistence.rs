@@ -31,7 +31,7 @@ pub struct ConfigSnapshot {
     /// Crossover replacement policy (`"worst"` | `"random"`). Crossover-only —
     /// mutation channel has its own knob, recorded just below.
     pub crossover_cull_policy: String,
-    /// Mutation replacement policy (`"worst"` | `"inverse_fitness"` | `"random"`), the channel's
+    /// Mutation replacement policy (`"worst"` | `"random"`), the channel's
     /// own knob — it decides which net a fresh immigrant replaces, so a reader cannot reconstruct
     #[serde(default = "default_mutation_cull_policy")]
     pub mutation_cull_policy: String,
@@ -1725,16 +1725,17 @@ mod tests {
 
     /// Both cull channels reach `engine.json` under their OWN key, with the stable
     /// snake_case spelling (not `Debug` casing): a header is a record a reader parses,
-    /// and `InverseFitness` lowercase would come out as `inversefitness`.
+    /// and a `Debug`-derived `LowestFitnessMostUpdates` would come out as
+    /// `lowestfitnessmostupdates`.
     #[test]
     fn config_snapshot_records_both_cull_policies_in_snake_case() {
         use crate::engine::config::{CrossCullPolicy, MutationCullPolicy, RaceConfig};
         let mut cfg = RaceConfig::defaults();
         cfg.crossover_cull_policy = CrossCullPolicy::Random;
-        cfg.mutation_cull_policy = MutationCullPolicy::InverseFitness;
+        cfg.mutation_cull_policy = MutationCullPolicy::LowestFitnessMostUpdates;
         let snap = ConfigSnapshot::from_config(&cfg, None, None);
         assert_eq!(snap.crossover_cull_policy, "random");
-        assert_eq!(snap.mutation_cull_policy, "inverse_fitness");
+        assert_eq!(snap.mutation_cull_policy, "lowest_fitness_most_updates");
         // …and the default run records the policy it actually culls with —
         // `highest_ticket_chance`, the enum's `#[default]` and the defaults() value.
         let dflt = ConfigSnapshot::from_config(&RaceConfig::defaults(), None, None);

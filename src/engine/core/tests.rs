@@ -3748,7 +3748,7 @@ fn resume_warns_on_a_cull_policy_mismatch_on_both_channels() {
 
     let mut mutp = RaceConfig::defaults();
     mutp.pop_size = 2;
-    mutp.mutation_cull_policy = crate::engine::config::MutationCullPolicy::InverseFitness;
+    mutp.mutation_cull_policy = crate::engine::config::MutationCullPolicy::Random;
     let resumed = resume(mutp).expect("the mutation channel warns on the same terms");
     let drift = resumed.behavioural_drift();
     let row = drift
@@ -3756,7 +3756,7 @@ fn resume_warns_on_a_cull_policy_mismatch_on_both_channels() {
         .find(|d| d.label == "mutation_cull_policy")
         .expect("the mutation channel is named");
     assert_eq!(row.recorded, "highest_ticket_chance");
-    assert!(row.current.to_lowercase().contains("inverse"), "{drift:?}");
+    assert!(row.current.to_lowercase().contains("random"), "{drift:?}");
     assert!(
         row.undo
             .contains("set_mutation_cull_policy(highest_ticket_chance)"),

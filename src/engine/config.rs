@@ -452,9 +452,6 @@ pub enum MutationCullPolicy {
     /// **LowestFitness** — evict the net with the lowest smoothed fitness, deterministically
     /// (mirrors [`CrossCullPolicy::LowestFitness`]).
     LowestFitness,
-    /// **InverseFitness** — a fitness-inverse roulette over non-elite nets (an opt-in:
-    /// the worst net weighs most, the best is never drawn; chance is kept).
-    InverseFitness,
     /// **Random** — evict a uniformly random live net, at the cost of occasionally
     /// losing a good one.
     Random,
@@ -474,7 +471,6 @@ impl std::fmt::Display for MutationCullPolicy {
     /// The STABLE spelling recorded in `engine.json` and the run manifest.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::InverseFitness => "inverse_fitness",
             Self::LowestFitness => "lowest_fitness",
             Self::Random => "random",
             Self::HighestTicketChance => "highest_ticket_chance",
@@ -1001,7 +997,10 @@ impl RaceConfig {
             } else if mcull.contains("lowest_fitness") || mcull.contains("worst") {
                 MutationCullPolicy::LowestFitness
             } else {
-                MutationCullPolicy::InverseFitness
+                // Anything else — including a pre-removal `inverse_fitness` — resumes at
+                // the deterministic arm. The drift row still shows the recorded spelling,
+                // so the policy change is named rather than silent.
+                MutationCullPolicy::LowestFitness
             };
         let selection = snap.crossover_selection.to_ascii_lowercase();
         cfg.crossover_selection = if selection.contains("tournament") {
