@@ -76,7 +76,7 @@ fn main() {
     drop(peeked);
 
     let mut builder = RaceConfig::builder()
-        .set_run_pop_size(POP)
+        .set_pop_size(POP)
         .set_stop_max_steps(steps)
         .set_topology_hidden_dim_range(4, 16)
         .set_topology_input_dim(d_in)
