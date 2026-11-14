@@ -154,7 +154,7 @@ impl BatchStream {
     }
 
     /// The **train** batch for `step`'s `attempt`: `0` is the clock's own pass, `1..` a recovery
-    /// retry on `set_recovery_same_seed(false)`, each one batch further along the permutation. Still
+    /// retry on `set_pop_recovery_same_seed(false)`, each one batch further along the permutation. Still
     /// a pure function of `(run_seed, step, attempt)` — nothing is consumed — so a replay asks again.
     pub fn train_batch_at(
         &self,

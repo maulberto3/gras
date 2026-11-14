@@ -129,7 +129,7 @@ pub struct StepEnv {
     /// schedules without a new config knob or a private counter.
     pub max_steps: Option<usize>,
     /// Retry index INSIDE this clock: `0` = the clock's own pass, `1..` = a recovery retry. Only a
-    /// run with `set_recovery_same_seed(false)` ever hands a non-zero value, so a trainer that keys
+    /// run with `set_pop_recovery_same_seed(false)` ever hands a non-zero value, so a trainer that keys
     /// every draw off `(net_seed, step)` alone replays bit-for-bit under the default. A trainer that
     /// wants the variety arm mixes it in — see [`RunData::train_batch_at`].
     pub attempt: u64,
@@ -159,7 +159,7 @@ impl RunData<'_> {
     }
 
     /// Draw the batch for `step`'s `attempt` — `0` is the clock's own pass, `1..` a recovery retry
-    /// on `set_recovery_same_seed(false)`, each one batch further along the stream.
+    /// on `set_pop_recovery_same_seed(false)`, each one batch further along the stream.
     pub fn train_batch_at(
         &self,
         step: u64,
