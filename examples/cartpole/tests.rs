@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn trainer_wiring_is_recorded_in_the_blob() {
         // Memoryless: the knob is `--obs-memory`, and `none` is the engine as it was.
-        let t = trainer(gras::auto_device(), ObsMemory::None);
+        let t = trainer(gras::auto_device(), ObsMemory::None, true);
         let blob = t.describe().expect("Reinforce describes itself");
         assert_eq!(blob["trainer"], "reinforce");
         // `Signal` is a tagged enum, so the name lives one level down.
@@ -108,6 +108,14 @@ mod tests {
         assert_eq!(blob["max_turns"], MAX_TURNS_PER_MATCH);
         assert_eq!(blob["matches_per_step"], MATCHES_PER_STEP);
         assert_eq!(blob["eval_matches_per_step"], EVAL_MATCHES_PER_STEP);
+        // The exam axis is recorded by name: per clock, so a reading that does not move
+        // means a frozen policy rather than a replayed exam.
+        assert_eq!(blob["exam"], "per_clock");
+        // ...and the flag is the only way to ask for the era exam back.
+        let era = trainer(gras::auto_device(), ObsMemory::None, false)
+            .describe()
+            .expect("Reinforce describes itself");
+        assert_eq!(era["exam"], "era");
         assert_eq!(blob["learning_rate"], LEARNING_RATE);
         assert_eq!(blob["grad_clip"], GRAD_CLIP);
         assert_eq!(blob["challenge_prob"], CHALLENGE_PROB);
@@ -158,6 +166,25 @@ mod tests {
                 assert_ne!(shared, episode_start_seed(net_seed, step, match_i));
             }
         }
+    }
+
+    /// The exam-axis flag: bare `--per-clock-exam` is ON, `false` asks for the era exam,
+    /// and omitting it leaves `main`'s `unwrap_or(true)` in charge.
+    #[test]
+    fn per_clock_exam_flag_parses_both_ways() {
+        let parse = |args: &[&str]| <Cli as clap::Parser>::parse_from(args).per_clock_exam;
+        assert_eq!(
+            parse(&["cartpole"]),
+            None,
+            "no flag ⇒ the example's default"
+        );
+        assert_eq!(parse(&["cartpole", "--per-clock-exam"]), Some(true));
+        assert_eq!(
+            parse(&["cartpole", "--per-clock-exam", "false"]),
+            Some(false),
+            "the era exam is opt-in"
+        );
+        assert_eq!(parse(&["cartpole", "--per-clock-exam", "true"]), Some(true));
     }
 
     /// The challenge forced-action draw is a pure fn of (net_seed, step): replay

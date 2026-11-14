@@ -18,8 +18,9 @@ mod cli {
     //! Shared CLI surface for the long-running example.
     //!
     //! [`EngineArgs`] / [`RlEngineArgs`] carry the fuller engine surface
-    //! (`--log-level`, `--seed`, `--risk-aversion`, `--train-merit`,
-    //! `--founders-from`, the evolution knobs, …) for `mnist`. `cartpole`
+    //! (`--log-level`, `--seed`, `--risk-aversion`, the `--merit-p-min` /
+    //! `--merit-p-max` band, `--founders-from`, the evolution knobs, …)
+    //! for `mnist`. `cartpole`
     //! declares its own `Cli` struct and does not include this module.
     //!
     //! ```text
@@ -67,11 +68,41 @@ mod cli {
         #[arg(long, value_name = "LAMBDA", visible_alias = "risk-based")]
         pub risk_aversion: Option<f32>,
 
-        /// Train-eval lottery strength Ω: `0` (default) = off, every net trains;
-        /// `1` = the full merit tilt; between = that fraction of the withholding.
-        /// Replay-relevant — a resume must use the recorded value.
-        #[arg(long, value_name = "OMEGA")]
-        pub train_merit: Option<f32>,
+        /// Lottery FLOOR `p_min` (`set_ticket_p_min`, crate default 0.05): the chance
+        /// the WORST-graded net is paid each clock. The band `p_min..p_max` IS the payout (Ω
+        /// retired), so this is a literal per-clock probability, not a blend: `0` starves the
+        /// bottom of the field, and `p_min == p_max` pays every graded net the same.
+        #[arg(long, value_name = "P")]
+        pub merit_p_min: Option<f32>,
+
+        /// Lottery CEILING `p_max` (`set_ticket_p_max`, crate default 0.4): the chance
+        /// the BEST-graded net is paid each clock; every net in between is interpolated by the
+        /// graded fraction (`Fm`, times the updates leg `ticket_legs` names). It is the one dial
+        /// that LOWERS ticket volume.
+        #[arg(long, value_name = "P")]
+        pub merit_p_max: Option<f32>,
+
+        /// The lottery's LEGS (`set_ticket_legs`, default `least_fit_fewest_updates`): which fit
+        /// place earns the most tickets and which side of the updates field it multiplies in.
+        /// `--ticket-legs most_fit_fewest_updates` walks the field best-first instead.
+        #[arg(
+            long,
+            value_name = "LEGS",
+            value_parser = [
+                "most_fit",
+                "most_fit_fewest_updates",
+                "most_fit_most_updates",
+                "least_fit_fewest_updates",
+                "least_fit_most_updates",
+                "least_fit"
+            ]
+        )]
+        pub ticket_legs: Option<String>,
+
+        /// INIT PROBATION (`set_pop_init_probation_steps`, default 0): opening clocks with no
+        /// culls and no births — evolution starts at clock `N`.
+        #[arg(long, value_name = "N")]
+        pub init_probation: Option<usize>,
 
         /// Seed the founder batch from the newest compatible previous experiment's
         /// elites instead of drawing fresh topologies. Bare flag = look in
@@ -125,17 +156,22 @@ mod cli {
         #[arg(long, value_name = "DIR")]
         pub run_dir: Option<PathBuf>,
 
-        /// Who an admitted crossover child evicts: `worst` (default, merit-based)
-        /// or `random` (keeps slots turning over). Mutation victims are always
-        /// fitness-inverse and ignore this.
+        /// Who an admitted crossover child evicts: `lowest_fitness` (plain lowest
+        /// smoothed fitness), `highest_ticket_chance` (the net the lottery pays MOST —
+        /// the highest `p`, so the least fit and least trained), `lowest_fitness_most_updates`
+        /// (the lowest-fitness net that has ALREADY spent its updates — evidence, not the
+        /// coin's next draw) or `random`. Mutation victims follow
+        /// `--mutation-cull-policy` and ignore this.
         #[arg(long, value_name = "POLICY")]
         pub crossover_cull_policy: Option<String>,
 
-        /// Mutation victim policy for the mutation/immigrant channel: `inverse`
-        /// (default, fitness-inverse roulette), `worst` (deterministic worst by
-        /// smoothed fitness), `random` (uniform, keeps slots turning over), or
-        /// `unfed` (the net the train-eval lottery starves — same selector the
-        /// crossover channel's `--crossover-cull-policy unfed` uses).
+        /// Mutation victim policy for the mutation/immigrant channel: `lowest_fitness`
+        /// (deterministic lowest smoothed fitness), `inverse_fitness` (fitness-inverse
+        /// roulette), `random` (uniform), `highest_ticket_chance` (the net the train-eval
+        /// lottery pays most — same selector the crossover channel's
+        /// `--crossover-cull-policy highest_ticket_chance` uses) or
+        /// `lowest_fitness_most_updates` (the lowest-fitness net that has already spent its
+        /// updates, `Fm⁻ × (1 − Um)`).
         /// Only fires when a mutation roll fires (see `--mutate-prob`).
         #[arg(long, value_name = "POLICY")]
         pub mutation_cull_policy: Option<String>,
@@ -151,10 +187,10 @@ mod cli {
         #[arg(long)]
         pub no_elite_save: bool,
 
-        /// Anti-devolution A: top-champion_count nets act-and-measure without
-        /// weight updates (default on). Pass --no-freeze-elites to let elites
-        /// keep training.
-        #[arg(long = "no-freeze-elites", action = clap::ArgAction::SetFalse)]
+        /// Anti-devolution A: hold the top `champion_count` nets out of the weight update
+        /// (they still act, score and sire). The example's default is OFF, exactly like
+        /// cartpole's — pass `--freeze-seats` to turn the crown ON.
+        #[arg(long)]
         pub freeze_seats: bool,
     }
 
@@ -206,7 +242,7 @@ mod cli {
         /// left `None` keeps the example's own default (set by its const panel).
         pub fn apply(&self, mut b: RaceConfigBuilder) -> RaceConfigBuilder {
             if let Some(pop) = self.pop {
-                b = b.set_run_pop_size(pop);
+                b = b.set_pop_size(pop);
             }
             if let Some(steps) = self.max_steps {
                 b = b.set_stop_max_steps(steps);
@@ -218,10 +254,24 @@ mod cli {
                 b = b.set_run_checkpoint_every(n);
             }
             if let Some(lambda) = self.risk_aversion {
-                b = b.set_run_risk_aversion(lambda);
+                b = b.set_fitness_risk_aversion(lambda);
             }
-            if let Some(omega) = self.train_merit {
-                b = b.set_run_train_merit(omega);
+            // The band IS the payout (Ω retired), so the two ends are ordinary flags and there is
+            // no strength to fold: what a run sets here is the chance it pays.
+            if let Some(p) = self.merit_p_min {
+                b = b.set_ticket_p_min(p);
+            }
+            if let Some(p) = self.merit_p_max {
+                b = b.set_ticket_p_max(p);
+            }
+            if let Some(legs) = &self.ticket_legs {
+                b = b.set_ticket_legs(
+                    gras::engine::config::TicketLegs::parse(legs)
+                        .unwrap_or(gras::engine::config::DEFAULT_TICKET_LEGS),
+                );
+            }
+            if let Some(k) = self.init_probation {
+                b = b.set_pop_init_probation_steps(k);
             }
             if let Some(dir) = &self.founders_from {
                 b = b
@@ -260,16 +310,27 @@ mod cli {
             if let Some(name) = &self.run_name {
                 b = b.set_run_name(name.clone());
             }
+            // The flag and the builder agree on OFF, so this can only ever turn the crown
+            // ON. It used to be a NEGATIVE flag (`--no-freeze-elites`, clap `SetFalse`,
+            // i.e. default `true`) applied unconditionally here, which silently overwrote
+            // the example's `set_seat_freeze(false)` on every run.
             b = b.set_seat_freeze(self.freeze_seats);
             if let Some(policy) = &self.crossover_cull_policy {
                 b = b.set_crossover_cull_policy(
                     match policy.trim().to_ascii_lowercase().as_str() {
-                        "worst" => gras::engine::config::CrossCullPolicy::Worst,
+                        "lowest_fitness" | "worst" => {
+                            gras::engine::config::CrossCullPolicy::LowestFitness
+                        }
                         "random" => gras::engine::config::CrossCullPolicy::Random,
-                        "unfed" => gras::engine::config::CrossCullPolicy::Unfed,
+                        "highest_ticket_chance" | "unfed" => {
+                            gras::engine::config::CrossCullPolicy::HighestTicketChance
+                        }
+                        "lowest_fitness_most_updates" | "spent" => {
+                            gras::engine::config::CrossCullPolicy::LowestFitnessMostUpdates
+                        }
                         other => {
                             eprintln!(
-                                "--crossover-cull-policy {other}: expected `worst` or `random`"
+                                "--crossover-cull-policy {other}: expected `lowest_fitness`, `random`, `highest_ticket_chance`, or `lowest_fitness_most_updates`"
                             );
                             std::process::exit(2);
                         }
@@ -281,12 +342,19 @@ mod cli {
                 "inverse" | "inverse-fitness" => {
                     gras::engine::config::MutationCullPolicy::InverseFitness
                 }
-                "worst" => gras::engine::config::MutationCullPolicy::Worst,
+                "lowest_fitness" | "worst" => {
+                    gras::engine::config::MutationCullPolicy::LowestFitness
+                }
                 "random" => gras::engine::config::MutationCullPolicy::Random,
-                "unfed" => gras::engine::config::MutationCullPolicy::Unfed,
+                "highest_ticket_chance" | "unfed" => {
+                    gras::engine::config::MutationCullPolicy::HighestTicketChance
+                }
+                "lowest_fitness_most_updates" | "spent" => {
+                    gras::engine::config::MutationCullPolicy::LowestFitnessMostUpdates
+                }
                 other => {
                     eprintln!(
-                        "--mutation-cull-policy {other}: expected `inverse`, `worst`, `random`, or `unfed`"
+                        "--mutation-cull-policy {other}: expected `lowest_fitness`, `inverse`, `random`, `highest_ticket_chance`, or `lowest_fitness_most_updates`"
                     );
                     std::process::exit(2);
                 }
@@ -355,9 +423,9 @@ const DATA_DIR: &str = "data/mnist";
 // Compare `examples/cartpole.rs` (same shape, `RlStep`).
 
 const LEARNING_RATE: f32 = 1e-3;
-const GRAD_CLIP: f32 = 1.0;
-const BATCH_SIZE: usize = 64;
-const EVAL_BATCH_SIZE: usize = 256;
+const GRAD_CLIP: f32 = 2.0;
+const BATCH_SIZE: usize = 32;
+const EVAL_BATCH_SIZE: usize = 64;
 const LABEL_SMOOTHING: f32 = 0.1;
 /// Peak input jitter std on a challenge step. Scaled by `1 − last_accuracy`,
 /// so a weak net explores hard and a strong net is barely disturbed.
@@ -562,7 +630,6 @@ const LOG_LEVEL: LogLevel = LogLevel::Summ;
 /// that is steadily 0.90 outranks one alternating 0.80 and 1.00. `0.0` ranks on
 /// the plain window mean.
 const RISK_AVERSION: f32 = 0.5;
-const TRAIN_LOTTERY: f32 = 0.75;
 
 /// The CLI is an OVERLAY on the consts, never a second source of truth: the
 /// shared engine surface ([`cli::EngineArgs`] — pop/steps/seed/λ/Ω/founders,
@@ -657,25 +724,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_run_log_level(LOG_LEVEL)
         .set_run_checkpoint_every(CHECKPOINT_EVERY)
         .set_run_csv_export(true) // history.csv + attempts.csv
-        .set_run_pop_size(pop)
+        .set_pop_size(pop)
+        // --- POP guards (the same knobs cartpole's showcase arms) ---
+        // RECOVERY: a reading that collapses by more than `tol` (relative) from the net's own
+        // standing is re-run inside the SAME clock, up to `retries` extra updates, so one unlucky
+        // batch cannot get a good net culled. `same_seed = false` lets the retry draw a fresh one.
+        .set_pop_recovery_retries(5)
+        .set_pop_recovery_tol(0.2)
+        .set_pop_recovery_same_seed(false)
+        // INIT PROBATION: the opening clocks evolve nothing — no culls, no births — so the
+        // founders are judged on draws every net shares instead of one lucky clock.
+        .set_pop_init_probation_steps(5)
         .set_run_metrics(metrics)
-        .set_run_smoothing_window(10)
-        .set_run_risk_aversion(RISK_AVERSION)
-        .set_run_train_merit(TRAIN_LOTTERY)
+        .set_fitness_smoothing_window(10)
+        .set_fitness_risk_aversion(RISK_AVERSION)
+        // The averaging FAMILY: `F = centre ∓ λ·spread` in that family's space. `median` charges
+        // `λ · 1.4826 · MAD` (one fluke reading cannot move a net); `arithmetic` is the crate
+        // default, and the one whose printed legs are literally `mean ∓ λ·σ`.
+        .set_fitness_mean_type(gras::engine::config::MeanType::Median)
+        // POLICY-SCOPED fitness (crate default `false`): RL-only in practice — a supervised clock
+        // that measures IS an update, so scoping here would pin every net to `n = 1` (newest
+        // reading, no spread) instead of its K-reading window.
+        .set_fitness_policy_scoped(true)
         //
         .set_stop_max_steps(max_steps)
+        // STOP (custom): the one stop rule besides the step budget — consulted every clock, and
+        // `true` ends the race with reason `Custom`. `best_smoothed_fitness` is F (the
+        // risk-adjusted accuracy this run RANKS on, so λ = 0.5 makes it sit below the raw
+        // accuracy), which is why the bar is 0.85 rather than 0.85 of raw accuracy. `max_steps`
+        // stays the ceiling for a run that never gets there.
+        .set_stop_custom(|snap| snap.best_smoothed_fitness > 0.85)
         //
         .set_crossover_rolls(pop / 30)
         .set_crossover_prob(0.5)
-        .set_crossover_cull_policy(CrossCullPolicy::Worst)
+        .set_crossover_cull_policy(CrossCullPolicy::LowestFitness)
         .set_crossover_probation_steps(5)
         .set_crossover_selection(SelectionMethod::Tournament { tournament_size: 2 })
+        // --- Lottery (the per-clock ticket; Ω retired) ---
+        // `p = p_min + (p_max − p_min) × Fm⁻ × Um`: the band IS the payout, and the shipped legs
+        // are `least_fit_fewest_updates` (the least fit, fewest updates net pays most). Set at the
+        // crate defaults here; `--merit-p-min` / `--merit-p-max` / `--ticket-legs` are the dials.
+        .set_ticket_p_min(0.05)
+        .set_ticket_p_max(0.95)
+        .set_ticket_legs(gras::engine::config::DEFAULT_TICKET_LEGS)
+        // LEARN-ONLY (crate default `false`): `true` keeps a denied net ACTING and MEASURING and
+        // withholds only the weight write. Supervised has no act-only pass, so a denied ticket
+        // idles the net outright — the pre-flag contract.
+        .set_ticket_learn_only(true)
         // --- Mutation (both modes) ---
         .set_mutate_rolls(pop / 30)
-        .set_mutation_cull_policy(MutationCullPolicy::Worst)
+        .set_mutation_cull_policy(MutationCullPolicy::LowestFitness)
         .set_mutate_prob(0.5) // per-roll chance a random immigrant is inserted
         .set_mutation_probation_steps(5)
-        .set_mutation_novelty_min(0.2) // Δ ≥ 0.2 from the nearest blueprint; 0 = the gate off
+        .set_mutation_novelty_min(0.3) // Δ ≥ 0.2 from the nearest blueprint; 0 = the gate off
         .set_mutation_novelty_draws(5) // candidates one mutation may spend before taking the best
         // --- Challenge (anti-plateau): TRAINER-owned since 2026-10-10 —
         // `CHALLENGE_PROB` lives on the trainer and rolls inside `train_step`
@@ -686,26 +787,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_topology_max_hidden_num_nodes(15)
         .set_topology_min_inputs_per_node(2)
         .set_topology_max_inputs_per_node(15)
+        // A HIDDEN node's own fan-out (2..15, the same bound as its fan-in above), so a node is
+        // never born with a single outgoing wire and "width" means what the census column says.
+        .set_topology_min_outputs_per_node(2)
+        .set_topology_max_outputs_per_node(15)
+        // DRIFT: a crossover child inherits its parents' genes EXACTLY at 0.0; 0.05 re-draws a
+        // small share of them, so crossover is not a pure cut-and-paste.
+        .set_topology_drift(0.1)
         .set_topology_input_dim(d_in)
         .set_topology_output_dim(d_out)
         .set_topology_hidden_dim_range(16, 64)
         .set_topology_hidden_dim_stride(16)
-        .set_topology_dropout_prob(0.25)
+        .set_topology_dropout_prob(0.20)
         // .set_topology_combine_op_pool(COMBINE_OPS)
         // .set_topology_activation_pool(ACTIVATIONS)
         // .set_topology_standardize_op_pool(STANDARDIZE_OPS)
         // .set_topology_feature_split(FEATURE_SPLIT)
+        .set_topology_feature_split_pool(["random"])
         // --- Exports ---
         // --- Evolution: the elite/founder rules (mode-agnostic) ---
-        .set_seat_freeze(true)
-        .set_champion_count(pop / 10)
-        .set_champion_previous_load(true) // on by default
+        .set_seat_freeze(false) // cartpole's choice: a seated elite still scores, ranks and sires
+        // (the `--freeze-seats` flag is OFF by default, so this is what a plain run gets)
         .set_seat_join_probation_steps(5)
         .set_seat_lifetime_steps(5)
-        .set_champion_save_topology(true);
+        .set_champion_count(pop / 10)
+        .set_champion_previous_load(true) // on by default
+        .set_champion_save_topology(true)
+        .set_worst_save_topology(true); // worst-<hash>-<fitness>.md + the worst.md index
     // Every CLI flag is an OVERLAY: a user-passed value wins, anything unset
-    // keeps the const above. This is also where `--history-flush`, `--train-merit`
-    // and `--founders-from` become engine config instead of being silently dropped.
+    // keeps the const above. This is also where `--history-flush`, the `--merit-p-min` /
+    // `--merit-p-max` band and `--founders-from` become engine config instead of being
+    // silently dropped.
     let config = cli.engine.apply(builder).build();
 
     // ── STEP D — run. The `Final field` table is the report; there is no exam after it.
