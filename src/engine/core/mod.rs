@@ -89,6 +89,9 @@ pub struct CoreEngine {
     pub(crate) rolling_fitness: HashMap<String, RollingBuffer>,
     pub(crate) rolling_train: HashMap<String, RollingBuffer>,
     pub(crate) rolling_eval: HashMap<String, RollingBuffer>,
+    /// Per-net WHOLE-RUN fitness trend — the least-squares line over every reading the net took
+    /// (`smoothing::ReadingTrend`). Report-only: nothing ranks, draws a ticket or culls on it.
+    pub(crate) rolling_trend: HashMap<String, crate::engine::smoothing::ReadingTrend>,
     /// Readings pushed since the net's last REAL weight update — the epoch a policy-scoped fitness
     /// window averages over. A missing entry (a test pushing straight into the buffer) reads the WHOLE buffer,
     /// which is the flag-off behaviour, so no caller can silently get an empty window.
@@ -115,9 +118,6 @@ pub struct CoreEngine {
     /// Children born per step clock — disambiguates same-clock siblings across
     /// evolution rounds, so same-clock children derive distinct seeds.
     pub(crate) children_born_at_clock: HashMap<usize, usize>,
-    /// Anti-devolution A: the nets holding the freeze crown — the seats the elite gate
-    /// dealt, a SUBSET of the count-top nets; tracked so crown lines fire on transitions.
-    pub(crate) frozen_crown: std::collections::HashSet<String>,
     /// `Minimal` mode: last step's population means (train, eval, fitness)
     /// framed table can show what changed. `None` until the first render.
     pub(crate) minimal_prev_means: Option<(f32, f32, f32)>,
@@ -186,6 +186,7 @@ impl CoreEngine {
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
             rolling_epoch: HashMap::new(),
+            rolling_trend: HashMap::new(),
             last_ticket_p: HashMap::new(),
             started_at_wall: std::time::Instant::now(),
             elapsed_base_secs: 0,
@@ -194,7 +195,6 @@ impl CoreEngine {
             accounting: crate::state::RunAccounting::default(),
             initial_population_counted: false,
             children_born_at_clock: HashMap::new(),
-            frozen_crown: std::collections::HashSet::new(),
             minimal_prev_means: None,
             history_csv_buffer: String::new(),
             attempts_csv_buffer: String::new(),
@@ -583,6 +583,7 @@ impl CoreEngine {
             rolling_train: HashMap::new(),
             rolling_eval: HashMap::new(),
             rolling_epoch: HashMap::new(),
+            rolling_trend: HashMap::new(),
             last_ticket_p: HashMap::new(),
             started_at_wall: std::time::Instant::now(),
             elapsed_base_secs: 0,
@@ -595,7 +596,6 @@ impl CoreEngine {
             step_rl: RlVolume::default(),
             total_train_turns: 0,
             champions: Vec::new(),
-            frozen_crown: std::collections::HashSet::new(),
             minimal_prev_means: None,
             log_level,
             interrupt_flag: None,
@@ -707,6 +707,7 @@ impl CoreEngine {
                 RollingBuffer::new(self.config.smoothing_window),
             );
             self.rolling_epoch.insert(hash.clone(), 0);
+            self.rolling_trend.insert(hash.clone(), Default::default());
             self.state.insert(state, initial_fitness);
         }
         let count = self.state.live_count();
@@ -855,10 +856,6 @@ impl CoreEngine {
                     self.config.champion_count.to_string(),
                 ),
                 (
-                    "freeze_seats".to_string(),
-                    self.config.freeze_seats.to_string(),
-                ),
-                (
                     "train_merit_learn_only".to_string(),
                     self.config.train_merit_learn_only.to_string(),
                 ),
@@ -938,14 +935,6 @@ impl CoreEngine {
                 (
                     "crossover_probation_steps",
                     self.config.crossover_probation_steps.to_string(),
-                ),
-                (
-                    "seat_join_probation_steps",
-                    self.config.seat_join_probation_steps.to_string(),
-                ),
-                (
-                    "seat_lifetime_steps",
-                    self.config.seat_lifetime_steps.to_string(),
                 ),
             ] {
                 manifest.push((k.to_string(), v));
@@ -1391,9 +1380,6 @@ impl CoreEngine {
                 ));
                 return Ok(StopReason::MaxSteps);
             }
-            // 1-pre. KISS crown: the crown IS the elite take(k) set, recomputed fresh
-            // step (refresh_crown prints the freeze/dethrone diffs up front).
-            self.refresh_crown(clock);
             // 1a.
             if self.trainer.wants_pop_phase() {
                 // One pass over the map — multiple get_mut borrows stored
@@ -1516,8 +1502,8 @@ impl CoreEngine {
                 let vitals = self.step_vitals(&hashes, lottery_skips, idled_skips);
                 info!("step {} │ {}", clock, step_rollup_line(&vitals));
             }
-            // The who-line rides the LOTTERY's gate, not the rollup's: a run with the elite crown
-            // off (`freeze_seats = false`) still reports which nets got no ticket.
+            // The who-line rides the LOTTERY's gate, not the rollup's: every run that arms the
+            // coin reports which nets got no ticket.
             if lottery_line_on {
                 if let Some(frame) = lottery {
                     // The Summ view is the aggregate: `p̄` vs the realized `won`,
@@ -1703,16 +1689,14 @@ impl CoreEngine {
 /// function of this clock's counts — named fields, so the wording is testable.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StepVitals {
-    /// Nets that RAN the trainer this clock: an update, or the crown's act-and-measure
-    /// pass. Nets the lottery denied a ticket are NOT in here — they idled.
+    /// Nets that RAN the trainer this clock: an update or an act-only pass. Nets the lottery
+    /// denied a ticket whose clock IDLED are not in here.
     pub stepped: usize,
     /// Nets that got a REAL weight update (`would_train - lottery_skips`).
     pub trained: usize,
     /// Live nets at the start of this clock.
     pub live: usize,
-    /// Crown members in this clock's group that acted + measured but skipped the update.
-    pub frozen: usize,
-    /// Nets that WOULD have updated without the lottery (`group - crown`).
+    /// Nets that WOULD have updated without the lottery (the clock's whole group).
     pub would_train: usize,
     /// Updates the training lottery withheld this clock (0 when it is off). Under
     /// `train_merit_learn_only` these nets ACTED — except the never-learned ones, so this is the
@@ -1727,22 +1711,6 @@ pub(crate) struct StepVitals {
     pub learn_only: bool,
     /// Nets that entered the pool this clock; they train from the NEXT clock.
     pub newborn: usize,
-    /// Nets that served the join window and are not age-blocked: seat-eligible.
-    pub eligible: usize,
-    /// Nets still inside the join window (`seat_join_probation_steps`).
-    pub probation: usize,
-    /// Nets past the crown lifetime (`seat_lifetime_steps`); 0 disarms
-    pub age_blocked: usize,
-    /// Seats actually dealt this clock (the crown's size).
-    pub seats_held: usize,
-    /// Dealable seats: `champion_count`, capped by the cullable population.
-    pub seats_capacity: usize,
-    /// The join window `k` this clock was graded against.
-    pub join_k: usize,
-    /// The crown lifetime `j` this clock was graded against (`0` = disarmed).
-    pub lifetime_j: usize,
-    /// Whether the crown is armed at all (`freeze_seats`).
-    pub crown_armed: bool,
 }
 
 /// WHO the ticket lottery graded this clock, in one compact line: both counts are always stated,
@@ -1807,17 +1775,10 @@ fn step_rollup_line(v: &StepVitals) -> String {
     } else {
         String::new()
     };
-    let head = if v.frozen > 0 {
-        format!(
-            "ran {} of {} = {} {}{} + {} crown",
-            v.stepped, v.live, v.trained, update_word, act_term, v.frozen
-        )
-    } else {
-        format!(
-            "ran {} of {} = {} {}{}",
-            v.stepped, v.live, v.trained, update_word, act_term
-        )
-    };
+    let head = format!(
+        "ran {} of {} = {} {}{}",
+        v.stepped, v.live, v.trained, update_word, act_term
+    );
     parts.push(head);
     // Nets that did not RUN at all: the idled (default contract) and the newborns sitting their
     // birth clock out. Under learn-only the denied nets acted — EXCEPT the never-learned ones, which
@@ -1839,27 +1800,6 @@ fn step_rollup_line(v: &StepVitals) -> String {
         parts.push(format!("held back {} = {}", held, not_run.join(" + ")));
     }
     parts.push(format!("{} = {} + {}", v.live, v.stepped, held));
-    if !v.crown_armed {
-        // No crown ⇒ no seats and no gates: the two legs below would print a tally
-        // restriction that is not in force (and a `seats 0 of k` that reads like a bug).
-        parts.push(format!(
-            "crown off (freeze_seats = false): 0 of {} seats, no gate — every live net is seat-eligible",
-            v.live
-        ));
-    } else {
-        parts.push(format!("seats {} of {}", v.seats_held, v.seats_capacity));
-        // The seat gates partition the live count: eligible + join window/cull shield
-        // + age-blocked = live. Printing the subtraction lets a reader check
-        let lifetime = if v.lifetime_j == 0 {
-            "age block off".to_string()
-        } else {
-            format!("{}-clock lifetime", v.lifetime_j)
-        };
-        parts.push(format!(
-            "seat gates, over all {} nets: {} may sit = {} − {} in a join window or cull shield ({} join clocks; the shield counts updates) − {} age-blocked ({})",
-            v.live, v.eligible, v.live, v.probation, v.join_k, v.age_blocked, lifetime
-        ));
-    }
     if v.lottery_skips > 0 {
         // The lottery's budget, in its own units: the ticketed plus the idled
         // exactly the nets that would have trained without

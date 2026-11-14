@@ -236,18 +236,6 @@ impl CoreEngine {
                 recorded.recovery_retries,
                 current.recovery_retries,
             ),
-            (
-                "seat_join_probation_steps",
-                "set_seat_join_probation_steps",
-                recorded.seat_join_probation_steps,
-                current.seat_join_probation_steps,
-            ),
-            (
-                "seat_lifetime_steps",
-                "set_seat_lifetime_steps",
-                recorded.seat_lifetime_steps,
-                current.seat_lifetime_steps,
-            ),
         ] {
             push(
                 label,
@@ -388,7 +376,7 @@ impl CoreEngine {
     pub(crate) fn replay_manifest_frontier(
         &mut self,
         manifest: &crate::state::FrontierManifest,
-        history: &HashMap<String, Vec<(f32, f32, Option<f32>)>>,
+        history: &HashMap<String, crate::engine::smoothing::HistoryReplay>,
         replayed: &mut Vec<Vec<String>>,
     ) -> Result<usize> {
         if manifest.run_seed != self.header.run_seed {
@@ -525,7 +513,7 @@ impl CoreEngine {
     pub(crate) fn insert_replayed(
         &mut self,
         child: crate::engine::child::RaceChild,
-        history: &HashMap<String, Vec<(f32, f32, Option<f32>)>>,
+        history: &HashMap<String, crate::engine::smoothing::HistoryReplay>,
     ) -> (String, usize) {
         let hash = child.state.hash.clone();
         let step = child
@@ -534,25 +522,27 @@ impl CoreEngine {
             .as_ref()
             .map(|m| m.step)
             .unwrap_or(child.state.step);
-        let mut state = child.state.clone();
-        state.elite_probation_age = child.state.elite_probation_age;
-        state.elite_seat_age = child.state.elite_seat_age;
+        let state = child.state.clone();
         self.state.insert(state, None);
         self.networks.insert(hash.clone(), child.net);
         self.optimizers.insert(hash.clone(), child.optimizer);
         let mut buf = RollingBuffer::new(self.config.smoothing_window);
         let mut train_buf = RollingBuffer::new(self.config.smoothing_window);
         let mut eval_buf = RollingBuffer::new(self.config.smoothing_window);
+        // The whole-run trend: replayed from EVERY row, so a resumed twin's slope is the live
+        // run's, not a line over the tail the window keeps.
+        let mut trend = crate::engine::smoothing::ReadingTrend::default();
         match history.get(&hash) {
             // The recorded runway, oldest → newest: the same window the live run held.
-            Some(rows) if !rows.is_empty() => {
-                for (fitness, train_loss, eval_loss) in rows {
+            Some(replay) if !replay.window.is_empty() => {
+                for (fitness, train_loss, eval_loss) in &replay.window {
                     buf.push(*fitness);
                     train_buf.push(*train_loss);
                     if let Some(eval) = eval_loss {
                         eval_buf.push(*eval);
                     }
                 }
+                trend = replay.trend;
             }
             // No `history.csv` (csv_export off, or a run recorded before it): fall back
             // to the single last reading, which is all the net state carries.
@@ -563,6 +553,7 @@ impl CoreEngine {
                     if let Some(e) = m.eval_loss {
                         eval_buf.push(e);
                     }
+                    trend.push(m.fitness);
                 }
             }
         }
@@ -574,6 +565,7 @@ impl CoreEngine {
         self.rolling_train.insert(hash.clone(), train_buf);
         self.rolling_eval.insert(hash.clone(), eval_buf);
         self.rolling_epoch.insert(hash.clone(), epoch);
+        self.rolling_trend.insert(hash.clone(), trend);
         (hash, step)
     }
 
@@ -608,7 +600,7 @@ impl CoreEngine {
     pub(crate) fn load_history_windows(
         run_dir: &std::path::Path,
         window: usize,
-    ) -> HashMap<String, Vec<(f32, f32, Option<f32>)>> {
+    ) -> HashMap<String, crate::engine::smoothing::HistoryReplay> {
         let Ok(raw) = std::fs::read_to_string(run_dir.join("history.csv")) else {
             return HashMap::new();
         };
@@ -624,8 +616,7 @@ impl CoreEngine {
         ) else {
             return HashMap::new();
         };
-        let mut out: HashMap<String, std::collections::VecDeque<(f32, f32, Option<f32>)>> =
-            HashMap::new();
+        let mut out: HashMap<String, crate::engine::smoothing::HistoryReplay> = HashMap::new();
         for line in lines {
             let fields = crate::engine::format::csv_split_line(line);
             let needed = hash_i.max(train_i).max(eval_i).max(fit_i);
@@ -639,15 +630,15 @@ impl CoreEngine {
                 continue;
             };
             let eval_loss = fields[eval_i].parse::<f32>().ok();
-            let q = out.entry(fields[hash_i].to_string()).or_default();
-            q.push_back((fitness, train_loss, eval_loss));
-            if q.len() > window {
-                q.pop_front();
+            let replay = out.entry(fields[hash_i].to_string()).or_default();
+            // EVERY row feeds the whole-run trend; only the tail is kept for the window.
+            replay.trend.push(fitness);
+            replay.window.push((fitness, train_loss, eval_loss));
+            if replay.window.len() > window {
+                replay.window.remove(0);
             }
         }
-        out.into_iter()
-            .map(|(hash, queue)| (hash, queue.into_iter().collect()))
-            .collect()
+        out
     }
 
     // ── Population setup ────────────────────────────────────────────
