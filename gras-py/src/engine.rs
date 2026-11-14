@@ -185,6 +185,10 @@ fn resume_rl(
     let clip = number("grad_clip")? as f32;
     let matches = count("matches_per_step")?;
     let eval_matches = count("eval_matches_per_step")?;
+    // The exam's step axis, recorded by name. Absent on runs made before the key:
+    // those trained per era, so the blob guard below reports that drift against this
+    // build's per-clock default instead of silently replaying different games.
+    let exam = text_or_none(blob, "exam");
 
     // Install the sink at the RECORDED level before construction can emit — a fresh
     // process would otherwise resume silently (the subscriber is process-wide).
@@ -205,6 +209,17 @@ fn resume_rl(
         .with_matches_per_step(matches)
         .with_eval_matches_per_step(eval_matches)
         .with_challenge(challenge_prob, policy, decay);
+    match exam.as_deref() {
+        Some("per_clock") => trainer = trainer.with_per_clock_exam(true),
+        Some("era") => trainer = trainer.with_per_clock_exam(false),
+        Some(other) => {
+            return Err(PyValueError::new_err(format!(
+                "resume: {}.trainer.exam is {other:?}; expected \"per_clock\" or \"era\"",
+                engine_json.display()
+            )));
+        }
+        None => {}
+    }
     // Same rule as the tabular half: an override wins, else the record's name. An
     // RL run only carries the key when it TRAINED with a schedule, so a run from
     // before this existed resumes with none.

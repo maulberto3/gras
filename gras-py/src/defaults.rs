@@ -43,6 +43,12 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("risk_aversion", 0.0)?;
     d.set_item("train_merit", round32(cfg.train_merit))?;
     d.set_item("train_merit_p_min", round32(cfg.train_merit_p_min))?;
+    d.set_item("train_merit_p_max", round32(cfg.train_merit_p_max))?;
+    // The ticket's LEGS: the shipped default is `least_fit_fewest_updates` (`Fm⁻ × Um`), no init
+    // probation. Emitted so a notebook can read the shipped product instead of inferring it from
+    // the column names.
+    d.set_item("ticket_legs", cfg.ticket_legs.to_string())?;
+    d.set_item("init_probation_steps", cfg.init_probation_steps)?;
     d.set_item("drift_prob", round32(cfg.drift_prob))?;
     d.set_item("feature_split_pool", cfg.feature_split_pool_names())?;
     d.set_item("log_level", format!("{:?}", cfg.log_level).to_lowercase())?;
@@ -68,6 +74,9 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("crossover_probation_steps", cfg.crossover_probation_steps)?;
     d.set_item("seat_join_probation_steps", cfg.seat_join_probation_steps)?;
     d.set_item("seat_lifetime_steps", cfg.seat_lifetime_steps)?;
+    d.set_item("recovery_retries", cfg.recovery_retries)?;
+    d.set_item("recovery_tolerance", round32(cfg.recovery_tolerance))?;
+    d.set_item("recovery_same_seed", cfg.recovery_same_seed)?;
 
     // ── search space (the blueprint the Python surface only shows as `None`) ──
     d.set_item(

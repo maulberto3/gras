@@ -9,8 +9,9 @@
 use std::path::PathBuf;
 
 use gras::engine::config::{
-    DEFAULT_CHECKPOINT_EVERY, DEFAULT_MUTATION_NOVELTY_DRAWS, DEFAULT_MUTATION_NOVELTY_MIN,
-    SMOOTHING_WINDOW,
+    DEFAULT_CHECKPOINT_EVERY, DEFAULT_INIT_PROBATION_STEPS, DEFAULT_MUTATION_NOVELTY_DRAWS,
+    DEFAULT_MUTATION_NOVELTY_MIN, DEFAULT_RECOVERY_RETRIES, DEFAULT_RECOVERY_SAME_SEED,
+    DEFAULT_RECOVERY_TOLERANCE, DEFAULT_TICKET_LEGS, DEFAULT_TRAIN_MERIT_P_MAX, SMOOTHING_WINDOW,
 };
 use gras::evolution::selection::SelectionMethod;
 use gras::prelude::*;
@@ -20,7 +21,8 @@ use pyo3::prelude::*;
 // Defaults that `RaceConfig::defaults()` sets to a literal, mirrored here so the
 // `#[pyo3(signature = …)]` below can name them. `defaults_mirror_the_crate` pins
 // every one of them against the crate, so a changed crate default fails a test
-// instead of silently re-tuning Python.
+// instead of silently re-tuning Python. The RECOVERY knobs are NOT mirrored: their
+// crate consts are already `pub`, so they are imported and the number lives once.
 const DEFAULT_POP_SIZE: usize = 10;
 const DEFAULT_CROSSOVER_ROLLS: usize = 2;
 const DEFAULT_MUTATE_ROLLS: usize = 2;
@@ -39,17 +41,18 @@ const DEFAULT_DROPOUT_PROB: f32 = 0.25;
 /// Drift on a crossover child's inherited genes (`DEFAULT_TOPOLOGY_DRIFT`).
 const DEFAULT_DRIFT_PROB: f32 = 0.1;
 
-/// Cull immunity for every newcomer, in clocks. The crate's shipped value, mirrored
-/// here so the signature can name it. Unlike λ and Ω this is not a "neutral at
-/// zero" knob: `0` removes a protection rather than switching off an effect on the
-/// ranking, so a Python caller inherits the crate's 5 instead of starting bare.
+/// Cull immunity for every newcomer, in UPDATES (`U`). The crate's shipped value,
+/// mirrored here so the signature can name it. Unlike λ and Ω this is not a
+/// "neutral at zero" knob: `0` removes a protection rather than switching off an
+/// effect on the ranking, so a Python caller inherits the crate's 5 instead of
+/// starting bare.
 const DEFAULT_PROBATION_STEPS: usize = 5;
-
 /// λ is the binding's one ranking divergence: `0.0` ranks on the plain window mean,
 /// while the crate's FIT default is `0.5` (a net pays for its own spread). Ω and
 /// every other knob mirror the crate's tuned reference run.
 const DEFAULT_RISK_AVERSION: f32 = 0.0;
-const DEFAULT_TRAIN_MERIT: f32 = 0.75;
+/// The retired Ω, at its identity: the band `train_merit_p_min..p_max` is the payout now.
+const DEFAULT_TRAIN_MERIT: f32 = 1.0;
 /// The lottery's merit floor `p_min`, mirrored from the crate's default. It only has
 /// an effect while Ω is above 0, so exposing it changes nothing about the Ω = 0 path
 /// a Python run starts on.
@@ -95,16 +98,31 @@ pub struct PyRaceConfig {
     /// defined for negative readings) or `"median"` (one fluke cannot move it).
     #[pyo3(get, set)]
     pub mean_type: String,
-    /// Train/eval lottery strength Ω: how much of a clock's budget merit decides;
-    /// **`0.0` = off** — the coin is never drawn and every non-crown net runs.
-    /// The crate's tuned default is `0.75`.
+    /// LEGACY train/eval lottery strength Ω — RETIRED as a second dial: the band
+    /// `train_merit_p_min..p_max` is the chance a net gets each clock, so what a run sets is
+    /// what it pays. A value passed here is folded into that band once; default `1.0` (identity).
     #[pyo3(get, set)]
     pub train_merit: f32,
-    /// Merit floor `p_min`: the share of clocks the WORST net in the field still gets
-    /// (`0.05` default, `0.0` = the pre-floor arithmetic). Lifts only the bottom, so it
-    /// is a cheaper dial than Ω — which lifts every net toward "always train".
+    /// FLOOR `p_min` of the ticket band: literally the chance the WORST-graded net gets each
+    /// clock (`0.05` default). Every graded net is paid between this and `train_merit_p_max`.
     #[pyo3(get, set)]
     pub train_merit_p_min: f32,
+    /// CEILING `p_max` of the ticket band: the chance the BEST-graded net gets each clock
+    /// (`0.4` default). With Ω retired the band IS the payout, so this is a literal probability
+    /// too — set `p_min == p_max` to pay every graded net the same chance.
+    #[pyo3(get, set)]
+    pub train_merit_p_max: f32,
+    /// The lottery's two LEGS (`set_ticket_legs`, crate default `least_fit_fewest_updates`): which
+    /// fit place earns the most tickets and which side of the updates field it multiplies in —
+    /// `most_fit_fewest_updates`, `most_fit_most_updates`, `least_fit_fewest_updates`,
+    /// `least_fit_most_updates`, or the place alone (`most_fit` / `least_fit`).
+    #[pyo3(get, set)]
+    pub ticket_legs: String,
+    /// INIT PROBATION (`set_pop_init_probation_steps`, crate default `0`): the opening clocks the
+    /// run spends WITH no culls and no births — evolution starts at that clock. The recovery
+    /// streak is off for the same window.
+    #[pyo3(get, set)]
+    pub init_probation_steps: usize,
     /// Drift on a crossover child's INHERITED genes (`0.0` = exact inheritance), one
     /// probability for the whole family: each mask bit flips, and each hidden activation /
     /// combine / standardize is re-drawn from its pool (dropout re-drawn in
@@ -147,11 +165,12 @@ pub struct PyRaceConfig {
     /// The top-k nets act and measure without weight updates.
     #[pyo3(get, set)]
     pub freeze_seats: bool,
-    /// Who a surviving crossover child evicts: `unfed` (default), `worst`, or `random`.
+    /// Who a surviving crossover child evicts: `highest_ticket_chance` (default),
+    /// `lowest_fitness`, `lowest_fitness_most_updates`, or `random`.
     #[pyo3(get, set)]
     pub crossover_cull_policy: String,
-    /// Who a firing mutation roll evicts: `unfed` (default), `worst`,
-    /// `inverse_fitness`, or `random`.
+    /// Who a firing mutation roll evicts: `highest_ticket_chance` (default),
+    /// `lowest_fitness`, `lowest_fitness_most_updates`, `inverse_fitness`, or `random`.
     #[pyo3(get, set)]
     pub mutation_cull_policy: String,
     /// How a crossover attempt draws parents: `tournament` (default, K =
@@ -167,19 +186,37 @@ pub struct PyRaceConfig {
     pub crossover_ops_pool: Vec<String>,
 
     // ── durability ──────────────────────────────────────────────────────
-    /// Steps between population checkpoints (the era rotation and the `history.csv`
-    /// flush cadence key off this). **`0` = no durability tick** and one eternal era.
+    /// Steps between population checkpoints (the `history.csv` flush cadence and, on the
+    /// tabular arm, the eval-permutation era key off this; an RL run's exam is per clock
+    /// unless `Reinforce::with_per_clock_exam(false)` asks for the era back). **`0` = no
+    /// durability tick** and one eternal era.
     #[pyo3(get, set)]
     pub checkpoint_every: usize,
 
     // ── probation (cull immunity for newcomers) ─────────────────────────
-    /// A random immigrant is cull-immune for its first k clocks; `0` = only the
-    /// empty-buffer step-0 immunity.
+    /// A random immigrant is cull-immune until it has spent k UPDATES (`U`), never by
+    /// mere waiting; `0` = only the empty-buffer step-0 immunity.
     #[pyo3(get, set)]
     pub mutation_probation_steps: usize,
-    /// A crossover-born net is cull-immune for its first k clocks; `0` = only step-0.
+    /// A crossover-born net is cull-immune until it has spent k UPDATES (`U`); `0` = off.
     #[pyo3(get, set)]
     pub crossover_probation_steps: usize,
+    /// Extra REAL updates a net may take in one clock after an update leaves it below its
+    /// standing: the recovery streak. Each retry counts in `U`. `0` = off, and `0` is the default;
+    /// any value above it arms the streak for that many retries. The streak never fires inside the
+    /// run's INIT PROBATION (`init_probation_steps`), whose clocks are judged on draws every net
+    /// shares.
+    #[pyo3(get, set)]
+    pub recovery_retries: usize,
+    /// How far a reading may drop below the net's standing before a rescue, as a fraction of
+    /// that standing (`0.2` = a fifth tolerated). `0.0` = every drop triggers.
+    #[pyo3(get, set)]
+    pub recovery_tolerance: f32,
+    /// `true` (default) = a retry repeats the clock's OWN train draw, so the streak re-tests the
+    /// update that fell; `false` = each retry walks to the next batch / match block, so it fights
+    /// on fresh evidence. The eval exam stays keyed to the clock either way.
+    #[pyo3(get, set)]
+    pub recovery_same_seed: bool,
     /// A net cannot become an elite until it has aged k clocks since arrival.
     #[pyo3(get, set)]
     pub seat_join_probation_steps: usize,
@@ -272,6 +309,9 @@ impl PyRaceConfig {
         mean_type = String::from("arithmetic"),
         train_merit = DEFAULT_TRAIN_MERIT,
         train_merit_p_min = DEFAULT_TRAIN_MERIT_P_MIN,
+        train_merit_p_max = DEFAULT_TRAIN_MERIT_P_MAX,
+        ticket_legs = DEFAULT_TICKET_LEGS.as_str().to_string(),
+        init_probation_steps = DEFAULT_INIT_PROBATION_STEPS,
         drift_prob = DEFAULT_DRIFT_PROB,
         champion_previous_load = false,
         log_level = String::from("summ"),
@@ -282,7 +322,7 @@ impl PyRaceConfig {
         mutate_prob = DEFAULT_MUTATE_PROB,
         mutation_novelty_min = DEFAULT_MUTATION_NOVELTY_MIN,
         mutation_novelty_draws = DEFAULT_MUTATION_NOVELTY_DRAWS,
-        freeze_seats = true,
+        freeze_seats = false,
         crossover_cull_policy = String::from("unfed"),
         mutation_cull_policy = String::from("unfed"),
         crossover_selection = String::from("tournament"),
@@ -312,6 +352,9 @@ impl PyRaceConfig {
         champion_save_topology = true,
         run_name = None,
         champion_previous_dir = None,
+        recovery_retries = DEFAULT_RECOVERY_RETRIES,
+        recovery_tolerance = DEFAULT_RECOVERY_TOLERANCE,
+        recovery_same_seed = DEFAULT_RECOVERY_SAME_SEED,
     ))]
     // A config's kwargs ARE its API: bundling them into an object would buy the
     // lint nothing and cost the caller a line per knob. Explicitly out of scope
@@ -327,6 +370,9 @@ impl PyRaceConfig {
         mean_type: String,
         train_merit: f32,
         train_merit_p_min: f32,
+        train_merit_p_max: f32,
+        ticket_legs: String,
+        init_probation_steps: usize,
         drift_prob: f32,
         champion_previous_load: bool,
         log_level: String,
@@ -363,6 +409,9 @@ impl PyRaceConfig {
         champion_save_topology: bool,
         run_name: Option<String>,
         champion_previous_dir: Option<PathBuf>,
+        recovery_retries: usize,
+        recovery_tolerance: f32,
+        recovery_same_seed: bool,
     ) -> Self {
         Self {
             pop_size,
@@ -374,6 +423,9 @@ impl PyRaceConfig {
             mean_type,
             train_merit,
             train_merit_p_min,
+            train_merit_p_max,
+            ticket_legs,
+            init_probation_steps,
             drift_prob,
             // OFF by default: a Python run must not silently inherit elites from
             // whatever `results/` happens to sit in the caller's cwd.
@@ -414,6 +466,9 @@ impl PyRaceConfig {
             champion_save_topology,
             run_name,
             champion_previous_dir,
+            recovery_retries,
+            recovery_tolerance,
+            recovery_same_seed,
         }
     }
 
@@ -519,23 +574,30 @@ fn parse_range_pool(
     }
 }
 
-/// `worst` | `random` | `unfed` — the spellings the crate records in `engine.json`.
+/// `lowest_fitness` | `random` | `highest_ticket_chance` | `lowest_fitness_most_updates` —
+/// the spellings the crate records in `engine.json`. The pre-2026-11 names (`worst` /
+/// `unfed` / `spent`) still parse, so an old script keeps running.
 fn parse_crossover_cull(name: &str) -> Option<CrossCullPolicy> {
     match name {
-        "worst" => Some(CrossCullPolicy::Worst),
+        "lowest_fitness" | "worst" => Some(CrossCullPolicy::LowestFitness),
         "random" => Some(CrossCullPolicy::Random),
-        "unfed" => Some(CrossCullPolicy::Unfed),
+        "highest_ticket_chance" | "unfed" => Some(CrossCullPolicy::HighestTicketChance),
+        "lowest_fitness_most_updates" | "spent" => Some(CrossCullPolicy::LowestFitnessMostUpdates),
         _ => None,
     }
 }
 
-/// `worst` | `inverse_fitness` | `random` | `unfed`.
+/// `lowest_fitness` | `inverse_fitness` | `random` | `highest_ticket_chance` |
+/// `lowest_fitness_most_updates`, plus the legacy `worst` / `unfed` / `spent`.
 fn parse_mutation_cull(name: &str) -> Option<MutationCullPolicy> {
     match name {
-        "worst" => Some(MutationCullPolicy::Worst),
+        "lowest_fitness" | "worst" => Some(MutationCullPolicy::LowestFitness),
         "inverse_fitness" => Some(MutationCullPolicy::InverseFitness),
         "random" => Some(MutationCullPolicy::Random),
-        "unfed" => Some(MutationCullPolicy::Unfed),
+        "highest_ticket_chance" | "unfed" => Some(MutationCullPolicy::HighestTicketChance),
+        "lowest_fitness_most_updates" | "spent" => {
+            Some(MutationCullPolicy::LowestFitnessMostUpdates)
+        }
         _ => None,
     }
 }
@@ -556,14 +618,14 @@ impl PyRaceConfig {
         let crossover_cull_policy =
             parse_crossover_cull(&self.crossover_cull_policy).ok_or_else(|| {
                 PyValueError::new_err(format!(
-                    "crossover_cull_policy {:?}: expected one of worst, random, unfed",
+                    "crossover_cull_policy {:?}: expected one of lowest_fitness, random, highest_ticket_chance, lowest_fitness_most_updates",
                     self.crossover_cull_policy
                 ))
             })?;
         let mutation_cull_policy =
             parse_mutation_cull(&self.mutation_cull_policy).ok_or_else(|| {
                 PyValueError::new_err(format!(
-                    "mutation_cull_policy {:?}: expected one of worst, inverse_fitness, random, unfed",
+                    "mutation_cull_policy {:?}: expected one of lowest_fitness, inverse_fitness, random, highest_ticket_chance, lowest_fitness_most_updates",
                     self.mutation_cull_policy
                 ))
             })?;
@@ -639,8 +701,35 @@ impl PyRaceConfig {
                     self.mean_type
                 ))
             })?;
-        cfg.train_merit = self.train_merit;
+        // Ω is RETIRED as a second dial (`fold_omega` is its whole story): a caller that still
+        // passes it gets the band it used to buy, folded ONCE, and the header records the identity
+        // so a resume never folds twice.
         cfg.train_merit_p_min = self.train_merit_p_min;
+        // …and the CEILING is the caller's too: with Ω retired the band is the WHOLE payout, so a
+        // surface that can set the floor but not the ceiling cannot reproduce a run's chances.
+        // Clamped like the crate's setter, and a non-finite value falls back to the crate default.
+        let ceiling = if self.train_merit_p_max.is_finite() {
+            self.train_merit_p_max.clamp(0.0, 1.0)
+        } else {
+            DEFAULT_TRAIN_MERIT_P_MAX
+        };
+        let (lo, hi) =
+            gras::engine::config::fold_omega(self.train_merit, cfg.train_merit_p_min, ceiling);
+        cfg.train_merit_p_min = lo;
+        cfg.train_merit_p_max = hi;
+        cfg.train_merit = 1.0;
+        // The LEGS are the rest of the band's arithmetic, so a surface that can set the ends but
+        // not the legs still cannot reproduce a run's chances. One spelling names both sides and
+        // a resume compares it by name.
+        cfg.ticket_legs =
+            gras::engine::config::TicketLegs::parse(&self.ticket_legs).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "ticket_legs {:?}: expected one of {}",
+                    self.ticket_legs,
+                    gras::engine::config::TicketLegs::ALL_NAMES.join(", ")
+                ))
+            })?;
+        cfg.init_probation_steps = self.init_probation_steps;
         // Clamped like the Rust setter (a stray 1.5 must not flip every bit twice); the
         // value is recorded in `engine.json` and compared by name on resume.
         cfg.drift_prob = if self.drift_prob.is_finite() {
@@ -672,6 +761,13 @@ impl PyRaceConfig {
         cfg.crossover_probation_steps = self.crossover_probation_steps;
         cfg.seat_join_probation_steps = self.seat_join_probation_steps;
         cfg.seat_lifetime_steps = self.seat_lifetime_steps;
+        cfg.recovery_retries = self.recovery_retries;
+        cfg.recovery_tolerance = if self.recovery_tolerance.is_finite() {
+            self.recovery_tolerance.max(0.0)
+        } else {
+            0.0
+        };
+        cfg.recovery_same_seed = self.recovery_same_seed;
         if let Some(pool) = hidden_dim_pool {
             cfg.hidden_dim_pool = Some(pool);
         }

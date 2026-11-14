@@ -65,11 +65,25 @@ pub(crate) const STANDARDIZE_OPS: [&str; 5] = [
 pub(crate) const CROSSOVER_OPS: [&str; 2] = ["one_point", "uniform"];
 
 /// `crossover_cull_policy`: who a surviving crossover child evicts.
-pub(crate) const CROSSOVER_CULLS: [&str; 3] = ["worst", "random", "unfed"];
+/// `lowest_fitness_most_updates` is the evidence-based twin of `highest_ticket_chance`:
+/// the lowest-fitness net that has already spent its updates.
+pub(crate) const CROSSOVER_CULLS: [&str; 4] = [
+    "lowest_fitness",
+    "random",
+    "highest_ticket_chance",
+    "lowest_fitness_most_updates",
+];
 
-/// `mutation_cull_policy`: who a firing mutation roll evicts. `unfed` is the same
-/// lottery-starved selector the crossover channel offers.
-pub(crate) const MUTATION_CULLS: [&str; 4] = ["worst", "inverse_fitness", "random", "unfed"];
+/// `mutation_cull_policy`: who a firing mutation roll evicts. `highest_ticket_chance` and
+/// `lowest_fitness_most_updates` are the same two lottery selectors the crossover channel
+/// offers.
+pub(crate) const MUTATION_CULLS: [&str; 5] = [
+    "lowest_fitness",
+    "inverse_fitness",
+    "random",
+    "highest_ticket_chance",
+    "lowest_fitness_most_updates",
+];
 
 /// `crossover_selection`: how a crossover attempt draws its parents.
 pub(crate) const SELECTION_METHODS: [&str; 2] = ["roulette", "tournament"];

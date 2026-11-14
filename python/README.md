@@ -98,7 +98,7 @@ build, not universal — CPU and CUDA kernels are different arithmetic.
 |---|---|
 | `engine.json` | the run: seed, clocks, search space, trainer recipe, data dir |
 | `history.csv` | every measured clock: net, fitness, loss, your metric columns |
-| `attempts.csv` | every evolution roll, including the ones that did nothing — the last three columns are the mutation novelty gate: Δ to the nearest blueprint, candidates spent, the floor |
+| `attempts.csv` | every evolution roll, including the ones that did nothing — the columns before the last three are the mutation novelty gate: Δ to the nearest blueprint, candidates spent, the floor; the last column is the culled net's score at cull time |
 | `nets/<hash>.json` | one blueprint: genome, feature masks, per-port activations |
 | `nets/<hash>.safetensors` / `.optim` | its weights / its optimizer moments |
 | `champions.json` | the ranking a compatible next run can inherit as founders (a legacy `elites.json` copy rides beside it for one release) |

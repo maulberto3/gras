@@ -108,8 +108,8 @@ def check_engine_knobs() -> None:
     """The engine's own families reach the run, and start neutral.
 
     Neutral means the values that change NOTHING about a ranking: λ = 0 (plain
-    window mean) and Ω = 0 (no lottery), plus no elite inheritance. Everything
-    else starts at the crate's `RaceConfig::defaults()`.
+    window mean) and the retired Ω at its identity, plus no elite inheritance.
+    Everything else starts at the crate's `RaceConfig::defaults()`.
     """
     cfg = RaceConfig()
     assert (cfg.risk_aversion, cfg.champion_previous_load) == (0.0, False), cfg
@@ -119,9 +119,12 @@ def check_engine_knobs() -> None:
     # Floats are stored as f32, so compare with a tolerance: 0.2 is not exact.
     assert (cfg.crossover_prob, round(cfg.mutate_prob, 6)) == (0.5, 0.2), cfg
     assert (cfg.crossover_rolls, cfg.mutate_rolls) == (2, 2), cfg
-    assert (cfg.crossover_cull_policy, cfg.mutation_cull_policy) == ("unfed", "unfed"), cfg
+    assert (cfg.crossover_cull_policy, cfg.mutation_cull_policy) == (
+        "highest_ticket_chance",
+        "highest_ticket_chance",
+    ), cfg
     assert cfg.crossover_selection == "tournament", cfg
-    assert cfg.train_merit == 0.75, cfg
+    assert cfg.train_merit == 1.0, cfg
     assert cfg.activation_pool == [] and cfg.feature_split is None, cfg
     # The topology shape behind the width range: `None` means the crate's range
     # (2..=15 for node count and both fans), and dropout is the crate's 0.25.
@@ -257,6 +260,9 @@ def check_defaults_agree() -> None:
         "risk_aversion": cfg.risk_aversion,
         "train_merit": cfg.train_merit,
         "train_merit_p_min": cfg.train_merit_p_min,
+        "train_merit_p_max": cfg.train_merit_p_max,
+        "ticket_legs": cfg.ticket_legs,
+        "init_probation_steps": cfg.init_probation_steps,
         "drift_prob": cfg.drift_prob,
         "log_level": cfg.log_level,
         "crossover_rolls": cfg.crossover_rolls,
