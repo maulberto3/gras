@@ -112,13 +112,10 @@ def check_engine_knobs() -> None:
     Everything else starts at the crate's `RaceConfig::defaults()`.
     """
     cfg = RaceConfig()
-    assert (cfg.risk_aversion, cfg.champion_previous_load) == (0.0, False), cfg
+    assert cfg.champion_previous_load is False, cfg
     assert (cfg.pop_size, cfg.champion_count, cfg.max_steps) == (10, 1, 10), cfg
     assert (cfg.pop_size, cfg.champion_count, cfg.smoothing_window) == (10, 1, 5), cfg
     assert cfg.mean_type == "arithmetic", cfg
-    # Floats are stored as f32, so compare with a tolerance: 0.2 is not exact.
-    assert (cfg.crossover_prob, round(cfg.mutate_prob, 6)) == (0.5, 0.2), cfg
-    assert (cfg.crossover_rolls, cfg.mutate_rolls) == (2, 2), cfg
     assert (cfg.crossover_cull_policy, cfg.mutation_cull_policy) == (
         "highest_ticket_chance",
         "highest_ticket_chance",
@@ -138,12 +135,7 @@ def check_engine_knobs() -> None:
     # these inherit the crate's shipped values instead of starting bare.
     assert cfg.checkpoint_every == 20, cfg
     assert cfg.crossover_ops_pool == [], cfg
-    assert (
-        cfg.mutation_probation_steps,
-        cfg.crossover_probation_steps,
-        cfg.seat_join_probation_steps,
-        cfg.seat_lifetime_steps,
-    ) == (5, 5, 5, 5), cfg
+    assert (cfg.mutation_probation_steps, cfg.crossover_probation_steps) == (5, 5), cfg
 
     with tempfile.TemporaryDirectory(prefix="gras-py-engine-knobs-") as tmp:
         cfg = RaceConfig(
@@ -151,20 +143,15 @@ def check_engine_knobs() -> None:
             champion_count=1,
             max_steps=2,
             log_level="none",
-            crossover_prob=0.25,
-            mutate_prob=0.75,
             mean_type="median",
-            freeze_seats=False,
             crossover_cull_policy="random",
-            mutation_cull_policy="inverse_fitness",
+            mutation_cull_policy="lowest_fitness",
             crossover_selection="tournament",
             tournament_size=3,
             crossover_ops_pool=["uniform"],
             checkpoint_every=3,
             mutation_probation_steps=2,
             crossover_probation_steps=3,
-            seat_join_probation_steps=1,
-            seat_lifetime_steps=7,
             hidden_dim_pool=(8, 16),
             hidden_dim_stride=8,
             hidden_nodes_pool=(3, 4),
@@ -182,20 +169,15 @@ def check_engine_knobs() -> None:
         meta = json.loads((Path(tmp) / "engine.json").read_text())
         sub = meta["config"]
         # Evolution knobs, under `config`.
-        assert sub["crossover_prob"] == 0.25, sub
-        assert sub["mutate_prob"] == 0.75, sub
         assert sub["mean_type"] == "median", sub
-        assert sub["freeze_seats"] is False, sub
         assert sub["crossover_cull_policy"] == "random", sub
-        assert sub["mutation_cull_policy"] == "inverse_fitness", sub
+        assert sub["mutation_cull_policy"] == "lowest_fitness", sub
         assert sub["crossover_selection"].startswith("tournament"), sub
         assert sub["crossover_ops_pool"] == ["uniform"], sub
         # Durability + probation, also under `config`.
         assert sub["checkpoint_every"] == 3, sub
         assert sub["mutation_probation_steps"] == 2, sub
         assert sub["crossover_probation_steps"] == 3, sub
-        assert sub["seat_join_probation_steps"] == 1, sub
-        assert sub["seat_lifetime_steps"] == 7, sub
         # Artifacts + label.
         assert sub["trace_file"] is True, sub
         assert sub["run_name"] == "knob-check", sub
@@ -257,7 +239,6 @@ def check_defaults_agree() -> None:
         "eval_share": cfg.eval_share,
         "smoothing_window": cfg.smoothing_window,
         "mean_type": cfg.mean_type,
-        "risk_aversion": cfg.risk_aversion,
         "train_merit": cfg.train_merit,
         "train_merit_p_min": cfg.train_merit_p_min,
         "train_merit_p_max": cfg.train_merit_p_max,
@@ -265,18 +246,11 @@ def check_defaults_agree() -> None:
         "init_probation_steps": cfg.init_probation_steps,
         "drift_prob": cfg.drift_prob,
         "log_level": cfg.log_level,
-        "crossover_rolls": cfg.crossover_rolls,
-        "mutate_rolls": cfg.mutate_rolls,
-        "crossover_prob": cfg.crossover_prob,
-        "mutate_prob": cfg.mutate_prob,
-        "freeze_seats": cfg.freeze_seats,
         "crossover_cull_policy": cfg.crossover_cull_policy,
         "mutation_cull_policy": cfg.mutation_cull_policy,
         "crossover_ops_pool": cfg.crossover_ops_pool,
         "mutation_probation_steps": cfg.mutation_probation_steps,
         "crossover_probation_steps": cfg.crossover_probation_steps,
-        "seat_join_probation_steps": cfg.seat_join_probation_steps,
-        "seat_lifetime_steps": cfg.seat_lifetime_steps,
         "hidden_dim_stride": cfg.hidden_dim_stride,
         "activation_pool": cfg.activation_pool,
         "combine_op_pool": cfg.combine_op_pool,

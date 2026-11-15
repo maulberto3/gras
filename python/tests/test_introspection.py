@@ -81,7 +81,7 @@ def test_live_count_matches_the_artifacts() -> None:
 
 
 def test_smoothed_fitness_is_the_recorded_score() -> None:
-    """`history.csv`'s `fitness_smooth` IS the risk-adjusted score — the same
+    """`history.csv`'s `fitness_smooth` IS the window-centre score — the same
     number, or the binding has implemented a second formula."""
     with tempfile.TemporaryDirectory(prefix="gras-introspect-smooth-") as tmp:
         engine, _, history = run(Path(tmp), "smooth")
@@ -93,38 +93,6 @@ def test_smoothed_fitness_is_the_recorded_score() -> None:
                 f"{hash}: smoothed_fitness_of={got} but history.csv says "
                 f"fitness_smooth={row['fitness_smooth']}"
             )
-
-
-def test_lambda_charges_the_window_spread() -> None:
-    """Two λ, same seed: the difference must be exactly `Δλ × σ`.
-
-    `score = mean ∓ λ·σ`, so a net's score under λ=2 is its λ=0 score plus
-    `2σ` on a Minimize race — the spread it was charged for, nothing else.
-    """
-    with tempfile.TemporaryDirectory(prefix="gras-introspect-lambda-") as tmp:
-        base, _, hist0 = run(Path(tmp), "lam0", risk_aversion=0.0)
-        charged, run_dir, hist2 = run(Path(tmp), "lam2", risk_aversion=2.0)
-        direction = json.loads((run_dir / "engine.json").read_text())["fitness_direction"]
-        # "Worse side" is HIGHER for Minimize (loss) and LOWER for Maximize (reward).
-        sign = 1.0 if direction == "Minimize" else -1.0
-
-        checked = 0
-        for hash in hist0["hash"].unique():
-            if hash not in set(hist2["hash"]):
-                continue  # a net that did not appear in both races proves nothing
-            sd = last_reading(hist2, hash)["fitness_smooth_std"]
-            if not sd > 1e-6:
-                continue  # a flat window has no charge to observe
-            charged_score = charged.smoothed_fitness_of(hash)
-            base_score = base.smoothed_fitness_of(hash)
-            assert charged_score is not None and base_score is not None
-            expected = base_score + sign * 2.0 * sd
-            assert abs(charged_score - expected) <= 1e-4, (
-                f"{hash}: λ=2 score {charged_score}, λ=0 score {base_score}, σ {sd} — "
-                f"expected {expected} ({direction}: mean {'+' if sign > 0 else '−'} λσ)"
-            )
-            checked += 1
-        assert checked, "no net had a non-flat window — the λ charge was never observable"
 
 
 def test_mean_type_reaches_the_ranking() -> None:
