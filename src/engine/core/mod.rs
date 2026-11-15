@@ -832,7 +832,7 @@ impl CoreEngine {
                     self.header
                         .engine_mode
                         .clone()
-                        .unwrap_or_else(|| "—".to_string()),
+                        .unwrap_or_else(|| crate::utils::cfy::NO_VALUE.to_string()),
                 ),
                 ("pop_size".to_string(), self.config.pop_size.to_string()),
                 (
@@ -933,7 +933,7 @@ impl CoreEngine {
                     self.meta_ctx
                         .batch_size
                         .map(|b| b.to_string())
-                        .unwrap_or_else(|| "—".to_string()),
+                        .unwrap_or_else(|| crate::utils::cfy::NO_VALUE.to_string()),
                 ),
                 (
                     "dropout".to_string(),

@@ -119,10 +119,11 @@ pub(crate) fn fmt_cfg(v: f32) -> String {
     format!("{v:.2}")
 }
 
-/// Optional float, log-line form — plain `—` when unset (never `Some(...)`
+/// Optional float, log-line form — plain `na` when unset (never `Some(...)`
 /// user-facing logs).
 pub(crate) fn fmt_line_opt(v: &Option<f32>) -> String {
-    v.as_ref().map_or_else(|| "—".into(), |x| fmt_line(*x))
+    v.as_ref()
+        .map_or_else(|| crate::utils::cfy::NO_VALUE.into(), |x| fmt_line(*x))
 }
 
 /// Which sink a reading is rendered for — a console line and a table cell share one rule
@@ -152,7 +153,7 @@ fn scalar(style: ReadingStyle) -> fn(f32) -> String {
 pub fn fmt_reading(mean: Option<f32>, sigma: Option<f32>, n: usize, style: ReadingStyle) -> String {
     let f = scalar(style);
     let Some(mean) = mean else {
-        return "—".to_string();
+        return crate::utils::cfy::NO_VALUE.to_string();
     };
     match sigma {
         Some(s) if n > 0 => format!(
@@ -191,7 +192,7 @@ pub(crate) fn fmt_family_reading(
     }
     let f = scalar(style);
     let Some(centre) = centre else {
-        return "—".to_string();
+        return crate::utils::cfy::NO_VALUE.to_string();
     };
     let (centre_noun, spread_noun) = match family {
         MeanType::Arithmetic => unreachable!("delegated above"),
@@ -380,7 +381,7 @@ mod tests {
 
     #[test]
     fn optional_forms_render_unset_as_dash() {
-        assert_eq!(fmt_line_opt(&None), "—");
+        assert_eq!(fmt_line_opt(&None), crate::utils::cfy::NO_VALUE);
         assert_eq!(fmt_line_opt(&Some(0.02)), "0.0200");
     }
 
@@ -410,7 +411,10 @@ mod tests {
             fmt_reading(Some(327.8), None, 1, ReadingStyle::Line),
             "avg 327.8 (n=1, no spread yet)"
         );
-        assert_eq!(fmt_reading(None, None, 0, ReadingStyle::Line), "—");
+        assert_eq!(
+            fmt_reading(None, None, 0, ReadingStyle::Line),
+            crate::utils::cfy::NO_VALUE
+        );
     }
 
     /// A non-arithmetic run's card names ITS pair and refuses to invent an SE: the score charges
@@ -447,7 +451,7 @@ mod tests {
         );
         assert_eq!(
             fmt_family_reading(None, None, 0, ReadingStyle::Line, MeanType::Median),
-            "—"
+            crate::utils::cfy::NO_VALUE
         );
     }
 

@@ -234,7 +234,9 @@ impl CoreEngine {
                 format!(
                     " │ {} {}",
                     metric.label(),
-                    value.map(fmt_line).unwrap_or_else(|| "—".to_string())
+                    value
+                        .map(fmt_line)
+                        .unwrap_or_else(|| crate::utils::cfy::NO_VALUE.to_string())
                 )
             })
             .collect();
@@ -528,7 +530,7 @@ impl CoreEngine {
         self.grade_lottery_parts(hash, frame, merit).ok()
     }
 
-    /// WHY the lottery gave a net no chance — the gate a `—` in the ticket cell stands
+    /// WHY the lottery gave a net no chance — the gate a `na` in the ticket cell stands
     pub(crate) fn lottery_abstain(
         &self,
         hash: &str,

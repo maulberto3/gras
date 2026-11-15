@@ -16,9 +16,12 @@ fn is_crossover_origin(created_from: Option<&str>) -> bool {
     created_from.is_some_and(|s| s.starts_with("crossover-lowest-fitness"))
 }
 
-/// A score as the roll lines print it: one decimal, `—` when the net had no reading yet.
+/// A score as the roll lines print it: one decimal, `na` when the net had no reading yet.
 fn fmt_score(score: Option<f32>) -> String {
-    score.map_or_else(|| "—".to_string(), |s| format!("{s:.1}"))
+    score.map_or_else(
+        || crate::utils::cfy::NO_VALUE.to_string(),
+        |s| format!("{s:.1}"),
+    )
 }
 
 /// Which roll group a roll belongs to. Kept apart so a crossover roll

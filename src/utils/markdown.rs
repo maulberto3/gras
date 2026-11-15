@@ -99,8 +99,12 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
                 }
                 _ => format!("{}", node.activation),
             };
-            let combine = node.combine_op.map_or("—".into(), |op| format!("{op}"));
-            let std = node.standardize.map_or("—".into(), |s| format!("{s}"));
+            let combine = node
+                .combine_op
+                .map_or(crate::utils::cfy::NO_VALUE.into(), |op| format!("{op}"));
+            let std = node
+                .standardize
+                .map_or(crate::utils::cfy::NO_VALUE.into(), |s| format!("{s}"));
             let (in_dim, out_dim) = graph.node_dims().get(i).copied().unwrap_or((0, 0));
             let marker = if i == net.output_node { " " } else { "" };
             let sources: Vec<String> = node_sources[i]
@@ -141,8 +145,12 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
                 NodeKind::Output => "Output",
             };
             let act = node.activation;
-            let combine = node.combine_op.map_or("—".into(), |op| format!("{op}"));
-            let std = node.standardize.map_or("—".into(), |s| format!("{s}"));
+            let combine = node
+                .combine_op
+                .map_or(crate::utils::cfy::NO_VALUE.into(), |op| format!("{op}"));
+            let std = node
+                .standardize
+                .map_or(crate::utils::cfy::NO_VALUE.into(), |s| format!("{s}"));
             let (in_dim, out_dim) = graph.node_dims().get(node_id).copied().unwrap_or((0, 0));
             let in_wires = graph
                 .connections
@@ -334,7 +342,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("\n| **Dashed stub `selu (input)` / `mish (orphan)`** | orphaned port — an input nothing feeds / an output nothing reads (mermaid's counterpart of the ASCII `*`). |");
     out.push_str("\n| **`in <n>` / `out <n>`** | dataset shape (fixed by the problem). |");
     out.push_str("\n| **Input box → second line** | the feature split when the net has one: `split <policy> · <ports>p · <seen>/<n> seen`. Present for ANY policy that carries rows (`exclusive`, `random`, `inherited`); absent for `none`, where every port already carries the full mixed vector — that is the common case, and why the box is usually one line. Per-port rows are in *Feature split* above. |");
-    out.push_str("\n| **`—` in `Combine` / `Std`** | no per-node override, so the forward pass uses `Add` / no standardisation. `—` is not a missing gene: it is the gene spelled as its default (the diversity metric folds `None` and `Identity` into one token for the same reason). |");
+    out.push_str("\n| **`na` in `Combine` / `Std`** | no per-node override, so the forward pass uses `Add` / no standardisation. `na` is not a missing gene: it is the gene spelled as its default (the diversity metric folds `None` and `Identity` into one token for the same reason). |");
     out.push_str("\n| **Nodes table → `Sources`** | which output port feeds each input port (`n1_o2` = output 2 of node 1), one entry per port in port order — the `k`-th entry feeds `i<k>`; `*` = an unwired port (never left behind by `finalize`). |");
     out.push_str("\n| **Nodes table → `In` / `Out` with `(Nw)`** | PORT counts; a parenthesised wire count appears only where the two differ (`Out 2 (3w)` = 2 ports, 3 wires). Only the Input node fans out, so only it can differ — the wiring diagram draws one slot per WIRE, which is why its `Out` slots can outnumber its ports. |");
     out.push_str("\n| **Nodes table → `In` / `Out`** | PORT counts. Only the Input node can fan out, so only its cell can read `2 (3w)` — two ports carrying three wires, the same numbers the wiring diagram labels `2o→3w` and the edge list shows as a repeated port (`n0_o0` twice). A hidden/output row reads plain numbers because an input port carries exactly one wire. |");
@@ -383,7 +391,7 @@ fn kept_features(mask: &[u8], input_dim: usize) -> String {
         .filter(|f| mask.get(*f).copied().unwrap_or(0) != 0)
         .collect();
     if kept.is_empty() {
-        return "—".to_string();
+        return crate::utils::cfy::NO_VALUE.to_string();
     }
     let shown: Vec<String> = kept
         .iter()
@@ -615,7 +623,7 @@ mod tests {
     fn kept_features_caps_a_wide_row() {
         assert_eq!(kept_features(&[1, 0, 1, 0], 4), "1010");
         assert_eq!(kept_features(&[0, 0, 0, 0], 4), "0000");
-        assert_eq!(kept_features(&[0u8; 40], 40), "—");
+        assert_eq!(kept_features(&[0u8; 40], 40), crate::utils::cfy::NO_VALUE);
         let every: Vec<u8> = vec![1; 40];
         let spelled = kept_features(&every, 40);
         assert!(spelled.starts_with("0,1,2,"), "{spelled}");
