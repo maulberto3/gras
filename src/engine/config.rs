@@ -24,7 +24,8 @@ pub enum StopReason {
 pub const SMOOTHING_WINDOW: usize = 5;
 
 /// How the smoothing window's readings are averaged into the ranking centre (`set_fitness_mean_type`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum MeanType {
     /// The weighted window mean — the plain average, the pre-knob ranking.
     Arithmetic,
@@ -41,11 +42,7 @@ pub enum MeanType {
 impl MeanType {
     /// The spelling `engine.json` records and the log prints.
     pub fn as_str(&self) -> &'static str {
-        match self {
-            MeanType::Arithmetic => "arithmetic",
-            MeanType::SignedLog => "signed_log",
-            MeanType::Median => "median",
-        }
+        (*self).into()
     }
 
     /// Parse a recorded spelling. Unknown (and `""` from a header written before the
@@ -89,7 +86,8 @@ pub const DEFAULT_MEAN_TYPE: MeanType = MeanType::Median;
 /// grades worst AND has trained least, `most_fit_most_updates` pays the one that grades best and
 /// has trained most. `most_fit` / `least_fit` are the place ALONE — the updates leg is off, so
 /// the ticket is exactly `Fm⁺`, and no boolean pair can claim a state that does not exist.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum TrainTicket {
     /// The fittest net earns the most tickets; the updates leg is OFF (`Fm⁺`).
     MostFit,
@@ -132,14 +130,7 @@ impl TrainTicket {
 
     /// The spelling `engine.json` records, the CLI accepts and the log prints.
     pub fn as_str(self) -> &'static str {
-        match self {
-            TrainTicket::MostFit => "most_fit",
-            TrainTicket::MostFitFewestUpdates => "most_fit_fewest_updates",
-            TrainTicket::MostFitMostUpdates => "most_fit_most_updates",
-            TrainTicket::LeastFitFewestUpdates => "least_fit_fewest_updates",
-            TrainTicket::LeastFitMostUpdates => "least_fit_most_updates",
-            TrainTicket::LeastFit => "least_fit",
-        }
+        self.into()
     }
 
     /// Parse a recorded or typed spelling: case, spaces and hyphens fold to `_`, so
@@ -434,7 +425,8 @@ impl LogLevel {
 /// The variants name WHAT the victim is: `lowest_fitness` is the plain merit answer,
 /// `highest_ticket_chance` is the net the train-eval lottery pays most, and
 /// `lowest_fitness_most_updates` is the lowest-fitness net that has already spent its updates.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum CrossCullPolicy {
     /// **LowestFitness** — evict the net with the lowest smoothed fitness; strictly
     /// merit-based. Risk: the population can ossify around one lineage.
@@ -452,7 +444,8 @@ pub enum CrossCullPolicy {
     /// paid has not had its chance yet; a weak net that has already trained `U` times has, so
     /// this arm culls on evidence instead of on the coin's next draw. It also ignores the
     /// ticket TILT: the lowest-fitness net is the lowest-fitness net whichever end the band
-    /// pays. Deterministic (hash tie-break).
+    /// pays. Deterministic (hash tie-break). This is the `#[default]` on both channels, so an
+    /// unconfigured run culls on evidence rather than on the coin's next draw.
     #[default]
     LowestFitnessMostUpdates,
 }
@@ -461,12 +454,7 @@ impl std::fmt::Display for CrossCullPolicy {
     /// The STABLE spelling recorded in `engine.json` and the run manifest (snake_case,
     /// not the `Debug` casing): a header written today must read the same tomorrow.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::LowestFitness => "lowest_fitness",
-            Self::Random => "random",
-            Self::HighestTicketChance => "highest_ticket_chance",
-            Self::LowestFitnessMostUpdates => "lowest_fitness_most_updates",
-        })
+        f.write_str((*self).into())
     }
 }
 
@@ -493,7 +481,8 @@ impl std::str::FromStr for CrossCullPolicy {
 
 /// Who gets evicted when a MUTATION roll inserts a fresh random immigrant.
 /// **Mutation-only** — the crossover channel has its own policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum MutationCullPolicy {
     /// **LowestFitness** — evict the net with the lowest smoothed fitness, deterministically
     /// (mirrors [`CrossCullPolicy::LowestFitness`]).
@@ -516,12 +505,7 @@ pub enum MutationCullPolicy {
 impl std::fmt::Display for MutationCullPolicy {
     /// The STABLE spelling recorded in `engine.json` and the run manifest.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::LowestFitness => "lowest_fitness",
-            Self::Random => "random",
-            Self::HighestTicketChance => "highest_ticket_chance",
-            Self::LowestFitnessMostUpdates => "lowest_fitness_most_updates",
-        })
+        f.write_str((*self).into())
     }
 }
 
@@ -1886,5 +1870,81 @@ mod tests {
         // feature's deletion — only the step budget remains)
         let cfg = RaceConfig::builder().set_stop_max_steps(15).build();
         assert_eq!(cfg.max_steps, Some(15));
+    }
+}
+
+/// The recorded spellings and the alias tables, pinned in ONE place: `strum::IntoStaticStr` derives
+/// `as_str`/`Display` from `serialize_all = "snake_case"`, while `parse` keeps the legacy aliases —
+/// so a variant rename cannot silently change what `engine.json` records.
+#[cfg(test)]
+mod spelling_pins {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn mean_type_spellings_hold() {
+        for (v, s) in [
+            (MeanType::Arithmetic, "arithmetic"),
+            (MeanType::SignedLog, "signed_log"),
+            (MeanType::Median, "median"),
+        ] {
+            assert_eq!(v.as_str(), s);
+            assert_eq!(v.to_string(), s);
+            assert_eq!(MeanType::parse(s), Some(v));
+            assert_eq!(MeanType::from_str(s).unwrap(), v);
+        }
+        assert_eq!(MeanType::parse("average"), Some(MeanType::Arithmetic));
+        assert_eq!(MeanType::parse("signed-log"), Some(MeanType::SignedLog));
+    }
+
+    #[test]
+    fn train_ticket_spellings_hold() {
+        for (v, s) in TrainTicket::ALL.iter().copied().zip(TrainTicket::ALL_NAMES) {
+            assert_eq!(v.as_str(), s);
+            assert_eq!(v.to_string(), s);
+            assert_eq!(TrainTicket::parse(s), Some(v));
+            assert_eq!(TrainTicket::from_str(s).unwrap(), v);
+        }
+        assert_eq!(
+            TrainTicket::parse("best_fewest"),
+            Some(TrainTicket::MostFitFewestUpdates)
+        );
+        assert_eq!(
+            TrainTicket::parse("least_fit_least_updates"),
+            Some(TrainTicket::LeastFitFewestUpdates)
+        );
+    }
+
+    #[test]
+    fn cull_policy_spellings_hold() {
+        for (v, s) in [
+            (CrossCullPolicy::LowestFitness, "lowest_fitness"),
+            (CrossCullPolicy::Random, "random"),
+            (
+                CrossCullPolicy::HighestTicketChance,
+                "highest_ticket_chance",
+            ),
+            (
+                CrossCullPolicy::LowestFitnessMostUpdates,
+                "lowest_fitness_most_updates",
+            ),
+        ] {
+            assert_eq!(v.to_string(), s);
+            assert_eq!(CrossCullPolicy::from_str(s).unwrap(), v);
+            assert_eq!(MutationCullPolicy::from_str(s).unwrap().to_string(), s);
+        }
+        assert_eq!(
+            CrossCullPolicy::from_str("spent").unwrap(),
+            CrossCullPolicy::LowestFitnessMostUpdates
+        );
+        assert_eq!(
+            MutationCullPolicy::from_str("unfed").unwrap(),
+            MutationCullPolicy::HighestTicketChance
+        );
+        assert!(
+            CrossCullPolicy::from_str("nope")
+                .unwrap_err()
+                .contains("expected lowest_fitness")
+        );
     }
 }
