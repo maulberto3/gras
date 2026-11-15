@@ -2,7 +2,8 @@
 
 //! MNIST — the tabular showcase: a gras-format dataset, one `TabularStep` trainer, config → run.
 //! Sections: 1 data, 2 trainer, 3 guardrail, 4 `main()`; **match** = batch, **turn** = net's step.
-//! Without real data in `data/mnist` this generates random-label synthetic data — a smoke test only.
+//! It reads the binary dataset at `data/mnist` (`train/` + `test/`); `--synthetic` opts into
+//! random-label smoke data, and without a dataset the run REFUSES instead of faking one.
 
 use std::path::{Path, PathBuf};
 
@@ -23,14 +24,28 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(2);
 }
 
-/// Resolve the dataset (generating synthetic data when the dir is absent) and return
-/// `(inputs, outputs)` — the widths the run's topologies are built with.
-fn dataset_widths(data_dir: &Path) -> (usize, usize) {
+/// Resolve the dataset and return `(inputs, outputs)` — the widths the run's topologies are built
+/// with. The dataset is REQUIRED: a missing dir is an error, and only `--synthetic` fabricates one.
+fn dataset_widths(data_dir: &Path, synthetic: bool) -> (usize, usize) {
     // Two layouts: a `{train,test}` parent (explicit split) or one pool (seeded internal split).
     let explicit_layout = data_dir.join("train").exists() && data_dir.join("test").exists();
-    if !explicit_layout && !data_dir.exists() {
+    let has_pool = data_dir.join("inputs.bin").exists()
+        || data_dir.join("inputs.csv").exists()
+        || data_dir.join("flodl_data").join("inputs.bin").exists();
+    if !explicit_layout && !has_pool {
+        // A fabricated set is a SMOKE TEST: its labels are random, so a fitness from it says
+        // nothing about MNIST — it must never be produced by accident.
+        if !synthetic {
+            die(format!(
+                "no dataset at {} — expected `train/` + `test/` (each holding inputs.bin|inputs.csv + \
+                 targets.bin|targets.csv) or a single pool in the dir; produce the MNIST binaries with \
+                 the producer in data/mnist/mnist_data.rs, or pass --synthetic for a random-label \
+                 smoke test",
+                data_dir.display()
+            ));
+        }
         println!(
-            "  {} not found — generating synthetic single-pool data",
+            "  {} not found — generating SYNTHETIC random-label data (smoke test only, not MNIST)",
             data_dir.display()
         );
         let ds = tabular_data::synthetic_classification(1024, 784, 10, 42, gras::auto_device())
@@ -53,6 +68,11 @@ fn dataset_widths(data_dir: &Path) -> (usize, usize) {
     if explicit_layout {
         println!(
             "  explicit train/test layout at {} — eval rows come ONLY from test/ (no train/eval overlap by construction)",
+            data_dir.display()
+        );
+    } else {
+        println!(
+            "  single-pool dataset at {} — the run seed splits train/eval internally",
             data_dir.display()
         );
     }
@@ -504,6 +524,15 @@ struct Cli {
     /// Dataset directory (any gras-format dataset works; unset: the `DATA_DIR` const).
     #[arg(long, value_name = "DIR")]
     data_dir: Option<PathBuf>,
+    /// Generate random-label data when the dataset is missing — SMOKE TEST only, never a real race.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = false
+    )]
+    synthetic: bool,
     /// Where a NEW run writes (default: `results/<timestamp>`). Output only —
     /// continuing an existing run is `--resume`.
     #[arg(long, value_name = "DIR")]
@@ -530,7 +559,7 @@ fn main() {
         .data_dir
         .clone()
         .unwrap_or_else(|| PathBuf::from(DATA_DIR));
-    let (d_in, d_out) = dataset_widths(&data_dir);
+    let (d_in, d_out) = dataset_widths(&data_dir, cli.synthetic);
 
     // STEP B — fitness: the reported accuracy IS the ranking input, maximized.
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
