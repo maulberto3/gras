@@ -666,7 +666,7 @@ impl CoreEngine {
     pub(crate) fn rolls_at(&self, kind: RollKind) -> usize {
         let share = match kind {
             RollKind::Crossover => self.config.crossover_share,
-            RollKind::Mutation => self.config.mutate_share,
+            RollKind::Mutation => self.config.mutation_share,
         };
         share_rolls(share, self.state.live_count())
     }

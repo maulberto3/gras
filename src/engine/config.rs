@@ -319,7 +319,7 @@ pub const DEFAULT_MAX_STEPS: usize = 10;
 /// the cartpole reference's old `rolls × prob` rates read at the default population of 10 — one
 /// crossover replacement per clock (10%), and 0.4 on the mutation channel (4%).
 pub const DEFAULT_CROSSOVER_SHARE: f32 = 0.1;
-pub const DEFAULT_MUTATE_SHARE: f32 = 0.04;
+pub const DEFAULT_MUTATION_SHARE: f32 = 0.04;
 
 /// Default champion set: the reference's `pop / 10`, read at the conservative default population
 /// 10 — one saved net.
@@ -442,7 +442,7 @@ pub enum CrossCullPolicy {
     /// **Random** — evict a uniformly random live net; keeps slots turning over and
     /// prevents a long-lived leader from starving diversity. Risk: losing a strong net.
     Random,
-    /// **HighestTicketChance** (default) — evict the net the coin pays MOST: the highest
+    /// **HighestTicketChance** — evict the net the coin pays MOST: the highest
     /// ticket chance `p = p_min + (p_max - p_min) x f` among the graded nets, deterministic
     /// with the hash as tie-break. Under the default inverted lottery that is the least fit,
     /// least updated net, i.e. the one the next clock would feed again.
@@ -501,14 +501,14 @@ pub enum MutationCullPolicy {
     /// **Random** — evict a uniformly random live net, at the cost of occasionally
     /// losing a good one.
     Random,
-    /// **HighestTicketChance** (default) — the SAME selector as
+    /// **HighestTicketChance** — the SAME selector as
     /// [`CrossCullPolicy::HighestTicketChance`]: evict the net the train-eval lottery pays
     /// the most (the highest `p` among the graded nets).
     HighestTicketChance,
     /// **LowestFitnessMostUpdates** — the SAME selector as
     /// [`CrossCullPolicy::LowestFitnessMostUpdates`]: evict the net with the highest
     /// `Fm⁻ × (1 − Um⁻)`, so the slot goes to evidence rather than to the coin's next draw.
-    /// Like the crossover arm it ignores the ticket tilt.
+    /// Like the crossover arm it ignores the ticket tilt. `#[default]`, matching the crossover arm.
     #[default]
     LowestFitnessMostUpdates,
 }
@@ -614,7 +614,7 @@ pub struct RaceConfig {
     pub crossover_share: f32,
     /// MUTATION turnover — the mutation channel's own knob — as a share of the live population per
     /// clock. Same contract as [`RaceConfig::crossover_share`]; `0.0` switches the channel off.
-    pub mutate_share: f32,
+    pub mutation_share: f32,
     /// Who a surviving crossover child evicts (crossover-only; immigrants follow
     /// `mutation_cull_policy`).
     pub crossover_cull_policy: CrossCullPolicy,
@@ -916,7 +916,7 @@ impl RaceConfig {
             pop_size: DEFAULT_POP_SIZE,
             checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
             crossover_share: DEFAULT_CROSSOVER_SHARE,
-            mutate_share: DEFAULT_MUTATE_SHARE,
+            mutation_share: DEFAULT_MUTATION_SHARE,
             crossover_cull_policy: CrossCullPolicy::default(),
             mutation_cull_policy: MutationCullPolicy::default(),
             champion_count: DEFAULT_CHAMPION_COUNT,
@@ -1021,8 +1021,8 @@ impl RaceConfig {
         } else {
             legacy_share(snap.crossover_rolls, snap.crossover_prob)
         };
-        cfg.mutate_share = if snap.mutate_share > 0.0 {
-            snap.mutate_share
+        cfg.mutation_share = if snap.mutation_share > 0.0 {
+            snap.mutation_share
         } else {
             legacy_share(snap.mutate_rolls, snap.mutate_prob)
         };
@@ -1246,8 +1246,8 @@ impl RaceConfigBuilder {
     }
     /// Set mutation turnover as a SHARE of the live population per clock, with
     /// `set_crossover_share`'s bounds. `0.0` = the channel OFF.
-    pub fn set_mutate_share(mut self, share: f32) -> Self {
-        self.cfg.mutate_share = if share.is_finite() {
+    pub fn set_mutation_share(mut self, share: f32) -> Self {
+        self.cfg.mutation_share = if share.is_finite() {
             share.clamp(0.0, 1.0)
         } else {
             0.0
