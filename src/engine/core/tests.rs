@@ -442,7 +442,7 @@ fn the_share_is_the_only_turnover_knob_and_the_channels_are_independent() {
         1,
         "the mutation channel is its own knob"
     );
-    eng.config.mutate_share = 0.0;
+    eng.config.mutation_share = 0.0;
     assert_eq!(
         eng.rolls_at(RollKind::Mutation),
         0,
@@ -456,9 +456,9 @@ fn turnover_shares_survive_the_config_snapshot_and_are_clamped() {
     use crate::engine::config::RaceConfig;
     let mut snap = crate::state::ConfigSnapshot::default();
     snap.crossover_share = 0.05;
-    snap.mutate_share = 0.25;
+    snap.mutation_share = 0.25;
     let cfg = RaceConfig::from_snapshot(&snap);
-    assert_eq!((cfg.crossover_share, cfg.mutate_share), (0.05, 0.25));
+    assert_eq!((cfg.crossover_share, cfg.mutation_share), (0.05, 0.25));
     // An OLD header carried fixed rolls and a fire probability instead of a share: the pair's
     // expected rolls per clock become the equivalent share, so the run resumes at its real rate.
     let mut old = crate::state::ConfigSnapshot::default();
@@ -468,20 +468,23 @@ fn turnover_shares_survive_the_config_snapshot_and_are_clamped() {
     old.mutate_rolls = 0; // a switched-off channel stays off
     let migrated = RaceConfig::from_snapshot(&old);
     assert_eq!(
-        (migrated.crossover_share, migrated.mutate_share),
+        (migrated.crossover_share, migrated.mutation_share),
         (0.015, 0.0),
         "3 rolls × 0.5 at pop 100 = 1.5%/clock"
     );
     let clamped = RaceConfig::builder()
         .set_crossover_share(2.0)
-        .set_mutate_share(f32::NAN)
+        .set_mutation_share(f32::NAN)
         .build();
-    assert_eq!((clamped.crossover_share, clamped.mutate_share), (1.0, 0.0));
+    assert_eq!(
+        (clamped.crossover_share, clamped.mutation_share),
+        (1.0, 0.0)
+    );
     // Each channel's knob touches only itself: a one-sided set leaves the other channel at the
     // crate default.
-    let one_sided = RaceConfig::builder().set_mutate_share(0.02).build();
+    let one_sided = RaceConfig::builder().set_mutation_share(0.02).build();
     assert_eq!(
-        (one_sided.crossover_share, one_sided.mutate_share),
+        (one_sided.crossover_share, one_sided.mutation_share),
         (crate::engine::config::DEFAULT_CROSSOVER_SHARE, 0.02),
         "the crossover default is untouched"
     );
@@ -1751,7 +1754,7 @@ fn run_culls_continue_across_a_resume_boundary() {
     let cfg = |max_steps: Option<usize>, stop_after_clock_zero: bool| {
         let mut c = RaceConfig::defaults();
         c.pop_size = 2;
-        c.mutate_share = 0.5; // pop 2 ⇒ one immigration per clock
+        c.mutation_share = 0.5; // pop 2 ⇒ one immigration per clock
         // defaults() shields founders for 5 clocks; the twin must be able to cull.
         c.mutation_probation_steps = 0;
         c.crossover_probation_steps = 0;
@@ -3745,11 +3748,11 @@ fn resume_warns_on_a_cull_policy_mismatch_on_both_channels() {
         .iter()
         .find(|d| d.label == "mutation_cull_policy")
         .expect("the mutation channel is named");
-    assert_eq!(row.recorded, "highest_ticket_chance");
+    assert_eq!(row.recorded, "lowest_fitness_most_updates");
     assert!(row.current.to_lowercase().contains("random"), "{drift:?}");
     assert!(
         row.undo
-            .contains("set_mutation_cull_policy(highest_ticket_chance)"),
+            .contains("set_mutation_cull_policy(lowest_fitness_most_updates)"),
         "{drift:?}"
     );
 

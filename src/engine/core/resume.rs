@@ -244,10 +244,10 @@ impl CoreEngine {
                 current.crossover_share,
             ),
             (
-                "mutate_share",
-                "set_mutate_share",
-                recorded.mutate_share,
-                current.mutate_share,
+                "mutation_share",
+                "set_mutation_share",
+                recorded.mutation_share,
+                current.mutation_share,
             ),
         ] {
             push(

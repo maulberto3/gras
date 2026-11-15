@@ -865,10 +865,10 @@ impl CoreEngine {
                 ),
                 (
                     "mutate_turnover".to_string(),
-                    if self.config.mutate_share > 0.0 {
+                    if self.config.mutation_share > 0.0 {
                         format!(
                             "{}% of pop per clock ({} roll(s))",
-                            fmt_cfg(self.config.mutate_share * 100.0),
+                            fmt_cfg(self.config.mutation_share * 100.0),
                             self.rolls_at(RollKind::Mutation)
                         )
                     } else {
