@@ -34,9 +34,10 @@ pub struct ConfigSnapshot {
     /// Crossover turnover SHARE (`set_crossover_share`); `0.0` = the channel is off.
     #[serde(default)]
     pub crossover_share: f32,
-    /// Mutation turnover SHARE (`set_mutate_share`); `0.0` = off.
-    #[serde(default)]
-    pub mutate_share: f32,
+    /// Mutation turnover SHARE (`set_mutation_share`); `0.0` = off. Reads the pre-rename
+    /// `mutate_share` key too, so a header written before the channel got its one name resumes.
+    #[serde(default, alias = "mutate_share")]
+    pub mutation_share: f32,
     /// Crossover replacement policy (`"worst"` | `"random"`). Crossover-only —
     /// mutation channel has its own knob, recorded just below.
     pub crossover_cull_policy: String,
@@ -247,7 +248,7 @@ impl ConfigSnapshot {
             crossover_rolls: 0,
             mutate_rolls: 0,
             crossover_share: cfg.crossover_share,
-            mutate_share: cfg.mutate_share,
+            mutation_share: cfg.mutation_share,
             crossover_cull_policy: cfg.crossover_cull_policy.to_string(),
             mutation_cull_policy: cfg.mutation_cull_policy.to_string(),
             champion_count: cfg.champion_count,
@@ -1761,10 +1762,10 @@ mod tests {
         assert_eq!(snap.crossover_cull_policy, "random");
         assert_eq!(snap.mutation_cull_policy, "lowest_fitness_most_updates");
         // …and the default run records the policy it actually culls with —
-        // `highest_ticket_chance`, the enum's `#[default]` and the defaults() value.
+        // `lowest_fitness_most_updates`, the `#[default]` on BOTH channels and the defaults() value.
         let dflt = ConfigSnapshot::from_config(&RaceConfig::defaults(), None, None);
-        assert_eq!(dflt.mutation_cull_policy, "highest_ticket_chance");
-        assert_eq!(dflt.crossover_cull_policy, "highest_ticket_chance");
+        assert_eq!(dflt.mutation_cull_policy, "lowest_fitness_most_updates");
+        assert_eq!(dflt.crossover_cull_policy, "lowest_fitness_most_updates");
     }
 
     /// The tombstone's mean was renamed (`final_smoothed_fitness` →
