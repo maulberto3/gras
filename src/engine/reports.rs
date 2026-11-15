@@ -9,7 +9,7 @@ use flodl::tensor::Result;
 
 /// Why the list is not simply the bottom of `fit (F)`, stamped into every `worst-*.md`: the file
 /// outlives the run, and the criterion reads engine knobs a later reader cannot see.
-const WORST_PICK_NOTE: &str = "**Why this net.** The pick is the `spent` criterion the cross/mutation cull evicts on: `spent = Fm⁻ × (1 − Um)` — how badly the net grades (`Fm⁻`: 0.99 = the field's worst, 0.01 = its best) times how much of its updates it has already spent (`1 − Um`: 0.01 at the field's least-updated net, 0.99 at its most). So a weak net the lottery has NOT paid yet ranks BELOW a weak net that trained and stayed weak — the net worth reading, and the reason this list is not just the bottom of `fit (F)`. The place is UN-TILTED: the fit side of `ticket_legs` (worst-first / best-first) is undone as `1 − p` before the product, so that leg decides who the band PAYS and never which end counts as bad, while the `U` leg is read whether or not `ticket_legs` arms it for tickets. A net the lottery cannot grade (shielded, unread, flat field, lottery off) prints `—` and falls to the tail of this index ordered by `fit (F)` — the pre-criterion dump.";
+const WORST_PICK_NOTE: &str = "**Why this net.** The pick is the `spent` criterion the cross/mutation cull evicts on: `spent = Fm⁻ × (1 − Um⁻)` — how badly the net grades (`Fm⁻`: 0.99 = the field's worst, 0.01 = its best) times how much of its updates it has already spent (`1 − Um`: 0.01 at the field's least-updated net, 0.99 at its most). So a weak net the lottery has NOT paid yet ranks BELOW a weak net that trained and stayed weak — the net worth reading, and the reason this list is not just the bottom of `fit (F)`. The place is UN-TILTED: the fit side of `train_ticket` (worst-first / best-first) is undone as `1 − p` before the product, so that leg decides who the band PAYS and never which end counts as bad, while the `U` leg is read whether or not `train_ticket` arms it for tickets. A net the lottery cannot grade (shielded, unread, flat field, lottery off) prints `—` and falls to the tail of this index ordered by `fit (F)` — the pre-criterion dump.";
 
 impl CoreEngine {
     /// Write the MACHINE-READABLE champion ranking — `champions.json`, best first,
@@ -213,7 +213,7 @@ impl CoreEngine {
     /// The pick is the SAME evidence the `spent` cross/mutation cull evicts on — `Fm⁻ × (1 − Um)`,
     /// the net's badness times the share of its updates already burned — so the weak net the
     /// lottery has NOT paid yet cannot crowd out the weak net that trained and stayed weak. The
-    /// place is un-tilted (`1 − p`) exactly as the cull does it, so the fit side of `ticket_legs`
+    /// place is un-tilted (`1 − p`) exactly as the cull does it, so the fit side of `train_ticket`
     /// moves the payouts and never which end of the field counts as bad. A net the lottery cannot grade
     /// (shield, unread, flat field, lottery off) has no `spent` and falls to the tail by
     /// `fit (F)` — the pre-criterion dump, byte for byte.
@@ -344,7 +344,7 @@ impl CoreEngine {
                 )
             });
             let body = format!(
-                "# Anti-champion field at clock {clock}\n\nThese are the `champion_count` nets that already BURNED their updates and stayed bad — ranked by the `spent` criterion `Fm⁻ × (1 − Um)`, the same number the `spent` cross/mutation cull evicts on, not by `fit (F)` alone: a weak net the lottery has not paid yet ranks BELOW a weak net that trained and stayed weak. Every row is one net's topology + mermaid graph + lineage; `spent` is the ranking value, `ticket p` is the chance the train-eval lottery gives that net on the NEXT clock (dash = not graded, so it has no chance to name), and `fit (F)` rides along for comparison. A row with `—` spent was not graded and is listed after the graded ones, by `fit (F)` ascending.\n\n{favourite_line}{index}"
+                "# Anti-champion field at clock {clock}\n\nThese are the `champion_count` nets that already BURNED their updates and stayed bad — ranked by the `spent` criterion `Fm⁻ × (1 − Um⁻)`, the same number the `spent` cross/mutation cull evicts on, not by `fit (F)` alone: a weak net the lottery has not paid yet ranks BELOW a weak net that trained and stayed weak. Every row is one net's topology + mermaid graph + lineage; `spent` is the ranking value, `ticket p` is the chance the train-eval lottery gives that net on the NEXT clock (dash = not graded, so it has no chance to name), and `fit (F)` rides along for comparison. A row with `—` spent was not graded and is listed after the graded ones, by `fit (F)` ascending.\n\n{favourite_line}{index}"
             );
             let path = self.run_dir.join("worst.md");
             if let Err(source) = std::fs::write(&path, body) {
@@ -361,7 +361,7 @@ impl CoreEngine {
                     "Anti-champion topology (markdown)",
                     &crate::utils::cfy::table(&["#", "hash", "fit (F)", "file"], &written),
                     Some(
-                        "the bad nets that already spent their updates (`Fm⁻ × (1 − Um)`); ungraded nets fall back to the lowest `fit (F)`",
+                        "the bad nets that already spent their updates (`Fm⁻ × (1 − Um⁻)`); ungraded nets fall back to the lowest `fit (F)`",
                     ),
                 ));
             }
@@ -439,7 +439,7 @@ impl CoreEngine {
     }
 }
 
-/// Anti-champion order: the HIGHEST `spent` (`Fm⁻ × (1 − Um)`) first — the bad nets the field has
+/// Anti-champion order: the HIGHEST `spent` (`Fm⁻ × (1 − Um⁻)`) first — the bad nets the field has
 /// already paid for — then the lowest `fit (F)`, the older net, the hash. Nets the lottery cannot
 /// grade carry `None` and follow the graded ones, ordered by `fit (F)` alone, which is exactly the
 /// pre-criterion dump. A TOTAL order, so the files, the index and the final table can never

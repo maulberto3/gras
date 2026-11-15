@@ -427,7 +427,7 @@ mod tests {
             m.fam_spread
         );
         // The default family is the pre-knob ranking, and `rolling_stats` is its shortcut.
-        assert_eq!(MeanType::default(), MeanType::Arithmetic);
+        assert_eq!(MeanType::default(), MeanType::Median);
         assert_eq!(
             rolling_stats_with(&buf, MeanType::Arithmetic)
                 .unwrap()

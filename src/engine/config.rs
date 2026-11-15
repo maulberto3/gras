@@ -26,14 +26,15 @@ pub const SMOOTHING_WINDOW: usize = 5;
 /// How the smoothing window's readings are averaged into the ranking centre (`set_fitness_mean_type`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MeanType {
-    /// The weighted window mean — the plain average, and the default.
-    #[default]
+    /// The weighted window mean — the plain average, the pre-knob ranking.
     Arithmetic,
     /// `g(x) = sign(x)·ln(1 + |x|)`: centre and spread are taken in that compressed space
     /// score is mapped back, so one spike cannot dominate the window the way it does through
     SignedLog,
     /// The WEIGHTED MEDIAN: no single reading can move the centre at all; the spread is the medians
     /// absolute deviation scaled by `1.4826`, so a median spread stays comparable with σ.
+    /// The MEDIAN is the default: no single reading can move the ranking centre.
+    #[default]
     Median,
 }
 
@@ -47,8 +48,8 @@ impl MeanType {
         }
     }
 
-    /// Parse a recorded spelling. Unknown (and `""` from a header written before
-    /// knob) yields `None`, which every caller reads as the arithmetic default.
+    /// Parse a recorded spelling. Unknown (and `""` from a header written before the
+    /// knob) yields `None`, which every caller reads as [`DEFAULT_MEAN_TYPE`].
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "arithmetic" | "mean" | "simple" | "average" => Some(MeanType::Arithmetic),
@@ -65,29 +66,41 @@ impl std::fmt::Display for MeanType {
     }
 }
 
-/// Default [`MeanType`] — the arithmetic mean, i.e. the ranking every run before
-/// knob used.
-pub const DEFAULT_MEAN_TYPE: MeanType = MeanType::Arithmetic;
+/// The ranking family a command line names, so a flag can be a typed `MeanType` rather than a
+/// string the caller has to parse (the same contract the cull policies use).
+impl std::str::FromStr for MeanType {
+    type Err = String;
 
-/// The lottery's two LEGS (`set_ticket_legs`): which fit PLACE earns the most tickets, and which
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        MeanType::parse(s)
+            .ok_or_else(|| format!("{s}: expected one of arithmetic, signed_log, median"))
+    }
+}
+
+/// Default [`MeanType`] — the WEIGHTED MEDIAN: one spike cannot promote or demote a net on a
+/// fluke. `arithmetic` is the older plain-window ranking.
+pub const DEFAULT_MEAN_TYPE: MeanType = MeanType::Median;
+
+/// The lottery's two LEGS (`set_train_ticket`): which fit PLACE earns the most tickets, and which
 /// side of the UPDATES field the ticket multiplies in.
 ///
 /// One spelling is the whole setting, and it is the value `engine.json` records, so a run is
 /// described in word-pairs a reader already knows: `least_fit_fewest_updates` pays the net that
 /// grades worst AND has trained least, `most_fit_most_updates` pays the one that grades best and
 /// has trained most. `most_fit` / `least_fit` are the place ALONE — the updates leg is off, so
-/// the ticket is exactly `Fm`, and no boolean pair can claim a state that does not exist.
+/// the ticket is exactly `Fm⁺`, and no boolean pair can claim a state that does not exist.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TicketLegs {
-    /// The fittest net earns the most tickets; the updates leg is OFF (`Fm`).
+pub enum TrainTicket {
+    /// The fittest net earns the most tickets; the updates leg is OFF (`Fm⁺`).
     MostFit,
-    /// The fittest net that has trained the LEAST earns the most tickets (`Fm × Um`).
+    /// The fittest net that has trained the LEAST earns the most tickets (`Fm⁺ × Um⁻`).
     MostFitFewestUpdates,
-    /// The fittest net that has trained the MOST earns the most tickets (`Fm × Um⁺`).
-    MostFitMostUpdates,
-    /// The LEAST fit net that has trained the LEAST earns the most tickets (`Fm⁻ × Um`) — the
-    /// engine default ([`DEFAULT_TICKET_LEGS`]) and the reference run's tuned leg.
+    /// The fittest net that has trained the MOST earns the most tickets (`Fm⁺ × Um⁺`) — the
+    /// engine default ([`DEFAULT_TRAIN_TICKET`]).
     #[default]
+    MostFitMostUpdates,
+    /// The LEAST fit net that has trained the LEAST earns the most tickets (`Fm⁻ × Um⁻`) — the
+    /// reference run's tuned leg.
     LeastFitFewestUpdates,
     /// The LEAST fit net that has trained the MOST earns the most tickets (`Fm⁻ × Um⁺`).
     LeastFitMostUpdates,
@@ -95,16 +108,16 @@ pub enum TicketLegs {
     LeastFit,
 }
 
-impl TicketLegs {
+impl TrainTicket {
     /// Every leg, in the order the docs, the CLI help and the error messages list them — ONE
     /// list, so a surface handed an unknown spelling names the real set instead of a retyped copy.
-    pub const ALL: [TicketLegs; 6] = [
-        TicketLegs::MostFit,
-        TicketLegs::MostFitFewestUpdates,
-        TicketLegs::MostFitMostUpdates,
-        TicketLegs::LeastFitFewestUpdates,
-        TicketLegs::LeastFitMostUpdates,
-        TicketLegs::LeastFit,
+    pub const ALL: [TrainTicket; 6] = [
+        TrainTicket::MostFit,
+        TrainTicket::MostFitFewestUpdates,
+        TrainTicket::MostFitMostUpdates,
+        TrainTicket::LeastFitFewestUpdates,
+        TrainTicket::LeastFitMostUpdates,
+        TrainTicket::LeastFit,
     ];
 
     /// [`Self::ALL`] as the spellings [`Self::as_str`] prints, for messages that list the choices.
@@ -120,12 +133,12 @@ impl TicketLegs {
     /// The spelling `engine.json` records, the CLI accepts and the log prints.
     pub fn as_str(self) -> &'static str {
         match self {
-            TicketLegs::MostFit => "most_fit",
-            TicketLegs::MostFitFewestUpdates => "most_fit_fewest_updates",
-            TicketLegs::MostFitMostUpdates => "most_fit_most_updates",
-            TicketLegs::LeastFitFewestUpdates => "least_fit_fewest_updates",
-            TicketLegs::LeastFitMostUpdates => "least_fit_most_updates",
-            TicketLegs::LeastFit => "least_fit",
+            TrainTicket::MostFit => "most_fit",
+            TrainTicket::MostFitFewestUpdates => "most_fit_fewest_updates",
+            TrainTicket::MostFitMostUpdates => "most_fit_most_updates",
+            TrainTicket::LeastFitFewestUpdates => "least_fit_fewest_updates",
+            TrainTicket::LeastFitMostUpdates => "least_fit_most_updates",
+            TrainTicket::LeastFit => "least_fit",
         }
     }
 
@@ -135,15 +148,15 @@ impl TicketLegs {
     pub fn parse(raw: &str) -> Option<Self> {
         let key = raw.trim().to_ascii_lowercase().replace([' ', '-'], "_");
         match key.as_str() {
-            "most_fit" | "best_fit" => Some(TicketLegs::MostFit),
-            "most_fit_most_updates" | "best_most" => Some(TicketLegs::MostFitMostUpdates),
+            "most_fit" | "best_fit" => Some(TrainTicket::MostFit),
+            "most_fit_most_updates" | "best_most" => Some(TrainTicket::MostFitMostUpdates),
             "most_fit_fewest_updates" | "most_fit_least_updates" | "best_fewest" => {
-                Some(TicketLegs::MostFitFewestUpdates)
+                Some(TrainTicket::MostFitFewestUpdates)
             }
-            "least_fit" | "worst_fit" => Some(TicketLegs::LeastFit),
-            "least_fit_most_updates" | "worst_most" => Some(TicketLegs::LeastFitMostUpdates),
+            "least_fit" | "worst_fit" => Some(TrainTicket::LeastFit),
+            "least_fit_most_updates" | "worst_most" => Some(TrainTicket::LeastFitMostUpdates),
             "least_fit_fewest_updates" | "least_fit_least_updates" | "worst_fewest" => {
-                Some(TicketLegs::LeastFitFewestUpdates)
+                Some(TrainTicket::LeastFitFewestUpdates)
             }
             _ => None,
         }
@@ -153,47 +166,47 @@ impl TicketLegs {
     pub fn fitness_inverted(self) -> bool {
         matches!(
             self,
-            TicketLegs::LeastFit
-                | TicketLegs::LeastFitFewestUpdates
-                | TicketLegs::LeastFitMostUpdates
+            TrainTicket::LeastFit
+                | TrainTicket::LeastFitFewestUpdates
+                | TrainTicket::LeastFitMostUpdates
         )
     }
 
     /// Does the updates leg multiply the place? `false` = place only.
     pub fn updates_armed(self) -> bool {
-        !matches!(self, TicketLegs::MostFit | TicketLegs::LeastFit)
+        !matches!(self, TrainTicket::MostFit | TrainTicket::LeastFit)
     }
 
     /// Which side of the updates field the ticket pays: `true` = the LEAST trained net
-    /// (`Um`, `1` at the field's fewest updates). Only meaningful while the leg is armed.
+    /// (`Um⁻`, `1` at the field's fewest updates). Only meaningful while the leg is armed.
     pub fn updates_inverted(self) -> bool {
         matches!(
             self,
-            TicketLegs::MostFitFewestUpdates | TicketLegs::LeastFitFewestUpdates
+            TrainTicket::MostFitFewestUpdates | TrainTicket::LeastFitFewestUpdates
         )
     }
 
     /// The same legs with the fit PLACE flipped (`most_fit` ↔ `least_fit`), updates side kept.
     pub fn with_fitness_inverted(self, inverted: bool) -> Self {
         match (inverted, self.updates_armed(), self.updates_inverted()) {
-            (false, false, _) => TicketLegs::MostFit,
-            (true, false, _) => TicketLegs::LeastFit,
-            (false, true, true) => TicketLegs::MostFitFewestUpdates,
-            (true, true, true) => TicketLegs::LeastFitFewestUpdates,
-            (false, true, false) => TicketLegs::MostFitMostUpdates,
-            (true, true, false) => TicketLegs::LeastFitMostUpdates,
+            (false, false, _) => TrainTicket::MostFit,
+            (true, false, _) => TrainTicket::LeastFit,
+            (false, true, true) => TrainTicket::MostFitFewestUpdates,
+            (true, true, true) => TrainTicket::LeastFitFewestUpdates,
+            (false, true, false) => TrainTicket::MostFitMostUpdates,
+            (true, true, false) => TrainTicket::LeastFitMostUpdates,
         }
     }
 
     /// The same place with the UPDATES leg armed or switched off. Arming a bare place picks
-    /// `fewest_updates` (the engine's default leg); a leg that already names its updates side
-    /// keeps it, so this is safe to call twice.
+    /// `fewest_updates` — the LEGACY `Um⁻` leg the pre-enum booleans meant, not today's default;
+    /// a leg that already names its updates side keeps it, so this is safe to call twice.
     pub fn with_updates_armed(self, armed: bool) -> Self {
         if !armed {
             return if self.fitness_inverted() {
-                TicketLegs::LeastFit
+                TrainTicket::LeastFit
             } else {
-                TicketLegs::MostFit
+                TrainTicket::MostFit
             };
         }
         match (
@@ -201,38 +214,56 @@ impl TicketLegs {
             self.updates_armed(),
             self.updates_inverted(),
         ) {
-            (false, true, false) => TicketLegs::MostFitMostUpdates,
-            (true, true, false) => TicketLegs::LeastFitMostUpdates,
-            (false, _, _) => TicketLegs::MostFitFewestUpdates,
-            (true, _, _) => TicketLegs::LeastFitFewestUpdates,
+            (false, true, false) => TrainTicket::MostFitMostUpdates,
+            (true, true, false) => TrainTicket::LeastFitMostUpdates,
+            (false, _, _) => TrainTicket::MostFitFewestUpdates,
+            (true, _, _) => TrainTicket::LeastFitFewestUpdates,
         }
     }
 
     /// The legs the two pre-enum booleans meant: `inverted` = which place, `updates_armed` = U
-    /// leg on or off (on means the LEAST trained net, the old `Um`).
+    /// leg on or off (on means the LEAST trained net, the old `Um⁻`).
     pub fn from_bools(inverted: bool, updates_armed: bool) -> Self {
-        TicketLegs::default()
+        // The pair named the LEGACY `Um` leg (fewest updates), not today's default, so start from
+        // the leg the booleans actually meant and let the setters move the two axes.
+        TrainTicket::MostFitFewestUpdates
             .with_fitness_inverted(inverted)
             .with_updates_armed(updates_armed)
     }
 }
 
-impl std::fmt::Display for TicketLegs {
+impl std::fmt::Display for TrainTicket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-/// Default ticket LEGS (`set_ticket_legs`): the LEAST fit, LEAST trained net earns the most
-/// tickets — the ordering the reference run was tuned on.
-pub const DEFAULT_TICKET_LEGS: TicketLegs = TicketLegs::LeastFitFewestUpdates;
+/// The leg a command line names, so the flag can be a typed `TrainTicket` (the setter's own
+/// type) instead of a string parsed at the call site.
+impl std::str::FromStr for TrainTicket {
+    type Err = String;
 
-/// The legs a HEADER records: its `ticket_legs` spelling when it carries one, else the legacy
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        TrainTicket::parse(s)
+            .ok_or_else(|| format!("{s}: expected one of {}", TrainTicket::ALL_NAMES.join(", ")))
+    }
+}
+
+/// Default ticket LEGS (`set_train_ticket`): the FITTEST net that has trained the MOST earns the
+/// most tickets (`Fm⁺ × Um⁺`) — the lottery pays the nets that keep proving themselves and keep
+/// learning, so a reading nobody acts on cannot hold a seat.
+pub const DEFAULT_TRAIN_TICKET: TrainTicket = TrainTicket::MostFitMostUpdates;
+
+/// The legs a HEADER records: its `train_ticket` spelling when it carries one, else the legacy
 /// `(inverted, updates_armed)` pair it replaced — `true,true` = `least_fit_fewest_updates`.
 /// The ONE reader, so `from_snapshot` and the resume parity check cannot disagree about what an
 /// old header meant.
-pub fn ticket_legs_from_header(recorded: &str, inverted: bool, updates_armed: bool) -> TicketLegs {
-    TicketLegs::parse(recorded).unwrap_or_else(|| TicketLegs::from_bools(inverted, updates_armed))
+pub fn train_ticket_from_header(
+    recorded: &str,
+    inverted: bool,
+    updates_armed: bool,
+) -> TrainTicket {
+    TrainTicket::parse(recorded).unwrap_or_else(|| TrainTicket::from_bools(inverted, updates_armed))
 }
 
 /// LEGACY lottery strength Ω (`set_run_train_merit`, deprecated): retired as a second dial. `1.0`
@@ -322,10 +353,11 @@ pub const DEFAULT_INIT_PROBATION_STEPS: usize = 0;
 pub const DEFAULT_HIDDEN_POOL: std::ops::RangeInclusive<usize> = 16..=64;
 
 /// Default merit floor `p_min`: the smallest share of clocks the WORST net in the lottery's field
-/// still gets.
-pub const DEFAULT_TRAIN_MERIT_P_MIN: f32 = 0.05;
-/// Default lottery CEILING `p_max`: the largest share of clocks the best-graded net may take.
-pub const DEFAULT_TRAIN_MERIT_P_MAX: f32 = 0.4;
+/// still gets — a quarter, so even the bottom of the field keeps a ladder back up.
+pub const DEFAULT_TRAIN_MERIT_P_MIN: f32 = 0.25;
+/// Default lottery CEILING `p_max`: the largest share of clocks the best-graded net may take —
+/// three quarters, so the field's best net still leaves clocks for the rest.
+pub const DEFAULT_TRAIN_MERIT_P_MAX: f32 = 0.75;
 
 /// Default share of the dataset held out for EVAL (`eval_share`): how much of the rows the race
 /// RANKS on and never trains
@@ -414,14 +446,14 @@ pub enum CrossCullPolicy {
     /// ticket chance `p = p_min + (p_max - p_min) x f` among the graded nets, deterministic
     /// with the hash as tie-break. Under the default inverted lottery that is the least fit,
     /// least updated net, i.e. the one the next clock would feed again.
-    #[default]
     HighestTicketChance,
-    /// **LowestFitnessMostUpdates** — evict the net with the highest `Fm- x (1 - Um)`: the
+    /// **LowestFitnessMostUpdates** — evict the net with the highest `Fm⁻ × (1 − Um⁻)`: the
     /// lowest-fitness net that has ALSO spent its updates. A weak newcomer the band has barely
     /// paid has not had its chance yet; a weak net that has already trained `U` times has, so
     /// this arm culls on evidence instead of on the coin's next draw. It also ignores the
     /// ticket TILT: the lowest-fitness net is the lowest-fitness net whichever end the band
     /// pays. Deterministic (hash tie-break).
+    #[default]
     LowestFitnessMostUpdates,
 }
 
@@ -438,6 +470,27 @@ impl std::fmt::Display for CrossCullPolicy {
     }
 }
 
+/// The reverse of [`Display`](std::fmt::Display): the policy a `--…-cull-policy` flag names.
+/// Spelled once here so a CLI, a manifest and `engine.json` cannot drift apart — a caller that
+/// wants a victim from a string parses the string, it does not match on it at the setter.
+/// The legacy aliases (`worst`, `spent`, `unfed`) are accepted because older scripts and
+/// manifests used them; the error names the canonical four.
+impl std::str::FromStr for CrossCullPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "lowest_fitness" | "worst" => Ok(Self::LowestFitness),
+            "random" => Ok(Self::Random),
+            "highest_ticket_chance" | "unfed" => Ok(Self::HighestTicketChance),
+            "lowest_fitness_most_updates" | "spent" => Ok(Self::LowestFitnessMostUpdates),
+            _ => Err(format!(
+                "{s}: expected lowest_fitness, random, highest_ticket_chance or lowest_fitness_most_updates"
+            )),
+        }
+    }
+}
+
 /// Who gets evicted when a MUTATION roll inserts a fresh random immigrant.
 /// **Mutation-only** — the crossover channel has its own policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -451,12 +504,12 @@ pub enum MutationCullPolicy {
     /// **HighestTicketChance** (default) — the SAME selector as
     /// [`CrossCullPolicy::HighestTicketChance`]: evict the net the train-eval lottery pays
     /// the most (the highest `p` among the graded nets).
-    #[default]
     HighestTicketChance,
     /// **LowestFitnessMostUpdates** — the SAME selector as
     /// [`CrossCullPolicy::LowestFitnessMostUpdates`]: evict the net with the highest
-    /// `Fm- x (1 - Um)`, so the slot goes to evidence rather than to the coin's next draw.
+    /// `Fm⁻ × (1 − Um⁻)`, so the slot goes to evidence rather than to the coin's next draw.
     /// Like the crossover arm it ignores the ticket tilt.
+    #[default]
     LowestFitnessMostUpdates,
 }
 
@@ -469,6 +522,25 @@ impl std::fmt::Display for MutationCullPolicy {
             Self::HighestTicketChance => "highest_ticket_chance",
             Self::LowestFitnessMostUpdates => "lowest_fitness_most_updates",
         })
+    }
+}
+
+/// The reverse of [`Display`](std::fmt::Display) — the same spellings and the same legacy
+/// aliases as [`CrossCullPolicy`], so the mutation channel's flag parses exactly like the
+/// crossover one.
+impl std::str::FromStr for MutationCullPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "lowest_fitness" | "worst" => Ok(Self::LowestFitness),
+            "random" => Ok(Self::Random),
+            "highest_ticket_chance" | "unfed" => Ok(Self::HighestTicketChance),
+            "lowest_fitness_most_updates" | "spent" => Ok(Self::LowestFitnessMostUpdates),
+            _ => Err(format!(
+                "{s}: expected lowest_fitness, random, highest_ticket_chance or lowest_fitness_most_updates"
+            )),
+        }
     }
 }
 
@@ -563,10 +635,10 @@ pub struct RaceConfig {
     /// CEILING `p_max` of the ticket band (`set_ticket_p_max`) — literally the chance the
     /// best-graded net gets each clock; every net is paid between the floor and this.
     pub train_merit_p_max: f32,
-    /// The lottery's two LEGS (`set_ticket_legs`): which fit place earns the ticket and which side
+    /// The lottery's two LEGS (`set_train_ticket`): which fit place earns the ticket and which side
     /// of the updates field it multiplies in. The ONE field the coin and the report both read, so
     /// place-only and the two updates sides are spellings of a value, not of three booleans.
-    pub ticket_legs: TicketLegs,
+    pub train_ticket: TrainTicket,
     /// LEARN-ONLY lottery (`set_ticket_learn_only`): `true` = a lost ticket costs the
     /// weight UPDATE, not the STEP — the net runs its trainer with a no-op optimizer, so it acts,
     /// is measured, and its fitness moves every clock. `false` = the clock idles. Default `false`.
@@ -580,7 +652,8 @@ pub struct RaceConfig {
     /// ranking decision averages over. Defaults to [`SMOOTHING_WINDOW`].
     pub smoothing_window: usize,
     /// How the window's readings are averaged into the ranking centre (`set_fitness_mean_type`):
-    /// [`MeanType::Arithmetic`] (default, the pre-knob ranking), [`MeanType::SignedLog`]
+    /// [`MeanType::Median`] (the default — no single reading moves the centre),
+    /// [`MeanType::Arithmetic`] (the older plain window mean), [`MeanType::SignedLog`]
     pub mean_type: MeanType,
     /// POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): `true` makes the mean/spread/n
     /// describe the CURRENT weights — the readings taken since the net's last real update — so the
@@ -850,7 +923,7 @@ impl RaceConfig {
             train_merit: DEFAULT_TRAIN_MERIT,
             train_merit_p_min: DEFAULT_TRAIN_MERIT_P_MIN,
             train_merit_p_max: DEFAULT_TRAIN_MERIT_P_MAX,
-            ticket_legs: DEFAULT_TICKET_LEGS,
+            train_ticket: DEFAULT_TRAIN_TICKET,
             train_merit_learn_only: DEFAULT_TRAIN_MERIT_LEARN_ONLY,
             eval_share: DEFAULT_EVAL_SHARE,
             smoothing_window: SMOOTHING_WINDOW,
@@ -884,8 +957,8 @@ impl RaceConfig {
             run_name: None,
             champion_previous_load: true,
             champion_previous_dir: None,
-            mutation_probation_steps: 5,
-            crossover_probation_steps: 5,
+            mutation_probation_steps: 0,
+            crossover_probation_steps: 0,
             init_probation_steps: DEFAULT_INIT_PROBATION_STEPS,
             recovery_retries: DEFAULT_RECOVERY_RETRIES,
             recovery_tolerance: DEFAULT_RECOVERY_TOLERANCE,
@@ -975,10 +1048,10 @@ impl RaceConfig {
         }
         // `""` = a header written before the knob, which averaged arithmetically.
         cfg.mean_type = MeanType::parse(&snap.mean_type).unwrap_or(DEFAULT_MEAN_TYPE);
-        // One spelling carries both legs: the `ticket_legs` key when the header has one, the
+        // One spelling carries both legs: the `train_ticket` key when the header has one, the
         // legacy bool pair it replaced otherwise.
-        cfg.ticket_legs = ticket_legs_from_header(
-            &snap.ticket_legs,
+        cfg.train_ticket = train_ticket_from_header(
+            &snap.train_ticket,
             snap.train_merit_inverted,
             snap.train_merit_updates,
         );
@@ -1217,7 +1290,7 @@ impl RaceConfigBuilder {
         self.cfg.train_merit = 1.0;
         self
     }
-    /// The lottery's merit floor `p_min` (default `0.05`, `0.0` = the pre-floor arithmetic).
+    /// The lottery's merit floor `p_min` (default `0.25`, `0.0` = the pre-floor arithmetic).
     pub fn set_ticket_p_min(mut self, p_min: f32) -> Self {
         self.cfg.train_merit_p_min = if p_min.is_finite() {
             p_min.clamp(0.0, 1.0)
@@ -1236,11 +1309,11 @@ impl RaceConfigBuilder {
         };
         self
     }
-    /// The lottery's LEGS (`TicketLegs`): which fit place earns the ticket, and which side of the
-    /// updates field it multiplies in. Default [`DEFAULT_TICKET_LEGS`] =
+    /// The lottery's LEGS (`TrainTicket`): which fit place earns the ticket, and which side of the
+    /// updates field it multiplies in. Default [`DEFAULT_TRAIN_TICKET`] =
     /// `least_fit_fewest_updates`.
-    pub fn set_ticket_legs(mut self, legs: TicketLegs) -> Self {
-        self.cfg.ticket_legs = legs;
+    pub fn set_train_ticket(mut self, legs: TrainTicket) -> Self {
+        self.cfg.train_ticket = legs;
         self
     }
     /// LEARN-ONLY lottery (default `false`): `true` keeps every net ACTING and MEASURING every
@@ -1511,7 +1584,7 @@ impl RaceConfigBuilder {
         self
     }
     /// Crossover probation steps: cull-immunity for a crossover child's first
-    /// `k` UPDATES — `U`, not clocks (see [`RaceConfig::crossover_probation_steps`]). Default 5.
+    /// `k` UPDATES — `U`, not clocks (see [`RaceConfig::crossover_probation_steps`]). Default 0.
     pub fn set_crossover_probation_steps(mut self, k: usize) -> Self {
         self.cfg.crossover_probation_steps = k;
         self

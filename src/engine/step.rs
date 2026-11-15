@@ -569,21 +569,24 @@ impl CoreEngine {
         {
             return Err("flat");
         }
-        let legs = self.config.ticket_legs;
+        let legs = self.config.train_ticket;
         let f = Self::merit_fraction_inverted(q, frame.best, frame.worst, legs.fitness_inverted());
         // The U leg: armed it multiplies the place, and WHICH SIDE it pays is the leg's own
         // business — `fewest_updates` keeps the fresh net (`0.99` at the field's fewest updates),
         // `most_updates` pays the net that has SPENT the most. Disarmed it is neutral at `1.0`, so
         // the ticket is exactly the place, bit for bit.
-        let updates = if legs.updates_armed() {
+        let updates = if !legs.updates_armed() || frame.most_updates <= frame.fewest_updates {
+            // No U leg, or no U SPREAD to pay a side of: the factor is neutral. `fresh` reads 1.0
+            // on a flat field (a min-max with no span has no end), so the `most_updates`
+            // complement would turn "everybody trained the same" into 0.0 and starve the field.
+            1.0
+        } else {
             let fresh = self.updates_fraction(hash, &frame);
             if legs.updates_inverted() {
                 fresh
             } else {
                 1.0 - fresh
             }
-        } else {
-            1.0
         };
         // The product is pushed inside the same interior as its factors, so `p` never lands on the
         // band's exact `p_min`/`p_max` whatever the two legs do.
@@ -618,7 +621,7 @@ impl CoreEngine {
         // The cull is about the NET, never about the payout: `Fm⁻` here is the WORST-first place
         // whichever end the band pays. `grade_lottery_parts` hands back the TILTED `f`, so undo the
         // tilt first — best-first flipped it, so the badness is its complement.
-        let badness = if self.config.ticket_legs.fitness_inverted() {
+        let badness = if self.config.train_ticket.fitness_inverted() {
             f
         } else {
             1.0 - f
@@ -654,7 +657,7 @@ impl CoreEngine {
     /// Which END of the field earns the tickets, in one word — the manifest, the debug card
     /// per-clock lottery line all print it, so a reader never has to translate an ordering out
     pub(crate) fn lottery_tilt(&self) -> &'static str {
-        if self.config.ticket_legs.fitness_inverted() {
+        if self.config.train_ticket.fitness_inverted() {
             "worst-first"
         } else {
             "best-first"
@@ -716,7 +719,7 @@ impl CoreEngine {
     }
 
     /// [`Self::merit_fraction`] with the ordering tilt: `inverted` grades the WORST merit `0.99`
-    /// and the best `0.01` (the fit side of `set_ticket_legs`), with `1.0` reserved for a field
+    /// and the best `0.01` (the fit side of `set_train_ticket`), with `1.0` reserved for a field
     /// that has no spread at all.
     pub(crate) fn merit_fraction_inverted(q: f32, best: f32, worst: f32, inverted: bool) -> f32 {
         if !q.is_finite() || !best.is_finite() || !worst.is_finite() || best <= worst {
