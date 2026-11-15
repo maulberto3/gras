@@ -33,8 +33,12 @@ pub(crate) fn kv(rows: &[(String, String)]) -> String {
     render(None, &cells)
 }
 
-/// Max width of PROSE inside a card — a legend value or a footnote.
+/// Max width of a card's prose BLOCK — a legend row (key AND value) or a footnote.
 pub(crate) const PROSE_WIDTH: usize = 110;
+
+/// The floor the key column may squeeze the prose down to. Without it a very long key
+/// (`fit (F = g⁻¹(ḡ), g = sign(x)·ln(1+|x|))`) would leave one word per line.
+const MIN_PROSE_WIDTH: usize = 40;
 
 /// Hard-wrap `text` at `width` COLUMNS (chars, not bytes: `·`, `Δ` and `—` are one column
 /// several bytes).
@@ -74,12 +78,21 @@ pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// The [`table`] whose SECOND column is prose: a real header row, values wrapped
-/// [`PROSE_WIDTH`].
+/// The [`table`] whose SECOND column is prose: a real header row, values wrapped so the WHOLE
+/// block stays near [`PROSE_WIDTH`]. The key column is as wide as its longest key, and that
+/// width comes OUT of the prose budget — a long key shrinks the value column instead of pushing
+/// the block past the terminal, which is what a per-cell [`PROSE_WIDTH`] did.
 pub(crate) fn table_wrapped(header: &[&str], rows: &[(String, String)]) -> String {
+    let key_width = rows
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .chain(header.iter().map(|h| h.chars().count()))
+        .max()
+        .unwrap_or(0);
+    let prose_width = PROSE_WIDTH.saturating_sub(key_width).max(MIN_PROSE_WIDTH);
     let cells: Vec<Vec<String>> = rows
         .iter()
-        .map(|(k, v)| vec![k.clone(), wrap(v, PROSE_WIDTH).join("\n")])
+        .map(|(k, v)| vec![k.clone(), wrap(v, prose_width).join("\n")])
         .collect();
     render(Some(header), &cells)
 }
@@ -200,16 +213,22 @@ mod tests {
             &[("A".to_string(), long.to_string())],
         );
         let widest = legend.lines().map(|l| l.chars().count()).max().unwrap_or(0);
-        // The HEADER widens the key column (`description` is 11 columns), so the bound
-        // the prose width plus that key cell — still one screen, never the old 350.
+        // The key column (`description` is 11 columns) comes OUT of the prose budget, so the
+        // block stays at the prose width plus its borders — one screen, never the old 350.
         assert!(
             widest <= PROSE_WIDTH + 24,
             "the block stays near the prose width, got {widest} columns"
         );
         // The key appears ONCE, and the wrapped tail rides the value column.
         assert_eq!(legend.matches("A").count(), 1, "{legend}");
+        // The wrapped tail continues in the VALUE column. Which word breaks is not fixed (the
+        // prose budget is `PROSE_WIDTH` minus the key column), but where the text goes is.
+        let tail = legend
+            .lines()
+            .find(|l| l.contains("observable"))
+            .expect("the value's tail is printed");
         assert!(
-            legend.contains("┆ which has no observable") || legend.contains("┆ no observable"),
+            tail.contains('┆'),
             "continuation stays in the value column: {legend}"
         );
 

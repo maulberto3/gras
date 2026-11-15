@@ -898,8 +898,8 @@ impl CoreEngine {
                 // Which NET the ticket favours, on both legs, spelled out so a reader does not
                 // have to interpret a pair of booleans.
                 (
-                    "ticket_legs".to_string(),
-                    self.config.ticket_legs.to_string(),
+                    "train_ticket".to_string(),
+                    self.config.train_ticket.to_string(),
                 ),
                 ("lottery tilt".to_string(), self.lottery_tilt().to_string()),
                 (
@@ -974,7 +974,9 @@ impl CoreEngine {
             ));
             // The legend: every word and symbol the step lines use, defined ONCE next
             // arithmetic it names.
-            let legend = crate::utils::cfy::kv(&[
+            // Wrapped like the stop card's legend: an unwrapped prose row makes the box as
+            // wide as its longest sentence, which is wider than any terminal.
+            let legend_rows: Vec<(String, String)> = vec![
                 (
                     "numbers".to_string(),
                     "|v| ≥ 10 → 1 decimal · 1 ≤ |v| < 10 → 2 · |v| < 1 → 4".to_string(),
@@ -1014,7 +1016,8 @@ impl CoreEngine {
                     "idled = the lottery withheld this clock's train+eval · exempt = crown or born shield, always runs · ticket = one clock of train+eval · trained n of m = optimizer updates over clocks lived"
                         .to_string(),
                 ),
-            ]);
+            ];
+            let legend = crate::utils::cfy::table_wrapped(&["abbrev", "description"], &legend_rows);
             crate::utils::cfy::emit(&crate::utils::cfy::card("Legend", &legend, None));
 
             // The genotype's structural bounds: without these the card names
@@ -1325,7 +1328,7 @@ impl CoreEngine {
 
             // A child born above is deliberately NOT in this clock's group (it skipped
             // birth clock), keeping the `entered_at_step + 1` metric-row contract.
-            let hashes: Vec<String> = self
+            let mut hashes: Vec<String> = self
                 .state
                 .live_hashes()
                 .into_iter()
@@ -1338,6 +1341,13 @@ impl CoreEngine {
                             .unwrap_or(true)
                 })
                 .collect();
+            // A birth clock is skipped only when somebody ELSE can carry the clock. When the
+            // channels replaced the whole field in one clock (a tiny population, or no probation
+            // shields), the fresh nets are then the only live nets — stepping none of them would
+            // end a race that still has a population, so the clock runs on the new field instead.
+            if hashes.is_empty() {
+                hashes = self.state.live_hashes();
+            }
             if hashes.is_empty() {
                 crate::utils::cfy::emit(&crate::utils::cfy::card(
                     "Race",
@@ -1640,6 +1650,11 @@ impl CoreEngine {
             .iter()
             .filter_map(|name| crate::trainer::menu::metric_for(name))
             .collect();
+    }
+
+    /// The step budget the engine is running under (`None` = unbounded).
+    pub fn max_steps(&self) -> Option<usize> {
+        self.config.max_steps
     }
 
     /// Change the step budget of a LIVE engine — the resume-and-extend door.

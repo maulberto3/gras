@@ -208,6 +208,9 @@ fn cull_tombstone_records_mean_spread_and_the_centre_it_ranked() {
         .unwrap();
     let hashes = eng.state.live_hashes();
     let victim = hashes[1].clone();
+    // The window FAMILY is its own knob (`mean_type`, default `median`); this test is about what a
+    // cull RECORDS, so it pins the arithmetic family and reads the mean that family names.
+    eng.config.mean_type = crate::engine::config::MeanType::Arithmetic;
     let mut buf = RollingBuffer::new(eng.config.smoothing_window);
     for v in [0.20_f32, 0.80, 0.20, 0.80] {
         buf.push(v);
@@ -1502,8 +1505,11 @@ fn resume_replays_nets_with_metric_parity() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 99).unwrap();
     // One update per clock: this test pins `state.step == clocks`. The streak's extra updates are
-    // covered by `recovery_streak_*`.
+    // covered by `recovery_streak_*`, and the lottery is OFF (`p_min = 1.0`) so no clock is a
+    // denied ticket.
     engine.config.recovery_retries = 0;
+    engine.config.train_merit_p_min = 1.0;
+    engine.config.train_merit_p_max = 1.0;
     engine
         .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
@@ -1534,6 +1540,9 @@ fn resume_replays_nets_with_metric_parity() {
         {
             let mut c = RaceConfig::defaults();
             c.pop_size = 2;
+            // Same lottery-OFF recipe as the fixture above, so the extra clock below is a ticket.
+            c.train_merit_p_min = 1.0;
+            c.train_merit_p_max = 1.0;
             c
         },
         fitness(),
@@ -1836,6 +1845,10 @@ fn resume_tops_up_to_the_requested_budget() {
         c.pop_size = 1;
         c.max_steps = Some(max_steps);
         c.checkpoint_every = 1; // the frontier survives the stop
+        // A one-net field with no cull shield would be replaced by a newborn every clock (each
+        // channel deals at least one roll), so the fixture shields it: this test is the BUDGET.
+        c.mutation_probation_steps = 100;
+        c.crossover_probation_steps = 100;
         c
     };
 
@@ -2351,6 +2364,10 @@ fn interrupt_then_resume_matches_the_twin_and_never_duplicates_history_rows() {
         c.checkpoint_every = 1;
         c.max_steps = Some(max_steps);
         c.log_level = crate::engine::config::LogLevel::None;
+        // Hold the field still: this test measures the RESUME machinery on the same live nets, so
+        // the founders keep their cull shield for the whole window.
+        c.mutation_probation_steps = 5;
+        c.crossover_probation_steps = 5;
         if stop_after_first_clock {
             // Fires at the top of clock 1: clock 0 has completed and its tick is on disk.
             c.custom_stop = Some(Box::new(|snap| snap.step >= 1));
@@ -2435,6 +2452,10 @@ fn a_named_lr_schedule_survives_a_resume_and_matches_the_twin() {
         c.checkpoint_every = 1;
         c.max_steps = Some(3);
         c.log_level = crate::engine::config::LogLevel::None;
+        // The field holds still: this test measures the LR SCHEDULE across a resume, so the two
+        // founders keep their cull shield for the whole window.
+        c.mutation_probation_steps = 5;
+        c.crossover_probation_steps = 5;
         if stop_after_first_clock {
             // Fires at the top of clock 1: clock 0 is complete and on disk.
             c.custom_stop = Some(Box::new(|snap| snap.step >= 1));
@@ -2568,11 +2589,14 @@ fn inverted_lottery_grades_the_worst_net_best() {
         eng.state.net_mut(h).unwrap().step = 1;
     }
     eng.config.train_merit_p_min = 0.0;
+    // This test asserts the BAND arithmetic literally, so it pins the ceiling it was written
+    // against (`p_max` is `0.75` by default; the numbers below say `0.4`).
+    eng.config.train_merit_p_max = 0.4;
     // The MERIT ordering is the fixture on this side of the test (the engine default
     // inverted now, so the test states which ordering it is grading).
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::from_bools(
+    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.ticket_legs.updates_armed(),
+        eng.config.train_ticket.updates_armed(),
     );
     let frame = eng.lottery_frame().expect("armed at clock 5");
     // The fixture fitness is Minimize: hashes[0] (100) is the best, hashes[2] the worst.
@@ -2583,8 +2607,10 @@ fn inverted_lottery_grades_the_worst_net_best() {
     );
     assert!((p(&eng, &hashes[2]) - 0.01).abs() < 1e-6);
 
-    eng.config.ticket_legs =
-        crate::engine::config::TicketLegs::from_bools(true, eng.config.ticket_legs.updates_armed());
+    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+        true,
+        eng.config.train_ticket.updates_armed(),
+    );
     assert!((p(&eng, &hashes[0]) - 0.01).abs() < 1e-6, "worst-first now");
     assert!((p(&eng, &hashes[2]) - 0.99).abs() < 1e-6);
     // The coin follows the flag: the worst net is paid the top of the band, the best the floor.
@@ -2633,43 +2659,43 @@ fn the_updates_fraction_grades_the_fewest_updates_one() {
 /// maps onto the spelling it meant.
 #[test]
 fn ticket_leg_spellings_round_trip() {
-    use crate::engine::config::{DEFAULT_TICKET_LEGS, TicketLegs};
+    use crate::engine::config::{DEFAULT_TRAIN_TICKET, TrainTicket};
     for legs in [
-        TicketLegs::MostFit,
-        TicketLegs::MostFitFewestUpdates,
-        TicketLegs::MostFitMostUpdates,
-        TicketLegs::LeastFitFewestUpdates,
-        TicketLegs::LeastFitMostUpdates,
-        TicketLegs::LeastFit,
+        TrainTicket::MostFit,
+        TrainTicket::MostFitFewestUpdates,
+        TrainTicket::MostFitMostUpdates,
+        TrainTicket::LeastFitFewestUpdates,
+        TrainTicket::LeastFitMostUpdates,
+        TrainTicket::LeastFit,
     ] {
-        assert_eq!(TicketLegs::parse(legs.as_str()), Some(legs), "{legs}");
+        assert_eq!(TrainTicket::parse(legs.as_str()), Some(legs), "{legs}");
         assert_eq!(legs.to_string(), legs.as_str());
     }
     // Case, spaces and hyphens fold; an unknown word is `None`, never a silent default.
     assert_eq!(
-        TicketLegs::parse("Least-Fit Most Updates"),
-        Some(TicketLegs::LeastFitMostUpdates)
+        TrainTicket::parse("Least-Fit Most Updates"),
+        Some(TrainTicket::LeastFitMostUpdates)
     );
-    assert_eq!(TicketLegs::parse("most_fit_fewest"), None);
-    assert_eq!(TicketLegs::parse(""), None);
+    assert_eq!(TrainTicket::parse("most_fit_fewest"), None);
+    assert_eq!(TrainTicket::parse(""), None);
     // The legacy pair maps onto the leg it stood for (`inverted`, `updates armed`).
     assert_eq!(
-        TicketLegs::from_bools(true, true),
-        TicketLegs::LeastFitFewestUpdates
+        TrainTicket::from_bools(true, true),
+        TrainTicket::LeastFitFewestUpdates
     );
     assert_eq!(
-        TicketLegs::from_bools(false, true),
-        TicketLegs::MostFitFewestUpdates
+        TrainTicket::from_bools(false, true),
+        TrainTicket::MostFitFewestUpdates
     );
-    assert_eq!(TicketLegs::from_bools(false, false), TicketLegs::MostFit);
-    assert_eq!(TicketLegs::from_bools(true, false), TicketLegs::LeastFit);
-    assert_eq!(DEFAULT_TICKET_LEGS, TicketLegs::LeastFitFewestUpdates);
+    assert_eq!(TrainTicket::from_bools(false, false), TrainTicket::MostFit);
+    assert_eq!(TrainTicket::from_bools(true, false), TrainTicket::LeastFit);
+    assert_eq!(DEFAULT_TRAIN_TICKET, TrainTicket::MostFitMostUpdates);
     // ONE list backs the help text and the error messages: the names are the spellings, in order,
     // and every one of them parses back to its own leg.
-    assert_eq!(TicketLegs::ALL.len(), TicketLegs::ALL_NAMES.len());
-    for (leg, name) in TicketLegs::ALL.into_iter().zip(TicketLegs::ALL_NAMES) {
+    assert_eq!(TrainTicket::ALL.len(), TrainTicket::ALL_NAMES.len());
+    for (leg, name) in TrainTicket::ALL.into_iter().zip(TrainTicket::ALL_NAMES) {
         assert_eq!(leg.as_str(), name);
-        assert_eq!(TicketLegs::parse(name), Some(leg));
+        assert_eq!(TrainTicket::parse(name), Some(leg));
     }
 }
 
@@ -2677,7 +2703,7 @@ fn ticket_leg_spellings_round_trip() {
 /// one that has already trained, and the place-only leg cannot see the updates axis at all.
 #[test]
 fn the_updates_leg_pays_the_side_it_names() {
-    let dir = std::env::temp_dir().join("gras-ticket-legs-updates-side");
+    let dir = std::env::temp_dir().join("gras-train-ticket-updates-side");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
     eng.config.mutation_probation_steps = 0;
@@ -2705,9 +2731,9 @@ fn the_updates_leg_pays_the_side_it_names() {
     let frame = eng.lottery_frame().expect("armed at clock 5");
     let p = |eng: &CoreEngine, h: &str| eng.train_lottery_p(h, Some(frame));
 
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::MostFitFewestUpdates;
+    eng.config.train_ticket = crate::engine::config::TrainTicket::MostFitFewestUpdates;
     let fresh_paid = p(&eng, &hashes[1]);
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::MostFitMostUpdates;
+    eng.config.train_ticket = crate::engine::config::TrainTicket::MostFitMostUpdates;
     let spent_paid = p(&eng, &hashes[1]);
     assert!(
         spent_paid > fresh_paid,
@@ -2719,16 +2745,16 @@ fn the_updates_leg_pays_the_side_it_names() {
     assert!((fresh_paid - 0.01).abs() < 1e-6, "{fresh_paid}");
 
     // Disarmed: the place alone, so the updates axis cannot move the ticket.
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::MostFit;
+    eng.config.train_ticket = crate::engine::config::TrainTicket::MostFit;
     assert!((p(&eng, &hashes[0]) - 0.99).abs() < 1e-6);
     assert!((p(&eng, &hashes[1]) - 0.5).abs() < 1e-6);
 
     // The CULL's evidence does not follow the ticket's updates side: `spent` reads the raw
     // fewest-is-one fraction, so the two legs rank the same badness the same way.
     let merit = eng.merit(&hashes[1]);
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::MostFitFewestUpdates;
+    eng.config.train_ticket = crate::engine::config::TrainTicket::MostFitFewestUpdates;
     let spent_fewest = eng.train_lottery_spent_fraction(&hashes[1], Some(frame), merit);
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::MostFitMostUpdates;
+    eng.config.train_ticket = crate::engine::config::TrainTicket::MostFitMostUpdates;
     let spent_most = eng.train_lottery_spent_fraction(&hashes[1], Some(frame), merit);
     assert_eq!(
         spent_fewest, spent_most,
@@ -2766,11 +2792,12 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
         eng.state.net_mut(h).unwrap().entered_at_step = born;
     }
     eng.config.train_merit_p_min = 0.0;
-    // The shipped leg: the U leg says "spent".
-    eng.config.ticket_legs = eng.config.ticket_legs.with_updates_armed(true);
+    // This test grades one ORDERING, so it pins it: worst-first × fewest-updates (the engine's
+    // default is `most_fit_most_updates` now, which pays the other end).
+    eng.config.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
     eng.config.crossover_cull_policy = crate::engine::config::CrossCullPolicy::HighestTicketChance;
 
-    // Worst-first (the default): the worst net has the highest `p`, so it is the one evicted.
+    // Worst-first (pinned above), so the worst net has the highest `p` and is the one evicted.
     assert_eq!(
         eng.select_highest_ticket_chance_victim()
             .unwrap()
@@ -2788,9 +2815,9 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
 
     // Best-first: the coin now feeds the BEST net, and the cull follows it there — the victim is
     // the highest chance, not a second, quietly different ranking.
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::from_bools(
+    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.ticket_legs.updates_armed(),
+        eng.config.train_ticket.updates_armed(),
     );
     assert_eq!(
         eng.select_highest_ticket_chance_victim()
@@ -2802,8 +2829,10 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
         eng.select_mutation_victim(5, 0).unwrap().as_deref(),
         Some(hashes[0].as_str())
     );
-    eng.config.ticket_legs =
-        crate::engine::config::TicketLegs::from_bools(true, eng.config.ticket_legs.updates_armed());
+    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+        true,
+        eng.config.train_ticket.updates_armed(),
+    );
 
     // With the lottery OFF there is no merit to sort on: the policy degrades to `worst`
     // instead of inventing a ranking from an unbounded field.
@@ -2852,7 +2881,8 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
         state.step = updates;
         state.entered_at_step = 0;
     }
-    eng.config.ticket_legs = eng.config.ticket_legs.with_updates_armed(true);
+    // Pinned: worst-first × fewest-updates, the ordering this test's two victims name.
+    eng.config.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
     eng.config.train_merit_p_min = 0.0;
     eng.config.crossover_cull_policy = crate::engine::config::CrossCullPolicy::HighestTicketChance;
     assert_eq!(
@@ -2881,7 +2911,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     );
 
     // Disarming the ticket's U leg does not blind the cull: the ranking reads `U` on its own.
-    eng.config.ticket_legs = eng.config.ticket_legs.with_updates_armed(false);
+    eng.config.train_ticket = eng.config.train_ticket.with_updates_armed(false);
     assert_eq!(
         eng.select_lowest_fitness_most_updates_victim()
             .unwrap()
@@ -2889,14 +2919,14 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
         Some(hashes[1].as_str()),
         "spent still ranks on updates spent"
     );
-    eng.config.ticket_legs = eng.config.ticket_legs.with_updates_armed(true);
+    eng.config.train_ticket = eng.config.train_ticket.with_updates_armed(true);
 
     // THE TILT: `unfed` follows the coin, so best-first moves its victim onto the BEST net. `spent`
     // does NOT follow it — the worst net that spent its updates is the victim either way, because
     // the tilt says who the band pays, not who is bad.
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::from_bools(
+    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.ticket_legs.updates_armed(),
+        eng.config.train_ticket.updates_armed(),
     );
     for (h, updates) in [(&hashes[0], 1usize), (&hashes[1], 9), (&hashes[2], 9)] {
         eng.state.net_mut(h).unwrap().step = updates;
@@ -2915,8 +2945,10 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
         Some(hashes[2].as_str()),
         "spent ignores the tilt: the worst net that spent its updates goes"
     );
-    eng.config.ticket_legs =
-        crate::engine::config::TicketLegs::from_bools(true, eng.config.ticket_legs.updates_armed());
+    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+        true,
+        eng.config.train_ticket.updates_armed(),
+    );
 
     // With the lottery OFF there is no field to rank: degrade to the worst-score victim.
     eng.config.train_merit_p_min = 1.0;
@@ -2947,9 +2979,9 @@ fn train_lottery_arms_after_the_born_shield_and_grades_level_per_ticket() {
     // This test asserts the RAW fractions and the p = 0 coin, so pin the miss-floor
     // the MERIT ordering (the engine default is inverted).
     eng.config.train_merit_p_min = 0.0;
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::from_bools(
+    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.ticket_legs.updates_armed(),
+        eng.config.train_ticket.updates_armed(),
     );
 
     // Means 100 / 200 / 300 over the SAME budget (each net has spent one ticket): the shared
@@ -3034,9 +3066,9 @@ fn a_newborn_always_trains_on_its_first_live_clock() {
     // A band whose TOP is 0: `hi = lo = 0`, so no draw can sell a clock — only the born ticket can.
     eng.config.train_merit_p_min = 0.0;
     eng.config.train_merit_p_max = 0.0;
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::from_bools(
+    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.ticket_legs.updates_armed(),
+        eng.config.train_ticket.updates_armed(),
     );
     for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
         let h = &hashes[i];
@@ -3100,9 +3132,9 @@ fn the_ticket_is_paid_from_the_band_alone() {
     // are 1, 0.5 and 0 — the best, the middle and the worst.
     eng.config.train_merit_p_min = 0.0;
     eng.config.train_merit_p_max = 1.0;
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::from_bools(
+    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.ticket_legs.updates_armed(),
+        eng.config.train_ticket.updates_armed(),
     );
     let frame = eng.lottery_frame().expect("armed at clock 5");
     let eff = |eng: &CoreEngine, i: usize| eng.train_lottery_p_eff(&hashes[i], Some(frame));
@@ -3165,9 +3197,9 @@ fn train_merit_p_min_floors_only_the_bottom_of_the_field() {
     eng.config.train_merit_p_min = 0.05;
     eng.config.train_merit_p_max = 1.0;
     // The floor is a BOTTOM floor in the MERIT ordering (the engine default is inverted).
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::from_bools(
+    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.ticket_legs.updates_armed(),
+        eng.config.train_ticket.updates_armed(),
     );
     let frame = eng.lottery_frame().expect("armed at clock 5");
     let eff = |eng: &CoreEngine, i: usize| eng.train_lottery_p_eff(&hashes[i], Some(frame));
@@ -3211,12 +3243,12 @@ fn lottery_merit_is_the_score_itself_not_a_rate() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
     // The MERIT ordering is the fixture (the engine default is inverted).
-    eng.config.ticket_legs = crate::engine::config::TicketLegs::from_bools(
+    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.ticket_legs.updates_armed(),
+        eng.config.train_ticket.updates_armed(),
     );
     // Fitness place alone: this test is about the divisor, so neither leg multiplies it.
-    eng.config.ticket_legs = eng.config.ticket_legs.with_updates_armed(false);
+    eng.config.train_ticket = eng.config.train_ticket.with_updates_armed(false);
     // No shields: this test is about the divisor, not the born gate.
     eng.config.mutation_probation_steps = 0;
     eng.config.crossover_probation_steps = 0;
@@ -3314,8 +3346,11 @@ fn resume_does_not_replay_idle_clocks() {
     let dir = std::env::temp_dir().join("race_resume_idle");
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 99).unwrap();
-    // `step == 3` below counts TICKETS; a recovery streak would add updates inside a clock.
+    // `step == 3` below counts TICKETS; a recovery streak would add updates inside a clock, and
+    // the lottery is switched OFF (`p_min = 1.0`) so every clock is one.
     engine.config.recovery_retries = 0;
+    engine.config.train_merit_p_min = 1.0;
+    engine.config.train_merit_p_max = 1.0;
     engine
         .seed_population_internal(vec![tiny_topology(7)], Some(0.5))
         .unwrap();
@@ -4438,7 +4473,10 @@ fn streak_engine(
 ) -> (crate::engine::TabularEngine, String) {
     let mut config = RaceConfig {
         pop_size: 0,
-        train_merit: 0.0,
+        // The lottery is OFF: the band's floor at 1.0 is the switch (the retired Ω no longer
+        // reaches the band), so every clock is a real update and the script lands one per clock.
+        train_merit_p_min: 1.0,
+        train_merit_p_max: 1.0,
         csv_export: false,
         checkpoint_every: 0,
         ..RaceConfig::defaults()
@@ -5321,7 +5359,7 @@ fn the_worst_dump_ranks_by_the_spent_criterion_not_by_fit_alone() {
         state.step = updates;
         state.entered_at_step = 0;
     }
-    eng.config.ticket_legs = eng.config.ticket_legs.with_updates_armed(true);
+    eng.config.train_ticket = eng.config.train_ticket.with_updates_armed(true);
     eng.config.train_merit_p_min = 0.0;
     eng.config.worst_save_topology = true;
     eng.config.champion_count = 1;

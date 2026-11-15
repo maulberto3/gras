@@ -445,7 +445,7 @@ impl CoreEngine {
         let legend_ctx = LegendCtx {
             window: self.config.smoothing_window,
             mean_type: self.config.mean_type,
-            legs: self.config.ticket_legs,
+            legs: self.config.train_ticket,
             p_min: self.train_merit_p_min(),
             p_max: self.train_merit_p_max(),
             tilt: self.lottery_tilt(),
@@ -545,22 +545,17 @@ impl CoreEngine {
         }
         // The columns this run can actually fill: the U leg's cell and the exam are columns
         // only when the run supplies them.
-        let mut columns = printed_columns(self.config.ticket_legs.updates_armed(), has_exam);
+        let mut columns = printed_columns(self.config.train_ticket.updates_armed(), has_exam);
         let fit = fit_column(self.config.mean_type);
-        // The two window legs print the pair `F` is BUILT from (`WindowStats::score` reads
-        // `fam_center`/`fam_spread`). Renaming them with the family is what keeps the row's own
-        // arithmetic true: a median run that printed `mean`/`σ` while charging `λ·1.4826·MAD`
-        // showed `F` above the `mean` it supposedly came from, and the subtraction read as an
-        // addition. With the scored pair on the row, `F = centre ∓ λ·spread` closes for every net
-        // in every family, and with λ ≥ 0 `F` can never sit above its own centre column.
-        let (centre_col, spread_col) = window_cell_columns(self.config.mean_type);
+        // The window legs are GONE from the card (2026-11-14): with the spread charge removed, `F`
+        // IS the window centre, so a `mean`/`median` column beside it printed the same number
+        // twice, and the diagnostic spread (`σ`, `1.4826·MAD`, the g-space spread) printed a
+        // statistic nothing charges or reads. The `fit` header carries the family instead
+        // (`fit (F = mean)` / `fit (F = median)` / the `g` equation), so the row still says which
+        // window the number came from.
         for c in columns.iter_mut() {
             if *c == COL_FIT {
                 *c = fit;
-            } else if *c == COL_WINDOW_MEAN {
-                *c = centre_col;
-            } else if *c == COL_WINDOW_SPREAD {
-                *c = spread_col;
             }
         }
         let header = self.stop_header(&columns);
@@ -582,7 +577,7 @@ impl CoreEngine {
         // TWO setters shape these cells, so BOTH are read here: the tilt mirrors the place, and
         // the U leg decides whether `Um` is a factor at all. One helper per cell, so the header
         // cannot name a symbol the row does not print.
-        let legs = self.config.ticket_legs;
+        let legs = self.config.train_ticket;
         let (place, u_cell, ticket) = (
             fit_minmax_column(legs.fitness_inverted()),
             updates_minmax_column(legs),
@@ -671,9 +666,6 @@ impl CoreEngine {
     /// rule for "no value".
     fn stop_row(&self, row: StopRow<'_>) -> StopCells {
         let state = self.state.net(row.hash);
-        // ONE window read for the whole row: the `fit (F)` cell, the `A/B` ratio derived
-        // from it and the three window legs printed beside
-        let reading = self.race_reading_of(row.hash);
         // The RANKING value, not just the fitness half: with selection terms the two differ, and
         // `fit (F)` must print the number the run actually sorted on.
         let score = self.ranking_score_of(row.hash).or(row.fit);
@@ -712,18 +704,12 @@ impl CoreEngine {
             // Mean hidden width is a MEASURED number like every other cell, so it takes the band
             // rule (`fmt_cell`) instead of a hand-picked `{:.1}` — a 3.5-wide net used to print
             shape.map(|s| fmt_cell(s.dim)).unwrap_or_else(dash),
-            // ── how it is RANKED ─────────────────────────────────────── The window's THREE legs,
-            // one column each: the pair `F` is the centre of, plus the spread any charge would use.
-            // The pair is `fam_center`/`fam_spread` — the SAME pair `WindowStats::score` charges —
-            // not the arithmetic `mean`/`std`. Printing the arithmetic pair beside a median score
-            // made `F` show ABOVE the `mean` it supposedly came from (the charge is a subtraction
-            // that appeared to add), and no reader could redo the row.
-            reading.map(|r| fmt_cell(r.fam_center)).unwrap_or_else(dash),
-            // `0.0000` at `n = 1`, never `—`: one reading has no observable spread
-            reading
-                .map(|r| fmt_cell(if r.n > 1 { r.fam_spread } else { 0.0 }))
-                .unwrap_or_else(dash),
-            // The ranking value the two legs make, printed after them:
+            // ── how it is RANKED ─────────────────────────────────────── ONE number: `F`, the
+            // window's centre — the value `WindowStats::score` returns, plus any
+            // `selection_metrics` terms (the Summ line names those). The centre column and the
+            // diagnostic spread column that used to sit to its left were dropped 2026-11-14: with
+            // nothing charging a spread, the centre printed `F`'s own number twice and the spread
+            // (`σ`, `1.4826·MAD`) was a statistic no cell reads.
             score.map(fmt_cell).unwrap_or_else(dash),
             // ── the whole-run trend, immediately right of the score ── `F` is where the net is
             // NOW (its last `n = min(B, K)` readings); `S` is the least-squares line through EVERY
@@ -744,8 +730,8 @@ impl CoreEngine {
         // a `most_updates` leg prints the mirror of a `fewest_updates` one. A column only while
         // the leg is armed AND the net was graded — an ungraded net has no place in the field to
         // read it against, and a field with no spread pays the neutral `1`.
-        if self.config.ticket_legs.updates_armed() {
-            let legs = self.config.ticket_legs;
+        if self.config.train_ticket.updates_armed() {
+            let legs = self.config.train_ticket;
             let um = match (parts.is_some(), row.lottery, state) {
                 (true, Some(frame), Some(s)) => {
                     let fresh =
@@ -984,7 +970,7 @@ impl CoreEngine {
                 &rows.into_iter().map(|(_, _, row)| row).collect::<Vec<_>>(),
             ),
             Some(&format!(
-                "F = the net's smoothed score (the K-reading window CENTRE, the ranking's number; the window spread is printed but never charged) · M = clocks the net was measured on: real updates + act-only passes (every ticket the coin denied while `train_merit_learn_only` is on) · `F ÷ U` = F ÷ its update count (this debug view only — the final table carries no efficiency column): informational — what one optimizer step bought, so a cheap net reads from an expensive one · field THIS clock drew from: best {} worst {} · T = where the net's SCORE sits between those two bounds as the graded fraction f = the product above (Fm × Um while the U leg is armed, otherwise Fm; Fm = 1 at the BEST end, 0 at the worst — unless the tilt says otherwise, and this run is {}), then paid INSIDE the band — `p = p_min + (p_max − p_min) × f` over [p_min {}, p_max {}] — so the floor is literally the worst-graded net's chance per clock and the ceiling the best-graded one's (Ω retired: the band IS the payout) · the coin is a seeded `fastrand` draw `d ∈ [0,1)` compared to `p`: `d < p` sells the ticket, otherwise the coin withholds the weight UPDATE — with `train_merit_learn_only` on the net still acts and measures on a fresh batch, with it off the clock idles (no train, no eval, nothing measured) · ticket? = yes if THIS clock sells it the weight update; `no` means it did not learn, which with the flag off means it did nothing at all · exempt nets (the born shield) always run and grade 1.00 · idle = clocks the lottery left it idle BEFORE this clock ({} across the run); the step's lottery line names this clock's count",
+                "F = the net's smoothed score (the K-reading window CENTRE, the ranking's number; the window spread is printed but never charged) · M = clocks the net was measured on: real updates + act-only passes (every ticket the coin denied while `train_merit_learn_only` is on) · `F ÷ U` = F ÷ its update count (this debug view only — the final table carries no efficiency column): informational — what one optimizer step bought, so a cheap net reads from an expensive one · field THIS clock drew from: best {} worst {} · T = where the net's SCORE sits between those two bounds as the graded fraction f = the product above (Fm⁺ × Um⁻ while the U leg is armed, otherwise Fm⁺; Fm = 1 at the BEST end, 0 at the worst — unless the tilt says otherwise, and this run is {}), then paid INSIDE the band — `p = p_min + (p_max − p_min) × f` over [p_min {}, p_max {}] — so the floor is literally the worst-graded net's chance per clock and the ceiling the best-graded one's (Ω retired: the band IS the payout) · the coin is a seeded `fastrand` draw `d ∈ [0,1)` compared to `p`: `d < p` sells the ticket, otherwise the coin withholds the weight UPDATE — with `train_merit_learn_only` on the net still acts and measures on a fresh batch, with it off the clock idles (no train, no eval, nothing measured) · ticket? = yes if THIS clock sells it the weight update; `no` means it did not learn, which with the flag off means it did nothing at all · exempt nets (the born shield) always run and grade 1.00 · idle = clocks the lottery left it idle BEFORE this clock ({} across the run); the step's lottery line names this clock's count",
                 fmt_cfg(best),
                 fmt_cfg(worst),
                 self.lottery_tilt(),
@@ -1219,25 +1205,6 @@ fn fit_column(mean_type: crate::engine::config::MeanType) -> &'static str {
         crate::engine::config::MeanType::Median => COL_FIT_MEDIAN,
     }
 }
-/// The window legs' slot names, before `stop_plan` renames them with the family
-/// ([`window_cell_columns`]): arithmetic keeps these exact spellings, because there the pair the
-/// score charges IS the mean and the σ.
-const COL_WINDOW_MEAN: &str = "mean";
-const COL_WINDOW_SPREAD: &str = "spread";
-
-/// The two window legs the field table prints, per family — the pair `F` is built from
-/// (`WindowStats::fam_center` / `fam_spread`). Arithmetic keeps `mean`/`spread`: there the score's
-/// centre IS the mean. The other families print their own centre and spread, so the row redoes its    /// own `F` (the centre itself) instead of showing a leg the score does not use.
-fn window_cell_columns(mean_type: crate::engine::config::MeanType) -> (&'static str, &'static str) {
-    use crate::engine::config::MeanType;
-    match mean_type {
-        MeanType::Arithmetic => (COL_WINDOW_MEAN, COL_WINDOW_SPREAD),
-        // The header's spelling (`COL_FIT_MEDIAN`): `F = median`.
-        MeanType::Median => ("window median", "1.4826·MAD"),
-        MeanType::SignedLog => ("window g-avg", "window g-spread"),
-    }
-}
-
 /// The whole-run TREND, printed immediately right of `fit (F)`: `F` says where the net is now, `S`
 /// says which way it has been moving.
 const COL_SLOPE: &str = "slope (S)";
@@ -1252,27 +1219,27 @@ fn fmt_slope(v: f32) -> String {
     }
 }
 
-const COL_FIT_MINMAX: &str = "fit minmax (Fm)";
+const COL_FIT_MINMAX: &str = "fit minmax (Fm⁺)";
 /// The same column under the INVERTED ordering: the tilt mirrors the place, so the equation
 /// header states has to mirror with it (`1 −` the best-first place).
 const COL_FIT_MINMAX_TILTED: &str = "fit minmax (Fm⁻)";
 const COL_AGE: &str = "age (A)";
-/// The U leg's cell (`set_ticket_legs`): `0.99` at the field's fewest updates, `0.01` at its
-/// most, so the ticket falls for a net that has spent its budget.
-const COL_UPMINMAX: &str = "updates minmax (Um)";
+/// The U leg's cell (`set_train_ticket`): `0.99` at the field's fewest updates, `0.01` at its
+/// most, so the ticket falls for a net that has spent its budget. Every leg keeps its SIGN.
+const COL_UPMINMAX: &str = "updates minmax (Um⁻)";
 /// The same cell under a `most_updates` leg: the updates are graded the other way round, so the
 /// header names the mirror it now prints (`Um⁺ = (U − U_min) ÷ (U_max − U_min)`).
 const COL_UPMINMAX_PLUS: &str = "updates minmax (Um⁺)";
-const COL_TICKET: &str = "ticket minmax (T = p_min + (p_max − p_min) × Fm)";
+const COL_TICKET: &str = "ticket minmax (T = p_min + (p_max − p_min) × Fm⁺)";
 /// The ticket under the INVERTED ordering: it multiplies the MIRRORED place, so the equation must
 /// name the cell actually on its left (`Fm⁻`), not the best-first `Fm` it no longer reads.
 const COL_TICKET_TILTED: &str = "ticket minmax (T = p_min + (p_max − p_min) × Fm⁻)";
-/// The ticket with a `fewest_updates` leg (`ticket_legs`): the product is the place times `Um`.
-const COL_TICKET_UP: &str = "ticket minmax (T = p_min + (p_max − p_min) × Fm × Um)";
-const COL_TICKET_UP_TILTED: &str = "ticket minmax (T = p_min + (p_max − p_min) × Fm⁻ × Um)";
+/// The ticket with a `fewest_updates` leg (`train_ticket`): the product is the place times `Um`.
+const COL_TICKET_UP: &str = "ticket minmax (T = p_min + (p_max − p_min) × Fm⁺ × Um⁻)";
+const COL_TICKET_UP_TILTED: &str = "ticket minmax (T = p_min + (p_max − p_min) × Fm⁻ × Um⁻)";
 /// The ticket with a `most_updates` leg: the updates factor is read forward, so the equation names
 /// `Um⁺` and the cell FALLS for the net that has trained least.
-const COL_TICKET_UP_PLUS: &str = "ticket minmax (T = p_min + (p_max − p_min) × Fm × Um⁺)";
+const COL_TICKET_UP_PLUS: &str = "ticket minmax (T = p_min + (p_max − p_min) × Fm⁺ × Um⁺)";
 const COL_TICKET_UP_PLUS_TILTED: &str = "ticket minmax (T = p_min + (p_max − p_min) × Fm⁻ × Um⁺)";
 
 /// The place cell this run prints — ONE function, so the header and its legend key cannot drift.
@@ -1284,10 +1251,10 @@ fn fit_minmax_column(inverted: bool) -> &'static str {
     }
 }
 
-/// The ticket cell this run prints — named after the legs `set_ticket_legs` actually armed, so the
+/// The ticket cell this run prints — named after the legs `set_train_ticket` actually armed, so the
 /// equation names exactly the factors the row multiplies.
-fn ticket_column(legs: crate::engine::config::TicketLegs) -> &'static str {
-    use crate::engine::config::TicketLegs as L;
+fn ticket_column(legs: crate::engine::config::TrainTicket) -> &'static str {
+    use crate::engine::config::TrainTicket as L;
     match legs {
         L::MostFit => COL_TICKET,
         L::LeastFit => COL_TICKET_TILTED,
@@ -1298,9 +1265,9 @@ fn ticket_column(legs: crate::engine::config::TicketLegs) -> &'static str {
     }
 }
 
-/// The U leg's cell under the leg's own polarity — `Um` pays the fewest updates, `Um⁺` the most.
+/// The U leg's cell under the leg's own polarity — `Um⁻` pays the fewest updates, `Um⁺` the most.
 /// A disarmed leg has no polarity to name, so the bare cell stands.
-fn updates_minmax_column(legs: crate::engine::config::TicketLegs) -> &'static str {
+fn updates_minmax_column(legs: crate::engine::config::TrainTicket) -> &'static str {
     if legs.updates_armed() && !legs.updates_inverted() {
         COL_UPMINMAX_PLUS
     } else {
@@ -1342,18 +1309,16 @@ const STOP_HEADER_FIXED: &[&str] = &[
     "width",
     // The word AND its letter, so a legend equation can be read straight off the row; the DERIVED
     // column is named by the value it produces (`ticket`).
-    // Listed under their ARITHMETIC spellings: `stop_plan` renames both to the family's own nouns
-    // (`window median` / `1.4826·MAD` for a median run), because the cells print the pair `F` is
-    // built from — never a second statistic beside it.
-    COL_WINDOW_MEAN,
-    COL_WINDOW_SPREAD,
-    // The value the two legs MAKE comes after them, so the row reads left to right.
+    // ONE ranking number: `fit (F)`. The two window legs that used to sit to its left are gone
+    // (2026-11-14) — with the spread charge removed `F` IS the window centre, so a `mean`/`median`
+    // column printed the same number twice and the diagnostic spread (`1.4826·MAD`) charged
+    // nothing. The `fit` header carries the family instead (`fit (F = mean)` / `fit (F = median)`).
     COL_FIT,
     // The trend sits IMMEDIATELY right of the score: `F` is the level the field ranked on, `S` the
     // direction its own readings have been going — the second thing a reader wants from a fitness
     // cell. It is a READING of the net, not a ranking input, so it interrupts nothing below it.
     COL_SLOPE,
-    // ── the coin's own arithmetic, in the order it runs ── `fit minmax (Fm)` = this net's `fit
+    // ── the coin's own arithmetic, in the order it runs ── `fit minmax (Fm⁺)` = this net's `fit
     // (F)` as a 0..1 place in the last field (the tilt already applied: `1` = the end that earns),
     COL_FIT_MINMAX,
     COL_UPMINMAX,
@@ -1379,9 +1344,9 @@ struct LegendCtx<'a> {
     /// The family the window is averaged in — its header equation and its legend row
     /// picked by this, so the two cannot disagree (`set_fitness_mean_type`).
     mean_type: crate::engine::config::MeanType,
-    /// The lottery's two LEGS (`set_ticket_legs`): the place cell, the U cell and the ticket
+    /// The lottery's two LEGS (`set_train_ticket`): the place cell, the U cell and the ticket
     /// equation all name the side this one value pays, so they cannot disagree.
-    legs: crate::engine::config::TicketLegs,
+    legs: crate::engine::config::TrainTicket,
 
     /// The last clock the lottery dealt — which clock the ticket column is read
     /// against.
@@ -1404,7 +1369,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
     let place = if ctx.legs.fitness_inverted() {
         "Fm⁻"
     } else {
-        "Fm"
+        "Fm⁺"
     };
     let minmax = fit_minmax_column(ctx.legs.fitness_inverted());
     let mut rows = vec![
@@ -1449,7 +1414,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         (
             fit_column(ctx.mean_type).to_string(),
             format!(
-                "`F` = {} — the ranking value: the window's CENTRE in the `{}` family, with NO spread charge (risk aversion was removed 2026-11-14). Any `selection_metrics` terms are ADDED to this centre (each a labelled metric's smoothed centre times its weight), so `F` is then composite and the Summ line names the terms. The spread leg to its left is printed for diagnosis only, so `F ∓ λ × spread` can be re-applied by hand for any λ, but nothing in this build charges it. The two window legs beside it are `fam_center` / `fam_spread` under the family's own names — `mean`/`spread` for `arithmetic`, `window median`/`1.4826·MAD` for `median`, `window g-avg`/`window g-spread` for `signed_log` — so every row redoes its own `F` exactly. Geometric/harmonic averaging is not offered: their domain excludes a non-positive reading, and a reward or centred fitness can cross zero — `signed_log` is the no-cliff form of the same damping",
+                "`F` = {} — the ranking value: the window's CENTRE in the `{}` family over the last `n = min(B, K)` readings, K = {}, with NO spread charge (risk aversion was removed 2026-11-14). Any `selection_metrics` terms are ADDED to this centre (each a labelled metric's smoothed centre times its weight), so `F` is then composite and the Summ line names the terms. This is the card's only window cell: with no charge to apply, a `mean`/`median` column beside it printed `F`'s own number a second time, and the diagnostic spread (`1.4826 × MAD` under `median`, `σ` under `arithmetic`) was a statistic no cell reads — both were dropped 2026-11-14. The header still names the family, so the row says which window the number came from. The per-clock `Summ` line keeps printing the legs it averaged (`window median` / `1.4826·MAD`), because that line charges nothing either. Geometric/harmonic averaging is not offered: their domain excludes a non-positive reading, and a reward or centred fitness can cross zero — `signed_log` is the no-cliff form of the same damping",
                 match ctx.mean_type {
                     crate::engine::config::MeanType::Arithmetic => "the window mean",
                     crate::engine::config::MeanType::SignedLog => {
@@ -1460,6 +1425,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
                     }
                 },
                 ctx.mean_type.as_str(),
+                ctx.window,
             ),
         ),
         (
@@ -1467,23 +1433,9 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
             "`S` — the LEAST-SQUARES slope of this net's own fitness through EVERY reading it ever took, in raw fitness units per READING (the sign follows `direction`: with maximize, `+` is improving). One point per eval pass (`evals (E)`), x = the reading's index 0, 1, 2… — never the clock, because a net the lottery starved has gaps and a clock x-axis would charge those gaps to its slope as if it had been getting worse. `F` is a level, `S` is a direction, and no net can be ranked by where it is going. It also ignores the `K` window on purpose — `K` is a ranking smoother, too short to call a trend — which is why `S` can disagree with `F`'s own recent move. Report-only: no ranking, champion, seat, lottery draw or cull reads it; `champions.json` carries the same number as `fitness_slope` beside `fitness_readings` (the count of readings the line was fit to). Four decimals, and a nonzero trend finer than that prints in exponent form rather than as a `0.0000` that would read as flat. `—` = fewer than two readings, so there is no line to fit".to_string(),
         ),
         (
-            window_cell_columns(ctx.mean_type).0.to_string(),
-            format!(
-                "the window's CENTRE in the `{}` family — the number `F` IS, over the last `n = min(B, K)` results, K = {}. `arithmetic` prints it as `mean`; `median` prints the weighted median and `signed_log` the average in `g(x) = sign(x)·ln(1+|x|)`. `n` gets no column of its own: it only falls short of K for a net born within K clocks of the stop, so it is read off `evals (E)`",
-                ctx.mean_type.as_str(),
-                ctx.window
-            ),
-        ),
-        (
-            window_cell_columns(ctx.mean_type).1.to_string(),
-            format!(
-                "the spread across those same `n` results, in the SAME family as the centre — `σ` for `arithmetic`, `1.4826 × MAD` for `median`, the g-space spread for `signed_log`. DIAGNOSTIC: `F` is the centre and nothing is charged, so this leg is what a reader applies any `centre ∓ λ × spread` from. `0.0000` at `n = 1` means one reading, not steadiness; a dash here would make that re-application impossible",
-            ),
-        ),
-        (
             minmax.to_string(),
             format!(
-                "this net's `fit (F)` as a 0..1 position between the field's two ends on the LAST dealt clock (clock {}): `Fm = (F − F_worst) ÷ (F_best − F_worst)` over the nets the lottery GRADES (live, non-crown, out of its born shield, with a reading). The tilt is ALREADY applied, so `0.99` is the end that earns the tickets ({} this run) and `0.01` the end that earns fewest (both ends are pushed inside `[0.01, 0.99]`, so no cell and no ticket ever sits exactly on the band's `p_max`/`p_min`) — under worst-first the place is mirrored, which is what lets the coin read one ordering, and the HEADER spells that mirror out (`Fm⁻ = 1 − …`) because that factor is the one the tilt reverses. The two ends themselves are printed with their numbers in the `F field · band` row",
+                "this net's `fit (F)` as a 0..1 position between the field's two ends on the LAST dealt clock (clock {}): `Fm⁺ = (F − F_worst) ÷ (F_best − F_worst)` over the nets the lottery GRADES (live, non-crown, out of its born shield, with a reading). The tilt is ALREADY applied, so `0.99` is the end that earns the tickets ({} this run) and `0.01` the end that earns fewest (both ends are pushed inside `[0.01, 0.99]`, so no cell and no ticket ever sits exactly on the band's `p_max`/`p_min`) — under worst-first the place is mirrored, which is what lets the coin read one ordering, and the HEADER spells that mirror out (`Fm⁻ = 1 − …`) because that factor is the one the tilt reverses. The two ends themselves are printed with their numbers in the `F field · band` row",
                 ctx.dealt_clock, ctx.tilt
             ),
         ),
@@ -1496,12 +1448,12 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
                     let (mut names, mut cells) = (format!("{place}"), format!("`{place}`"));
                     if ctx.legs.updates_armed() {
                         names.push_str(if ctx.legs.updates_inverted() {
-                            " × Um"
+                            " × Um⁻"
                         } else {
                             " × Um⁺"
                         });
                         cells.push_str(if ctx.legs.updates_inverted() {
-                            " × `Um`"
+                            " × `Um⁻`"
                         } else {
                             " × `Um⁺`"
                         });
@@ -1513,18 +1465,18 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
                         format!("the single leg on its LEFT (`{place}`)")
                     };
                     let arm = if ctx.legs.updates_armed() {
-                        "The U leg is ARMED (`ticket_legs` names an updates side), so it multiplies the place and a net that has SPENT its updates sees the cell fall under `Um`"
+                        "The U leg is ARMED (`train_ticket` names an updates side), so it multiplies the place and a net that has SPENT its updates sees the cell fall under `Um⁻`"
                     } else {
-                        "The U leg is OFF (`ticket_legs` is place-only: `most_fit` / `least_fit`), so nothing multiplies the place and the cell is one step from it"
+                        "The U leg is OFF (`train_ticket` is place-only: `most_fit` / `least_fit`), so nothing multiplies the place and the cell is one step from it"
                     };
                     // A derived leg is only honest if the legend says which printed cell it comes
                     // from: `Um` is computed off the `updates (U)` column.
                     let um = if !ctx.legs.updates_armed() {
                         ""
                     } else if ctx.legs.updates_inverted() {
-                        " · `Um = 1 − (U − U_min) ÷ (U_max − U_min)` over the graded field: `0.99` at the fewest updates and `0.01` at the most, so a net that spent updates on rescue retries pays for them out of its own future tickets. NOT mirrored by the tilt: spending the budget spends it in either ordering"
+                        " · `Um⁻ = 1 − (U − U_min) ÷ (U_max − U_min)` over the graded field: `0.99` at the fewest updates and `0.01` at the most, so a net that spent updates on rescue retries pays for them out of its own future tickets. NOT mirrored by the tilt: spending the budget spends it in either ordering"
                     } else {
-                        " · `Um⁺ = (U − U_min) ÷ (U_max − U_min)` over the graded field: `1` at the MOST updates and `0` at the fewest, so this leg pays the net that has already trained — the opposite of `Um`, and NOT mirrored by the tilt"
+                        " · `Um⁺ = (U − U_min) ÷ (U_max − U_min)` over the graded field: `1` at the MOST updates and `0` at the fewest, so this leg pays the net that has already trained — the opposite of `Um⁻`, and NOT mirrored by the tilt"
                     };
                     format!(
                         "the chance the coin gave this net on the LAST clock it dealt (clock {}): {eq}, {legs}, paid inside the band (`p_min`, `p_max` stated with their numbers in the `F field · band` row) — and `T` is the probability ITSELF, on the coin's own line: the draw is `d = fastrand ∈ [0,1)` and the net LEARNS iff `d < T` — a lost draw still acts and measures when `train_merit_learn_only` is on, so `p_min` and `p_max` are the share of the unit interval the field's chances cover (`T = 1` trains every clock, `T = 0` never). {arm}{um}. `—` when the coin was not thrown for this net: the lottery is off or was never armed, it is inside its born shield, it has no reading yet, or the graded field had no spread to place it in. Those nets always run, but a number here would claim a draw they never took part in. Under tilt {} this column FALLS as `fit (F)` rises",
@@ -1538,8 +1490,8 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         (
             updates_minmax_column(ctx.legs).to_string(),
             match ctx.legs.updates_inverted() {
-                true => "the U leg: `Um = 1 − (U − U_min) ÷ (U_max − U_min)` over the graded field, so `0.99` at the FEWEST updates and `0.01` at the most — NOT mirrored by the tilt, since spending the budget spends it in either ordering. Printed only while the leg is ARMED (`set_ticket_legs` names an updates side) and the net was graded".to_string(),
-                false => "the U leg read FORWARD: `Um⁺ = (U − U_min) ÷ (U_max − U_min)` over the graded field, so `1` at the MOST updates and `0` at the fewest — this leg pays the net that has already trained. Printed only while the leg is ARMED (`set_ticket_legs` names an updates side) and the net was graded".to_string(),
+                true => "the U leg: `Um⁻ = 1 − (U − U_min) ÷ (U_max − U_min)` over the graded field, so `0.99` at the FEWEST updates and `0.01` at the most — NOT mirrored by the tilt, since spending the budget spends it in either ordering. Printed only while the leg is ARMED (`set_train_ticket` names an updates side) and the net was graded".to_string(),
+                false => "the U leg read FORWARD: `Um⁺ = (U − U_min) ÷ (U_max − U_min)` over the graded field, so `1` at the MOST updates and `0` at the fewest — this leg pays the net that has already trained. Printed only while the leg is ARMED (`set_train_ticket` names an updates side) and the net was graded".to_string(),
             },
         ),
         // ── what its learning COST ──────────────────────────────────────
@@ -1620,20 +1572,11 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         ),
     ];
     // The legend follows the HEADER: a reader with the table and the legend side by side finds
-    // same column in the same relative place. The two window legs print under the family's names,
-    // so they occupy the slot their placeholders hold — a median legend must not push them last.
+    // same column in the same relative place.
     let slot = |key: &str| -> usize {
-        let (centre, spread) = window_cell_columns(ctx.mean_type);
-        let canonical = if key == centre {
-            COL_WINDOW_MEAN
-        } else if key == spread {
-            COL_WINDOW_SPREAD
-        } else {
-            key
-        };
         STOP_HEADER_FIXED
             .iter()
-            .position(|c| *c == canonical)
+            .position(|c| *c == key)
             .unwrap_or(STOP_HEADER_FIXED.len())
     };
     rows.sort_by_key(|(key, _)| slot(key));
@@ -1648,7 +1591,7 @@ mod stop_legend_tests {
         LegendCtx {
             window: 10,
             mean_type: crate::engine::config::MeanType::Arithmetic,
-            legs: crate::engine::config::TicketLegs::MostFit,
+            legs: crate::engine::config::TrainTicket::MostFit,
             dealt_clock: 0,
             p_min: 0.0,
             p_max: 1.0,
@@ -1681,34 +1624,39 @@ mod stop_legend_tests {
         );
     }
 
-    /// The window legs print the pair the score is READ from: `F` IS the family's centre, and the
-    /// spread beside it is the diagnostic any `centre ∓ λ × spread` would use. A median run must
-    /// print the median and the MAD — the arithmetic pair is a different number.
+    /// The card prints NO window leg beside `F`: with the spread charge gone `F` IS the window
+    /// centre, so a `mean`/`median` column held the same number twice, and the diagnostic spread
+    /// (`1.4826·MAD`) held a statistic no cell charges. The `fit` header carries the family instead.
     #[test]
-    fn the_window_legs_are_the_pair_the_centre_is_read_from() {
+    fn the_card_prints_no_window_leg_beside_the_score() {
         use crate::engine::config::MeanType;
         use crate::engine::smoothing::{RollingBuffer, rolling_stats_with};
         // The window that started it: two good readings and one low one.
         let buf = RollingBuffer::from_values(10, &[0.828125, 0.859375, 0.859375]);
         let stats = rolling_stats_with(&buf, MeanType::Median).unwrap();
-        assert_eq!(
-            window_cell_columns(MeanType::Median),
-            ("window median", "1.4826·MAD")
-        );
-        // Arithmetic keeps the plain spellings: there the scored centre IS the mean.
-        assert_eq!(
-            window_cell_columns(MeanType::Arithmetic),
-            (COL_WINDOW_MEAN, COL_WINDOW_SPREAD)
-        );
-        // The row carries the MEDIAN and the MAD — not the mean/σ pair that cannot redo `F`.
-        assert!((stats.fam_center - 0.859375).abs() < 1e-6, "centre");
-        assert_eq!(stats.fam_spread, 0.0);
-        assert!(
-            (stats.mean - 0.8490).abs() < 1e-3,
-            "the arithmetic mean is a DIFFERENT number, which is why printing it read as a rise"
-        );
-        let fit = stats.score();
-        assert_eq!(fit, stats.fam_center, "F is the centre, with no charge");
+        // `F` is the centre, so the dropped column carried exactly the cell `fit (F)` carries.
+        assert_eq!(stats.score(), stats.fam_center, "F is the centre");
+        // Nothing named like a window leg survives in the header the rows, the CSV export and the
+        // legend all share.
+        let cols = printed_columns(true, true);
+        for gone in [
+            "mean",
+            "spread",
+            "window median",
+            "1.4826·MAD",
+            "window g-avg",
+            "window g-spread",
+        ] {
+            assert!(
+                !cols.contains(&gone),
+                "`{gone}` is still a column: {cols:?}"
+            );
+        }
+        // The family still rides the `fit` header, so the row says which window the number is.
+        assert_eq!(fit_column(MeanType::Median), COL_FIT_MEDIAN);
+        assert_eq!(fit_column(MeanType::Arithmetic), COL_FIT);
+        assert_eq!(fit_column(MeanType::SignedLog), COL_FIT_SIGNED_LOG);
+        assert!(COL_FIT_MEDIAN.contains("median") && COL_FIT.contains("mean"));
     }
 
     /// The clock columns are `age (A)` (beside the ticket) and `updates (U) | evals (E)` — `E` holds
@@ -1772,7 +1720,7 @@ mod stop_legend_tests {
     #[test]
     fn tilted_ticket_names_the_mirrored_place() {
         let mut c = ctx();
-        c.legs = crate::engine::config::TicketLegs::LeastFit;
+        c.legs = crate::engine::config::TrainTicket::LeastFit;
         let rows = stop_legend_rows(&c);
         let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&COL_FIT_MINMAX_TILTED), "{keys:?}");
@@ -1780,28 +1728,33 @@ mod stop_legend_tests {
         assert!(!keys.contains(&COL_FIT_MINMAX), "{keys:?}");
         assert!(!keys.contains(&COL_TICKET), "{keys:?}");
         assert!(COL_TICKET_TILTED.contains("× Fm⁻"));
-        assert!(COL_TICKET.contains("× Fm"));
+        assert!(COL_TICKET.contains("× Fm⁺"));
+        assert!(
+            COL_TICKET_UP.contains("× Fm⁺ × Um⁻"),
+            "a leg without a sign is a leg a reader cannot place"
+        );
+        assert!(COL_UPMINMAX.contains("Um⁻"));
         // The header rewrite and the legend key read the SAME helper, so the cell and its row agree.
         assert_eq!(fit_minmax_column(true), COL_FIT_MINMAX_TILTED);
         assert_eq!(
-            ticket_column(crate::engine::config::TicketLegs::MostFit),
+            ticket_column(crate::engine::config::TrainTicket::MostFit),
             COL_TICKET
         );
     }
 
-    /// ONE value names both legs: every `TicketLegs` spelling has its own equation, and the header
+    /// ONE value names both legs: every `TrainTicket` spelling has its own equation, and the header
     /// a reader sees is the key its legend row carries.
     #[test]
     fn the_ticket_equation_follows_the_legs() {
-        use crate::engine::config::TicketLegs;
+        use crate::engine::config::TrainTicket;
         let mut headers: Vec<&'static str> = Vec::new();
         for legs in [
-            TicketLegs::MostFit,
-            TicketLegs::MostFitFewestUpdates,
-            TicketLegs::MostFitMostUpdates,
-            TicketLegs::LeastFit,
-            TicketLegs::LeastFitFewestUpdates,
-            TicketLegs::LeastFitMostUpdates,
+            TrainTicket::MostFit,
+            TrainTicket::MostFitFewestUpdates,
+            TrainTicket::MostFitMostUpdates,
+            TrainTicket::LeastFit,
+            TrainTicket::LeastFitFewestUpdates,
+            TrainTicket::LeastFitMostUpdates,
         ] {
             let mut c = ctx();
             c.legs = legs;
@@ -1860,7 +1813,7 @@ mod stop_legend_tests {
             assert_eq!(MeanType::parse(family.as_str()), Some(family));
         }
         assert_eq!(MeanType::parse(""), None);
-        assert_eq!(MeanType::default(), MeanType::Arithmetic);
+        assert_eq!(MeanType::default(), MeanType::Median);
     }
 
     /// One key, one explanation — two rows for a column can disagree with each other.

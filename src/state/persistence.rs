@@ -121,15 +121,17 @@ pub struct ConfigSnapshot {
     /// the upper end of `p = p_min + (p_max − p_min)·f`.
     #[serde(default = "default_p_max")]
     pub train_merit_p_max: f32,
-    /// The lottery's two LEGS (`set_ticket_legs`) as ONE spelling — `least_fit_fewest_updates`,
+    /// The lottery's two LEGS (`set_train_ticket`) as ONE spelling — `least_fit_fewest_updates`,
     /// `most_fit_most_updates`, `most_fit`, … `""` = a header written before the key, read out of
-    /// the two legacy bools below instead.
-    #[serde(default)]
-    pub ticket_legs: String,
-    /// LEGACY, read-only: the pre-`ticket_legs` ordering bool (`true` = the LEAST fit net is paid).
+    /// the two legacy bools below instead. Headers written before the 2026-11-14 rename carry it
+    /// as `ticket_legs`, which the field's `alias` still reads.
+    #[serde(default, alias = "ticket_legs")]
+    pub train_ticket: String,
+    /// LEGACY, read-only: the pre-`train_ticket` ordering bool (`true` = the LEAST fit net is paid).
     /// Still READ so an old header resumes on the legs it actually ran; never written again.
-    /// Drop it once no surviving header predates `ticket_legs` — it is `skip_serializing`, so
-    /// every header written since is already clean.
+    /// Drop it once no surviving header predates `train_ticket` (spelled `ticket_legs` before the
+    /// 2026-11-14 rename) — it is `skip_serializing`, so every header written since is already
+    /// clean.
     #[serde(default, skip_serializing)]
     pub train_merit_inverted: bool,
     /// LEARN-ONLY lottery (`set_ticket_learn_only`): `true` = a lost ticket costs the
@@ -196,7 +198,7 @@ pub struct ConfigSnapshot {
     /// replay-relevant while `recovery_retries > 0`.
     #[serde(default = "default_true")]
     pub recovery_same_seed: bool,
-    /// LEGACY, read-only: the pre-`ticket_legs` U-leg bool (`true` = the ticket also multiplies
+    /// LEGACY, read-only: the pre-`train_ticket` U-leg bool (`true` = the ticket also multiplies
     /// the updates fraction). Read to map an old header onto the legs spelling it means; never
     /// written again. Drop it on the same schedule as `train_merit_inverted` above.
     #[serde(default, skip_serializing)]
@@ -279,8 +281,8 @@ impl ConfigSnapshot {
             train_merit: cfg.train_merit,
             train_merit_p_min: cfg.train_merit_p_min,
             train_merit_p_max: cfg.train_merit_p_max,
-            ticket_legs: cfg.ticket_legs.to_string(),
-            // Legacy, read-only: written headers carry `ticket_legs` and nothing else.
+            train_ticket: cfg.train_ticket.to_string(),
+            // Legacy, read-only: written headers carry `train_ticket` and nothing else.
             train_merit_inverted: false,
             train_merit_updates: false,
             train_merit_learn_only: cfg.train_merit_learn_only,

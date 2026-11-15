@@ -94,18 +94,18 @@ impl CoreEngine {
             format!("set_ticket_p_max({})", fmt_cfg(rec_max)),
         );
         // Which NET the ticket favours, on BOTH legs. The same idle ledger means a different
-        // search under another leg, so it is named like Ω — and a pre-`ticket_legs` header is
+        // search under another leg, so it is named like Ω — and a pre-`train_ticket` header is
         // mapped from its two bools, so an old run compares equal when it means the same leg.
-        let rec_legs = crate::engine::config::ticket_legs_from_header(
-            &recorded.ticket_legs,
+        let rec_legs = crate::engine::config::train_ticket_from_header(
+            &recorded.train_ticket,
             recorded.train_merit_inverted,
             recorded.train_merit_updates,
         );
         push(
-            "ticket_legs",
+            "train_ticket",
             rec_legs.to_string(),
-            current.ticket_legs.to_string(),
-            format!("set_ticket_legs(\"{rec_legs}\")"),
+            current.train_ticket.to_string(),
+            format!("set_train_ticket(\"{rec_legs}\")"),
         );
         // The coin's CONSEQUENCE: the same draw writes a different ledger (idle clocks vs act-only
         // spans) and a different fitness series, so a resume under the other value is not the same
