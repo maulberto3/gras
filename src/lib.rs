@@ -148,3 +148,67 @@ pub fn auto_device() -> flodl::Device {
         flodl::Device::CPU
     }
 }
+
+// ── example dependency pin ───────────────────────────────────────────
+/// The examples are runnable documentation and must run on what the crate already pulls: a task that
+/// seems to need a new crate is a sign the example is reaching past the API. This pin makes growing
+/// either dependency table a deliberate edit instead of a stray `cargo add`.
+#[cfg(test)]
+mod example_dependency_pin {
+    const MANIFEST: &str = include_str!("../Cargo.toml");
+
+    /// The crates declared in one `[table]`: the key of each `name = ...` line, sorted.
+    fn table(name: &str) -> Vec<String> {
+        let header = format!("[{name}]");
+        let mut out = Vec::new();
+        let mut inside = false;
+        for line in MANIFEST.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                inside = trimmed == header;
+                continue;
+            }
+            if !inside || trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some((key, _)) = trimmed.split_once('=') {
+                out.push(key.trim().to_string());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The declared crates, pinned: adding one is a decision, so update this list in the same change.
+    const DEPS: &[&str] = &[
+        "comfy-table",
+        "ctrlc",
+        "fastrand",
+        "flodl",
+        "serde",
+        "serde_json",
+        "strum",
+        "tracing",
+        "tracing-subscriber",
+        "xxhash-rust",
+    ];
+    const DEV_DEPS: &[&str] = &["clap", "dhat", "proptest"];
+
+    fn expected(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn examples_add_no_dependencies() {
+        assert_eq!(
+            table("dependencies"),
+            expected(DEPS),
+            "[dependencies] changed: an example must not need a new crate (CONVENTIONS.md)"
+        );
+        assert_eq!(
+            table("dev-dependencies"),
+            expected(DEV_DEPS),
+            "[dev-dependencies] changed: an example must not need a new crate (CONVENTIONS.md)"
+        );
+    }
+}

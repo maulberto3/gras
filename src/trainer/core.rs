@@ -18,7 +18,7 @@ pub struct StepReport {
     /// Extra non-ranking/informative scores configured for the run,
     pub informative: Vec<f32>,
     /// RL-only environment volume for this step — see [`RlStepMeta`]. `None`
-    /// Tabular (the log prints `—`).
+    /// Tabular (the log prints `na`).
     #[serde(default)]
     pub rl: Option<RlStepMeta>,
 }
@@ -52,7 +52,7 @@ pub struct RlStepReport {
     /// Extra non-ranking/informative scores configured for the run,
     pub informative: Vec<f32>,
     /// Environment volume for this step — feeds the `matches`/`train`/`eval`
-    /// rollup columns. `None` = not reported (the log prints `—`).
+    /// rollup columns. `None` = not reported (the log prints `na`).
     pub rl: Option<RlStepMeta>,
 }
 

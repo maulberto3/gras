@@ -156,7 +156,7 @@ impl flodl::nn::optim::Optimizer for NoopOptimizer {
 }
 
 /// Per-step RL volume summed over every net that stepped this clock — the env work
-/// actually done. `nets` counts reporters (a silent trainer shows `—`), zero in Tabular.
+/// actually done. `nets` counts reporters (a silent trainer shows `na`), zero in Tabular.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct RlVolume {
     /// Nets that reported `StepReport.rl` this step.
@@ -180,12 +180,14 @@ impl RlVolume {
     /// eval`, the mean turns per episode, and the per-turn wall cost — `took` alone cannot answer
     pub(crate) fn label(&self, step_secs: f32) -> String {
         if self.nets == 0 || self.matches == 0 {
-            return "episodes — │ turns — = train — + eval — │ turns/episode — │ ms/turn —"
-                .to_string();
+            let none = crate::utils::cfy::NO_VALUE;
+            return format!(
+                "episodes {none} │ turns {none} = train {none} + eval {none} │ turns/episode {none} │ ms/turn {none}"
+            );
         }
         let turns = self.turns();
         let per_turn = if turns == 0 {
-            "—".to_string()
+            crate::utils::cfy::NO_VALUE.to_string()
         } else {
             fmt_line(step_secs * 1000.0 / turns as f32)
         };

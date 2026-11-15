@@ -16,7 +16,7 @@ use flodl::{Device, Variable};
 #[test]
 fn rl_volume_label_formats_and_never_lies() {
     let empty = RlVolume::default();
-    assert!(empty.label(1.0).contains('—'), "{}", empty.label(1.0));
+    assert!(empty.label(1.0).contains("na"), "{}", empty.label(1.0));
     let pop = RlVolume {
         nets: 3,
         matches: 3,
@@ -30,7 +30,7 @@ fn rl_volume_label_formats_and_never_lies() {
         "episodes 3 │ turns 540 = train 432 + eval 108 │ turns/episode 180.0 │ 1.85 ms/turn"
     );
     // Matches with zero turns is still a real report (every match died on turn 0) —
-    // it reads as a mean of 0, with the cost cell `—` rather than an infinity.
+    // it reads as a mean of 0, with the cost cell `na` rather than an infinity.
     let zero_turns = RlVolume {
         nets: 1,
         matches: 1,
@@ -39,7 +39,7 @@ fn rl_volume_label_formats_and_never_lies() {
     };
     assert_eq!(
         zero_turns.label(1.0),
-        "episodes 1 │ turns 0 = train 0 + eval 0 │ turns/episode 0.0000 │ — ms/turn"
+        "episodes 1 │ turns 0 = train 0 + eval 0 │ turns/episode 0.0000 │ na ms/turn"
     );
 }
 

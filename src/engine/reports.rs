@@ -9,7 +9,7 @@ use flodl::tensor::Result;
 
 /// Why the list is not simply the bottom of `fit (F)`, stamped into every `worst-*.md`: the file
 /// outlives the run, and the criterion reads engine knobs a later reader cannot see.
-const WORST_PICK_NOTE: &str = "**Why this net.** The pick is the `spent` criterion the cross/mutation cull evicts on: `spent = Fm⁻ × (1 − Um⁻)` — how badly the net grades (`Fm⁻`: 0.99 = the field's worst, 0.01 = its best) times how much of its updates it has already spent (`1 − Um`: 0.01 at the field's least-updated net, 0.99 at its most). So a weak net the lottery has NOT paid yet ranks BELOW a weak net that trained and stayed weak — the net worth reading, and the reason this list is not just the bottom of `fit (F)`. The place is UN-TILTED: the fit side of `train_ticket` (worst-first / best-first) is undone as `1 − p` before the product, so that leg decides who the band PAYS and never which end counts as bad, while the `U` leg is read whether or not `train_ticket` arms it for tickets. A net the lottery cannot grade (shielded, unread, flat field, lottery off) prints `—` and falls to the tail of this index ordered by `fit (F)` — the pre-criterion dump.";
+const WORST_PICK_NOTE: &str = "**Why this net.** The pick is the `spent` criterion the cross/mutation cull evicts on: `spent = Fm⁻ × (1 − Um⁻)` — how badly the net grades (`Fm⁻`: 0.99 = the field's worst, 0.01 = its best) times how much of its updates it has already spent (`1 − Um`: 0.01 at the field's least-updated net, 0.99 at its most). So a weak net the lottery has NOT paid yet ranks BELOW a weak net that trained and stayed weak — the net worth reading, and the reason this list is not just the bottom of `fit (F)`. The place is UN-TILTED: the fit side of `train_ticket` (worst-first / best-first) is undone as `1 − p` before the product, so that leg decides who the band PAYS and never which end counts as bad, while the `U` leg is read whether or not `train_ticket` arms it for tickets. A net the lottery cannot grade (shielded, unread, flat field, lottery off) prints `na` and falls to the tail of this index ordered by `fit (F)` — the pre-criterion dump.";
 
 impl CoreEngine {
     /// Write the MACHINE-READABLE champion ranking — `champions.json`, best first,
@@ -117,7 +117,7 @@ impl CoreEngine {
             // The header names both legs: the score it ranked by, and the reading it was charged
             // from — `μ ±σ (SE, n)` in the same spelling as the logs, so a reader never has
             let reading = self.race_reading_of(&hash).map_or_else(
-                || "—".to_string(),
+                || crate::utils::cfy::NO_VALUE.to_string(),
                 |r| {
                     // The pair the SCORE was charged from (`fam_center` / `fam_spread`), under
                     // the family's own nouns — a median run's card redoes its own header instead
@@ -264,14 +264,14 @@ impl CoreEngine {
                 continue;
             };
             let short = &hash[..8.min(hash.len())];
-            // `—` when the lottery cannot grade the net (no reading, flat field, shield): the table
+            // `na` when the lottery cannot grade the net (no reading, flat field, shield): the table
             // prints the same dash, because a neutral fraction is not a chance anybody is paid.
             let p = self
                 .train_lottery_parts(hash, frame, self.merit(hash))
                 .map(|_| self.train_lottery_p_eff(hash, frame));
             let merit = self.merit(hash);
             let reading = self.race_reading_of(hash).map_or_else(
-                || "—".to_string(),
+                || crate::utils::cfy::NO_VALUE.to_string(),
                 |r| {
                     // The pair the SCORE was charged from (`fam_center` / `fam_spread`), under
                     // the family's own nouns — a median run's card redoes its own header instead
@@ -292,16 +292,16 @@ impl CoreEngine {
             let fit = self.smoothed_fitness_of(hash);
             let score = fit.map_or_else(|| "na".to_string(), |s| format!("{s:.2}"));
             let file = format!("worst-{:02}-{short}-{score}.md", rank + 1);
-            let fit_cell = fit.map_or_else(|| "—".to_string(), fmt_cfg);
-            let ticket_cell = p.map_or_else(|| "—".to_string(), fmt_cfg);
-            let spent_cell = spent.map_or_else(|| "—".to_string(), fmt_cfg);
+            let fit_cell = fit.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg);
+            let ticket_cell = p.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg);
+            let spent_cell = spent.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg);
             let md = format!(
                 "**Worst #{} · spent {} · fit (F) {} · ticket p {} · merit {} · age {} clocks · window {} · run seed {} · net seed {}**\n\n{}\n\n{}\n\n{}",
                 rank + 1,
                 spent_cell,
                 fit_cell,
                 ticket_cell,
-                merit.map_or_else(|| "—".to_string(), fmt_cfg),
+                merit.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg),
                 age,
                 reading,
                 self.header.run_seed,
@@ -315,7 +315,7 @@ impl CoreEngine {
                     index.push_str(&format!(
                         "| {} | {short} | {spent_cell} | {fit_cell} | {ticket_cell} | {} | {age} | [{file}]({file}) |\n",
                         rank + 1,
-                        merit.map_or_else(|| "—".to_string(), fmt_cfg),
+                        merit.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg),
                     ));
                     written.push(vec![
                         (rank + 1).to_string(),
@@ -344,7 +344,7 @@ impl CoreEngine {
                 )
             });
             let body = format!(
-                "# Anti-champion field at clock {clock}\n\nThese are the `champion_count` nets that already BURNED their updates and stayed bad — ranked by the `spent` criterion `Fm⁻ × (1 − Um⁻)`, the same number the `spent` cross/mutation cull evicts on, not by `fit (F)` alone: a weak net the lottery has not paid yet ranks BELOW a weak net that trained and stayed weak. Every row is one net's topology + mermaid graph + lineage; `spent` is the ranking value, `ticket p` is the chance the train-eval lottery gives that net on the NEXT clock (dash = not graded, so it has no chance to name), and `fit (F)` rides along for comparison. A row with `—` spent was not graded and is listed after the graded ones, by `fit (F)` ascending.\n\n{favourite_line}{index}"
+                "# Anti-champion field at clock {clock}\n\nThese are the `champion_count` nets that already BURNED their updates and stayed bad — ranked by the `spent` criterion `Fm⁻ × (1 − Um⁻)`, the same number the `spent` cross/mutation cull evicts on, not by `fit (F)` alone: a weak net the lottery has not paid yet ranks BELOW a weak net that trained and stayed weak. Every row is one net's topology + mermaid graph + lineage; `spent` is the ranking value, `ticket p` is the chance the train-eval lottery gives that net on the NEXT clock (dash = not graded, so it has no chance to name), and `fit (F)` rides along for comparison. A row with `na` spent was not graded and is listed after the graded ones, by `fit (F)` ascending.\n\n{favourite_line}{index}"
             );
             let path = self.run_dir.join("worst.md");
             if let Err(source) = std::fs::write(&path, body) {
@@ -397,7 +397,10 @@ impl CoreEngine {
     /// cells the card printed, one row per individual, in rank order.
     pub(crate) fn write_final_field_csv(&self, header: &[String], rows: &[Vec<String>]) {
         let path = self.run_dir.join("final-field.csv");
-        let mut body = csv_row(header);
+        // The DISPLAY header breaks the ticket equation over lines so the console table stays
+        // narrow; a CSV header is one line, so the same cells are flattened here.
+        let flat: Vec<String> = header.iter().map(|h| h.replace('\n', " ")).collect();
+        let mut body = csv_row(&flat);
         for row in rows {
             body.push('\n');
             body.push_str(&csv_row(row));
@@ -516,10 +519,10 @@ mod tests {
             "7".to_string(),
             "abc12345".to_string(),
             "0.6348".to_string(),
-            "—".to_string(),
+            crate::utils::cfy::NO_VALUE.to_string(),
             "cx one-point@14, +mut".to_string(),
         ]);
-        assert_eq!(row, "7,abc12345,0.6348,—,\"cx one-point@14, +mut\"");
+        assert_eq!(row, "7,abc12345,0.6348,na,\"cx one-point@14, +mut\"");
         // The quoted comma is FIELD TEXT: a naive split sees 6 pieces for 5 columns,
         // which is exactly why the quoting is here.
         assert_eq!(row.split(',').count(), 6);

@@ -106,6 +106,9 @@ pub(crate) struct NetShape {
     pub wires: usize,
     /// Mean hidden-node width; `0.0` for a net with no hidden node.
     pub dim: f32,
+    /// The Input node's feature-split policy (`exclusive` / `random` / `inherited`); `None` = every
+    /// port reads every feature, which the table prints as `rows`.
+    pub split: Option<crate::graph::topology::FeatureSplitPolicy>,
 }
 
 /// Read one net's structure: the pair metric's genes plus the census legs.
@@ -121,6 +124,7 @@ pub(crate) fn shape_of(topo: &Topology) -> NetShape {
         nodes: topo.nodes.len(),
         wires: topo.connections.len(),
         dim: trait_of(&hidden).mean,
+        split: topo.options.feature_split,
     }
 }
 
@@ -417,12 +421,13 @@ mod tests {
             nodes: 1,
             wires: 1,
             dim: 4.0,
+            split: None,
         };
         let straggler = shape(&[("W:Tanh", 1)]);
         assert_eq!(
             mean_delta_to(&straggler, &[]),
             None,
-            "no reference ⇒ `—`, never a fake 0.0"
+            "no reference ⇒ `na`, never a fake 0.0"
         );
         assert_eq!(
             mean_delta_to(&straggler, &[shape(&[("W:Tanh", 1)])]),
