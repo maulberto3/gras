@@ -77,9 +77,8 @@ pub(crate) const CROSSOVER_CULLS: [&str; 4] = [
 /// `mutation_cull_policy`: who a firing mutation roll evicts. `highest_ticket_chance` and
 /// `lowest_fitness_most_updates` are the same two lottery selectors the crossover channel
 /// offers.
-pub(crate) const MUTATION_CULLS: [&str; 5] = [
+pub(crate) const MUTATION_CULLS: [&str; 4] = [
     "lowest_fitness",
-    "inverse_fitness",
     "random",
     "highest_ticket_chance",
     "lowest_fitness_most_updates",

@@ -904,15 +904,18 @@ impl PyRaceEngine {
     }
 
     /// The net's CURRENT RACE READING: its `smoothing_window` recent fitness
-    /// readings, shifted by `risk_aversion` standard deviations toward the worse
-    /// side (the direction is the fitness's own). `None` for a hash the engine
+    /// readings, summarised as the window's CENTRE in the run's mean family (no
+    /// spread charge — risk aversion was removed). `None` for a hash the engine
     /// never read (`""`, a typo, a net from another run).
     ///
     /// This is the number the race ranks on — not the last raw step fitness. The
     /// SAME value is in `history.csv` as `fitness_smooth` (the file stores the
-    /// risk-adjusted score, not the raw window mean), with the σ it paid for
-    /// beside it as `fitness_smooth_std`, so a caller can cross-check the two
-    /// without a second implementation.
+    /// score, not the raw window mean), with the spread printed beside it as
+    /// `fitness_smooth_std` — the FAMILY spread, i.e. `σ` under
+    /// `mean_type="arithmetic"` and `1.4826 × MAD` under `"median"` — the leg any
+    /// `centre ∓ λ × spread` would be applied to outside the engine.
+    /// `champions.json` carries the same pair as `fitness_centre` / `fitness_spread`
+    /// (`fitness_mean` / `fitness_std` stay the arithmetic reading).
     ///
     /// ```python
     /// best = history.loc[history["fitness"].idxmin(), "hash"]

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use gras::engine::config::{
     DEFAULT_CHECKPOINT_EVERY, DEFAULT_INIT_PROBATION_STEPS, DEFAULT_MUTATION_NOVELTY_DRAWS,
     DEFAULT_MUTATION_NOVELTY_MIN, DEFAULT_RECOVERY_RETRIES, DEFAULT_RECOVERY_SAME_SEED,
-    DEFAULT_RECOVERY_TOLERANCE, DEFAULT_TICKET_LEGS, DEFAULT_TRAIN_MERIT_P_MAX, SMOOTHING_WINDOW,
+    DEFAULT_RECOVERY_TOLERANCE, DEFAULT_TRAIN_MERIT_P_MAX, DEFAULT_TRAIN_TICKET, SMOOTHING_WINDOW,
 };
 use gras::evolution::selection::SelectionMethod;
 use gras::prelude::*;
@@ -24,10 +24,6 @@ use pyo3::prelude::*;
 // instead of silently re-tuning Python. The RECOVERY knobs are NOT mirrored: their
 // crate consts are already `pub`, so they are imported and the number lives once.
 const DEFAULT_POP_SIZE: usize = 10;
-const DEFAULT_CROSSOVER_ROLLS: usize = 2;
-const DEFAULT_MUTATE_ROLLS: usize = 2;
-const DEFAULT_CROSSOVER_PROB: f32 = 0.5;
-const DEFAULT_MUTATE_PROB: f32 = 0.2;
 const DEFAULT_HIDDEN_DIM_STRIDE: usize = 16;
 const DEFAULT_TOURNAMENT_SIZE: usize = 2;
 /// Step budget a no-arg `RaceConfig()` carries. `None` removes the cap, which
@@ -47,10 +43,6 @@ const DEFAULT_DRIFT_PROB: f32 = 0.1;
 /// effect on the ranking, so a Python caller inherits the crate's 5 instead of
 /// starting bare.
 const DEFAULT_PROBATION_STEPS: usize = 5;
-/// λ is the binding's one ranking divergence: `0.0` ranks on the plain window mean,
-/// while the crate's FIT default is `0.5` (a net pays for its own spread). Ω and
-/// every other knob mirror the crate's tuned reference run.
-const DEFAULT_RISK_AVERSION: f32 = 0.0;
 /// The retired Ω, at its identity: the band `train_merit_p_min..p_max` is the payout now.
 const DEFAULT_TRAIN_MERIT: f32 = 1.0;
 /// The lottery's merit floor `p_min`, mirrored from the crate's default. It only has
@@ -65,9 +57,9 @@ const DEFAULT_EVAL_SHARE: f32 = 0.2;
 /// Engine knobs a Python caller turns. Anything not listed keeps the crate's
 /// default, and every field is recorded in the run's `engine.json`.
 ///
-/// Two choices are the binding's own, both to keep a Python run neutral until it
-/// asks otherwise: `risk_aversion` is `0.0` (rank on the plain mean, no charge
-/// for spread) and `champion_previous_load` is `false` (all-random founders).
+/// One choice is the binding's own, to keep a Python run neutral until it asks
+/// otherwise: `champion_previous_load` is `false` (all-random founders). There is
+/// no risk knob on either side — the ranking is the crate's window CENTRE.
 #[pyclass(name = "RaceConfig", module = "gras._core")]
 #[derive(Clone)]
 pub struct PyRaceConfig {
@@ -88,11 +80,6 @@ pub struct PyRaceConfig {
     pub eval_share: f32,
     #[pyo3(get, set)]
     pub smoothing_window: usize,
-    /// Risk aversion λ: window standard deviations subtracted from a net's
-    /// smoothed mean before ranking. **`0.0` here** ranks on the plain mean (the
-    /// crate's FIT default is `0.5`).
-    #[pyo3(get, set)]
-    pub risk_aversion: f32,
     /// How the smoothing window is averaged into the ranking centre:
     /// `"arithmetic"` (default), `"signed_log"` (geometric-like damping that is
     /// defined for negative readings) or `"median"` (one fluke cannot move it).
@@ -112,7 +99,7 @@ pub struct PyRaceConfig {
     /// too — set `p_min == p_max` to pay every graded net the same chance.
     #[pyo3(get, set)]
     pub train_merit_p_max: f32,
-    /// The lottery's two LEGS (`set_ticket_legs`, crate default `least_fit_fewest_updates`): which
+    /// The lottery's two LEGS (`set_train_ticket`, crate default `least_fit_fewest_updates`): which
     /// fit place earns the most tickets and which side of the updates field it multiplies in —
     /// `most_fit_fewest_updates`, `most_fit_most_updates`, `least_fit_fewest_updates`,
     /// `least_fit_most_updates`, or the place alone (`most_fit` / `least_fit`).
@@ -138,18 +125,6 @@ pub struct PyRaceConfig {
     pub log_level: String,
 
     // ── evolution ───────────────────────────────────────────────────────
-    /// Crossover rolls per step (each fires with `crossover_prob`; a spent roll
-    /// has no random fallback).
-    #[pyo3(get, set)]
-    pub crossover_rolls: usize,
-    /// Mutation rolls per step (each fires with `mutate_prob` and inserts a
-    /// random immigrant by evicting one net).
-    #[pyo3(get, set)]
-    pub mutate_rolls: usize,
-    #[pyo3(get, set)]
-    pub crossover_prob: f32,
-    #[pyo3(get, set)]
-    pub mutate_prob: f32,
     /// Mutation NOVELTY floor Δ: how far a random immigrant must sit from the NEAREST
     /// blueprint the run has ever made (founders, crossover children and earlier mutants),
     /// as a Jaccard distance on the gene multiset — the reading the diversity cards print.
@@ -162,15 +137,12 @@ pub struct PyRaceConfig {
     /// the draw; it never blocks a birth. Crate default `5`.
     #[pyo3(get, set)]
     pub mutation_novelty_draws: usize,
-    /// The top-k nets act and measure without weight updates.
-    #[pyo3(get, set)]
-    pub freeze_seats: bool,
     /// Who a surviving crossover child evicts: `highest_ticket_chance` (default),
     /// `lowest_fitness`, `lowest_fitness_most_updates`, or `random`.
     #[pyo3(get, set)]
     pub crossover_cull_policy: String,
     /// Who a firing mutation roll evicts: `highest_ticket_chance` (default),
-    /// `lowest_fitness`, `lowest_fitness_most_updates`, `inverse_fitness`, or `random`.
+    /// `lowest_fitness`, `lowest_fitness_most_updates`, or `random`.
     #[pyo3(get, set)]
     pub mutation_cull_policy: String,
     /// How a crossover attempt draws parents: `tournament` (default, K =
@@ -217,13 +189,6 @@ pub struct PyRaceConfig {
     /// on fresh evidence. The eval exam stays keyed to the clock either way.
     #[pyo3(get, set)]
     pub recovery_same_seed: bool,
-    /// A net cannot become an elite until it has aged k clocks since arrival.
-    #[pyo3(get, set)]
-    pub seat_join_probation_steps: usize,
-    /// How long a net may stay at peak on the frozen crown before age-elimination;
-    /// `0` = permanent until its rank moves.
-    #[pyo3(get, set)]
-    pub seat_lifetime_steps: usize,
 
     // ── search space ────────────────────────────────────────────────────
     /// Hidden-dim sampling range as `(min, max)` inclusive. `None` keeps the
@@ -305,24 +270,18 @@ impl PyRaceConfig {
         max_steps = DEFAULT_MAX_STEPS,
         eval_share = DEFAULT_EVAL_SHARE,
         smoothing_window = SMOOTHING_WINDOW,
-        risk_aversion = DEFAULT_RISK_AVERSION,
         mean_type = String::from("arithmetic"),
         train_merit = DEFAULT_TRAIN_MERIT,
         train_merit_p_min = DEFAULT_TRAIN_MERIT_P_MIN,
         train_merit_p_max = DEFAULT_TRAIN_MERIT_P_MAX,
-        ticket_legs = DEFAULT_TICKET_LEGS.as_str().to_string(),
+        ticket_legs = DEFAULT_TRAIN_TICKET.as_str().to_string(),
         init_probation_steps = DEFAULT_INIT_PROBATION_STEPS,
         drift_prob = DEFAULT_DRIFT_PROB,
         champion_previous_load = false,
         log_level = String::from("summ"),
         // evolution
-        crossover_rolls = DEFAULT_CROSSOVER_ROLLS,
-        mutate_rolls = DEFAULT_MUTATE_ROLLS,
-        crossover_prob = DEFAULT_CROSSOVER_PROB,
-        mutate_prob = DEFAULT_MUTATE_PROB,
         mutation_novelty_min = DEFAULT_MUTATION_NOVELTY_MIN,
         mutation_novelty_draws = DEFAULT_MUTATION_NOVELTY_DRAWS,
-        freeze_seats = false,
         crossover_cull_policy = String::from("unfed"),
         mutation_cull_policy = String::from("unfed"),
         crossover_selection = String::from("tournament"),
@@ -332,8 +291,6 @@ impl PyRaceConfig {
         checkpoint_every = DEFAULT_CHECKPOINT_EVERY,
         mutation_probation_steps = DEFAULT_PROBATION_STEPS,
         crossover_probation_steps = DEFAULT_PROBATION_STEPS,
-        seat_join_probation_steps = DEFAULT_PROBATION_STEPS,
-        seat_lifetime_steps = DEFAULT_PROBATION_STEPS,
         // search space
         hidden_dim_pool = None,
         hidden_dim_stride = DEFAULT_HIDDEN_DIM_STRIDE,
@@ -366,7 +323,6 @@ impl PyRaceConfig {
         max_steps: Option<usize>,
         eval_share: f32,
         smoothing_window: usize,
-        risk_aversion: f32,
         mean_type: String,
         train_merit: f32,
         train_merit_p_min: f32,
@@ -376,13 +332,8 @@ impl PyRaceConfig {
         drift_prob: f32,
         champion_previous_load: bool,
         log_level: String,
-        crossover_rolls: usize,
-        mutate_rolls: usize,
-        crossover_prob: f32,
-        mutate_prob: f32,
         mutation_novelty_min: f32,
         mutation_novelty_draws: usize,
-        freeze_seats: bool,
         crossover_cull_policy: String,
         mutation_cull_policy: String,
         crossover_selection: String,
@@ -391,8 +342,6 @@ impl PyRaceConfig {
         checkpoint_every: usize,
         mutation_probation_steps: usize,
         crossover_probation_steps: usize,
-        seat_join_probation_steps: usize,
-        seat_lifetime_steps: usize,
         hidden_dim_pool: Option<(usize, usize)>,
         hidden_dim_stride: usize,
         hidden_nodes_pool: Option<(usize, usize)>,
@@ -419,7 +368,6 @@ impl PyRaceConfig {
             max_steps,
             eval_share,
             smoothing_window,
-            risk_aversion,
             mean_type,
             train_merit,
             train_merit_p_min,
@@ -433,13 +381,8 @@ impl PyRaceConfig {
             // `summ` matches every Rust example's default: a race reports one
             // line per step instead of running silently.
             log_level,
-            crossover_rolls,
-            mutate_rolls,
-            crossover_prob,
-            mutate_prob,
             mutation_novelty_min,
             mutation_novelty_draws,
-            freeze_seats,
             crossover_cull_policy,
             mutation_cull_policy,
             crossover_selection,
@@ -448,8 +391,6 @@ impl PyRaceConfig {
             checkpoint_every,
             mutation_probation_steps,
             crossover_probation_steps,
-            seat_join_probation_steps,
-            seat_lifetime_steps,
             hidden_dim_pool,
             hidden_dim_stride,
             hidden_nodes_pool,
@@ -477,12 +418,11 @@ impl PyRaceConfig {
     fn __repr__(&self) -> String {
         format!(
             "RaceConfig(pop_size={}, champion_count={}, max_steps={:?}, smoothing_window={}, \
-             risk_aversion={}, champion_previous_load={}, log_level={:?})",
+             champion_previous_load={}, log_level={:?})",
             self.pop_size,
             self.champion_count,
             self.max_steps,
             self.smoothing_window,
-            self.risk_aversion,
             self.champion_previous_load,
             self.log_level
         )
@@ -500,33 +440,6 @@ impl PyRaceConfig {
     #[setter(elite_count)]
     fn set_elite_count_legacy(&mut self, value: usize) {
         self.champion_count = value;
-    }
-    /// Deprecated: use `freeze_seats`.
-    #[getter(freeze_elites)]
-    fn get_freeze_elites_legacy(&self) -> bool {
-        self.freeze_seats
-    }
-    #[setter(freeze_elites)]
-    fn set_freeze_elites_legacy(&mut self, value: bool) {
-        self.freeze_seats = value;
-    }
-    /// Deprecated: use `seat_join_probation_steps`.
-    #[getter(elite_join_probation_steps)]
-    fn get_elite_join_probation_steps_legacy(&self) -> usize {
-        self.seat_join_probation_steps
-    }
-    #[setter(elite_join_probation_steps)]
-    fn set_elite_join_probation_steps_legacy(&mut self, value: usize) {
-        self.seat_join_probation_steps = value;
-    }
-    /// Deprecated: use `seat_lifetime_steps`.
-    #[getter(elite_crown_lifetime_steps)]
-    fn get_elite_crown_lifetime_steps_legacy(&self) -> usize {
-        self.seat_lifetime_steps
-    }
-    #[setter(elite_crown_lifetime_steps)]
-    fn set_elite_crown_lifetime_steps_legacy(&mut self, value: usize) {
-        self.seat_lifetime_steps = value;
     }
     /// Deprecated: use `champion_save_topology`.
     #[getter(elite_save_topology)]
@@ -587,12 +500,11 @@ fn parse_crossover_cull(name: &str) -> Option<CrossCullPolicy> {
     }
 }
 
-/// `lowest_fitness` | `inverse_fitness` | `random` | `highest_ticket_chance` |
+/// `lowest_fitness` | `random` | `highest_ticket_chance` |
 /// `lowest_fitness_most_updates`, plus the legacy `worst` / `unfed` / `spent`.
 fn parse_mutation_cull(name: &str) -> Option<MutationCullPolicy> {
     match name {
         "lowest_fitness" | "worst" => Some(MutationCullPolicy::LowestFitness),
-        "inverse_fitness" => Some(MutationCullPolicy::InverseFitness),
         "random" => Some(MutationCullPolicy::Random),
         "highest_ticket_chance" | "unfed" => Some(MutationCullPolicy::HighestTicketChance),
         "lowest_fitness_most_updates" | "spent" => {
@@ -625,7 +537,7 @@ impl PyRaceConfig {
         let mutation_cull_policy =
             parse_mutation_cull(&self.mutation_cull_policy).ok_or_else(|| {
                 PyValueError::new_err(format!(
-                    "mutation_cull_policy {:?}: expected one of lowest_fitness, inverse_fitness, random, highest_ticket_chance, lowest_fitness_most_updates",
+                    "mutation_cull_policy {:?}: expected one of lowest_fitness, random, highest_ticket_chance, lowest_fitness_most_updates",
                     self.mutation_cull_policy
                 ))
             })?;
@@ -693,7 +605,6 @@ impl PyRaceConfig {
         }
         cfg.eval_share = self.eval_share;
         cfg.smoothing_window = self.smoothing_window;
-        cfg.risk_aversion = self.risk_aversion;
         cfg.mean_type =
             gras::engine::config::MeanType::parse(&self.mean_type).ok_or_else(|| {
                 PyValueError::new_err(format!(
@@ -721,12 +632,12 @@ impl PyRaceConfig {
         // The LEGS are the rest of the band's arithmetic, so a surface that can set the ends but
         // not the legs still cannot reproduce a run's chances. One spelling names both sides and
         // a resume compares it by name.
-        cfg.ticket_legs =
-            gras::engine::config::TicketLegs::parse(&self.ticket_legs).ok_or_else(|| {
+        cfg.train_ticket =
+            gras::engine::config::TrainTicket::parse(&self.ticket_legs).ok_or_else(|| {
                 PyValueError::new_err(format!(
                     "ticket_legs {:?}: expected one of {}",
                     self.ticket_legs,
-                    gras::engine::config::TicketLegs::ALL_NAMES.join(", ")
+                    gras::engine::config::TrainTicket::ALL_NAMES.join(", ")
                 ))
             })?;
         cfg.init_probation_steps = self.init_probation_steps;
@@ -739,10 +650,6 @@ impl PyRaceConfig {
         };
         cfg.champion_previous_load = self.champion_previous_load;
         cfg.log_level = log_level;
-        cfg.crossover_rolls = self.crossover_rolls;
-        cfg.mutate_rolls = self.mutate_rolls;
-        cfg.crossover_prob = self.crossover_prob;
-        cfg.mutate_prob = self.mutate_prob;
         // The gate's two numbers take the same bounds the crate's setters enforce, so a typed
         // slip reads as "off" / "one draw" in both languages instead of a mid-race surprise.
         cfg.mutation_novelty_min = if self.mutation_novelty_min.is_finite() {
@@ -751,7 +658,6 @@ impl PyRaceConfig {
             0.0
         };
         cfg.mutation_novelty_draws = self.mutation_novelty_draws.max(1);
-        cfg.freeze_seats = self.freeze_seats;
         cfg.crossover_cull_policy = crossover_cull_policy;
         cfg.mutation_cull_policy = mutation_cull_policy;
         cfg.crossover_selection = crossover_selection;
@@ -759,8 +665,6 @@ impl PyRaceConfig {
         cfg.checkpoint_every = self.checkpoint_every;
         cfg.mutation_probation_steps = self.mutation_probation_steps;
         cfg.crossover_probation_steps = self.crossover_probation_steps;
-        cfg.seat_join_probation_steps = self.seat_join_probation_steps;
-        cfg.seat_lifetime_steps = self.seat_lifetime_steps;
         cfg.recovery_retries = self.recovery_retries;
         cfg.recovery_tolerance = if self.recovery_tolerance.is_finite() {
             self.recovery_tolerance.max(0.0)
