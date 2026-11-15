@@ -85,11 +85,11 @@ fn main() {
         // `0` = durability tick OFF (no per-tick frontier/snapshot writes to skew the
         // heap profile); the stop-time writers still run once at the end.
         .set_run_checkpoint_every(0);
-    if evolve {
-        builder = builder.set_crossover_rolls(1).set_mutate_rolls(1);
-    } else {
-        builder = builder.set_crossover_rolls(0).set_mutate_rolls(0);
-    }
+    // TURNOVER: a small share when the bench evolves, off otherwise.
+    let turnover = if evolve { 0.01 } else { 0.0 };
+    builder = builder
+        .set_crossover_share(turnover)
+        .set_mutation_share(turnover);
     let config = builder.set_run_csv_export(false).build();
 
     let _ = std::fs::remove_dir_all(&run_dir);
