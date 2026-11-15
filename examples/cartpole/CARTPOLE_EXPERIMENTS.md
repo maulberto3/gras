@@ -63,8 +63,8 @@ the random baseline):
   best-so-far skill survives its own training steps AND its fitness stays
   honest (fresh trajectories, real standing);
 - **regression demotion** (REMOVED 2026-09-25, was `--regression-tol 0.7`)
-  — culling via the ordinary inverse-fitness roulette (where a collapsed
-  fitness up-weights naturally) is the single regression story, and a
+  — culling via the ordinary victim policies (a collapsed fitness ranks worst,
+  so the net is evicted on merit) is the single regression story, and a
   dethroned champion resumes with its last optimizer state, giving its
   reclaim attempt an intact trend (see TODO.md's anti-devolution entries);
 

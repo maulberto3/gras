@@ -99,7 +99,14 @@ mod tests {
     #[test]
     fn trainer_wiring_is_recorded_in_the_blob() {
         // Memoryless: the knob is `--obs-memory`, and `none` is the engine as it was.
-        let t = trainer(gras::auto_device(), ObsMemory::None, true);
+        let t = trainer(
+            gras::auto_device(),
+            ObsMemory::None,
+            true,
+            SIGNAL,
+            (ActionRule::Argmax, ACTING_TEMPERATURE),
+            ActionRule::Argmax,
+        );
         let blob = t.describe().expect("Reinforce describes itself");
         assert_eq!(blob["trainer"], "reinforce");
         // `Signal` is a tagged enum, so the name lives one level down.
@@ -112,9 +119,16 @@ mod tests {
         // means a frozen policy rather than a replayed exam.
         assert_eq!(blob["exam"], "per_clock");
         // ...and the flag is the only way to ask for the era exam back.
-        let era = trainer(gras::auto_device(), ObsMemory::None, false)
-            .describe()
-            .expect("Reinforce describes itself");
+        let era = trainer(
+            gras::auto_device(),
+            ObsMemory::None,
+            false,
+            SIGNAL,
+            (ActionRule::Argmax, ACTING_TEMPERATURE),
+            ActionRule::Argmax,
+        )
+        .describe()
+        .expect("Reinforce describes itself");
         assert_eq!(era["exam"], "era");
         assert_eq!(blob["learning_rate"], LEARNING_RATE);
         assert_eq!(blob["grad_clip"], GRAD_CLIP);
@@ -168,23 +182,21 @@ mod tests {
         }
     }
 
-    /// The exam-axis flag: bare `--per-clock-exam` is ON, `false` asks for the era exam,
-    /// and omitting it leaves `main`'s `unwrap_or(true)` in charge.
+    /// The exam-axis flag: ON by default, bare `--per-clock-exam` is ON, `false` asks for the
+    /// era exam — the CLI carries the value itself, so `main` has nothing to unwrap.
     #[test]
     fn per_clock_exam_flag_parses_both_ways() {
         let parse = |args: &[&str]| <Cli as clap::Parser>::parse_from(args).per_clock_exam;
-        assert_eq!(
+        assert!(
             parse(&["cartpole"]),
-            None,
-            "no flag ⇒ the example's default"
+            "no flag ⇒ the flag's own default (the per-clock exam)"
         );
-        assert_eq!(parse(&["cartpole", "--per-clock-exam"]), Some(true));
-        assert_eq!(
-            parse(&["cartpole", "--per-clock-exam", "false"]),
-            Some(false),
+        assert!(parse(&["cartpole", "--per-clock-exam"]));
+        assert!(
+            !parse(&["cartpole", "--per-clock-exam", "false"]),
             "the era exam is opt-in"
         );
-        assert_eq!(parse(&["cartpole", "--per-clock-exam", "true"]), Some(true));
+        assert!(parse(&["cartpole", "--per-clock-exam", "true"]));
     }
 
     /// The challenge forced-action draw is a pure fn of (net_seed, step): replay
@@ -209,20 +221,5 @@ mod tests {
         // The draw actually varies — it is not accidentally constant.
         let draws: std::collections::HashSet<usize> = (0..16).map(|step| draw(42, step)).collect();
         assert_eq!(draws.len(), 2, "draw must hit both actions over 16 steps");
-    }
-
-    /// The λ flag: both spellings write the same field, and omitting it leaves
-    /// `main`'s `RISK_AVERSION` const in charge (`unwrap_or`, never a default here).
-    #[test]
-    fn risk_aversion_flag_parses_under_both_names() {
-        let parse = |args: &[&str]| <Cli as clap::Parser>::parse_from(args).risk_aversion;
-        assert_eq!(parse(&["cartpole"]), None, "no flag ⇒ the const decides");
-        assert_eq!(parse(&["cartpole", "--risk-aversion", "0.5"]), Some(0.5));
-        assert_eq!(
-            parse(&["cartpole", "--risk-based", "0.5"]),
-            Some(0.5),
-            "the alias must land on the same field"
-        );
-        assert_eq!(parse(&["cartpole", "--risk-aversion", "0"]), Some(0.0));
     }
 }
