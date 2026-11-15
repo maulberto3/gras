@@ -232,8 +232,12 @@ impl<'a> LineageTree<'a> {
         // ── Contrast: every box is LIGHT, every label states its own near-black ink ──
         // diagram shipped twice before with a readable-on-paper palette that a real viewer
         let mut out = String::from("```mermaid\n");
+        // Front matter, not an `%%{init}%%` directive: Mermaid 12 defaults to the ELK layout, whose
+        // wires are rounded right angles, and directives are ignored at the default
+        // `securityLevel: "strict"`. Front matter always beats the viewer's `initialize()`, so
+        // `layout: dagre` is the key that lets `curve: basis` actually draw smooth wires.
         out.push_str(
-            "%%{init: {\"theme\": \"base\", \"flowchart\": {\"htmlLabels\": true, \"curve\": \"basis\"}, \"themeVariables\": {\"background\": \"#ffffff\", \"primaryColor\": \"#e6f1fb\", \"primaryTextColor\": \"#0d2538\", \"primaryBorderColor\": \"#2f6fa8\", \"lineColor\": \"#3d6b96\", \"textColor\": \"#0d2538\", \"edgeLabelBackground\": \"#ffffff\", \"fontSize\": \"14px\"}}}%%\n",
+            "---\nconfig:\n  layout: dagre\n  theme: base\n  themeVariables:\n    background: \"#ffffff\"\n    primaryColor: \"#e6f1fb\"\n    primaryTextColor: \"#0d2538\"\n    primaryBorderColor: \"#2f6fa8\"\n    lineColor: \"#3d6b96\"\n    textColor: \"#0d2538\"\n    edgeLabelBackground: \"#ffffff\"\n    fontSize: \"14px\"\n  flowchart:\n    htmlLabels: true\n    curve: basis\n---\n",
         );
         out.push_str("graph TB\n");
         // Classes first, so a viewer that only reads classes never sees an unstyled box.

@@ -411,16 +411,34 @@ mod tests {
     use crate::graph::node::Node;
     use crate::graph::topology::{Connection, Port, TopologyOptions};
 
-    /// The topology graph curves its wires like the lineage graph does. Without the init
-    /// directive every viewer picks its own default, and the two diagrams in one card disagreed
-    /// (the lineage's smooth `Δfit` wires above a square-folded topology).
+    /// The topology graph curves its wires like the lineage graph does. Without a config block
+    /// every viewer picks its own default, and the two diagrams in one card disagreed (the
+    /// lineage's smooth `Δfit` wires above a square-folded topology).
     #[test]
     fn the_topology_mermaid_curves_its_wires_like_the_lineage_graph() {
         let m = super::topology_mermaid(&sample());
-        assert!(m.contains("\"curve\": \"basis\""), "{m}");
+        // FRONT MATTER, not an `%%{init}%%` directive: directives are deprecated since 10.5 and are
+        // ignored at the default `securityLevel: "strict"`, so a pinned renderer written as a
+        // directive was silently dropped by real viewers.
+        assert!(m.starts_with("```mermaid\n---\nconfig:\n"), "{m}");
+        // …and the LAYOUT is named, not inherited: Mermaid 12 defaults to ELK, whose wires are
+        // right-angle segments, and `curve` can only round their corners.
         assert!(
-            m.contains("\nflowchart LR\n"),
-            "the init block only applies under the `flowchart` keyword: {m}"
+            m.contains("\n  layout: dagre\n"),
+            "the layout is pinned: {m}"
+        );
+        assert!(m.contains("\n    curve: basis\n"), "{m}");
+        // The block has to close BEFORE the diagram keyword, or `---` is parsed as diagram text.
+        let config = m.find("  layout: dagre").expect("config present");
+        let diagram = m.find("flowchart LR").expect("diagram keyword present");
+        assert!(
+            config < diagram,
+            "front matter must precede the diagram: {m}"
+        );
+        assert!(m.contains("---\nflowchart LR\n"), "{m}");
+        assert!(
+            !m.contains("%%{init"),
+            "directives are deprecated, and ignored at strict: {m}"
         );
         assert!(!m.contains("graph LR"), "the legacy keyword is gone: {m}");
     }

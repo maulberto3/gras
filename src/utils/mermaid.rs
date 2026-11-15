@@ -40,11 +40,18 @@ pub(crate) fn feature_split_cell(graph: &Topology) -> Option<String> {
 pub fn topology_mermaid(graph: &Topology) -> String {
     let mut out = String::new();
     out.push_str("```mermaid\n");
-    // The SAME curve the lineage graph asks for (`lineage.rs`): without an explicit directive every
-    // viewer picks its own default, so one card showed the smooth `Δfit` wires of the birth graph
-    // above a square-folded topology. `basis` is Mermaid's smooth interpolation, and the
-    // `flowchart` keyword is what makes an `init` block apply to the graph at all.
-    out.push_str("%%{init: {\"flowchart\": {\"curve\": \"basis\"}}}%%\n");
+    // The SAME curve the lineage graph asks for (`lineage.rs`): without an explicit config every
+    // viewer picks its own, so one card showed the smooth `Δfit` wires of the birth graph above a
+    // square-folded topology.
+    //
+    // This is FRONT MATTER, not an `%%{init}%%` directive, and both halves matter:
+    // - Mermaid 12 (2026-09) made ELK the bundled default layout engine, and ELK routes every wire
+    //   as right-angle segments with rounded corners — the `curve` setting can only round those
+    //   bends, so a diagram that never names its layout renders square no matter what it asks for.
+    // - Directives are deprecated since 10.5 and are ignored at the default `securityLevel:
+    //   \"strict\"`, which is what most viewers run. Front matter config always wins over the
+    //   viewer's `initialize()`, so naming `layout: dagre` is what keeps `curve: basis` load-bearing.
+    out.push_str("---\nconfig:\n  layout: dagre\n  flowchart:\n    curve: basis\n---\n");
     out.push_str("flowchart LR\n");
     // Per-net hidden-dim range for edge-thickness normalization (min/max
     // interpolate, same spirit as the planned ASCII box sizing).
