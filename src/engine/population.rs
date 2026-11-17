@@ -80,9 +80,7 @@ pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
 
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(topos.len());
-    // The re-roll cursor lives PAST the batch and only moves FORWARD: a collision can never
-    // re-try an ordinal an earlier collision already spent (the old fixed `pop_size + attempt`
-    // window was consumed by the first few duplicates and every later one was doomed).
+    // The re-roll cursor lives PAST the batch and only moves FORWARD: a collision can never re-try an ordinal an earlier collision already spent (the old fixed `pop_size +…
     let mut cursor = pop_size + 64;
     for topo in topos.drain(..) {
         let hash = match topo.to_json() {
@@ -156,10 +154,7 @@ pub fn fill_unique(
         }
     }
     let imported = out.len();
-    // The random batch starts PAST the imported ordinals. An inherited batch's imports ARE
-    // ordinals 0..n of this run's own draw (a source run's rank-1..n blueprints, same run seed),
-    // so drawing them again is a guaranteed duplicate on every inherited run — the root cause of
-    // the per-event "duplicates a founder" cards.
+    // The random batch starts PAST the imported ordinals.
     let mut ordinal = imported;
     let mut duplicate_draws = 0usize;
     // Generous but BOUNDED: a run that collides this often is a space smaller than its batch.
@@ -180,9 +175,7 @@ pub fn fill_unique(
             duplicate_draws += 1;
         }
     }
-    // Still short ⇒ the topology space is smaller than the batch. Keep the colliding blueprints so
-    // every slot exists, and let the summary say exactly that (the engine dedupes them, so the run
-    // starts short by the count printed).
+    // Still short ⇒ the topology space is smaller than the batch.
     let mut kept_duplicates = 0usize;
     while out.len() < target {
         let candidate = draw_topology(config, run_seed, ordinal);
@@ -310,10 +303,7 @@ mod tests {
         );
     }
 
-    /// A source run's rank-1..n blueprints ARE ordinals 0..n of the same run seed, so an inherited
-    /// batch must start its random draws PAST them: no draw collides, the batch is full and unique,
-    /// and the imports keep their slots (this is the shared-seed case that produced the old
-    /// per-event duplicate cards and the short population).
+    /// A source run's rank-1..n blueprints ARE ordinals 0..n of the same run seed, so an inherited batch must start its random draws PAST them: no draw collides, the batch is…
     #[test]
     fn an_inherited_batch_draws_past_the_imported_ordinals() {
         let cfg = tiny_config(8);

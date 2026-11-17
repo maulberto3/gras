@@ -44,15 +44,7 @@ pub(crate) struct RandomDraw {
     pub(crate) draws: usize,
 }
 
-/// How many rolls a SHARE-driven channel deals: `round(share · pop)`, the SAME count every clock —
-/// deterministic, no carry, nothing to persist.
-///
-/// `0.1` at pop 100 deals 10 rolls per clock; at pop 15 it deals 2 (`round(1.5)`). A live knob never
-/// deals ZERO: a share that would round below one roll still deals one, so `0.01` at pop 10 evolves
-/// instead of freezing the way `pop / 20` does. `0.0` is the only way to switch a channel off (it
-/// hands the channel back to its fixed rolls).
-///
-/// Floating-point rounding only, so the deal is identical on every platform and in every build.
+/// How many rolls a SHARE-driven channel deals: `round(share · pop)`, the SAME count every clock — deterministic, no carry, nothing to persist.  `0.1` at pop 100 deals 10…
 pub(crate) fn share_rolls(share: f32, pop: usize) -> usize {
     if !share.is_finite() || share <= 0.0 || pop == 0 {
         return 0;
@@ -182,10 +174,7 @@ impl CoreEngine {
     /// Insert a newborn child into the live maps (state, network, optimizer; its rolling
     /// buffer was pre-inserted and is NOT reset).
     fn insert_child(&mut self, child: RaceChild, _clock: usize, _group: &str) {
-        // NO per-event log here: inserts are reported on the calling roll's
-        // single line — one roll, one line.
-        // Every birth lands in the novelty archive — crossover children too, so a mutation
-        // cannot re-invent what recombination already made.
+        // NO per-event log here: inserts are reported on the calling roll's single line — one roll, one line.
         if let Ok(topo) = child.state.topology() {
             self.novelty.push(&topo);
         }
@@ -368,12 +357,7 @@ impl CoreEngine {
         }
     }
 
-    /// Append one evolution-event row to the `attempts.csv` buffer: every attempt
-    /// is recorded (inserted or rejected), so the failed-draw rate stays queryable.
-    ///
-    /// `gate` is the novelty reading for a row that has one — `(Δ to the nearest archived
-    /// blueprint, candidates spent)` — and `None` everywhere else, because a crossover child is
-    /// never judged and the reading only exists at birth, not per clock.
+    /// Append one evolution-event row to the `attempts.csv` buffer: every attempt is recorded (inserted or rejected), so the failed-draw rate stays queryable.  `gate` is the…
     #[allow(clippy::too_many_arguments)] // one row of the attempt ledger — fields, not logic
     pub(crate) fn record_attempt(
         &mut self,
@@ -388,9 +372,7 @@ impl CoreEngine {
         victim: Option<&str>,
         victim_net_seed: Option<usize>,
         gate: Option<(f32, usize)>,
-        // The culled net's score AT CULL TIME (`smoothed_fitness_of` — the risk-adjusted number
-        // the ranking reads, the same one `final-field.csv` prints), `None` when it had no reading
-        // yet. Read by the CALLER before the cull, which is the last moment the net exists.
+        // The culled net's score AT CULL TIME (`smoothed_fitness_of` — the risk-adjusted number the ranking reads, the same one `final-field.csv` prints), `None` when it had no…
         victim_fitness: Option<f32>,
     ) {
         if !self.config.csv_export {
@@ -412,10 +394,7 @@ impl CoreEngine {
             victim_net_seed.map(|s| s.to_string()).unwrap_or_default(),
             self.state.live_count(),
         );
-        // The gate's reading, appended LAST so every existing column keeps its position: the Δ to
-        // the NEAREST archived blueprint, the candidates this draw spent, and the floor it was
-        // judged against. A Δ BELOW the floor says the cap ran out and the most novel refusal was
-        // taken anyway; blank cells say the row was never judged (crossover, or the gate off).
+        // The gate's reading, appended LAST so every existing column keeps its position: the Δ to the NEAREST archived blueprint, the candidates this draw spent, and the floor it…
         match gate {
             Some((delta, draws)) => {
                 row.push_str(&format!(",{delta},{draws},{}", self.novelty.min()))
@@ -524,9 +503,7 @@ impl CoreEngine {
             .find(|h| off_probation(h))
     }
 
-    /// One mutation roll: cull a net per `MutationCullPolicy` (worst, random, lottery arms,
-    /// lowest-fitness-most-updates) and insert a fully-random immigrant, fresh from the current
-    /// clock.
+    /// One mutation roll: cull a net per `MutationCullPolicy` (worst, random, lottery arms, lowest-fitness-most-updates) and insert a fully-random immigrant, fresh from the…
     pub(crate) fn evolve_random_immigrant(
         &mut self,
         clock: usize,
@@ -541,9 +518,7 @@ impl CoreEngine {
         let Some(victim) = self.select_mutation_victim(clock, roll)? else {
             return Ok(None);
         };
-        // Identity and score are read BEFORE the cull: `cull_net` drops the net from every live map
-        // (its rolling window included), so both are gone afterwards — which is why mutation rows
-        // used to leave `victim_net_seed` blank.
+        // Identity and score are read BEFORE the cull: `cull_net` drops the net from every live map (its rolling window included), so both are gone afterwards — which is why…
         let victim_net_seed = self.state.net(&victim).map(|s| s.net_seed);
         let victim_fitness = self.smoothed_fitness_of(&victim);
         // The population the victim was the worst OF — read before the cull shrinks it, exactly as
@@ -569,9 +544,7 @@ impl CoreEngine {
         // verdict yet"; its first optimizer update is the next group step.
         child.state.step = 0;
         child.state.last_metrics = None;
-        // The same shape the crossover line prints — `culled <hash> (F <score>, <why this net>)` —
-        // so a reader can weigh what the field GAVE UP for an immigrant. `F —` is honest: a newborn
-        // victim that never got a reading has no score to report, and the note still says the policy.
+        // The same shape the crossover line prints — `culled <hash> (F <score>, <why this net>)` — so a reader can weigh what the field GAVE UP for an immigrant. `F —` is honest…
         let victim_note = match self.config.mutation_cull_policy {
             crate::engine::config::MutationCullPolicy::LowestFitness => {
                 format!("lowest score of {live_before}")
@@ -626,11 +599,7 @@ impl CoreEngine {
         let smoothed_std = reading.map(|r| r.std);
         let risk_score = self.smoothed_fitness_of(hash);
         let samples = reading.map(|r| r.n).unwrap_or(0);
-        // The run's accounting tallies culls by the slot freed — the one funnel
-        // every cull passes through. The reason carries the POLICY that picked the
-        // victim (`crossover-random`, `crossover-unfed`, …), so the slot is matched
-        // by prefix: an exact-spelling match here leaves those culls in the total
-        // and out of both slot rows, and the stop table stops adding up.
+        // The run's accounting tallies culls by the slot freed — the one funnel every cull passes through.
         self.accounting.culls += 1;
         match reason {
             r if r.starts_with("crossover") => self.accounting.culls_crossover += 1,
@@ -674,23 +643,12 @@ impl CoreEngine {
         share_rolls(share, self.state.live_count())
     }
 
-    /// Whether this clock may EVOLVE at all: the run's INIT PROBATION has passed (`clock >=
-    /// init_probation_steps`) AND somebody is cull-eligible. Clock 0 never evolves, so the
-    /// probation reads as "the opening clocks with no culls and no births", and `0` (the default)
-    /// withholds nothing beyond the born shields — the pre-knob behaviour, bit for bit.
+    /// Whether this clock may EVOLVE at all: the run's INIT PROBATION has passed (`clock >= init_probation_steps`) AND somebody is cull-eligible.
     pub(crate) fn evolution_allowed(&self, clock: usize) -> bool {
         clock >= self.config.init_probation_steps && self.has_cull_eligible()
     }
 
-    /// Whether `hash` is still under its **cull shield** — what the log calls `cull shield` (NOT
-    /// the cull shield, which is the born/probation window): cull-IMMUNE until the net has spent
-    /// `k` UPDATES (`U`, real optimizer steps), `k` being its channel's window.
-    ///
-    /// Counted in UPDATES, not clocks: the shield exists to buy a newcomer enough TRAINING to be
-    /// judged, so a net nobody fed keeps it (waiting is not evidence) and one that trains hard — a
-    /// recovery streak — serves it inside a single clock. `U` is the same counter the lottery's `Um`
-    /// leg and the stop card's `updates (U)` column read, so the shield lifts on exactly the number
-    /// printed beside it.
+    /// Whether `hash` is still under its **cull shield** — what the log calls `cull shield` (NOT the cull shield, which is the born/probation window): cull-IMMUNE until the net…
     pub(crate) fn on_probation(&self, hash: &str) -> bool {
         let Some(state) = self.state.net(hash) else {
             return false;
@@ -703,19 +661,12 @@ impl CoreEngine {
         window > 0 && state.step < window
     }
 
-    /// The **Unfed** victim, shared by both channels' `Unfed` arm: the net with the HIGHEST ticket
-    /// chance `p` this clock — deterministic, taken from the coin's own number, so it is the least
-    /// fit AND most spent net whenever the setters arm it that way (worst-first `Fm⁻` × `Um`).
-    /// Excluded: every net the lottery does not grade (born shield, no reading, flat field).
-    /// `None` when that leaves nobody — the roll is spent, nothing culled.
+    /// The **Unfed** victim, shared by both channels' `Unfed` arm: the net with the HIGHEST ticket chance `p` this clock — deterministic, taken from the coin's own number, so…
     pub(crate) fn select_highest_ticket_chance_victim(&self) -> Result<Option<String>> {
         let Some(frame) = self.lottery_frame() else {
             return self.select_lowest_fitness_victim();
         };
-        // THE HIGHEST TICKET CHANCE GOES: the victim is the net the coin is about to pay the most,
-        // read off the SAME `p = p_min + (p_max − p_min) × f` the step draws against. No draw, no
-        // second score, hash tie-break — so "least fit, most spent" is evicted exactly when the
-        // setters say so (worst-first plus `Um`), and the cull can never disagree with the coin.
+        // THE HIGHEST TICKET CHANCE GOES: the victim is the net the coin is about to pay the most, read off the SAME `p = p_min + (p_max − p_min) × f` the step draws against.
         let mut worst: Option<(String, f32)> = None;
         for h in self.state.live_hashes() {
             let merit = self.merit(&h);
@@ -741,14 +692,7 @@ impl CoreEngine {
         }
     }
 
-    /// The **LowestFitnessMostUpdates** victim, shared by both channels' arm of that name: the net
-    /// with the HIGHEST `Fm⁻ × (1 − Um)` — lowest-fitness AND most spent, so the evidence picks the
-    /// slot instead of the coin's next draw. UNLIKE `highest_ticket_chance`, the tilt does not move
-    /// it: that arm reads the coin's `p` (so best-first sends it after the BEST net), while this one
-    /// keeps the lowest-fitness-first place. A weak net with `U = 1` has not had its chance; a weak
-    /// net with `U = 18` has, and `highest_ticket_chance` would keep paying it. Excluded: every
-    /// net the lottery does not grade (born shield, no reading, flat field). `None` when that
-    /// leaves nobody — the roll is spent, nothing culled.
+    /// The **LowestFitnessMostUpdates** victim, shared by both channels' arm of that name: the net with the HIGHEST `Fm⁻ × (1 − Um)` — lowest-fitness AND most spent, so the…
     pub(crate) fn select_lowest_fitness_most_updates_victim(&self) -> Result<Option<String>> {
         let Some(frame) = self.lottery_frame() else {
             return self.select_lowest_fitness_victim();

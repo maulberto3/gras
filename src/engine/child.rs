@@ -614,9 +614,7 @@ impl CoreEngine {
         let roll_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx);
         let mut rng = fastrand::Rng::with_seed(roll_seed);
 
-        // Every dealt roll IS a crossover attempt: the channel's turnover decided how many rolls
-        // this clock, so there is no probability left to draw. A failed pairing is a SPENT roll (no
-        // random fallback) and random whole nets enter only via mutation.
+        // Every dealt roll IS a crossover attempt: the channel's turnover decided how many rolls this clock, so there is no probability left to draw.
         match self.evolved_child(clock, child_idx, &mut rng) {
             // Crossover produced nothing viable: the roll does NOTHING (no random
             // fallback). NO log here — the caller logs one line per roll.

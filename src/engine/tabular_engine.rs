@@ -1,49 +1,4 @@
 //! Tabular engine — the dataset-driven race constructor + resume.
-//!
-//! One of the 2026-09-24 engine-split slices (TODO.md) out of what
-//! single `race_engine.rs` monolith. This file holds the TABULAR-specific
-//! constructors (`resume`); the tabular arm of `new` is built on the shared
-//! core. Everything else — the struct, the step loop, evolution, artifacts —
-//! lives in [`crate::engine::core::CoreEngine`] and is shared with the RL
-//! engine.
-//!
-//! ## Resume semantics — what must match vs what's yours to change
-//! Every live net is LOADED from `nets/<hash>.safetensors` at the step the frontier
-//! manifest names (R4/R5; the replay path is gone), with `nets/<hash>.optim` restored
-//! when `save_optim` recorded it, and with the trainer's own per-net bookkeeping
-//! (`nets/<hash>.json` → `trainer_state`, R9) handed back to `TabularStep::restore`
-//! before the first continued step.
-//!
-//! **Refused** — what cannot be rebuilt at all: `pop_size` (checked against the live
-//! frontier), the trainer scheme (loss, update recipe, `stream_shape()` batch sizes),
-//! the fitness function, the dataset at `data_dir`, the metric set, dims,
-//! `run_seed` / `train_eval_split_ratio` / eval-row counts, which come
-//! persisted header rather than your config.
-//!
-//! **Warned, not refused (R6)** — everything BEHAVIOURAL, i.e. it changes the draws
-//! from here on without making the record untrue: K, Ω, the parent draw, both cull
-//! policies, the probation windows. `CoreEngine::behavioural_drift()`
-//! names each one with both values and the setter that reproduces the record.
-//!
-//! **Yours freely** (surface only): the stop criterion (the `max_steps` budget
-//! **absolute**, not per-process: interrupt at 17 with `max_steps: 20` and the resumed
-//! run does 3 more steps), `log_level`, and `checkpoint_every` (the recorded eval era
-//! still governs the stream — R3b).
-//!
-//! Also: `step_clock()` reads the max step across live nets, so a trailing
-//! crossover child can never repeat an iteration; replayed nets' rolling buffers
-//! are seeded by replay, and the checkpoint ledger is reloaded so the history
-//! the SAME. Tabular resume is bit-identical because
-//! trainer randomness is engine-seeded — in RL only the env's own internal draws
-//! (the Python-side seeding contract) can drift; engine-side rolls always replay.
-//!
-//! Recorded schema (identical for tabular and RL): run-level settings
-//! `engine.json`'s `config`, per-net facts in `nets/<hash>.json`,
-//! trainer-owned facts (LR, grad clip, loss/update scheme) only in `engine.json`
-//! → `"trainer"`. Mode-owned absences are recorded as absences (`batch_size: null`
-//! for RL, not a tabular `16`). `MatchLength::draw` is a pure function
-//! `(run_seed, step, match_i)`, so no schedule cursor is stored — a stateful
-//! variant (a curriculum ladder) would need one, which is why it isn't in the enum.
 
 use super::config::RaceConfig;
 use super::core::{CoreEngine, CoreEngineParts, assert_trainer_blob_matches};

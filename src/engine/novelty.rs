@@ -1,7 +1,4 @@
 //! Novelty gate: a random immigrant must not copy a blueprint the run already had.
-//!
-//! The archive is append-only for the life of the run — founders, crossover children and
-//! immigrants — so a culled lineage still counts as "seen" when the next draw is judged.
 
 use std::path::Path;
 

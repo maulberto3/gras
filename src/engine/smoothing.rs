@@ -101,24 +101,13 @@ impl WindowStats {
         (self.n > 0).then(|| self.std / (self.n as f32).sqrt())
     }
 
-    /// The RANKING score in the window's chosen [`MeanType`] family: the family CENTRE, mapped
-    /// back into fitness units. `fam_spread` is printed beside it as a diagnostic, never charged:
-    /// the row carries both legs, so a reader can apply any `centre ∓ λ × spread` themselves.
+    /// The RANKING score in the window's chosen [`MeanType`] family: the family CENTRE, mapped back into fitness units. `fam_spread` is printed beside it as a diagnostic, never…
     pub fn score(&self) -> f32 {
         self.family.restore(self.fam_center)
     }
 }
 
-/// A net's WHOLE-RUN fitness trend as a least-squares line — one point per reading, no window.
-///
-/// `x` is the READING INDEX (`0, 1, 2, …`), not the clock: readings exist only on the clocks a net
-/// ran, so a clock axis would charge a starved net for the gaps between its readings and read slow
-/// improvement where there was simply missing data. The slope is therefore "fitness change per
-/// EVAL", which is the one quantity two nets measured a different number of times can share.
-///
-/// Not a ranking input: `F` stays the K-reading window's business. The trend is accumulated in
-/// O(1) memory per net from the same pushes the window gets, so it covers the whole run without a
-/// second store (and a resume rebuilds it by replaying `history.csv`, exactly like the window).
+/// A net's WHOLE-RUN fitness trend as a least-squares line — one point per reading, no window.  `x` is the READING INDEX (`0, 1, 2, …`), not the clock: readings exist only…
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ReadingTrend {
     n: usize,
@@ -164,9 +153,7 @@ impl ReadingTrend {
     }
 }
 
-/// What a replayed net takes from `history.csv`: the tail its smoothing window is rebuilt from, and
-/// the whole-run line over EVERY row (so a resumed twin's trend is the live run's, never a line over
-/// whichever `window` rows happened to survive the load).
+/// What a replayed net takes from `history.csv`: the tail its smoothing window is rebuilt from, and the whole-run line over EVERY row (so a resumed twin's trend is the live…
 #[derive(Default)]
 pub(crate) struct HistoryReplay {
     /// The last `window` rows, oldest → newest.
@@ -222,18 +209,12 @@ pub fn rolling_stats(buf: &RollingBuffer) -> Option<WindowStats> {
     rolling_stats_with(buf, MeanType::Arithmetic)
 }
 
-/// [`rolling_stats`] in `family`'s averaging space (`set_fitness_mean_type`): the centre and the spread
-/// are measured after the family's transform, so a spike cannot drag the level the way it drags the
-/// arithmetic mean.
+/// [`rolling_stats`] in `family`'s averaging space (`set_fitness_mean_type`): the centre and the spread are measured after the family's transform, so a spike cannot drag…
 pub fn rolling_stats_with(buf: &RollingBuffer, family: MeanType) -> Option<WindowStats> {
     rolling_stats_all(buf, family)
 }
 
-/// [`rolling_stats_with`] over the LAST `take` readings only — the POLICY-SCOPED window
-/// (`set_fitness_policy_scoped`): the readings taken on the weights the net holds right now, so
-/// no reading from another policy enters the statistics. `take`
-/// clamps to the buffer; `0` is `None` (nothing measured on this policy yet), and `1` is that
-/// value with zero spread, so one reading never claims a confidence nobody has.
+/// [`rolling_stats_with`] over the LAST `take` readings only — the POLICY-SCOPED window (`set_fitness_policy_scoped`): the readings taken on the weights the net holds right…
 pub fn rolling_stats_tail(
     buf: &RollingBuffer,
     take: usize,

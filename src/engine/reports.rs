@@ -1,7 +1,4 @@
 //! Run artifacts: the CHAMPION ranking and the anti-champion (worst) dumps.
-//!
-//! Two words, two jobs, no overlap: a CHAMPION is a net in the saved, inheritable top-k ranking;
-//! the GUARD is cull immunity for the same top-k while the run is still going.
 
 use super::core::CoreEngine;
 use super::format::{ReadingStyle, fmt_cfg, fmt_family_reading};
@@ -12,11 +9,7 @@ use flodl::tensor::Result;
 const WORST_PICK_NOTE: &str = "**Why this net.** The pick is the `spent` criterion the cross/mutation cull evicts on: `spent = Fm⁻ × (1 − Um⁻)` — how badly the net grades (`Fm⁻`: 0.99 = the field's worst, 0.01 = its best) times how much of its updates it has already spent (`1 − Um`: 0.01 at the field's least-updated net, 0.99 at its most). So a weak net the lottery has NOT paid yet ranks BELOW a weak net that trained and stayed weak — the net worth reading, and the reason this list is not just the bottom of `fit (F)`. The place is UN-TILTED: the fit side of `train_ticket` (worst-first / best-first) is undone as `1 − p` before the product, so that leg decides who the band PAYS and never which end counts as bad, while the `U` leg is read whether or not `train_ticket` arms it for tickets. A net the lottery cannot grade (shielded, unread, flat field, lottery off) prints `na` and falls to the tail of this index ordered by `fit (F)` — the pre-criterion dump.";
 
 impl CoreEngine {
-    /// Write the MACHINE-READABLE champion ranking — `champions.json`, best first,
-    /// k = `champion_count`. UNCONDITIONAL: an inheritance receipt, not a log line.
-    ///
-    /// A legacy `elites.json` with the same bytes is written beside it for one release, so a
-    /// reader built before the rename keeps working; the reader prefers `champions.json`.
+    /// Write the champion ranking (`champions.json`, best first).
     pub(crate) fn write_champion_index(&mut self) -> Result<()> {
         self.record_champions();
         // `fitness` stays the RANKING value (the key the next run and this file's readers already
@@ -34,18 +27,11 @@ impl CoreEngine {
                     "fitness": fitness,
                     "fitness_mean": reading.map(|r| r.mean),
                     "fitness_std": reading.map(|r| r.std),
-                    // The arithmetic pair keeps its keys (readers already key on them); the pair the
-                    // SCORE was charged from is APPENDED beside it, so a `median` / `signed_log`
-                    // run's JSON can redo its own `fitness` (the centre) without a second
-                    // implementation and without redefining a key that says `mean`.
+                    // The arithmetic pair keeps its keys (readers already key on them); the pair the SCORE was charged from is APPENDED beside it, so a `median` / `signed_log` run's JSON can…
                     "fitness_centre": reading.map(|r| r.fam_center),
                     "fitness_spread": reading.map(|r| r.fam_spread),
                     "fitness_samples": reading.map(|r| r.n),
-                    // The WHOLE-RUN line beside the window's numbers: `fitness_samples` counts the
-                    // K-reading window, `fitness_readings` every reading the net ever took, and
-                    // `fitness_slope` is that whole series' least-squares slope per READING (raw
-                    // fitness units — which sign means "improving" is `direction` in `engine.json`).
-                    // Both are report-only: no ranking, ticket or cull reads them.
+                    // The WHOLE-RUN line beside the window's numbers: `fitness_samples` counts the K-reading window, `fitness_readings` every reading the net ever took, and `fitness_slope` is…
                     "fitness_readings": trend.map(|t| t.len()),
                     "fitness_slope": trend.and_then(|t| t.slope()),
                     "mean_type": self.config.mean_type.to_string(),
@@ -56,9 +42,6 @@ impl CoreEngine {
             .collect();
         let path = self.run_dir.join("champions.json");
         let body = serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
-        // The legacy name, same bytes, one release. Writing it here (not in a second card) keeps
-        // the two files from ever disagreeing.
-        let _ = std::fs::write(self.run_dir.join("elites.json"), &body);
         if let Err(source) = std::fs::write(&path, body) {
             tracing::warn!(
                 "champion index write failed: {}",
@@ -80,9 +63,7 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Write the top-k champions' topology markdown, one file per champion
-    /// (`champion-<hash>-<fitness>.md`, the suffix being the risk-adjusted score the file ranked
-    /// by, rounded to an integer). UNCONDITIONAL at every log level.
+    /// Write the top-k champions' topology markdown, one file per champion (`champion-<hash>-<fitness>.md`, the suffix being the risk-adjusted score the file ranked by, rounded…
     pub(crate) fn write_champion_markdown(&mut self) -> Result<()> {
         if !self.config.champion_save_topology {
             return Ok(());
@@ -101,11 +82,7 @@ impl CoreEngine {
                 continue;
             };
             let short = &hash[..8.min(hash.len())];
-            // `champion-<rank>-<hash>-<F>`: the RANK orders a directory listing (the one thing a
-            // reader scrolls these files for), the hash is the identity, and the two decimals are
-            // the risk-adjusted score the header prints. The old rule rounded that score to an
-            // integer, which on a 0–1 fitness is the constant `1` for every champion — a suffix
-            // that named nothing and ordered nothing.
+            // `champion-<rank>-<hash>-<F>`: the RANK orders a directory listing (the one thing a reader scrolls these files for), the hash is the identity, and the two decimals are…
             let path = self
                 .run_dir
                 .join(format!("champion-{:02}-{short}-{fitness:.2}.md", rank + 1));
@@ -119,9 +96,7 @@ impl CoreEngine {
             let reading = self.race_reading_of(&hash).map_or_else(
                 || crate::utils::cfy::NO_VALUE.to_string(),
                 |r| {
-                    // The pair the SCORE was charged from (`fam_center` / `fam_spread`), under
-                    // the family's own nouns — a median run's card redoes its own header instead
-                    // of printing an `avg`/`spread` the charge never touched.
+                    // The pair the SCORE was charged from (`fam_center` / `fam_spread`), under the family's own nouns — a median run's card redoes its own header instead of printing an…
                     fmt_family_reading(
                         Some(r.fam_center),
                         (r.n > 1).then_some(r.fam_spread),
@@ -206,17 +181,7 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// The anti-champion dump: the nets worth READING, not merely the lowest `fit (F)` — one file
-    /// per net (`worst-<hash>-<fit>.md`: topology + mermaid graph + lineage) plus a `worst.md`
-    /// index.
-    ///
-    /// The pick is the SAME evidence the `spent` cross/mutation cull evicts on — `Fm⁻ × (1 − Um)`,
-    /// the net's badness times the share of its updates already burned — so the weak net the
-    /// lottery has NOT paid yet cannot crowd out the weak net that trained and stayed weak. The
-    /// place is un-tilted (`1 − p`) exactly as the cull does it, so the fit side of `train_ticket`
-    /// moves the payouts and never which end of the field counts as bad. A net the lottery cannot grade
-    /// (shield, unread, flat field, lottery off) has no `spent` and falls to the tail by
-    /// `fit (F)` — the pre-criterion dump, byte for byte.
+    /// The anti-champion dump: the nets worth READING, not merely the lowest `fit (F)` — one file per net (`worst-<hash>-<fit>.md`: topology + mermaid graph + lineage) plus a…
     pub(crate) fn write_worst_markdown(&mut self, clock: usize) -> Result<()> {
         if !self.config.worst_save_topology {
             return Ok(());
@@ -224,9 +189,7 @@ impl CoreEngine {
         // The SAME frame the coin dealt from: the ticket chance printed here is the number the
         // next clock would compare against, not a second opinion.
         let frame = self.lottery_frame();
-        // The SAME evidence the `spent` cull evicts on: `Fm⁻ × (1 − Um)`, bad AND already paid
-        // for. `None` = the lottery cannot grade the net, which is why the tail below still orders
-        // by `fit (F)` instead of inventing a score for a net nothing measured.
+        // The SAME evidence the `spent` cull evicts on: `Fm⁻ × (1 − Um)`, bad AND already paid for. `None` = the lottery cannot grade the net, which is why the tail below still…
         let rows: Vec<(String, f32, usize, Option<f32>)> = self
             .ranked_live()
             .into_iter()
@@ -273,9 +236,7 @@ impl CoreEngine {
             let reading = self.race_reading_of(hash).map_or_else(
                 || crate::utils::cfy::NO_VALUE.to_string(),
                 |r| {
-                    // The pair the SCORE was charged from (`fam_center` / `fam_spread`), under
-                    // the family's own nouns — a median run's card redoes its own header instead
-                    // of printing an `avg`/`spread` the charge never touched.
+                    // The pair the SCORE was charged from (`fam_center` / `fam_spread`), under the family's own nouns — a median run's card redoes its own header instead of printing an…
                     fmt_family_reading(
                         Some(r.fam_center),
                         (r.n > 1).then_some(r.fam_spread),
@@ -285,10 +246,7 @@ impl CoreEngine {
                     )
                 },
             );
-            // The same shape as the champion files — `worst-<rank>-<hash>-<F>` — so the two ends
-            // of one ranking are named alike and both listings sort by place. A net the lottery
-            // could not read prints `na` where the score goes: the old rule wrote `0`, which read
-            // as a measurement.
+            // The same shape as the champion files — `worst-<rank>-<hash>-<F>` — so the two ends of one ranking are named alike and both listings sort by place.
             let fit = self.smoothed_fitness_of(hash);
             let score = fit.map_or_else(|| "na".to_string(), |s| format!("{s:.2}"));
             let file = format!("worst-{:02}-{short}-{score}.md", rank + 1);
@@ -442,11 +400,7 @@ impl CoreEngine {
     }
 }
 
-/// Anti-champion order: the HIGHEST `spent` (`Fm⁻ × (1 − Um⁻)`) first — the bad nets the field has
-/// already paid for — then the lowest `fit (F)`, the older net, the hash. Nets the lottery cannot
-/// grade carry `None` and follow the graded ones, ordered by `fit (F)` alone, which is exactly the
-/// pre-criterion dump. A TOTAL order, so the files, the index and the final table can never
-/// disagree about which net is #1.
+/// Anti-champion order: the HIGHEST `spent` (`Fm⁻ × (1 − Um⁻)`) first — the bad nets the field has already paid for — then the lowest `fit (F)`, the older net, the hash.
 pub(crate) fn worst_order(
     mut rows: Vec<(String, f32, usize, Option<f32>)>,
 ) -> Vec<(String, f32, usize, Option<f32>)> {

@@ -22,9 +22,8 @@ pub mod stop;
 pub mod tabular_engine;
 
 pub use config::{
-    CrossCullPolicy, ModeConfig, MutationCullPolicy, RaceConfig, RaceSnapshot, RlConfig,
-    RlRaceConfig, RunMode, StopReason, TabularConfig, TabularRaceConfig, rl_race_config_builder,
-    tabular_race_config_builder,
+    CrossCullPolicy, ModeConfig, MutationCullPolicy, RaceConfig, RaceSnapshot, RlRaceConfig,
+    RunMode, StopReason, TabularRaceConfig, rl_race_config_builder, tabular_race_config_builder,
 };
 pub use core::CoreEngine;
 pub use rl_engine::RlEngine;

@@ -29,12 +29,7 @@ use crate::state::NetMetrics;
 #[cfg(debug_assertions)]
 use crate::utils::race_steps::eval_one_step;
 
-/// The min-max band's INTERIOR: every graded factor is pushed inside `[0.01, 0.99]`, so neither a
-/// factor nor the ticket product can sit exactly on an end. An exact `1.0` or `0.0` hands one net
-/// the band's whole `p_max` or `p_min` as if the interval were a step function, which is how a
-/// best-fit net with the wrong updates leg used to fall to the floor.
-/// Public on purpose: the report text and the bindings name the same clamp the engine applies
-/// instead of retyping `0.01` / `0.99`.
+/// The min-max band's INTERIOR: every graded factor is pushed inside `[0.01, 0.99]`, so neither a factor nor the ticket product can sit exactly on an end.
 pub const MINMAX_FLOOR: f32 = 0.01;
 pub const MINMAX_CEIL: f32 = 0.99;
 
@@ -73,21 +68,12 @@ impl CoreEngine {
         if let Some(_frame) = frame {
             let p = self.train_lottery_p_eff(hash, frame);
             self.last_ticket_p.insert(hash.to_string(), p);
-            // THE BORN TICKET is AUTOMATIC: a net that has never trained SKIPS the draw outright
-            // — its first update is granted, not paid, so it cannot idle its own shield away and
-            // `U` reads 1 the moment its first clock lands. `p` is left as the chance the coin
-            // would have given it (the born shield's fraction folds to `hi`); nothing pretends
-            // the probability was 1.0.
+            // THE BORN TICKET is AUTOMATIC: a net that has never trained SKIPS the draw outright — its first update is granted, not paid, so it cannot idle its own shield away and `U`…
             let born = self.never_trained(hash);
             // `draws_at` is the same draw the wrapper would make, with `p` already
             // hand — one merit read per net per clock, not two.
             if !forced && !born && !self.train_lottery_draws_at(hash, clock, p) {
-                // LEARN-ONLY: the coin withholds the UPDATE, never the STEP — the net runs its
-                // real trainer through the no-op optimizer, so it acts and is MEASURED on a fresh
-                // batch every clock and only the weight write is lost. OFF: the clock idles.
-                // `U = 0` cannot reach this point: the born ticket above grants the first clock,
-                // so every net the coin denies already has a learned policy to measure. No act, no
-                // eval, no fitness, no RNG — the clock costs it one ledger entry.
+                // LEARN-ONLY: the coin withholds the UPDATE, never the STEP — the net runs its real trainer through the no-op optimizer, so it acts and is MEASURED on a fresh batch every…
                 return if self.config.train_merit_learn_only {
                     self.act_only_step(hash, clock, "NO TICKET (act-only)")
                 } else {
@@ -104,34 +90,16 @@ impl CoreEngine {
             ))
             .into());
         }
-        // The net's standing BEFORE this clock's update: the level its new reading has to reach
-        // for the update to have done no harm. Read NOW, while the window still holds the
-        // PRE-update policy — `record_update` below resets the epoch, and with it the level.
+        // The net's standing BEFORE this clock's update: the level its new reading has to reach for the update to have done no harm.
         let before = self.race_reading_of(hash).map(|r| r.mean);
-        // `call_index` is the recovery streak's retry counter: 0 is the clock's own update, 1.. the
-        // retries. Under the default `recovery_same_seed` a retry is the clock's OWN draw again (a
-        // true retry, which asks whether the fall was the update's fault); with the switch off,
-        // `call_index` rides into `StepEnv::attempt` so the retry trains on the NEXT draw.
+        // `call_index` is the recovery streak's retry counter: 0 is the clock's own update, 1.. the retries.
         let mut call_index = 0u64;
         let mut report = self.run_trainer_step_with_real_optimizer(hash, clock, call_index)?;
         if let Some(rl) = &report.rl {
             self.total_train_turns += rl.train_turns;
         }
         let mut metrics = self.record_update(hash, clock, &report)?;
-        // RECOVERY STREAK (`recovery_retries`): an update that lands WORSE than the net's standing
-        // bought a bad READING, which is not yet a bad policy — the two differ by one more update,
-        // and near the crown that difference is a seat. So take the next update NOW, in this same
-        // clock, and stop the moment the net is back where it was going in. Every retry is a REAL
-        // update: its own RNG stream, its own optimizer step, its own `U`. The streak is CAPPED —
-        // after `recovery_retries` failures the clock ends wherever the policy stands, so a policy
-        // that cannot be rescued is not chased forever.
-        //
-        // …and the streak is OFF for the run's INIT PROBATION (`set_pop_init_probation_steps`): those
-        // opening clocks are for judging what the founders ARE, on draws every net shares. A retry
-        // there would hand one net extra updates the rest never got, in exactly the window whose
-        // whole point is that nobody evolves — the verdict would measure who was rescued, not who
-        // was born right. The same clock arithmetic `evolution_allowed` uses, so the gate lifts
-        // with the culls and births it protects.
+        // RECOVERY STREAK (`recovery_retries`): an update that lands WORSE than the net's standing bought a bad READING, which is not yet a bad policy — the two differ by one more…
         let in_init_probation = clock < self.config.init_probation_steps;
         let cap = if in_init_probation {
             0
@@ -161,11 +129,7 @@ impl CoreEngine {
         if retries > 0 {
             self.state.record_recovery(hash, clock, retries)?;
         }
-        // RECOVERY, on its own line: a streak is the one event that buys a net updates it never had
-        // clocks for, so it is not folded into the per-net debug line (which a watch run never
-        // shows). Who needed it, for what — the standing it had to climb back to and how far it
-        // actually fell against the tolerance — and how much it cost, all on one row. The DRAW is
-        // named too: `same draw` re-tests the update that fell, `fresh draw` fights on new rows.
+        // RECOVERY, on its own line: a streak is the one event that buys a net updates it never had clocks for, so it is not folded into the per-net debug line (which a watch run…
         if let (Some(was), false) = (before, walk.is_empty()) {
             let direction = self.fitness.direction();
             let drop = match direction {
@@ -263,11 +227,7 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// Fold ONE real update into the state and the ledgers: the metrics snapshot + local step
-    /// advance (so `U` counts this update). The READING is deliberately not pushed here — a
-    /// streak's intermediate verdicts are search detail, and the window holds one reading per
-    /// clock ([`Self::record_reading`]), which is the series `history.csv` records and a resume
-    /// rebuilds.
+    /// Fold ONE real update into the state and the ledgers: the metrics snapshot + local step advance (so `U` counts this update).
     fn record_update(
         &mut self,
         hash: &str,
@@ -288,10 +248,7 @@ impl CoreEngine {
         Ok(metrics)
     }
 
-    /// Push the clock's FINAL reading — ONE per clock, streak or not. The window and `history.csv`
-    /// (one row per clock) must describe the same series: a resume rebuilds its window from those
-    /// rows, so a streak that pushed every intermediate value would leave the resumed twin with a
-    /// window the live run never had.
+    /// Push the clock's FINAL reading — ONE per clock, streak or not.
     fn record_reading(&mut self, hash: &str, metrics: &NetMetrics) {
         // A challenge is just another step: its forced-action fitness ranks like
         // any other — the user's semantics.
@@ -303,9 +260,7 @@ impl CoreEngine {
         if let Some(trend) = self.rolling_trend.get_mut(hash) {
             trend.push(metrics.fitness);
         }
-        // This reading describes the weights the update just produced: under a policy-scoped
-        // fitness window it is reading ONE of a new epoch, which keeps the window on the current
-        // policy.
+        // This reading describes the weights the update just produced: under a policy-scoped fitness window it is reading ONE of a new epoch, which keeps the window on the current…
         self.rolling_epoch.insert(hash.to_string(), 1);
         if let Some(buf) = self.rolling_train.get_mut(hash) {
             buf.push(metrics.train_loss);
@@ -326,17 +281,12 @@ impl CoreEngine {
         }
     }
 
-    /// `U == 0`: no optimizer update has ever landed on this net. It holds no learned policy, so a
-    /// denied clock has nothing to measure — the one predicate under which the learn-only pass is
-    /// skipped and the net idles outright.
+    /// `U == 0`: no optimizer update has ever landed on this net.
     fn never_trained(&self, hash: &str) -> bool {
         self.state.net(hash).is_some_and(|s| s.step == 0)
     }
 
     /// Whether `after` fell BEYOND the tolerance from `before` — the recovery streak's trigger.
-    /// A `NaN` on either side never triggers: an unreadable number is not a fall. The tolerance is
-    /// a FRACTION of the standing (`0.2` = a fifth is absorbed), so one number holds for a loss and
-    /// for turns survived alike; the band is strict, so a drop of exactly `tolerance` is kept.
     fn fell_from(&self, before: f32, after: f32) -> bool {
         if !before.is_finite() || !after.is_finite() {
             return false;
@@ -481,10 +431,7 @@ impl CoreEngine {
     /// Whether the lottery is ARMED yet.
     fn lottery_armed(&self) -> bool {
         self.state.live_hashes().iter().all(|h| {
-            // Only the STARTING population gates the arming; `entered_at_step == 0`
-            // founder/seeded-batch contract (`NetState::new` stamps `step` as the entry step
-            // while the lottery stays disarmed everyone is handed `p = 1.0` and trains, which is
-            // what serves a founder's shield — the gate opens by TRAINING, never by waiting.
+            // Only the STARTING population gates the arming; `entered_at_step == 0` founder/seeded-batch contract (`NetState::new` stamps `step` as the entry step while the lottery…
             match self.state.net(h) {
                 Some(s) if s.entered_at_step != 0 => true,
                 Some(_) => !self.on_probation(h),
@@ -573,14 +520,9 @@ impl CoreEngine {
         }
         let legs = self.config.train_ticket;
         let f = Self::merit_fraction_inverted(q, frame.best, frame.worst, legs.fitness_inverted());
-        // The U leg: armed it multiplies the place, and WHICH SIDE it pays is the leg's own
-        // business — `fewest_updates` keeps the fresh net (`0.99` at the field's fewest updates),
-        // `most_updates` pays the net that has SPENT the most. Disarmed it is neutral at `1.0`, so
-        // the ticket is exactly the place, bit for bit.
+        // The U leg: armed it multiplies the place, and WHICH SIDE it pays is the leg's own business — `fewest_updates` keeps the fresh net (`0.99` at the field's fewest updates)…
         let updates = if !legs.updates_armed() || frame.most_updates <= frame.fewest_updates {
-            // No U leg, or no U SPREAD to pay a side of: the factor is neutral. `fresh` reads 1.0
-            // on a flat field (a min-max with no span has no end), so the `most_updates`
-            // complement would turn "everybody trained the same" into 0.0 and starve the field.
+            // No U leg, or no U SPREAD to pay a side of: the factor is neutral. `fresh` reads 1.0 on a flat field (a min-max with no span has no end), so the `most_updates` complement…
             1.0
         } else {
             let fresh = self.updates_fraction(hash, &frame);
@@ -595,10 +537,7 @@ impl CoreEngine {
         Ok((f, updates, (f * updates).clamp(MINMAX_FLOOR, MINMAX_CEIL)))
     }
 
-    /// The field's U fraction for one net, INDEPENDENT of whether the ticket's U leg is armed:
-    /// `0.99` at the field's fewest updates, `0.01` at its most. The `spent` cull ranks on this one,
-    /// so a run that disarms the leg for its tickets still gets an evidence ranking instead of a
-    /// field-wide tie at `1.0`.
+    /// The field's U fraction for one net, INDEPENDENT of whether the ticket's U leg is armed: `0.99` at the field's fewest updates, `0.01` at its most.
     fn updates_fraction(&self, hash: &str, frame: &LotteryFrame) -> f32 {
         self.state
             .net(hash)
@@ -606,12 +545,7 @@ impl CoreEngine {
             .unwrap_or(1.0)
     }
 
-    /// The SPENT score the cull ranks on: `Fm⁻ × (1 − Um)` — how badly the net grades TIMES how
-    /// many updates it has already spent, so a weak net the band has paid `U` times outranks a weak
-    /// net that has not had its chance yet. `Fm⁻` is the WORST-first place even when the ticket
-    /// tilt is best-first: the tilt says which end the coin pays, not which end is bad. Gated
-    /// exactly like the coin (crown, shield, unread net and flat field all give `None`), so a cull
-    /// built on it can never disagree about who is eligible.
+    /// The SPENT score the cull ranks on: `Fm⁻ × (1 − Um)` — how badly the net grades TIMES how many updates it has already spent, so a weak net the band has paid `U` times…
     pub(crate) fn train_lottery_spent_fraction(
         &self,
         hash: &str,
@@ -620,9 +554,7 @@ impl CoreEngine {
     ) -> Option<f32> {
         let frame = frame?;
         let (f, _, _) = self.grade_lottery_parts(hash, Some(frame), merit).ok()?;
-        // The cull is about the NET, never about the payout: `Fm⁻` here is the WORST-first place
-        // whichever end the band pays. `grade_lottery_parts` hands back the TILTED `f`, so undo the
-        // tilt first — best-first flipped it, so the badness is its complement.
+        // The cull is about the NET, never about the payout: `Fm⁻` here is the WORST-first place whichever end the band pays. `grade_lottery_parts` hands back the TILTED `f`, so…
         let badness = if self.config.train_ticket.fitness_inverted() {
             f
         } else {
@@ -631,9 +563,7 @@ impl CoreEngine {
         Some(badness * (1.0 - self.updates_fraction(hash, &frame)))
     }
 
-    /// The inverted min-max over a field: `1.0` at `min` and `0.0` at `max`, linear between,
-    /// clamped outside — and both ends pushed inside `[MINMAX_FLOOR, MINMAX_CEIL]`, so no factor
-    /// is ever exactly an end. A field with no spread pays the neutral `1.0`.
+    /// The inverted min-max over a field: `1.0` at `min` and `0.0` at `max`, linear between, clamped outside — and both ends pushed inside `[MINMAX_FLOOR, MINMAX_CEIL]`, so no…
     pub(crate) fn inverted_minmax(value: usize, min: usize, max: usize) -> f32 {
         if max <= min {
             return 1.0;
@@ -681,9 +611,7 @@ impl CoreEngine {
         merit: Option<f32>,
     ) -> f32 {
         let fraction = self.train_lottery_p_from(hash, frame, merit);
-        // ONE BAND, no second dial: `p_min` is the chance the WORST-graded net gets each clock and
-        // `p_max` the chance the BEST-graded one gets, and every net plays in between. Ω used to
-        // fold this band toward 1; it is retired, so what a run sets is what a run pays.
+        // ONE BAND, no second dial: `p_min` is the chance the WORST-graded net gets each clock and `p_max` the chance the BEST-graded one gets, and every net plays in between. Ω…
         let p_min = self.train_merit_p_min();
         let p_max = self.train_merit_p_max();
         p_min + (p_max - p_min) * fraction
@@ -720,9 +648,7 @@ impl CoreEngine {
         Self::merit_fraction_inverted(q, best, worst, false)
     }
 
-    /// [`Self::merit_fraction`] with the ordering tilt: `inverted` grades the WORST merit `0.99`
-    /// and the best `0.01` (the fit side of `set_train_ticket`), with `1.0` reserved for a field
-    /// that has no spread at all.
+    /// [`Self::merit_fraction`] with the ordering tilt: `inverted` grades the WORST merit `0.99` and the best `0.01` (the fit side of `set_train_ticket`), with `1.0` reserved…
     pub(crate) fn merit_fraction_inverted(q: f32, best: f32, worst: f32, inverted: bool) -> f32 {
         if !q.is_finite() || !best.is_finite() || !worst.is_finite() || best <= worst {
             return 1.0;
@@ -769,9 +695,7 @@ impl CoreEngine {
             .as_ref()
             .zip(self.stream.as_ref())
             .map(|(dataset, stream)| crate::trainer::RunData { dataset, stream });
-        // The retry's DRAW index: the default `recovery_same_seed` hands out `0`, so a retry is the
-        // clock's own draw again — the trainer re-derives the same seeds and the stream hands back
-        // the same rows. The variety arm hands out the retry counter instead.
+        // The retry's DRAW index: the default `recovery_same_seed` hands out `0`, so a retry is the clock's own draw again — the trainer re-derives the same seeds and the stream…
         let attempt = if self.config.recovery_same_seed {
             0
         } else {

@@ -59,9 +59,7 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
     ) -> Self {
         // The spec variant DECIDES the mode arm: stamp the Tabular arm, replacing
         // whatever placeholder the builder carried.
-        config.mode_specific = crate::engine::config::ModeConfig::Tabular(
-            crate::engine::config::TabularConfig::default(),
-        );
+        config.mode_specific = crate::engine::config::ModeConfig::Tabular;
         Self::Tabular(TabularSpec {
             data_dir: data_dir.into(),
             config,
@@ -82,13 +80,7 @@ impl RunSpec<Box<dyn TabularStep>, Box<dyn RlStep>> {
         run_dir: Option<std::path::PathBuf>,
     ) -> Self {
         // The spec variant DECIDES the mode arm (see `tabular`).
-        if !matches!(
-            config.mode_specific,
-            crate::engine::config::ModeConfig::Rl(_)
-        ) {
-            config.mode_specific =
-                crate::engine::config::ModeConfig::Rl(crate::engine::config::RlConfig::default());
-        }
+        config.mode_specific = crate::engine::config::ModeConfig::Rl;
         Self::RL(RLSpec {
             config,
             fitness,

@@ -66,7 +66,7 @@ impl SeedOutcome {
     }
 }
 
-/// One entry of a source run's `elites.json` — the machine-readable ranking
+/// One entry of a source run's `champions.json` — the machine-readable ranking
 /// next experiment reads; only the rank and hash matter here.
 #[derive(Clone, Debug, serde::Deserialize)]
 struct EliteIndexEntry {
@@ -149,8 +149,7 @@ pub fn resolve_plan(
         Some(entries) if !entries.is_empty() => entries,
         _ => {
             return SeedOutcome::Skipped(format!(
-                "run {source_run_id} has no champions.json (nor a legacy elites.json — its final \
-                 table was not recorded, or it predates the index)"
+                "run {source_run_id} has no champions.json — its final table was not recorded"
             ));
         }
     };
@@ -211,15 +210,9 @@ pub fn resolve_plan(
     }))
 }
 
-/// Read a source run's `champions.json` as `(rank, hash)` pairs, best first. `None`
-/// when absent/unparsable (the source predates the index); duplicates collapse.
-///
-/// A run written before the rename still carries `elites.json`, so that name is the fallback:
-/// inheritance must not break just because a word changed.
+/// Read a source run's `champions.json` as `(rank, hash)` pairs, best first.
 fn read_champion_index(dir: &Path) -> Option<Vec<(usize, String)>> {
-    let raw = std::fs::read_to_string(dir.join("champions.json"))
-        .or_else(|_| std::fs::read_to_string(dir.join("elites.json")))
-        .ok()?;
+    let raw = std::fs::read_to_string(dir.join("champions.json")).ok()?;
     let mut entries: Vec<EliteIndexEntry> = serde_json::from_str(&raw).ok()?;
     entries.retain(|e| !e.hash.is_empty());
     // The file is written ranked already; sorting makes the reader
@@ -380,7 +373,7 @@ mod tests {
             // The FINAL TABLE is what inheritance reads now: rank 1 is the net
             // source run's own `Final field` card printed first.
             std::fs::write(
-                dir.join("elites.json"),
+                dir.join("champions.json"),
                 serde_json::json!([{ "rank": 1, "hash": hash, "fitness": 0.25, "params": 123 }])
                     .to_string(),
             )
@@ -411,7 +404,7 @@ mod tests {
         let pick = plan.champion();
         assert_eq!(pick.rank, 1);
         assert_eq!(pick.champion_hash, "abcd1234abcd1234");
-        // `elites.json` carries rank + hash; the parameter count is not read back.
+        // `champions.json` carries rank + hash; the parameter count is not read back.
         assert_eq!(pick.champion_params, None);
     }
 
@@ -473,7 +466,7 @@ mod tests {
         write_run(&root.join("1000"), "1000", "tabular", "toy", false);
         let reason = match resolve(Some(&root), None, "tabular", 2, 2, Some("toy")) {
             SeedOutcome::Skipped(r) => r,
-            SeedOutcome::Seeded(_) => panic!("a run with no elites.json must be skipped"),
+            SeedOutcome::Seeded(_) => panic!("a run with no champions.json must be skipped"),
         };
         assert!(reason.contains("no champions.json"), "{reason}");
     }
@@ -558,7 +551,7 @@ mod tests {
         );
     }
 
-    /// The widened inheritance: `elites.json` is read as the ranked list,
+    /// The widened inheritance: `champions.json` is read as the ranked list,
     /// cap takes the TOP ranks, and the champion is rank 1 either way.
     #[test]
     fn elites_json_is_read_ranked_and_capped() {
@@ -587,7 +580,7 @@ mod tests {
             { "rank": 2, "hash": extra[0].1, "fitness": 80.0 },
             { "rank": 3, "hash": extra[1].1, "fitness": 70.0 },
         ]);
-        std::fs::write(dir.join("elites.json"), index.to_string()).unwrap();
+        std::fs::write(dir.join("champions.json"), index.to_string()).unwrap();
 
         // All three, in rank order.
         let out = resolve_plan(Some(&root), None, "tabular", 2, 2, Some("toy"), 10);
@@ -629,7 +622,7 @@ mod tests {
             { "rank": 1, "hash": "abcd1234abcd1234" },
             { "rank": 2, "hash": "9999dead9999dead" },
         ]);
-        std::fs::write(dir.join("elites.json"), index.to_string()).unwrap();
+        std::fs::write(dir.join("champions.json"), index.to_string()).unwrap();
         let out = resolve_plan(Some(&root), None, "tabular", 2, 2, Some("toy"), 10);
         let plan = out.seeded().expect("the champion still inherits");
         assert_eq!(plan.picks.len(), 1, "the unloadable rank is dropped");
@@ -637,7 +630,7 @@ mod tests {
 
         // …but a broken RANK 1 sinks the whole inheritance, as before.
         let index = serde_json::json!([{ "rank": 1, "hash": "9999dead9999dead" }]);
-        std::fs::write(dir.join("elites.json"), index.to_string()).unwrap();
+        std::fs::write(dir.join("champions.json"), index.to_string()).unwrap();
         let reason = match resolve_plan(Some(&root), None, "tabular", 2, 2, Some("toy"), 10) {
             SeedOutcome::Skipped(r) => r,
             SeedOutcome::Seeded(_) => panic!("a champion with no blueprint must be skipped"),

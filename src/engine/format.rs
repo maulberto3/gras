@@ -168,15 +168,7 @@ pub fn fmt_reading(mean: Option<f32>, sigma: Option<f32>, n: usize, style: Readi
     }
 }
 
-/// The FAMILY spelling of a sampled reading — the pair the score was actually charged from
-/// (`WindowStats::fam_center` / `fam_spread`), named as that family's centre and spread.
-///
-/// `arithmetic` delegates to [`fmt_reading`], so its bytes are unchanged
-/// (`avg 0.86 (spread 0.02; SE 0.01 = spread/√4, n=4)`). The other families have no `SE` to
-/// report: `1.4826·MAD` over a handful of readings is not a standard error, and printing
-/// `SE = spread/√n` beside it would invent a confidence nobody computed. A card that showed
-/// `avg`/`spread` beside a median score was a header a reader could not redo — the score charges
-/// `median` and its scaled MAD, not `mean` and `σ`.
+/// The FAMILY spelling of a sampled reading — the pair the score was actually charged from (`WindowStats::fam_center` / `fam_spread`), named as that family's centre and…
 pub(crate) fn fmt_family_reading(
     centre: Option<f32>,
     spread: Option<f32>,

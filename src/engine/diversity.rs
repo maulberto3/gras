@@ -106,9 +106,9 @@ pub(crate) struct NetShape {
     pub wires: usize,
     /// Mean hidden-node width; `0.0` for a net with no hidden node.
     pub dim: f32,
-    /// The Input node's feature-split policy (`exclusive` / `random` / `inherited`); `None` = every
-    /// port reads every feature, which the table prints as `rows`.
-    pub split: Option<crate::graph::topology::FeatureSplitPolicy>,
+    /// Share of the input each Input port reads on average: `1.0` = no split, `1/ports` = a
+    /// perfect partition; `None` = no readable Input node.
+    pub mask: Option<f32>,
 }
 
 /// Read one net's structure: the pair metric's genes plus the census legs.
@@ -119,12 +119,26 @@ pub(crate) fn shape_of(topo: &Topology) -> NetShape {
         .filter(|n| n.kind == NodeKind::Hidden)
         .filter_map(|n| n.hidden_dim.map(|d| d as f32))
         .collect();
+    let mask = match topo.nodes.iter().find(|n| n.kind == NodeKind::Input) {
+        None => None,
+        Some(input) => match input.feature_masks.as_ref() {
+            None => Some(1.0),
+            Some(rows) => {
+                let ports = rows.len();
+                let width = rows.first().map_or(0, Vec::len);
+                (ports > 0 && width > 0).then(|| {
+                    let ones = rows.iter().flatten().filter(|b| **b != 0).count();
+                    ones as f32 / (ports * width) as f32
+                })
+            }
+        },
+    };
     NetShape {
         genome: genes(topo),
         nodes: topo.nodes.len(),
         wires: topo.connections.len(),
         dim: trait_of(&hidden).mean,
-        split: topo.options.feature_split,
+        mask,
     }
 }
 
@@ -421,7 +435,7 @@ mod tests {
             nodes: 1,
             wires: 1,
             dim: 4.0,
-            split: None,
+            mask: None,
         };
         let straggler = shape(&[("W:Tanh", 1)]);
         assert_eq!(
