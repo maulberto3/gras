@@ -7,9 +7,7 @@ Hand-designing architectures is slow, biased, and easy to overfit to your own
 intuition. `gras` searches that space for you — continuously and reproducibly —
 and hands back a champion you can actually trust.
 
-Crate **`gras` 2.0.0** · docs [**docs.rs/gras**](https://docs.rs/gras) · the
-Python bindings ship separately as **`gras-nn`** (still `import gras`) — see
-[`python/README.md`](https://github.com/maulberto3/gras/blob/main/python/README.md).
+Crate **`gras` 2.0.0** · docs [**docs.rs/gras**](https://docs.rs/gras).
 
 ## Is this for me?
 
@@ -52,8 +50,7 @@ tracks population and clocks, not how long you leave it running.
 - **Runs compound.** Each run ends with a ranked `champions.json`; a compatible next
   run can start from its champions instead of from scratch.
 - **A whole recipe by name.** 9 losses, 7 optimizers, 8 learning-rate schedules
-  and 14 metrics/fitnesses ship built in — enums and closures in Rust, strings in
-  Python (`gras.menus()`).
+  and 14 metrics/fitnesses ship built in — all as enums and closures in Rust.
 
 ## How it works
 
@@ -71,8 +68,7 @@ steady net deserves.
 A run ends with its **final table** — every net, measured, ranked — written to
 `final-field.csv` and `champions.json`. A compatible next run can seed its founders
 from that ranking, and a killed run resumes from its directory with the same
-seed, search space and trainer recipe. Both doors are first-class in Rust and in
-Python.
+seed, search space and trainer recipe. Both doors are first-class in Rust.
 
 ## What gras is not
 
@@ -81,11 +77,9 @@ Python.
 - **Not a hyperparameter sweep over one architecture.** Every candidate is a
   different graph: node count, width, activations, merge ops, wiring, and
   optionally a per-port feature split.
-- **Not distributed.** One race per thread (the engine is `!Send`), and Python
-  holds the GIL for the whole `run()`.
-- **Not a step-by-step controller.** `run()` is all-or-nothing in both languages;
-  there are no per-clock Python callbacks. That is deliberate parity, not a
-  missing feature.
+- **Not distributed.** One race per thread (the engine is `!Send`).
+- **Not a step-by-step controller.** `run()` is all-or-nothing; there are no
+  per-clock callbacks. That is deliberate, not a missing feature.
 - **Not a model hub.** Artifacts are plain files in the run directory — JSON,
   CSV, safetensors — with no database and no service to operate.
 
@@ -103,18 +97,6 @@ time, shared objects at run time. We point our own harness at one with the
 conventional `LIBTORCH_PATH` / linker-path arrangement; any setup that puts
 libtorch in your workspace and your loader's path works, and choosing that setup
 is deliberately left to you. CUDA builds need a CUDA-enabled libtorch.
-
-### Python
-
-The bindings are their own distribution — **`gras-nn`** on PyPI, imported as
-`gras` — so they version independently of the crate (`gras` on crates.io is
-2.0.0; the binding is 0.1.x). They build with maturin into `gras._core`, ship one
-`cp312-abi3` wheel for CPython ≥ 3.12 on Linux x86_64, and **do not bundle
-libtorch** either: `python/gras/__init__.py` loads it from `LIBTORCH_PATH` (then
-`~/.flodl/libtorch/precompiled/{cpu,cuda}`) before the extension imports, so
-`import gras` works without `LD_LIBRARY_PATH`. Prerequisites, the three on-ramps,
-the name menus, artifacts and limits live in
-[`python/README.md`](https://github.com/maulberto3/gras/blob/main/python/README.md).
 
 ## Contracts worth knowing
 
@@ -139,10 +121,8 @@ the name menus, artifacts and limits live in
 
 ## Get started
 
-- Rust: `examples/mnist.rs` (tabular) and `examples/cartpole.rs` (RL) — each is
-  self-contained, with `--help` describing its flags.
-- Python: `python/notebooks/python_bindings_tour.ipynb` — six self-contained arms;
-  install, surface and limits in [`python/README.md`](https://github.com/maulberto3/gras/blob/main/python/README.md).
+- Examples: `examples/mnist.rs` (tabular) and `examples/cartpole.rs` (RL) — each
+  is self-contained, with `--help` describing its flags.
 - API docs: **https://docs.rs/gras** · repository:
   **https://github.com/maulberto3/gras**
 
