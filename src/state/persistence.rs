@@ -1,5 +1,4 @@
-//! Step-race run state — replaces the generational `gen_XX.json` + per-gen `robustness.csv`
-//! artifact shape with a present-tense model: - `engine.json` — the run header, overwritten
+//! On-disk run state: `engine.json` is the header, `nets/<hash>.json` the snapshots.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,19 +23,10 @@ pub struct ConfigSnapshot {
     pub pop_size: usize,
     /// Steps between population checkpoints.
     pub checkpoint_every: usize,
-    /// Crossover rolls offered per step. LEGACY — the knob is gone (turnover is a share now).
-    /// Still READ so an old header migrates to its equivalent share, never written.
-    #[serde(default, skip_serializing)]
-    pub crossover_rolls: usize,
-    /// Mutation (immigrant) rolls offered per step. LEGACY, like `crossover_rolls`.
-    #[serde(default, skip_serializing)]
-    pub mutate_rolls: usize,
-    /// Crossover turnover SHARE (`set_crossover_share`); `0.0` = the channel is off.
+    /// Share of the population each channel replaces per clock; `0.0` = off.
     #[serde(default)]
     pub crossover_share: f32,
-    /// Mutation turnover SHARE (`set_mutation_share`); `0.0` = off. Reads the pre-rename
-    /// `mutate_share` key too, so a header written before the channel got its one name resumes.
-    #[serde(default, alias = "mutate_share")]
+    #[serde(default)]
     pub mutation_share: f32,
     /// Crossover replacement policy (`"worst"` | `"random"`). Crossover-only —
     /// mutation channel has its own knob, recorded just below.
@@ -45,8 +35,8 @@ pub struct ConfigSnapshot {
     /// own knob — it decides which net a fresh immigrant replaces, so a reader cannot reconstruct
     #[serde(default = "default_mutation_cull_policy")]
     pub mutation_cull_policy: String,
-    /// Champion set size: the top-k live nets by smoothed fitness, saved at stop.
-    #[serde(default, alias = "elite_count")]
+    /// Top-k live nets saved as champions at stop.
+    #[serde(default)]
     pub champion_count: usize,
     /// Crossover operator pool (`"one_point"`/`"uniform"`); empty ⇒ both.
     pub crossover_ops_pool: Vec<String>,
@@ -54,13 +44,6 @@ pub struct ConfigSnapshot {
     /// `"tournament(size=3)"`).
     #[serde(default)]
     pub crossover_selection: String,
-    /// Probability a crossover roll fired. LEGACY — the knob is gone; read only, to migrate an
-    /// old header's `rolls × prob` rate into the equivalent share.
-    #[serde(default, skip_serializing)]
-    pub crossover_prob: f32,
-    /// Probability a mutation roll fired. LEGACY, like `crossover_prob`.
-    #[serde(default, skip_serializing)]
-    pub mutate_prob: f32,
     /// Stop budget as configured (`None` = no limit). Duplicated at the header root;
     /// this copy is authoritative.
     #[serde(default)]
@@ -84,11 +67,6 @@ pub struct ConfigSnapshot {
     pub eval_batch_size: Option<usize>,
     /// Per-net fitness smoothing window (K).
     pub smoothing_window: usize,
-    /// LEGACY: risk aversion λ, REMOVED from the engine on 2026-11-14. New records always write
-    /// `0.0`; the field is kept only so a header that recorded a charge is readable (and can be
-    /// reported by `RaceConfig::from_snapshot`) instead of silently changing what it means.
-    #[serde(default)]
-    pub risk_aversion: f32,
     /// How the smoothing window was averaged into the ranking centre (`set_fitness_mean_type`:
     /// `"arithmetic"` | `"signed_log"` | `"median"`).
     #[serde(default)]
@@ -107,44 +85,20 @@ pub struct ConfigSnapshot {
     /// Human label for the experiment (`set_run_name`), verbatim. Purely
     /// informative — never affects the results folder name.
     pub run_name: Option<String>,
-    /// LEGACY lottery strength Ω (`set_run_train_merit`, deprecated): retired as a second dial,
-    /// because `p_min`/`p_max` are the chance band now. New headers write `1.0` (the identity); a
-    /// header written before the retirement carries its value and `from_snapshot` folds it into
-    /// the band once — `lo = 1 − Ω(1 − p_min)`, `hi = 1 − Ω(1 − p_max)` — so the run resumes at
-    /// the chances it actually paid.
-    #[serde(default)]
-    pub train_merit: f32,
-    /// Merit floor `p_min` (`set_ticket_p_min`): the worst net's share of clocks even
-    /// `0` fraction, applied before Ω blends.
+    /// Lottery floor `p_min`: the worst net's chance of a ticket each clock.
     #[serde(default)]
     pub train_merit_p_min: f32,
-    /// Merit CEILING `p_max` (`set_ticket_p_max`): the best-graded net's share of clocks —
-    /// the upper end of `p = p_min + (p_max − p_min)·f`.
+    /// Lottery ceiling `p_max`: the best net's chance of a ticket each clock.
     #[serde(default = "default_p_max")]
     pub train_merit_p_max: f32,
-    /// The lottery's two LEGS (`set_train_ticket`) as ONE spelling — `least_fit_fewest_updates`,
-    /// `most_fit_most_updates`, `most_fit`, … `""` = a header written before the key, read out of
-    /// the two legacy bools below instead. Headers written before the 2026-11-14 rename carry it
-    /// as `ticket_legs`, which the field's `alias` still reads.
-    #[serde(default, alias = "ticket_legs")]
+    /// The lottery's legs, e.g. `most_fit_fewest_updates` (`""` = the default).
+    #[serde(default)]
     pub train_ticket: String,
-    /// LEGACY, read-only: the pre-`train_ticket` ordering bool (`true` = the LEAST fit net is paid).
-    /// Still READ so an old header resumes on the legs it actually ran; never written again.
-    /// Drop it once no surviving header predates `train_ticket` (spelled `ticket_legs` before the
-    /// 2026-11-14 rename) — it is `skip_serializing`, so every header written since is already
-    /// clean.
-    #[serde(default, skip_serializing)]
-    pub train_merit_inverted: bool,
-    /// LEARN-ONLY lottery (`set_ticket_learn_only`): `true` = a lost ticket costs the
-    /// weight update, not the clock (the net acts and is measured anyway). `default` = `false`,
-    /// which is exactly what every header written before the flag recorded.
+    /// LEARN-ONLY lottery (`set_ticket_learn_only`): `true` = a lost ticket costs the weight update, not the clock (the net acts and is measured anyway). `default` = `false`…
     #[serde(default)]
     pub train_merit_learn_only: bool,
-    /// POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): `true` = mean/spread/n describe the
-    /// CURRENT weights, so no reading from another policy enters them. `default` = `false`, which
-    /// is exactly what every header written before the flag recorded (the last-K-readings window).
-    /// `policy_stats`, the knob's old name, still reads as this one.
-    #[serde(default, alias = "policy_stats")]
+    /// `true` = rank only on readings from the weights the net holds now.
+    #[serde(default)]
     pub policy_scoped_fitness: bool,
     /// ANTI-CHAMPION dump (`set_worst_save_topology`): `true` writes the `spent`-ranked nets'
     /// markdown at stop. `default` = `false` for every header written before the knob.
@@ -154,16 +108,11 @@ pub struct ConfigSnapshot {
     /// orders both drawn parents best-first, so the child keeps the BETTER one's skeleton.
     #[serde(default)]
     pub crossover_fitter_base: bool,
-    /// Drift on a crossover child's INHERITED genes (`set_topology_drift`): each mask bit flips,
-    /// and each hidden activation / combine / standardize is re-drawn (dropout in `0.0..=cap`),
-    #[serde(default, alias = "feature_mask_flip_prob")]
+    /// Chance each inherited gene is re-drawn on a crossover child.
+    #[serde(default)]
     pub drift_prob: f32,
-    /// LEGACY, read-only: before Ω this knob was the bool `evolution_train_lottery` (`true` =
-    /// run trained under the full lottery, i.e.
-    #[serde(default, rename = "evolution_train_lottery", skip_serializing)]
-    pub legacy_train_lottery: Option<bool>,
-    /// The two end-of-run TOPOLOGY switches (`*_save_topology`).
-    #[serde(default = "default_true", alias = "elite_save_topology")]
+    /// Write the champions' topology markdown at stop.
+    #[serde(default = "default_true")]
     pub champion_save_topology: bool,
     /// Novelty floor `d_min` for a mutation draw (`set_mutation_novelty_min`). Replay-relevant:
     /// `0.0` is what a header written before the gate recorded.
@@ -181,29 +130,18 @@ pub struct ConfigSnapshot {
     #[serde(default)]
     pub crossover_probation_steps: usize,
     /// INIT PROBATION (`set_pop_init_probation_steps`): opening clocks with no culls or births.
-    /// A header written before the knob reads `0` — nothing withheld beyond the born shields.
-    /// Replay-relevant.
     #[serde(default)]
     pub init_probation_steps: usize,
-    /// Post-update recovery streak cap (extra real updates in one clock). A header written
-    /// before the knob carries no field and reads `0` (off), so an old run replays unchanged.
-    /// Replay-relevant.
-    #[serde(default, alias = "recovery_updates")]
+    /// Extra real updates one clock may run to recover a falling net (`0` = off).
+    #[serde(default)]
     pub recovery_retries: usize,
     /// Recovery tolerance: the fraction of the standing a reading may lose before a rescue. A
     /// header written before the knob reads `0.0` (every drop triggers). Replay-relevant.
     #[serde(default)]
     pub recovery_tolerance: f32,
-    /// Recovery retry DRAW (`set_pop_recovery_same_seed`): `true` = a retry repeats the clock's own
-    /// train draw. A header written before the knob reads `true` — the behaviour it had. Only
-    /// replay-relevant while `recovery_retries > 0`.
+    /// Recovery retry DRAW (`set_pop_recovery_same_seed`): `true` = a retry repeats the clock's own train draw.
     #[serde(default = "default_true")]
     pub recovery_same_seed: bool,
-    /// LEGACY, read-only: the pre-`train_ticket` U-leg bool (`true` = the ticket also multiplies
-    /// the updates fraction). Read to map an old header onto the legs spelling it means; never
-    /// written again. Drop it on the same schedule as `train_merit_inverted` above.
-    #[serde(default, skip_serializing)]
-    pub train_merit_updates: bool,
     /// The input feature-split policy the run drew masks from (`"split_exclusive"` /
     /// `"split_random"`); `None` = no split
     #[serde(default)]
@@ -212,12 +150,11 @@ pub struct ConfigSnapshot {
     /// `"split_random"`, `"split_exclusive"`).
     #[serde(default)]
     pub feature_split_pool: Vec<String>,
-    /// Load the newest compatible previous experiment's CHAMPIONS as the first founders.
-    #[serde(default, alias = "elite_previous_load", alias = "seed_previous_run")]
+    /// Seed the first founders from the newest compatible previous run.
+    #[serde(default)]
     pub champion_previous_load: bool,
-    /// Where that previous experiment is looked up: a run dir or a dir of run dirs
-    /// (newest wins). `None` ⇒ `results/`.
-    #[serde(default, alias = "elite_previous_dir", alias = "seed_previous_run_dir")]
+    /// Where that run is looked up: a run dir or a dir of run dirs (`None` = `results/`).
+    #[serde(default)]
     pub champion_previous_dir: Option<String>,
     /// One-line identity of the binary that produced the run (version, profile, exe
     /// path, build time). Diagnostics
@@ -244,9 +181,6 @@ impl ConfigSnapshot {
         ConfigSnapshot {
             pop_size: cfg.pop_size,
             checkpoint_every: cfg.checkpoint_every,
-            // Legacy, never written: the turnover share below is the knob now.
-            crossover_rolls: 0,
-            mutate_rolls: 0,
             crossover_share: cfg.crossover_share,
             mutation_share: cfg.mutation_share,
             crossover_cull_policy: cfg.crossover_cull_policy.to_string(),
@@ -254,9 +188,6 @@ impl ConfigSnapshot {
             champion_count: cfg.champion_count,
             crossover_ops_pool: cfg.crossover_ops_pool.clone(),
             crossover_selection: cfg.crossover_selection.to_string(),
-            // Legacy, never written (see the snapshot's field docs).
-            crossover_prob: 0.0,
-            mutate_prob: 0.0,
             mutation_novelty_min: cfg.mutation_novelty_min,
             mutation_novelty_draws: cfg.mutation_novelty_draws,
             max_steps: cfg.max_steps,
@@ -267,7 +198,6 @@ impl ConfigSnapshot {
             batch_size,
             eval_batch_size,
             smoothing_window: cfg.smoothing_window,
-            risk_aversion: 0.0,
             mean_type: cfg.mean_type.to_string(),
             selection_metrics: cfg.selection_metrics.clone(),
             device: if cfg!(feature = "cuda") {
@@ -279,18 +209,13 @@ impl ConfigSnapshot {
             csv_export: cfg.csv_export,
             save_optim: cfg.save_optim,
             run_name: cfg.run_name.clone(),
-            train_merit: cfg.train_merit,
             train_merit_p_min: cfg.train_merit_p_min,
             train_merit_p_max: cfg.train_merit_p_max,
             train_ticket: cfg.train_ticket.to_string(),
-            // Legacy, read-only: written headers carry `train_ticket` and nothing else.
-            train_merit_inverted: false,
-            train_merit_updates: false,
             train_merit_learn_only: cfg.train_merit_learn_only,
             policy_scoped_fitness: cfg.policy_scoped_fitness,
             worst_save_topology: cfg.worst_save_topology,
             crossover_fitter_base: cfg.crossover_fitter_base,
-            legacy_train_lottery: None,
             champion_previous_load: cfg.champion_previous_load,
             champion_previous_dir: cfg
                 .champion_previous_dir
@@ -309,15 +234,6 @@ impl ConfigSnapshot {
             build: crate::engine::format::build_stamp(),
         }
     }
-
-    /// Fold a pre-Ω header's `evolution_train_lottery` bool into `train_merit`.
-    pub fn normalize_legacy(&mut self) {
-        if self.train_merit == 0.0 && self.legacy_train_lottery == Some(true) {
-            self.train_merit = 1.0;
-        }
-        // Consumed: one truth per snapshot from here
-        self.legacy_train_lottery = None;
-    }
 }
 
 /// Which previous experiment this run's founder batch was seeded from — the inheritance
@@ -333,8 +249,7 @@ pub struct SeedSourceRecord {
     /// That champion's parameter count (the tie-break key).
     #[serde(default)]
     pub champion_params: Option<i64>,
-    /// Every elite reinstated here, ranked (best first, `[0]` == `champion_hash`);
-    /// one entry when the source predates `elites.json`, empty if nothing inherited.
+    /// Every founder reinstated here, best first (`[0]` = `champion_hash`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub elite_hashes: Vec<String>,
 }
@@ -345,8 +260,7 @@ pub struct SeedSourceRecord {
 pub struct RunHeader {
     /// User-visible run id (directory name or CLI-chosen label).
     pub run_id: String,
-    /// Mode discriminator (`"tabular"` | `"rl"`) at the header ROOT; legacy headers
-    /// lack it and `from_json` derives it from `config.mode`.
+    /// Mode (`"tabular"` | `"rl"`) at the header root, so a resume need not read the config.
     #[serde(default)]
     pub engine_mode: Option<String>,
     /// Dataset directory the run was launched from (one-argument resume). `None`
@@ -438,7 +352,7 @@ pub struct RunAccounting {
     /// Every net this process created: the initial batch plus each insert.
     pub born: usize,
     /// Initial-batch split: random founders vs nets inherited from a previous
-    /// run's `elites.json` (`created_from = seed:<run>:<hash>`).
+    /// run's `champions.json` (`created_from = seed:<run>:<hash>`).
     pub founders: usize,
     /// Founders that came from an inherited run.
     pub inherited_founders: usize,
@@ -728,13 +642,11 @@ impl RunHeader {
                     .collect()
             })
             .unwrap_or_default();
-        // Missing on legacy engine.json files ⇒ Default (all-zero snapshot).
-        let mut config: ConfigSnapshot = v
+        let config: ConfigSnapshot = v
             .get("config")
             .cloned()
             .and_then(|c| serde_json::from_value(c).ok())
             .unwrap_or_default();
-        config.normalize_legacy();
         // Trainer self-description (see `Trainer::describe`). Absent on legacy
         // files and on trainers that don't implement the hook.
         let trainer = v.get("trainer").cloned();
@@ -898,9 +810,7 @@ pub struct NetState {
     /// because that era re-ran them through a no-op optimizer).
     #[serde(default)]
     pub budget_skips: usize,
-    /// Clocks whose update was followed by a RECOVERY STREAK: `(clock, extra real updates)` in
-    /// clock order. Replay-relevant: a resumed run must take the same extra updates at the same
-    /// clock, or its weights — and every reading after them — diverge from the recorded race.
+    /// Clocks whose update was followed by a RECOVERY STREAK: `(clock, extra real updates)` in clock order.
     #[serde(default)]
     pub recovery_ledger: Vec<(usize, usize)>,
 }
@@ -1057,9 +967,7 @@ impl NetState {
         push_span(&mut self.idle_spans, step);
     }
 
-    /// Record the `extras` extra updates ONE clock's recovery streak took, in clock order. This is
-    /// the ledger a replay re-walks: `U` is no longer derivable from the spans alone, because a
-    /// streak puts several updates inside one clock.
+    /// Record the `extras` extra updates ONE clock's recovery streak took, in clock order.
     pub fn record_recovery(&mut self, step: usize, extras: usize) {
         if extras == 0 {
             return;
@@ -1076,9 +984,7 @@ impl NetState {
         self.recovery_ledger.iter().map(|&(_, n)| n).sum()
     }
 
-    /// Clocks this net spent ACTING without updating (a lottery denied the update while
-    /// `train_merit_learn_only` was on): the length of `frozen_spans`. One implementation for the
-    /// replay ledger and the `frozen` column.
+    /// Clocks this net spent ACTING without updating (a lottery denied the update while `train_merit_learn_only` was on): the length of `frozen_spans`.
     pub fn frozen_clocks(&self) -> usize {
         span_len(&self.frozen_spans)
     }
@@ -1685,9 +1591,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A record that has moved past the frontier is rewound consistently: spans clamped,
-    /// `step` recomputed for the window, the too-late reading dropped — so the ledger
-    /// identity (`step + frozen + idle == span`) still holds for the replay planner.
+    /// A record that has moved past the frontier is rewound consistently: spans clamped, `step` recomputed for the window, the too-late reading dropped — so the ledger identity…
     #[test]
     fn net_state_truncates_to_an_earlier_frontier() {
         // Built through the real reader, so the fixture cannot drift from the schema.
@@ -1748,10 +1652,7 @@ mod tests {
         })
     }
 
-    /// Both cull channels reach `engine.json` under their OWN key, with the stable
-    /// snake_case spelling (not `Debug` casing): a header is a record a reader parses,
-    /// and a `Debug`-derived `LowestFitnessMostUpdates` would come out as
-    /// `lowestfitnessmostupdates`.
+    /// Both cull channels reach `engine.json` under their OWN key, with the stable snake_case spelling (not `Debug` casing): a header is a record a reader parses, and a…
     #[test]
     fn config_snapshot_records_both_cull_policies_in_snake_case() {
         use crate::engine::config::{CrossCullPolicy, MutationCullPolicy, RaceConfig};
@@ -1768,9 +1669,7 @@ mod tests {
         assert_eq!(dflt.crossover_cull_policy, "lowest_fitness_most_updates");
     }
 
-    /// The tombstone's mean was renamed (`final_smoothed_fitness` →
-    /// `final_fitness_mean`); every file written before the rename must still load,
-    /// or the seeding path silently loses its ranking key on old runs.
+    /// The tombstone's mean was renamed (`final_smoothed_fitness` → `final_fitness_mean`); every file written before the rename must still load, or the seeding path silently…
     #[test]
     fn a_legacy_tombstone_key_still_loads_as_the_mean() {
         let legacy = serde_json::json!({
@@ -1863,20 +1762,9 @@ mod tests {
         assert_eq!(again.run_id, "run-2");
     }
 
-    /// `risk_aversion` is LEGACY: the knob was removed 2026-11-14, so every new record writes
-    /// `0.0`, while a header that carries a charge stays readable so `from_snapshot` can report it
-    /// rather than let the value silently change meaning.
+    /// Selection terms survive the header round trip.
     #[test]
-    fn risk_aversion_is_legacy_and_new_records_write_zero() {
-        let snapshot =
-            ConfigSnapshot::from_config(&crate::engine::config::RaceConfig::defaults(), None, None);
-        assert_eq!(snapshot.risk_aversion, 0.0, "no knob, no charge");
-        // Round-trips as written…
-        let json = serde_json::to_string(&snapshot).unwrap();
-        let back: ConfigSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.risk_aversion, 0.0);
-        // A selection term rides the same record: label + weight survive the round trip, and a
-        // header without the key loads as fitness-only.
+    fn selection_metrics_round_trip() {
         let mut cfg = crate::engine::config::RaceConfig::defaults();
         cfg.selection_metrics = vec![crate::utils::fitness::SelectionMetric {
             label: "r2".to_string(),
@@ -1886,22 +1774,9 @@ mod tests {
         let back: ConfigSnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
         assert_eq!(back.selection_metrics, cfg.selection_metrics);
-        // …and a value JSON with the key REMOVED (exactly a pre-FIT engine.json) loads
-        // as 0.0 while every other knob still comes through.
-        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
-        legacy.as_object_mut().unwrap().remove("risk_aversion");
-        let loaded: ConfigSnapshot = serde_json::from_value(legacy).unwrap();
-        assert_eq!(
-            loaded.risk_aversion, 0.0,
-            "a pre-FIT run ranked on the plain mean"
-        );
-        assert_eq!(loaded.smoothing_window, snapshot.smoothing_window);
-        assert_eq!(loaded.pop_size, snapshot.pop_size);
     }
 
-    /// The parent draw is recorded as its label; a pre-knob `engine.json` (no key
-    /// at all) loads as `""`, which the resume guard reads as roulette — the draw
-    /// those runs actually made.
+    /// The parent draw is recorded as its label; a pre-knob `engine.json` (no key at all) loads as `""`, which the resume guard reads as roulette — the draw those runs actually…
     #[test]
     fn config_snapshot_records_the_crossover_selection() {
         use crate::evolution::selection::SelectionMethod;
@@ -1926,9 +1801,7 @@ mod tests {
         assert_eq!(loaded.crossover_selection, "");
     }
 
-    /// The feature-split POLICY is recorded (the masks themselves are genome
-    /// live in each net's blueprint): the header must say how the run drew them,
-    /// and a pre-knob `engine.json` (no key at all) must load as "no split".
+    /// The feature-split POLICY is recorded (the masks themselves are genome live in each net's blueprint): the header must say how the run drew them, and a pre-knob…
     #[test]
     fn config_snapshot_records_the_feature_split_policy() {
         use crate::graph::topology::FeatureSplitPolicy;
