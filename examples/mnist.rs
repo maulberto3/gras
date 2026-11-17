@@ -291,9 +291,9 @@ fn jitter_inputs(
 /// Live nets in the race (default; `--pop` overrides).
 const POP: usize = 100;
 /// Crossover turnover: the share of the live field replaced per clock, dealt as `round(share × pop)` rolls.
-const CROSSOVER_TURNOVER: f32 = 0.05;
+const CROSSOVER_TURNOVER: f32 = 0.025;
 /// MUTATION turnover default, the mutation channel's own share of the field per clock.
-const MUTATION_TURNOVER: f32 = 0.01;
+const MUTATION_TURNOVER: f32 = 0.005;
 /// Step budget for a full run: `--max-steps N` runs exactly N clocks before Stop.
 const RACE_STEPS: usize = 50;
 /// Steps between population checkpoints — the era rotation and the CSV flush ride this.
@@ -507,13 +507,8 @@ struct Cli {
     /// Crossover operator pool, drawn per attempt; empty = both.
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
     crossover_ops_pool: Vec<String>,
-    /// Feature-split draw order for a newborn (`none`,`random`,`exclusive`); `none` = every feature hits every port.
-    #[arg(
-        long,
-        value_name = "LIST",
-        value_delimiter = ',',
-        default_values_t = [String::from("none")]
-    )]
+    /// Feature-split draw order for a newborn (`none`,`random`,`exclusive`); empty = all three.
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
     feature_split_pool: Vec<String>,
     /// Combine-op pool (`add`,`mean`,`max`,…); empty = every combine op.
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
