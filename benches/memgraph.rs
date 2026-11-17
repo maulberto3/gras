@@ -65,14 +65,11 @@ fn main() {
     let run_dir = root.join("benches/memgraph/run");
     if !data_dir.exists() {
         let ds =
-            tabular_data::synthetic_classification(1024, 64, 4, SEED, gras::auto_device()).unwrap();
+            support::synthetic_classification(1024, 64, 4, SEED, gras::auto_device());
         tabular_data::save_dataset(&data_dir, &ds).unwrap();
     }
     let peeked = tabular_data::resolve_dataset(&data_dir).unwrap();
-    let (d_in, d_out) = (
-        peeked.inputs.shape()[1] as usize,
-        peeked.targets.shape()[1] as usize,
-    );
+    let (d_in, d_out) = peeked.dims();
     drop(peeked);
 
     let mut builder = RaceConfig::builder()
@@ -150,3 +147,6 @@ fn fmt(n: impl ToString) -> String {
         n.to_string()
     }
 }
+
+#[path = "support/mod.rs"]
+mod support;

@@ -28,7 +28,7 @@ use std::time::Instant;
 use gras::engine::population::initial_population;
 use gras::prelude::*;
 use gras::utils::race_steps::{eval_one_step, train_one_step};
-use gras::utils::{score, tabular_data};
+use gras::utils::score;
 
 const SEED: u64 = 42;
 const FEATURES: usize = 64;
@@ -76,7 +76,7 @@ fn main() {
 
     for rows in ROW_COUNTS {
         let ds =
-            tabular_data::synthetic_classification(rows, FEATURES, CLASSES, SEED, device).unwrap();
+            support::synthetic_classification(rows, FEATURES, CLASSES, SEED, device);
         let stream = BatchStream::new(SEED, BATCH, PoolSplit::of(&ds, 0.2, SEED));
 
         // The stream: one train + one eval batch materialization per net per
@@ -139,3 +139,6 @@ fn main() {
          and the stream work is not worth it.\n      `era_eval` = eval batch cost across a checkpoint-era \n         boundary (rotation included) — if ~equal to `eval_batch`, era rotation is free."
     );
 }
+
+#[path = "support/mod.rs"]
+mod support;
