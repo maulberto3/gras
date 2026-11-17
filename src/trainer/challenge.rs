@@ -3,7 +3,7 @@
 //! Challenges were engine-wired: `RaceConfig::challenge_prob` + a per-step
 //! engine roll handed every trainer a `challenged` bool. The engine has
 //! forgotten all of it — the trigger is a pure function of values a trainer
-//! already has in its [`StepEnv`]/net seed, so the ROLL belongs where
+//! already has in its [`StepEnv`](crate::trainer::StepEnv)/net seed, so the ROLL belongs where
 //! RESPONSE does: inside `train_step`.
 //!
 //! # Recipe (both modes)

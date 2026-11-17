@@ -251,7 +251,7 @@ impl CoreEngine {
         &self.run_dir
     }
 
-    /// Start a race from a [`RunSpec`] — the entire argument surface. The engine loads
+    /// Start a race from a [`RunSpec`](crate::engine::run_spec::RunSpec) — the entire argument surface. The engine loads
     /// data, derives the run dir, resolves a seed and writes the self-contained header.
     pub fn from_spec(spec: crate::engine::run_spec::RunSpec) -> Result<Self> {
         use crate::engine::run_spec::RunSpec as RS;

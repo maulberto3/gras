@@ -75,7 +75,7 @@ impl TabularEngine {
         Ok(Self(CoreEngine::from_spec(spec)?))
     }
 
-    /// Build a tabular run from a [`TabularSpec`] directly — the typed-spec path
+    /// Build a tabular run from a [`TabularSpec`](crate::engine::run_spec::TabularSpec) directly — the typed-spec path
     /// (no enum round-trip); the trainer is auto-boxed.
     pub fn from_tabular_spec<T: crate::trainer::TabularStep + 'static>(
         spec: crate::engine::run_spec::TabularSpec<T>,

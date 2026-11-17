@@ -1,19 +1,18 @@
 //! Tensor data I/O — the engine's data contract.
 //!
-//! The engine consumes data as a **path to tensors** (flodl-native;
-//! crate deals with no other data formats). Since flodl has no built-in
-//! `Tensor::save`/`load`, this module owns the tiny binary tensor format
-//! used on disk:
+//! The engine consumes data as a **path to tensors**: this module owns the
+//! tiny binary format used on disk and also reads plain CSV. Since flodl has
+//! no built-in `Tensor::save`/`load`, the binary pair is ours end to end:
 //!
 //! ```text
 //!   magic "GRA1" (4 bytes) | dtype tag (1 byte) | ndim (u64 LE)
 //!   | shape (ndim × u64 LE) | raw bytes
 //! ```
 //!
-//! Deliberately **dependency-light**: pure `std` + flodl + fastrand
-//! already in the crate), so the library binary stays lean. Real-world
-//! dataset producers that need HTTP (e.g. a MNIST downloader) live
-//! `examples/` and use `[dev-dependencies]` instead.
+//! Deliberately **dependency-light**: pure `std` + flodl + fastrand (already
+//! in the crate), so the library binary stays lean. Real-world dataset
+//! producers that need HTTP (e.g. a MNIST downloader) live in `examples/`
+//! and use `[dev-dependencies]` instead.
 
 use std::fs;
 use std::path::Path;
@@ -263,8 +262,9 @@ pub fn load_dataset_auto(dir: impl AsRef<Path>) -> Result<Dataset> {
     .into())
 }
 
-/// Save a dataset into `dir` as `inputs.bin` + `targets.bin`, plus
-/// human-readable `meta.json` with the tensor shapes (informational
+/// Save a dataset into `dir` as `inputs.bin` + `targets.bin`, plus a
+/// human-readable `meta.json` carrying the tensor shapes (informational: nothing
+/// reads it back).
 pub fn save_dataset(dir: impl AsRef<Path>, ds: &Dataset) -> Result<()> {
     let dir = dir.as_ref();
     fs::create_dir_all(dir).map_err(|source| DataError::Io {
@@ -346,6 +346,7 @@ pub fn resolve_train_test_datasets(dir: impl AsRef<Path>) -> Result<(Dataset, Da
 }
 
 /// Resolve a **`train/` + `val/`** dir: `train/` learns, `val/` is the pool the race RANKS
+/// on; a sibling `test/` is report-only.
 pub fn resolve_train_val_datasets(dir: impl AsRef<Path>) -> Result<(Dataset, Dataset)> {
     resolve_two_splits(dir.as_ref(), "train", "val")
 }

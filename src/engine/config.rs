@@ -91,11 +91,12 @@ pub const DEFAULT_MEAN_TYPE: MeanType = MeanType::Median;
 pub enum TrainTicket {
     /// The fittest net earns the most tickets; the updates leg is OFF (`Fm⁺`).
     MostFit,
-    /// The fittest net that has trained the LEAST earns the most tickets (`Fm⁺ × Um⁻`).
-    MostFitFewestUpdates,
-    /// The fittest net that has trained the MOST earns the most tickets (`Fm⁺ × Um⁺`) — the
-    /// engine default ([`DEFAULT_TRAIN_TICKET`]).
+    /// The fittest net that has trained the LEAST earns the most tickets (`Fm⁺ × Um⁻`) — the
+    /// engine default ([`DEFAULT_TRAIN_TICKET`]): pay the net that grades best and has had the
+    /// fewest chances to act on that reading.
     #[default]
+    MostFitFewestUpdates,
+    /// The fittest net that has trained the MOST earns the most tickets (`Fm⁺ × Um⁺`).
     MostFitMostUpdates,
     /// The LEAST fit net that has trained the LEAST earns the most tickets (`Fm⁻ × Um⁻`) — the
     /// reference run's tuned leg.
@@ -190,7 +191,7 @@ impl TrainTicket {
     }
 
     /// The same place with the UPDATES leg armed or switched off. Arming a bare place picks
-    /// `fewest_updates` — the LEGACY `Um⁻` leg the pre-enum booleans meant, not today's default;
+    /// `fewest_updates` — the LEGACY `Um⁻` leg the pre-enum booleans meant, and the crate default;
     /// a leg that already names its updates side keeps it, so this is safe to call twice.
     pub fn with_updates_armed(self, armed: bool) -> Self {
         if !armed {
@@ -240,10 +241,10 @@ impl std::str::FromStr for TrainTicket {
     }
 }
 
-/// Default ticket LEGS (`set_train_ticket`): the FITTEST net that has trained the MOST earns the
-/// most tickets (`Fm⁺ × Um⁺`) — the lottery pays the nets that keep proving themselves and keep
-/// learning, so a reading nobody acts on cannot hold a seat.
-pub const DEFAULT_TRAIN_TICKET: TrainTicket = TrainTicket::MostFitMostUpdates;
+/// Default ticket LEGS (`set_train_ticket`): the FITTEST net that has trained the FEWEST earns the
+/// most tickets (`Fm⁺ × Um⁻`) — the lottery pays the net that grades best and has acted on that
+/// reading least, so a good reading buys the next step instead of repeating the last one.
+pub const DEFAULT_TRAIN_TICKET: TrainTicket = TrainTicket::MostFitFewestUpdates;
 
 /// The legs a HEADER records: its `train_ticket` spelling when it carries one, else the legacy
 /// `(inverted, updates_armed)` pair it replaced — `true,true` = `least_fit_fewest_updates`.
@@ -1217,6 +1218,12 @@ impl RaceConfigBuilder {
         self.cfg.checkpoint_every = n;
         self
     }
+    /// Set whether each live net's optimizer state rides its checkpoint (`nets/<hash>.optim`), so a
+    /// resume restores the Adam moments exactly. `false` = weights only. Default true.
+    pub fn set_run_save_optim(mut self, enabled: bool) -> Self {
+        self.cfg.save_optim = enabled;
+        self
+    }
     /// Set crossover turnover as a SHARE of the live population per clock (`0.05` = 5%), dealt as
     /// `round(share · pop)` rolls each clock. `0.0` = the channel OFF. Non-finite reads as off and
     /// values above `1.0` are clamped.
@@ -1295,7 +1302,7 @@ impl RaceConfigBuilder {
     }
     /// The lottery's LEGS (`TrainTicket`): which fit place earns the ticket, and which side of the
     /// updates field it multiplies in. Default [`DEFAULT_TRAIN_TICKET`] =
-    /// `least_fit_fewest_updates`.
+    /// `most_fit_fewest_updates`.
     pub fn set_train_ticket(mut self, legs: TrainTicket) -> Self {
         self.cfg.train_ticket = legs;
         self

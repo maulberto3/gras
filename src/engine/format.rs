@@ -126,15 +126,15 @@ pub(crate) fn fmt_line_opt(v: &Option<f32>) -> String {
         .map_or_else(|| crate::utils::cfy::NO_VALUE.into(), |x| fmt_line(*x))
 }
 
-/// Which sink a reading is rendered for — a console line and a table cell share one rule
-/// value's magnitude, [`fmt_band`]); only a document header still differs, at a flat 2dp.
+/// Which sink a reading is rendered for — a console line and a table cell share one rule for
+/// a value's magnitude (`fmt_band`); only a document header still differs, at a flat 2dp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadingStyle {
-    /// A console/log LINE ([`fmt_line`]).
+    /// A console/log LINE (`fmt_line`).
     Line,
-    /// A CFY TABLE cell ([`fmt_cell`] — the same band rule as [`ReadingStyle::Line`]).
+    /// A CFY TABLE cell (`fmt_cell` — the same band rule as [`ReadingStyle::Line`]).
     Cell,
-    /// A markdown/document header ([`fmt_cfg`] precision, flat 2dp).
+    /// A markdown/document header (`fmt_cfg` precision, flat 2dp).
     Doc,
 }
 

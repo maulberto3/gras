@@ -12,8 +12,8 @@
 //!
 //! Naming convention — **two families**, both required:
 //!
-//! - one Linear per graph node ⇒ `node<N>.weight` `[out,
-//!   `node<N>.bias` `[out]` (when present);
+//! - one Linear per graph node ⇒ a weight `node<N>.weight` of shape `[out, hidden]`
+//!   and a bias `node<N>.bias` of shape `[out]` (when present);
 //! - one Linear per **cross-dim bridge** (a wire whose source and target dims
 //!   differ) ⇒ `proj<N>_<port>_<src>.weight` `[in_dim, src_dim]` (+ `.bias`),
 //!   indexed by target node, target port, and the source's index on that port.

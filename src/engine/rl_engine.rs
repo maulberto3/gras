@@ -52,7 +52,7 @@ impl RlEngine {
         Ok(Self(CoreEngine::from_spec(spec)?))
     }
 
-    /// Build an RL run from an [`RLSpec`] directly — the typed-spec path (no
+    /// Build an RL run from an [`RLSpec`](crate::engine::run_spec::RLSpec) directly — the typed-spec path (no
     /// enum round-trip); the trainer is auto-boxed. Example in the module docs.
     pub fn from_rl_spec<T: crate::trainer::RlStep + 'static>(
         spec: crate::engine::run_spec::RLSpec<T>,

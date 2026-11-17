@@ -50,12 +50,12 @@
 //! run replays the identical episodes. The TRAIN base is `net_seed ^ run_seed`:
 //! per net, so nets of one population explore different worlds, and blended
 //! the run seed so an inherited champion does not replay its parent's exact
-//! trajectories. The EVAL base is `run_seed` alone ([`eval_seed_base`]): shared,
+//! trajectories. The EVAL base is `run_seed` alone (`eval_seed_base`): shared,
 //! because every net has to sit the same exam, and its step axis is the CLOCK —
 //! a fresh set of start states every clock, so a reading moves when the POLICY
 //! moves rather than when an era happens to end, and the spread across a
 //! clock's games is a robustness signal the ranking can charge for. The ERA
-//! axis ([`eval_era_of`], `checkpoint_every` clocks wide) is opt-in
+//! axis (`eval_era_of`, `checkpoint_every` clocks wide) is opt-in
 //! (`with_per_clock_exam(false)`): it makes nets measured inside one era sit
 //! identical games — a newborn is then comparable with a parent read earlier in
 //! that era — at the cost of replaying one exam for a whole era, which is what

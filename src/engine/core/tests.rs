@@ -2692,7 +2692,7 @@ fn ticket_leg_spellings_round_trip() {
     );
     assert_eq!(TrainTicket::from_bools(false, false), TrainTicket::MostFit);
     assert_eq!(TrainTicket::from_bools(true, false), TrainTicket::LeastFit);
-    assert_eq!(DEFAULT_TRAIN_TICKET, TrainTicket::MostFitMostUpdates);
+    assert_eq!(DEFAULT_TRAIN_TICKET, TrainTicket::MostFitFewestUpdates);
     // ONE list backs the help text and the error messages: the names are the spellings, in order,
     // and every one of them parses back to its own leg.
     assert_eq!(TrainTicket::ALL.len(), TrainTicket::ALL_NAMES.len());
@@ -2796,7 +2796,7 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
     }
     eng.config.train_merit_p_min = 0.0;
     // This test grades one ORDERING, so it pins it: worst-first × fewest-updates (the engine's
-    // default is `most_fit_most_updates` now, which pays the other end).
+    // default is `most_fit_fewest_updates` now, which pays the other end of the FIT axis).
     eng.config.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
     eng.config.crossover_cull_policy = crate::engine::config::CrossCullPolicy::HighestTicketChance;
 

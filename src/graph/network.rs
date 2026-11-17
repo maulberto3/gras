@@ -73,7 +73,7 @@ impl serde::Serialize for NetworkOptions {
 
 // ── Network — the executable module ──────────────────────────────────────
 
-/// Executable flodl module built from a [`Topology`](crate::graph::topology::Topology).
+/// Executable flodl module built from a [`Topology`].
 pub struct Network {
     pub(crate) name: String,
     /// Input feature dimension.
