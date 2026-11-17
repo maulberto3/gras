@@ -18,9 +18,7 @@ impl CoreEngine {
             .collect()
     }
 
-    /// The net's FITNESS value: the window score (the family CENTRE over
-    /// `smoothing_window` step fitnesses). With no `selection_metrics` this is also the ranking
-    /// value; [`Self::ranking_score_of`] is always the number the race sorts on.
+    /// The net's FITNESS value: the window score (the family CENTRE over `smoothing_window` step fitnesses).
     pub fn smoothed_fitness_of(&self, hash: &str) -> Option<f32> {
         self.race_reading_of(hash).map(|s| s.score())
     }
@@ -29,21 +27,11 @@ impl CoreEngine {
     /// policy-scoped rule the fitness centre uses. `None` when the metric has no reading yet.
     pub(crate) fn metric_center_of(&self, hash: &str, index: usize) -> Option<f32> {
         let buf = self.rolling_metrics.get(hash)?.get(index)?;
-        let take = if self.config.policy_scoped_fitness {
-            self.rolling_epoch
-                .get(hash)
-                .copied()
-                .unwrap_or(buf.len())
-                .min(buf.len())
-        } else {
-            buf.len()
-        };
+        let take = self.policy_scoped_take(hash, buf.len());
         rolling_stats_tail(buf, take, self.config.mean_type).map(|s| s.score())
     }
 
-    /// The net's RANKING value: the fitness window centre plus every `selection_metrics` term
-    /// (`weight × that metric's smoothed centre`). With no terms this is exactly
-    /// [`Self::smoothed_fitness_of`], so a run without the knob ranks byte-identically to before.
+    /// The net's RANKING value: the fitness window centre plus every `selection_metrics` term (`weight × that metric's smoothed centre`).
     pub fn ranking_score_of(&self, hash: &str) -> Option<f32> {
         let mut score = self.smoothed_fitness_of(hash)?;
         for &(index, weight) in &self.selection_terms {
@@ -60,23 +48,21 @@ impl CoreEngine {
     /// step readings are behind it and how far apart they were ([`WindowStats`]).
     pub(crate) fn race_reading_of(&self, hash: &str) -> Option<WindowStats> {
         self.rolling_fitness.get(hash).and_then(|buf| {
-            // POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): average only the readings
-            // taken on the CURRENT weights — `rolling_epoch` counts them since the net's last real
-            // update, so a learner that updates every clock reports ONE datapoint (its value, zero
-            // spread) while a net that rarely earns a ticket reports many readings of the same
-            // policy. OFF: the whole buffer, exactly as before (readings from different weight sets
-            // mix).
-            let take = if self.config.policy_scoped_fitness {
-                self.rolling_epoch
-                    .get(hash)
-                    .copied()
-                    .unwrap_or(buf.len())
-                    .min(buf.len())
-            } else {
-                buf.len()
-            };
+            let take = self.policy_scoped_take(hash, buf.len());
             rolling_stats_tail(buf, take, self.config.mean_type)
         })
+    }
+
+    /// Readings taken on the CURRENT weights: the epoch count, or the whole buffer while no
+    /// update has landed yet (every reading is still on the current weights).
+    fn policy_scoped_take(&self, hash: &str, len: usize) -> usize {
+        if !self.config.policy_scoped_fitness {
+            return len;
+        }
+        match self.rolling_epoch.get(hash).copied() {
+            Some(n) if n > 0 => n.min(len),
+            _ => len,
+        }
     }
 
     /// A live net's parameter count (`NetMeta::params`) — the ranking
@@ -140,11 +126,7 @@ impl CoreEngine {
         armed && self.log_level == crate::engine::config::LogLevel::Summ
     }
 
-    /// Split one clock's nets into `(trained, withheld)` from the LEDGER snapshot taken BEFORE the
-    /// clock ran: a net whose idle clocks grew got no ticket, and under `train_merit_learn_only`
-    /// so did a net whose ACT-ONLY clocks grew (it ran and was measured, it just never learned).
-    /// Everyone else in the group updated its weights. A never-learned net (`U = 0`) denied the coin
-    /// lands in the IDLE branch under either setting — its clock was skipped, not spent acting.
+    /// Split one clock's nets into `(trained, withheld)` from the LEDGER snapshot taken BEFORE the clock ran: a net whose idle clocks grew got no ticket, and under…
     pub(crate) fn lottery_clock_report(
         &self,
         group: &[String],
@@ -160,9 +142,7 @@ impl CoreEngine {
             let Some(state) = self.state.net(h) else {
                 continue;
             };
-            // TWO ledgers answer "did the coin withhold this clock": the idle one under the
-            // default contract (nothing ran), and the act-only one under learn-only (the net ran
-            // and was measured, so only `frozen_spans` grew).
+            // TWO ledgers answer "did the coin withhold this clock": the idle one under the default contract (nothing ran), and the act-only one under learn-only (the net ran and was…
             let denied = state.idle_clocks() > idle_before
                 || (self.config.train_merit_learn_only && state.frozen_clocks() > frozen_before);
             if denied {
@@ -174,10 +154,7 @@ impl CoreEngine {
         (trained, withheld)
     }
 
-    /// Group nets whose IDLE clock grew since the ledger snapshot — the clocks that did not run at
-    /// all. Under learn-only most denied nets still act-and-measure, but a net that has never
-    /// learned (`U = 0`) is skipped outright, so the rollup must not count that clock as spent
-    /// acting. An empty snapshot (lottery off, or the line off) claims nothing.
+    /// Group nets whose IDLE clock grew since the ledger snapshot — the clocks that did not run at all.
     pub(crate) fn idled_since(&self, group: &[String], ledger_before: &[(usize, usize)]) -> usize {
         group
             .iter()
@@ -204,8 +181,6 @@ impl CoreEngine {
         let would_train = group.len();
         StepVitals {
             // The one honest count in BOTH contracts: subtract the clocks that actually IDLED.
-            // Under the default contract that is every denied net; under learn-only it is only the
-            // never-learned (`U = 0`) ones — everyone else acted and was measured.
             stepped: group.len().saturating_sub(idled_skips.min(lottery_skips)),
             trained: would_train.saturating_sub(lottery_skips),
             // Clamped: a stray idle delta can never make the denied split exceed the denied total.

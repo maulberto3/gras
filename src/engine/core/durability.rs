@@ -122,11 +122,7 @@ impl CoreEngine {
                         row.push(',');
                         row.push_str(&val.to_string());
                     }
-                    // FIT columns, appended LAST so every existing column keeps its position
-                    // (positional readers stay valid): the risk-adjusted score this net ranked
-                    // by, then the spread that score CHARGED — the family spread (`fam_spread`),
-                    // the diagnostic any post-hoc charge would use, not only
-                    // under `arithmetic`.
+                    // FIT columns, appended LAST so every existing column keeps its position (positional readers stay valid): the risk-adjusted score this net ranked by, then the spread that…
                     let reading = self.race_reading_of(hash);
                     let score = self.smoothed_fitness_of(hash);
                     row.push(',');
@@ -167,9 +163,6 @@ impl CoreEngine {
         // the risk-adjusted score the net ranked by, and its spread `σ`.
         history_header.push_str(",fitness_smooth,fitness_smooth_std");
         // The last three are the mutation novelty gate's reading: Δ, candidates spent, floor.
-        // Appended, never inserted, so every existing column keeps its position.
-        // `victim_fitness` closes the row: the culled net's score at cull time, so the ledger says
-        // what the field gave up, not just which hash left. Appended last, like the gate's columns.
         let attempts_header = "step,branch,attempt,outcome,child_hash,child_net_seed,child_origin,child_fitness,victim,victim_net_seed,pop_size,novelty_delta,novelty_draws,novelty_min,victim_fitness";
         let history_body = std::mem::take(&mut self.history_csv_buffer);
         let attempts_body = std::mem::take(&mut self.attempts_csv_buffer);

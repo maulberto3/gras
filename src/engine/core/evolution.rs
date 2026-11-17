@@ -58,10 +58,7 @@ pub(crate) struct StepEvolve {
     pub mutate_fired: usize,
 }
 
-/// What the mutation gate bought at every birth: how DIFFERENT each immigrant was from every
-/// blueprint the run had already archived, and how many candidates the draw had to spend to get
-/// there. In memory only — `attempts.csv` keeps the per-row ledger, this is the tally the stop
-/// card reads, so a run can say "Δ 0.46 per birth, 1.3 of 5 candidates" without parsing a CSV.
+/// What the mutation gate bought at every birth: how DIFFERENT each immigrant was from every blueprint the run had already archived, and how many candidates the draw had to…
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct BirthLedger {
     /// Immigrants the mutation channel admitted.

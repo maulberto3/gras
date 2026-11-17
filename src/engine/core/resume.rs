@@ -74,42 +74,27 @@ impl CoreEngine {
             current.crossover_selection.to_string(),
             format!("set_crossover_selection({rec_selection})"),
         );
-        // The band IS the payout now (Ω retired), so a pre-retirement header's Ω is folded into
-        // the band it RECORDED before the comparison: an old run resumes at the chances it paid.
-        let (rec_min, rec_max) = crate::engine::config::fold_omega(
-            recorded.train_merit,
-            recorded.train_merit_p_min,
-            recorded.train_merit_p_max,
-        );
         push(
             "train_merit_p_min (p_min)",
-            fmt_cfg(rec_min),
+            fmt_cfg(recorded.train_merit_p_min),
             fmt_cfg(current.train_merit_p_min),
-            format!("set_ticket_p_min({})", fmt_cfg(rec_min)),
+            format!("set_ticket_p_min({})", fmt_cfg(recorded.train_merit_p_min)),
         );
         push(
             "train_merit_p_max (p_max)",
-            fmt_cfg(rec_max),
+            fmt_cfg(recorded.train_merit_p_max),
             fmt_cfg(current.train_merit_p_max),
-            format!("set_ticket_p_max({})", fmt_cfg(rec_max)),
+            format!("set_ticket_p_max({})", fmt_cfg(recorded.train_merit_p_max)),
         );
-        // Which NET the ticket favours, on BOTH legs. The same idle ledger means a different
-        // search under another leg, so it is named like Ω — and a pre-`train_ticket` header is
-        // mapped from its two bools, so an old run compares equal when it means the same leg.
-        let rec_legs = crate::engine::config::train_ticket_from_header(
-            &recorded.train_ticket,
-            recorded.train_merit_inverted,
-            recorded.train_merit_updates,
-        );
+        let rec_legs = crate::engine::config::TrainTicket::parse(&recorded.train_ticket)
+            .unwrap_or(crate::engine::config::DEFAULT_TRAIN_TICKET);
         push(
             "train_ticket",
             rec_legs.to_string(),
             current.train_ticket.to_string(),
             format!("set_train_ticket(\"{rec_legs}\")"),
         );
-        // The coin's CONSEQUENCE: the same draw writes a different ledger (idle clocks vs act-only
-        // spans) and a different fitness series, so a resume under the other value is not the same
-        // run. Recorded default `false` = the pre-flag contract, so an old header compares equal.
+        // The coin's CONSEQUENCE: the same draw writes a different ledger (idle clocks vs act-only spans) and a different fitness series, so a resume under the other value is not…
         push(
             "train_merit_learn_only",
             recorded.train_merit_learn_only.to_string(),
@@ -583,9 +568,7 @@ impl CoreEngine {
                 }
             }
         }
-        // The replayed readings are counted as the CURRENT policy: the row's step says when it was
-        // read, not whether the weights had moved, and the net's next real update opens a fresh
-        // epoch anyway — so a resumed run never reads an empty window where a live one would not.
+        // The replayed readings are counted as the CURRENT policy: the row's step says when it was read, not whether the weights had moved, and the net's next real update opens a…
         let epoch = buf.len();
         self.rolling_fitness.insert(hash.clone(), buf);
         self.rolling_train.insert(hash.clone(), train_buf);

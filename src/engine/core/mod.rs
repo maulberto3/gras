@@ -89,10 +89,7 @@ pub struct CoreEngine {
     pub(crate) rolling_fitness: HashMap<String, RollingBuffer>,
     pub(crate) rolling_train: HashMap<String, RollingBuffer>,
     pub(crate) rolling_eval: HashMap<String, RollingBuffer>,
-    /// Per-net windows for the run's informative metrics, one buffer per `config.metrics` entry
-    /// (the order `StepReport::informative` arrives in). Only the metrics named by
-    /// [`crate::engine::config::RaceConfig::selection_metrics`] are READ, but every metric keeps a
-    /// window so a term can be added without a shape change.
+    /// Per-net windows for the run's informative metrics, one buffer per `config.metrics` entry (the order `StepReport::informative` arrives in).
     pub(crate) rolling_metrics: HashMap<String, Vec<RollingBuffer>>,
     /// [`crate::engine::config::RaceConfig::selection_metrics`] resolved to `(index, weight)`
     /// pairs over `metrics`. Empty = the fitness score IS the ranking value.
@@ -100,9 +97,7 @@ pub struct CoreEngine {
     /// Per-net WHOLE-RUN fitness trend — the least-squares line over every reading the net took
     /// (`smoothing::ReadingTrend`). Report-only: nothing ranks, draws a ticket or culls on it.
     pub(crate) rolling_trend: HashMap<String, crate::engine::smoothing::ReadingTrend>,
-    /// Readings pushed since the net's last REAL weight update — the epoch a policy-scoped fitness
-    /// window averages over. A missing entry (a test pushing straight into the buffer) reads the WHOLE buffer,
-    /// which is the flag-off behaviour, so no caller can silently get an empty window.
+    /// Readings pushed since the net's last REAL weight update — the epoch a policy-scoped fitness window averages over.
     pub(crate) rolling_epoch: HashMap<String, usize>,
     /// The ticket probability the coin last COMPARED for each net, captured AT THE DRAW
     /// (`step_one_net_in_frame`).
@@ -218,8 +213,6 @@ impl CoreEngine {
     }
 
     /// Recompute the resolved selection terms from `config.selection_metrics` + `metrics`.
-    /// Assembly calls it once; a test that flips the knob after construction calls it too, so the
-    /// ranking can never read terms that no longer match the config.
     pub(crate) fn apply_selection_metrics(&mut self) {
         self.selection_terms = self.config.selection_metric_terms(&self.metrics);
     }
@@ -641,13 +634,6 @@ impl CoreEngine {
         Ok(engine)
     }
 
-    /// Runtime default for the best-net eval size, for configs that predate
-    /// the field (legacy `0` sentinel ⇒ batch_size). No-op for current configs.
-    fn apply_eval_defaults(&mut self) {
-        // Batch geometry now lives on RunSpec::stream, not RaceConfig — the engine
-        // stores the stream directly, so this is a no-op for current code paths.
-    }
-
     /// The run id back to the caller (for logs / tool use).
     pub fn run_id(&self) -> &str {
         &self.header.run_id
@@ -756,9 +742,7 @@ impl CoreEngine {
             ("run dir".to_string(), self.run_dir.display().to_string()),
             ("seeded slots".to_string(), seeded_slots.to_string()),
         ];
-        // The inheritance receipt (source run, source dir, champion, ranks, founder slots) is the
-        // `Inheritance` card emitted when the plan resolves — repeating three of those rows here
-        // was the same receipt twice. `seeded slots` stays: it is this card's own count.
+        // The inheritance receipt (source run, source dir, champion, ranks, founder slots) is the `Inheritance` card emitted when the plan resolves — repeating three of those rows…
         crate::utils::cfy::emit(&crate::utils::cfy::card(
             "Race init",
             &crate::utils::cfy::kv(&rows),
@@ -776,7 +760,6 @@ impl CoreEngine {
     /// Run the step-race loop until a stop criterion fires: one step_clock per
     /// iteration — same batch, same eval, then the evolve rolls cull and replace.
     pub fn run(&mut self) -> Result<StopReason> {
-        self.apply_eval_defaults();
         // Keep the stream's eval-rotation cadence in lockstep with the checkpoint cadence —
         // post-construction config edit must not desync era numbering — but ONLY on a fresh run.
         if !self.resumed {
@@ -972,10 +955,7 @@ impl CoreEngine {
                 &crate::utils::cfy::kv(&manifest),
                 None,
             ));
-            // The legend: every word and symbol the step lines use, defined ONCE next
-            // arithmetic it names.
-            // Wrapped like the stop card's legend: an unwrapped prose row makes the box as
-            // wide as its longest sentence, which is wider than any terminal.
+            // The legend: every word and symbol the step lines use, defined ONCE next arithmetic it names.
             let legend_rows: Vec<(String, String)> = vec![
                 (
                     "numbers".to_string(),
@@ -1148,9 +1128,7 @@ impl CoreEngine {
                 let evolve_allowed = self.evolution_allowed(clock);
                 if !evolve_allowed {
                     self.accounting.deferred_clocks += 1;
-                    // THE INIT PROBATION (`set_pop_init_probation_steps`) is DECLARED, not
-                    // emergent: while the clock is inside it the rolls are withheld by the run's
-                    // own arithmetic, so the line names the probation, not the cull shield.
+                    // THE INIT PROBATION (`set_pop_init_probation_steps`) is DECLARED, not emergent: while the clock is inside it the rolls are withheld by the run's own arithmetic, so the…
                     if clock < self.config.init_probation_steps {
                         info!(
                             "step {} │ evolution deferred: init probation — the run opens with {} clock(s) of no culls or births, so evolution starts at clock {} ({} crossover + {} mutation roll(s) forgone)",
@@ -1161,10 +1139,7 @@ impl CoreEngine {
                             mutate_total,
                         );
                     } else {
-                        // The windows are NAMED, with their lengths: "no cull-eligible net" alone reads
-                        // as a stuck engine, while `k=5` beside it makes it arithmetic. The shield is
-                        // served in UPDATES, so the one way it outlasts the run is a net nobody feeds —
-                        // say that instead of the old clock arithmetic.
+                        // The windows are NAMED, with their lengths: "no cull-eligible net" alone reads as a stuck engine, while `k=5` beside it makes it arithmetic.
                         info!(
                             "step {} │ evolution deferred: no cull-eligible net — every non-champion net is inside its cull shield window (crossover k={}, mutation k={} updates) or champion ({} crossover + {} mutation roll(s) forgone; nothing culled/born) · the shield is served by UPDATES, not clocks, so it outlasts the run only if its net never trains",
                             clock,
@@ -1341,10 +1316,7 @@ impl CoreEngine {
                             .unwrap_or(true)
                 })
                 .collect();
-            // A birth clock is skipped only when somebody ELSE can carry the clock. When the
-            // channels replaced the whole field in one clock (a tiny population, or no probation
-            // shields), the fresh nets are then the only live nets — stepping none of them would
-            // end a race that still has a population, so the clock runs on the new field instead.
+            // A birth clock is skipped only when somebody ELSE can carry the clock.
             if hashes.is_empty() {
                 hashes = self.state.live_hashes();
             }
@@ -1679,13 +1651,9 @@ pub(crate) struct StepVitals {
     pub live: usize,
     /// Nets that WOULD have updated without the lottery (the clock's whole group).
     pub would_train: usize,
-    /// Updates the training lottery withheld this clock (0 when it is off). Under
-    /// `train_merit_learn_only` these nets ACTED — except the never-learned ones, so this is the
-    /// denied TOTAL: `idled_skips` names how much of it did not run.
+    /// Updates the training lottery withheld this clock (0 when it is off).
     pub lottery_skips: usize,
-    /// Denied clocks that did NOT run at all: a net that has never learned (`U = 0`) is skipped
-    /// outright even under learn-only, so `lottery_skips` is not all act-only. Always equal to
-    /// `lottery_skips` when the learn-only flag is off.
+    /// Denied clocks that did NOT run at all: a net that has never learned (`U = 0`) is skipped outright even under learn-only, so `lottery_skips` is not all act-only.
     pub idled_skips: usize,
     /// Whether a lost ticket cost only the update (`train_merit_learn_only`), which is what the
     /// line's `act-only` wording and its arithmetic key off.
@@ -1743,9 +1711,7 @@ fn step_rollup_line(v: &StepVitals) -> String {
     } else {
         "updating"
     };
-    // Under learn-only the denied nets RAN (act + measure, no update), so the head must name
-    // them or `ran` would not add up against `live`. A never-learned net (`U = 0`) is the exception:
-    // it is skipped outright, so it is held back instead of counted as an act.
+    // Under learn-only the denied nets RAN (act + measure, no update), so the head must name them or `ran` would not add up against `live`.
     let acted_only = if v.learn_only {
         v.lottery_skips.saturating_sub(v.idled_skips)
     } else {
@@ -1761,9 +1727,7 @@ fn step_rollup_line(v: &StepVitals) -> String {
         v.stepped, v.live, v.trained, update_word, act_term
     );
     parts.push(head);
-    // Nets that did not RUN at all: the idled (default contract) and the newborns sitting their
-    // birth clock out. Under learn-only the denied nets acted — EXCEPT the never-learned ones, which
-    // are skipped outright and so are held back exactly like an idle net.
+    // Nets that did not RUN at all: the idled (default contract) and the newborns sitting their birth clock out.
     let idled = if v.learn_only {
         v.idled_skips
     } else {

@@ -136,11 +136,7 @@ fn engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::Tabular
     ))
 }
 
-/// The tombstone a cull writes records all three legs of the reading the net died
-/// with: the readable mean, its spread, and the score it was ranked
-/// Metrics can FEED the ranking (`set_selection_metric`): two nets tied on fitness are ordered by
-/// a registered metric's smoothed centre, a zero weight is exactly the fitness-only ranking, and
-/// the metric is read over the same window the table prints.
+/// The tombstone a cull writes records all three legs of the reading the net died with: the readable mean, its spread, and the score it was ranked Metrics can FEED the…
 #[test]
 fn a_selection_metric_reorders_a_fitness_tie_and_zero_weight_is_neutral() {
     use crate::utils::fitness::{Metric, SelectionMetric};
@@ -231,12 +227,7 @@ fn cull_tombstone_records_mean_spread_and_the_centre_it_ranked() {
     );
 }
 
-/// Every cull lands in exactly ONE slot row. The crossover call site spells the reason with
-/// the cull policy that chose the victim (`crossover-random`,
-/// `crossover-highest-ticket-chance`), so an
-/// exact-string attribution leaves those culls inside `culls` and outside both slot rows —
-/// the stop table then reads `culled 90` over `0 + 51`, which is what a default
-/// (`HighestTicketChance`) run printed.
+/// Every cull lands in exactly ONE slot row.
 #[test]
 fn every_cull_is_attributed_to_one_slot() {
     let dir = std::env::temp_dir().join("gras-cull-attribution");
@@ -459,19 +450,6 @@ fn turnover_shares_survive_the_config_snapshot_and_are_clamped() {
     snap.mutation_share = 0.25;
     let cfg = RaceConfig::from_snapshot(&snap);
     assert_eq!((cfg.crossover_share, cfg.mutation_share), (0.05, 0.25));
-    // An OLD header carried fixed rolls and a fire probability instead of a share: the pair's
-    // expected rolls per clock become the equivalent share, so the run resumes at its real rate.
-    let mut old = crate::state::ConfigSnapshot::default();
-    old.pop_size = 100;
-    old.crossover_rolls = 3;
-    old.crossover_prob = 0.5;
-    old.mutate_rolls = 0; // a switched-off channel stays off
-    let migrated = RaceConfig::from_snapshot(&old);
-    assert_eq!(
-        (migrated.crossover_share, migrated.mutation_share),
-        (0.015, 0.0),
-        "3 rolls × 0.5 at pop 100 = 1.5%/clock"
-    );
     let clamped = RaceConfig::builder()
         .set_crossover_share(2.0)
         .set_mutation_share(f32::NAN)
@@ -1507,9 +1485,7 @@ fn resume_replays_nets_with_metric_parity() {
     let dir = std::env::temp_dir().join("race_resume_parity");
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 99).unwrap();
-    // One update per clock: this test pins `state.step == clocks`. The streak's extra updates are
-    // covered by `recovery_streak_*`, and the lottery is OFF (`p_min = 1.0`) so no clock is a
-    // denied ticket.
+    // One update per clock: this test pins `state.step == clocks`.
     engine.config.recovery_retries = 0;
     engine.config.train_merit_p_min = 1.0;
     engine.config.train_merit_p_max = 1.0;
@@ -1648,7 +1624,7 @@ fn resume_keeps_the_recorded_eval_era_when_the_tick_cadence_changes() {
     let header = crate::state::load_engine_json(&dir).unwrap();
     assert_eq!(
         header.eval_era_every,
-        Some(20),
+        Some(25),
         "the era is recorded at launch"
     );
 
@@ -1667,7 +1643,7 @@ fn resume_keeps_the_recorded_eval_era_when_the_tick_cadence_changes() {
     .unwrap();
     assert_eq!(
         resumed.eval_era_every(),
-        20,
+        25,
         "the eval era follows the record, not this call's cadence"
     );
 
@@ -2011,9 +1987,7 @@ fn the_novelty_gate_spends_its_cap_and_never_leaves_the_slot_empty() {
         pop,
         "a capped draw must still fill the emptied seat"
     );
-    // The gate's reading lands in the attempt ledger: Δ, candidates spent, and the floor they
-    // were judged against — a Δ below that floor is the capped fallback itself. The culled net's
-    // score closes the row, AFTER them.
+    // The gate's reading lands in the attempt ledger: Δ, candidates spent, and the floor they were judged against — a Δ below that floor is the capped fallback itself.
     eng.flush_csv_exports().unwrap();
     let attempts = std::fs::read_to_string(dir.join("attempts.csv")).unwrap();
     let header = attempts.lines().next().expect("attempts header");
@@ -2616,9 +2590,7 @@ fn inverted_lottery_grades_the_worst_net_best() {
     );
     assert!((p(&eng, &hashes[0]) - 0.01).abs() < 1e-6, "worst-first now");
     assert!((p(&eng, &hashes[2]) - 0.99).abs() < 1e-6);
-    // The coin follows the flag: the worst net is paid the top of the band, the best the floor.
-    // `p` is compared rather than the draw — the interior clamp means neither end is exactly 1/0,
-    // so a seeded draw is no longer a foregone conclusion.
+    // The coin follows the flag: the worst net is paid the top of the band, the best the floor. `p` is compared rather than the draw — the interior clamp means neither end is…
     assert!(p(&eng, &hashes[2]) > p(&eng, &hashes[0]));
     // p_min still lifts the starved end by the same arithmetic…
     eng.config.train_merit_p_min = 0.5;
@@ -2766,10 +2738,7 @@ fn the_updates_leg_pays_the_side_it_names() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The `unfed` cull is DETERMINISTIC and reads the coin's OWN number: the net with the highest
-/// ticket chance `p` leaves, so under the shipped setters (worst-first × `Um`) it evicts the least
-/// fit, most spent net — and a tilt change moves the cull WITH the tickets, because the victim IS
-/// the highest `p`. Nets the lottery does not grade are never victims.
+/// The `unfed` cull is DETERMINISTIC and reads the coin's OWN number: the net with the highest ticket chance `p` leaves, so under the shipped setters (worst-first × `Um`)…
 #[test]
 fn unfed_cull_evicts_the_highest_ticket_chance() {
     let dir = std::env::temp_dir().join("gras-unfed-cull");
@@ -2852,10 +2821,7 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The `spent` cull ranks by `Fm⁻ × (1 − Um)`: the worst net that has ALREADY spent its updates
-/// leaves, not the weak newcomer the coin is about to pay. On the SAME fixture `unfed` takes the
-/// newcomer, so the two arms are provably different policies, and disarming the ticket's U leg
-/// does not blind `spent` (its ranking reads `U` directly).
+/// The `spent` cull ranks by `Fm⁻ × (1 − Um)`: the worst net that has ALREADY spent its updates leaves, not the weak newcomer the coin is about to pay.
 #[test]
 fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     let dir = std::env::temp_dir().join("gras-spent-cull");
@@ -2876,9 +2842,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
     }
-    // The BEST and the MID net have each spent 9 updates; the WORST has spent 1, so the coin is
-    // about to keep paying it and `unfed` would evict it. `spent` should take the MID net instead:
-    // it grades badly AND the field has already paid for its 9 updates.
+    // The BEST and the MID net have each spent 9 updates; the WORST has spent 1, so the coin is about to keep paying it and `unfed` would evict it. `spent` should take the MID…
     for (h, updates) in [(&hashes[0], 9usize), (&hashes[1], 9), (&hashes[2], 1)] {
         let state = eng.state.net_mut(h).unwrap();
         state.step = updates;
@@ -2924,9 +2888,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     );
     eng.config.train_ticket = eng.config.train_ticket.with_updates_armed(true);
 
-    // THE TILT: `unfed` follows the coin, so best-first moves its victim onto the BEST net. `spent`
-    // does NOT follow it — the worst net that spent its updates is the victim either way, because
-    // the tilt says who the band pays, not who is bad.
+    // THE TILT: `unfed` follows the coin, so best-first moves its victim onto the BEST net. `spent` does NOT follow it — the worst net that spent its updates is the victim…
     eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
         eng.config.train_ticket.updates_armed(),
@@ -3020,9 +2982,7 @@ fn train_lottery_arms_after_the_born_shield_and_grades_level_per_ticket() {
     assert!((p(&eng, &hashes[1]) - 0.5).abs() < 1e-6);
     assert!((p(&eng, &hashes[2]) - 0.01).abs() < 1e-6);
 
-    // `p == 1` always trains and `p == 0` never does, and the same (net, clock) always lands the
-    // same way — a resume replays the identical decisions. A graded net is clamped off those two
-    // ends, so the coin's own boundaries are stated on the coin itself.
+    // `p == 1` always trains and `p == 0` never does, and the same (net, clock) always lands the same way — a resume replays the identical decisions.
     assert!(eng.train_lottery_draws_at(&hashes[2], 5, 1.0));
     assert!(!eng.train_lottery_draws_at(&hashes[2], 5, 0.0));
     assert_eq!(
@@ -3030,9 +2990,7 @@ fn train_lottery_arms_after_the_born_shield_and_grades_level_per_ticket() {
         eng.train_lottery_draws(&hashes[1], 5, Some(frame))
     );
 
-    // The routing contract: a denied ticket IDLES the net — no trainer call, so no
-    // metric row, no update and no reading. The band is closed to `0` first, so the loss is a
-    // certainty instead of a 99%-likely draw.
+    // The routing contract: a denied ticket IDLES the net — no trainer call, so no metric row, no update and no reading.
     eng.config.train_merit_p_min = 0.0;
     eng.config.train_merit_p_max = 0.0;
     eng.step_one_net_in_frame(&hashes[2], 5, Some(frame), false)
@@ -3050,10 +3008,7 @@ fn train_lottery_arms_after_the_born_shield_and_grades_level_per_ticket() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// THE BORN TICKET IS AUTOMATIC: the born shield hands a fresh net a fraction of `1.0`, and the
-/// band folds that to `hi` — so leaving the first clock to the coin could idle a net whose shield
-/// is served only by TRAINING. A net at `U = 0` therefore SKIPS the draw: the first update is
-/// granted, not paid, and `U` reads 1 the moment that clock lands.
+/// THE BORN TICKET IS AUTOMATIC: the born shield hands a fresh net a fraction of `1.0`, and the band folds that to `hi` — so leaving the first clock to the coin could idle…
 #[test]
 fn a_newborn_always_trains_on_its_first_live_clock() {
     let dir = std::env::temp_dir().join("gras-born-ticket");
@@ -3159,12 +3114,6 @@ fn the_ticket_is_paid_from_the_band_alone() {
         (eff(&eng, 2) - 0.204).abs() < 1e-6,
         "the worst keeps 1% of the band above p_min"
     );
-    // The retired field moves nothing: the band is the only dial left.
-    eng.config.train_merit = 0.0;
-    assert!(
-        (eff(&eng, 2) - 0.204).abs() < 1e-6,
-        "Ω is inert, the band is literal"
-    );
     // `p = 1` sells without consuming a draw; `p = 0` never sells.
     eng.config.train_merit_p_min = 1.0;
     assert!(eng.train_lottery_draws(&hashes[0], 5, Some(frame)));
@@ -3175,8 +3124,7 @@ fn the_ticket_is_paid_from_the_band_alone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `p_min` is a BOTTOM floor on the field fraction: it lifts the worst net off `p = 0` without
-/// moving the best one, and it sits UNDER Ω, so `Ω = 0` still means "everybody trains".
+/// `p_min` lifts the worst net off `p = 0` without moving the best one.
 #[test]
 fn train_merit_p_min_floors_only_the_bottom_of_the_field() {
     let dir = std::env::temp_dir().join("gras-train-merit-p-min");
@@ -3220,8 +3168,6 @@ fn train_merit_p_min_floors_only_the_bottom_of_the_field() {
     // Bottom-ONLY: the gap between the best and the middle shrank by the 0.95 factor,
     // not by a constant, so the field's order and relative shape survive.
     assert!((eff(&eng, 0) - eff(&eng, 1) - 0.4655).abs() < 1e-6);
-    // No second dial: the floor stays the floor, whatever the retired field says.
-    eng.config.train_merit = 0.5;
     assert!((eff(&eng, 2) - 0.0595).abs() < 1e-6, "the band is literal");
     assert!(
         (eff(&eng, 1) - 0.525).abs() < 1e-6,
@@ -3592,7 +3538,6 @@ fn resume_warns_on_a_train_merit_mismatch() {
     let dir = std::env::temp_dir().join("race_resume_train_merit");
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 99).unwrap();
-    engine.config.train_merit = 0.5;
     engine
         .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
@@ -3654,32 +3599,6 @@ fn resume_warns_on_a_train_merit_mismatch() {
     assert!(resumed.behavioural_drift().is_empty());
 
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A header written before Ω recorded the knob as the bool `evolution_train_lottery`: `true` ran
-/// the full merit weighting, so it must normalize to Ω = 1.0 (and stay resumable at that strength),
-#[test]
-fn a_legacy_bool_lottery_header_normalizes_to_omega() {
-    let snap = |json: &str| {
-        let header: crate::state::RunHeader =
-            crate::state::RunHeader::from_json(json).expect("legacy header loads");
-        header.config.train_merit
-    };
-    assert_eq!(
-        snap(r#"{"config":{"evolution_train_lottery":true}}"#),
-        1.0,
-        "a run recorded as ON trained at the full merit weighting"
-    );
-    assert_eq!(snap(r#"{"config":{"evolution_train_lottery":false}}"#), 0.0);
-    assert_eq!(snap(r#"{"config":{}}"#), 0.0, "pre-knob = always train");
-    // One truth per header: the legacy key is consumed, not carried forward.
-    let header =
-        crate::state::RunHeader::from_json(r#"{"config":{"evolution_train_lottery":true}}"#)
-            .unwrap();
-    assert_eq!(header.config.legacy_train_lottery, None);
-    let written = header.to_json().unwrap();
-    assert!(!written.contains("evolution_train_lottery"), "{written}");
-    assert!(written.contains("\"train_merit\""), "{written}");
 }
 
 /// R6: cull policies are BEHAVIOURAL — they pick the next victim, not what already happened —
@@ -4077,7 +3996,7 @@ fn founder_topology_loader_reads_netstate_json() {
 // ── Seed from a previous run's final table ──────────────────────────
 
 /// Write a prior-run fixture (`engine.json` + `nets/<hash>.json`, optionally
-/// final table `elites.json`); no `trainer` blob, so that check skips.
+/// final table `champions.json`); no `trainer` blob, so that check skips.
 fn write_prior_run(dir: &std::path::Path, run_id: &str, with_index: bool) -> Topology {
     std::fs::create_dir_all(dir.join("nets")).unwrap();
     let topo = tiny_topology(999);
@@ -4099,7 +4018,7 @@ fn write_prior_run(dir: &std::path::Path, run_id: &str, with_index: bool) -> Top
     });
     if with_index {
         std::fs::write(
-            dir.join("elites.json"),
+            dir.join("champions.json"),
             serde_json::json!([{ "rank": 1, "hash": hash, "fitness": 0.25, "params": 4242 }])
                 .to_string(),
         )
@@ -4362,8 +4281,6 @@ fn every_live_net_gets_weights_at_every_tick_and_at_stop() {
     // The retired writers left no WEIGHTS behind under their old names (the topology
     // markdown `champion-<hash>-<fitness>.md` stays — that flag is untouched).
     assert!(dir.join("champions.json").exists());
-    // One release of compatibility: the legacy name carries the same bytes.
-    assert!(dir.join("elites.json").exists());
     for stale in std::fs::read_dir(&dir).unwrap().flatten() {
         let name = stale.file_name().to_string_lossy().to_string();
         let retired_weights = name.ends_with(".safetensors") && name.starts_with("elite-");
@@ -4418,9 +4335,7 @@ fn zero_checkpoint_every_skips_the_tick_but_still_finishes_the_run() {
 
 // ── Recovery streak (post-update retries) ─────────────────────────
 
-/// Reports a SCRIPTED fitness per train call, ignoring the weights: the streak reads exactly
-/// `report.fitness`, so a test can hand it a fall, a deeper fall and a recovery without a real
-/// loss surface. `eval_loss` stays `None` so the debug re-score probe stays out of the way.
+/// Reports a SCRIPTED fitness per train call, ignoring the weights: the streak reads exactly `report.fitness`, so a test can hand it a fall, a deeper fall and a recovery…
 struct ScriptedTrainer {
     inner: crate::trainer::TabularTrainer,
     script: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<f32>>>,
@@ -4502,16 +4417,12 @@ fn streak_engine(
     (eng, hash)
 }
 
-/// The mechanic: a reading WORSE than the net's standing buys the next update in the SAME clock,
-/// and the streak stops the moment the net is back where it was going in. Minimize, so a HIGHER
-/// reading is a fall.
+/// The mechanic: a reading WORSE than the net's standing buys the next update in the SAME clock, and the streak stops the moment the net is back where it was going in.
 #[test]
 fn recovery_streak_retries_until_the_reading_is_back() {
     let dir = std::env::temp_dir().join("gras-recovery-streak");
     let _ = std::fs::remove_dir_all(&dir);
-    // Clock 0 sets the standing at 1.0 (no prior reading, so no streak). Clock 1 reads 3.0 — a
-    // fall — then 2.5 — still short — then 0.5, which is back. Two retries, and the 1.5 that would
-    // have been the third is never taken.
+    // Clock 0 sets the standing at 1.0 (no prior reading, so no streak).
     let (mut eng, hash) = streak_engine(
         &dir,
         |c| {
@@ -4547,9 +4458,7 @@ fn recovery_streak_retries_until_the_reading_is_back() {
 fn recovery_never_fires_inside_the_init_probation() {
     let dir = std::env::temp_dir().join("gras-recovery-probation");
     let _ = std::fs::remove_dir_all(&dir);
-    // Clock 0 sets the standing (1.0). Clock 1 is INSIDE the probation and reads 3.0 — a fall with a
-    // 5-retry budget armed, and still no retry. Clock 2 is past the probation and falls again (5.0
-    // against a 2.0 standing), so the SAME budget now buys exactly one retry, back at 1.0.
+    // Clock 0 sets the standing (1.0).
     let (mut eng, hash) = streak_engine(
         &dir,
         |c| {
@@ -4815,9 +4724,7 @@ fn crossover_probation_shields_crossover_children_with_its_own_window() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
-/// A two-net fixture whose coin can NEVER be won: `p_min = p_max = 0` collapses BOTH ends of the
-/// Ω band to `0`, so `p_eff = 0` and every draw is lost. Both founders are out of their born
-/// shield (the probation windows are 0) and carry a reading, so the lottery is armed.
+/// A two-net fixture whose coin can NEVER be won: `p_min = p_max = 0` collapses BOTH ends of the Ω band to `0`, so `p_eff = 0` and every draw is lost.
 fn zero_ticket_engine(dir: &std::path::Path, learn_only: bool) -> crate::TabularEngine {
     let mut eng = engine(dir, 31).unwrap();
     eng.config.train_merit_p_min = 0.0;
@@ -4836,9 +4743,7 @@ fn zero_ticket_engine(dir: &std::path::Path, learn_only: bool) -> crate::Tabular
     eng
 }
 
-/// LEARN-ONLY: the lost ticket costs the UPDATE, not the STEP — the net runs its real trainer
-/// through the no-op optimizer, so it acts, is measured on a fresh batch, and its reading moves;
-/// only the weight write (and the update counter) is lost.
+/// LEARN-ONLY: the lost ticket costs the UPDATE, not the STEP — the net runs its real trainer through the no-op optimizer, so it acts, is measured on a fresh batch, and its…
 #[test]
 fn learn_only_turns_a_lost_ticket_into_an_act_only_pass() {
     let dir = std::env::temp_dir().join("gras-learn-only-on");
@@ -4936,10 +4841,9 @@ fn init_probation_round_trips_and_legacy_headers_mean_off() {
     );
 }
 
-/// The renamed window knob round-trips under its new key, and a header written while it was called
-/// `policy_stats` still reads back as the same field.
+/// The renamed window knob round-trips under its current key.
 #[test]
-fn policy_scoped_fitness_round_trips_and_reads_its_old_key() {
+fn policy_scoped_fitness_round_trips() {
     let mut cfg = RaceConfig::defaults();
     cfg.policy_scoped_fitness = true;
     let snap = ConfigSnapshot::from_config(&cfg, None, None);
@@ -4949,19 +4853,6 @@ fn policy_scoped_fitness_round_trips_and_reads_its_old_key() {
     assert!(
         json.contains("\"policy_scoped_fitness\""),
         "the header carries the name the knob means: {json}"
-    );
-
-    let mut obj = serde_json::from_str::<serde_json::Value>(&json)
-        .unwrap()
-        .as_object()
-        .unwrap()
-        .clone();
-    let v = obj.remove("policy_scoped_fitness").unwrap();
-    obj.insert("policy_stats".to_string(), v);
-    let old: ConfigSnapshot = serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
-    assert!(
-        old.policy_scoped_fitness,
-        "the knob's old key still reads as this one"
     );
 }
 
@@ -5226,10 +5117,7 @@ fn resume_refuses_a_different_exam_store() {
     );
 }
 
-/// The anti-champion dump is a real ARTIFACT, not a card: `worst-<hash>-<fit>.md` for the
-/// `champion_count` worst nets — the `spent` ranking when the lottery can grade, the lowest
-/// `fit (F)` when it cannot (this test pins that fallback) — plus a `worst.md` index, each file
-/// carrying the topology, the mermaid graph and the lineage.
+/// The anti-champion dump is a real ARTIFACT, not a card: `worst-<hash>-<fit>.md` for the `champion_count` worst nets — the `spent` ranking when the lottery can grade, the…
 #[test]
 fn the_worst_dump_writes_the_lowest_fit_nets() {
     let dir = std::env::temp_dir().join("gras-worst-dump");
@@ -5239,9 +5127,7 @@ fn the_worst_dump_writes_the_lowest_fit_nets() {
         .unwrap();
     eng.config.worst_save_topology = true;
     eng.config.champion_count = 1;
-    // The lottery OFF (a band whose floor is 1.0 sells every clock to everybody): no net has a
-    // `spent` score, so this pins the FALLBACK contract — the ungraded dump is the lowest
-    // `fit (F)`, exactly the pre-criterion artifact.
+    // The lottery OFF (a band whose floor is 1.0 sells every clock to everybody): no net has a `spent` score, so this pins the FALLBACK contract — the ungraded dump is the…
     eng.config.train_merit_p_min = 1.0;
     let hashes = eng.state.live_hashes();
     for (i, h) in hashes.iter().enumerate() {
@@ -5289,15 +5175,13 @@ fn the_worst_dump_writes_the_lowest_fit_nets() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// POLICY-SCOPED FITNESS (`policy_scoped_fitness`): `n` counts the readings taken on the CURRENT
-/// weights, so a net that updates every clock reports ONE datapoint (its value, no spread) instead
-/// of K readings from K different policies — while the flag off keeps the pre-flag window byte for
-/// byte.
+/// POLICY-SCOPED FITNESS (`policy_scoped_fitness`): `n` counts the readings taken on the CURRENT weights, so a net that updates every clock reports ONE datapoint (its…
 #[test]
 fn policy_scoped_fitness_reads_only_the_current_weights() {
     let dir = std::env::temp_dir().join("gras-policy-scoped-fitness");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 11).unwrap();
+    eng.config.policy_scoped_fitness = false;
     eng.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
         .unwrap();
     let h = eng.state.live_hashes()[0].clone();
@@ -5324,10 +5208,7 @@ fn policy_scoped_fitness_reads_only_the_current_weights() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The anti-champion dump follows the `spent` criterion, not `fit (F)`: on the SAME three-net
-/// fixture the cull test uses, the weak net that has spent ONE update is the bottom of `fit (F)`
-/// and would head the old dump — the `spent` list files the mid net that already burned nine
-/// instead, and the file carries the note explaining the criterion.
+/// The anti-champion dump follows the `spent` criterion, not `fit (F)`: on the SAME three-net fixture the cull test uses, the weak net that has spent ONE update is the…
 #[test]
 fn the_worst_dump_ranks_by_the_spent_criterion_not_by_fit_alone() {
     let dir = std::env::temp_dir().join("gras-worst-dump-spent");
@@ -5348,11 +5229,7 @@ fn the_worst_dump_ranks_by_the_spent_criterion_not_by_fit_alone() {
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
     }
-    // Name the ends from the RANKING, not from a hard-coded direction: `ranked_live()` is
-    // best-first whatever the fitness points, so `best_fit` / `mid` / `worst_fit` mean the same
-    // thing in every fixture. The two better nets have spent 9 updates each; the fit-worst has
-    // spent 1, so it is the net the lottery is about to keep paying — and the one the old dump
-    // filed first.
+    // Name the ends from the RANKING, not from a hard-coded direction: `ranked_live()` is best-first whatever the fitness points, so `best_fit` / `mid` / `worst_fit` mean the…
     let ranked = eng.ranked_live();
     let best_fit = ranked[0].0.clone();
     let mid = ranked[1].0.clone();
