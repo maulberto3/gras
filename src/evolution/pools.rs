@@ -26,9 +26,7 @@ pub fn all_activations() -> Vec<Activation> {
     ]
 }
 
-/// All built-in combine ops — the pool an EMPTY `combine_op_pool` resolves to, so "all" here has to
-/// mean all of them, `mul`/`sub`/`div` included: a caller who wants the conservative four names
-/// them explicitly (`set_topology_combine_op_pool(["add", "mean", "max", "min"])`).
+/// All built-in combine ops — the pool an EMPTY `combine_op_pool` resolves to, so "all" here has to mean all of them, `mul`/`sub`/`div` included: a caller who wants the…
 pub fn all_combine_ops() -> Vec<CombineOp> {
     vec![
         CombineOp::Add,
