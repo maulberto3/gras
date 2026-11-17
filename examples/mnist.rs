@@ -24,6 +24,29 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(2);
 }
 
+/// Random-label smoke data — nothing to download, and nothing to trust: only
+/// `--synthetic` builds it, and its fitness says nothing about MNIST.
+fn synthetic_classification(
+    n: usize,
+    in_dim: usize,
+    out_dim: usize,
+    seed: u64,
+    device: Device,
+) -> gras::Dataset {
+    let mut rng = fastrand::Rng::with_seed(seed);
+    let inputs: Vec<f32> = (0..n * in_dim).map(|_| rng.f32()).collect();
+    let inputs = Tensor::from_f32(&inputs, &[n as i64, in_dim as i64], device)
+        .unwrap_or_else(|e| die(format!("synthetic inputs: {e}")));
+    let mut targets = vec![0.0f32; n * out_dim];
+    for row in 0..n {
+        targets[row * out_dim + rng.usize(0..out_dim)] = 1.0;
+    }
+    let targets = Tensor::from_f32(&targets, &[n as i64, out_dim as i64], device)
+        .unwrap_or_else(|e| die(format!("synthetic targets: {e}")));
+    gras::Dataset::from_tensors(inputs, targets)
+        .unwrap_or_else(|e| die(format!("synthetic dataset: {e}")))
+}
+
 /// Resolve the dataset and return `(inputs, outputs)` — the widths the run's topologies are built
 /// with. The dataset is REQUIRED: a missing dir is an error, and only `--synthetic` fabricates one.
 fn dataset_widths(data_dir: &Path, synthetic: bool) -> (usize, usize) {
@@ -48,8 +71,7 @@ fn dataset_widths(data_dir: &Path, synthetic: bool) -> (usize, usize) {
             "  {} not found — generating SYNTHETIC random-label data (smoke test only, not MNIST)",
             data_dir.display()
         );
-        let ds = tabular_data::synthetic_classification(1024, 784, 10, 42, gras::auto_device())
-            .unwrap_or_else(|e| die(format!("synthetic dataset: {e}")));
+        let ds = synthetic_classification(1024, 784, 10, 42, gras::auto_device());
         tabular_data::save_dataset(data_dir, &ds)
             .unwrap_or_else(|e| die(format!("saving {}: {e}", data_dir.display())));
     }
@@ -62,8 +84,7 @@ fn dataset_widths(data_dir: &Path, synthetic: bool) -> (usize, usize) {
         tabular_data::resolve_dataset(data_dir)
             .unwrap_or_else(|e| die(format!("{}: {e}", data_dir.display())))
     };
-    let d_in = peeked.inputs.shape()[1] as usize;
-    let d_out = peeked.targets.shape()[1] as usize;
+    let (d_in, d_out) = peeked.dims();
     drop(peeked);
     if explicit_layout {
         println!(
@@ -270,9 +291,9 @@ fn jitter_inputs(
 /// Live nets in the race (default; `--pop` overrides).
 const POP: usize = 100;
 /// Crossover turnover: the share of the live field replaced per clock, dealt as `round(share × pop)` rolls.
-const CROSSOVER_TURNOVER: f32 = 1.0 / 60.0;
+const CROSSOVER_TURNOVER: f32 = 0.05;
 /// MUTATION turnover default, the mutation channel's own share of the field per clock.
-const MUTATION_TURNOVER: f32 = 1.0 / 60.0;
+const MUTATION_TURNOVER: f32 = 0.01;
 /// Step budget for a full run: `--max-steps N` runs exactly N clocks before Stop.
 const RACE_STEPS: usize = 50;
 /// Steps between population checkpoints — the era rotation and the CSV flush ride this.
@@ -486,12 +507,12 @@ struct Cli {
     /// Crossover operator pool, drawn per attempt; empty = both.
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
     crossover_ops_pool: Vec<String>,
-    /// Feature-split draw order for a newborn (`none`,`random`,`exclusive`); empty = all three.
+    /// Feature-split draw order for a newborn (`none`,`random`,`exclusive`); `none` = every feature hits every port.
     #[arg(
         long,
         value_name = "LIST",
         value_delimiter = ',',
-        default_values_t = [String::from("exclusive")]
+        default_values_t = [String::from("none")]
     )]
     feature_split_pool: Vec<String>,
     /// Combine-op pool (`add`,`mean`,`max`,…); empty = every combine op.

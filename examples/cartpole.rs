@@ -488,8 +488,13 @@ struct Cli {
     /// Crossover operator pool, drawn per attempt; empty = both.
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
     crossover_ops_pool: Vec<String>,
-    /// Feature-split draw order for a newborn (`none`,`random`,`exclusive`); empty = all three.
-    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    /// Feature-split draw order for a newborn (`none`,`random`,`exclusive`); `none` = every feature hits every port.
+    #[arg(
+        long,
+        value_name = "LIST",
+        value_delimiter = ',',
+        default_values_t = [String::from("none")]
+    )]
     feature_split_pool: Vec<String>,
     /// Combine-op pool (`add`,`mean`,`max`,…); empty = every combine op.
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
@@ -632,7 +637,7 @@ fn main() {
         .set_topology_input_dim(input_dim)
         .set_topology_output_dim(ACTIONS)
         // A one-entry pool pins a policy — the same call `set_topology_feature_split` makes.
-        // .set_topology_feature_split_pool(cli.feature_split_pool.clone())
+        .set_topology_feature_split_pool(cli.feature_split_pool.clone())
         // .set_topology_combine_op_pool(cli.combine_op_pool.clone())
         // .set_topology_activation_pool(cli.activation_pool.clone())
         // .set_topology_standardize_op_pool(cli.standardize_pool.clone())
