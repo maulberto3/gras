@@ -1,25 +1,4 @@
 //! The optimizers a trainer can be built with — by name, so a record can carry one.
-//!
-//! The engine never touches an optimizer: `TabularStep` / `RlStep` own
-//! `make_optimizer` / `restore_optimizer`, which is what lets a scheme pick its own
-//! update. Until this module existed that choice was welded to Adam inside both
-//! shipped trainers, so a config file could not name a different one and a resume
-//! could not check that it had not changed.
-//!
-//! # Why a name and not a closure
-//!
-//! An optimizer is not just a step function: its MOMENTS are part of the run's
-//! state (`nets/<hash>.optim`). A closure could not be recorded, so a resumed run
-//! could silently continue with different moments — the exact class of bug
-//! trainer blob exists to prevent. A name is recorded, compared, and rebuilt.
-//!
-//! # Hyperparameters
-//!
-//! One entry per optimizer, at flodl's conventional defaults — `adamw` uses weight
-//! decay 0.01, `sgd` uses momentum 0.9. They are deliberately NOT knobs here:
-//! tunable would have to be recorded, round-tripped and compared, and a menu
-//! names is the surface this binding can honestly offer. Use a custom trainer
-//! Rust closure) when you need the knobs.
 
 use crate::graph::network::Network;
 use flodl::nn::Module;

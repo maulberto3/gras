@@ -1,72 +1,4 @@
 //! The reference [`RlStep`]: REINFORCE over any [`Env`].
-//!
-//! The update the crate used to keep welded to cartpole's physics.
-//! `examples/cartpole.rs` an environment and an algorithm were one file, so no
-//! RL scheme could ship in the crate and no second world could reuse the update.
-//! Here the world sits behind the [`Env`] contract and this type is the update:
-//! `Reinforce::new(my_world, device)` trains any world that can `reset(seed)`
-//! `step(action)`.
-//!
-//! # The step
-//!
-//! Per net, per clock:
-//!
-//! 1. Play `matches_per_step` TRAIN episodes with the acting rule ([`ACTION_RULE`]:
-//!    the greedy head — argmax over the policy's action values — by default, or a
-//!    seeded softmax sample), recording every `(observation, action)` turn.
-//! 2. Score them: a per-turn return `G_t` from the episode's own outcome
-//!    ([`Signal`]), a batch-mean baseline, advantages scaled to unit variance, and the summed
-//!    per-turn loss divided by the batch's turn count ([`LOSS_MEAN_OVER_TURNS`]).
-//! 3. One optimizer step on the REINFORCE objective
-//!    `−Σ_t Â_t · log π(a_t | s_t)`, where the log-probability is a **normalized**
-//!    `log_softmax` of the policy's own forward — the graph a gradient needs.
-//! 4. Play `eval_matches_per_step` EVAL episodes from SHARED seeds — the same
-//!    games for every net, freshly drawn at every clock — under [`EVAL_ACTION_RULE`]
-//!    (the greedy head, unless [`Reinforce::with_eval_action_rule`] names another) and
-//!    report their mean outcome as the fitness: the only ranking input the engine gets.
-//!
-//! # Exploration
-//!
-//! [`ACTION_RULE`] is the DEFAULT switch ([`Reinforce::with_action_rule`] overrides it per run):
-//! `Argmax` plays the net's own preference, `Softmax` draws from `softmax(values / T)` with a
-//! generator seeded from the episode's OWN seed — the replay contract, not a hidden
-//! RNG. Under the default head there is no sampling, so exploration comes from the
-//! anti-plateau challenge ([`challenge_fires`]): on a fired step the trainer forces
-//! an action on every TRAIN turn through [`ChallengePolicy`], and EVAL games stay
-//! clean, so the exam still measures the net's own policy. [`EVAL_ACTION_RULE`] is the same
-//! guarantee for the SAMPLING arm: `Softmax` training explores, the exam still plays greedy unless
-//! `with_eval_action_rule` names otherwise. The default probability
-//! is non-zero for that reason: a greedy head never tries a second action in the
-//! state it is in. The matches of a batch are still different GAMES — each index
-//! draws its own seed, and `Env::reset` draws the start state from it — so a greedy
-//! batch differs in where it starts, never in what the policy attempts.
-//!
-//! # The replay contract
-//!
-//! Every episode seed is a pure function of `(seed_base, step, match_i)` —
-//! [`episode_start_seed`] — and every draw the world makes comes from the seed
-//! is handed ([`Env::reset`]). Nothing here keeps a counter or consumes a global
-//! generator, so two runs with the same seed feed identical seeds and a resumed
-//! run replays the identical episodes. The TRAIN base is `net_seed ^ run_seed`:
-//! per net, so nets of one population explore different worlds, and blended
-//! the run seed so an inherited champion does not replay its parent's exact
-//! trajectories. The EVAL base is `run_seed` alone (`eval_seed_base`): shared,
-//! because every net has to sit the same exam, and its step axis is the CLOCK —
-//! a fresh set of start states every clock, so a reading moves when the POLICY
-//! moves rather than when an era happens to end, and the spread across a
-//! clock's games is a robustness signal the ranking can charge for. The ERA
-//! axis (`eval_era_of`, `checkpoint_every` clocks wide) is opt-in
-//! (`with_per_clock_exam(false)`): it makes nets measured inside one era sit
-//! identical games — a newborn is then comparable with a parent read earlier in
-//! that era — at the cost of replaying one exam for a whole era, which is what
-//! froze a champion's reading to a constant.
-//!
-//! # Modes
-//!
-//! Episode play runs with dropout OFF and the update with dropout ON, both set
-//! explicitly (`eval` / `train`) rather than inherited from whatever ran last.
-//! `Network::build` already leaves a net in eval, so this changes no recorded
-//! run's numbers — it just makes the trainer independent of its caller.
 
 use crate::graph::network::Network;
 use crate::trainer::challenge::{
@@ -101,12 +33,7 @@ const DEFAULT_CHALLENGE_PROB: f32 = 0.1;
 /// `eff = p × (1 − √progress)`).
 const DEFAULT_CHALLENGE_DECAY: ChallengeDecay = ChallengeDecay::Custom { exponent: 0.5 };
 
-/// The seed offset that separates a step's EVAL exam from its TRAIN episodes —
-/// a plain add on the run seed, so the two bases sit that constant apart for any run
-/// seed. The BASES are not guaranteed distinct from a net's, though: a net seed that
-/// folds onto the offset (`net_seed ^ run_seed == run_seed + EVAL_SEED_OFFSET`, e.g.
-/// `net_seed` 1000 on a run seed whose low bits do not carry) makes one of its TRAIN
-/// games coincide with the exam game in the same slot.
+/// The seed offset that separates a step's EVAL exam from its TRAIN episodes — a plain add on the run seed, so the two bases sit that constant apart for any run seed.
 const EVAL_SEED_OFFSET: u64 = 1000;
 
 /// The guardrail's games stay on a fixed seed forever: a verdict has to be
@@ -236,9 +163,7 @@ pub struct Reinforce<E: Env> {
     /// How the acting forward pass turns action values into a move, and the temperature
     /// [`ActionRule::Softmax`] draws at — the build consts unless a caller sets them.
     action_rule: ActionRule,
-    /// The EXAM's rule ([`EVAL_ACTION_RULE`], the greedy head unless a caller sets it): training
-    /// may explore while the reading stays the policy the net actually plays. Shares
-    /// [`Self::softmax_temperature`], so one `T` describes both arms.
+    /// The EXAM's rule ([`EVAL_ACTION_RULE`], the greedy head unless a caller sets it): training may explore while the reading stays the policy the net actually plays.
     eval_action_rule: ActionRule,
     softmax_temperature: f32,
 }
@@ -293,12 +218,7 @@ impl<E: Env> Reinforce<E> {
         self
     }
 
-    /// Draw the EVAL exam per CLOCK (default `true`) instead of per era — see the
-    /// module docs' replay contract. Per-clock is what makes a net's robustness
-    /// visible: every clock draws a fresh set of start states (the same set for
-    /// every net, so the comparison stays paired), so a frozen policy's reading
-    /// still moves and the within-clock spread becomes real. `false` restores the
-    /// pre-2026-11-08 era-scoped exam (`checkpoint_every` clocks share one).
+    /// Draw the EVAL exam per CLOCK (default `true`) instead of per era — see the module docs' replay contract.
     pub fn with_per_clock_exam(mut self, on: bool) -> Self {
         self.per_clock_exam = on;
         self
@@ -311,11 +231,7 @@ impl<E: Env> Reinforce<E> {
         self
     }
 
-    /// Set the ACTING rule and its temperature (defaults [`ACTION_RULE`] /
-    /// [`SOFTMAX_TEMPERATURE`]): what both the TRAIN episodes and the EVAL exam act under. A
-    /// `Softmax` run explores inside its own policy, drawn from each episode's seeded generator,
-    /// so a seed still replays the same moves. A non-positive or non-finite temperature falls back
-    /// to `1.0`, and the value is recorded by `describe()` whenever it is not the default.
+    /// Set the ACTING rule and its temperature (defaults [`ACTION_RULE`] / [`SOFTMAX_TEMPERATURE`]): what both the TRAIN episodes and the EVAL exam act under.
     pub fn with_action_rule(mut self, rule: ActionRule, temperature: f32) -> Self {
         self.action_rule = rule;
         self.softmax_temperature = if temperature.is_finite() && temperature > 0.0 {
@@ -331,11 +247,7 @@ impl<E: Env> Reinforce<E> {
         (self.action_rule, self.softmax_temperature)
     }
 
-    /// Set the EXAM's acting rule (default [`EVAL_ACTION_RULE`], the greedy head) — the phase
-    /// split [`Self::with_action_rule`] cannot express: `Softmax` training explores inside the
-    /// policy, `Argmax` exam scores the policy the net would actually play. The temperature is the
-    /// one [`Self::with_action_rule`] set. Recorded by `describe()` whenever it is not the
-    /// default, so a resume cannot silently start sampling its readings.
+    /// Set the EXAM's acting rule (default [`EVAL_ACTION_RULE`], the greedy head) — the phase split [`Self::with_action_rule`] cannot express: `Softmax` training explores…
     pub fn with_eval_action_rule(mut self, rule: ActionRule) -> Self {
         self.eval_action_rule = rule;
         self
@@ -410,9 +322,7 @@ impl<E: Env> Reinforce<E> {
         self.play_episode_with_rule(net, start_seed, forced, self.action_rule)
     }
 
-    /// [`Self::play_episode`] under an EXPLICIT rule — the eval exam passes
-    /// [`Self::eval_action_rule`], so exploration on the training side can never leak into the
-    /// fitness the net is ranked and culled on.
+    /// [`Self::play_episode`] under an EXPLICIT rule — the eval exam passes [`Self::eval_action_rule`], so exploration on the training side can never leak into the fitness the…
     fn play_episode_with_rule(
         &mut self,
         net: &mut Network,
@@ -456,9 +366,7 @@ impl<E: Env> Reinforce<E> {
         Ok(episode)
     }
 
-    /// REINFORCE update over the step's played episodes: `−Σ_t Â_t · log π(a_t|s_t)`
-    /// with a batch-mean baseline and unit-variance advantages, summed over the batch's turns and
-    /// divided by their count when [`LOSS_MEAN_OVER_TURNS`]. Returns the loss.
+    /// REINFORCE update over the step's played episodes: `−Σ_t Â_t · log π(a_t|s_t)` with a batch-mean baseline and unit-variance advantages, summed over the batch's turns and…
     fn reinforce_update(
         &self,
         net: &mut Network,
@@ -617,19 +525,14 @@ impl<E: Env> RlStep for Reinforce<E> {
         if self.optimizer != crate::trainer::OptimizerKind::default() {
             blob["optimizer"] = serde_json::Value::String(self.optimizer.label().to_string());
         }
-        // The acting rule can be the build const OR a per-run setter, so the resume guard must see
-        // it: a run recorded under `softmax` cannot resume into an `argmax` trainer. Omitted while
-        // it is the reference recipe, so every run recorded before the switch existed still
-        // resumes unchanged.
+        // The acting rule can be the build const OR a per-run setter, so the resume guard must see it: a run recorded under `softmax` cannot resume into an `argmax` trainer.
         if self.action_rule != ActionRule::Argmax {
             blob["action_rule"] = serde_json::Value::String(self.action_rule.as_str().to_string());
             if self.softmax_temperature != SOFTMAX_TEMPERATURE {
                 blob["softmax_temperature"] = serde_json::json!(self.softmax_temperature);
             }
         }
-        // Same rule for the EXAM's arm: a sampled exam measures a different quantity from a greedy
-        // one, so a resume must not swap it. Omitted at the default, exactly like `action_rule`, so
-        // every run recorded before the split still resumes unchanged.
+        // Same rule for the EXAM's arm: a sampled exam measures a different quantity from a greedy one, so a resume must not swap it.
         if self.eval_action_rule != EVAL_ACTION_RULE {
             blob["eval_action_rule"] =
                 serde_json::Value::String(self.eval_action_rule.as_str().to_string());
@@ -666,11 +569,7 @@ impl<E: Env> RlStep for Reinforce<E> {
             optimizer.set_lr(named.lr(self.learning_rate, step, ctx.env.max_steps) as f64);
         }
 
-        // 1. TRAIN episodes: per-net seeds, run seed blended in so an inherited
-        //    champion does not replay its source run's exact trajectories. A recovery retry on a
-        //    FRESH draw (`env.attempt`) walks the NEXT block of starts; under the default
-        //    same-draw streak `attempt` is `0`, so the retry replays this clock's episodes exactly
-        //    and answers whether the fall was the update's fault.
+        // 1.
         let train_base = ctx.net_seed ^ ctx.env.run_seed;
         let attempt_block = ctx.env.attempt.wrapping_mul(self.matches_per_step as u64);
         let mut episodes: Vec<Episode> = Vec::with_capacity(self.matches_per_step);
@@ -737,11 +636,7 @@ fn eval_seed_base(run_seed: u64) -> u64 {
     run_seed.wrapping_add(EVAL_SEED_OFFSET)
 }
 
-/// The ERA a clock sits: `era_len` clocks share one — the opt-in axis
-/// (`with_per_clock_exam(false)`), where a net read at clock 118 and a newborn read at 121 are
-/// graded on the identical games whenever both land in the same era. The same arithmetic the
-/// tabular stream rotates its eval permutation on. `era_len == 0` (no tick recorded) reads as
-/// per-clock, never a divide by zero.
+/// The ERA a clock sits: `era_len` clocks share one — the opt-in axis (`with_per_clock_exam(false)`), where a net read at clock 118 and a newborn read at 121 are graded on…
 fn eval_era_of(step: usize, era_len: usize) -> usize {
     if era_len == 0 { step } else { step / era_len }
 }
@@ -767,15 +662,9 @@ fn greedy_action(values: &[f32]) -> usize {
 /// How the ACTING forward pass turns a net's action values into a move.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionRule {
-    /// The greedy head: argmax over the action values, ties to the lowest index. The
-    /// policy plays its own preference, so a fixed game set replayed on fixed weights
-    /// plays the identical episode — the exam's spread is then the POLICY's, never a
-    /// sampler's.
+    /// The greedy head: argmax over the action values, ties to the lowest index.
     Argmax,
-    /// Sample from `softmax(values / T)`, `T` the run's temperature (`with_action_rule`, default
-    /// [`SOFTMAX_TEMPERATURE`]). Exploration inside the
-    /// acting policy itself, drawn from the episode's seeded generator, so a seed
-    /// still replays the same moves.
+    /// Sample from `softmax(values / T)`, `T` the run's temperature (`with_action_rule`, default [`SOFTMAX_TEMPERATURE`]).
     Softmax,
 }
 
@@ -790,38 +679,16 @@ impl ActionRule {
 }
 
 /// THE default acting switch: [`ActionRule::Argmax`] (default) or [`ActionRule::Softmax`].
-///
-/// This is the build-wide default; a caller can override it per runner with
-/// [`Reinforce::with_action_rule`] (an example spells it out as a const or a flag). Either way
-/// the choice is recorded by `describe()` and diffed by the resume guard, because it changes
-/// every episode the run plays — it is never threaded through the engine, which only ever sees
-/// the fitness.
 pub const ACTION_RULE: ActionRule = ActionRule::Argmax;
 
-/// THE default EXAM switch: [`ActionRule::Argmax`].
-///
-/// eli5: exploration belongs to the learning side. A sampled exam would score a lottery draw as
-/// well as a policy, so the fitness that ranks, culls and crowns would wobble with the sampler
-/// instead of with the weights. Keeping the exam greedy means `--action-rule softmax` changes what
-/// the net LEARNS and nothing about what it is MEASURED to be. Override per run with
-/// [`Reinforce::with_eval_action_rule`]; the choice is recorded by `describe()` when it is not the
-/// default.
+/// THE default EXAM switch: [`ActionRule::Argmax`].  eli5: exploration belongs to the learning side.
 pub const EVAL_ACTION_RULE: ActionRule = ActionRule::Argmax;
 
 /// Temperature for [`ActionRule::Softmax`]: `π ∝ exp(values / T)`. `1.0` keeps the
 /// net's own scale; smaller sharpens toward [`ActionRule::Argmax`], larger flattens.
 pub const SOFTMAX_TEMPERATURE: f32 = 1.0;
 
-/// Whether the REINFORCE loss is the batch's TURN MEAN instead of its SUM.
-///
-/// eli5: one update's gradient should not get 50× louder just because the episodes it happened
-/// to play were 50× longer. `true` (the reference recipe) divides the summed per-turn terms by
-/// the batch's turn count, so a step's size is set by the learning rate and the clip, not by how
-/// long the world let the policy live. `false` restores the pre-2026-11-10 sum, where a
-/// 500-turn cartpole episode carried ~50× the gradient of a 10-turn one.
-///
-/// This is a build const, not a per-run knob: it changes every RL step, so it is recorded here
-/// once rather than threaded through the engine, which only ever sees the fitness.
+/// Whether the REINFORCE loss is the batch's TURN MEAN instead of its SUM.  eli5: one update's gradient should not get 50× louder just because the episodes it happened to…
 pub const LOSS_MEAN_OVER_TURNS: bool = true;
 
 /// Salt for the acting generator, so the sampler's stream is independent of the
@@ -841,11 +708,7 @@ fn choose_action(
     }
 }
 
-/// Sample one action from `softmax(values / temperature)`: subtract the max (so the
-/// exponentials cannot overflow), draw uniformly in `[0, Σ)`, take the first bucket
-/// whose cumulative mass passes it. A NaN value gets zero mass — never preferred; a
-/// non-positive or non-finite temperature falls back to `1.0`, and an all-zero mass
-/// (every value NaN) falls back to the greedy head rather than dividing by zero.
+/// Sample one action from `softmax(values / temperature)`: subtract the max (so the exponentials cannot overflow), draw uniformly in `[0, Σ)`, take the first bucket whose…
 fn softmax_action(values: &[f32], temperature: f32, rng: &mut fastrand::Rng) -> usize {
     let t = if temperature.is_finite() && temperature > 0.0 {
         temperature
@@ -884,10 +747,7 @@ fn softmax_action(values: &[f32], temperature: f32, rng: &mut fastrand::Rng) -> 
     mass.iter().rposition(|w| *w > 0.0).unwrap_or(0)
 }
 
-/// The factor the summed per-turn loss is multiplied by: `scale` alone (the turn SUM), or
-/// `scale / turns` (the turn MEAN) when `mean_over_turns` — see [`LOSS_MEAN_OVER_TURNS`]. An
-/// empty batch reads `1` turn rather than dividing by zero (it cannot reach an optimizer step,
-/// since the update's forward would already have a zero-row input).
+/// The factor the summed per-turn loss is multiplied by: `scale` alone (the turn SUM), or `scale / turns` (the turn MEAN) when `mean_over_turns` — see…
 fn loss_scale(scale: f32, turns: usize, mean_over_turns: bool) -> f32 {
     if mean_over_turns {
         scale / turns.max(1) as f32
@@ -960,9 +820,7 @@ mod tests {
     use crate::trainer::env::toy::ToyEnv;
     use crate::utils::fitness::{Direction, Fitness};
 
-    /// The loss is the batch's TURN MEAN, not its sum: a step's size stops depending on how long
-    /// the world let the policy live, and the pre-2026-11-10 sum is still reachable with the
-    /// toggle off.
+    /// The loss is the batch's TURN MEAN, not its sum: a step's size stops depending on how long the world let the policy live, and the pre-2026-11-10 sum is still reachable…
     #[test]
     fn loss_is_the_turn_mean_not_the_sum() {
         let scale = 2.0;
@@ -1191,9 +1049,7 @@ mod tests {
         assert_eq!(ActionRule::Softmax.as_str(), "softmax");
     }
 
-    /// An environment whose episode LENGTH depends on the action taken — action 1 survives both
-    /// turns, action 0 dies at the first. The smallest world where a greedy exam and a sampled one
-    /// can report different fitness, which is what the phase split has to prove.
+    /// An environment whose episode LENGTH depends on the action taken — action 1 survives both turns, action 0 dies at the first.
     struct PickyEnv {
         turns: usize,
     }
@@ -1223,9 +1079,7 @@ mod tests {
         }
     }
 
-    /// THE PHASE SPLIT: `action_rule` governs the TRAIN episodes, `eval_action_rule` the exam. With
-    /// no train matches there is no update, so the net is identical in every run and the only thing
-    /// that can move the reading is the EXAM's rule.
+    /// THE PHASE SPLIT: `action_rule` governs the TRAIN episodes, `eval_action_rule` the exam.
     #[test]
     fn the_exam_plays_under_its_own_rule_not_the_training_one() {
         assert_eq!(EVAL_ACTION_RULE, ActionRule::Argmax);
@@ -1259,10 +1113,7 @@ mod tests {
         );
     }
 
-    /// The blob records the acting rule ONLY when it is not the reference recipe — the
-    /// same convention the named schedule and the optimizer follow, so every run recorded
-    /// before the switch existed still resumes. The EXAM's arm follows the same rule: its key is
-    /// absent at the default and present the moment a run samples its readings.
+    /// The blob records the acting rule ONLY when it is not the reference recipe — the same convention the named schedule and the optimizer follow, so every run recorded before…
     #[test]
     fn describe_omits_the_acting_rule_while_it_is_the_default() {
         let trainer = Reinforce::new(ToyEnv::new(2, 5), Device::CPU);
@@ -1388,9 +1239,7 @@ mod tests {
         );
     }
 
-    /// Every match inside ONE clock draws its own game — TRAIN and EVAL alike. The world
-    /// draws its start state from that seed (`Env::reset`), so K matches that shared a seed
-    /// would be K identical trajectories: one episode's compute, paid K times.
+    /// Every match inside ONE clock draws its own game — TRAIN and EVAL alike.
     #[test]
     fn every_match_inside_one_clock_draws_its_own_game() {
         let step = 3usize;
@@ -1426,9 +1275,7 @@ mod tests {
         );
     }
 
-    /// The DEFAULT exam is per-clock: even with a tick cadence recorded, two clocks draw
-    /// different games (and every net sits the same ones) — so a reading that does not move
-    /// means a frozen POLICY, not a frozen exam.
+    /// The DEFAULT exam is per-clock: even with a tick cadence recorded, two clocks draw different games (and every net sits the same ones) — so a reading that does not move…
     #[test]
     fn the_default_exam_draws_fresh_games_every_clock() {
         let fitness = Fitness::reported(Direction::Maximize, "turns");
@@ -1462,9 +1309,7 @@ mod tests {
         );
     }
 
-    /// The era exam is OPT-IN ([`Reinforce::with_per_clock_exam`] `false`): clocks inside one era
-    /// sit the identical games, so a net born mid-era is ranked on what its parents were ranked on;
-    /// a new era is a new exam.
+    /// The era exam is OPT-IN ([`Reinforce::with_per_clock_exam`] `false`): clocks inside one era sit the identical games, so a net born mid-era is ranked on what its parents…
     #[test]
     fn the_era_exam_is_stable_within_an_era_and_rotates_between_them() {
         assert_eq!(eval_era_of(0, 20), 0);

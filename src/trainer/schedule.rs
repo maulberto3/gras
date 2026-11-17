@@ -1,28 +1,4 @@
 //! Named learning-rate schedules — pure functions of the step clock.
-//!
-//! The engine has no learning rate of its own: the TRAINER owns
-//! `TabularStep` / `RlStep` applies its schedule before the step's update. What
-//! this module adds is the part a NAME can carry: a schedule that can be spelled
-//! (`cosine(0.1)`), recorded in `engine.json`, and checked on resume, instead
-//! a closure only its author can see.
-//!
-//! # The replay contract
-//!
-//! `lr` is a pure function of `(base, step, max_steps)` — no counter, no RNG, no
-//! accumulated factor. Two clocks asked the same question get the same answer,
-//! a resumed run applies the learning rate the uninterrupted run would have used.
-//! A schedule needs a budget: with `max_steps = None` the run is unbounded
-//! progress-based shapes (`cosine`, `onecycle`) deliberately fall back to the base
-//! rate rather than invent a horizon.
-//!
-//! # Why these and not flodl's
-//!
-//! flodl ships the same shapes ([`flodl::nn::scheduler`]), but its constructors
-//! need `total_steps` up front and carry a `base_lr` per object. Here the BASE
-//! rate stays the trainer's `learning_rate` and the schedule is a FACTOR,
-//! `lr=` and `lr_schedule=` compose: changing the base changes the whole curve,
-//! and the recorded name does not embed a number that a resume would have
-//! agree with twice.
 
 use crate::utils::training::run_progress;
 

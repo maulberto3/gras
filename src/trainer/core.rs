@@ -118,20 +118,14 @@ pub struct StepEnv {
     pub pop_size: usize,
     /// Live nets in the population right now.
     pub live_count: usize,
-    /// Checkpoint cadence — the durability tick (frontier + champion weight snapshots)
-    /// fires every N steps. The tabular stream's eval-permutation era keys off it, and so
-    /// does an RL exam built with `Reinforce::with_per_clock_exam(false)`; the default
-    /// (per-clock) RL exam ignores it.
+    /// Checkpoint cadence — the durability tick (frontier + champion weight snapshots) fires every N steps.
     pub checkpoint_every: usize,
     /// The per-net fitness smoothing window, in steps (K).
     pub smoothing_window: usize,
     /// The run's step budget (`None` = unbounded), carried so a trainer can anneal
     /// schedules without a new config knob or a private counter.
     pub max_steps: Option<usize>,
-    /// Retry index INSIDE this clock: `0` = the clock's own pass, `1..` = a recovery retry. Only a
-    /// run with `set_pop_recovery_same_seed(false)` ever hands a non-zero value, so a trainer that keys
-    /// every draw off `(net_seed, step)` alone replays bit-for-bit under the default. A trainer that
-    /// wants the variety arm mixes it in — see [`RunData::train_batch_at`].
+    /// Retry index INSIDE this clock: `0` = the clock's own pass, `1..` = a recovery retry.
     pub attempt: u64,
 }
 
@@ -258,19 +252,7 @@ impl StreamShape {
 
 // ── The traits ───────────────────────────────────────────────────────────────
 
-/// The dataset-driven training contract — the ONE trait a tabular scheme
-/// implements. Owns the loss (required, not `Option`) and shapes the stream.
-///
-/// # Randomness — the replay contract
-///
-/// The engine re-seeds BOTH generators (`fastrand` + libtorch) once per
-/// `(net, step)` before calling [`TabularStep::train_step`]:
-/// [`seed_step_randomness`](crate::utils::race_steps::seed_step_randomness)
-/// mixes `ctx.net_seed` with `ctx.env.step`. A trainer that draws its own
-/// randomness (dropout, sampling, augmentation) must derive it from those same
-/// inputs — the `(net_seed, step)` pair is the whole address of a step —
-/// never from a hidden global counter, or the run stops being replayable.
-/// same rule as [`TabularStep::scheduled_lr`].
+/// The dataset-driven training contract — the ONE trait a tabular scheme implements.
 pub trait TabularStep: Send {
     /// Make the optimizer for a newly built or reloaded network.
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;
@@ -321,17 +303,7 @@ pub trait TabularStep: Send {
     ) -> flodl::tensor::Result<TabularStepReport>;
 }
 
-/// The environment-driven training contract — the ONE trait an RL scheme
-/// implements. No `loss()`; the engine's only ranking input is `fitness`.
-///
-/// # Randomness — the replay contract
-///
-/// The engine re-seeds BOTH generators (`fastrand` + libtorch) once per
-/// `(net, step)` before calling [`RlStep::train_step`]:
-/// [`seed_step_randomness`](crate::utils::race_steps::seed_step_randomness)
-/// mixes `ctx.net_seed` with `ctx.env.step`. An environment that randomizes
-/// (initial state, resets, exploration) must derive its draws from those same
-/// inputs so a replay reproduces the episode — never from a hidden global.
+/// The environment-driven training contract — the ONE trait an RL scheme implements.
 pub trait RlStep: Send {
     /// Make the optimizer for a newly built or reloaded network.
     fn make_optimizer(&self, net: &Network) -> Box<dyn flodl::nn::optim::Optimizer>;

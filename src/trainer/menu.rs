@@ -1,33 +1,4 @@
 //! The name→recipe tables a caller selects from: "which loss", "which metric".
-//!
-//! Each choice is spelled **once**, here, so the Rust API and the Python binding
-//! cannot drift, and `engine.json` records a label that a resume can diff
-//! (`assert_trainer_blob_matches`).
-//!
-//! # Only what the contract can carry
-//!
-//! A tabular run's data contract is exactly two tensors — `(pred, target)`, drawn
-//! row-aligned from the shared stream — so only losses that fit that shape
-//! listed. Deliberately absent: `ctc` (needs input lengths), `triplet_margin` /
-//! `margin_ranking` (need three inputs), `poisson_nll` (a `log_input` flag),
-//! `nll` (class-index targets, not the dataset's dense rows) and `kl_div`
-//! (log-probabilities on one side, probabilities on the other).
-//!
-//! # Loss and fitness travel together
-//!
-//! A loss is the *training* signal; a fitness is the *ranking* signal. Pairing
-//! them carelessly ranks on nonsense — `mse` trained against a cross-entropy
-//! fitness will happily breed whichever net happens to have noisy outputs.
-//! [`Loss::natural_fitness`] is the default pairing; overriding it is allowed,
-//! but it has to be deliberate.
-//!
-//! # Why the label carries the parameters
-//!
-//! `engine.json` stores [`Loss::label`] and refuses a resume whose trainer blob
-//! differs. So `label` includes the knobs (`label_smoothing_ce(0.1)`)
-//! [`Loss::parse`] accepts that same spelling back — a changed ε
-//! visible diff instead of a silent one. The float is printed at shortest
-//! round-trip precision, so `parse(&label())` returns the identical value.
 
 use crate::trainer::BoxedLossFn;
 use crate::utils::error::EngineError;

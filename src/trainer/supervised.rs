@@ -188,10 +188,7 @@ impl TabularStep for TabularTrainer {
         let fitness = ctx.fitness;
         let loss_fn: crate::trainer::LossFn<'_> = &*self.loss_fn; // our own loss
 
-        // call_index = hash of the net's name, so each net sees distinct
-        // dropout at one step (live nets vs catching-up children too). The
-        // recovery retry index rides on top (`0` under the default same-draw
-        // streak, so the retry re-seeds exactly what the clock seeded).
+        // call_index = hash of the net's name, so each net sees distinct dropout at one step (live nets vs catching-up children too).
         let h: u64 = ctx
             .net_hash
             .bytes()

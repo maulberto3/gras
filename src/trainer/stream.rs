@@ -10,6 +10,35 @@ use crate::utils::tabular_data::Dataset;
 /// `run_seed` itself — train and eval randomness must not share a seed.
 pub const EVAL_STREAM_OFFSET: u64 = 0xFFFF;
 
+/// Deterministic seeded shuffle split: `train_ratio` of the rows train, the rest
+/// evaluate. An empty eval side falls back to the whole pool (train/eval overlap).
+fn seeded_split(len: usize, train_ratio: f32, eval_ratio: f32, seed: u64) -> (Vec<i64>, Vec<i64>) {
+    assert!(
+        (train_ratio + eval_ratio - 1.0).abs() < 1e-6,
+        "ratios must sum to 1.0"
+    );
+    let mut indices: Vec<i64> = (0..len as i64).collect();
+    let mut rng = fastrand::Rng::with_seed(seed);
+    for i in (1..indices.len()).rev() {
+        let j = rng.usize(0..=i);
+        indices.swap(i, j);
+    }
+    let split = (len as f32 * train_ratio).round() as usize;
+    let train: Vec<i64> = indices[..split].to_vec();
+    let eval: Vec<i64> = indices[split..].to_vec();
+    if eval.is_empty() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "eval set is empty (train_ratio={train_ratio}) — falling back to using ALL data for eval (train/eval overlap)"
+            );
+        });
+        (train, indices.clone())
+    } else {
+        (train, eval)
+    }
+}
+
 // ── PoolSplit (D12) ─────────────────────────────────────────────────────────
 
 /// The static train/eval pool split, fixed once at run start: every net trains
@@ -27,7 +56,7 @@ impl PoolSplit {
     /// Split `dataset.len()` rows into train/eval pools with a seeded, deterministic shuffle:
     /// `train_eval_split_ratio` of the rows train, the rest are the eval pool.
     pub fn new(len: usize, train_eval_split_ratio: f32, seed: u64) -> Self {
-        let (train, eval) = crate::utils::tabular_data::split_indices(
+        let (train, eval) = seeded_split(
             len,
             1.0 - train_eval_split_ratio,
             train_eval_split_ratio,
@@ -153,9 +182,7 @@ impl BatchStream {
         self.train_batch_at(dataset, step, 0)
     }
 
-    /// The **train** batch for `step`'s `attempt`: `0` is the clock's own pass, `1..` a recovery
-    /// retry on `set_pop_recovery_same_seed(false)`, each one batch further along the permutation. Still
-    /// a pure function of `(run_seed, step, attempt)` — nothing is consumed — so a replay asks again.
+    /// The **train** batch for `step`'s `attempt`: `0` is the clock's own pass, `1..` a recovery retry on `set_pop_recovery_same_seed(false)`, each one batch further along the…
     pub fn train_batch_at(
         &self,
         dataset: &Dataset,
