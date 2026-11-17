@@ -6,7 +6,7 @@ resolver = "2"
 
 [package]
 name = "gras"
-version = "1.1.7"
+version = "1.2.0"
 edition = "2024"
 description = "A Genetic Programming framework for Neural Architecture Search in Rust"
 license = "MIT"
@@ -18,6 +18,17 @@ homepage = "https://github.com/maulberto3/gras"
 repository = "https://github.com/maulberto3/gras"
 documentation = "https://docs.rs/gras"
 authors = ["Mauricio Maroto <maulberto3@hotmail.com>"]
+include = [
+    "/src/**",
+    "/examples/mnist.rs",
+    "/examples/cartpole.rs",
+    "/examples/cartpole/tests.rs",
+    "/examples/python/*.py",
+    "/benches/*.rs",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+]
 
 [features]
 default = []
