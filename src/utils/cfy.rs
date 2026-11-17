@@ -36,9 +36,7 @@ pub(crate) fn kv(rows: &[(String, String)]) -> String {
 /// Max width of a card's prose BLOCK — a legend row (key AND value) or a footnote.
 pub(crate) const PROSE_WIDTH: usize = 110;
 
-/// The table's "no value" cell: `na` (not available). Plain ASCII on purpose — a glyph like `na`
-/// renders inconsistently in terminals — and never a dash, so a missing number cannot be read as a
-/// negative one (`−0.42` is a value, `na` is no value).
+/// The table's "no value" cell: `na` (not available).
 pub(crate) const NO_VALUE: &str = "na";
 
 /// The floor the key column may squeeze the prose down to. Without it a very long key
@@ -83,10 +81,7 @@ pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// The [`table`] whose SECOND column is prose: a real header row, values wrapped so the WHOLE
-/// block stays near [`PROSE_WIDTH`]. The key column is as wide as its longest key, and that
-/// width comes OUT of the prose budget — a long key shrinks the value column instead of pushing
-/// the block past the terminal, which is what a per-cell [`PROSE_WIDTH`] did.
+/// The [`table`] whose SECOND column is prose: a real header row, values wrapped so the WHOLE block stays near [`PROSE_WIDTH`].
 pub(crate) fn table_wrapped(header: &[&str], rows: &[(String, String)]) -> String {
     let key_width = rows
         .iter()

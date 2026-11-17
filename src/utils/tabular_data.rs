@@ -43,6 +43,14 @@ impl Dataset {
         self.len() == 0
     }
 
+    /// The two widths a topology needs: `(input_dim, output_dim)`; rows are [`Dataset::len`].
+    pub fn dims(&self) -> (usize, usize) {
+        (
+            self.inputs.shape()[1] as usize,
+            self.targets.shape()[1] as usize,
+        )
+    }
+
     /// Build a dataset from tensors already in memory — the same pair [`load_dataset`] returns,
     /// with no directory in between.
     pub fn from_tensors(inputs: Tensor, targets: Tensor) -> Result<Dataset> {
@@ -262,9 +270,7 @@ pub fn load_dataset_auto(dir: impl AsRef<Path>) -> Result<Dataset> {
     .into())
 }
 
-/// Save a dataset into `dir` as `inputs.bin` + `targets.bin`, plus a
-/// human-readable `meta.json` carrying the tensor shapes (informational: nothing
-/// reads it back).
+/// Save a dataset into `dir` as `inputs.bin` + `targets.bin`, plus a human-readable `meta.json` carrying the tensor shapes (informational: nothing reads it back).
 pub fn save_dataset(dir: impl AsRef<Path>, ds: &Dataset) -> Result<()> {
     let dir = dir.as_ref();
     fs::create_dir_all(dir).map_err(|source| DataError::Io {
@@ -653,9 +659,10 @@ pub fn save_csv_dataset(dir: impl AsRef<Path>, inputs: &Tensor, targets: &Tensor
     Ok(())
 }
 
-/// Generate a synthetic classification dataset: random inputs and one-hot targets
-/// — a quick stand-in for MNIST or any categorical task, no download needed.
-pub fn synthetic_classification(
+/// Test-only synthetic classification dataset: random inputs, one-hot targets —
+/// keeps unit fixtures download-free without widening the public API.
+#[cfg(test)]
+pub(crate) fn synthetic_classification(
     n: usize,
     in_dim: usize,
     out_dim: usize,
@@ -672,43 +679,6 @@ pub fn synthetic_classification(
     }
     let targets = Tensor::from_f32(&targets, &[n as i64, out_dim as i64], device)?;
     Ok(Dataset { inputs, targets })
-}
-
-/// Split a dataset length into train and eval index vectors.
-/// Returns `(train_indices, eval_indices)`.
-pub fn split_indices(
-    len: usize,
-    train_ratio: f32,
-    eval_ratio: f32,
-    seed: u64,
-) -> (Vec<i64>, Vec<i64>) {
-    assert!(
-        (train_ratio + eval_ratio - 1.0).abs() < 1e-6,
-        "ratios must sum to 1.0"
-    );
-    let mut indices: Vec<i64> = (0..len as i64).collect();
-    // Deterministic shuffle via seed
-    let mut rng = fastrand::Rng::with_seed(seed);
-    for i in (1..indices.len()).rev() {
-        let j = rng.usize(0..=i);
-        indices.swap(i, j);
-    }
-    let split = (len as f32 * train_ratio).round() as usize;
-    let train: Vec<i64> = indices[..split].to_vec();
-    let eval: Vec<i64> = indices[split..].to_vec();
-    // Silent fallback: if eval is empty, use all data for eval
-    if eval.is_empty() {
-        // One-shot so the "unseedable" warning prints at most once per process.
-        static WARNED: std::sync::Once = std::sync::Once::new();
-        WARNED.call_once(|| {
-            tracing::warn!(
-                "eval set is empty (train_ratio={train_ratio}) — falling back to using ALL data for eval (train/eval overlap)"
-            );
-        });
-        (train, indices.clone())
-    } else {
-        (train, eval)
-    }
 }
 
 /// One-hot encode class indices: `indices: Vec<usize>` → `[n, num_classes]` tensor.

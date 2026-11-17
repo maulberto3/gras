@@ -9,10 +9,7 @@ pub(crate) fn split_policy_name(policy: Option<FeatureSplitPolicy>) -> &'static 
     match policy {
         Some(FeatureSplitPolicy::Exclusive) => "exclusive",
         Some(FeatureSplitPolicy::Random) => "random",
-        // PROVENANCE, not a policy: the run's pool can only draw `exclusive` or `random`
-        // (`FeatureSplitPolicy::is_drawable`), so calling this `crossover` read like a third
-        // drawable arm — a reader who set `feature_split="exclusive"` saw "crossover" and
-        // thought the knob had been ignored. `engine.json` records the same word.
+        // PROVENANCE, not a policy: the run's pool can only draw `exclusive` or `random` (`FeatureSplitPolicy::is_drawable`), so calling this `crossover` read like a third…
         Some(FeatureSplitPolicy::Inherited) => "inherited",
         None => "rows",
     }
@@ -40,17 +37,7 @@ pub(crate) fn feature_split_cell(graph: &Topology) -> Option<String> {
 pub fn topology_mermaid(graph: &Topology) -> String {
     let mut out = String::new();
     out.push_str("```mermaid\n");
-    // The SAME curve the lineage graph asks for (`lineage.rs`): without an explicit config every
-    // viewer picks its own, so one card showed the smooth `Δfit` wires of the birth graph above a
-    // square-folded topology.
-    //
-    // This is FRONT MATTER, not an `%%{init}%%` directive, and both halves matter:
-    // - Mermaid 12 (2026-09) made ELK the bundled default layout engine, and ELK routes every wire
-    //   as right-angle segments with rounded corners — the `curve` setting can only round those
-    //   bends, so a diagram that never names its layout renders square no matter what it asks for.
-    // - Directives are deprecated since 10.5 and are ignored at the default `securityLevel:
-    //   \"strict\"`, which is what most viewers run. Front matter config always wins over the
-    //   viewer's `initialize()`, so naming `layout: dagre` is what keeps `curve: basis` load-bearing.
+    // The SAME curve the lineage graph asks for (`lineage.rs`): without an explicit config every viewer picks its own, so one card showed the smooth `Δfit` wires of the birth…
     out.push_str("---\nconfig:\n  layout: dagre\n  flowchart:\n    curve: basis\n---\n");
     out.push_str("flowchart LR\n");
     // Per-net hidden-dim range for edge-thickness normalization (min/max

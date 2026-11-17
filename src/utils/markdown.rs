@@ -187,9 +187,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
         // The accounting is the check a reader can do at a glance: `exclusive` is a partition,
         // the rows must add up to exactly one full vector (100%).
         let pct = 100.0 * total as f32 / input_dim as f32;
-        // A partition is a PER-FEATURE claim, so the total cannot prove it: rows `[1,1,0] [0,1,0]`
-        // add up to one full vector yet own feature 1 twice and feature 2 never. Count owners per
-        // feature and let the sentence name the offenders instead of trusting the sum.
+        // A partition is a PER-FEATURE claim, so the total cannot prove it: rows `[1,1,0] [0,1,0]` add up to one full vector yet own feature 1 twice and feature 2 never.
         let owned_by: Vec<usize> = (0..input_dim)
             .map(|f| {
                 masks
@@ -238,10 +236,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             Some(FeatureSplitPolicy::Random) => format!(
                 "`random` flips one coin per (port, feature), so **above 100% is normal** (ports share features) and features can be missed entirely — {seen} of {input_dim} are seen by some port here."
             ),
-            // The label names PROVENANCE, and the sentence has to say so: a run whose pool is
-            // `exclusive` produces these children too, and calling one `exclusive` would claim a
-            // partition its rows do not have (hence a total above 100%). `crossover` is the
-            // mechanism, not a policy the pool can draw, so the label is the enum's own word.
+            // The label names PROVENANCE, and the sentence has to say so: a run whose pool is `exclusive` produces these children too, and calling one `exclusive` would claim a…
             Some(FeatureSplitPolicy::Inherited) => "`inherited` rows are a per-port **crossover blend** of two parents' masks, so this net does NOT carry the policy the run configured — a run drawing only `exclusive` still produces children like this. A blend of two partitions is not itself a partition (a feature can reach two ports, which is why the total may pass 100%), and which policy the blend came from is not recoverable, so claiming one would be a lie: the label states provenance, not a draw rule."
                 .to_string(),
             None => "No policy recorded, so read the rows themselves.".to_string(),
@@ -264,9 +259,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
         }
         out.push('\n');
     } else {
-        // The other half of the consistency rule: a net WITHOUT the gene says so where a net WITH
-        // it lists its rows. The section used to vanish entirely, so "no split" was
-        // indistinguishable from "this file came from a build that did not record one".
+        // The other half of the consistency rule: a net WITHOUT the gene says so where a net WITH it lists its rows.
         let input_dim = graph.options.input_dim.unwrap_or(1).max(1);
         let ports = graph
             .nodes
@@ -353,11 +346,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out
 }
 
-/// A node's `In` / `Out` cell: the PORT count, annotated with the wire count only when the node
-/// carries MORE wires than ports. That is exactly the Input node's fan-out — `2 (3w)` = two
-/// ports carrying three wires — which is the one case where the table and the wiring diagram's
-/// `2o→3w` label would otherwise look inconsistent. Fewer wires than ports is an ORPHAN port,
-/// drawn `*` in the diagram and named port-by-port by the `Sources` column, so it needs no note.
+/// A node's `In` / `Out` cell: the PORT count, annotated with the wire count only when the node carries MORE wires than ports.
 fn ports_cell(ports: usize, wires: usize) -> String {
     if wires > ports {
         format!("{ports} ({wires}w)")
@@ -411,15 +400,11 @@ mod tests {
     use crate::graph::node::Node;
     use crate::graph::topology::{Connection, Port, TopologyOptions};
 
-    /// The topology graph curves its wires like the lineage graph does. Without a config block
-    /// every viewer picks its own default, and the two diagrams in one card disagreed (the
-    /// lineage's smooth `Δfit` wires above a square-folded topology).
+    /// The topology graph curves its wires like the lineage graph does.
     #[test]
     fn the_topology_mermaid_curves_its_wires_like_the_lineage_graph() {
         let m = super::topology_mermaid(&sample());
-        // FRONT MATTER, not an `%%{init}%%` directive: directives are deprecated since 10.5 and are
-        // ignored at the default `securityLevel: "strict"`, so a pinned renderer written as a
-        // directive was silently dropped by real viewers.
+        // FRONT MATTER, not an `%%{init}%%` directive: directives are deprecated since 10.5 and are ignored at the default `securityLevel: "strict"`, so a pinned renderer written…
         assert!(m.starts_with("```mermaid\n---\nconfig:\n"), "{m}");
         // …and the LAYOUT is named, not inherited: Mermaid 12 defaults to ELK, whose wires are
         // right-angle segments, and `curve` can only round their corners.
@@ -457,9 +442,7 @@ mod tests {
         g
     }
 
-    /// The consistency rule: a net WITHOUT the gene names it in the same section a net WITH it
-    /// lists rows, instead of the section vanishing and leaving "no split" indistinguishable from
-    /// "an older file that did not record one".
+    /// The consistency rule: a net WITHOUT the gene names it in the same section a net WITH it lists rows, instead of the section vanishing and leaving "no split"…
     #[test]
     fn a_net_with_no_feature_split_still_gets_the_section() {
         let md = topology_markdown(&sample(), None);
@@ -533,9 +516,7 @@ mod tests {
         );
     }
 
-    /// A 100% total is NOT proof of a partition: rows `[1,1,0]` and `[0,1,0]` add up to a full
-    /// 3-wide vector while owning feature 1 twice and feature 2 never. The accounting sentence
-    /// used to read exactly that total and call it a partition.
+    /// A 100% total is NOT proof of a partition: rows `[1,1,0]` and `[0,1,0]` add up to a full 3-wide vector while owning feature 1 twice and feature 2 never.
     #[test]
     fn a_hundred_percent_total_does_not_make_an_exclusive_split_a_partition() {
         use crate::graph::node::Node;
@@ -588,10 +569,7 @@ mod tests {
         );
     }
 
-    /// A BLENDED child names itself `inherited`, not `crossover`: crossover is the MECHANISM,
-    /// and the run's `feature_split` pool never contains it (`FeatureSplitPolicy::is_drawable`),
-    /// so a policy-looking `crossover` label invited exactly the misreading this pins. The
-    /// mechanism is still named in the sentence, so a reader can tell what produced the rows.
+    /// A BLENDED child names itself `inherited`, not `crossover`: crossover is the MECHANISM, and the run's `feature_split` pool never contains it…
     #[test]
     fn a_blended_split_is_labelled_inherited_not_crossover() {
         let mut g = Topology::new(
@@ -663,9 +641,7 @@ mod tests {
         );
     }
 
-    /// The Input node is the ONE fan-out, so its `Out` cell must carry both numbers: the port
-    /// count the topology declares and the wire count the diagram draws. The table printed the
-    /// port count alone, which read as a discrepancy against `2o→3w` and the three `o` labels.
+    /// The Input node is the ONE fan-out, so its `Out` cell must carry both numbers: the port count the topology declares and the wire count the diagram draws.
     #[test]
     fn a_fanning_input_names_its_wire_count_beside_its_ports() {
         use crate::graph::node::Node;

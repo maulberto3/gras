@@ -163,10 +163,7 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         1usize
     };
 
-    // The canvas must be as wide as the layout it was computed for: `in_col` / `out_col` below
-    // are NOT clamped, so a narrower canvas either silently drops labels or slices out of
-    // bounds. `MAX_WIDTH` is a safety valve for pathological graphs, not a readability cap —
-    // this render goes into a markdown file, not a console.
+    // The canvas must be as wide as the layout it was computed for: `in_col` / `out_col` below are NOT clamped, so a narrower canvas either silently drops labels or slices out…
     const MAX_WIDTH: usize = 4096;
     let raw_width = lane_x0 + n_wires * lane_step + 2;
     let width = raw_width.min(MAX_WIDTH).max(1);
@@ -450,11 +447,7 @@ mod tests {
         }
     }
 
-    /// A graph whose geometry alone needs more than the old 200-column canvas: 60 input ports
-    /// put `in_col(59)` well past 200, and Phase 3's west run sliced from `tgt + 1` (264) into a
-    /// 200-char row — `range start index ... out of range for slice of length 200`, which killed
-    /// the stop-time topology dump AFTER the race had finished. The layout is the authority on
-    /// width, so the render must cover it instead of truncating to a fixed cap.
+    /// A graph whose geometry alone needs more than the old 200-column canvas: 60 input ports put `in_col(59)` well past 200, and Phase 3's west run sliced from `tgt + 1` (264)…
     #[test]
     fn a_layout_wider_than_two_hundred_columns_renders_without_panicking() {
         let nodes = [
