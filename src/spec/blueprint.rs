@@ -1,24 +1,4 @@
-//! JSON round-trip representation of a [`Topology`].
-//!
-//! [`Topology`] can't derive `Serialize` directly — it holds an RNG
-//! (`rng: fastrand::Rng`) that isn't serializable — so this module defines:
-//!
-//! - [`Spec`] — a plain, fully-serializable mirror of the blueprint:
-//!   everything except the RNG
-//! - `Serialize` / `Deserialize` impls for [`Topology`] that convert through
-//!   [`Spec`]
-//!
-//! # Reproducibility
-//!
-//! The RNG is **re-seeded from `options.topology_seed`** on load, so a loaded graph
-//! regenerates wiring identically to a fresh graph with the same options
-//! (`Topology::to_json` / `Topology::from_json` delegate here).
-//!
-//! Weights are **never** serialized — the blueprint is the single source
-//! truth, and the executable module is rebuilt with fresh random weights via
-//! [`Network::build`](crate::graph::network::Network::build). Saving
-//! found architecture is `graph.to_json()`, reloading
-//! `Topology::from_json(&json)` then `Network::build(&graph, device)`.
+//! JSON round-trip representation of a [`Topology`].  [`Topology`] can't derive `Serialize` directly — it holds an RNG (`rng: fastrand::Rng`) that isn't serializable — so…
 
 use fastrand::Rng;
 use serde::de::Deserializer;
