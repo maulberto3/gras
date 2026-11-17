@@ -101,7 +101,7 @@ build, not universal — CPU and CUDA kernels are different arithmetic.
 | `attempts.csv` | every evolution roll, including the ones that did nothing — the columns before the last three are the mutation novelty gate: Δ to the nearest blueprint, candidates spent, the floor; the last column is the culled net's score at cull time |
 | `nets/<hash>.json` | one blueprint: genome, feature masks, per-port activations |
 | `nets/<hash>.safetensors` / `.optim` | its weights / its optimizer moments |
-| `champions.json` | the ranking a compatible next run can inherit as founders (a legacy `elites.json` copy rides beside it for one release) |
+| `champions.json` | the ranking a compatible next run can inherit as founders |
 | `final-field.csv` | the stopping table — the report you read |
 | `ckpt.json` | the resume frontier |
 
@@ -138,7 +138,7 @@ language, and the parity guard says so.
 ## Versions
 
 `gras.__version__` is the **binding's** version (0.1.x) and moves independently
-of the Rust crate (`gras` on crates.io, 1.1.7 today). A binding release that
+of the Rust crate (`gras` on crates.io, 1.2.0 pending publication). A binding release that
 needs a newer crate says so in its release notes.
 
 ## More

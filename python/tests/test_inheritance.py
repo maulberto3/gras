@@ -90,10 +90,7 @@ def test_a_source_without_a_table_seeds_nothing() -> None:
     with tempfile.TemporaryDirectory(prefix="gras-inherit-none-") as tmp:
         source = Path(tmp) / "no-table"
         make_run(source, 11).run()
-        # Both names go: the legacy alias is a fallback, so leaving `elites.json` behind
-        # would look like a source that still has a table.
         (source / "champions.json").unlink()
-        (source / "elites.json").unlink()
 
         child_dir = Path(tmp) / "child"
         make_run(child_dir, 12, inherit_from=source).run()

@@ -121,7 +121,6 @@ def check_engine_knobs() -> None:
         "highest_ticket_chance",
     ), cfg
     assert cfg.crossover_selection == "tournament", cfg
-    assert cfg.train_merit == 1.0, cfg
     assert cfg.activation_pool == [] and cfg.feature_split is None, cfg
     # The topology shape behind the width range: `None` means the crate's range
     # (2..=15 for node count and both fans), and dropout is the crate's 0.25.
@@ -239,7 +238,6 @@ def check_defaults_agree() -> None:
         "eval_share": cfg.eval_share,
         "smoothing_window": cfg.smoothing_window,
         "mean_type": cfg.mean_type,
-        "train_merit": cfg.train_merit,
         "train_merit_p_min": cfg.train_merit_p_min,
         "train_merit_p_max": cfg.train_merit_p_max,
         "ticket_legs": cfg.ticket_legs,
