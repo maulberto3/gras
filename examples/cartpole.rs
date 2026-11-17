@@ -1,7 +1,7 @@
 // NOTE: `source env_setup.sh` in the shell first — this example links against that environment.
 
-//! CartPole — the RL example: a pure-Rust `Env`, the crate's REINFORCE trainer, a reported fitness, a guardrail.
-//! Sections: 1 environment, 2 trainer, 3 guardrail, 4 `main()`; **match** = episode, **turn** = env step.
+//! CartPole — the RL example: a pure-Rust `Env`, the crate's REINFORCE trainer, a reported fitness.
+//! Sections: 1 environment, 2 trainer, 3 stop rule, 4 `main()`; **match** = episode, **turn** = env step.
 
 /// The example's tests, kept in a sibling file so the example reads cleanly.
 #[cfg(test)]
@@ -200,7 +200,7 @@ fn trainer(
         .with_signal(signal)
         // TRAIN arm: `Argmax` (the default) or a seeded `Softmax` draw at T — exploration inside the policy.
         .with_action_rule(acting.0, acting.1)
-        // EXAM arm (and the guardrail): greedy unless `--eval-action-rule softmax` measures the sampler.
+        // EXAM arm: greedy unless `--eval-action-rule softmax` measures the sampler.
         .with_eval_action_rule(eval_acting)
         // EXPERIMENTAL obs memory: `none`, or `delta`/`ema` appending a second observation width.
         .with_obs_memory(memory)
@@ -213,9 +213,12 @@ fn trainer(
         )
 }
 
-// ═══ SECTION 3 — THE GUARDRAIL (fresh unseen games) ════════════════════
+// ═══ SECTION 3 — THE STOP RULE (the solved bar) ════════════════════════
 
-// ═══ SECTION 4 — main(): config → spec → run → guardrail ═══════════════
+// `best_smoothed_fitness > 400` ends a run that has actually solved the world; `--max-steps`
+// bounds every run that does not.
+
+// ═══ SECTION 4 — main(): config → spec → run ═══════════════════════════
 
 // RunSpec::rl declares the mode; Fitness::reported takes the value from the report.
 
@@ -327,7 +330,7 @@ struct Cli {
         default_value = "summ"
     )]
     log_level: String,
-    /// Continue the recorded run here: its seed wins over `--seed`, and with a budget-filling `--max-steps` only the guardrail re-runs.
+    /// Continue the recorded run here: its seed wins over `--seed`, and `--max-steps` EXTENDS the recorded budget.
     #[arg(long, value_name = "DIR")]
     resume: Option<std::path::PathBuf>,
     /// What the net is told about the past: `none`, `delta` (obs − prev) or a smoothed `ema`; the fed row doubles.
@@ -369,7 +372,7 @@ struct Cli {
         default_value = "argmax"
     )]
     action_rule: String,
-    /// EXAM arm (and the guardrail), independent of `--action-rule`; shares `--softmax-temperature`.
+    /// EXAM arm, independent of `--action-rule`; shares `--softmax-temperature`.
     #[arg(
         long,
         value_name = "RULE",
@@ -390,6 +393,15 @@ struct Cli {
     /// Steps between checkpoints — weights, frontier states and the CSV flush.
     #[arg(long, value_name = "N", default_value_t = CHECKPOINT_EVERY)]
     checkpoint_every: usize,
+    /// Write each net's optimizer state (Adam moments) beside its weights, so `--resume` restores them exactly.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true
+    )]
+    save_optim: bool,
     /// Mutation probation: cull immunity for an immigrant's first N updates (`U`, not clocks).
     #[arg(long, value_name = "N", default_value_t = 0)]
     mutation_probation: usize,
@@ -524,7 +536,7 @@ struct Cli {
     run_dir: Option<std::path::PathBuf>,
 }
 
-/// Wire the config → run the race → guardrail the champion; prints the verdict.
+/// Wire the config → run the race; prints where the artifacts landed.
 fn main() {
     // Default reporting shape when `--log-level` is not passed.
     const LOG_LEVEL: LogLevel = LogLevel::Summ;
@@ -571,6 +583,7 @@ fn main() {
         .set_run_name(cli.run_name.clone())
         .set_run_log_level(log_level)
         .set_run_checkpoint_every(cli.checkpoint_every)
+        .set_run_save_optim(cli.save_optim)
         .set_run_csv_export(cli.csv_export)
         .set_run_trace_file(cli.trace_file)
         // .set_run_metrics(vec![…])`.
@@ -700,6 +713,4 @@ fn main() {
         Err(e) => eprintln!("race error: {e}"),
     }
 
-    // STEP D — guardrail: re-score the champion on fresh games; the verdict lands in `engine.json`.
-    // report_guardrail(&mut engine, baseline);
 }

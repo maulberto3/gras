@@ -1,7 +1,7 @@
 // NOTE: `source env_setup.sh` in the shell first — this example links against that environment.
 
 //! MNIST — the tabular showcase: a gras-format dataset, one `TabularStep` trainer, config → run.
-//! Sections: 1 data, 2 trainer, 3 guardrail, 4 `main()`; **match** = batch, **turn** = net's step.
+//! Sections: 1 data, 2 trainer, 3 stop rule, 4 `main()`; **match** = batch, **turn** = net's step.
 //! It reads the binary dataset at `data/mnist` (`train/` + `test/`); `--synthetic` opts into
 //! random-label smoke data, and without a dataset the run REFUSES instead of faking one.
 
@@ -258,10 +258,10 @@ fn jitter_inputs(
     Ok((Tensor::from_f32(&data, &shape, x.device())?, jittered))
 }
 
-// ═══ SECTION 3 — THE GUARDRAIL (the stop bar, not a re-score) ═══════════
+// ═══ SECTION 3 — THE STOP RULE (the bar, not a re-score) ════════════════
 
-// The tabular arm's guardrail is its stop rule: `best_smoothed_fitness` is the window CENTRE,
-// so the bar below ends the run on accuracy the window actually believes, not one lucky batch.
+// `best_smoothed_fitness` is the window CENTRE, so the bar below ends the run on accuracy the
+// window actually believes, not on one lucky batch.
 
 // ═══ SECTION 4 — main(): data → config → spec → run ═════════════════════
 
@@ -376,7 +376,7 @@ struct Cli {
         default_value = "summ"
     )]
     log_level: String,
-    /// Continue the recorded run here: its seed wins over `--seed`, and with a budget-filling `--max-steps` only the guardrail re-runs.
+    /// Continue the recorded run here: its seed wins over `--seed`, and `--max-steps` EXTENDS the recorded budget.
     #[arg(long, value_name = "DIR")]
     resume: Option<PathBuf>,
     /// Drift on a crossover child's inherited genes (`0` = exact inheritance).
@@ -391,6 +391,15 @@ struct Cli {
     /// Steps between checkpoints — weights, frontier states and the CSV flush.
     #[arg(long, value_name = "N", default_value_t = CHECKPOINT_EVERY)]
     checkpoint_every: usize,
+    /// Write each net's optimizer state (Adam moments) beside its weights, so `--resume` restores them exactly.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true
+    )]
+    save_optim: bool,
     /// Mutation probation: cull immunity for an immigrant's first N updates (`U`, not clocks).
     #[arg(long, value_name = "N", default_value_t = 0)]
     mutation_probation: usize,
@@ -596,6 +605,7 @@ fn main() {
         .set_run_name(cli.run_name.clone())
         .set_run_log_level(log_level)
         .set_run_checkpoint_every(cli.checkpoint_every)
+        .set_run_save_optim(cli.save_optim)
         .set_run_csv_export(cli.csv_export)
         .set_run_trace_file(cli.trace_file)
         // .set_run_metrics(_metrics)`.
