@@ -34,9 +34,9 @@ pub use utils::tabular_data;
 
 // ── engine — the step-race loop ──────────────────────────────────────
 pub use engine::{
-    RLSpec, RaceConfig, RaceSnapshot, RlConfig, RlEngine, RlRaceConfig, RunMode, RunSpec,
-    StopReason, TabularConfig, TabularEngine, TabularRaceConfig, TabularSpec,
-    rl_race_config_builder, tabular_race_config_builder,
+    RLSpec, RaceConfig, RaceSnapshot, RlEngine, RlRaceConfig, RunMode, RunSpec, StopReason,
+    TabularEngine, TabularRaceConfig, TabularSpec, rl_race_config_builder,
+    tabular_race_config_builder,
 };
 // Scoring vocabulary lives in `utils`, not `engine`: a training scheme must be
 // able to rank/report without importing the engine.
@@ -103,8 +103,8 @@ pub mod prelude {
     // Engine config + entry points.
     pub use crate::engine::config::{
         CrossCullPolicy, LogLevel, MutationCullPolicy, RaceConfig, RaceConfigBuilder, RaceSnapshot,
-        RlConfig, RlRaceConfig, RunMode, StopReason, TabularConfig, TabularRaceConfig,
-        rl_race_config_builder, tabular_race_config_builder,
+        RlRaceConfig, RunMode, StopReason, TabularRaceConfig, rl_race_config_builder,
+        tabular_race_config_builder,
     };
     // Scoring vocabulary is `utils`-resident: shared with any training scheme.
     pub use crate::engine::{RLSpec, RlEngine, RunSpec, TabularEngine, TabularSpec};
@@ -150,9 +150,7 @@ pub fn auto_device() -> flodl::Device {
 }
 
 // ── example dependency pin ───────────────────────────────────────────
-/// The examples are runnable documentation and must run on what the crate already pulls: a task that
-/// seems to need a new crate is a sign the example is reaching past the API. This pin makes growing
-/// either dependency table a deliberate edit instead of a stray `cargo add`.
+/// The examples are runnable documentation and must run on what the crate already pulls: a task that seems to need a new crate is a sign the example is reaching past the…
 #[cfg(test)]
 mod example_dependency_pin {
     const MANIFEST: &str = include_str!("../Cargo.toml");

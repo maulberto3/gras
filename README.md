@@ -7,9 +7,9 @@ Hand-designing architectures is slow, biased, and easy to overfit to your own
 intuition. `gras` searches that space for you — continuously and reproducibly —
 and hands back a champion you can actually trust.
 
-Crate **`gras` 1.1.7** · docs [**docs.rs/gras**](https://docs.rs/gras) · the
+Crate **`gras` 2.0.0** · docs [**docs.rs/gras**](https://docs.rs/gras) · the
 Python bindings ship separately as **`gras-nn`** (still `import gras`) — see
-[`python/README.md`](python/README.md).
+[`python/README.md`](https://github.com/maulberto3/gras/blob/main/python/README.md).
 
 ## Is this for me?
 
@@ -108,13 +108,13 @@ is deliberately left to you. CUDA builds need a CUDA-enabled libtorch.
 
 The bindings are their own distribution — **`gras-nn`** on PyPI, imported as
 `gras` — so they version independently of the crate (`gras` on crates.io is
-1.1.7; the binding is 0.1.x). They build with maturin into `gras._core`, ship one
+2.0.0; the binding is 0.1.x). They build with maturin into `gras._core`, ship one
 `cp312-abi3` wheel for CPython ≥ 3.12 on Linux x86_64, and **do not bundle
 libtorch** either: `python/gras/__init__.py` loads it from `LIBTORCH_PATH` (then
 `~/.flodl/libtorch/precompiled/{cpu,cuda}`) before the extension imports, so
 `import gras` works without `LD_LIBRARY_PATH`. Prerequisites, the three on-ramps,
 the name menus, artifacts and limits live in
-[`python/README.md`](python/README.md).
+[`python/README.md`](https://github.com/maulberto3/gras/blob/main/python/README.md).
 
 ## Contracts worth knowing
 
@@ -142,7 +142,7 @@ the name menus, artifacts and limits live in
 - Rust: `examples/mnist.rs` (tabular) and `examples/cartpole.rs` (RL) — each is
   self-contained, with `--help` describing its flags.
 - Python: `python/notebooks/python_bindings_tour.ipynb` — six self-contained arms;
-  install, surface and limits in [`python/README.md`](python/README.md).
+  install, surface and limits in [`python/README.md`](https://github.com/maulberto3/gras/blob/main/python/README.md).
 - API docs: **https://docs.rs/gras** · repository:
   **https://github.com/maulberto3/gras**
 
