@@ -7,7 +7,6 @@ use super::core::CoreEngine;
 use crate::engine::diversity::{NetShape, mean_delta_to, shape_of};
 use crate::engine::format::{ReadingStyle, fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_units};
 use crate::engine::smoothing::rolling_mean;
-use crate::utils::mermaid::split_policy_name;
 
 mod lineage;
 
@@ -73,9 +72,6 @@ impl CoreEngine {
             self.step_rl.label(step_secs)
         };
         // Per-step rollup: Summ = compact one-liner; Minimal = framed table (step 2+).
-        // The `Summ` line's OWN legs: the FAMILY pair the score is READ from (`fam_center` /
-        // `fam_spread`), so a median run prints its median and MAD, not the arithmetic pair that
-        // belongs to another score. `fam_spread` is diagnostic — nothing is charged.
         let centers: Vec<f32> = readings.iter().map(|r| r.fam_center).collect();
         let fam_spreads: Vec<f32> = readings.iter().map(|r| r.fam_spread).collect();
         let leg_center = avg(&centers);
@@ -283,12 +279,7 @@ impl CoreEngine {
     /// the resume command to continue from here.
     pub(crate) fn log_stop_summary(&self) -> flodl::tensor::Result<()> {
         let live = self.state.live_hashes();
-        // CFY: the stop block is comfy tables — an artifact/resume card, the accounting matrix,
-        // then the elite card.
-        // ONE row per fact. The live count is printed ONCE (the frontier row carries it and the
-        // pop_size a resume must pass), the stop clock lives on the `Stop` card above, and
-        // `checkpoint_every`/`pop_size` are in the run manifest — repeating them here was three
-        // spellings of numbers already on screen.
+        // CFY: the stop block is comfy tables — an artifact/resume card, the accounting matrix, then the elite card.
         let artifact_rows = vec![
             (
                 "frontier snapshots".to_string(),
@@ -548,12 +539,7 @@ impl CoreEngine {
         // only when the run supplies them.
         let mut columns = printed_columns(self.config.train_ticket.updates_armed(), has_exam);
         let fit = fit_column(self.config.mean_type);
-        // The window legs are GONE from the card (2026-11-14): with the spread charge removed, `F`
-        // IS the window centre, so a `mean`/`median` column beside it printed the same number
-        // twice, and the diagnostic spread (`σ`, `1.4826·MAD`, the g-space spread) printed a
-        // statistic nothing charges or reads. The `fit` header carries the family instead
-        // (`fit (F = mean)` / `fit (F = median)` / the `g` equation), so the row still says which
-        // window the number came from.
+        // The window legs are GONE from the card (2026-11-14): with the spread charge removed, `F` IS the window centre, so a `mean`/`median` column beside it printed the same…
         for c in columns.iter_mut() {
             if *c == COL_FIT {
                 *c = fit;
@@ -575,9 +561,7 @@ impl CoreEngine {
     /// how it is RANKED (fit and its min-max place) → what the coin paid it (the U leg,
     fn stop_header(&self, columns: &[&'static str]) -> Vec<String> {
         let mut header: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
-        // TWO setters shape these cells, so BOTH are read here: the tilt mirrors the place, and
-        // the U leg decides whether `Um` is a factor at all. One helper per cell, so the header
-        // cannot name a symbol the row does not print.
+        // TWO setters shape these cells, so BOTH are read here: the tilt mirrors the place, and the U leg decides whether `Um` is a factor at all.
         let legs = self.config.train_ticket;
         let (place, u_cell, ticket) = (
             fit_minmax_column(legs.fitness_inverted()),
@@ -701,10 +685,11 @@ impl CoreEngine {
                 .map(fmt_units)
                 .unwrap_or_else(|| "?".to_string()),
             shape.map(|s| s.nodes.to_string()).unwrap_or_else(dash),
-            // The feature split is part of what the net IS: `exclusive` gives each input port its
-            // own columns, `random` lets ports overlap, `inherited` is a crossover blend.
+            // The mask's DENSITY, not its policy label: a blended split has no single policy to
+            // name, but how much of the input a port reads is still a comparable number.
             shape
-                .map(|s| split_policy_name(s.split).to_string())
+                .and_then(|s| s.mask)
+                .map(|d| format!("{:.0}%", d * 100.0))
                 .unwrap_or_else(dash),
             shape.map(|s| s.wires.to_string()).unwrap_or_else(dash),
             // Mean hidden width is a MEASURED number like every other cell, so it takes the band
@@ -732,10 +717,7 @@ impl CoreEngine {
             // below — one read, so the row cannot show a fraction that disagrees
             parts.map(|(f, _, _)| fmt_cell(f)).unwrap_or_else(dash),
         ];
-        // `Um` is derived off `updates (U)`: `1` at the end the LEG pays and `0` at the other, so
-        // a `most_updates` leg prints the mirror of a `fewest_updates` one. A column only while
-        // the leg is armed AND the net was graded — an ungraded net has no place in the field to
-        // read it against, and a field with no spread pays the neutral `1`.
+        // `Um` is derived off `updates (U)`: `1` at the end the LEG pays and `0` at the other, so a `most_updates` leg prints the mirror of a `fewest_updates` one.
         if self.config.train_ticket.updates_armed() {
             let legs = self.config.train_ticket;
             let um = match (parts.is_some(), row.lottery, state) {
@@ -757,9 +739,7 @@ impl CoreEngine {
         // The chance the coin gave this net on the LAST dealt clock — the same `p_eff` the debug
         // card prints.
         cells.push(self.stop_ticket_p(row.hash, row.lottery, score));
-        // `A` — clocks lived, inclusive of the birth clock — closes the ranking run beside the
-        // ticket: `T` is the chance per clock, `A` how many clocks this net was there to be paid
-        // for. `U ≠ A` whenever a clock was withheld, which is why both keep their own column.
+        // `A` — clocks lived, inclusive of the birth clock — closes the ranking run beside the ticket: `T` is the chance per clock, `A` how many clocks this net was there to be…
         cells.push(age.to_string());
         // ── what its learning COST ─────────────────────────────────────
         // The budget it spent learning, then what it cost to MEASURE it: `U`, then `E` (every
@@ -767,10 +747,7 @@ impl CoreEngine {
         // passes, so there is nothing left for a reader to add up.
         cells.push(state.map(|s| s.step.to_string()).unwrap_or_else(dash));
         cells.push(evals.map(|t| t.to_string()).unwrap_or_else(dash));
-        // NO `idle (I)` column: the withholding is visible in `E` versus `A`, and the debug card
-        // still prints the count for a clock that needs it.
-        // The exam: selection's number's honest twin, a column only when the run supplied one
-        // still `na` for a net outside the reported set — the exam costs a forward pass per net,
+        // NO `idle (I)` column: the withholding is visible in `E` versus `A`, and the debug card still prints the count for a clock that needs it.
         if row.plan.has_exam {
             cells.push(row.exam.map(fmt_cell).unwrap_or_else(dash));
         }
@@ -807,13 +784,7 @@ impl CoreEngine {
             inlined[col(COL_AGE)].push(' ');
             inlined[col(COL_AGE)].push('b');
         }
-        // Two marks on the column that owns what they describe — `updates (U)`, the learning
-        // budget: `r<n>` = the recovery retries this net spent inside single clocks (each one a REAL
-        // update, which is why `U` outruns `A` by exactly this), `n` = NEVER LEARNED (`U = 0`), a net
-        // whose first live clock has not arrived yet — no act, no measure, no fitness, so its window
-        // cells stay `na`. A newborn's first ticket is the NEXT clock, so a net born on the run's last
-        // clock keeps `n` forever. Both are printed only when they apply, so a plain row is unchanged. ASCII letters,
-        // not a glyph: `r3` survives any console, column width and monospace fallback.
+        // Two marks on the column that owns what they describe — `updates (U)`, the learning budget: `r<n>` = the recovery retries this net spent inside single clocks (each one a…
         if let Some(s) = state {
             let u = col(COL_UPDATES);
             let retries = s.recovery_retries();
@@ -826,9 +797,7 @@ impl CoreEngine {
                 inlined[u].push_str(" n");
             }
         }
-        // NO `eval loss` column: it is the net's LAST clock's eval loss, i.e. the closing row that
-        // net already has in `history.csv` — a copy that costs a column and a forward pass of
-        // reading to learn nothing the ledger does not already say.
+        // NO `eval loss` column: it is the net's LAST clock's eval loss, i.e. the closing row that net already has in `history.csv` — a copy that costs a column and a forward pass…
         let mut tail: Vec<String> = Vec::new();
         // One cell per configured informative metric, in config order — the same order
         // `history.csv` writes its columns
@@ -922,10 +891,7 @@ impl CoreEngine {
                 } else {
                     crate::utils::cfy::NO_VALUE
                 };
-                // `smt / D` is ONE quantity, so it prints as its two legs and the ratio between
-                // them: the numerator here, the divisor (`updates`) and the quotient beside each
-                // A born-ticketed net SKIPS the draw in the step path, so the card must not print
-                // `no` for the clock it is about to spend training.
+                // `smt / D` is ONE quantity, so it prints as its two legs and the ratio between them: the numerator here, the divisor (`updates`) and the quotient beside each A…
                 let born = state.is_some_and(|s| s.step == 0);
                 let trains = born || self.train_lottery_draws_at(&h, clock, p);
                 let row = vec![
@@ -1049,10 +1015,7 @@ impl CoreEngine {
         );
     }
 
-    /// The mutation gate's reading, cumulative: how DIFFERENT the immigrants that were born turned
-    /// out to be (Δ to the nearest archived blueprint) and what each birth cost in candidates. The
-    /// same numbers the stop card's `Births & novelty` table prints, so a watched run and a finished
-    /// one cannot disagree.
+    /// The mutation gate's reading, cumulative: how DIFFERENT the immigrants that were born turned out to be (Δ to the nearest archived blueprint) and what each birth cost in…
     pub(crate) fn log_birth_draws(&self, clock: usize) {
         let every = self.config.checkpoint_every;
         if every == 0
@@ -1277,9 +1240,7 @@ fn ticket_column(legs: crate::engine::config::TrainTicket) -> &'static str {
     }
 }
 
-/// The ticket header BROKEN over lines: its equation is the widest cell in the table, so a header
-/// earns the extra height back by not setting the width of every row. Display only — `columns`, the
-/// legend key and the CSV header keep the single-line spelling.
+/// The ticket header BROKEN over lines: its equation is the widest cell in the table, so a header earns the extra height back by not setting the width of every row.
 fn ticket_header(cell: &str) -> String {
     cell.replacen("minmax (T", "minmax\n(T", 1)
         .replacen(" + (", "\n+ (", 1)
@@ -1296,10 +1257,7 @@ fn updates_minmax_column(legs: crate::engine::config::TrainTicket) -> &'static s
     }
 }
 const COL_UPDATES: &str = "updates (U)";
-/// `E`: every time the net ran the trainer and was SCORED — `U` (the updates that stuck) plus the
-/// act-only passes the lottery denied under `train_merit_learn_only`. ONE cell, not three: the
-/// act-only part has no column of its own, because a third clock count beside `A` was the thing a
-/// reader tried to add up (and `A` also counts the withheld clocks, so it never closes).
+/// `E`: every time the net ran the trainer and was SCORED — `U` (the updates that stuck) plus the act-only passes the lottery denied under `train_merit_learn_only`.
 const COL_EVALS: &str = "evals (E)";
 const COL_EXAM: &str = "exam (X)";
 
@@ -1317,37 +1275,26 @@ fn printed_columns(updates_leg: bool, has_exam: bool) -> Vec<&'static str> {
         .collect()
 }
 
-/// The fixed left-hand columns of the stop-time table, in NARRATIVE order: what the net IS (`#`,
-/// `hash`, `origin`, census) → how it is RANKED (`fit (F)`, its whole-run `slope (S)`, and its
-/// min-max place) → what it cost
+/// The fixed left-hand columns of the stop-time table, in NARRATIVE order: what the net IS (`#`, `hash`, `origin`, census) → how it is RANKED (`fit (F)`, its whole-run…
 const STOP_HEADER_FIXED: &[&str] = &[
     "#",
     "hash",
     "origin",
     "params",
     "nodes",
-    "split",
+    "mask",
     "wires",
     "width",
-    // The word AND its letter, so a legend equation can be read straight off the row; the DERIVED
-    // column is named by the value it produces (`ticket`).
-    // ONE ranking number: `fit (F)`. The two window legs that used to sit to its left are gone
-    // (2026-11-14) — with the spread charge removed `F` IS the window centre, so a `mean`/`median`
-    // column printed the same number twice and the diagnostic spread (`1.4826·MAD`) charged
-    // nothing. The `fit` header carries the family instead (`fit (F = mean)` / `fit (F = median)`).
+    // The word AND its letter, so a legend equation can be read straight off the row; the DERIVED column is named by the value it produces (`ticket`).
     COL_FIT,
-    // The trend sits IMMEDIATELY right of the score: `F` is the level the field ranked on, `S` the
-    // direction its own readings have been going — the second thing a reader wants from a fitness
-    // cell. It is a READING of the net, not a ranking input, so it interrupts nothing below it.
+    // The trend sits IMMEDIATELY right of the score: `F` is the level the field ranked on, `S` the direction its own readings have been going — the second thing a reader wants…
     COL_SLOPE,
     // ── the coin's own arithmetic, in the order it runs ── `fit minmax (Fm⁺)` = this net's `fit
     // (F)` as a 0..1 place in the last field (the tilt already applied: `1` = the end that earns),
     COL_FIT_MINMAX,
     COL_UPMINMAX,
     COL_TICKET,
-    // `A` (clocks lived) closes the ranking run, right of the ticket: `T` is the chance the coin
-    // paid per clock and `A` is how many clocks this net was there to be paid for — the lottery's
-    // arithmetic read left to right. Still the ONLY count of clocks the net lived.
+    // `A` (clocks lived) closes the ranking run, right of the ticket: `T` is the chance the coin paid per clock and `A` is how many clocks this net was there to be paid for —…
     COL_AGE,
     // The learning budget, then the eval cost: `E` already holds the act-only passes, so these
     // are the only two cost columns — `A` stays the only count of clocks the net lived.
@@ -1421,8 +1368,8 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
             "nodes in the blueprint: input + hidden + output".to_string(),
         ),
         (
-            "split".to_string(),
-            "the Input node's feature-mask draw: `exclusive` gives every port its own columns, `random` lets ports overlap, `inherited` is a crossover blend of two parents' masks (provenance, not a draw rule), `rows` = masks recorded with no policy".to_string(),
+            "mask".to_string(),
+            "share of the input each Input port reads on average: `100%` = no split (every port sees every feature), `1/P` = exclusive over P ports, ~`50%` = random masks, and between = an inherited crossover blend".to_string(),
         ),
         (
             "wires".to_string(),
@@ -1650,9 +1597,7 @@ mod stop_legend_tests {
         );
     }
 
-    /// The card prints NO window leg beside `F`: with the spread charge gone `F` IS the window
-    /// centre, so a `mean`/`median` column held the same number twice, and the diagnostic spread
-    /// (`1.4826·MAD`) held a statistic no cell charges. The `fit` header carries the family instead.
+    /// The card prints NO window leg beside `F`: with the spread charge gone `F` IS the window centre, so a `mean`/`median` column held the same number twice, and the…
     #[test]
     fn the_card_prints_no_window_leg_beside_the_score() {
         use crate::engine::config::MeanType;
@@ -1685,9 +1630,7 @@ mod stop_legend_tests {
         assert!(COL_FIT_MEDIAN.contains("median") && COL_FIT.contains("mean"));
     }
 
-    /// The clock columns are `age (A)` (beside the ticket) and `updates (U) | evals (E)` — `E` holds
-    /// the act-only passes,
-    /// so a reader has no third number to add up (and none to add into `A` by mistake).
+    /// The clock columns are `age (A)` (beside the ticket) and `updates (U) | evals (E)` — `E` holds the act-only passes, so a reader has no third number to add up (and none to…
     #[test]
     fn the_clock_columns_are_age_updates_and_evals() {
         let rows = stop_legend_rows(&ctx());
@@ -2158,11 +2101,7 @@ pub(crate) fn summarize_rows(v: &serde_json::Value) -> Vec<(String, String)> {
     parts
 }
 
-/// How the `Summ` line spells its window legs, per family: `(separator, centre noun, spread noun,
-/// short spread noun, note)`. The leg NUMBERS are `fam_center` / `fam_spread` — the pair the score
-/// is built from — so the printed identity closes. `signed_log` is the one family it cannot close
-/// in: `g⁻¹` is nonlinear, so the population mean of the restored scores is not `g⁻¹` of the mean
-/// legs, and the cell reads `≈` and names `g`.
+/// How the `Summ` line spells its window legs, per family: `(separator, centre noun, spread noun, short spread noun, note)`.
 fn window_legs(
     family: crate::engine::config::MeanType,
 ) -> (
@@ -2187,11 +2126,7 @@ fn window_legs(
     }
 }
 
-/// The `Summ` line's `score↑` cell: the population's mean score, the spread ACROSS nets, and the
-/// window legs that produced it — in the FAMILY the ranking used, so the reader can redo `F` from
-/// the numbers printed beside it (arithmetic and median close exactly; `signed_log` reads `≈`).
-/// The legs are AVERAGED across nets — a median run prints the field's mean MEDIAN, which is what
-/// makes the identity close on the mean rather than on one net's median.
+/// The `Summ` line's `score↑` cell: the population's mean score, the spread ACROSS nets, and the window legs that produced it — in the FAMILY the ranking used, so the…
 fn step_score_cell(
     fit_m: f32,
     fit_spread: &str,
@@ -2229,9 +2164,7 @@ fn minimal_score_cell(
     fit_delta: &str,
     direction: crate::utils::fitness::Direction,
 ) -> String {
-    // The score is the window centre: there is no charge to spell out, so the cell is the number
-    // plus its delta (the `Minimal` frame has no room for the diagnostic legs, and printing a
-    // charge that does not exist would be worse than printing none).
+    // The score is the window centre: there is no charge to spell out, so the cell is the number plus its delta (the `Minimal` frame has no room for the diagnostic legs, and…
     format!(
         "score{} {}{}",
         direction.arrow(),
@@ -2581,7 +2514,7 @@ mod tests {
             nodes: 1,
             wires: 1,
             dim: 4.0,
-            split: None,
+            mask: Some(1.0),
         }
     }
 
@@ -2595,7 +2528,7 @@ mod tests {
             nodes: 1,
             wires: 2,
             dim: 8.0,
-            split: None,
+            mask: Some(0.5),
         }
     }
 
