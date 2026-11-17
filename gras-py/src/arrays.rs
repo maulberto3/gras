@@ -1,9 +1,4 @@
-//! The array on-ramp: NumPy (or any buffer-protocol object) → the crate's
-//! native dataset files.
-//!
-//! There is no second data format here. What this writes is exactly what
-//! `RaceEngine(data_dir, ...)` reads and what a Rust caller writes, so a run
-//! started from arrays resumes like any other.
+//! The array on-ramp: NumPy (or any buffer-protocol object) → the crate's native dataset files.
 
 use std::path::Path;
 
@@ -12,12 +7,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-/// Drain a 2-D buffer into `(rows, cols, row-major f32)`.
-///
-/// `float64` is tried second on purpose: NumPy's default dtype is float64, so a
-/// caller who passes ordinary arrays must not be told to cast. Anything else is
-/// refused by dtype name rather than reinterpreted — reading int64 bytes as f32
-/// would train on noise.
+/// Drain a 2-D buffer into `(rows, cols, row-major f32)`.  `float64` is tried second on purpose: NumPy's default dtype is float64, so a caller who passes ordinary arrays…
 fn drain_2d(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
@@ -29,9 +19,7 @@ fn drain_2d(
         let flat = buf.to_vec(py)?.into_iter().map(|v| v as f32).collect();
         (buf.shape().to_vec(), flat)
     } else {
-        // Name the DTYPE when the object has one (`ndarray.dtype` → "int64"),
-        // because "got ndarray" tells the caller nothing actionable; fall back to
-        // the type for anything else that exports a buffer.
+        // Name the DTYPE when the object has one (`ndarray.dtype` → "int64"), because "got ndarray" tells the caller nothing actionable; fall back to the type for anything else…
         let kind = obj
             .getattr("dtype")
             .map(|dtype| dtype.to_string())
@@ -65,9 +53,7 @@ fn drain_2d(
     Ok((rows, cols, flat))
 }
 
-/// Write `X`/`Y` into `dir` as the crate's native pair — `inputs.bin`,
-/// `targets.bin`, `meta.json` — which is what `RaceEngine(dir, ...)` already
-/// reads. The on-ramp writes a dataset; it does not introduce a second format.
+/// Write `X`/`Y` into `dir` as the crate's native pair — `inputs.bin`, `targets.bin`, `meta.json` — which is what `RaceEngine(dir, ...)` already reads.
 pub(crate) fn write_arrays(
     py: Python<'_>,
     x: &Bound<'_, PyAny>,

@@ -1,13 +1,4 @@
 //! `gras.defaults()` — the numbers a fresh `RaceConfig()` actually holds.
-//!
-//! Rust callers get this for free (`RaceConfig::defaults()`, `TopologyOptions::
-//! default()`); a notebook has no way to read a `TopologyOptions` at all, and the
-//! Python surface hides a dozen knobs behind `None` (= "use the crate default") or
-//! an empty pool (= "all"). So the source of truth here is the CRATE's
-//! `RaceConfig::defaults()`, with the one deliberate Python divergence applied and
-//! re-stated in `binding_overrides`: a Python run ranks on the plain mean
-//! re-stated in `binding_overrides`: a Python run starts all-random
-//! (`champion_previous_load = false`).
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -39,12 +30,9 @@ pub fn defaults(py: Python<'_>) -> PyResult<Py<PyDict>> {
     d.set_item("smoothing_window", cfg.smoothing_window)?;
     d.set_item("mean_type", cfg.mean_type.to_string())?;
     // The BINDING's values: the two knobs a Python run does not inherit from the crate.
-    d.set_item("train_merit", round32(cfg.train_merit))?;
     d.set_item("train_merit_p_min", round32(cfg.train_merit_p_min))?;
     d.set_item("train_merit_p_max", round32(cfg.train_merit_p_max))?;
-    // The ticket's LEGS: the shipped default is `least_fit_fewest_updates` (`Fm⁻ × Um`), no init
-    // probation. Emitted so a notebook can read the shipped product instead of inferring it from
-    // the column names.
+    // The ticket's LEGS: the shipped default is `least_fit_fewest_updates` (`Fm⁻ × Um`), no init probation.
     d.set_item("ticket_legs", cfg.train_ticket.to_string())?;
     d.set_item("init_probation_steps", cfg.init_probation_steps)?;
     d.set_item("drift_prob", round32(cfg.drift_prob))?;

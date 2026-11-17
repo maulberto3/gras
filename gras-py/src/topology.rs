@@ -3,9 +3,7 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-/// An opaque blueprint handle over the crate's `Topology`. Kept minimal on
-/// purpose: JSON in, JSON out, so Python stays artifact-shaped (the same files
-/// the Rust side writes into `nets/<hash>.json`).
+/// An opaque blueprint handle over the crate's `Topology`.
 #[pyclass(name = "Topology", module = "gras._core")]
 pub struct PyTopology {
     inner: gras::Topology,

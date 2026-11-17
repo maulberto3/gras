@@ -1,23 +1,10 @@
-//! The string menus the binding accepts, and the `gras.*()` pyfunctions that
-//! publish them.
-//!
-//! One table per concept on purpose: the error a caller gets for a typo and the
-//! listing they can print are read from the same place, so they cannot disagree.
-//!
-//! The binding cannot take a closure — the loss IS the autograd graph, and
-//! `Variable` does not cross the boundary — so every choice Python gets is a NAME
-//! from one of these tables. That makes the tables the whole surface: `menus()`
-//! returns all of them in one dictionary, and `python/tests/test_determinism.py`
-//! drives one real clock through every published entry, so a name that is listed
-//! and a name the engine accepts are provably the same set.
+//! The string menus the binding accepts, and the `gras.*()` pyfunctions that publish them.
 
 use gras::prelude::*;
 use pyo3::prelude::*;
 use std::collections::BTreeMap;
 
-/// Task presets: a name that picks the loss (and, through
-/// [`Loss::natural_fitness`], the fitness it ranks on) without spelling either.
-/// A `loss=` / `fitness=` kwarg still wins for the half it names.
+/// Task presets: a name that picks the loss (and, through [`Loss::natural_fitness`], the fitness it ranks on) without spelling either.
 pub(crate) const TASKS: [&str; 2] = ["classification", "regression"];
 
 /// The RL updates `gym(algo=…)` accepts. One entry on purpose: `Reinforce` is
@@ -64,9 +51,7 @@ pub(crate) const STANDARDIZE_OPS: [&str; 5] = [
 /// `crossover_ops_pool`: the mixing methods a crossover attempt can draw.
 pub(crate) const CROSSOVER_OPS: [&str; 2] = ["one_point", "uniform"];
 
-/// `crossover_cull_policy`: who a surviving crossover child evicts.
-/// `lowest_fitness_most_updates` is the evidence-based twin of `highest_ticket_chance`:
-/// the lowest-fitness net that has already spent its updates.
+/// `crossover_cull_policy`: who a surviving crossover child evicts. `lowest_fitness_most_updates` is the evidence-based twin of `highest_ticket_chance`: the lowest-fitness…
 pub(crate) const CROSSOVER_CULLS: [&str; 4] = [
     "lowest_fitness",
     "random",
@@ -74,9 +59,7 @@ pub(crate) const CROSSOVER_CULLS: [&str; 4] = [
     "lowest_fitness_most_updates",
 ];
 
-/// `mutation_cull_policy`: who a firing mutation roll evicts. `highest_ticket_chance` and
-/// `lowest_fitness_most_updates` are the same two lottery selectors the crossover channel
-/// offers.
+/// `mutation_cull_policy`: who a firing mutation roll evicts. `highest_ticket_chance` and `lowest_fitness_most_updates` are the same two lottery selectors the crossover…
 pub(crate) const MUTATION_CULLS: [&str; 4] = [
     "lowest_fitness",
     "random",
@@ -87,20 +70,13 @@ pub(crate) const MUTATION_CULLS: [&str; 4] = [
 /// `crossover_selection`: how a crossover attempt draws its parents.
 pub(crate) const SELECTION_METHODS: [&str; 2] = ["roulette", "tournament"];
 
-/// `feature_split`: how the Input node's per-port feature masks are drawn. The
-/// recorded spellings `split_random` / `split_exclusive` are accepted too, so an
-/// old `engine.json` reads back; they are aliases, not extra choices.
+/// `feature_split`: how the Input node's per-port feature masks are drawn.
 pub(crate) const FEATURE_SPLITS: [&str; 2] = ["random", "exclusive"];
 
 /// `log_level` — the card vocabulary, most to least talkative.
 pub(crate) const LOG_LEVELS: [&str; 5] = ["none", "summ", "minimal", "debug", "trace"];
 
-/// The LR schedules `lr_schedule=…` accepts, read from the crate's own table so
-/// the listing and the parse can never disagree. Each has a bare form (the
-/// defaults) and a parameterised one — `cosine(0.1)`, `onecycle(0.3)`,
-/// `step_decay(10,0.5)`, `multistep(0.5,50,100)`, `cyclic(20,0.1)`, `warmup(50)`,
-/// `exponential(0.99)`.
-/// The optimizers `optimizer=…` accepts, from the crate's own table.
+/// The LR schedules `lr_schedule=…` accepts, read from the crate's own table so the listing and the parse can never disagree.
 #[pyfunction]
 pub(crate) fn optimizers() -> Vec<String> {
     gras::trainer::OptimizerKind::NAMES
@@ -143,9 +119,7 @@ pub(crate) fn metrics() -> Vec<String> {
     gras::METRIC_NAMES.iter().map(|s| s.to_string()).collect()
 }
 
-/// The ranking fitness names `RaceEngine(fitness=...)` accepts. Same scorers as
-/// `metrics()`, but each carries the direction that makes "better" true — which
-/// is why naming one is not the same as naming a metric.
+/// The ranking fitness names `RaceEngine(fitness=...)` accepts.
 #[pyfunction]
 pub(crate) fn fitnesses() -> Vec<String> {
     gras::FITNESS_NAMES.iter().map(|s| s.to_string()).collect()
@@ -171,9 +145,7 @@ pub(crate) fn activations() -> Vec<String> {
     ACTIVATIONS.iter().map(|s| s.to_string()).collect()
 }
 
-/// The combine ops `RaceConfig(combine_op_pool=[...])` accepts. Empty means the
-/// stable four (`add`, `mean`, `max`, `min`); `mul` / `sub` / `div` are accepted
-/// but must be asked for.
+/// The combine ops `RaceConfig(combine_op_pool=[...])` accepts.
 #[pyfunction]
 pub(crate) fn combine_ops() -> Vec<String> {
     COMBINE_OPS.iter().map(|s| s.to_string()).collect()

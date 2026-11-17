@@ -1,19 +1,10 @@
 //! One Python gym/gymnasium environment, seen as the crate's `Env`.
-//!
-//! The algorithm is NOT here: `Reinforce` in the crate plays the episodes and
-//! this adapter is only the world — `reset(seed)` and `step(action)`.
 
 use gras::prelude::*;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 /// One Python gym/gymnasium environment, seen as the crate's [`Env`].
-///
-/// The algorithm is NOT here: `Reinforce` in the crate plays the episodes, and
-/// this adapter is only the world — `reset(seed)` and `step(action)`. Every call
-/// crosses back into Python, which is why the GIL stays held for a whole `run()`
-/// (see the module note) and why the environment must not be one of this module's
-/// own types: re-entering a `#[pyclass]` borrowed by `run()` would raise.
 pub(crate) struct GymEnv {
     /// The environment handle. `Py<PyAny>` is `Send + Sync`, which is what lets a
     /// trainer own a Python object at all.
@@ -26,12 +17,7 @@ pub(crate) struct GymEnv {
 }
 
 impl GymEnv {
-    /// Take a Python environment and read the three facts the contract needs:
-    /// the action count, the episode cap, and (later) the observation width.
-    ///
-    /// Discrete actions only. A `Box` space would need a different policy head
-    /// and a different objective, so it is refused by name rather than silently
-    /// rounded to one action.
+    /// Take a Python environment and read the three facts the contract needs: the action count, the episode cap, and (later) the observation width.
     pub(crate) fn new(py: Python<'_>, env: Py<PyAny>, max_turns: Option<usize>) -> PyResult<Self> {
         let bound = env.bind(py);
         let space = bound.getattr("action_space").map_err(|_| {
@@ -67,11 +53,7 @@ impl GymEnv {
         })
     }
 
-    /// `reset(seed=…)` → the first observation, normalising gymnasium's
-    /// `(obs, info)` and classic gym's bare `obs`.
-    ///
-    /// The seed is ALWAYS passed: an unseeded `reset()` randomises from the
-    /// environment's own generator, which would make the run unreplayable.
+    /// `reset(seed=…)` → the first observation, normalising gymnasium's `(obs, info)` and classic gym's bare `obs`.
     pub(crate) fn reset_and_observe(&mut self) -> gras::flodl::tensor::Result<Vec<f32>> {
         Python::attach(|py| {
             let kwargs = pyo3::types::PyDict::new(py);
@@ -97,9 +79,7 @@ impl GymEnv {
     }
 }
 
-/// The adapter's error type: [`Env`] returns tensor results, and a Python
-/// exception has to travel as one of those (it cannot be re-raised through the
-/// crate's trait).
+/// The adapter's error type: [`Env`] returns tensor results, and a Python exception has to travel as one of those (it cannot be re-raised through the crate's trait).
 fn tensor_error(message: String) -> gras::flodl::tensor::TensorError {
     gras::flodl::tensor::TensorError::new(&message)
 }
@@ -191,9 +171,7 @@ impl Env for GymEnv {
         self.max_turns
     }
 
-    /// The recorded world: the environment's own id when it publishes one, so a
-    /// resume with a DIFFERENT environment is refused instead of silently
-    /// training a different game under the old run's name.
+    /// The recorded world: the environment's own id when it publishes one, so a resume with a DIFFERENT environment is refused instead of silently training a different game…
     fn describe(&self) -> serde_json::Value {
         let id = Python::attach(|py| {
             let bound = self.env.bind(py);

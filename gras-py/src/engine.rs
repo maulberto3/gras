@@ -12,10 +12,7 @@ use crate::gym::GymEnv;
 use crate::logging::LOGGING;
 use crate::menu::{TASKS, task_loss};
 
-/// The binding owns ONE live race. Which engine it is follows from the source
-/// of experience: a dataset (dir or arrays) is tabular, a gym environment is RL.
-/// Both wrappers deref to [`CoreEngine`], so the shared surface below dispatches
-/// with one deref per arm instead of duplicating `run`/`step_clock`/... here.
+/// The binding owns ONE live race.
 enum Arm {
     Tabular(TabularEngine),
     Rl(RlEngine),
@@ -68,16 +65,7 @@ fn blob_usize(blob: Option<&serde_json::Value>, key: &str) -> Option<usize> {
         .map(|v| v as usize)
 }
 
-/// Resume an **RL** directory: hand back the environment, take every other knob
-/// from the record.
-///
-/// The recipe a resume cannot invent is the world (`reset(seed)` / `step(action)` /
-/// `action_space.n`) — the caller holds it, so `env=` is required. Everything the
-/// crate can read back out of `engine.json` → `"trainer"` IS read back: `signal`
-/// (turns vs discounted return), both episode counts, `challenge_prob` / policy /
-/// decay, the learning rate, the clip and the episode cap. Nothing falls back to a
-/// default: a default that disagrees with the record is a silent second experiment,
-/// and the crate's blob guard would refuse it one step later anyway.
+/// Resume an **RL** directory: hand back the environment, take every other knob from the record.
 fn resume_rl(
     run_dir: PathBuf,
     header: gras::state::RunHeader,
@@ -100,9 +88,7 @@ fn resume_rl(
             run_dir.display()
         )));
     };
-    // The tabular recipe kwargs name a DIFFERENT scheme than the one recorded here:
-    // the RL blob holds those knobs itself, so accepting one would be accepted-then-
-    // refused by the parity guard. Name the mistake at the call site.
+    // The tabular recipe kwargs name a DIFFERENT scheme than the one recorded here: the RL blob holds those knobs itself, so accepting one would be accepted-then- refused by…
     let mut tabular_only: Vec<&str> = Vec::new();
     for (name, given) in [
         ("loss", loss.is_some()),
@@ -166,9 +152,7 @@ fn resume_rl(
     };
     let count = |key: &str| -> PyResult<usize> { Ok(number(key)? as usize) };
 
-    // `signal` is the one structured knob: `{"kind": "turns"}` or
-    // `{"kind": "return", "discount": 0.99}` — the same serde shape the record
-    // holds, so there is no second decoder to drift.
+    // `signal` is the one structured knob: `{"kind": "turns"}` or `{"kind": "return", "discount": 0.99}` — the same serde shape the record holds, so there is no second decoder…
     let signal: Signal = serde_json::from_value(read("signal")?.clone()).map_err(|e| {
         PyValueError::new_err(format!(
             "resume: {}.trainer.signal: {e}",
@@ -185,9 +169,7 @@ fn resume_rl(
     let clip = number("grad_clip")? as f32;
     let matches = count("matches_per_step")?;
     let eval_matches = count("eval_matches_per_step")?;
-    // The exam's step axis, recorded by name. Absent on runs made before the key:
-    // those trained per era, so the blob guard below reports that drift against this
-    // build's per-clock default instead of silently replaying different games.
+    // The exam's step axis, recorded by name.
     let exam = text_or_none(blob, "exam");
 
     // Install the sink at the RECORDED level before construction can emit — a fresh
@@ -198,9 +180,7 @@ fn resume_rl(
             None,
         );
     });
-    // The recorded cap is the FALLBACK: an environment that publishes its own
-    // `spec.max_episode_steps` still wins, exactly as it did when the run started —
-    // and a mismatch there is the blob guard's to report.
+    // The recorded cap is the FALLBACK: an environment that publishes its own `spec.max_episode_steps` still wins, exactly as it did when the run started — and a mismatch…
     let world = Python::attach(|py| GymEnv::new(py, env, Some(max_turns)))?;
     let mut trainer = Reinforce::new(world, gras::auto_device())
         .with_signal(signal)
@@ -220,9 +200,7 @@ fn resume_rl(
         }
         None => {}
     }
-    // Same rule as the tabular half: an override wins, else the record's name. An
-    // RL run only carries the key when it TRAINED with a schedule, so a run from
-    // before this existed resumes with none.
+    // Same rule as the tabular half: an override wins, else the record's name.
     let recorded_schedule = text_or_none(blob, "lr_schedule");
     if let Some(schedule) = lr_schedule_of(lr_schedule.as_deref().or(recorded_schedule.as_deref()))?
     {
@@ -247,10 +225,7 @@ fn resume_rl(
     })
 }
 
-/// Resolve `lr_schedule=` (or a recorded label) into the crate's named schedule.
-///
-/// `None` in, `None` out — no schedule, which is the crate's fixed-rate default.
-/// The error names the offender AND the full set, so a typo is a one-line fix.
+/// Resolve `lr_schedule=` (or a recorded label) into the crate's named schedule.  `None` in, `None` out — no schedule, which is the crate's fixed-rate default.
 fn lr_schedule_of(name: Option<&str>) -> PyResult<Option<gras::trainer::LrSchedule>> {
     name.map(named_lr_schedule).transpose()
 }
@@ -289,17 +264,7 @@ fn named_lr_schedule(text: &str) -> PyResult<gras::trainer::LrSchedule> {
     })
 }
 
-/// A step-race. Construct from a dataset dir (`inputs.bin` / `targets.bin` /
-/// optional `meta.json`), in-memory arrays, or a gym environment — a
-/// [`RaceConfig`](crate::config::PyRaceConfig) and an optional seed in every
-/// case; `run()` advances the whole race (holding the GIL) and returns the stop
-/// reason. Artifacts land in the run dir (`history.csv` is the fitness stream a
-/// determinism test compares).
-///
-/// The training recipe is chosen BY NAME and defaults to what v1 always ran
-/// (one-hot cross-entropy, ranked on cross-entropy). `gras.losses()`,
-/// `gras.metrics()` and `gras.fitnesses()` list the accepted names. RL runs use
-/// the crate's `Reinforce` (`gym()`), so the same determinism contract holds.
+/// A step-race.
 #[pyclass(name = "RaceEngine", module = "gras._core", unsendable)]
 pub struct PyRaceEngine {
     engine: Option<Arm>,
@@ -364,9 +329,7 @@ impl PyRaceEngine {
             })?,
             None => preset.unwrap_or(Loss::CrossEntropyOnehot),
         };
-        // Which net WINS. `None` = the loss's own pairing, because a loss and a
-        // fitness that disagree (mse trained, cross-entropy ranked) rank on
-        // nonsense — and say nothing about it.
+        // Which net WINS. `None` = the loss's own pairing, because a loss and a fitness that disagree (mse trained, cross-entropy ranked) rank on nonsense — and say nothing about…
         let fitness = match fitness {
             Some(name) => fitness_for(&name).ok_or_else(|| {
                 PyValueError::new_err(format!(
@@ -379,11 +342,7 @@ impl PyRaceEngine {
         // Informative, non-ranking metrics: recorded in history.csv/engine.json,
         // never selected on.
         let metrics = match metrics {
-            // Spelled out here rather than via `metrics_for` so the name that
-            // failed and the valid set read the same as the loss/fitness errors
-            // above — the crate's `EngineError` display would prefix this with
-            // its own layering ("invalid options: …"), which is Rust's business,
-            // not a Python caller's.
+            // Spelled out here rather than via `metrics_for` so the name that failed and the valid set read the same as the loss/fitness errors above — the crate's `EngineError`…
             Some(names) => names
                 .iter()
                 .map(|name| {
@@ -422,29 +381,16 @@ impl PyRaceEngine {
             trainer = trainer.with_optimizer(kind);
         }
 
-        // Bind the topology dims from the dataset, exactly like the Rust
-        // examples do: the engine records dims in `engine.json`, but the
-        // topologies drawn at seed time carry `topology_options`, and an
-        // unset dim there becomes 1 in `Network::build` — a shape error on the
-        // first step, not a helpful message.
+        // Bind the topology dims from the dataset, exactly like the Rust examples do: the engine records dims in `engine.json`, but the topologies drawn at seed time carry…
         let (mut inner, log_verbosity) = (*config).clone().into_inner()?;
         inner.metrics = metrics;
-        // Install the console sink before the engine can emit its start-up block:
-        // `Once` because the subscriber is process-wide (a second install is a
-        // no-op, not a panic), and the first engine's level sets the ceiling.
+        // Install the console sink before the engine can emit its start-up block: `Once` because the subscriber is process-wide (a second install is a no-op, not a panic), and the…
         LOGGING.call_once(|| {
             gras::engine::logging::init(inner.log_level, log_verbosity);
         });
-        // The SAME layout sniff the engine runs: a dir holding `train/` + `test/`
-        // is an EXPLICIT split, anything else is one pool that the engine splits
-        // by `eval_share`. Asking only the single-pool resolver here made an
-        // explicit-layout dir raise "no inputs.bin" at construction — the layout
-        // existed in Rust and was unreachable from Python.
+        // The SAME layout sniff the engine runs: a dir holding `train/` + `test/` is an EXPLICIT split, anything else is one pool that the engine splits by `eval_share`.
         let (in_dim, out_dim) = {
-            // The SAME layout sniff the engine runs: `train/` + `val/` ranks on val and
-            // reports on test/, `train/` + `test/` ranks on test, anything else is one pool
-            // the engine splits by `eval_share`. Every split agrees on dims (the resolver
-            // refuses a mismatch), so the TRAIN pool speaks for all of them.
+            // The SAME layout sniff the engine runs: `train/` + `val/` ranks on val and reports on test/, `train/` + `test/` ranks on test, anything else is one pool the engine splits…
             let layout = gras::detect_pool_layout(&data_dir).map_err(|e| {
                 PyRuntimeError::new_err(format!("dataset {}: {e}", data_dir.display()))
             })?;
@@ -641,9 +587,7 @@ impl PyRaceEngine {
             )));
         }
         let blob = header.trainer.as_ref();
-        // Nothing named ⇒ the run's OWN recipe, read back from its `describe()` blob:
-        // any other scheme the parity guard refuses anyway, so falling back to the
-        // binding's default here would only move that error one step later.
+        // Nothing named ⇒ the run's OWN recipe, read back from its `describe()` blob: any other scheme the parity guard refuses anyway, so falling back to the binding's default…
         let loss = match loss.or_else(|| blob_str(blob, "loss")) {
             Some(name) => Loss::parse(&name).ok_or_else(|| {
                 PyValueError::new_err(format!(
@@ -674,9 +618,7 @@ impl PyRaceEngine {
         if let Some(value) = eval_batch_size.or_else(|| blob_usize(blob, "eval_batch_size")) {
             trainer = trainer.with_eval_batch_size(value);
         }
-        // The schedule is part of the recipe: an override wins, otherwise the
-        // RECORDED name is rebuilt — a bare resume replays the same curve, and the
-        // crate's blob guard refuses one that differs.
+        // The schedule is part of the recipe: an override wins, otherwise the RECORDED name is rebuilt — a bare resume replays the same curve, and the crate's blob guard refuses…
         let recorded_schedule = blob_str(blob, "lr_schedule_name");
         if let Some(schedule) =
             lr_schedule_of(lr_schedule.as_deref().or(recorded_schedule.as_deref()))?
@@ -689,9 +631,7 @@ impl PyRaceEngine {
         if let Some(kind) = optimizer_of(optimizer.as_deref().or(recorded_optimizer.as_deref()))? {
             trainer = trainer.with_optimizer(kind);
         }
-        // Install the sink at the RECORDED level before construction can emit: in a
-        // fresh process a resume would otherwise be silent (the subscriber is
-        // process-wide, so an earlier engine's ceiling still wins).
+        // Install the sink at the RECORDED level before construction can emit: in a fresh process a resume would otherwise be silent (the subscriber is process-wide, so an earlier…
         LOGGING.call_once(|| {
             gras::engine::logging::init(
                 gras::RaceConfig::from_snapshot(&header.config).log_level,
@@ -789,9 +729,7 @@ impl PyRaceEngine {
             }
         }
         let mut world = GymEnv::new(py, env, max_turns)?;
-        // The topology is drawn BEFORE the trainer exists, so the observation
-        // width has to be known now: one probe reset, on a fixed seed, which also
-        // fails fast if the environment does not behave like a gym env.
+        // The topology is drawn BEFORE the trainer exists, so the observation width has to be known now: one probe reset, on a fixed seed, which also fails fast if the environment…
         let probe = world
             .reset_and_observe()
             .map_err(|e| PyRuntimeError::new_err(format!("env probe reset: {e}")))?;
@@ -844,18 +782,7 @@ impl PyRaceEngine {
         })
     }
 
-    /// How many nets are in the race right now.
-    ///
-    /// `pop_size` on a fresh engine, and it drops as culls remove nets — so it is
-    /// the live population, not the configured one. Read from the engine's own
-    /// state, which means it keeps answering after `run()` and matches the
-    /// `is_alive` flags in `nets/<hash>.json` rather than a fresh draw.
-    /// Run the race to its stop criterion.
-    ///
-    /// The GIL stays held for the call: `detach` needs a `Send` closure and the
-    /// engine is `!Send` (flodl `Rc<RefCell<_>>`), so a Python thread cannot step
-    /// the race concurrently with other Python threads yet. Same root cause as
-    /// the parallel-population TODO item; no `unsafe` is used to paper over it.
+    /// How many nets are in the race right now.  `pop_size` on a fresh engine, and it drops as culls remove nets — so it is the live population, not the configured one.
     fn run(&mut self) -> PyResult<String> {
         let mut arm = self.engine.take().ok_or_else(|| {
             PyRuntimeError::new_err("run() may only be called while an engine is present")
