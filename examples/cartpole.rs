@@ -225,9 +225,9 @@ fn trainer(
 /// Live nets in the race (default; `--pop` overrides).
 const POP: usize = 100;
 /// Crossover turnover: the share of the live field replaced per clock, dealt as `round(share × pop)` rolls.
-const CROSSOVER_TURNOVER: f32 = 0.05;
+const CROSSOVER_TURNOVER: f32 = 0.025;
 /// MUTATION turnover default, the mutation channel's own share of the field per clock.
-const MUTATION_TURNOVER: f32 = 0.01;
+const MUTATION_TURNOVER: f32 = 0.005;
 /// Step budget for a full run: `--max-steps N` runs exactly N clocks before Stop.
 const RACE_STEPS: usize = 20;
 /// Train matches each net plays per step — the learning signal.

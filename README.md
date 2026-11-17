@@ -7,7 +7,7 @@ Hand-designing architectures is slow, biased, and easy to overfit to your own
 intuition. `gras` searches that space for you — continuously and reproducibly —
 and hands back a champion you can actually trust.
 
-Crate **`gras` 2.0.0** · docs [**docs.rs/gras**](https://docs.rs/gras).
+Crate **`gras` 2.0.1** · docs [**docs.rs/gras**](https://docs.rs/gras).
 
 ## Is this for me?
 
