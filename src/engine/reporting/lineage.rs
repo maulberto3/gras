@@ -109,6 +109,9 @@ pub(super) fn mermaid_node_label(
     if let Some(fit) = facts.fit {
         parts.push(format!("fit {}", fmt_cell(fit)));
     }
+    // Two nets can share a fit and differ by whether it was bought with 2 updates or 200:
+    // the box says what the stop card's `updates (U)` column says.
+    parts.push(format!("updates {}", facts.updates));
     // The root says what the FILE says it is (`CHAMPION` in `champion-<hash>.md`) — one
     // renderer, so the role stays the caller's.
     if let Some(role) = root_role {
@@ -130,6 +133,8 @@ pub(super) struct LineageFacts {
     born: usize,
     /// The ranking value (risk-adjusted fit); `None` when it never measured.
     fit: Option<f32>,
+    /// Clocks it actually TRAINED through — the `U` the stop card prints under `updates (U)`.
+    updates: usize,
     alive: bool,
     culled_at: Option<usize>,
     /// Parent hashes named by `created_from` (empty = a root).
@@ -164,6 +169,7 @@ impl<'a> LineageTree<'a> {
                 origin: state.created_from.clone(),
                 born: state.entered_at_step,
                 fit: engine.smoothed_fitness_of(hash),
+                updates: state.step,
                 alive: true,
                 culled_at: None,
                 parents: lineage_parents(state.created_from.as_deref()),
@@ -179,6 +185,7 @@ impl<'a> LineageTree<'a> {
                         .final_risk_score
                         .filter(|v| v.is_finite())
                         .or_else(|| state.final_fitness_mean.filter(|v| v.is_finite())),
+                    updates: state.step,
                     alive: state.is_alive,
                     culled_at: state.culled_at_step,
                     parents: lineage_parents(state.created_from.as_deref()),

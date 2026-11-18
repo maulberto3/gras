@@ -386,10 +386,13 @@ impl Topology {
         let n_ports = self.nodes[input].num_outputs.max(1);
         let masks: Vec<Vec<u8>> = (0..n_ports)
             .map(|i| {
+                // A port the donors did not have starts on a donor's view (cycled), NOT on a
+                // free full vector: with one wire per socket the port count follows the number
+                // of consumers, so padding here would silently widen the net instead of
+                // inheriting what its parents actually read.
                 rows.get(i)
-                    // No inherited row for this port: every feature reaches
                     .cloned()
-                    .unwrap_or_else(|| vec![1u8; input_dim])
+                    .unwrap_or_else(|| rows[i % rows.len()].clone())
             })
             .collect();
         // PADDING BREAKS AN `Exclusive` CLAIM.
@@ -472,7 +475,7 @@ impl Topology {
         // Step 6: connect_orphans — wire orphaned inputs to the input node (cycle ports)
         self.rewire_orphaned_inputs();
 
-        // Step 6b: clean_wiring — one Input wire per target (the Input node fans out)
+        // Step 6b: clean_wiring — one Input wire per target (each target reads one port)
         self.dedup_input_connections();
 
         // Step 7: rescue_outputs — wire orphaned outputs into a free input port, or grow
@@ -561,40 +564,44 @@ impl Topology {
         input_node.num_outputs = input_node.num_outputs.max(n_hidden).max(1);
     }
 
-    /// Step 6: wire orphaned input ports to the input node's output ports, cycling
-    /// through available ports (the combine op merges shared ones).
+    /// Step 6: wire every orphaned input port to a NEW Input output port — ONE SOCKET PER WIRE.
+    ///
+    /// This used to cycle `output_idx % n_ports`, so one Input port carried several wires. That
+    /// made `ports` and `wires` two numbers the reader had to reconcile, and made ONE mask row
+    /// stand for several consumers — a shared feature view that crossover could not split. A
+    /// fresh port per wire makes the two counts equal by construction, and gives every consumer
+    /// its own row of the split genome.
     fn rewire_orphaned_inputs(&mut self) {
-        let input_id = self
+        let Some(input_id) = self
             .nodes
             .iter()
             .find(|n| n.kind == NodeKind::Input)
-            .unwrap()
-            .id;
-        let n_ports = self
-            .nodes
-            .iter()
-            .find(|n| n.id == input_id)
-            .unwrap()
-            .num_outputs;
-        let mut output_idx = 0usize;
+            .map(|n| n.id)
+        else {
+            return;
+        };
+        // Never `% n_ports`: each orphan takes the NEXT unused index, and the Input node grows.
+        let mut next_port = self.nodes[input_id].num_outputs;
         for node in &self.nodes {
             for i in 0..node.num_inputs {
                 let port = Port {
                     node: node.id,
                     index: i,
                 };
-                if !self.connections.iter().any(|c| c.to == port) {
-                    self.connections.push(Connection {
-                        from: Port {
-                            node: input_id,
-                            index: output_idx % n_ports,
-                        },
-                        to: port,
-                    });
-                    output_idx += 1;
+                if self.connections.iter().any(|c| c.to == port) {
+                    continue;
                 }
+                self.connections.push(Connection {
+                    from: Port {
+                        node: input_id,
+                        index: next_port,
+                    },
+                    to: port,
+                });
+                next_port += 1;
             }
         }
+        self.nodes[input_id].num_outputs = next_port;
     }
 
     /// The Input node is the one deliberate fan-out node (its ports are the features, and each may
@@ -744,9 +751,10 @@ impl Topology {
                     num_ports: dst.num_inputs,
                 });
             }
-            // Input node's output ports can fan out to multiple destinations.
-            let is_input_node = self.nodes[conn.from.node].kind == NodeKind::Input;
-            if !is_input_node && used_sources.contains(&conn.from) {
+            // ONE WIRE PER SOCKET, both ends: an output port feeds at most one input port.
+            // (Fan-in is extra input ports; fan-out is extra output ports.) The Input node was
+            // exempt while it cycled its ports — that exemption is what let `2 (3w)` exist.
+            if used_sources.contains(&conn.from) {
                 return Err(TopologyError::DoubleUsedOutput(conn.from));
             }
             used_sources.push(conn.from);
@@ -2524,6 +2532,8 @@ mod finalize_order_tests {
 mod fanout_bounds_tests {
     use super::*;
 
+
+
     #[test]
     fn finalize_respects_max_inputs_per_node() {
         // The setters bound CREATION; verify finalize never grows a node's declared input
@@ -2727,7 +2737,7 @@ mod fanout_bounds_tests {
     /// The crossover path's installer: an inherited row lands on its own port, a port with no
     /// inherited row starts UNMASKED (every feature reaches it), and the result always validates
     #[test]
-    fn install_feature_masks_maps_rows_and_leaves_new_ports_unmasked() {
+    fn install_feature_masks_maps_rows_and_seeds_new_ports_on_a_donor_view() {
         let opts = TopologyOptions {
             input_dim: Some(4),
             output_dim: Some(1),
@@ -2753,8 +2763,8 @@ mod fanout_bounds_tests {
         assert_eq!(masks.len(), ports, "one row per port");
         assert_eq!(masks[0], vec![0, 1, 1, 1], "the inherited row rides port 0");
         assert!(
-            masks[1..].iter().all(|m| m == &vec![1u8; 4]),
-            "a port with no inherited row sees every feature"
+            masks[1..].iter().all(|m| m == &vec![0, 1, 1, 1]),
+            "a port with no inherited row starts on the donor's view, not a free full vector"
         );
         g.validate().expect("installed masks must validate");
         assert_eq!(

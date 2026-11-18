@@ -574,8 +574,12 @@ impl CoreEngine {
             } else if cell == COL_UPMINMAX {
                 *cell = u_cell.to_string();
             } else if cell == COL_TICKET {
-                *cell = ticket_header(ticket);
+                *cell = ticket.to_string();
             }
+            // BREAK the label at every joint: the header is the widest thing in the table, so its
+            // height is what buys the rows their width.
+            let wrapped = wrap_header(cell);
+            *cell = wrapped;
         }
         for m in &self.metrics {
             // `m:` marks the informative band: measured on the same eval batch as `fit (F)`,
@@ -689,7 +693,7 @@ impl CoreEngine {
             // name, but how much of the input a port reads is still a comparable number.
             shape
                 .and_then(|s| s.mask)
-                .map(|d| format!("{:.0}%", d * 100.0))
+                .map(|d| format!("{:.0}", d * 100.0))
                 .unwrap_or_else(dash),
             shape.map(|s| s.wires.to_string()).unwrap_or_else(dash),
             // Mean hidden width is a MEASURED number like every other cell, so it takes the band
@@ -1240,11 +1244,17 @@ fn ticket_column(legs: crate::engine::config::TrainTicket) -> &'static str {
     }
 }
 
-/// The ticket header BROKEN over lines: its equation is the widest cell in the table, so a header earns the extra height back by not setting the width of every row.
-fn ticket_header(cell: &str) -> String {
-    cell.replacen("minmax (T", "minmax\n(T", 1)
-        .replacen(" + (", "\n+ (", 1)
-        .replacen(" × ", "\n× ", usize::MAX)
+/// BREAK a header over lines at its joints — after `=`, before `minmax`, before a `(`, between
+/// `feature`/`split`/`masks`/`%`. A column is as wide as its longest LINE, not as wide as the
+/// label was on one line, so the header's height is what buys every ROW its width.
+fn wrap_header(cell: &str) -> String {
+    cell.replace(" = ", " =\n")
+        .replace(" minmax", "\nminmax")
+        .replace(" + (", " +\n(")
+        .replace(" × ", "\n× ")
+        .replace(" (", "\n(")
+        .replace("feature split", "feature\nsplit")
+        .replace("split masks", "split\nmasks")
 }
 
 /// The U leg's cell under the leg's own polarity — `Um⁻` pays the fewest updates, `Um⁺` the most.
@@ -1260,6 +1270,11 @@ const COL_UPDATES: &str = "updates (U)";
 /// `E`: every time the net ran the trainer and was SCORED — `U` (the updates that stuck) plus the act-only passes the lottery denied under `train_merit_learn_only`.
 const COL_EVALS: &str = "evals (E)";
 const COL_EXAM: &str = "exam (X)";
+/// `mask`: the share of the input each Input port reads, averaged over the ports. The header is
+/// WRAPPED at render time (`wrap_header`) so the CELL holds the bare number: `100` = no split
+/// (every port sees every feature), `1/P` = exclusive over P ports, between = an inherited
+/// crossover blend. The `%` is stated once, in the header, instead of in every row.
+const COL_MASK: &str = "feature split masks %";
 
 /// The columns the card actually PRINTS, in reading order — `STOP_HEADER_FIXED` minus the cells
 /// this run cannot fill.
@@ -1282,7 +1297,7 @@ const STOP_HEADER_FIXED: &[&str] = &[
     "origin",
     "params",
     "nodes",
-    "mask",
+    COL_MASK,
     "wires",
     "width",
     // The word AND its letter, so a legend equation can be read straight off the row; the DERIVED column is named by the value it produces (`ticket`).
@@ -1368,7 +1383,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
             "nodes in the blueprint: input + hidden + output".to_string(),
         ),
         (
-            "mask".to_string(),
+            COL_MASK.to_string(),
             "share of the input each Input port reads on average: `100%` = no split (every port sees every feature), `1/P` = exclusive over P ports, ~`50%` = random masks, and between = an inherited crossover blend".to_string(),
         ),
         (
