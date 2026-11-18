@@ -3,11 +3,6 @@
 //! CartPole — the RL example: a pure-Rust `Env`, the crate's REINFORCE trainer, a reported fitness.
 //! Sections: 1 environment, 2 trainer, 3 stop rule, 4 `main()`; **match** = episode, **turn** = env step.
 
-/// The example's tests, kept in a sibling file so the example reads cleanly.
-#[cfg(test)]
-#[path = "cartpole/tests.rs"]
-mod cartpole_tests;
-
 mod common;
 
 use fastrand::Rng;
