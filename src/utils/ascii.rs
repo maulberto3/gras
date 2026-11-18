@@ -20,8 +20,8 @@ pub(crate) struct AsciiNode {
     /// Wires ARRIVING at this node — equals `num_inputs` on a finalized graph
     /// (one wire per input port; a port is a socket, not a bucket).
     pub in_wires: usize,
-    /// Wires LEAVING this node (may exceed `num_outputs`: the Input node's ports
-    /// fan out to many targets by design — it is the only fan-out node).
+    /// Wires LEAVING this node — equal to `num_outputs` on a graph `finalize` built
+    /// (one socket per wire); only a LEGACY blueprint can leave one port feeding several.
     pub out_wires: usize,
 }
 
@@ -107,7 +107,7 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
         in_slots.push(slots);
     }
     // Each wire is labelled with its PORT index; where one port feeds several
-    // wires (Input only) the label repeats (`o1 o1` = fan-out).
+    // wires (legacy Input fan-out only) the label repeats (`o1 o1`).
     let slot_labels = |prefix: char, ports: &[usize]| -> Vec<String> {
         ports.iter().map(|p| format!("{prefix}{p}")).collect()
     };

@@ -247,14 +247,55 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             split_policy_name(graph.options.feature_split),
             masks.len()
         ));
-        out.push_str("| port | keeps | share | features |\n|---:|---:|---:|---|\n");
+        // Which wires each port feeds: the Input node is the one node that FANS OUT, so its port
+        // count and its wire count can differ. A diagram draws one slot per WIRE, so a row has to
+        // name the consumers its single masked slice is read by — else three slots look like a
+        // third mask row the table forgot.
+        let input_node = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Input)
+            .map(|n| n.id);
+        let feeds: Vec<String> = (0..masks.len())
+            .map(|port| {
+                let consumers: Vec<String> = graph
+                    .connections
+                    .iter()
+                    .filter(|c| Some(c.from.node) == input_node && c.from.index == port)
+                    .map(|c| c.to_label())
+                    .collect();
+                if consumers.is_empty() {
+                    crate::utils::cfy::NO_VALUE.to_string()
+                } else {
+                    consumers.join(", ")
+                }
+            })
+            .collect();
+        out.push_str("| port | keeps | share | features | wires |\n|---:|---:|---:|---|---|\n");
         for (port, mask) in masks.iter().enumerate() {
             let keeps = mask.iter().filter(|b| **b != 0).count();
             let note = if keeps == 0 { " (bias only)" } else { "" };
             out.push_str(&format!(
-                "| {port} | {keeps}{note} | {:.1}% | {} |\n",
+                "| {port} | {keeps}{note} | {:.1}% | {} | {} |\n",
                 100.0 * keeps as f32 / input_dim as f32,
-                kept_features(mask, input_dim)
+                kept_features(mask, input_dim),
+                feeds[port]
+            ));
+        }
+        // Rows are PORTS, the diagram draws WIRES: say so where the two disagree.
+        let wires: usize = graph
+            .connections
+            .iter()
+            .filter(|c| Some(c.from.node) == input_node)
+            .count();
+        if wires != masks.len() {
+            out.push_str(&format!(
+                "\n**{} port(s) carry {wires} wire(s)**: the Input node fans out — {}, and a port's masked slice is computed ONCE and read by every wire it feeds. This table is one row per PORT; the diagram draws one slot per WIRE (its `Out` cell counts both).\n\n",
+                masks.len(),
+                (0..masks.len())
+                    .map(|p| format!("port {p} → {}", feeds[p]))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
             ));
         }
         out.push('\n');
@@ -337,8 +378,8 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("\n| **Input box → second line** | the feature split when the net has one: `split <policy> · <ports>p · <seen>/<n> seen`. Present for ANY policy that carries rows (`exclusive`, `random`, `inherited`); absent for `none`, where every port already carries the full mixed vector — that is the common case, and why the box is usually one line. Per-port rows are in *Feature split* above. |");
     out.push_str("\n| **`na` in `Combine` / `Std`** | no per-node override, so the forward pass uses `Add` / no standardisation. `na` is not a missing gene: it is the gene spelled as its default (the diversity metric folds `None` and `Identity` into one token for the same reason). |");
     out.push_str("\n| **Nodes table → `Sources`** | which output port feeds each input port (`n1_o2` = output 2 of node 1), one entry per port in port order — the `k`-th entry feeds `i<k>`; `*` = an unwired port (never left behind by `finalize`). |");
-    out.push_str("\n| **Nodes table → `In` / `Out` with `(Nw)`** | PORT counts; a parenthesised wire count appears only where the two differ (`Out 2 (3w)` = 2 ports, 3 wires). Only the Input node fans out, so only it can differ — the wiring diagram draws one slot per WIRE, which is why its `Out` slots can outnumber its ports. |");
-    out.push_str("\n| **Nodes table → `In` / `Out`** | PORT counts. Only the Input node can fan out, so only its cell can read `2 (3w)` — two ports carrying three wires, the same numbers the wiring diagram labels `2o→3w` and the edge list shows as a repeated port (`n0_o0` twice). A hidden/output row reads plain numbers because an input port carries exactly one wire. |");
+    out.push_str("\n| **Nodes table → `In` / `Out` with `(Nw)`** | PORT counts; a parenthesised wire count appears only where the two differ (`Out 2 (3w)` = 2 ports, 3 wires). A graph built now is one-wire-per-socket, so a `(Nw)` cell can only come from a legacy blueprint — the wiring diagram draws one slot per WIRE, which is why its `Out` slots can outnumber its ports. |");
+    out.push_str("\n| **Nodes table → `In` / `Out`** | PORT counts. Only a legacy blueprint can read `2 (3w)` — two ports carrying three wires, the same numbers the wiring diagram labels `2o→3w` and the edge list shows as a repeated port (`n0_o0` twice). A hidden/output row reads plain numbers because an input port carries exactly one wire. |");
     out.push_str("\n| **Nodes table → `Combine` / `Std`** | how multiple inputs are merged / whether they're normalized first. |");
     out.push_str("\n| **Edge list & wiring diagram** | one line per wire, exact ports (`n0_o1 → n2_i0`); `<<<<` = long jump; `▶ ◀ *` = wired out / wired in / orphaned. |");
     out.push('\n');
@@ -478,33 +519,39 @@ mod tests {
         g.nodes.push(Node::new_input(0, 2));
         g.nodes.push(Node::new_hidden(1, 2, 1));
         g.nodes.push(Node::new_output(2, 1, 1));
-        for (from, to) in [(0, 0), (1, 1)] {
-            g.connections.push(Connection {
-                from: Port {
-                    node: 0,
-                    index: from,
-                },
-                to: Port { node: 1, index: to },
-            });
-        }
-        g.connections.push(Connection {
-            from: Port { node: 1, index: 0 },
-            to: Port { node: 2, index: 0 },
-        });
         g.finalize();
+        // `finalize` picks its OWN port mapping, so the fixture installs the wires it wants to
+        // read AFTER the build — exactly where the engine installs masks.
+        g.connections = vec![
+            Connection {
+                from: Port { node: 0, index: 0 },
+                to: Port { node: 1, index: 0 },
+            },
+            Connection {
+                from: Port { node: 0, index: 1 },
+                to: Port { node: 2, index: 0 },
+            },
+            Connection {
+                from: Port { node: 1, index: 0 },
+                to: Port { node: 2, index: 1 },
+            },
+        ];
         // Masks are genome but `finalize` drops them (a rebuild may renumber ports),
         // the fixture installs them exactly where the engine does: after the build.
         g.nodes[0].feature_masks = Some(vec![vec![1, 0, 1, 0], vec![0, 1, 0, 0]]);
         g.options.feature_split = Some(FeatureSplitPolicy::Exclusive);
 
         let md = topology_markdown(&g, None);
-        assert!(md.contains("| port | keeps | share | features |"), "{md}");
         assert!(
-            md.contains("| 0 | 2 | 50.0% | 1010 |"),
+            md.contains("| port | keeps | share | features | wires |"),
+            "{md}"
+        );
+        assert!(
+            md.contains("| 0 | 2 | 50.0% | 1010 | n1_i0 |"),
             "port 0 keeps features 0 and 2:\n{md}"
         );
         assert!(
-            md.contains("| 1 | 1 | 25.0% | 0100 |"),
+            md.contains("| 1 | 1 | 25.0% | 0100 | n2_i0 |"),
             "port 1 keeps feature 1, which the count alone could not say:\n{md}"
         );
         // The blueprint line is complete: dropout stated even at 0, and the seed travels
@@ -513,6 +560,64 @@ mod tests {
         assert!(
             md.contains("sampled 2–15 nodes · 2–15 in · 2–15 out"),
             "the topology seed needs its bounds beside it:\n{md}"
+        );
+    }
+
+
+    /// The Input node is the only node that FANS OUT: two ports can carry three wires, so a row
+    /// has to name the consumers its masked slice feeds — otherwise the diagram's three input
+    /// slots read like a third mask row the table forgot.
+    #[test]
+    fn a_fanning_input_names_the_wires_each_port_feeds() {
+        use crate::graph::node::Node;
+        use crate::graph::topology::{Connection, Port};
+        let mut g = Topology::new(
+            12,
+            Some(TopologyOptions {
+                input_dim: Some(4),
+                output_dim: Some(1),
+                dropout_prob: 0.0,
+                ..Default::default()
+            }),
+        );
+        g.nodes.push(Node::new_input(0, 2));
+        g.nodes.push(Node::new_hidden(1, 1, 1));
+        g.nodes.push(Node::new_output(2, 3, 1));
+        // port 0 feeds TWO consumers, port 1 one: 2 ports, 3 wires out of the Input node.
+        g.finalize();
+        // Port 0 feeds TWO consumers, port 1 one: 2 ports, 3 wires — the shape the real
+        // champion `2 (3w)` cell reports, installed after the build like the engine does.
+        g.connections = vec![
+            Connection {
+                from: Port { node: 0, index: 0 },
+                to: Port { node: 1, index: 0 },
+            },
+            Connection {
+                from: Port { node: 0, index: 0 },
+                to: Port { node: 2, index: 1 },
+            },
+            Connection {
+                from: Port { node: 0, index: 1 },
+                to: Port { node: 2, index: 0 },
+            },
+        ];
+        g.nodes[0].feature_masks = Some(vec![vec![1, 1, 0, 0], vec![0, 0, 1, 1]]);
+        g.options.feature_split = Some(FeatureSplitPolicy::Exclusive);
+
+        let md = topology_markdown(&g, None);
+        // The row names BOTH wires port 0 feeds, and the single wire port 1 feeds.
+        assert!(
+            md.contains("| 0 | 2 | 50.0% | 1100 | n1_i0, n2_i1 |"),
+            "port 0 feeds two wires:\n{md}"
+        );
+        assert!(
+            md.contains("| 1 | 2 | 50.0% | 0011 | n2_i0 |"),
+            "port 1 feeds one:\n{md}"
+        );
+        // And where ports and wires disagree, the table says so in words.
+        assert!(
+            md.contains("**2 port(s) carry 3 wire(s)**"),
+            "the fan-out is stated next to the rows:\n{md}"
         );
     }
 
