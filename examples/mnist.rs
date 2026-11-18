@@ -5,13 +5,15 @@
 //! It reads the binary dataset at `data/mnist` (`train/` + `test/`); `--synthetic` opts into
 //! random-label smoke data, and without a dataset the run REFUSES instead of faking one.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
-use gras::engine::config::{MeanType, TrainTicket};
 use gras::flodl::tensor::Result as TensorResult;
 use gras::prelude::*;
 use gras::utils::race_steps::{deterministic_train_step, eval_one_step};
 use gras::utils::{score, tabular_data};
+use common::EngineArgs;
 
 // ═══ SECTION 1 — THE DATA (a gras-format dataset on disk) ═══════════════
 
@@ -288,16 +290,6 @@ fn jitter_inputs(
 
 // `RunSpec::tabular` declares the mode; `Fitness::new` takes the score the report computes.
 
-/// Live nets in the race (default; `--pop` overrides).
-const POP: usize = 100;
-/// Crossover turnover: the share of the live field replaced per clock, dealt as `round(share × pop)` rolls.
-const CROSSOVER_TURNOVER: f32 = 0.025;
-/// MUTATION turnover default, the mutation channel's own share of the field per clock.
-const MUTATION_TURNOVER: f32 = 0.005;
-/// Step budget for a full run: `--max-steps N` runs exactly N clocks before Stop.
-const RACE_STEPS: usize = 50;
-/// Steps between population checkpoints — the era rotation and the CSV flush ride this.
-const CHECKPOINT_EVERY: usize = 50;
 /// Name recorded in `engine.json` (informational only).
 const RUN_NAME: &str = "mnist";
 /// Seed a fresh run uses when `--seed` is not passed; the record still wins on `--resume`.
@@ -312,243 +304,50 @@ const CHALLENGE_PROB: f32 = 0.15;
     about = "MNIST tabular race: every engine knob is a flag, each one carrying the value the run uses."
 )]
 struct Cli {
-    /// Live networks in the race (default: the `POP` const).
-    #[arg(long, value_name = "N", default_value_t = POP)]
-    pop: usize,
-    /// Stop after this many steps; on `--resume` it EXTENDS the recorded budget.
-    #[arg(long, value_name = "N", default_value_t = RACE_STEPS)]
-    max_steps: usize,
+    /// Every engine knob shared with the other example (`examples/common/mod.rs`).
+    #[command(flatten)]
+    engine: EngineArgs,
+
     /// Pin the run seed (otherwise `RUN_SEED`); it is always recorded in `engine.json`.
     #[arg(long, value_name = "U64")]
     seed: Option<u64>,
-    /// Lottery FLOOR `p_min`: the chance the WORST-graded net is paid each clock (`p_min == p_max` pays all alike).
-    #[arg(long, value_name = "P", default_value_t = 0.25)]
-    ticket_p_min: f32,
-    /// Lottery CEILING `p_max`: the chance the BEST-graded net is paid; everyone between is interpolated.
-    #[arg(long, value_name = "P", default_value_t = 0.75)]
-    ticket_p_max: f32,
-    /// LEARN-ONLY: a lost ticket costs the weight UPDATE, not the clock — the net still measures.
-    #[arg(
-        long,
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = false
-    )]
-    learn_only: bool,
-    /// Crossover victim: `highest_ticket_chance` (the coin's favourite), `lowest_fitness`, `lowest_fitness_most_updates` (evidence) or `random`.
-    #[arg(long, value_name = "POLICY", default_value_t = CrossCullPolicy::default())]
-    crossover_cull_policy: CrossCullPolicy,
-    /// Mutation/immigrant victim: the same four arms as the crossover channel.
-    #[arg(long, value_name = "POLICY", default_value_t = MutationCullPolicy::default())]
-    mutation_cull_policy: MutationCullPolicy,
-    /// Opening clocks with NO culls, no births and no recovery streak: evolution starts at clock N.
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    init_probation: usize,
-    /// Window stats scoped to the CURRENT weights: n counts only readings since the last real update.
-    #[arg(
-        long,
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = true
-    )]
-    policy_scoped_fitness: bool,
-    /// Ranking window K: how many readings are averaged (under `--policy-scoped-fitness`, of ONE policy).
-    #[arg(long, value_name = "K", default_value_t = gras::engine::config::SMOOTHING_WINDOW)]
-    smoothing_window: usize,
-    /// Averaging family: `arithmetic`, `signed_log` (spike-damped) or `median` — the default, where no single reading moves it.
-    #[arg(long, value_name = "FAMILY", default_value_t = MeanType::Median)]
-    mean_type: MeanType,
-    /// At stop, write `worst-<hash>-<fitness>.md` for the `spent`-ranked nets, plus a `worst.md` index.
-    #[arg(
-        long,
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = true
-    )]
-    worst_save_topology: bool,
-    /// Lottery legs: which fit place pays the most and which updates side it multiplies in; a typo is a CLI error.
-    #[arg(
-        long,
-        value_name = "LEGS",
-        default_value_t = gras::engine::config::DEFAULT_TRAIN_TICKET
-    )]
-    train_ticket: TrainTicket,
-    /// Crossover turnover: the share of the live field replaced per clock (`0` switches the channel off).
-    #[arg(long, value_name = "RATE", default_value_t = CROSSOVER_TURNOVER)]
-    crossover_turnover: f32,
-    /// Mutation turnover: the mutation channel's own share, same contract as `--crossover-turnover`.
-    #[arg(long, value_name = "RATE", default_value_t = MUTATION_TURNOVER)]
-    mutation_turnover: f32,
-    /// Mutation novelty floor Δ: a new immigrant must sit this far (Jaccard) from the nearest blueprint; `0` = off.
-    #[arg(long, value_name = "DELTA", default_value_t = 0.3)]
-    mutation_novelty_min: f32,
+
     /// Candidates one mutation may spend clearing the floor; the most novel refusal is taken anyway.
     #[arg(long, value_name = "N", default_value_t = 5)]
     mutation_novelty_draws: usize,
-    /// Log level (default: the `LOG_LEVEL` const). `none`/`summ`/`minimal` pick
-    /// the shape; `debug`/`trace` add the engine's per-roll detail.
-    #[arg(
-        long,
-        value_name = "LEVEL",
-        value_parser = ["none", "summ", "minimal", "debug", "trace"],
-        default_value = "summ"
-    )]
-    log_level: String,
-    /// Continue the recorded run here: its seed wins over `--seed`, and `--max-steps` EXTENDS the recorded budget.
-    #[arg(long, value_name = "DIR")]
-    resume: Option<PathBuf>,
+
     /// Drift on a crossover child's inherited genes (`0` = exact inheritance).
     #[arg(long, value_name = "P", default_value_t = 0.1)]
     drift: f32,
+
     /// Dropout probability applied when building the run's networks.
     #[arg(long, value_name = "P", default_value_t = 0.20)]
     dropout: f32,
+
     /// Name recorded in `engine.json` (informational only).
     #[arg(long, value_name = "NAME", default_value = RUN_NAME)]
     run_name: String,
-    /// Steps between checkpoints — weights, frontier states and the CSV flush.
-    #[arg(long, value_name = "N", default_value_t = CHECKPOINT_EVERY)]
-    checkpoint_every: usize,
-    /// Write each net's optimizer state (Adam moments) beside its weights, so `--resume` restores them exactly.
-    #[arg(
-        long,
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = true
-    )]
-    save_optim: bool,
-    /// Mutation probation: cull immunity for an immigrant's first N updates (`U`, not clocks).
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    mutation_probation: usize,
-    /// Crossover probation: the same shield for a crossover child's first N updates.
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    crossover_probation: usize,
-    /// Recovery updates: extra real updates inside one clock after a worse reading (`0` = off).
-    #[arg(long, value_name = "N", default_value_t = 0)]
-    recovery_retries: usize,
-    /// Recovery tolerance: the fraction of its standing a reading may lose before the streak fires.
-    #[arg(long, value_name = "F", default_value_t = 0.0)]
-    recovery_tol: f32,
-    /// Recovery draw: `true` retries the clock's own draw, `false` walks one draw further.
-    #[arg(
-        long,
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = true
-    )]
-    recovery_same_seed: bool,
-    /// Elite count saved at stop (a rank, not a seat — a champion shields nothing from a cull).
-    #[arg(long, value_name = "N", default_value_t = POP / 10)]
-    champion_count: usize,
-    /// At stop, save each champion's topology markdown (`champion-<hash>-<fitness>.md`).
-    #[arg(
-        long,
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = true
-    )]
-    champion_save_topology: bool,
-    /// Seed the founders from the newest compatible run's elites.
-    #[arg(
-        long,
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = true
-    )]
-    champion_previous_load: bool,
-    /// Where that inheritance looks: a run dir or a dir of run dirs (unset: `results/`).
-    #[arg(long, value_name = "DIR")]
-    champion_previous_dir: Option<PathBuf>,
-    /// Write `history.csv` + `attempts.csv` (the lossless event logs).
-    #[arg(
-        long,
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = true
-    )]
-    csv_export: bool,
-    /// Also write `<run_dir>/telemetry.jsonl`, one JSON record per event.
-    #[arg(
-        long,
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = false
-    )]
-    trace_file: bool,
-    /// Parent selection for the crossover draw: `tournament` or `roulette`.
-    #[arg(
-        long,
-        value_name = "METHOD",
-        value_parser = ["tournament", "roulette"],
-        default_value = "tournament"
-    )]
-    crossover_selection: String,
-    /// Tournament width when `--crossover-selection tournament`.
-    #[arg(long, value_name = "K", default_value_t = 2)]
-    tournament_size: usize,
-    /// The FITTER drawn parent becomes the crossover BASE (off: the first drawn parent is).
-    #[arg(
-        long,
-        value_name = "BOOL",
-        num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = true
-    )]
-    crossover_fitter_base: bool,
-    /// Crossover operator pool, drawn per attempt; empty = both.
-    #[arg(long, value_name = "LIST", value_delimiter = ',')]
-    crossover_ops_pool: Vec<String>,
-    /// Feature-split draw order for a newborn (`none`,`random`,`exclusive`); empty = all three.
-    #[arg(long, value_name = "LIST", value_delimiter = ',')]
-    feature_split_pool: Vec<String>,
-    /// Combine-op pool (`add`,`mean`,`max`,…); empty = every combine op.
-    #[arg(long, value_name = "LIST", value_delimiter = ',')]
-    combine_op_pool: Vec<String>,
-    /// Activation pool (`relu`,`gelu`,…); empty = the full default pool.
-    #[arg(long, value_name = "LIST", value_delimiter = ',')]
-    activation_pool: Vec<String>,
-    /// Standardize-op pool (`none`,`layer`,…); empty = the full default pool.
-    #[arg(long, value_name = "LIST", value_delimiter = ',')]
-    standardize_pool: Vec<String>,
-    /// Hidden nodes per net: the lower sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 2)]
-    hidden_min: usize,
+
     /// Hidden nodes per net: the upper sampling bound.
     #[arg(long, value_name = "N", default_value_t = 15)]
     hidden_max: usize,
-    /// Inputs per node: the lower sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 2)]
-    inputs_min: usize,
+
     /// Inputs per node: the upper sampling bound.
     #[arg(long, value_name = "N", default_value_t = 15)]
     inputs_max: usize,
-    /// Outputs per node: the lower sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 2)]
-    outputs_min: usize,
+
     /// Outputs per node: the upper sampling bound.
     #[arg(long, value_name = "N", default_value_t = 15)]
     outputs_max: usize,
-    /// Hidden width for a newborn: the lower bound of the sampled range.
-    #[arg(long, value_name = "N", default_value_t = 16)]
-    hidden_dim_min: usize,
-    /// Hidden width for a newborn: the upper bound of the sampled range.
-    #[arg(long, value_name = "N", default_value_t = 64)]
-    hidden_dim_max: usize,
+
     /// Counter stride of the hidden-width range (`16` = 16, 32, 48, …).
     #[arg(long, value_name = "N", default_value_t = 16)]
     hidden_dim_stride: usize,
+
     /// Dataset directory (any gras-format dataset works; unset: the `DATA_DIR` const).
     #[arg(long, value_name = "DIR")]
     data_dir: Option<PathBuf>,
+
     /// Generate random-label data when the dataset is missing — SMOKE TEST only, never a real race.
     #[arg(
         long,
@@ -558,10 +357,14 @@ struct Cli {
         default_value_t = false
     )]
     synthetic: bool,
-    /// Where a NEW run writes (default: `results/<timestamp>`). Output only —
-    /// continuing an existing run is `--resume`.
-    #[arg(long, value_name = "DIR")]
-    run_dir: Option<PathBuf>,
+}
+
+/// The body reads `cli.pop`, `cli.max_steps`, … — the overlay never hides a knob.
+impl std::ops::Deref for Cli {
+    type Target = EngineArgs;
+    fn deref(&self) -> &EngineArgs {
+        &self.engine
+    }
 }
 
 /// Wire the config → run the race; prints the verdict.
