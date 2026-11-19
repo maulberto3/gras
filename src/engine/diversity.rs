@@ -109,6 +109,9 @@ pub(crate) struct NetShape {
     /// Share of the input each Input port reads on average: `1.0` = no split, `1/ports` = a
     /// perfect partition; `None` = no readable Input node.
     pub mask: Option<f32>,
+    /// The wiring gene: the share of hidden nodes allowed a wire straight from the Input node.
+    /// `1.0` = one Input port per hidden node (every node may read the raw input).
+    pub reach: f32,
 }
 
 /// Read one net's structure: the pair metric's genes plus the census legs.
@@ -134,6 +137,7 @@ pub(crate) fn shape_of(topo: &Topology) -> NetShape {
         },
     };
     NetShape {
+        reach: topo.options.input_reach,
         genome: genes(topo),
         nodes: topo.nodes.len(),
         wires: topo.connections.len(),
@@ -431,6 +435,7 @@ mod tests {
     #[test]
     fn mean_delta_to_reads_the_distance_to_the_reference_set() {
         let shape = |tokens: &[(&str, usize)]| NetShape {
+            reach: 1.0,
             genome: genome(tokens),
             nodes: 1,
             wires: 1,

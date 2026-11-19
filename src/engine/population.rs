@@ -31,6 +31,8 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     // The split is a POOL draw: none, random or exclusive can enter the population.
     let feature_split = draw_feature_split(config, &mut rng);
     opts.feature_split = feature_split;
+    // The wiring gene: how much of the raw input this individual's hidden layer may read.
+    opts.input_reach = opts.draw_input_reach(&mut rng);
     let mut graph = Topology::new(seed, Some(opts));
     graph.create_random_hidden_nodes(n_hidden);
     let pool = config.hidden_dim_pool.clone().unwrap_or(4..=8);
