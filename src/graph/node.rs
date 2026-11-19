@@ -546,7 +546,7 @@ mod tests {
         );
         let g10d = g10.data().to_f32_vec().unwrap();
         let r10 = &g10d[0..10]; // row 0: [1..=10]
-        // Group 0 = {1, 2, 3} → z-score [-1.22, 0, 1.22].
+                                // Group 0 = {1, 2, 3} → z-score [-1.22, 0, 1.22].
         assert!((r10[0] + 1.2247).abs() < 1e-3, "uneven group 0 start");
         assert!(r10[1].abs() < 1e-4, "uneven group 0 middle");
         assert!((r10[2] - 1.2247).abs() < 1e-3, "uneven group 0 end");
@@ -672,6 +672,7 @@ mod tests {
             span_out in 0usize..4,
         ) {
             let opts = TopologyOptions {
+                unique_source_per_target: true,
                 topology_seed: 16,
                 min_hidden_num_nodes: 2,
                 max_hidden_num_nodes: 5,
@@ -682,6 +683,9 @@ mod tests {
                 input_dim: Some(4),
                 output_dim: Some(2),
                 dropout_prob: 0.0,
+                input_reach: 1.0,
+                min_input_reach: 1.0,
+                max_input_reach: 1.0,
                 feature_split: None,
                 weight_seed: None,
             };

@@ -305,6 +305,10 @@ mod tests {
 
     fn toy_topology() -> Topology {
         let opts = crate::graph::topology::TopologyOptions {
+            unique_source_per_target: true,
+            input_reach: 1.0,
+            min_input_reach: 1.0,
+            max_input_reach: 1.0,
             topology_seed: 7,
             min_hidden_num_nodes: 1,
             max_hidden_num_nodes: 1,
@@ -421,30 +425,22 @@ mod tests {
         let root = tmp("incompat");
         write_run(&root.join("1000"), "1000", "tabular", "toy", true);
         // mode
-        assert!(
-            resolve(Some(&root), None, "rl", 2, 2, Some("toy"))
-                .seeded()
-                .is_none()
-        );
+        assert!(resolve(Some(&root), None, "rl", 2, 2, Some("toy"))
+            .seeded()
+            .is_none());
         // dims
-        assert!(
-            resolve(Some(&root), None, "tabular", 4, 2, Some("toy"))
-                .seeded()
-                .is_none()
-        );
+        assert!(resolve(Some(&root), None, "tabular", 4, 2, Some("toy"))
+            .seeded()
+            .is_none());
         // trainer name (two environments can share dims)
-        assert!(
-            resolve(Some(&root), None, "tabular", 2, 2, Some("other"))
-                .seeded()
-                .is_none()
-        );
+        assert!(resolve(Some(&root), None, "tabular", 2, 2, Some("other"))
+            .seeded()
+            .is_none());
         // …and the compatible call still works, proving the gate isn't just
         // refusing everything.
-        assert!(
-            resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
-                .seeded()
-                .is_some()
-        );
+        assert!(resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
+            .seeded()
+            .is_some());
     }
 
     #[test]
@@ -453,11 +449,9 @@ mod tests {
         write_run(&root.join("1000"), "1000", "tabular", "toy", true);
         // This run declares no trainer name → the check cannot be applied,
         // it must not reject the candidate.
-        assert!(
-            resolve(Some(&root), None, "tabular", 2, 2, None)
-                .seeded()
-                .is_some()
-        );
+        assert!(resolve(Some(&root), None, "tabular", 2, 2, None)
+            .seeded()
+            .is_some());
     }
 
     #[test]
@@ -486,17 +480,13 @@ mod tests {
     #[test]
     fn empty_root_and_missing_root_are_skipped_not_panicked() {
         let root = tmp("empty");
-        assert!(
-            resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
-                .seeded()
-                .is_none()
-        );
+        assert!(resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
+            .seeded()
+            .is_none());
         let missing = root.join("does-not-exist");
-        assert!(
-            resolve(Some(&missing), None, "tabular", 2, 2, Some("toy"))
-                .seeded()
-                .is_none()
-        );
+        assert!(resolve(Some(&missing), None, "tabular", 2, 2, Some("toy"))
+            .seeded()
+            .is_none());
     }
 
     /// The run's OWN directory is written before the lookup,
@@ -520,18 +510,16 @@ mod tests {
         // Pointed straight at itself ⇒ nothing to inherit.
         let self_only = tmp("self-only");
         write_run(&self_only, "3000", "tabular", "toy", true);
-        assert!(
-            resolve(
-                Some(&self_only),
-                Some(&self_only),
-                "tabular",
-                2,
-                2,
-                Some("toy")
-            )
-            .seeded()
-            .is_none()
-        );
+        assert!(resolve(
+            Some(&self_only),
+            Some(&self_only),
+            "tabular",
+            2,
+            2,
+            Some("toy")
+        )
+        .seeded()
+        .is_none());
     }
 
     #[test]

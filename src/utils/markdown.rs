@@ -1,7 +1,7 @@
 //! Markdown rendering for topologies — includes nodes table, edge list,
 //! ASCII wiring diagram, and Mermaid flowchart.
 
-use super::ascii::{AsciiNode, edge_list, render_wire_diagram};
+use super::ascii::{edge_list, render_wire_diagram, AsciiNode};
 use super::mermaid::{split_policy_name, topology_mermaid};
 use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
@@ -63,7 +63,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     // ranges that constrained the draw travel with it, and this file is meant to outlive the run
     let o = &graph.options;
     out.push_str(&format!(
-        "Blueprint: {} · topology seed {} · sampled {}–{} nodes · {}–{} in · {}–{} out\n\n",
+        "Blueprint: {} · topology seed {} · sampled {}–{} nodes · {}–{} in · {}–{} out · reach {:.2}–{:.2}\n\n",
         knobs.join(" · "),
         o.topology_seed,
         o.min_hidden_num_nodes,
@@ -71,7 +71,9 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
         o.min_hidden_inputs_per_node,
         o.max_hidden_inputs_per_node,
         o.min_hidden_outputs_per_node,
-        o.max_hidden_outputs_per_node
+        o.max_hidden_outputs_per_node,
+        o.min_input_reach,
+        o.max_input_reach,
     ));
 
     // ── Nodes table (merged topology + network layer info) ──
@@ -290,7 +292,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             .count();
         if wires != masks.len() {
             out.push_str(&format!(
-                "\n**{} port(s) carry {wires} wire(s)**: the Input node fans out — {}, and a port's masked slice is computed ONCE and read by every wire it feeds. This table is one row per PORT; the diagram draws one slot per WIRE (its `Out` cell counts both).\n\n",
+                "\n**{} port(s) carry {wires} wire(s)** — a LEGACY blueprint, saved before one-wire-per-socket: the Input node fans out — {}, and a port's masked slice is computed ONCE and read by every wire it feeds. This table is one row per PORT; the diagram draws one slot per WIRE (its `Out` cell counts both). A graph built now never prints this line.\n\n",
                 masks.len(),
                 (0..masks.len())
                     .map(|p| format!("port {p} → {}", feeds[p]))
@@ -355,7 +357,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("```\n");
     out.push_str("\n> **Legend**:\n");
     out.push_str("> - I=input  H=hidden  O=output\n");
-    out.push_str("> - `2w→2i/1o→5w` = wires→input ports / output ports→wires. An input port carries exactly ONE wire (fan-in is extra ports), so `w == i`; only the Input node fans out, which is why its labels can repeat (`o1 o1`). Every marker maps to exactly one wire\n");
+    out.push_str("> - `2w→2i/1o→5w` = wires→input ports / output ports→wires. A port is a SOCKET: on a graph built now every port carries exactly ONE wire, so `w == i` and `o == w`. A label repeats (`o1 o1`) only in a legacy blueprint saved before one-wire-per-socket. Every marker maps to exactly one wire\n");
     out.push_str("> - ->dim = output dimension\n");
     out.push_str("> - ▶ connected output  ◀ connected input  * orphaned port\n");
 
@@ -558,11 +560,10 @@ mod tests {
         // with the bounds it was drawn from, so the draw is reproducible from the file.
         assert!(md.contains("dropout 0.00"), "{md}");
         assert!(
-            md.contains("sampled 2–15 nodes · 2–15 in · 2–15 out"),
+            md.contains("sampled 2–15 nodes · 2–15 in · 2–15 out · reach 1.00–1.00"),
             "the topology seed needs its bounds beside it:\n{md}"
         );
     }
-
 
     /// The Input node is the only node that FANS OUT: two ports can carry three wires, so a row
     /// has to name the consumers its masked slice feeds — otherwise the diagram's three input
@@ -737,8 +738,12 @@ mod tests {
         // the wiring model that no longer exists; the legend must say what replaced
         let md = topology_markdown(&sample(), None);
         assert!(
-            md.contains("An input port carries exactly ONE wire"),
+            md.contains("every port carries exactly ONE wire"),
             "legend must state the one-wire rule:\n{md}"
+        );
+        assert!(
+            !md.contains("only the Input node fans out"),
+            "the Input node is no longer the one fan-out:\n{md}"
         );
         assert!(
             !md.contains("a port with several wires is drawn once per wire"),

@@ -1720,6 +1720,7 @@ mod tests {
         let mut topo = crate::graph::topology::Topology::new(
             0,
             Some(crate::graph::topology::TopologyOptions {
+                unique_source_per_target: true,
                 topology_seed: 7,
                 min_hidden_num_nodes: 1,
                 max_hidden_num_nodes: 1,
@@ -1730,6 +1731,9 @@ mod tests {
                 input_dim: Some(2),
                 output_dim: Some(2),
                 dropout_prob: 0.0,
+                input_reach: 1.0,
+                min_input_reach: 1.0,
+                max_input_reach: 1.0,
                 feature_split: None,
                 weight_seed: None,
             }),
@@ -2024,17 +2028,15 @@ mod tests {
         let topo = tiny_topology();
         let state = NetState::new(&topo, 0, None).unwrap();
         write_net_state(&dir, &state).unwrap();
-        assert!(
-            dir.join("nets")
-                .join(format!("{}.json", state.hash))
-                .exists()
-        );
+        assert!(dir
+            .join("nets")
+            .join(format!("{}.json", state.hash))
+            .exists());
         remove_net_state(&dir, &state.hash).unwrap();
-        assert!(
-            !dir.join("nets")
-                .join(format!("{}.json", state.hash))
-                .exists()
-        );
+        assert!(!dir
+            .join("nets")
+            .join(format!("{}.json", state.hash))
+            .exists());
     }
 
     #[test]

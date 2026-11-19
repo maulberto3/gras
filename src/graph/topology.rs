@@ -58,6 +58,26 @@ pub struct TopologyOptions {
     /// part of the blueprint so replays don't diverge; defaults to 0.0.
     #[serde(default)]
     pub dropout_prob: f32,
+    /// How much of the RAW input the hidden layer may read directly. `1.0` gives the Input node one
+    /// port per hidden node, so every node may touch the pixels (the historical wiring); a lower
+    /// value hands out proportionally fewer ports, and the sockets it cannot cover must be fed by
+    /// other hidden nodes — depth instead of width-at-the-input. Drawn per net from
+    /// [`Self::min_input_reach`]..=[`Self::max_input_reach`].
+    #[serde(default = "default_input_reach")]
+    pub input_reach: f32,
+    /// Lower bound of the per-net `input_reach` draw.
+    #[serde(default = "default_input_reach")]
+    pub min_input_reach: f32,
+    /// Upper bound of the per-net `input_reach` draw.
+    #[serde(default = "default_input_reach")]
+    pub max_input_reach: f32,
+    /// At most ONE wire per (source node, target node) pair, for EVERY kind: Input→hidden as much
+    /// as hidden→hidden and hidden→Output. A second wire from the same node carries the same
+    /// signal — only its per-port activation differs — so it inflates fan-in, params and the edge
+    /// list without adding information. On by default; `false` restores the wiring where an
+    /// orphan socket could pick a source that already fed it.
+    #[serde(default = "default_true")]
+    pub unique_source_per_target: bool,
     /// Feature-split policy this blueprint's Input ports were drawn under — part of the topology,
     /// not the run, so a newborn's policy travels with its blueprint and a population can hold
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +98,10 @@ impl PartialEq for TopologyOptions {
             && self.input_dim == other.input_dim
             && self.output_dim == other.output_dim
             && self.dropout_prob.to_bits() == other.dropout_prob.to_bits()
+            && self.input_reach.to_bits() == other.input_reach.to_bits()
+            && self.min_input_reach.to_bits() == other.min_input_reach.to_bits()
+            && self.max_input_reach.to_bits() == other.max_input_reach.to_bits()
+            && self.unique_source_per_target == other.unique_source_per_target
             && self.feature_split == other.feature_split
     }
 }
@@ -96,6 +120,10 @@ impl std::hash::Hash for TopologyOptions {
         self.input_dim.hash(state);
         self.output_dim.hash(state);
         self.dropout_prob.to_bits().hash(state);
+        self.input_reach.to_bits().hash(state);
+        self.min_input_reach.to_bits().hash(state);
+        self.max_input_reach.to_bits().hash(state);
+        self.unique_source_per_target.hash(state);
         self.feature_split.hash(state);
     }
 }
@@ -133,6 +161,33 @@ fn split_rows_are_partition(rows: &[Vec<u8>], input_dim: usize) -> bool {
     })
 }
 
+/// `1.0` — the historical wiring: one Input port per hidden node, every node may read the input.
+/// Also the serde default, so a record written before the knob replays unchanged.
+fn default_input_reach() -> f32 {
+    1.0
+}
+
+/// `true` — one wire per (source node, target node) pair.
+fn default_true() -> bool {
+    true
+}
+
+impl TopologyOptions {
+    /// Draw this net's `input_reach` from its own range — the wiring gene, sampled per individual
+    /// the way a hidden width is, so one population can hold shallow readers of the input and
+    /// genuinely deep nets at the same time.
+    pub fn draw_input_reach(&self, rng: &mut Rng) -> f32 {
+        let lo = self.min_input_reach.clamp(0.0, 1.0);
+        let hi = self.max_input_reach.clamp(0.0, 1.0);
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+        if hi <= lo {
+            lo
+        } else {
+            lo + rng.f32() * (hi - lo)
+        }
+    }
+}
+
 impl Default for TopologyOptions {
     fn default() -> Self {
         TopologyOptions {
@@ -149,6 +204,10 @@ impl Default for TopologyOptions {
             output_dim: None,
             // `0.25` — the cartpole reference's dropout, promoted to the engine default.
             dropout_prob: 0.25,
+            input_reach: 1.0,
+            min_input_reach: 1.0,
+            max_input_reach: 1.0,
+            unique_source_per_target: true,
             feature_split: None,
             weight_seed: None,
         }
@@ -469,10 +528,12 @@ impl Topology {
         // Step 4: connect — wire input ports to unused output ports from earlier nodes
         self.wire_ports();
 
-        // Step 5: filter_input — set input node output count = number of hidden nodes
+        // Step 5: filter_input — size the Input node from `input_reach` (1.0 = one port per
+        // hidden node, the historical wiring)
         self.set_input_fanout();
 
-        // Step 6: connect_orphans — wire orphaned inputs to the input node (cycle ports)
+        // Step 6: connect_orphans — a spare Input port while the reach budget lasts, else an
+        // EARLIER hidden node's output (never a blind Input wire)
         self.rewire_orphaned_inputs();
 
         // Step 6b: clean_wiring — one Input wire per target (each target reads one port)
@@ -549,19 +610,26 @@ impl Topology {
         }
     }
 
-    /// Step 5: Set input node output count = number of hidden nodes (at least).
+    /// Step 5: Size the Input node's port count from `input_reach`.
+    ///
+    /// The ports ARE the reach budget: `1.0` gives one per hidden node (the historical wiring, every
+    /// node may read the raw input), `0.5` roughly one per two nodes. Whatever the budget cannot
+    /// cover, `rewire_orphaned_inputs` sources from the hidden layer instead.
     fn set_input_fanout(&mut self) {
         let n_hidden = self
             .nodes
             .iter()
             .filter(|n| n.kind == NodeKind::Hidden)
             .count();
+        let reach = self.options.input_reach.clamp(0.0, 1.0);
+        // At least one port: the first hidden node has no upstream node to read from.
+        let wanted = ((n_hidden as f32 * reach).round() as usize).max(1);
         let input_node = self
             .nodes
             .iter_mut()
             .find(|n| n.kind == NodeKind::Input)
             .unwrap();
-        input_node.num_outputs = input_node.num_outputs.max(n_hidden).max(1);
+        input_node.num_outputs = input_node.num_outputs.max(wanted).max(1);
     }
 
     /// Step 6: wire every orphaned input port to a NEW Input output port — ONE SOCKET PER WIRE.
@@ -580,28 +648,166 @@ impl Topology {
         else {
             return;
         };
-        // Never `% n_ports`: each orphan takes the NEXT unused index, and the Input node grows.
-        let mut next_port = self.nodes[input_id].num_outputs;
+        let mut orphans: Vec<Port> = Vec::new();
         for node in &self.nodes {
             for i in 0..node.num_inputs {
                 let port = Port {
                     node: node.id,
                     index: i,
                 };
-                if self.connections.iter().any(|c| c.to == port) {
-                    continue;
+                if !self.connections.iter().any(|c| c.to == port) {
+                    orphans.push(port);
                 }
+            }
+        }
+        // The first hidden node has no upstream AT ALL, so it can only ever read the Input node.
+        // Reserve one port for it: a net whose first hidden node is fed by nothing is dead.
+        let first_hidden = self.nodes.iter().position(|n| n.kind == NodeKind::Hidden);
+        if let Some(first) = first_hidden {
+            let fed = self
+                .connections
+                .iter()
+                .any(|c| c.from.node == input_id && c.to.node == first);
+            if !fed && self.spare_input_port(input_id).is_none() && self.nodes[first].num_inputs > 0
+            {
+                self.nodes[input_id].num_outputs += 1;
+            }
+        }
+        for port in orphans {
+            // 1. A SPARE Input port is the `input_reach` budget: spend it first (identical wiring
+            //    at `1.0`, where there is one port per hidden node).
+            if let Some(index) = self.spare_input_port(input_id) {
                 self.connections.push(Connection {
                     from: Port {
                         node: input_id,
-                        index: next_port,
+                        index,
                     },
                     to: port,
                 });
-                next_port += 1;
+                continue;
+            }
+            // 2. Budget spent ⇒ source from the HIDDEN layer, never from the raw input. Only a
+            //    node EARLIER than the target is eligible, so the graph stays a DAG.
+            if let Some(from) = self.spare_hidden_output(port.node) {
+                self.connections.push(Connection { from, to: port });
+                continue;
+            }
+            // 3. Nothing spare upstream ⇒ widen an earlier hidden node's fan-out (bounded by
+            //    `max_hidden_outputs_per_node` rather than growing without limit).
+            if let Some(from) = self.grow_hidden_output(port.node) {
+                self.connections.push(Connection { from, to: port });
+                continue;
+            }
+            // 4. Nothing upstream can feed it (only the first hidden node is in that position):
+            //    leave the socket UNWIRED and let `trim_orphaned_ports` DELETE it, rather than
+            //    paying for it with another raw-input port and widening the first layer.
+        }
+    }
+
+    /// Keep ONE wire per (source node, target node) pair, dropping the rest in RANDOM order —
+    /// `self.rng` is seeded from `topology_seed`, so a reload is random yet reproducible — then
+    /// close the port gaps. Returns how many wires were removed. No-op when the option is off.
+    pub fn dedup_source_targets(&mut self) -> usize {
+        if !self.options.unique_source_per_target {
+            return 0;
+        }
+        let mut order: Vec<usize> = (0..self.connections.len()).collect();
+        self.rng.shuffle(&mut order);
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let mut keep = vec![false; self.connections.len()];
+        for i in order {
+            let key = (self.connections[i].from.node, self.connections[i].to.node);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            keep[i] = true;
+        }
+        let before = self.connections.len();
+        let mut k = 0;
+        self.connections.retain(|_| {
+            let keep_this = keep[k];
+            k += 1;
+            keep_this
+        });
+        let removed = before - self.connections.len();
+        if removed > 0 {
+            self.trim_orphaned_ports();
+        }
+        removed
+    }
+
+    /// An Input port nothing has claimed yet — the room left in the `input_reach` budget.
+    fn spare_input_port(&self, input_id: usize) -> Option<usize> {
+        (0..self.nodes[input_id].num_outputs).find(|&index| {
+            let port = Port {
+                node: input_id,
+                index,
+            };
+            !self.connections.iter().any(|c| c.from == port)
+        })
+    }
+
+    /// An unused output port on a HIDDEN node EARLIER than `before`, picked at random.
+    fn spare_hidden_output(&mut self, target: usize) -> Option<Port> {
+        // A source that already feeds `target` is skipped: the second wire would carry the same
+        // signal with a different per-port activation.
+        let unique = self.options.unique_source_per_target;
+        let mut spare: Vec<Port> = Vec::new();
+        for node in &self.nodes {
+            if node.id >= target || node.kind != NodeKind::Hidden {
+                continue;
+            }
+            if unique
+                && self
+                    .connections
+                    .iter()
+                    .any(|c| c.from.node == node.id && c.to.node == target)
+            {
+                continue;
+            }
+            for index in 0..node.num_outputs {
+                let port = Port {
+                    node: node.id,
+                    index,
+                };
+                if !self.connections.iter().any(|c| c.from == port) {
+                    spare.push(port);
+                }
             }
         }
-        self.nodes[input_id].num_outputs = next_port;
+        if spare.is_empty() {
+            return None;
+        }
+        Some(spare[self.rng.usize(0..spare.len())])
+    }
+
+    /// Widen an earlier hidden node's fan-out by one port, staying inside
+    /// `max_hidden_outputs_per_node`; `None` when every upstream node is already at its cap.
+    fn grow_hidden_output(&mut self, target: usize) -> Option<Port> {
+        let cap = self.options.max_hidden_outputs_per_node;
+        let unique = self.options.unique_source_per_target;
+        let growable: Vec<usize> = self
+            .nodes
+            .iter()
+            .filter(|n| n.id < target && n.kind == NodeKind::Hidden && n.num_outputs < cap)
+            .filter(|n| {
+                !unique
+                    || !self
+                        .connections
+                        .iter()
+                        .any(|c| c.from.node == n.id && c.to.node == target)
+            })
+            .map(|n| n.id)
+            .collect();
+        if growable.is_empty() {
+            return None;
+        }
+        let id = growable[self.rng.usize(0..growable.len())];
+        let node = &mut self.nodes[id];
+        let index = node.num_outputs;
+        node.num_outputs += 1;
+        Some(Port { node: id, index })
     }
 
     /// The Input node is the one deliberate fan-out node (its ports are the features, and each may
@@ -762,6 +968,23 @@ impl Topology {
                 return Err(TopologyError::MultiWiredInputPort(conn.to));
             }
             used_targets.push(conn.to);
+        }
+
+        // ONE WIRE PER (source, target) PAIR — every kind, not just hidden→hidden: an Input wire is
+        // Identity, so a second one into the same target is the same signal, and the same holds for
+        // a hidden node or the Output node's fan-in.
+        if self.options.unique_source_per_target {
+            let mut pairs: Vec<(usize, usize)> = Vec::new();
+            for conn in &self.connections {
+                let key = (conn.from.node, conn.to.node);
+                if pairs.contains(&key) {
+                    return Err(TopologyError::DuplicateSourceWire {
+                        source: key.0,
+                        target: key.1,
+                    });
+                }
+                pairs.push(key);
+            }
         }
 
         // 4. Feature-dim consistency per node: with per-node hidden_dim + port
@@ -1215,6 +1438,8 @@ impl Topology {
         // Every loaded net (live, tombstone, resumed or imported) passes through here:
         // the one place that can promise a reader "policy present ⇔ rows present".
         topo.reconcile_split_policy();
+        // A recorded graph may hold two wires from one node into the same later node.
+        topo.dedup_source_targets();
         Ok(topo)
     }
 
@@ -1413,6 +1638,10 @@ pub(crate) mod test_strategies {
         )
             .prop_map(
                 |(seed, min_in, min_out, input_dim, output_dim)| TopologyOptions {
+                    unique_source_per_target: true,
+                    input_reach: 1.0,
+                    min_input_reach: 1.0,
+                    max_input_reach: 1.0,
                     topology_seed: seed,
                     min_hidden_num_nodes: 2,
                     max_hidden_num_nodes: 6,
@@ -1487,6 +1716,7 @@ mod tests {
     #[test]
     fn test_new_with_options() {
         let opts = TopologyOptions {
+            unique_source_per_target: true,
             topology_seed: 123,
             min_hidden_num_nodes: 3,
             max_hidden_num_nodes: 10,
@@ -1497,6 +1727,9 @@ mod tests {
             input_dim: Some(4),
             output_dim: Some(10),
             dropout_prob: 0.0,
+            input_reach: 1.0,
+            min_input_reach: 1.0,
+            max_input_reach: 1.0,
             feature_split: None,
             weight_seed: None,
         };
@@ -1802,8 +2035,17 @@ mod tests {
             loaded.input_ports_with_multiple_wires().is_empty(),
             "loading must spread a stacked port over one port per wire"
         );
-        assert_eq!(loaded.connections.len(), 3, "no wire may be dropped");
-        assert_eq!(loaded.nodes[1].num_inputs, 2, "the stacked port became two");
+        // …and then the repeat is culled: both spread wires are the SAME (source → target) pair,
+        // so `unique_source_per_target` keeps one and `trim_orphaned_ports` closes the gap.
+        assert_eq!(
+            loaded.connections.len(),
+            2,
+            "the repeated source→target pair is culled"
+        );
+        assert_eq!(
+            loaded.nodes[1].num_inputs, 1,
+            "the now-empty port is trimmed"
+        );
         loaded.assert_one_wire_per_port();
         assert_eq!(loaded.validate(), Ok(()));
     }
@@ -2254,6 +2496,114 @@ mod tests {
             prop_assert!(graph.validate().is_ok());
         }
     }
+
+    /// 5 wires, one of them a repeat: Input feeds n2 on two of its ports.
+    fn duplicate_pair_graph(seed: u64) -> Topology {
+        let opts = TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(2),
+            topology_seed: seed as _,
+            ..Default::default()
+        };
+        let mut g = Topology::new(seed as _, Some(opts));
+        g.nodes.push(Node::new_input(0, 3));
+        g.nodes.push(Node::new_hidden(1, 1, 2));
+        g.nodes.push(Node::new_hidden(2, 3, 2));
+        g.nodes.push(Node::new_output(3, 1, 1));
+        let wire =
+            |from_node: usize, from_index: usize, to_node: usize, to_index: usize| Connection {
+                from: Port {
+                    node: from_node,
+                    index: from_index,
+                },
+                to: Port {
+                    node: to_node,
+                    index: to_index,
+                },
+            };
+        g.connections.push(wire(0, 0, 1, 0));
+        g.connections.push(wire(0, 1, 2, 0));
+        g.connections.push(wire(0, 2, 2, 1)); // same pair as the wire above
+        g.connections.push(wire(1, 0, 2, 2));
+        g.connections.push(wire(2, 0, 3, 0));
+        g
+    }
+
+    #[test]
+    fn validate_rejects_one_source_wired_twice_into_the_same_target() {
+        let mut g = duplicate_pair_graph(11);
+        assert_eq!(
+            g.validate(),
+            Err(crate::utils::error::TopologyError::DuplicateSourceWire {
+                source: 0,
+                target: 2
+            })
+        );
+        g.options.unique_source_per_target = false;
+        g.validate()
+            .expect("with the rule off, the older wiring is allowed again");
+    }
+
+    #[test]
+    fn dedup_source_targets_keeps_one_wire_per_pair_and_is_seeded() {
+        let mut a = duplicate_pair_graph(11);
+        let mut b = duplicate_pair_graph(11);
+        let before = a.connections.len();
+        assert_eq!(a.dedup_source_targets(), 1);
+        assert_eq!(b.dedup_source_targets(), 1);
+        assert_eq!(a.connections.len(), before - 1);
+        let pairs: Vec<(usize, usize)> = a
+            .connections
+            .iter()
+            .map(|c| (c.from.node, c.to.node))
+            .collect();
+        let mut unique = pairs.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), pairs.len(), "a pair repeats: {pairs:?}");
+        a.validate().expect("the repaired graph validates");
+        // Seeded: the same graph culls the same wire.
+        let key = |g: &Topology| {
+            let mut v: Vec<(usize, usize, usize, usize)> = g
+                .connections
+                .iter()
+                .map(|c| (c.from.node, c.from.index, c.to.node, c.to.index))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(key(&a), key(&b));
+        // Off ⇒ nothing is removed.
+        let mut c = duplicate_pair_graph(11);
+        c.options.unique_source_per_target = false;
+        assert_eq!(c.dedup_source_targets(), 0);
+    }
+
+    #[test]
+    fn finalize_never_wires_one_source_twice_into_the_same_target() {
+        for seed in 0..40u64 {
+            let opts = TopologyOptions {
+                input_dim: Some(4),
+                output_dim: Some(1),
+                topology_seed: seed as _,
+                ..Default::default()
+            };
+            let mut g = Topology::new(seed as _, Some(opts));
+            g.create_random_hidden_nodes(8);
+            g.finalize();
+            g.validate()
+                .expect("finalize must not repeat a source→target pair");
+            let mut pairs: Vec<(usize, usize)> = g
+                .connections
+                .iter()
+                .map(|c| (c.from.node, c.to.node))
+                .collect();
+            pairs.sort_unstable();
+            let mut unique = pairs.clone();
+            unique.dedup();
+            assert_eq!(pairs, unique, "seed {seed}: a source feeds a target twice");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2532,8 +2882,6 @@ mod finalize_order_tests {
 mod fanout_bounds_tests {
     use super::*;
 
-
-
     #[test]
     fn finalize_respects_max_inputs_per_node() {
         // The setters bound CREATION; verify finalize never grows a node's declared input
@@ -2560,6 +2908,127 @@ mod fanout_bounds_tests {
                 }
             }
         }
+    }
+
+    /// `input_reach` is the DEPTH knob. `1.0` keeps the historical wiring (an Input port per hidden
+    /// node, so every node may read the raw input); `0.0` leaves the deep layer fed by hidden nodes,
+    /// with one wire per socket either way and no cycle.
+    #[test]
+    fn input_reach_trades_input_width_for_depth() {
+        let build = |seed: usize, reach: f32| {
+            let opts = TopologyOptions {
+                topology_seed: seed,
+                input_dim: Some(4),
+                output_dim: Some(1),
+                input_reach: reach,
+                ..Default::default()
+            };
+            let mut g = Topology::new(seed, Some(opts));
+            g.create_random_hidden_nodes(8);
+            g.finalize();
+            g
+        };
+        let input_wires = |g: &Topology| {
+            let in_id = g
+                .nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Input)
+                .unwrap()
+                .id;
+            g.connections
+                .iter()
+                .filter(|c| c.from.node == in_id)
+                .count()
+        };
+        let deep_nodes = |g: &Topology| {
+            let in_id = g
+                .nodes
+                .iter()
+                .find(|n| n.kind == NodeKind::Input)
+                .unwrap()
+                .id;
+            g.nodes
+                .iter()
+                .filter(|n| n.kind == NodeKind::Hidden)
+                .filter(|n| {
+                    !g.connections
+                        .iter()
+                        .any(|c| c.from.node == in_id && c.to.node == n.id)
+                })
+                .count()
+        };
+        for seed in 0..25 {
+            let full = build(seed, 1.0);
+            let narrow = build(seed, 0.0);
+            full.assert_one_wire_per_port();
+            narrow.assert_one_wire_per_port();
+            full.validate().expect("reach 1.0 must validate");
+            narrow.validate().expect("reach 0.0 must validate");
+            assert!(
+                input_wires(&full) >= 7,
+                "seed {seed}: reach 1.0 keeps ~one Input port per hidden node, got {}",
+                input_wires(&full)
+            );
+            assert!(
+                input_wires(&narrow) <= 3,
+                "seed {seed}: reach 0.0 must stop feeding the raw input to the deep layer, got {}",
+                input_wires(&narrow)
+            );
+            assert!(
+                deep_nodes(&narrow) >= 5,
+                "seed {seed}: reach 0.0 must leave the net DEEPER, only {} node(s) are purely deep",
+                deep_nodes(&narrow)
+            );
+            assert!(
+                input_wires(&narrow) < input_wires(&full),
+                "seed {seed}: the knob must deepen the net, not widen it"
+            );
+            // Earlier-only sources ⇒ still a DAG: every hidden wire goes forward.
+            for c in &narrow.connections {
+                assert!(
+                    c.from.node < c.to.node,
+                    "seed {seed}: wire n{}_o{} -> n{}_i{} runs backwards",
+                    c.from.node,
+                    c.from.index,
+                    c.to.node,
+                    c.to.index
+                );
+            }
+        }
+    }
+
+    /// The per-net draw: inside the range, pinned when `min == max`, and genuinely varied.
+    #[test]
+    fn draw_input_reach_samples_inside_its_range() {
+        let mut opts = TopologyOptions::default();
+        opts.min_input_reach = 0.2;
+        opts.max_input_reach = 0.8;
+        let mut rng = Rng::with_seed(7);
+        let mut seen: Vec<f32> = Vec::new();
+        for _ in 0..64 {
+            let v = opts.draw_input_reach(&mut rng);
+            assert!((0.2..=0.8).contains(&v), "{v} escaped 0.2..=0.8");
+            seen.push(v);
+        }
+        seen.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!(
+            seen.first().unwrap() != seen.last().unwrap(),
+            "a range must actually vary the gene"
+        );
+
+        opts.min_input_reach = 0.4;
+        opts.max_input_reach = 0.4;
+        assert_eq!(
+            opts.draw_input_reach(&mut rng),
+            0.4,
+            "a pinned range is a constant"
+        );
+
+        // A reversed range still samples inside it rather than panicking.
+        opts.min_input_reach = 0.9;
+        opts.max_input_reach = 0.1;
+        let v = opts.draw_input_reach(&mut rng);
+        assert!((0.1..=0.9).contains(&v));
     }
 
     #[test]
