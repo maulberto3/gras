@@ -61,6 +61,8 @@ impl<'de> Deserialize<'de> for Topology {
         // Reading is the ONE place old wiring enters the process, and a run recorded before
         // one-wire-per-port refactor may stack wires on a port.
         topology.unstack_input_ports();
+        // One wire per (source node, target node) pair, for graphs saved before the rule.
+        topology.dedup_source_targets();
         Ok(topology)
     }
 }

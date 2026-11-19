@@ -51,6 +51,10 @@ fn tiny_topology(seed: usize) -> Topology {
     let mut topo = Topology::new(
         seed,
         Some(TopologyOptions {
+            unique_source_per_target: true,
+            input_reach: 1.0,
+            min_input_reach: 1.0,
+            max_input_reach: 1.0,
             topology_seed: seed,
             min_hidden_num_nodes: 1,
             max_hidden_num_nodes: 1,
@@ -1127,6 +1131,10 @@ fn flat_topology(seed: usize) -> Topology {
     let mut topo = Topology::new(
         seed,
         Some(TopologyOptions {
+            unique_source_per_target: true,
+            input_reach: 1.0,
+            min_input_reach: 1.0,
+            max_input_reach: 1.0,
             topology_seed: seed,
             min_hidden_num_nodes: 0,
             max_hidden_num_nodes: 0,
@@ -1731,7 +1739,7 @@ fn run_culls_continue_across_a_resume_boundary() {
         let mut c = RaceConfig::defaults();
         c.pop_size = 2;
         c.mutation_share = 0.5; // pop 2 ⇒ one immigration per clock
-        // defaults() shields founders for 5 clocks; the twin must be able to cull.
+                                // defaults() shields founders for 5 clocks; the twin must be able to cull.
         c.mutation_probation_steps = 0;
         c.crossover_probation_steps = 0;
         c.checkpoint_every = 1; // frontier survives the stop without a manual flush
@@ -1824,8 +1832,8 @@ fn resume_tops_up_to_the_requested_budget() {
         c.pop_size = 1;
         c.max_steps = Some(max_steps);
         c.checkpoint_every = 1; // the frontier survives the stop
-        // A one-net field with no cull shield would be replaced by a newborn every clock (each
-        // channel deals at least one roll), so the fixture shields it: this test is the BUDGET.
+                                // A one-net field with no cull shield would be replaced by a newborn every clock (each
+                                // channel deals at least one roll), so the fixture shields it: this test is the BUDGET.
         c.mutation_probation_steps = 100;
         c.crossover_probation_steps = 100;
         c
@@ -2634,7 +2642,7 @@ fn the_updates_fraction_grades_the_fewest_updates_one() {
 /// maps onto the spelling it meant.
 #[test]
 fn ticket_leg_spellings_round_trip() {
-    use crate::engine::config::{DEFAULT_TRAIN_TICKET, TrainTicket};
+    use crate::engine::config::{TrainTicket, DEFAULT_TRAIN_TICKET};
     for legs in [
         TrainTicket::MostFit,
         TrainTicket::MostFitFewestUpdates,
@@ -4152,12 +4160,10 @@ fn champion_previous_load_is_on_by_default_and_can_be_turned_off() {
         eng.config.pop_size,
     );
     assert_eq!(topos.len(), 2);
-    assert!(
-        crate::state::load_engine_json(&dir)
-            .unwrap()
-            .run_topology_source
-            .is_none()
-    );
+    assert!(crate::state::load_engine_json(&dir)
+        .unwrap()
+        .run_topology_source
+        .is_none());
     let _ = std::fs::remove_dir_all(&dir);
 
     // Explicit opt-out: no lookup, no receipt, still a full random population.
@@ -4178,12 +4184,10 @@ fn champion_previous_load_is_on_by_default_and_can_be_turned_off() {
     ))
     .unwrap();
     assert_eq!(eng.state.live_count(), 2, "opt-out still fills the pop");
-    assert!(
-        crate::state::load_engine_json(&dir)
-            .unwrap()
-            .run_topology_source
-            .is_none()
-    );
+    assert!(crate::state::load_engine_json(&dir)
+        .unwrap()
+        .run_topology_source
+        .is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

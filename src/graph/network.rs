@@ -1259,7 +1259,7 @@ mod tests {
         assert_eq!(v["kind_counts"][0], 1); // one Input
         assert_eq!(v["kind_counts"][1], 1); // one Hidden
         assert_eq!(v["kind_counts"][2], 1); // one Output
-        // input (Identity) + output (Identity) + the widened hidden (ReLU)
+                                            // input (Identity) + output (Identity) + the widened hidden (ReLU)
         let acts = v["activation_counts"].as_array().unwrap();
         assert!(acts.contains(&serde_json::json!(["ReLU", 1])));
         assert!(acts.contains(&serde_json::json!(["Identity", 2])));
@@ -1270,8 +1270,10 @@ mod tests {
     #[test]
     fn legacy_stacked_blueprint_runs_identically_to_a_native_one_wire_graph() {
         // The same graph written both ways: the old shape (two wires on one input port) and the new
-        // one (one wire per port).
+        // one (one wire per port). Both double the Input→n1 wire, which `unique_source_per_target`
+        // culls on load (this test is about unstacking), so the fixture opts out.
         let opts = crate::graph::topology::TopologyOptions {
+            unique_source_per_target: false,
             input_dim: Some(2),
             output_dim: Some(1),
             ..Default::default()
@@ -1332,6 +1334,9 @@ mod tests {
         // n1 has port 0 ReLU, port 1 Tanh; n2 receives those two DIFFERENT tensors
         // i0/i1 even though both leave the same node.
         let opts = crate::graph::topology::TopologyOptions {
+            // This test is the opt-out path: with the rule off, two wires from one node into one
+            // target may still carry different per-port activations.
+            unique_source_per_target: false,
             // Guarantee the hidden node keeps 2 wired output ports after trim.
             min_hidden_outputs_per_node: 2,
             max_hidden_outputs_per_node: 2,
@@ -1348,8 +1353,8 @@ mod tests {
         // finalize trims ports BEFORE we stamp per-port activations
         // port count is only final after trim) — mirrors the engine flow.
         g.finalize(); // Force the 2-port wiring deterministically: random finalize may orphan a
-        // port and trim it, so re-stamp both ports and wire n2's inputs by hand —
-        // one wire per input port, so n2's own wires go first.
+                      // port and trim it, so re-stamp both ports and wire n2's inputs by hand —
+                      // one wire per input port, so n2's own wires go first.
         g.nodes[1].num_outputs = 2;
         g.connections.retain(|c| c.to.node != 2);
         g.connections.push(Connection {

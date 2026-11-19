@@ -12,6 +12,11 @@ pub(crate) const MAX_PARENT_PAIRINGS: usize = 3;
 const UNIFORM_MASK_PICK: f32 = 0.5;
 
 /// Blend the two parents' feature-mask rows into the child's starting split.
+///
+/// Rows are aligned by PORT INDEX, and each parent is read modulo its OWN row count: a parent with
+/// fewer ports than the other is not erased from the tail, so a 3-port split crossed with a 2-port
+/// one mixes A's third partition against B's first. Port index is the only alignment two splits
+/// ever share — port 2 of one parent feeds a consumer unrelated to port 2 of the other.
 fn mix_feature_masks(
     a: Option<Vec<Vec<u8>>>,
     b: Option<Vec<Vec<u8>>>,
@@ -33,15 +38,17 @@ fn mix_feature_masks(
     if width == 0 {
         return (Vec::new(), None);
     }
-    // One BIT from the chosen donor, falling back to the other parent's bit
-    // feature — a missing cell means "the other parent's view", never a blind `0`.
+    // One BIT from the chosen donor. Each parent is read at `i % its own row count`, so a parent
+    // with FEWER ports still has a view for every port the child needs: its split is not erased
+    // from the surplus rows just because it had fewer partitions to hand out. A row too short for
+    // `f` falls back to the other parent's bit — never a blind `0`.
     let bit = |i: usize, f: usize, take_a: bool| -> u8 {
         let (first, second) = if take_a { (&a, &b) } else { (&b, &a) };
-        first
-            .get(i)
-            .and_then(|row| row.get(f).copied())
-            .or_else(|| second.get(i).and_then(|row| row.get(f).copied()))
-            .unwrap_or(1)
+        let at = |rows: &[Vec<u8>]| -> Option<u8> {
+            let row = rows.get(i % rows.len().max(1))?;
+            row.get(f).copied()
+        };
+        at(first).or_else(|| at(second)).unwrap_or(1)
     };
     let mixed: Vec<Vec<u8>> = match op {
         CrossoverOp::Uniform => (0..n)
@@ -889,6 +896,9 @@ impl CoreEngine {
         // The topology's internal rng must also derive from the run seed,
         // random child with the same n_hidden is structurally identical.
         let topo_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx) as usize;
+        let mut opts = opts;
+        // The wiring gene, drawn like a hidden width so a population mixes shallow and deep
+        opts.input_reach = opts.draw_input_reach(&mut rng);
         let mut graph = Topology::new(topo_seed, Some(opts));
         graph.create_random_hidden_nodes(n_hidden);
         // Children draw from the config's resolved pools — an empty config
@@ -1197,5 +1207,40 @@ mod tests {
         for (i, r) in mixed.iter().enumerate() {
             assert_ne!(r, &row([0, 0]), "port {i} fell back to an empty row");
         }
+    }
+
+    /// Asymmetric splits: a 3-port parent and a 2-port parent must BOTH reach every port. The old
+    /// rule copied the longer parent's surplus row verbatim, so the shorter split could never
+    /// influence it — port 2 was 100% A however the coins fell.
+    #[test]
+    fn mix_reads_each_parent_modulo_its_own_row_count() {
+        let a = vec![row([1, 0]), row([0, 1]), row([1, 1])];
+        let b = vec![row([0, 0]), row([0, 1])];
+        let mut saw_b = false;
+        for seed in 0..64u64 {
+            let (rows, _) = mix_feature_masks(
+                Some(a.clone()),
+                Some(b.clone()),
+                Some(FeatureSplitPolicy::Exclusive),
+                Some(FeatureSplitPolicy::Exclusive),
+                CrossoverOp::Uniform,
+                &mut rng(seed),
+            );
+            assert_eq!(rows.len(), 3, "the longer split sets the row count");
+            // Ports 0/1 pair a0↔b0 and a1↔b1; port 2 pairs a2 with B's FIRST row (2 % 2 = 0).
+            for (f, bit) in rows[2].iter().enumerate() {
+                assert!(
+                    *bit == a[2][f] || *bit == b[0][f],
+                    "seed {seed}: port 2 bit {f} came from neither a2 nor b0"
+                );
+            }
+            if rows[2] != a[2] {
+                saw_b = true;
+            }
+        }
+        assert!(
+            saw_b,
+            "port 2 must be able to take B's view — the old rule always copied A's surplus row"
+        );
     }
 }

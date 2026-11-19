@@ -4,8 +4,8 @@
 use tracing::info;
 
 use super::core::CoreEngine;
-use crate::engine::diversity::{NetShape, mean_delta_to, shape_of};
-use crate::engine::format::{ReadingStyle, fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_units};
+use crate::engine::diversity::{mean_delta_to, shape_of, NetShape};
+use crate::engine::format::{fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_units, ReadingStyle};
 use crate::engine::smoothing::rolling_mean;
 
 mod lineage;
@@ -688,6 +688,11 @@ impl CoreEngine {
                 .and_then(|s| s.meta.params)
                 .map(fmt_units)
                 .unwrap_or_else(|| "?".to_string()),
+            // The wiring GENE, read beside the census it shaped: `1.00` = one Input port per
+            // hidden node (the historical wiring), lower = fewer raw-input wires, deeper net.
+            shape
+                .map(|s| format!("{:.2}", s.reach))
+                .unwrap_or_else(dash),
             shape.map(|s| s.nodes.to_string()).unwrap_or_else(dash),
             // The mask's DENSITY, not its policy label: a blended split has no single policy to
             // name, but how much of the input a port reads is still a comparable number.
@@ -1296,6 +1301,7 @@ const STOP_HEADER_FIXED: &[&str] = &[
     "hash",
     "origin",
     "params",
+    "reach",
     "nodes",
     COL_MASK,
     "wires",
@@ -1376,6 +1382,11 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         (
             "params".to_string(),
             "trainable parameters, in K/M/B units (`40.2K` = 40 200); the exact count is in `nets/<hash>.json`"
+                .to_string(),
+        ),
+        (
+            "reach".to_string(),
+            "the wiring gene `input_reach`: the share of hidden nodes allowed a wire straight from the Input node. `1.00` = every node may read the raw input (one Input port per hidden node); lower = fewer Input ports and hidden→hidden wires instead, so the net is deeper and each Input port still carries one wire and one mask row"
                 .to_string(),
         ),
         (
@@ -1616,7 +1627,7 @@ mod stop_legend_tests {
     #[test]
     fn the_card_prints_no_window_leg_beside_the_score() {
         use crate::engine::config::MeanType;
-        use crate::engine::smoothing::{RollingBuffer, rolling_stats_with};
+        use crate::engine::smoothing::{rolling_stats_with, RollingBuffer};
         // The window that started it: two good readings and one low one.
         let buf = RollingBuffer::from_values(10, &[0.828125, 0.859375, 0.859375]);
         let stats = rolling_stats_with(&buf, MeanType::Median).unwrap();
@@ -2192,8 +2203,8 @@ fn minimal_score_cell(
 mod tests {
     use super::lineage::*;
     use super::{
-        CardStats, NetShape, StopPlan, delta_crown, delta_pop, mean_of, minimal_score_cell,
-        origin_cell, step_score_cell,
+        delta_crown, delta_pop, mean_of, minimal_score_cell, origin_cell, step_score_cell,
+        CardStats, NetShape, StopPlan,
     };
     use crate::utils::fitness::Direction;
 
@@ -2266,7 +2277,7 @@ mod tests {
     #[test]
     fn the_median_step_cell_closes_on_the_median_not_the_mean() {
         use crate::engine::config::MeanType;
-        use crate::engine::smoothing::{RollingBuffer, rolling_stats_with};
+        use crate::engine::smoothing::{rolling_stats_with, RollingBuffer};
         // One net, four readings: mean 25.75 / σ 14.77, but median 12 and MAD 2.
         let stats = rolling_stats_with(
             &RollingBuffer::from_values(4, &[10.0, 12.0, 40.0, 41.0]),
@@ -2525,6 +2536,7 @@ mod tests {
     /// without building a blueprint.
     fn shape(token: &str) -> NetShape {
         NetShape {
+            reach: 1.0,
             genome: [(token.to_string(), 1usize)].into_iter().collect(),
             nodes: 1,
             wires: 1,
@@ -2537,6 +2549,7 @@ mod tests {
     /// lands on 0.5 (one shared gene out of two) rather than 0 or 1.
     fn shape_pair() -> NetShape {
         NetShape {
+            reach: 1.0,
             genome: [("W:Tanh".to_string(), 1usize), ("W:SiLU".to_string(), 1)]
                 .into_iter()
                 .collect(),

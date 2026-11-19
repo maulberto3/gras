@@ -31,6 +31,10 @@ pub enum TopologyError {
     DoubleUsedOutput(Port),
     /// An input port receives more than one wire.
     MultiWiredInputPort(Port),
+    /// One node feeds another more than once — the second wire carries the same signal, only its
+    /// per-port activation differs. Applies to every kind (Input→hidden, hidden→hidden,
+    /// hidden→Output).
+    DuplicateSourceWire { source: usize, target: usize },
 }
 
 impl Display for TopologyError {
@@ -44,6 +48,10 @@ impl Display for TopologyError {
             }
             TopologyError::EmptyTopology => write!(f, "graph has no nodes"),
             TopologyError::InvalidOptions(msg) => write!(f, "invalid options: {msg}"),
+            TopologyError::DuplicateSourceWire { source, target } => write!(
+                f,
+                "node n{source} feeds node n{target} more than once (one wire per source→target pair)"
+            ),
             TopologyError::UnknownNode(id) => write!(f, "connection references unknown node {id}"),
             TopologyError::BackwardConnection(c) => {
                 write!(

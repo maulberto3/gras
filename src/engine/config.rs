@@ -890,11 +890,10 @@ impl RaceConfig {
         // Pool: a header that recorded one (a post-pool run) wins; an older header recorded
         // single policy (or none), which becomes a one-entry pool so a resume cannot silently start
         cfg.feature_split_pool = if snap.feature_split_pool.is_empty() {
-            vec![
-                snap.feature_split
-                    .clone()
-                    .unwrap_or_else(|| "none".to_string()),
-            ]
+            vec![snap
+                .feature_split
+                .clone()
+                .unwrap_or_else(|| "none".to_string())]
         } else {
             snap.feature_split_pool.clone()
         };
@@ -1218,6 +1217,30 @@ impl RaceConfigBuilder {
     /// Set the max outputs per node.
     pub fn set_topology_max_outputs_per_node(mut self, n: usize) -> Self {
         self.cfg.topology_options.max_hidden_outputs_per_node = n;
+        self
+    }
+    /// Sample each newborn's `input_reach` from `min..=max` (`0.0..=1.0`).
+    ///
+    /// `input_reach` is how much of the raw input the hidden layer may read directly: `1.0` sizes
+    /// the Input node at one port per hidden node (every node may read the input, the historical
+    /// wiring), lower values hand out fewer ports, so the sockets they cannot cover are fed by
+    /// other hidden nodes — the net gets DEEPER instead of wider at its first layer. `1.0, 1.0`
+    /// (the default) pins the historical wiring.
+    pub fn set_topology_input_reach_range(mut self, min: f32, max: f32) -> Self {
+        self.cfg.topology_options.min_input_reach = min.clamp(0.0, 1.0);
+        self.cfg.topology_options.max_input_reach = max.clamp(0.0, 1.0);
+        // The header's template must not keep a stale sampled value.
+        self.cfg.topology_options.input_reach = min.clamp(0.0, 1.0);
+        self
+    }
+    /// Keep at most ONE wire per (source node, target node) pair — `true` by default.
+    ///
+    /// The rule spans every kind: Input→hidden (where the Input port is Identity, so a second wire
+    /// is the same signal), hidden→hidden, and hidden→Output. With it on, `finalize` will not pick
+    /// a source that already feeds the target, `validate` rejects a blueprint that does, and a
+    /// loaded graph is repaired by one seeded random cull. `false` restores the older wiring.
+    pub fn set_topology_unique_source_per_target(mut self, on: bool) -> Self {
+        self.cfg.topology_options.unique_source_per_target = on;
         self
     }
     /// Set the input dimension.
@@ -1656,10 +1679,8 @@ mod spelling_pins {
             assert_eq!(CrossCullPolicy::from_str(s).unwrap(), v);
             assert_eq!(MutationCullPolicy::from_str(s).unwrap().to_string(), s);
         }
-        assert!(
-            CrossCullPolicy::from_str("nope")
-                .unwrap_err()
-                .contains("expected lowest_fitness")
-        );
+        assert!(CrossCullPolicy::from_str("nope")
+            .unwrap_err()
+            .contains("expected lowest_fitness"));
     }
 }

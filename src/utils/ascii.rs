@@ -266,7 +266,7 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
                 put(&mut canvas, r0 + 1, c + k, ch);
             }
         }
-        // One label per outgoing wire (`o1 o1` where the Input node fans out).
+        // One label per outgoing wire (`o1 o1` only in a legacy Input fan-out).
         for (q, label) in out_labels[i].iter().enumerate() {
             let c = out_col(q);
             for (k, ch) in label.chars().enumerate() {

@@ -1,7 +1,7 @@
 //! Run artifacts: the CHAMPION ranking and the anti-champion (worst) dumps.
 
 use super::core::CoreEngine;
-use super::format::{ReadingStyle, fmt_cfg, fmt_family_reading};
+use super::format::{fmt_cfg, fmt_family_reading, ReadingStyle};
 use flodl::tensor::Result;
 
 /// Why the list is not simply the bottom of `fit (F)`, stamped into every `worst-*.md`: the file
@@ -109,9 +109,13 @@ impl CoreEngine {
             // The run seed rides the header: this file outlives the run dir, and the seed
             // one input a later replay cannot reconstruct from the net.
             let md = format!(
-                "**{label} · fitness {} = {:.4} · window {} · run seed {} · net seed {}**\n\n{}\n\n{}",
+                // `updates` sits beside the score, not only in the lineage box at the foot of the
+                // file: two nets can share a fitness and differ by whether it cost 2 updates or
+                // 200, and the header is what a reader sees first.
+                "**{label} · fitness {} = {:.4} · updates {} · window {} · run seed {} · net seed {}**\n\n{}\n\n{}",
                 self.fitness.direction().arrow(),
                 fitness,
+                state.step,
                 reading,
                 self.header.run_seed,
                 state.net_seed,
@@ -254,12 +258,16 @@ impl CoreEngine {
             let ticket_cell = p.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg);
             let spent_cell = spent.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg);
             let md = format!(
-                "**Worst #{} · spent {} · fit (F) {} · ticket p {} · merit {} · age {} clocks · window {} · run seed {} · net seed {}**\n\n{}\n\n{}\n\n{}",
+                // `updates` rides the header beside `age`: `spent` says how the net ranks, the
+                // COUNT says what the ranking is made of, and the lineage box at the foot of the
+                // file already prints it — the two must agree.
+                "**Worst #{} · spent {} · fit (F) {} · ticket p {} · merit {} · updates {} · age {} clocks · window {} · run seed {} · net seed {}**\n\n{}\n\n{}\n\n{}",
                 rank + 1,
                 spent_cell,
                 fit_cell,
                 ticket_cell,
                 merit.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg),
+                state.step,
                 age,
                 reading,
                 self.header.run_seed,
