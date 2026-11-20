@@ -3,8 +3,9 @@
 pub mod persistence;
 
 pub use persistence::{
-    ConfigSnapshot, FRONTIER_MANIFEST_SCHEMA, FrontierManifest, FrontierNet, NetMeta, NetMetrics,
-    NetState, RaceState, RunAccounting, RunConfig, RunHeader, SeedSourceRecord, TopologyLifetime,
     load_engine_json, load_frontier_manifest, load_net_state, truncate_csv_to_clock,
-    write_engine_json, write_frontier_manifest, write_net_state,
+    write_engine_json, write_frontier_manifest, write_net_state, ConfigSnapshot, EvalBench,
+    FrontierManifest, FrontierNet, NetMeta, NetMetrics, NetState, RaceState, RunAccounting,
+    RunConfig, RunHeader, SeedSourceRecord, TopologyLife, TopologyLifetime,
+    FRONTIER_MANIFEST_SCHEMA,
 };
