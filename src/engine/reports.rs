@@ -1,7 +1,7 @@
 //! Run artifacts: the CHAMPION ranking and the anti-champion (worst) dumps.
 
 use super::core::CoreEngine;
-use super::format::{fmt_cfg, fmt_family_reading, ReadingStyle};
+use super::format::{fmt_cell, fmt_cfg, fmt_family_reading, fmt_micros, fmt_units, ReadingStyle};
 use flodl::tensor::Result;
 
 /// Why the list is not simply the bottom of `fit (F)`, stamped into every `worst-*.md`: the file
@@ -64,7 +64,7 @@ impl CoreEngine {
     }
 
     /// Write the top-k champions' topology markdown, one file per champion (`champion-<hash>-<fitness>.md`, the suffix being the risk-adjusted score the file ranked by, rounded…
-    pub(crate) fn write_champion_markdown(&mut self) -> Result<()> {
+    pub(crate) fn write_champion_markdown(&mut self, clock: usize) -> Result<()> {
         if !self.config.champion_save_topology {
             return Ok(());
         }
@@ -108,11 +108,17 @@ impl CoreEngine {
             );
             // The run seed rides the header: this file outlives the run dir, and the seed
             // one input a later replay cannot reconstruct from the net.
+            // ── Facts: every number the stop card prints for this net, in ONE table ── the file
+            // outlives the run, so it carries the census, the eval price and the read window the
+            // console showed, not only the blueprint. Prices are per SAMPLE (tabular) or per TURN
+            // (RL), the same unit the `eval time (µs)` column states in its header.
+            let facts = self.net_facts(&hash, &topo, clock, &reading);
+            let facts_md = facts_markdown(&facts);
             let md = format!(
                 // `updates` sits beside the score, not only in the lineage box at the foot of the
                 // file: two nets can share a fitness and differ by whether it cost 2 updates or
                 // 200, and the header is what a reader sees first.
-                "**{label} · fitness {} = {:.4} · updates {} · window {} · run seed {} · net seed {}**\n\n{}\n\n{}",
+                "**{label} · fitness {} = {:.4} · updates {} · window {} · run seed {} · net seed {}**\n\n{facts_md}{}\n\n{}",
                 self.fitness.direction().arrow(),
                 fitness,
                 state.step,
@@ -149,6 +155,85 @@ impl CoreEngine {
             ));
         }
         Ok(())
+    }
+
+    /// The `## Facts` rows: every number the stop card prints for one net — census,
+    /// eval price, read window. Shared by the CHAMPION and ANTI-CHAMPION markdown so the
+    /// two ends of one ranking leave the same record on disk.
+    fn net_facts(
+        &self,
+        hash: &str,
+        topo: &crate::graph::topology::Topology,
+        clock: usize,
+        reading: &str,
+    ) -> Vec<(&'static str, String)> {
+        let na = crate::utils::cfy::NO_VALUE.to_string();
+        let Some(state) = self.state.net(hash) else {
+            return Vec::new();
+        };
+        // Prices are per SAMPLE (tabular) or per TURN (RL) — the same unit the stop
+        // column states in its header.
+        let eval = &state.meta.eval;
+        let eval_cell = match eval.secs_per_unit() {
+            Some(secs) => format!(
+                "{} µs / {} ({} timed passes)",
+                fmt_micros(secs),
+                if eval.unit.is_empty() {
+                    "pass"
+                } else {
+                    eval.unit.as_str()
+                },
+                eval.passes
+            ),
+            None => na.clone(),
+        };
+        // The blueprint's census, read the SAME way the stop card reads it.
+        let shape = crate::engine::diversity::shape_of(topo);
+        let trend = self.rolling_trend.get(hash).and_then(|t| t.slope());
+        vec![
+            ("hash", hash.to_string()),
+            (
+                "origin",
+                state
+                    .created_from
+                    .clone()
+                    .unwrap_or_else(|| "founder".to_string()),
+            ),
+            ("born (clock)", state.entered_at_step.to_string()),
+            (
+                "age (A)",
+                (clock.saturating_sub(state.entered_at_step) + 1).to_string(),
+            ),
+            (
+                "params",
+                state
+                    .meta
+                    .params
+                    .map(fmt_units)
+                    .unwrap_or_else(|| na.clone()),
+            ),
+            ("nodes", shape.nodes.to_string()),
+            ("wires", shape.wires.to_string()),
+            ("width", fmt_cell(shape.dim)),
+            ("reach", format!("{:.2}", shape.reach)),
+            (
+                "feature split",
+                shape
+                    .mask
+                    .map_or_else(|| na.clone(), |m| format!("{}%", fmt_cell(m * 100.0))),
+            ),
+            ("eval time (t)", eval_cell),
+            ("updates (U)", state.step.to_string()),
+            ("evals (E)", state.measured_clocks().to_string()),
+            ("fit (F)", reading.to_string()),
+            (
+                "slope (S)",
+                trend.map_or_else(|| na.clone(), |v| format!("{v:.4}")),
+            ),
+            ("net seed", state.net_seed.to_string()),
+            ("run seed", self.header.run_seed.to_string()),
+            ("mean type", self.config.mean_type.to_string()),
+        ]
     }
 
     /// Write EVERY live net's weights to `nets/<hash>.safetensors`.
@@ -257,11 +342,15 @@ impl CoreEngine {
             let fit_cell = fit.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg);
             let ticket_cell = p.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg);
             let spent_cell = spent.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg);
+            // The same `## Facts` table the champion files carry: this file outlives the
+            // run too, and an anti-champion is read for exactly the same numbers.
+            let facts = self.net_facts(hash, &topo, clock, &reading);
+            let facts_md = facts_markdown(&facts);
             let md = format!(
                 // `updates` rides the header beside `age`: `spent` says how the net ranks, the
                 // COUNT says what the ranking is made of, and the lineage box at the foot of the
                 // file already prints it — the two must agree.
-                "**Worst #{} · spent {} · fit (F) {} · ticket p {} · merit {} · updates {} · age {} clocks · window {} · run seed {} · net seed {}**\n\n{}\n\n{}\n\n{}",
+                "**Worst #{} · spent {} · fit (F) {} · ticket p {} · merit {} · updates {} · age {} clocks · window {} · run seed {} · net seed {}**\n\n{facts_md}{}\n\n{}\n\n{}",
                 rank + 1,
                 spent_cell,
                 fit_cell,
@@ -409,6 +498,41 @@ impl CoreEngine {
 }
 
 /// Anti-champion order: the HIGHEST `spent` (`Fm⁻ × (1 − Um⁻)`) first — the bad nets the field has already paid for — then the lowest `fit (F)`, the older net, the hash.
+/// Field/value pairs printed per `## Facts` row. Two keeps the card short without dragging the
+/// long cells (`origin`, `fit (F)`) across the page.
+const FACTS_PAIRS_PER_ROW: usize = 2;
+
+/// Render a `## Facts` table. One row list, one spelling, for both ends of the ranking.
+///
+/// The list is laid out as a GRID — `FACTS_PAIRS_PER_ROW` pairs per row — because the card is read
+/// beside the mermaid graph, and eighteen single-pair lines pushed the numbers off the screen.
+/// A short final row is padded with blank cells so the table stays a rectangle.
+fn facts_markdown(facts: &[(&str, String)]) -> String {
+    let cols = FACTS_PAIRS_PER_ROW * 2;
+    let mut out = String::from("## Facts\n\n|");
+    for c in 0..cols {
+        out.push_str(if c % 2 == 0 { " field |" } else { " value |" });
+    }
+    out.push('\n');
+    out.push('|');
+    for _ in 0..cols {
+        out.push_str("---|");
+    }
+    out.push('\n');
+    for row in facts.chunks(FACTS_PAIRS_PER_ROW) {
+        out.push('|');
+        for (key, value) in row {
+            out.push_str(&format!(" {key} | {value} |"));
+        }
+        for _ in row.len()..FACTS_PAIRS_PER_ROW {
+            out.push_str("  |  |");
+        }
+        out.push('\n');
+    }
+    out.push('\n');
+    out
+}
+
 pub(crate) fn worst_order(
     mut rows: Vec<(String, f32, usize, Option<f32>)>,
 ) -> Vec<(String, f32, usize, Option<f32>)> {
