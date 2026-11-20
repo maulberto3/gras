@@ -34,7 +34,7 @@ pub(crate) fn kv(rows: &[(String, String)]) -> String {
 }
 
 /// Max width of a card's prose BLOCK — a legend row (key AND value) or a footnote.
-pub(crate) const PROSE_WIDTH: usize = 110;
+pub(crate) const PROSE_WIDTH: usize = 150;
 
 /// The table's "no value" cell: `na` (not available).
 pub(crate) const NO_VALUE: &str = "na";
@@ -42,6 +42,9 @@ pub(crate) const NO_VALUE: &str = "na";
 /// The floor the key column may squeeze the prose down to. Without it a very long key
 /// (`fit (F = g⁻¹(ḡ), g = sign(x)·ln(1+|x|))`) would leave one word per line.
 const MIN_PROSE_WIDTH: usize = 40;
+
+/// Columns the table's borders, separators and cell padding add around a legend's two cells.
+const TABLE_CHROME: usize = 18;
 
 /// Hard-wrap `text` at `width` COLUMNS (chars, not bytes: `·`, `Δ` and `na` are one column
 /// several bytes).
@@ -89,7 +92,11 @@ pub(crate) fn table_wrapped(header: &[&str], rows: &[(String, String)]) -> Strin
         .chain(header.iter().map(|h| h.chars().count()))
         .max()
         .unwrap_or(0);
-    let prose_width = PROSE_WIDTH.saturating_sub(key_width).max(MIN_PROSE_WIDTH);
+    // The key column AND the table's borders/padding come OUT of the prose budget, so the
+    // rendered block lands at `PROSE_WIDTH` instead of overshooting it by its chrome.
+    let prose_width = PROSE_WIDTH
+        .saturating_sub(key_width + TABLE_CHROME)
+        .max(MIN_PROSE_WIDTH);
     let cells: Vec<Vec<String>> = rows
         .iter()
         .map(|(k, v)| vec![k.clone(), wrap(v, prose_width).join("\n")])
@@ -143,7 +150,7 @@ pub(crate) fn emit_always(text: &str) {
 }
 #[cfg(test)]
 mod tests {
-    use super::{PROSE_WIDTH, card, kv, table, table_wrapped, wrap};
+    use super::{card, kv, table, table_wrapped, wrap, PROSE_WIDTH};
 
     /// The ONE decision in these wrappers worth pinning: a key/value block has no header row
     /// banner names it), while a named table keeps the header that says what it holds.
