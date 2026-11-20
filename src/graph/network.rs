@@ -541,19 +541,28 @@ impl Network {
         &self,
         ports: Vec<Variable>,
         node_id: usize,
+        batch: i64,
     ) -> flodl::tensor::Result<Variable> {
         let n = ports.len();
         let mut iter = ports.into_iter();
         let Some(mut result) = iter.next() else {
-            // No wired ports (a hand-built or legacy graph) — a zero tensor
-            // node's output dim keeps the forward pass shaped.
-            let dim = self.node_dims[node_id].1 as i64;
+            // No wired ports: a topology can declare an input port that no wire feeds (a
+            // crossover child does, occasionally). The node's Layer still runs, so the zero
+            // tensor must carry the node's declared INPUT width — shaping it by `out_dim` fed a
+            // `[1, 32]` into a `64 → 32` layer and aborted the race with `mat1 and mat2 shapes
+            // cannot be multiplied (1x32 and 64x32)`. It must also carry the FORWARD's batch:
+            // a fallback batch of 1 silently shrinks an unwired node's output, and any sibling
+            // wire it then meets has a different leading dim.
+            let dim = self.node_dims[node_id].0 as i64;
+            debug!(
+                "Network::forward -- node {node_id} has no wired input port; feeding zeros [{batch}, {dim}]"
+            );
             let opts = flodl::TensorOptions {
                 dtype: flodl::DType::Float32,
                 device: Device::CPU,
             };
             return Ok(Variable::new(
-                flodl::Tensor::zeros(&[1, dim], opts).unwrap(),
+                flodl::Tensor::zeros(&[batch, dim], opts).unwrap(),
                 false,
             ));
         };
@@ -872,6 +881,9 @@ impl Module for Network {
     fn forward(&self, input: &Variable) -> flodl::tensor::Result<Variable> {
         // Per-port outputs, keyed by (node_id, port_index); consumers look up
         // exact port they are wired
+        // The batch the zero-input fallback must carry: an unwired node invents no batch of its
+        // own, or its output loses the batch every wired sibling has.
+        let batch = input.data().shape()[0];
         let mut port_outputs: HashMap<(usize, usize), Variable> = HashMap::new();
 
         // Pass 1: compute all node outputs normally.
@@ -882,7 +894,7 @@ impl Module for Network {
                 self.layers[node_id].forward(input)?
             } else {
                 let ports = self.gather_port_tensors(&port_outputs, node_id)?;
-                let combined = self.combine_inputs(ports, node_id)?;
+                let combined = self.combine_inputs(ports, node_id, batch)?;
                 let projected = self.layers[node_id].forward(&combined)?;
                 // Standardize + dropout BEFORE the port split, so every port sees
                 // the same tensor and the mask draw is one-per-node.
@@ -1047,6 +1059,40 @@ mod tests {
             Tensor::randn(&[batch, input_dim as i64], cpu_opts()).unwrap(),
             false,
         )
+    }
+
+    /// A node whose every input port carries no wire still has to forward: `node_dims` gives such
+    /// a node `in_dim = effective_hidden_dim()` (the widest node), so shaping the zero fallback by
+    /// its OWN `out_dim` fed a `4`-wide tensor into an `8 → 4` layer. That is the exact race
+    /// failure `mat1 and mat2 shapes cannot be multiplied (1x32 and 64x32)`.
+    #[test]
+    fn unwired_input_ports_feed_the_declared_input_width() {
+        let mut graph = Topology::new(0, None);
+        graph.options.input_dim = Some(2);
+        graph.options.output_dim = Some(2);
+        graph.nodes.push(Node::new_input(0, 2));
+        let mut wide = Node::new_hidden(1, 2, 2);
+        wide.hidden_dim = Some(8);
+        graph.nodes.push(wide);
+        // The victim: 4 wide, so its declared `in_dim` (the widest node, 8) != its `out_dim` (4).
+        let mut orphan = Node::new_hidden(2, 1, 2);
+        orphan.hidden_dim = Some(4);
+        graph.nodes.push(orphan);
+        let mut out = Node::new_output(3, 1, 1);
+        out.hidden_dim = Some(2);
+        graph.nodes.push(out);
+        graph.refresh_labels();
+        graph.finalize();
+        // Cut every wire into node 2: the port stays DECLARED, nothing feeds it — the topology a
+        // crossover child came out with at step 30 of a pop-50 race.
+        graph.connections.retain(|c| c.to.node != 2);
+        let dims = graph.node_dims();
+        assert_eq!(dims[2], (8, 4), "the node keeps its declared widths");
+        let net = Network::build(&graph, Device::CPU).expect("an unwired port still builds");
+        let out = net
+            .forward(&rand_input(4, 2))
+            .expect("forward must not break on a shape mismatch");
+        assert_eq!(out.data().shape(), &[4, 2]);
     }
 
     // ── execution (Network) ───────────────────────────────────────────────
@@ -1564,6 +1610,48 @@ mod var_dim_test {
             prop_assert!(net.is_ok(), "build failed: {:?}", net.err());
             let net = net.unwrap();
             prop_assert!(!net.parameters().is_empty(), "no parameters");
+        }
+
+        /// Whatever wires a topology loses, the network must still build and forward. A crossover
+        /// child came out with a hidden node whose single input port had NO wire, and the zero
+        /// fallback fed `[1, out_dim]` into an `in_dim → out_dim` layer — `1x32` against `64x32`.
+        /// Shaped by the node's declared INPUT width, any wired subset must survive.
+        #[test]
+        fn prop_unwired_ports_never_break_the_shape(
+            mut topo in crate::graph::topology::test_strategies::topology_strategy(),
+            keep in prop::collection::vec(any::<bool>(), 0usize..64),
+            batch in 1i64..5,
+        ) {
+            let connections: Vec<Connection> = topo
+                .connections
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| keep.get(*i).copied().unwrap_or(true))
+                .map(|(_, c)| c.clone())
+                .collect();
+            topo.connections = connections;
+            let net = Network::build(&topo, Device::CPU);
+            prop_assert!(net.is_ok(), "build failed after cutting wires: {:?}", net.err());
+            let net = net.unwrap();
+            let input = Variable::new(
+                Tensor::randn(
+                    &[batch, topo.options.input_dim.unwrap_or(1) as i64],
+                    TensorOptions {
+                        dtype: DType::Float32,
+                        device: Device::CPU,
+                    },
+                )
+                .unwrap(),
+                false,
+            );
+            let out = net.forward(&input);
+            prop_assert!(out.is_ok(), "forward failed: {:?}", out.err());
+            let out = out.unwrap();
+            prop_assert_eq!(out.shape()[0], batch);
+            prop_assert_eq!(
+                out.shape()[1],
+                topo.options.output_dim.unwrap_or(1) as i64
+            );
         }
 
         #[test]
