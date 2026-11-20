@@ -23,6 +23,11 @@ pub struct ConfigSnapshot {
     pub pop_size: usize,
     /// Steps between population checkpoints.
     pub checkpoint_every: usize,
+    /// Whether every live net's weights were written at the terminal STOP (see
+    /// `RaceConfig::save_weights_at_stop`). `false` = a stop snapshot with blueprints only,
+    /// and on every header written before the knob.
+    #[serde(default)]
+    pub save_weights_at_stop: bool,
     /// Share of the population each channel replaces per clock; `0.0` = off.
     #[serde(default)]
     pub crossover_share: f32,
@@ -208,6 +213,7 @@ impl ConfigSnapshot {
             .to_string(),
             csv_export: cfg.csv_export,
             save_optim: cfg.save_optim,
+            save_weights_at_stop: cfg.save_weights_at_stop,
             run_name: cfg.run_name.clone(),
             train_merit_p_min: cfg.train_merit_p_min,
             train_merit_p_max: cfg.train_merit_p_max,
@@ -339,6 +345,17 @@ pub struct RunHeader {
     /// [`SeedSourceRecord`]). `None` = an all-random batch: nothing was inherited.
     #[serde(default)]
     pub run_topology_source: Option<SeedSourceRecord>,
+    /// Every LIVE topology's lifetime accumulator at the stop (appearances, first/last clock,
+    /// final reading). Accumulated every clock in memory and, before this field, never written.
+    #[serde(default)]
+    pub topologies: Vec<TopologyLife>,
+    /// Mean `Δcrown` over the final table's rows — the number the stop card printed, persisted
+    /// beside the rest of the stop record. `None` = no card (no live net) or a legacy file.
+    #[serde(default)]
+    pub delta_crown: Option<f32>,
+    /// Mean `Δpop` over the final table's rows (same card, same caveat).
+    #[serde(default)]
+    pub delta_pop: Option<f32>,
     /// What the run DID to its population (see [`RunAccounting`]). Written
     /// stop; absent on a running or legacy run.
     #[serde(default)]
@@ -520,6 +537,10 @@ impl RunHeader {
             // A post-construction fact: the seed source is stamped in right after
             // population is resolved.
             run_topology_source: None,
+            // Stop-time records: filled by `persist_run_counters` at the terminal stop.
+            topologies: Vec::new(),
+            delta_crown: None,
+            delta_pop: None,
             accounting: None,
         }
     }
@@ -705,6 +726,20 @@ impl RunHeader {
             config,
             trainer,
             run_topology_source,
+            // Stop-time records (absent on a header written before they existed).
+            topologies: v
+                .get("topologies")
+                .cloned()
+                .and_then(|t| serde_json::from_value(t).ok())
+                .unwrap_or_default(),
+            delta_crown: v
+                .get("delta_crown")
+                .and_then(|f| f.as_f64())
+                .map(|n| n as f32),
+            delta_pop: v
+                .get("delta_pop")
+                .and_then(|f| f.as_f64())
+                .map(|n| n as f32),
             accounting: v
                 .get("accounting")
                 .cloned()
@@ -870,6 +905,38 @@ pub struct NetMeta {
     #[serde(default)]
     /// Run seed recorded for this net's regime (`None` if unknown).
     pub run_seed: Option<u64>,
+    /// What ONE eval-mode forward pass cost, measured once at the run's terminal stop — the
+    /// stop table's `eval time (µs)` cell. `None` (the default) on a culled net, a net never benched
+    /// and every file written before the measurement existed.
+    #[serde(default)]
+    pub eval: EvalBench,
+}
+
+/// One measured eval-forward price, stamped into [`NetMeta::eval`] at the terminal stop: the
+/// stop table's `eval time (µs)` cell and every later reader of `nets/<hash>.json`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct EvalBench {
+    /// Mean wall-clock seconds of ONE eval-mode forward pass over an eval-sized input.
+    #[serde(default)]
+    pub secs_per_pass: Option<f64>,
+    /// Units that pass covered: the eval batch's rows (tabular) or `1` (RL: one turn).
+    #[serde(default)]
+    pub units_per_pass: Option<usize>,
+    /// The unit the run priced: `"sample"` (tabular) or `"turn"` (RL).
+    #[serde(default)]
+    pub unit: String,
+    /// Timed passes behind the mean (warm-up passes are not counted).
+    #[serde(default)]
+    pub passes: usize,
+}
+
+impl EvalBench {
+    /// Seconds per priced unit — the number the `eval time (µs)` column prints, scaled to µs there.
+    pub fn secs_per_unit(&self) -> Option<f64> {
+        let secs = self.secs_per_pass?;
+        let units = self.units_per_pass.unwrap_or(1).max(1);
+        Some(secs / units as f64)
+    }
 }
 
 /// One snapshot of metrics for a single net, at a single step.
@@ -1083,6 +1150,24 @@ pub struct RaceState {
     topology_lifetime: HashMap<String, TopologyLifetime>,
 }
 
+/// One topology's lifetime record as written into `engine.json` → `topologies`: the
+/// in-memory [`TopologyLifetime`] accumulator, serialized (it was computed every clock and
+/// never left the process before this record existed).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TopologyLife {
+    /// Canonical topology hash the record belongs to.
+    pub hash: String,
+    /// Times this blueprint entered the live population.
+    pub appearances: usize,
+    /// First clock it was live.
+    pub first_step: usize,
+    /// Last clock it was live.
+    pub last_step: usize,
+    /// The final fitness reading it carried.
+    #[serde(default)]
+    pub last_fitness: Option<f32>,
+}
+
 /// Per-topology lifetime tracking — entries, step span, and final recorded fitness.
 #[derive(Clone, Debug)]
 pub struct TopologyLifetime {
@@ -1278,6 +1363,24 @@ impl RaceState {
         out
     }
 
+    /// Every topology's lifetime record, owned and sorted by hash — the `engine.json`
+    /// `topologies` block.
+    pub fn topology_lifetimes(&self) -> Vec<TopologyLife> {
+        let mut out: Vec<TopologyLife> = self
+            .topology_lifetime
+            .iter()
+            .map(|(hash, life)| TopologyLife {
+                hash: hash.clone(),
+                appearances: life.appearances(),
+                first_step: life.first_step(),
+                last_step: life.last_step(),
+                last_fitness: life.last_fitness(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.hash.cmp(&b.hash));
+        out
+    }
+
     /// Clear the entire state (used by tests / fresh-run init).
     pub fn clear(&mut self) {
         self.nets.clear();
@@ -1338,6 +1441,12 @@ pub struct FrontierManifest {
     pub run_seed: u64,
     /// The live set, sorted by hash so the file's bytes are deterministic.
     pub nets: Vec<FrontierNet>,
+    /// Whether this tick exported every live net's weights (`nets/<hash>.safetensors`). `false`
+    /// at a stop run with `save_weights_at_stop` off: the net JSONs are current while the
+    /// weights on disk are older, so a resume must refuse instead of loading a stale state.
+    /// Legacy files read `true` (the stop always exported before the knob).
+    #[serde(default = "default_true")]
+    pub weights: bool,
 }
 
 /// The temporary sibling a [`write_atomic`] rename goes through.
@@ -1536,6 +1645,7 @@ mod tests {
             schema: FRONTIER_MANIFEST_SCHEMA,
             next_clock: 41,
             run_seed: 7,
+            weights: true,
             nets: vec![
                 FrontierNet {
                     hash: "aa".to_string(),
