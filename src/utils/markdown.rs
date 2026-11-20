@@ -200,6 +200,8 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             .collect();
         let shared: Vec<usize> = (0..input_dim).filter(|f| owned_by[*f] > 1).collect();
         let unowned: Vec<usize> = (0..input_dim).filter(|f| owned_by[*f] == 0).collect();
+        // The accounting means something DIFFERENT per policy, so the sentence says what this net's
+        // own label makes of it: 100% is a partition, >100% is sharing, <100% is dropped features —
         // Capped so a 784-wide vector cannot turn one sentence into a wall of indices.
         let name_features = |feats: &[usize]| -> String {
             const CAP: usize = 8;
@@ -209,12 +211,11 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             }
             shown.join(", ")
         };
-        // The accounting means something DIFFERENT per policy, so the sentence says what this net's
-        // own label makes of it: 100% is a partition, >100% is sharing, <100% is dropped features —
         let accounting = match graph.options.feature_split {
             Some(FeatureSplitPolicy::Exclusive) => {
                 if shared.is_empty() && unowned.is_empty() {
-                    "`exclusive` is a partition, so this must account for exactly **100%** — it does: every feature is owned by exactly one port.".to_string()
+                    "`exclusive` is a partition: every feature is owned by exactly one port."
+                        .to_string()
                 } else {
                     let shared_note = if shared.is_empty() {
                         String::new()
@@ -227,7 +228,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
                         format!(" (first {})", name_features(&unowned))
                     };
                     format!(
-                        "`exclusive` is a partition, so this must account for exactly **100%** — it does not: {} feature(s) are shared by two or more ports{} and {} feature(s) reach no port{}. A shared feature and an unowned one can cancel out in the total, so a 100% sum cannot prove a partition on its own.",
+                        "`exclusive` is a partition, but {} feature(s) are shared by two or more ports{} and {} feature(s) reach no port{}.",
                         shared.len(),
                         shared_note,
                         unowned.len(),
@@ -236,16 +237,15 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
                 }
             }
             Some(FeatureSplitPolicy::Random) => format!(
-                "`random` flips one coin per (port, feature), so **above 100% is normal** (ports share features) and features can be missed entirely — {seen} of {input_dim} are seen by some port here."
+                "`random` flips a coin per (port, feature), so sharing is normal — {seen} of {input_dim} features are seen by some port."
             ),
-            // The label names PROVENANCE, and the sentence has to say so: a run whose pool is `exclusive` produces these children too, and calling one `exclusive` would claim a…
-            Some(FeatureSplitPolicy::Inherited) => "`inherited` rows are a per-port **crossover blend** of two parents' masks, so this net does NOT carry the policy the run configured — a run drawing only `exclusive` still produces children like this. A blend of two partitions is not itself a partition (a feature can reach two ports, which is why the total may pass 100%), and which policy the blend came from is not recoverable, so claiming one would be a lie: the label states provenance, not a draw rule."
+            Some(FeatureSplitPolicy::Inherited) => "`inherited` rows are a per-port crossover blend, not the run's draw policy: a blend of partitions need not be one."
                 .to_string(),
-            None => "No policy recorded, so read the rows themselves.".to_string(),
+            None => "No policy recorded — read the rows.".to_string(),
         };
         out.push_str("## Feature split\n\n");
         out.push_str(&format!(
-            "`{}` over **{}** Input port(s): **{seen} of {input_dim}** features reach at least one port, **{total} keeps = {pct:.0}%** of the vector, mean **{mean:.1}** per port. {accounting} Rows are genome — a port keeps a feature where its row reads `1` and hides it where it reads `0`, and the rows cross over with the ports that carry them. The `features` column is that row written out: a bit string while the vector is at most {MASK_BIT_MAX_DIM} wide (bit `f` is feature `f`), and the kept INDICES above it — capped at {MASK_INDEX_CAP} with `… +n` on a wide net, where `keeps` is still the exact count.\n\n",
+            "`{}` over **{}** Input port(s): **{seen} of {input_dim}** features reach a port, **{total} keeps = {pct:.0}%** of the vector, mean **{mean:.1}** per port. {accounting} Rows are genome (`1` keeps a feature, `0` hides it); `features` writes the row out — a bit string at ≤{MASK_BIT_MAX_DIM} wide, else the kept indices (capped at {MASK_INDEX_CAP}).\n\n",
             split_policy_name(graph.options.feature_split),
             masks.len()
         ));
@@ -312,7 +312,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             .unwrap_or(1);
         out.push_str("## Feature split\n\n");
         out.push_str(&format!(
-            "`{}` over **{ports}** Input port(s) — no mask rows are recorded, so every port projects the FULL **{input_dim}**-feature vector and this net carries no split genome (`keeps` = {input_dim} on every port, 100% each). That is the ABSENCE of the gene, not a partition of it: an `exclusive` or `random` split writes one row per port, and those rows cross over with the ports that carry them.\n\n",
+            "`{}` over **{ports}** Input port(s) — no mask rows are recorded: every port projects the FULL **{input_dim}**-feature vector (`keeps` = {input_dim}, 100% each). This is the ABSENCE of the split gene, not a partition of it.\n\n",
             split_policy_name(graph.options.feature_split)
         ));
     }

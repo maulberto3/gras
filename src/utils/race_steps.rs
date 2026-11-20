@@ -1,7 +1,7 @@
 //! Per-step training/eval primitives for the step-race engine.
 
-use flodl::nn::Module;
 use flodl::nn::optim::Optimizer;
+use flodl::nn::Module;
 use flodl::tensor::Result;
 use flodl::{Tensor, Variable};
 
@@ -147,6 +147,35 @@ pub fn train_one_step_pred_only(
     }
     optimizer.step()?;
     Ok(loss_val)
+}
+
+/// Mean wall-clock seconds of ONE eval-mode forward pass over `input`.
+///
+/// Measured ONCE at the run's terminal stop, never per step: the primitive exists so the
+/// engine can price a blueprint WITHOUT wrapping every forward in timers. `warmup` passes run
+/// untimed (allocator and kernel selection settle on the first), then `reps` are timed and
+/// averaged. The net's mode is restored to `train` before returning, so a live path is
+/// unaffected; values do not change cost, so the reading is a property of the shape, not the
+/// weights.
+pub fn bench_eval_forward(
+    net: &mut Network,
+    input: &Tensor,
+    warmup: usize,
+    reps: usize,
+) -> Result<f64> {
+    let reps = reps.max(1);
+    net.eval();
+    let x = Variable::new(input.clone(), false);
+    for _ in 0..warmup {
+        std::hint::black_box(net.forward(&x)?);
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..reps {
+        std::hint::black_box(net.forward(&x)?);
+    }
+    let secs = start.elapsed().as_secs_f64() / reps as f64;
+    net.train();
+    Ok(secs)
 }
 
 /// What one eval step reports: loss, ranking fitness, and the informative
