@@ -242,6 +242,10 @@ pub const DEFAULT_WORST_SAVE_TOPOLOGY: bool = false;
 /// key off.
 pub const DEFAULT_CHECKPOINT_EVERY: usize = 25;
 
+/// Default for [`RaceConfig::save_weights_at_stop`]: OFF. The stop snapshot is a RECORD of the
+/// race; the checkpoint is the resume artifact that actually needs weights.
+pub const DEFAULT_SAVE_WEIGHTS_AT_STOP: bool = false;
+
 /// Default population size: `10`, deliberately conservative.
 pub const DEFAULT_POP_SIZE: usize = 10;
 
@@ -526,6 +530,12 @@ pub struct RaceConfig {
     /// Steps between population checkpoints (the stream's era rotation and the CSV flush cadence
     /// key off
     pub checkpoint_every: usize,
+    /// Write every live net's WEIGHTS at the terminal stop (`nets/<hash>.safetensors`).
+    /// **Off by default**: the stop is a READING of the race — what a run exists to produce is
+    /// the winning BLUEPRINT for a separate full training, not a whole population's
+    /// coefficients — while a checkpoint's weights are what a resume loads. `true` restores
+    /// the old whole-field dump.
+    pub save_weights_at_stop: bool,
     /// CROSSOVER turnover — the channel's ONE knob — as a share of the live population per clock: `0.1` = 10%, dealt as `round(share · pop)` rolls EVERY clock (at least one…
     pub crossover_share: f32,
     /// MUTATION turnover — the mutation channel's own knob — as a share of the live population per
@@ -726,6 +736,7 @@ impl RaceConfig {
         RaceConfig {
             pop_size: DEFAULT_POP_SIZE,
             checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
+            save_weights_at_stop: DEFAULT_SAVE_WEIGHTS_AT_STOP,
             crossover_share: DEFAULT_CROSSOVER_SHARE,
             mutation_share: DEFAULT_MUTATION_SHARE,
             crossover_cull_policy: CrossCullPolicy::default(),
@@ -815,6 +826,7 @@ impl RaceConfig {
         let mut cfg = RaceConfig::defaults();
         cfg.pop_size = snap.pop_size;
         cfg.checkpoint_every = snap.checkpoint_every;
+        cfg.save_weights_at_stop = snap.save_weights_at_stop;
         cfg.crossover_share = snap.crossover_share;
         cfg.mutation_share = snap.mutation_share;
         // A header written before the gate recorded no floor: `0.0` replays it unchanged.
@@ -989,6 +1001,12 @@ impl RaceConfigBuilder {
     /// weights + `ckpt.json` + CSV flush) and the stream's eval-permutation era.
     pub fn set_run_checkpoint_every(mut self, n: usize) -> Self {
         self.cfg.checkpoint_every = n;
+        self
+    }
+    /// Set whether the TERMINAL stop writes every live net's weights. Default false: the stop
+    /// is a reading of the race, the checkpoint is the artifact a resume loads.
+    pub fn set_run_save_weights_at_stop(mut self, enabled: bool) -> Self {
+        self.cfg.save_weights_at_stop = enabled;
         self
     }
     /// Set whether each live net's optimizer state rides its checkpoint (`nets/<hash>.optim`), so a
