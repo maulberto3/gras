@@ -136,6 +136,7 @@ impl Display for SelectionMethod {
                 write!(f, "tournament(size={tournament_size})")
             }
             SelectionMethod::Roulette => write!(f, "roulette"),
+            SelectionMethod::Elite => write!(f, "elite"),
         }
     }
 }

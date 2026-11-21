@@ -373,7 +373,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("\n| **Box border thickness (Graph)** | node width (`hidden_dim`, scaled min→max within this net). |");
     out.push_str("\n| **Wire thickness (Graph)** | hop distance — thick = long-range skip, thin = neighbor. |");
     out.push_str("\n| **Box height (Wiring diagram)** | the node's port count (`max(i, o)`, scaled min→max within this net) — a tall box is a wide fan-in/fan-out node. Wire thickness is a Graph-only channel by design; in the text diagram, hop distance is the `N hops <<<<` marker in the edge list. |");
-    out.push_str("\n| **Box label (Graph)** | `H<id> <combine>·<std> <dim>` — the node's internal processing. Activation is NOT here: it lives on each outgoing arrow. |");
+    out.push_str("\n| **Box label (Graph)** | `H<id> <combine>→lin→<std> <dim>` — the node's internal ops in EXECUTION order: gather (a port whose source width differs is bridged) → `combine` → `lin` → `std` → dropout → per-port activation. Activation is NOT here: it lives on each outgoing arrow. |");
     out.push_str("\n| **Arrow label (Graph)** | the wire's own activation — per-port, so one node can emit `mish` to one neighbor and `tanh` to another. Equal labels from the same node = same signal; duplicates are impossible (dedup collapses them). |");
     out.push_str("\n| **Dashed stub `selu (input)` / `mish (orphan)`** | orphaned port — an input nothing feeds / an output nothing reads (mermaid's counterpart of the ASCII `*`). |");
     out.push_str("\n| **`in <n>` / `out <n>`** | dataset shape (fixed by the problem). |");

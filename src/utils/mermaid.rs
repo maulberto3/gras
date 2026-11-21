@@ -72,21 +72,8 @@ pub fn topology_mermaid(graph: &Topology) -> String {
             }
             NodeKind::Hidden => {
                 let dim = node.hidden_dim.unwrap_or(8);
-                // Activation moves OFF the label (per-port ops belong
-                // wire); label = combine + std + dim, kept one line.
-                let combine = node
-                    .combine_op
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "add".into());
-                let std = node
-                    .standardize
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "identity".into());
-                format!("n{}[\"H{} {}·{} {}\"]", node.id, node.id, combine, std, dim)
-            }
-            NodeKind::Output => {
-                // Same combine·std·dim shape, prefixed `out`; activation omitted
-                // (fixed identity readout).
+                // Activation moves OFF the label (per-port ops belong on the wire); the label
+                // keeps the INTERNAL ops in execution order — combine → Linear → std — then width.
                 let combine = node
                     .combine_op
                     .map(|c| c.to_string())
@@ -96,7 +83,23 @@ pub fn topology_mermaid(graph: &Topology) -> String {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "identity".into());
                 format!(
-                    "n{}[\"out {}·{} {}\"]",
+                    "n{}[\"H{} {}→lin→{} {}\"]",
+                    node.id, node.id, combine, std, dim
+                )
+            }
+            NodeKind::Output => {
+                // Same ordered shape, prefixed `out`; the readout's activation is
+                // the port-0 allele, so it belongs on the wire like every other port.
+                let combine = node
+                    .combine_op
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "add".into());
+                let std = node
+                    .standardize
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "identity".into());
+                format!(
+                    "n{}[\"out {}→lin→{} {}\"]",
                     node.id,
                     combine,
                     std,
