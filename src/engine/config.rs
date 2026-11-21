@@ -68,8 +68,8 @@ pub const DEFAULT_RECOVERY_TOLERANCE: f32 = 0.0;
 /// Default INIT PROBATION (`set_pop_init_probation_steps`): `0` = nothing is withheld beyond the born shields, which is exactly what every run before the knob did.
 pub const DEFAULT_INIT_PROBATION_STEPS: usize = 0;
 
-/// Default width for a `SelectionMethod::Tournament` parent draw — the examples'.
-/// `--tournament-size`. NOT the engine default draw: that is `SelectionMethod::Roulette`.
+/// Default width when a `SelectionMethod::Tournament` is chosen — the examples'
+/// `--tournament-size`. The engine's default parent draw is `SelectionMethod::Roulette`, not a tournament.
 pub const DEFAULT_TOURNAMENT_SIZE: usize = 2;
 
 /// Default: the fitter parent is the crossover base.
@@ -94,7 +94,7 @@ pub const DEFAULT_CHAMPION_PREVIOUS_LOAD: bool = true;
 pub const DEFAULT_RUN_MODE: RunMode = RunMode::Tabular;
 
 /// Default share of the dataset held out for EVAL (`eval_share`): how much of the rows the race
-/// RANKS on and never trains
+/// RANKS on and never trains.
 pub const DEFAULT_EVAL_SHARE: f32 = 0.2;
 
 /// The narrowest and widest `eval_share` a run accepts.
