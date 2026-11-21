@@ -500,7 +500,7 @@ impl Network {
     }
 }
 
-// Forward pass — gather → combine → standardize (LayerNorm) → activate → dropout ───────────────────────
+// Forward pass — gather (bridge differing widths) → combine → Linear → standardize → dropout → activate ───
 
 impl Network {
     /// Step 1: Gather -- one tensor per wired input port, looked up by the exact
@@ -915,6 +915,9 @@ impl Module for Network {
                         }
                         None => base.clone(),
                     };
+                    // The port's activation is genome on the Input node too: a branch may
+                    // emit `sin`/`relu` of its (possibly masked) projection, not just the affine.
+                    let out = self.nodes[node_id].port_activation(o).apply(&out)?;
                     port_outputs.insert((node_id, o), out);
                 }
             } else {
@@ -1373,6 +1376,55 @@ mod tests {
         let out_a = a.forward(&input).unwrap().data().to_f32_vec().unwrap();
         let out_b = b.forward(&input).unwrap().data().to_f32_vec().unwrap();
         assert_eq!(out_a, out_b);
+    }
+
+    #[test]
+    fn input_port_activation_changes_the_raw_wire() {
+        // Same blueprint seed, one build with the Input ports activated: the wire must carry
+        // `act(W x + b)`, so the two networks cannot agree on a negative sample.
+        let build = |act: Option<Activation>| {
+            let opts = crate::graph::topology::TopologyOptions {
+                input_dim: Some(1),
+                output_dim: Some(1),
+                ..Default::default()
+            };
+            let mut g = Topology::new(11, Some(opts));
+            g.create_random_hidden_nodes(2);
+            g.finalize();
+            if let Some(act) = act {
+                let input = g
+                    .nodes
+                    .iter()
+                    .position(|n| n.kind == crate::graph::node::NodeKind::Input)
+                    .unwrap();
+                let n = g.nodes[input].num_outputs;
+                g.nodes[input].port_activations = Some(vec![act; n]);
+                g.validate().unwrap();
+            }
+            Network::build(&g, Device::CPU).unwrap()
+        };
+        let plain = build(None);
+        let curved = build(Some(Activation::Sin));
+        let x = Variable::new(
+            Tensor::from_f32(&[-2.0], &[1, 1], Device::CPU).unwrap(),
+            false,
+        );
+        let d = plain
+            .forward(&x)
+            .unwrap()
+            .data()
+            .sub(&curved.forward(&x).unwrap().data())
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum()
+            .unwrap()
+            .item()
+            .unwrap();
+        assert!(
+            d > 1e-6,
+            "an Input port's activation must reach the wire (Δ={d})"
+        );
     }
 
     #[test]

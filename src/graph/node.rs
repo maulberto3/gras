@@ -394,7 +394,8 @@ impl Node {
     }
 
     /// The activation carried by output port `i`: its override when set, else
-    /// node-level one. Input-node ports are Identity (raw data fan-out).
+    /// node-level one. Input-node ports default to Identity (raw data fan-out) but are
+    /// evolvable genome, so a multi-port Input may emit `identity` on one wire and `sin` on another.
     pub fn port_activation(&self, i: usize) -> Activation {
         self.port_activations
             .as_ref()

@@ -336,14 +336,18 @@ impl Topology {
         }
     }
 
-    /// Assign per-output-port activations to every hidden node from `pool`: port 0
+    /// Assign per-output-port activations to every fan-out node from `pool`: port 0
     /// mirrors the node-level activation, ports 1..n draw from the seeded RNG.
+    ///
+    /// The Input node is INCLUDED: its ports carry the raw-data projection, and which
+    /// non-linearity each branch sees is as evolvable as a hidden node's. Port 0 stays the
+    /// node gene (`Identity`), so a multi-port Input reads e.g. `[identity, sin, relu]`.
     pub fn assign_port_activations(&mut self, pool: &[Activation]) {
         if pool.is_empty() {
             return;
         }
         for node in &mut self.nodes {
-            if node.kind == NodeKind::Input || node.num_outputs <= 1 {
+            if node.num_outputs <= 1 {
                 continue;
             }
             // FILL-ONLY: a port's activation is genome, and `finalize` carries it through the port
@@ -632,6 +636,57 @@ impl Topology {
         input_node.num_outputs = input_node.num_outputs.max(wanted).max(1);
     }
 
+    /// Re-derive the Input fanout from the CURRENT `input_reach` gene — the mutation-drift hook for
+    /// the wiring gene. A crossover child inherits its blueprint's wires, so a re-drawn reach must
+    /// move real wires or it is a number nothing reads: the raw-input edges are dropped, the Input
+    /// node is resized to the new budget, and every consumer is re-de-orphaned by the SAME rule
+    /// `finalize` uses (spare Input port first, then an EARLIER hidden node's output). Hidden↔hidden
+    /// wires are untouched. Returns `true` when the port count actually changed.
+    pub fn redrift_input_reach(&mut self) -> bool {
+        let Some(input_id) = self
+            .nodes
+            .iter()
+            .find(|n| n.kind == NodeKind::Input)
+            .map(|n| n.id)
+        else {
+            return false;
+        };
+        let n_hidden = self
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Hidden)
+            .count();
+        let reach = self.options.input_reach.clamp(0.0, 1.0);
+        // At least one port: the first hidden node has no upstream node to read from.
+        let wanted = ((n_hidden as f32 * reach).round() as usize).max(1);
+        if wanted == self.nodes[input_id].num_outputs {
+            return false;
+        }
+        // The wiring gene OWNS the raw-input edges: drop them, resize, and let the de-orphan rule
+        // rebuild them inside the new budget (it may spend a hidden source when the budget is
+        // short, and leaves an unfeedable socket for `trim_orphaned_ports` to delete).
+        self.connections.retain(|c| c.from.node != input_id);
+        self.nodes[input_id].num_outputs = wanted;
+        self.rewire_orphaned_inputs();
+        self.dedup_input_connections();
+        self.trim_orphaned_ports();
+        // Port activations are genome and one-per-port: a fan-out that GREW gains the node's
+        // own activation on its new sockets (`trim_orphaned_ports` compacts the ones it drops).
+        for node in &mut self.nodes {
+            let n = node.num_outputs;
+            let act = node.activation;
+            if let Some(slots) = node.port_activations.as_mut() {
+                slots.truncate(n);
+                slots.resize(n, act);
+            }
+        }
+        self.refresh_labels();
+        if let Err(e) = self.validate() {
+            panic!("drift validation failed: {e}\n{self:?}");
+        }
+        true
+    }
+
     /// Step 6: wire every orphaned input port to a NEW Input output port — ONE SOCKET PER WIRE.
     ///
     /// This used to cycle `output_idx % n_ports`, so one Input port carried several wires. That
@@ -873,20 +928,15 @@ impl Topology {
                     "node n{i} has hidden_dim 0"
                 )));
             }
-            // Per-port activations: length must match the port count, and Input nodes
-            // keep their ports raw (Identity) — activating raw data is a bug.
+            // Per-port activations: length must match the port count. Input ports may be
+            // non-Identity too — an Input port is `Linear(masked x)` followed by its own
+            // activation, exactly like a hidden port, and that allele is genome.
             if let Some(ports) = &node.port_activations {
                 if ports.len() != node.num_outputs {
                     return Err(TopologyError::InvalidOptions(format!(
                         "node n{i} has {} port activations but {} output ports",
                         ports.len(),
                         node.num_outputs
-                    )));
-                }
-                if node.kind == NodeKind::Input && ports.iter().any(|a| *a != Activation::Identity)
-                {
-                    return Err(TopologyError::InvalidOptions(format!(
-                        "node n{i} is an Input node — its ports must stay Identity"
                     )));
                 }
             }
@@ -1373,7 +1423,7 @@ impl Topology {
                     .count()
                     .max(1);
                 // Compact port_activations alongside the port remap — the vec must always
-                // match num_outputs (`validate()` enforces it). Input ports stay Identity.
+                // match num_outputs (`validate()` enforces it).
                 if let Some(ports) = &mut node.port_activations {
                     let mut compacted: Vec<crate::graph::node::Activation> = out_remap[i]
                         .iter()
@@ -1821,13 +1871,50 @@ mod tests {
         g.nodes.push(n1);
         g.nodes.push(Node::new_output(2, 1, 1));
         assert!(g.validate().is_err());
-        // Input node with a non-Identity port is also rejected.
+        // An Input node's non-Identity port is genome, not an error: it must validate.
         let mut g2 = Topology::new(0, Some(TopologyOptions::default()));
-        let mut input = Node::new_input(0, 1);
-        input.port_activations = Some(vec![Activation::ReLU]);
-        g2.nodes.push(input);
-        g2.nodes.push(Node::new_output(1, 1, 1));
-        assert!(g2.validate().is_err());
+        g2.create_random_hidden_nodes(2);
+        g2.finalize();
+        let input = g2
+            .nodes
+            .iter()
+            .position(|n| n.kind == NodeKind::Input)
+            .unwrap();
+        let n = g2.nodes[input].num_outputs;
+        g2.nodes[input].port_activations = Some(vec![Activation::ReLU; n]);
+        assert!(
+            g2.validate().is_ok(),
+            "Input ports may evolve past Identity"
+        );
+    }
+
+    #[test]
+    fn test_input_port_activations_are_genome() {
+        let mut g = Topology::new(
+            0,
+            Some(TopologyOptions {
+                input_reach: 1.0,
+                min_input_reach: 1.0,
+                max_input_reach: 1.0,
+                ..Default::default()
+            }),
+        );
+        g.create_random_hidden_nodes(4);
+        g.finalize();
+        let i = g
+            .nodes
+            .iter()
+            .position(|n| n.kind == NodeKind::Input)
+            .unwrap();
+        assert!(g.nodes[i].num_outputs > 1, "fixture needs an Input fan-out");
+        g.assign_port_activations(&[Activation::Sin]);
+        let ports = g.nodes[i].port_activations.as_ref().unwrap();
+        assert_eq!(ports[0], Activation::Identity, "port 0 is the node gene");
+        assert!(
+            ports[1..].iter().all(|a| *a == Activation::Sin),
+            "later Input ports draw from the pool: {ports:?}"
+        );
+        g.validate().unwrap();
     }
 
     #[test]
