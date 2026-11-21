@@ -16,7 +16,6 @@ macro_rules! variant_names {
     };
 }
 
-use crate::evolution::crossover::CrossoverMethod;
 use crate::evolution::mutation::MutationMethod;
 use crate::evolution::selection::SelectionMethod;
 use crate::graph::network::NetworkOptions;
@@ -137,27 +136,6 @@ impl Display for SelectionMethod {
             }
             SelectionMethod::Roulette => write!(f, "roulette"),
             SelectionMethod::Elite => write!(f, "elite"),
-        }
-    }
-}
-
-impl Display for CrossoverMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CrossoverMethod::OnePoint { action_prob } => {
-                write!(f, "one_point(p={}%))", (action_prob * 100.0).round())
-            }
-            CrossoverMethod::Uniform {
-                action_prob,
-                swap_prob,
-            } => {
-                write!(
-                    f,
-                    "uniform(p={}%,swap={}%)",
-                    (action_prob * 100.0).round(),
-                    (swap_prob * 100.0).round()
-                )
-            }
         }
     }
 }
