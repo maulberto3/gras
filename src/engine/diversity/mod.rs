@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn a_missing_standardize_op_is_the_identity_gene() {
         let cfg = crate::engine::config::RaceConfig::defaults();
-        let mut spelled_none = crate::engine::population::initial_population(&cfg, 42)
+        let mut spelled_none = crate::engine::founding::population::initial_population(&cfg, 42)
             .into_iter()
             .next()
             .expect("the founders are never empty");
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn shape_of_reads_the_same_blueprint_the_pair_metric_does() {
         let cfg = crate::engine::config::RaceConfig::defaults();
-        let topos = crate::engine::population::initial_population(&cfg, 42);
+        let topos = crate::engine::founding::population::initial_population(&cfg, 42);
         let topo = &topos[0];
         let shape = shape_of(topo);
         assert_eq!(shape.nodes, topo.nodes.len());

@@ -111,7 +111,7 @@ impl Novelty {
 mod tests {
     use super::*;
     use crate::engine::config::RaceConfig;
-    use crate::engine::population::initial_population;
+    use crate::engine::founding::population::initial_population;
 
     fn topos(seed: u64) -> Vec<Topology> {
         let mut cfg = RaceConfig::defaults();
