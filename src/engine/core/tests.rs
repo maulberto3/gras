@@ -1985,7 +1985,7 @@ fn reseed_gate(eng: &mut CoreEngine, d_min: f32) {
         .iter()
         .filter_map(|h| eng.state.net(h).and_then(|s| s.topology().ok()))
         .collect();
-    let mut gate = crate::engine::novelty::Novelty::new(eng.state.live_count(), d_min, 5);
+    let mut gate = crate::engine::diversity::novelty::Novelty::new(eng.state.live_count(), d_min, 5);
     for topo in &topos {
         gate.push(topo);
     }

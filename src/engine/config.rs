@@ -12,7 +12,7 @@ pub use super::clock::lottery::{
     DEFAULT_TRAIN_MERIT_LEARN_ONLY, DEFAULT_TRAIN_MERIT_P_MAX, DEFAULT_TRAIN_MERIT_P_MIN,
     DEFAULT_TRAIN_TICKET, TrainTicket,
 };
-pub use super::novelty::{DEFAULT_MUTATION_NOVELTY_DRAWS, DEFAULT_MUTATION_NOVELTY_MIN};
+pub use super::diversity::novelty::{DEFAULT_MUTATION_NOVELTY_DRAWS, DEFAULT_MUTATION_NOVELTY_MIN};
 pub use super::run_spec::{ModeConfig, RunMode};
 pub use super::clock::smoothing::{DEFAULT_MEAN_TYPE, MeanType, SMOOTHING_WINDOW};
 pub use super::clock::stop::{DEFAULT_MAX_STEPS, RaceSnapshot, StopFn, StopReason};

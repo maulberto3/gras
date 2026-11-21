@@ -131,7 +131,7 @@ pub struct CoreEngine {
     /// the two row kinds share no columns, and padding shifted every later column.
     pub(crate) attempts_csv_buffer: String,
     /// Append-only novelty archive: every blueprint this run made, judged by mutation draws.
-    pub(crate) novelty: crate::engine::novelty::Novelty,
+    pub(crate) novelty: crate::engine::diversity::novelty::Novelty,
     /// What that gate bought at each birth — Δ to the nearest archive, candidates spent
     /// (see [`BirthLedger`]). In memory; the stop card renders it, `attempts.csv` keeps rows.
     pub(crate) births: BirthLedger,
@@ -158,7 +158,7 @@ impl CoreEngine {
     /// Assemble the engine from the chosen parts; every scratch field is initialised HERE, so a new
     /// field cannot be added to one engine and forgotten in the other.
     pub(crate) fn assemble(p: CoreEngineParts) -> Self {
-        let novelty = crate::engine::novelty::Novelty::new(
+        let novelty = crate::engine::diversity::novelty::Novelty::new(
             p.config.population.pop_size,
             p.config.evolution.mutation_novelty_min,
             p.config.evolution.mutation_novelty_draws,
@@ -579,7 +579,7 @@ impl CoreEngine {
             run_seed,
         };
 
-        let novelty = crate::engine::novelty::Novelty::new(
+        let novelty = crate::engine::diversity::novelty::Novelty::new(
             config.population.pop_size,
             config.evolution.mutation_novelty_min,
             config.evolution.mutation_novelty_draws,

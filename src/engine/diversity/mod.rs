@@ -36,6 +36,8 @@
 //! it), so a behavioural number — action agreement on a probe set, say — belongs
 //! beside the trainer's own eval games, not here.
 
+pub mod novelty;
+
 use crate::graph::node::{CombineOp, NodeKind, StandardizeOp};
 use crate::graph::topology::Topology;
 use crate::state::RaceState;
