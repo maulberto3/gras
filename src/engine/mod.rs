@@ -1,6 +1,7 @@
 //! The engine — the step-race NAS loop.
 
 pub mod child;
+pub mod clock;
 pub mod config;
 pub mod core;
 pub mod cull;
@@ -9,7 +10,6 @@ pub mod evolve;
 pub mod exam;
 pub mod format;
 pub mod logging;
-pub mod lottery;
 pub mod novelty;
 pub mod pool;
 pub mod population;
@@ -18,9 +18,6 @@ pub mod reports;
 pub mod rl_engine;
 pub mod run_spec;
 pub mod seed;
-pub mod smoothing;
-pub mod step;
-pub mod stop;
 pub mod tabular_engine;
 
 pub use config::{

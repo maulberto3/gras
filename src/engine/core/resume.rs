@@ -385,7 +385,7 @@ impl CoreEngine {
     pub(crate) fn replay_manifest_frontier(
         &mut self,
         manifest: &crate::state::FrontierManifest,
-        history: &HashMap<String, crate::engine::smoothing::HistoryReplay>,
+        history: &HashMap<String, crate::engine::clock::smoothing::HistoryReplay>,
         replayed: &mut Vec<Vec<String>>,
     ) -> Result<usize> {
         if manifest.run_seed != self.header.run_seed {
@@ -522,7 +522,7 @@ impl CoreEngine {
     pub(crate) fn insert_replayed(
         &mut self,
         child: crate::engine::child::RaceChild,
-        history: &HashMap<String, crate::engine::smoothing::HistoryReplay>,
+        history: &HashMap<String, crate::engine::clock::smoothing::HistoryReplay>,
     ) -> (String, usize) {
         let hash = child.state.hash.clone();
         let step = child
@@ -540,7 +540,7 @@ impl CoreEngine {
         let mut eval_buf = RollingBuffer::new(self.config.ranking.smoothing_window);
         // The whole-run trend: replayed from EVERY row, so a resumed twin's slope is the live
         // run's, not a line over the tail the window keeps.
-        let mut trend = crate::engine::smoothing::ReadingTrend::default();
+        let mut trend = crate::engine::clock::smoothing::ReadingTrend::default();
         let mut metric_bufs = self.metric_buffers();
         match history.get(&hash) {
             // The recorded runway, oldest → newest: the same window the live run held.
@@ -621,7 +621,7 @@ impl CoreEngine {
     pub(crate) fn load_history_windows(
         run_dir: &std::path::Path,
         window: usize,
-    ) -> HashMap<String, crate::engine::smoothing::HistoryReplay> {
+    ) -> HashMap<String, crate::engine::clock::smoothing::HistoryReplay> {
         let Ok(raw) = std::fs::read_to_string(run_dir.join("history.csv")) else {
             return HashMap::new();
         };
@@ -657,7 +657,7 @@ impl CoreEngine {
             .filter(|(_, c)| !FIXED.iter().any(|f| **c == *f))
             .map(|(i, c)| (i, c.trim_start_matches("m:").to_string()))
             .collect();
-        let mut out: HashMap<String, crate::engine::smoothing::HistoryReplay> = HashMap::new();
+        let mut out: HashMap<String, crate::engine::clock::smoothing::HistoryReplay> = HashMap::new();
         for line in lines {
             let fields = crate::engine::format::csv_split_line(line);
             let needed = hash_i.max(train_i).max(eval_i).max(fit_i);

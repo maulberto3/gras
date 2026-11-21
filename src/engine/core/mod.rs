@@ -16,7 +16,7 @@ pub(crate) use crate::utils::fitness::{Fitness, FitnessLabel, Metric};
 
 pub(crate) use super::config::{RaceConfig, StopReason};
 pub(crate) use super::format::{build_stamp, csv_field, fmt_cfg, fmt_line};
-pub(crate) use super::smoothing::{rolling_stats_tail, RollingBuffer, WindowStats};
+pub(crate) use crate::engine::clock::smoothing::{rolling_stats_tail, RollingBuffer, WindowStats};
 
 // ── CoreEngine ───────────────────────────────────────────────────────────────
 
@@ -96,7 +96,7 @@ pub struct CoreEngine {
     pub(crate) selection_terms: Vec<(usize, f32)>,
     /// Per-net WHOLE-RUN fitness trend — the least-squares line over every reading the net took
     /// (`smoothing::ReadingTrend`). Report-only: nothing ranks, draws a ticket or culls on it.
-    pub(crate) rolling_trend: HashMap<String, crate::engine::smoothing::ReadingTrend>,
+    pub(crate) rolling_trend: HashMap<String, crate::engine::clock::smoothing::ReadingTrend>,
     /// Readings pushed since the net's last REAL weight update — the epoch a policy-scoped fitness window averages over.
     pub(crate) rolling_epoch: HashMap<String, usize>,
     /// The ticket probability the coin last COMPARED for each net, captured AT THE DRAW

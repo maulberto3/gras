@@ -8,14 +8,14 @@ use crate::utils::fitness::Metric;
 
 pub use super::cull::{CrossCullPolicy, MutationCullPolicy};
 pub use super::logging::LogLevel;
-pub use super::lottery::{
+pub use super::clock::lottery::{
     DEFAULT_TRAIN_MERIT_LEARN_ONLY, DEFAULT_TRAIN_MERIT_P_MAX, DEFAULT_TRAIN_MERIT_P_MIN,
     DEFAULT_TRAIN_TICKET, TrainTicket,
 };
 pub use super::novelty::{DEFAULT_MUTATION_NOVELTY_DRAWS, DEFAULT_MUTATION_NOVELTY_MIN};
 pub use super::run_spec::{ModeConfig, RunMode};
-pub use super::smoothing::{DEFAULT_MEAN_TYPE, MeanType, SMOOTHING_WINDOW};
-pub use super::stop::{DEFAULT_MAX_STEPS, RaceSnapshot, StopFn, StopReason};
+pub use super::clock::smoothing::{DEFAULT_MEAN_TYPE, MeanType, SMOOTHING_WINDOW};
+pub use super::clock::stop::{DEFAULT_MAX_STEPS, RaceSnapshot, StopFn, StopReason};
 pub use crate::evolution::crossover::CrossoverOp;
 pub use crate::graph::topology::{
     DEFAULT_HIDDEN_DIM_STRIDE, DEFAULT_HIDDEN_POOL, DEFAULT_TOPOLOGY_DRIFT,
@@ -701,16 +701,16 @@ mod tests {
     #[test]
     fn the_ranking_score_is_the_centre_with_no_spread_charge() {
         let cfg = RaceConfig::defaults();
-        let ran = crate::engine::smoothing::rolling_stats_with(
-            &crate::engine::smoothing::RollingBuffer::from_values(
+        let ran = crate::engine::clock::smoothing::rolling_stats_with(
+            &crate::engine::clock::smoothing::RollingBuffer::from_values(
                 5,
                 &[40.0, 500.0, 40.0, 40.0, 40.0],
             ),
             cfg.ranking.mean_type,
         )
         .unwrap();
-        let steady = crate::engine::smoothing::rolling_stats_with(
-            &crate::engine::smoothing::RollingBuffer::from_values(
+        let steady = crate::engine::clock::smoothing::rolling_stats_with(
+            &crate::engine::clock::smoothing::RollingBuffer::from_values(
                 5,
                 &[40.0, 40.0, 40.0, 40.0, 40.0],
             ),

@@ -4,11 +4,12 @@
 use tracing::info;
 
 use super::core::CoreEngine;
+use crate::engine::clock::step::LotteryFrame;
 use crate::engine::diversity::{mean_delta_to, shape_of, NetShape};
 use crate::engine::format::{
     fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_micros, fmt_units, ReadingStyle,
 };
-use crate::engine::smoothing::rolling_mean;
+use crate::engine::clock::smoothing::rolling_mean;
 
 mod lineage;
 
@@ -669,7 +670,7 @@ impl CoreEngine {
         plan: &StopPlan,
         marks: &std::collections::HashMap<String, &'static str>,
         exam: &std::collections::HashMap<String, Option<f32>>,
-        lottery: Option<super::step::LotteryFrame>,
+        lottery: Option<LotteryFrame>,
     ) -> (comfy_table::Table, CardStats, Vec<Vec<String>>) {
         let mut table = comfy_table::Table::new();
         table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
@@ -913,7 +914,7 @@ impl CoreEngine {
     fn stop_ticket_p(
         &self,
         hash: &str,
-        lottery: Option<super::step::LotteryFrame>,
+        lottery: Option<LotteryFrame>,
         score: Option<f32>,
     ) -> String {
         let Some(frame) = lottery else {
@@ -950,7 +951,7 @@ impl CoreEngine {
 
     /// The training lottery's per-net card for ONE clock — the DEBUG view (the caller gates
     /// the debug filter), printed at the START of the clock's step, not once at stop,
-    pub(crate) fn log_lottery_card(&self, clock: usize, frame: super::step::LotteryFrame) {
+    pub(crate) fn log_lottery_card(&self, clock: usize, frame: LotteryFrame) {
         // (exempt?, p, row): the nets the lottery actually grades come first, so the exempt rows
         // (which all grade 1.00 by construction) cannot bury the graded field at the top
         let mut rows: Vec<(bool, f32, Vec<String>)> = self
@@ -1146,7 +1147,7 @@ impl CoreEngine {
     pub(crate) fn log_lottery_summary(
         &self,
         clock: usize,
-        frame: super::step::LotteryFrame,
+        frame: LotteryFrame,
         ticketed: usize,
         idled: usize,
     ) {
@@ -1441,7 +1442,7 @@ struct LegendCtx<'a> {
     p_max: f32,
     tilt: &'a str,
     direction: crate::utils::fitness::Direction,
-    lottery: Option<super::step::LotteryFrame>,
+    lottery: Option<LotteryFrame>,
     k: usize,
     crossover_probation: usize,
     mutation_probation: usize,
@@ -1702,7 +1703,7 @@ mod stop_legend_tests {
     #[test]
     fn the_card_prints_no_window_leg_beside_the_score() {
         use crate::engine::config::MeanType;
-        use crate::engine::smoothing::{rolling_stats_with, RollingBuffer};
+        use crate::engine::clock::smoothing::{rolling_stats_with, RollingBuffer};
         // The window that started it: two good readings and one low one.
         let buf = RollingBuffer::from_values(10, &[0.828125, 0.859375, 0.859375]);
         let stats = rolling_stats_with(&buf, MeanType::Median).unwrap();
@@ -1944,7 +1945,7 @@ struct StopRow<'a> {
     exam: Option<f32>,
     /// The field the LAST dealt clock drew from, shared by every row of the card
     /// ticket cell costs no extra walk. `None` = the lottery was off / never armed.
-    lottery: Option<super::step::LotteryFrame>,
+    lottery: Option<LotteryFrame>,
 }
 
 /// One card's own structural summary: the mean `Δcrown` and `Δpop` over the rows it printed.
@@ -2354,7 +2355,7 @@ mod tests {
     #[test]
     fn the_median_step_cell_closes_on_the_median_not_the_mean() {
         use crate::engine::config::MeanType;
-        use crate::engine::smoothing::{rolling_stats_with, RollingBuffer};
+        use crate::engine::clock::smoothing::{rolling_stats_with, RollingBuffer};
         // One net, four readings: mean 25.75 / σ 14.77, but median 12 and MAD 2.
         let stats = rolling_stats_with(
             &RollingBuffer::from_values(4, &[10.0, 12.0, 40.0, 41.0]),

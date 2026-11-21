@@ -1,6 +1,6 @@
 //! Stop criteria, checked once per step at the loop boundary.
 
-use super::core::CoreEngine;
+use crate::engine::core::CoreEngine;
 
 impl CoreEngine {
     /// Check the stop criteria at this step: `Some(reason)` if one fires, `None`
