@@ -48,7 +48,7 @@ pub use graph::node::{Activation, CombineOp, Node, NodeKind, StandardizeOp};
 pub use graph::topology::{FeatureSplitPolicy, Topology, TopologyOptions};
 
 // ── evolution — the genetic operators ────────────────────────────────
-pub use evolution::crossover::CrossoverMethod;
+pub use evolution::crossover::CrossoverOp;
 pub use evolution::mutation::MutationMethod;
 pub use evolution::selection::SelectionMethod;
 
