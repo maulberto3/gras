@@ -114,6 +114,20 @@ pub(crate) fn fmt_units(n: i64) -> String {
     format!("{value:.1}{}", UNITS[idx - 1])
 }
 
+/// A wall-clock COST in human units: `1.24s`, `41.2ms`, `12.3µs`, `840ns`. The unit is picked
+/// by magnitude, so a stop-table cell never reads `0.000012`.
+pub(crate) fn fmt_micros(secs: f64) -> String {
+    if !secs.is_finite() {
+        return format!("{secs}");
+    }
+    let us = secs * 1e6;
+    if us.abs() >= 10.0 {
+        format!("{us:.1}")
+    } else {
+        format!("{us:.2}")
+    }
+}
+
 /// A config / knob echo: flat 2 decimals.
 pub(crate) fn fmt_cfg(v: f32) -> String {
     format!("{v:.2}")
@@ -244,8 +258,8 @@ pub(crate) fn csv_split_line(line: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReadingStyle, csv_field, fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_line_opt,
-        fmt_reading, fmt_units,
+        csv_field, fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_line_opt, fmt_micros, fmt_reading,
+        fmt_units, ReadingStyle,
     };
     use crate::engine::format::fmt_family_reading;
 
@@ -367,6 +381,17 @@ mod tests {
         assert_eq!(fmt_units(5_000_000_000_000), "5000.0B");
         // Signed counts (a deficit is still a count) keep their sign.
         assert_eq!(fmt_units(-40_242), "-40.2K");
+    }
+
+    /// A duration takes the unit its magnitude is readable in — never `0.000012`.
+    #[test]
+    fn secs_takes_the_unit_its_magnitude_is_readable_in() {
+        // The unit lives in the HEADER (`eval time (µs)`), so a cell is a bare number.
+        assert_eq!(fmt_micros(0.04123), "41230.0");
+        assert_eq!(fmt_micros(0.00001234), "12.3");
+        assert_eq!(fmt_micros(0.000005638), "5.64");
+        assert_eq!(fmt_micros(0.00000084), "0.84");
+        assert_eq!(fmt_micros(0.0), "0.00");
     }
 
     // ── optional forms ────────────────────────────────────────────────────

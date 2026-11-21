@@ -48,6 +48,11 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     }
     graph.refresh_labels();
     graph.finalize();
+    // Per-port activations AFTER finalize: `num_outputs` is final only once
+    // `trim_orphaned_ports` compacted the ports. FOUNDERS get them for the same reason
+    // crossover children do — without them every port inherits the node gene, so a
+    // `unique_source_per_target = false` fan-out carries N copies of ONE signal.
+    graph.assign_port_activations(&activation);
     // Feature split AFTER finalize: the Input node's port count is final only once
     // `trim_orphaned_ports` compacted the ports (same rule as port activations).
     if let Some(policy) = feature_split {
@@ -258,6 +263,48 @@ mod tests {
         cfg.topology_options = opts;
         cfg.hidden_dim_pool = Some(4..=4);
         cfg
+    }
+
+    /// Founders must leave `draw_topology` with PER-PORT activations, exactly like
+    /// crossover children. Without them every output port mirrors the node gene, and a
+    /// `unique_source_per_target = false` fan-out is N copies of one signal.
+    #[test]
+    fn founders_carry_per_port_activations() {
+        let opts = crate::graph::topology::TopologyOptions {
+            min_hidden_num_nodes: 2,
+            max_hidden_num_nodes: 2,
+            min_hidden_outputs_per_node: 3,
+            max_hidden_outputs_per_node: 3,
+            input_dim: Some(2),
+            output_dim: Some(2),
+            ..Default::default()
+        };
+        let mut cfg = RaceConfig::defaults();
+        cfg.pop_size = 8;
+        cfg.topology_options = opts;
+        cfg.hidden_dim_pool = Some(4..=4);
+        let topos = initial_population(&cfg, 42);
+        let mut nodes_checked = 0usize;
+        let mut differing = 0usize;
+        for node in topos
+            .iter()
+            .flat_map(|t| t.nodes.iter())
+            .filter(|n| n.kind == NodeKind::Hidden && n.num_outputs > 1)
+        {
+            let ports = node
+                .port_activations
+                .as_ref()
+                .expect("a founder's fan-out carries per-port activations");
+            assert_eq!(ports.len(), node.num_outputs);
+            assert_eq!(ports[0], node.activation, "port 0 mirrors the node gene");
+            differing += ports.iter().filter(|a| **a != node.activation).count();
+            nodes_checked += 1;
+        }
+        assert!(nodes_checked > 0, "the draw produced no fan-out to inspect");
+        assert!(
+            differing > 0,
+            "every port mirrored its node gene — the fill never ran"
+        );
     }
 
     #[test]

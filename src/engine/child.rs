@@ -116,15 +116,32 @@ const GENE_SALT_COMBINE: u64 = 0x0AC7_0000_0000_0002;
 const GENE_SALT_STANDARDIZE: u64 = 0x0AC7_0000_0000_0003;
 const GENE_SALT_PORT: u64 = 0x0AC7_0000_0000_0004;
 const GENE_SALT_DROPOUT: u64 = 0x0AC7_0000_0000_0005;
+const GENE_SALT_REACH: u64 = 0x0AC7_0000_0000_0006;
+const GENE_SALT_WIDTH: u64 = 0x0AC7_0000_0000_0007;
 
-/// GENE DRIFT: the mask flip's coin, on the genes crossover can only DONATE.
+/// The run-wide bounds a drifted gene must stay inside — `input_reach` inside the run's own
+/// `min..=max`, a node's width on the run's pool/stride grid, dropout under the run's cap. Passed
+/// as one value so adding a family cannot silently reorder the call site's arguments.
+#[derive(Clone, Copy)]
+pub(crate) struct DriftLimits {
+    pub reach_min: f32,
+    pub reach_max: f32,
+    pub width_start: usize,
+    pub width_end: usize,
+    pub width_stride: usize,
+    pub dropout_cap: f32,
+}
+
+/// GENE DRIFT: the mask flip's coin, on every gene crossover can only DONATE — node content
+/// (activation / combine / standardize / width), the per-port alleles, the wiring gene
+/// (`input_reach`, whose wires are re-derived) and the dropout rate under its cap.
 pub(crate) fn drift_child_genes(
     topo: &mut Topology,
     prob: f32,
     activation_pool: &[Activation],
     combine_pool: &[CombineOp],
     standardize_pool: &[StandardizeOp],
-    dropout_cap: f32,
+    limits: DriftLimits,
     run_seed: u64,
     clock: usize,
     child_idx: usize,
@@ -138,6 +155,37 @@ pub(crate) fn drift_child_genes(
     };
 
     // Node genes — the same node set the random path draws them on (hidden
+    // WIRING GENE: `input_reach`, the share of hidden nodes wired straight from the Input node.
+    // The wires are the phenotype, so a re-drawn reach re-derives them instead of leaving a
+    // stored number nothing reads.
+    let mut reach = stream(GENE_SALT_REACH);
+    if reach.f32() < p {
+        let lo = limits.reach_min.clamp(0.0, 1.0);
+        let hi = limits.reach_max.clamp(0.0, 1.0);
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+        topo.options.input_reach = if hi <= lo {
+            lo
+        } else {
+            lo + reach.f32() * (hi - lo)
+        };
+        topo.redrift_input_reach();
+    }
+
+    // WIDTH GENE: a node's `hidden_dim`, on the run's own pool/stride grid. Changing it changes the
+    // layer's shape, so the provenance map stops matching the donor (`same_gene` compares dims) and
+    // the drifted node keeps the inventory init instead of a mismatched transplant.
+    let mut width = stream(GENE_SALT_WIDTH);
+    let stride = limits.width_stride.max(1);
+    let width_choices = limits.width_end.saturating_sub(limits.width_start) / stride + 1;
+    for node in topo.nodes.iter_mut() {
+        if node.kind != NodeKind::Hidden {
+            continue;
+        }
+        if width.f32() < p {
+            node.hidden_dim = Some(limits.width_start + width.usize(0..width_choices) * stride);
+        }
+    }
+
     let mut act = stream(GENE_SALT_ACTIVATION);
     let mut comb = stream(GENE_SALT_COMBINE);
     let mut std = stream(GENE_SALT_STANDARDIZE);
@@ -162,7 +210,9 @@ pub(crate) fn drift_child_genes(
         topo.assign_port_activations(activation_pool);
         let mut ports = stream(GENE_SALT_PORT);
         for node in topo.nodes.iter_mut() {
-            if node.kind == NodeKind::Input || node.num_outputs <= 1 {
+            // Input ports evolve too: an Input branch may switch `identity` → `sin` exactly
+            // like a hidden port. Port 0 stays the node gene (Identity).
+            if node.num_outputs <= 1 {
                 continue;
             }
             let Some(slots) = node.port_activations.as_mut() else {
@@ -178,10 +228,10 @@ pub(crate) fn drift_child_genes(
 
     // Per-net gene: the cap is the run's `set_topology_dropout_prob`, so drift can
     // lower or zero the dropout but never widen the search past what was asked
-    if dropout_cap > 0.0 {
+    if limits.dropout_cap > 0.0 {
         let mut drop = stream(GENE_SALT_DROPOUT);
         if drop.f32() < p {
-            topo.options.dropout_prob = drop.f32() * dropout_cap;
+            topo.options.dropout_prob = drop.f32() * limits.dropout_cap;
         }
     }
 }
@@ -258,17 +308,37 @@ mod gene_drift_tests {
     }
 
     type Genes = (
-        Vec<(Activation, Option<CombineOp>, Option<StandardizeOp>)>,
+        Vec<(
+            Activation,
+            Option<CombineOp>,
+            Option<StandardizeOp>,
+            Option<usize>,
+        )>,
+        u32,
         u32,
     );
+
+    /// The run-wide bounds drift must respect: reach inside the run's own range, width on the
+    /// run's pool/stride grid, dropout under the cap.
+    fn limits() -> DriftLimits {
+        DriftLimits {
+            reach_min: 0.2,
+            reach_max: 0.8,
+            width_start: 4,
+            width_end: 16,
+            width_stride: 4,
+            dropout_cap: 0.25,
+        }
+    }
 
     fn genes(t: &Topology) -> Genes {
         (
             t.nodes
                 .iter()
-                .map(|n| (n.activation, n.combine_op, n.standardize))
+                .map(|n| (n.activation, n.combine_op, n.standardize, n.hidden_dim))
                 .collect(),
             t.options.dropout_prob.to_bits(),
+            t.options.input_reach.to_bits(),
         )
     }
 
@@ -276,15 +346,40 @@ mod gene_drift_tests {
     fn zero_probability_leaves_every_gene_exactly_as_inherited() {
         let mut t = topo(7);
         let before = genes(&t);
-        drift_child_genes(&mut t, 0.0, &acts(), &combs(), &stds(), 0.25, 7, 3, 1);
+        drift_child_genes(&mut t, 0.0, &acts(), &combs(), &stds(), limits(), 7, 3, 1);
         assert_eq!(genes(&t), before);
+    }
+
+    #[test]
+    fn full_probability_also_reaches_the_wiring_and_width_genes() {
+        let mut t = topo(7);
+        let before = genes(&t);
+        drift_child_genes(&mut t, 1.0, &acts(), &combs(), &stds(), limits(), 7, 3, 1);
+        let after = genes(&t);
+        assert!(
+            after.2 != before.2,
+            "p=1 must re-draw the wiring gene, not leave a stored number"
+        );
+        let reach = t.options.input_reach;
+        assert!(
+            (0.2..=0.8).contains(&reach),
+            "reach {reach} escaped the run's own range"
+        );
+        for n in t.nodes.iter().filter(|n| n.kind == NodeKind::Hidden) {
+            let w = n.hidden_dim.expect("a hidden node keeps a width");
+            assert!(
+                (4..=16).contains(&w) && (w - 4) % 4 == 0,
+                "width {w} escaped the 4..=16 pool on a stride-4 grid"
+            );
+        }
+        assert!(t.validate().is_ok(), "drift left an unrunnable graph");
     }
 
     #[test]
     fn full_probability_reaches_the_genes_without_changing_the_shape() {
         let mut t = topo(7);
         let before = genes(&t);
-        drift_child_genes(&mut t, 1.0, &acts(), &combs(), &stds(), 0.25, 7, 3, 1);
+        drift_child_genes(&mut t, 1.0, &acts(), &combs(), &stds(), limits(), 7, 3, 1);
         let after = genes(&t);
         assert_eq!(
             after.0.len(),
@@ -302,7 +397,7 @@ mod gene_drift_tests {
     fn dropout_stays_inside_the_cap_for_every_child_ordinal() {
         for idx in 0..32 {
             let mut t = topo(7);
-            drift_child_genes(&mut t, 0.5, &acts(), &combs(), &stds(), 0.25, 7, 3, idx);
+            drift_child_genes(&mut t, 0.5, &acts(), &combs(), &stds(), limits(), 7, 3, idx);
             let d = t.options.dropout_prob;
             assert!(
                 (0.0..=0.25).contains(&d),
@@ -315,12 +410,22 @@ mod gene_drift_tests {
     fn the_same_child_draws_the_same_genes_and_a_sibling_can_differ() {
         let mut a = topo(7);
         let mut b = topo(7);
-        drift_child_genes(&mut a, 0.5, &acts(), &combs(), &stds(), 0.25, 11, 4, 0);
-        drift_child_genes(&mut b, 0.5, &acts(), &combs(), &stds(), 0.25, 11, 4, 0);
+        drift_child_genes(&mut a, 0.5, &acts(), &combs(), &stds(), limits(), 11, 4, 0);
+        drift_child_genes(&mut b, 0.5, &acts(), &combs(), &stds(), limits(), 11, 4, 0);
         assert_eq!(genes(&a), genes(&b), "replay: same seed, clock and ordinal");
         let differs = (1..=64).any(|idx| {
             let mut c = topo(7);
-            drift_child_genes(&mut c, 0.5, &acts(), &combs(), &stds(), 0.25, 11, 4, idx);
+            drift_child_genes(
+                &mut c,
+                0.5,
+                &acts(),
+                &combs(),
+                &stds(),
+                limits(),
+                11,
+                4,
+                idx,
+            );
             genes(&c) != genes(&a)
         });
         assert!(differs, "child_idx must reach the drift seeds");
@@ -686,22 +791,15 @@ impl CoreEngine {
         let mut inherit_kept: Option<String> = None;
         let mut inherit_other: Option<String> = None;
         for _ in 0..MAX_PARENT_PAIRINGS {
-            // 2.
+            // 2. ONE call for the whole pairing: distinct parents, and the `Elite` draft reads
+            // each net's real optimizer updates (`NetState::step`) to break a fitness tie.
             let method = self.config.crossover_selection.clone();
-            let mut parent_positions: Vec<usize> = (0..n_parents)
-                .filter_map(|_| method.draw_one(&scores, direction, rng))
+            let updates: Vec<usize> = ranked
+                .iter()
+                .map(|(h, _)| self.state.net(h).map(|s| s.step).unwrap_or(0))
                 .collect();
-            if n_parents == 2
-                && parent_positions.len() == 2
-                && parent_positions[0] == parent_positions[1]
-            {
-                let others: Vec<usize> = (0..scores.len())
-                    .filter(|&p| p != parent_positions[0])
-                    .collect();
-                if !others.is_empty() {
-                    parent_positions[1] = others[rng.usize(..others.len())];
-                }
-            }
+            let mut parent_positions: Vec<usize> =
+                method.draw_parents(&scores, &updates, direction, rng, n_parents);
             // FITTER BASE: `ranked` is best-first (`ranked_live_impl` sorts on the direction),
             // the LOWER index is the better net.
             if self.config.crossover_fitter_base
@@ -810,15 +908,11 @@ impl CoreEngine {
                 .resolved_activation_pool()
                 .unwrap_or_else(|_| crate::evolution::pools::all_activations()),
         );
-        // Feature masks: INHERIT what the parents carried (the child's rows are mapped
-        // post-finalize port count — extra ports stay unmasked).
-        if child_masks.is_empty() {
-            if let Some(policy) = child_topo.options.feature_split {
-                child_topo.assign_feature_masks(policy);
-            }
-        } else {
-            // Drift BEFORE the install: the rows are the gene, the label is restamped
-            // from what they now are (a flipped `exclusive` partition stops being one).
+        // Feature masks: INHERIT what the parents carried. The ROWS drift here (they are the gene),
+        // but the INSTALL waits until after gene drift: a re-drawn `input_reach` resizes the Input
+        // node, and the rows are one-per-port.
+        let inherited_masks = !child_masks.is_empty();
+        if inherited_masks {
             drift_feature_masks(
                 &mut child_masks,
                 self.config.drift_prob,
@@ -826,7 +920,6 @@ impl CoreEngine {
                 clock,
                 child_idx,
             );
-            child_topo.install_input_feature_masks(&child_masks, child_policy);
         }
         // GENE DRIFT: the same coin, on the genes crossover can only donate.
         if self.config.drift_prob > 0.0 {
@@ -842,17 +935,33 @@ impl CoreEngine {
                 .config
                 .resolved_standardize_pool()
                 .unwrap_or_else(|_| crate::evolution::pools::all_standardize_ops());
+            let topo_opts = self.config.topology_options;
+            let width_pool = self.config.hidden_dim_pool.clone().unwrap_or(4..=8);
             drift_child_genes(
                 &mut child_topo,
                 self.config.drift_prob,
                 &activations,
                 &combine,
                 &standardize,
-                self.config.topology_options.dropout_prob,
+                DriftLimits {
+                    reach_min: topo_opts.min_input_reach,
+                    reach_max: topo_opts.max_input_reach,
+                    width_start: *width_pool.start(),
+                    width_end: *width_pool.end(),
+                    width_stride: self.config.hidden_dim_stride.max(1),
+                    dropout_cap: topo_opts.dropout_prob,
+                },
                 self.header.run_seed,
                 clock,
                 child_idx,
             );
+        }
+        // Masks land AFTER the drift: the row count follows the Input port count, and the wiring
+        // gene may just have changed it.
+        if inherited_masks {
+            child_topo.install_input_feature_masks(&child_masks, child_policy);
+        } else if let Some(policy) = child_topo.options.feature_split {
+            child_topo.assign_feature_masks(policy);
         }
         Ok(Some(self.finalize_child(
             child_topo,

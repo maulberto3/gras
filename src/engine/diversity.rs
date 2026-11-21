@@ -112,6 +112,9 @@ pub(crate) struct NetShape {
     /// The wiring gene: the share of hidden nodes allowed a wire straight from the Input node.
     /// `1.0` = one Input port per hidden node (every node may read the raw input).
     pub reach: f32,
+    /// The longest wire path from an Input node to any node: `Topology::depths` max. Input = 0,
+    /// so `Input → H1 → H2 → Output` reads `3`. Report-only.
+    pub depth: usize,
 }
 
 /// Read one net's structure: the pair metric's genes plus the census legs.
@@ -138,6 +141,7 @@ pub(crate) fn shape_of(topo: &Topology) -> NetShape {
     };
     NetShape {
         reach: topo.options.input_reach,
+        depth: topo.depths().into_iter().max().unwrap_or(0),
         genome: genes(topo),
         nodes: topo.nodes.len(),
         wires: topo.connections.len(),
@@ -436,6 +440,7 @@ mod tests {
     fn mean_delta_to_reads_the_distance_to_the_reference_set() {
         let shape = |tokens: &[(&str, usize)]| NetShape {
             reach: 1.0,
+            depth: 1,
             genome: genome(tokens),
             nodes: 1,
             wires: 1,
@@ -503,6 +508,11 @@ mod tests {
         assert_eq!(shape.nodes, topo.nodes.len());
         assert_eq!(shape.wires, topo.connections.len());
         assert_eq!(
+            shape.depth,
+            topo.depths().into_iter().max().unwrap_or(0),
+            "depth is the longest wire path in the same blueprint"
+        );
+        assert_eq!(
             shape.genome,
             genes(topo),
             "the shape carries the pair metric's own genes, not a second spelling"
@@ -514,6 +524,54 @@ mod tests {
             .filter_map(|n| n.hidden_dim.map(|d| d as f32))
             .collect();
         assert_eq!(shape.dim, trait_of(&hidden).mean);
+    }
+
+    #[test]
+    fn shape_of_reads_depth_as_the_longest_wire_path() {
+        use crate::graph::node::{Activation, Node};
+        use crate::graph::topology::{Connection, Port};
+        let node = |id: usize, kind: NodeKind, num_inputs: usize, num_outputs: usize| Node {
+            id,
+            num_inputs,
+            num_outputs,
+            kind,
+            hidden_dim: (kind == NodeKind::Hidden).then_some(8),
+            activation: if kind == NodeKind::Hidden {
+                Activation::ReLU
+            } else {
+                Activation::Identity
+            },
+            port_activations: None,
+            combine_op: None,
+            standardize: None,
+            feature_masks: None,
+        };
+        let mut topo = Topology::new(0, None);
+        topo.nodes.push(node(0, NodeKind::Input, 0, 2));
+        topo.nodes.push(node(1, NodeKind::Hidden, 1, 1));
+        topo.nodes.push(node(2, NodeKind::Hidden, 1, 1));
+        topo.nodes.push(node(3, NodeKind::Output, 2, 0));
+        topo.connections.push(Connection {
+            from: Port { node: 0, index: 0 },
+            to: Port { node: 1, index: 0 },
+        });
+        topo.connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 2, index: 0 },
+        });
+        topo.connections.push(Connection {
+            from: Port { node: 0, index: 1 },
+            to: Port { node: 3, index: 0 },
+        });
+        topo.connections.push(Connection {
+            from: Port { node: 2, index: 0 },
+            to: Port { node: 3, index: 1 },
+        });
+        assert_eq!(
+            shape_of(&topo).depth,
+            3,
+            "Input → H1 → H2 → Output is three wires deep"
+        );
     }
 
     #[test]

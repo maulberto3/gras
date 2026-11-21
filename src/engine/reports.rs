@@ -1,6 +1,7 @@
 //! Run artifacts: the CHAMPION ranking and the anti-champion (worst) dumps.
 
 use super::core::CoreEngine;
+use super::diversity::{shape_of, NetShape};
 use super::format::{fmt_cell, fmt_cfg, fmt_family_reading, fmt_micros, fmt_units, ReadingStyle};
 use flodl::tensor::Result;
 
@@ -112,7 +113,8 @@ impl CoreEngine {
             // outlives the run, so it carries the census, the eval price and the read window the
             // console showed, not only the blueprint. Prices are per SAMPLE (tabular) or per TURN
             // (RL), the same unit the `eval time (µs)` column states in its header.
-            let facts = self.net_facts(&hash, &topo, clock, &reading);
+            let shape = shape_of(&topo);
+            let facts = self.net_facts(&hash, &shape, clock, &reading);
             let facts_md = facts_markdown(&facts);
             let md = format!(
                 // `updates` sits beside the score, not only in the lineage box at the foot of the
@@ -163,7 +165,7 @@ impl CoreEngine {
     fn net_facts(
         &self,
         hash: &str,
-        topo: &crate::graph::topology::Topology,
+        shape: &NetShape,
         clock: usize,
         reading: &str,
     ) -> Vec<(&'static str, String)> {
@@ -187,8 +189,6 @@ impl CoreEngine {
             ),
             None => na.clone(),
         };
-        // The blueprint's census, read the SAME way the stop card reads it.
-        let shape = crate::engine::diversity::shape_of(topo);
         let trend = self.rolling_trend.get(hash).and_then(|t| t.slope());
         vec![
             ("hash", hash.to_string()),
@@ -216,6 +216,7 @@ impl CoreEngine {
             ("wires", shape.wires.to_string()),
             ("width", fmt_cell(shape.dim)),
             ("reach", format!("{:.2}", shape.reach)),
+            ("depth (D)", shape.depth.to_string()),
             (
                 "feature split",
                 shape
@@ -306,7 +307,7 @@ impl CoreEngine {
         rows.truncate(k);
         let mut written: Vec<Vec<String>> = Vec::new();
         let mut index = String::from(
-            "| # | hash | spent | fit (F) | ticket p | merit | age | file |\n|---|---|---|---|---|---|---|---|\n",
+            "| # | hash | spent | fit (F) | ticket p | merit | age | depth (D) | file |\n|---|---|---|---|---|---|---|---|---|\n",
         );
         for (rank, (hash, _fraction, age, spent)) in rows.iter().enumerate() {
             let Some(state) = self.state.net(hash) else {
@@ -344,7 +345,8 @@ impl CoreEngine {
             let spent_cell = spent.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg);
             // The same `## Facts` table the champion files carry: this file outlives the
             // run too, and an anti-champion is read for exactly the same numbers.
-            let facts = self.net_facts(hash, &topo, clock, &reading);
+            let shape = shape_of(&topo);
+            let facts = self.net_facts(hash, &shape, clock, &reading);
             let facts_md = facts_markdown(&facts);
             let md = format!(
                 // `updates` rides the header beside `age`: `spent` says how the net ranks, the
@@ -368,9 +370,10 @@ impl CoreEngine {
             match std::fs::write(self.run_dir.join(&file), &md) {
                 Ok(()) => {
                     index.push_str(&format!(
-                        "| {} | {short} | {spent_cell} | {fit_cell} | {ticket_cell} | {} | {age} | [{file}]({file}) |\n",
+                        "| {} | {short} | {spent_cell} | {fit_cell} | {ticket_cell} | {} | {age} | {} | [{file}]({file}) |\n",
                         rank + 1,
                         merit.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg),
+                        shape.depth,
                     ));
                     written.push(vec![
                         (rank + 1).to_string(),
@@ -399,7 +402,7 @@ impl CoreEngine {
                 )
             });
             let body = format!(
-                "# Anti-champion field at clock {clock}\n\nThese are the `champion_count` nets that already BURNED their updates and stayed bad — ranked by the `spent` criterion `Fm⁻ × (1 − Um⁻)`, the same number the `spent` cross/mutation cull evicts on, not by `fit (F)` alone: a weak net the lottery has not paid yet ranks BELOW a weak net that trained and stayed weak. Every row is one net's topology + mermaid graph + lineage; `spent` is the ranking value, `ticket p` is the chance the train-eval lottery gives that net on the NEXT clock (dash = not graded, so it has no chance to name), and `fit (F)` rides along for comparison. A row with `na` spent was not graded and is listed after the graded ones, by `fit (F)` ascending.\n\n{favourite_line}{index}"
+                "# Anti-champion field at clock {clock}\n\nThese are the `champion_count` nets that already BURNED their updates and stayed bad — ranked by the `spent` criterion `Fm⁻ × (1 − Um⁻)`, the same number the `spent` cross/mutation cull evicts on, not by `fit (F)` alone: a weak net the lottery has not paid yet ranks BELOW a weak net that trained and stayed weak. Every row is one net's topology + mermaid graph + lineage; `spent` is the ranking value, `ticket p` is the chance the train-eval lottery gives that net on the NEXT clock (dash = not graded, so it has no chance to name), and `fit (F)` rides along for comparison, and `depth (D)` is the net's longest wire path from the Input node (`Input → H1 → H2 → Output` = `3`), report-only. A row with `na` spent was not graded and is listed after the graded ones, by `fit (F)` ascending.\n\n{favourite_line}{index}"
             );
             let path = self.run_dir.join("worst.md");
             if let Err(source) = std::fs::write(&path, body) {

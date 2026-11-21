@@ -701,8 +701,12 @@ impl CoreEngine {
         } else {
             call_index
         };
+        // The net's OWN clock: updates it has already spent (`0` on its first step).
+        // Read before the trainer runs, so the first update sees `0`, not `1`.
+        let net_step = self.state.net(hash).map(|s| s.step).unwrap_or(0);
         let env = crate::trainer::StepEnv {
             step: clock,
+            net_step,
             run_seed: self.header.run_seed,
             pop_size: self.config.pop_size,
             live_count: self.state.live_count(),

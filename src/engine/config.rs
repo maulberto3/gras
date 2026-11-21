@@ -282,7 +282,8 @@ pub const DEFAULT_INIT_PROBATION_STEPS: usize = 0;
 /// Default step between sampled hidden widths.
 pub const DEFAULT_HIDDEN_DIM_STRIDE: usize = 16;
 
-/// Default crossover parent tournament size.
+/// Default width for a `SelectionMethod::Tournament` parent draw — the examples'.
+/// `--tournament-size`. NOT the engine default draw: that is `SelectionMethod::Roulette`.
 pub const DEFAULT_TOURNAMENT_SIZE: usize = 2;
 
 /// Default: the fitter parent is the crossover base.
@@ -326,7 +327,9 @@ pub const EVAL_SHARE_MIN: f32 = 0.01;
 pub const EVAL_SHARE_MAX: f32 = 0.9;
 
 /// Default chance that ONE inherited drift slot moves on a crossover child (`set_topology_drift`):
-/// a mask bit flips, or a hidden node's activation / combine / standardize is re-drawn
+/// a mask bit flips; a hidden node's activation / combine / standardize / width is re-drawn; a port
+/// activation moves; the wiring gene (`input_reach`) is re-drawn and its wires re-derived; or the
+/// dropout rate is re-drawn under the run's cap.
 pub const DEFAULT_TOPOLOGY_DRIFT: f32 = 0.1;
 
 /// Default novelty floor `d_min` for a mutation draw (`set_mutation_novelty_min`): the clone
@@ -575,8 +578,10 @@ pub struct RaceConfig {
     /// Crossover operator pool (`"one_point"` | `"uniform"`), drawn uniformly per attempt.
     /// Empty ⇒ both.
     pub crossover_ops_pool: Vec<String>,
-    /// How a crossover attempt draws its parents: [`SelectionMethod::Roulette`] (default —
-    /// engine's historical behavior) or a `Tournament { k }`, which concentrates recombination
+    /// How a crossover attempt draws its parents: [`SelectionMethod::Roulette`] (default — the
+    /// fitter a net, the likelier it is drawn, with nothing fixed), a `Tournament { k }`,
+    /// which concentrates recombination on the leaders, or [`SelectionMethod::Elite`], the
+    /// deterministic best-fitness draft.
     pub crossover_selection: SelectionMethod,
     /// Fitter parent as the crossover BASE (`set_crossover_fitter_base`).
     pub crossover_fitter_base: bool,
@@ -594,7 +599,9 @@ pub struct RaceConfig {
     /// spellings `engine.json` writes are accepted too).
     pub feature_split_pool: Vec<String>,
     /// Per-SLOT drift on a crossover child's INHERITED genes (`set_topology_drift`): the chance,
-    /// for each slot below, that it moves
+    /// for each slot below, that it moves — mask bits, a hidden node's activation / combine /
+    /// standardize / width, port activations, the wiring gene `input_reach` (whose wires are
+    /// re-derived) and the dropout rate (under the run's cap)
     pub drift_prob: f32,
     /// Activation pool (empty ⇒
     pub activation_pool: Vec<String>,
@@ -753,9 +760,7 @@ impl RaceConfig {
             worst_save_topology: DEFAULT_WORST_SAVE_TOPOLOGY,
             mode_specific: ModeConfig::Tabular,
             crossover_ops_pool: Vec::new(),
-            crossover_selection: SelectionMethod::Tournament {
-                tournament_size: DEFAULT_TOURNAMENT_SIZE,
-            },
+            crossover_selection: SelectionMethod::default(),
             crossover_fitter_base: DEFAULT_CROSSOVER_FITTER_BASE,
             max_steps: Some(DEFAULT_MAX_STEPS),
             hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
@@ -889,7 +894,9 @@ impl RaceConfig {
             MutationCullPolicy::LowestFitness
         };
         let selection = snap.crossover_selection.to_ascii_lowercase();
-        cfg.crossover_selection = if selection.contains("tournament") {
+        cfg.crossover_selection = if selection.contains("elite") {
+            SelectionMethod::Elite
+        } else if selection.contains("tournament") {
             let k = selection
                 .split(|c: char| !c.is_ascii_digit())
                 .filter_map(|n| n.parse::<usize>().ok())
@@ -1091,7 +1098,8 @@ impl RaceConfigBuilder {
         self.cfg.worst_save_topology = enabled;
         self
     }
-    /// DRIFT on a crossover child's inherited genes (default `0.0` = exact inheritance).
+    /// DRIFT on a crossover child's inherited genes (default `DEFAULT_TOPOLOGY_DRIFT` = `0.1`;
+    /// `0.0` = exact inheritance).
     pub fn set_topology_drift(mut self, p: f32) -> Self {
         self.cfg.drift_prob = if p.is_finite() {
             p.clamp(0.0, 1.0)
@@ -1130,7 +1138,8 @@ impl RaceConfigBuilder {
         self.cfg.crossover_ops_pool = ops.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
-    /// Parent-selection method for the crossover draw.
+    /// Parent-selection method for the crossover draw (default [`SelectionMethod::Roulette`]:
+    /// fitness-proportionate, never deterministic).
     pub fn set_crossover_selection(mut self, method: SelectionMethod) -> Self {
         self.cfg.crossover_selection = method;
         self
@@ -1253,8 +1262,8 @@ impl RaceConfigBuilder {
     }
     /// Keep at most ONE wire per (source node, target node) pair — `true` by default.
     ///
-    /// The rule spans every kind: Input→hidden (where the Input port is Identity, so a second wire
-    /// is the same signal), hidden→hidden, and hidden→Output. With it on, `finalize` will not pick
+    /// The rule spans every kind: Input→hidden, hidden→hidden, and hidden→Output. With it on,
+    /// `finalize` will not pick
     /// a source that already feeds the target, `validate` rejects a blueprint that does, and a
     /// loaded graph is repaired by one seeded random cull. `false` restores the older wiring.
     pub fn set_topology_unique_source_per_target(mut self, on: bool) -> Self {
@@ -1606,15 +1615,15 @@ mod tests {
         assert_eq!(ran.score(), ran.fam_center, "the score IS the centre");
     }
 
-    /// The parent draw defaults to the reference loop's tournament of 2; the tournament arm must
-    /// survive the round-trip untouched, and roulette stays expressible for a caller that wants
+    /// The parent draw defaults to fitness-proportionate ROULETTE; the tournament and elite arms
+    /// must survive the round-trip untouched.
     #[test]
-    fn crossover_selection_defaults_to_tournament_two_and_round_trips() {
+    fn crossover_selection_defaults_to_roulette_and_round_trips() {
         use crate::evolution::selection::SelectionMethod;
         assert_eq!(
             RaceConfig::defaults().crossover_selection,
-            SelectionMethod::Tournament { tournament_size: 2 },
-            "the knob's default is the reference loop's draw"
+            SelectionMethod::Roulette,
+            "the knob's default is the fitness-proportionate draw"
         );
         let cfg = RaceConfig::builder()
             .set_crossover_selection(SelectionMethod::Tournament { tournament_size: 3 })
@@ -1626,6 +1635,7 @@ mod tests {
         // The recorded label is the Display form the snapshot stores.
         assert_eq!(cfg.crossover_selection.to_string(), "tournament(size=3)");
         assert_eq!(SelectionMethod::Roulette.to_string(), "roulette");
+        assert_eq!(SelectionMethod::Elite.to_string(), "elite");
     }
 
     /// The stop field setters are mutually exclusive BY CONSTRUCTION: each write clears
