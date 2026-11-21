@@ -112,6 +112,11 @@ impl RlStepMeta {
 pub struct StepEnv {
     /// The current step clock (same as the `step` argument of `train_step`).
     pub step: usize,
+    /// THIS net's own step count: the real optimizer updates it has spent, `0` on its
+    /// first clock. Persisted (`NetState::step`), so a resume re-derives it. The run
+    /// clock says nothing about how long an individual has existed — a net born at
+    /// clock 150 standing its first step is at `net_step == 0`, not 150.
+    pub net_step: usize,
     /// The run's seed (as resolved at construction, recorded in engine.json).
     pub run_seed: u64,
     /// Configured population size (the run's target, not the live count).
@@ -134,6 +139,13 @@ impl StepEnv {
     /// unbounded — pure arithmetic on the clock, so replays match.
     pub fn progress(&self) -> Option<f32> {
         crate::utils::training::run_progress(self.step, self.max_steps)
+    }
+
+    /// Fraction of the step budget THIS net has consumed (`0.0` → `1.0`), or `None`
+    /// unbounded — the per-individual clock a schedule tuned to a net's own life
+    /// reads (`net_step`), as opposed to [`Self::progress`]'s run clock.
+    pub fn net_progress(&self) -> Option<f32> {
+        crate::utils::training::run_progress(self.net_step, self.max_steps)
     }
 }
 
@@ -561,12 +573,14 @@ mod tests {
         );
     }
 
-    /// The ctx carries the run clock (`step` + `max_steps`), so a trainer can anneal
-    /// its own schedule; `None` = unbounded, the same convention as challenge decay.
+    /// The ctx carries both clocks (`step` run-wide, `net_step` per individual) plus
+    /// `max_steps`, so a trainer can anneal its own schedule; `None` = unbounded, the
+    /// same convention as challenge decay.
     #[test]
     fn step_env_progress_reads_the_run_clock() {
         let env = StepEnv {
             step: 25,
+            net_step: 5,
             run_seed: 1,
             pop_size: 2,
             live_count: 2,
@@ -576,8 +590,18 @@ mod tests {
             attempt: 0,
         };
         assert_eq!(env.progress(), Some(0.25));
+        // `net_progress` reads the individual's own clock, not the run's.
+        assert_eq!(env.net_progress(), Some(0.05));
         // Past the budget clamps rather than overshooting.
         assert_eq!(StepEnv { step: 400, ..env }.progress(), Some(1.0));
+        assert_eq!(
+            StepEnv {
+                net_step: 400,
+                ..env
+            }
+            .net_progress(),
+            Some(1.0)
+        );
         // Unbounded: the trainer gets no schedule signal
         assert_eq!(
             StepEnv {

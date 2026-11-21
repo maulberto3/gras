@@ -195,7 +195,12 @@ impl<T: RlStep> RlStep for DecisionLagTrainer<T> {
                 let shadow_ctx = RlContext {
                     fitness: ctx.fitness,
                     metrics: ctx.metrics,
-                    env: StepEnv { step: s, ..ctx.env },
+                    // The shadow walks forward: both clocks advance together.
+                    env: StepEnv {
+                        step: s,
+                        net_step: ctx.env.net_step + i + 1,
+                        ..ctx.env
+                    },
                     net_hash: ctx.net_hash,
                     net_seed: ctx
                         .net_seed
@@ -312,6 +317,7 @@ mod tests {
             metrics,
             env: StepEnv {
                 step,
+                net_step: step,
                 run_seed: 42,
                 pop_size: 2,
                 live_count: 2,

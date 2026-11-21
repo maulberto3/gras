@@ -2,14 +2,14 @@
 
 use crate::graph::network::Network;
 use crate::trainer::challenge::{
-    ChallengeDecay, ChallengePolicy, ForcedAction, challenge_fires, forced_action,
+    challenge_fires, forced_action, ChallengeDecay, ChallengePolicy, ForcedAction,
 };
 use crate::trainer::core::{RlContext, RlStep, RlStepMeta, RlStepReport};
 use crate::trainer::env::Env;
 use crate::utils::fitness::Metric;
 use crate::utils::race_steps::train_one_step_pred_only;
-use flodl::nn::Module;
 use flodl::nn::optim::Optimizer;
+use flodl::nn::Module;
 use flodl::tensor::Result;
 use flodl::{Device, Tensor, Variable};
 use std::cmp::Ordering;
@@ -25,12 +25,14 @@ const DEFAULT_MATCHES_PER_STEP: usize = 1;
 /// EVAL episodes per net per step — the ranking signal (default: 5, the cartpole recipe).
 const DEFAULT_EVAL_MATCHES_PER_STEP: usize = 5;
 
-/// Peak probability that a step fires a challenge (default: the cartpole
-/// recipe's 0.1 — see the module docs on why the default is not 0).
-const DEFAULT_CHALLENGE_PROB: f32 = 0.1;
+/// Peak probability that a net's step fires a challenge. OFF by default: a
+/// challenge rewrites what the update sees, so it is an explicit opt-in
+/// ([`Reinforce::with_challenge`]), never something a `Reinforce::new` run does
+/// behind the caller's back. The cartpole recipe passes `0.1`.
+const DEFAULT_CHALLENGE_PROB: f32 = 0.0;
 
 /// Challenge decay shape (default: the cartpole recipe's `custom:0.5`, i.e.
-/// `eff = p × (1 − √progress)`).
+/// `eff = p × (1 − √progress)`). Inert while `DEFAULT_CHALLENGE_PROB` is 0.
 const DEFAULT_CHALLENGE_DECAY: ChallengeDecay = ChallengeDecay::Custom { exponent: 0.5 };
 
 /// The seed offset that separates a step's EVAL exam from its TRAIN episodes — a plain add on the run seed, so the two bases sit that constant apart for any run seed.
@@ -282,8 +284,9 @@ impl<E: Env> Reinforce<E> {
         self
     }
 
-    /// Set the anti-plateau challenge: the peak probability a step fires one, which action
-    /// forces, and how the knob decays to 0 over the budget.
+    /// Set the anti-plateau challenge: the peak probability a net's step fires one, which action
+    /// forces, and how the knob decays to 0 over the net's own step budget. Off unless you call
+    /// this (`prob == 0.0` = never fires, the default).
     pub fn with_challenge(
         mut self,
         prob: f32,
@@ -551,17 +554,25 @@ impl<E: Env> RlStep for Reinforce<E> {
     ) -> Result<RlStepReport> {
         let actions = self.env.action_count();
         // On a fired step the policy forces an action on every TRAIN turn — a pure
-        // fn of (run_seed, net_seed, step), so a resume forces the identical action.
+        // fn of (run_seed, net_seed, net step), so a resume forces the identical
+        // action. The rdw rides the NET's own step (`ctx.env.net_step`), never the
+        // run clock: a net born deep into the run still starts at the full knob.
         let challenged = challenge_fires(
             ctx.env.run_seed,
             ctx.net_seed,
-            step,
+            ctx.env.net_step,
             self.challenge_prob,
             ctx.env.max_steps,
             self.challenge_decay,
         );
-        let forced =
-            challenged.then(|| forced_action(self.challenge_policy, ctx.net_seed, step, actions));
+        let forced = challenged.then(|| {
+            forced_action(
+                self.challenge_policy,
+                ctx.net_seed,
+                ctx.env.net_step,
+                actions,
+            )
+        });
 
         // The rate for THIS clock, before any gradient flows: a pure function
         // the clock and the budget, so a replay sets the identical value.
@@ -638,7 +649,11 @@ fn eval_seed_base(run_seed: u64) -> u64 {
 
 /// The ERA a clock sits: `era_len` clocks share one — the opt-in axis (`with_per_clock_exam(false)`), where a net read at clock 118 and a newborn read at 121 are graded on…
 fn eval_era_of(step: usize, era_len: usize) -> usize {
-    if era_len == 0 { step } else { step / era_len }
+    if era_len == 0 {
+        step
+    } else {
+        step / era_len
+    }
 }
 
 /// The policy's preferred action: the argmax over its action values, ties to the lowest index.
@@ -869,6 +884,8 @@ mod tests {
             metrics: &[],
             env: crate::trainer::StepEnv {
                 step,
+                // This synthetic net has trained every clock it is read at.
+                net_step: step,
                 run_seed,
                 pop_size: 1,
                 live_count: 1,

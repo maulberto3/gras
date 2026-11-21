@@ -9,7 +9,7 @@
 //! # Recipe (both modes)
 //!
 //! Keep `challenge_prob` as your own field/const and roll the trigger per
-//! (net, step):
+//! (net, that net's own step):
 //!
 //! ```ignore
 //! use gras::trainer::challenge::{ChallengeDecay, challenge_fires};
@@ -17,9 +17,9 @@
 //! let challenged = challenge_fires(
 //!     ctx.env.run_seed,          // recorded in engine.json — replay-safe
 //!     ctx.net_seed,
-//!     step,
+//!     ctx.env.net_step,          // the NET's own step — never the run clock
 //!     self.challenge_prob,       // your knob (0.0 = never fires)
-//!     ctx.env.max_steps,         // the decay denominator
+//!     ctx.env.max_steps,         // the net's budget: it lives at most this long
 //!     ChallengeDecay::Linear,    // or Custom { exponent } / Exponential
 //! );
 //! ```
@@ -39,12 +39,23 @@
 //!
 //! # Replay contract
 //!
-//! [`challenge_fires`] is a pure function of `(run_seed, net_seed, step)` —
+//! [`challenge_fires`] is a pure function of `(run_seed, net_seed, net_step)` —
 //! no stored state, no engine involvement — so a resumed run and the original
 //! run both re-derive the identical trigger. The run seed
-//! is recorded in `engine.json`; the net seed rides the net's blueprint.
+//! is recorded in `engine.json`; the net seed rides the net's blueprint, and
+//! `net_step` is the individual's own update count, persisted on its record
+//! (`NetState::step`), so a resume picks the same clock back up.
 //! stateful schedule (a counter, an RNG stream) would advance
 //! replay and silently break determinism — don't keep one.
+//!
+//! # Why the NET's step, not the run clock
+//!
+//! Nets are born all run long. Decaying by the run clock hands a net born at
+//! clock 150 of 200 the *dregs* of the knob (13% of an opening net's odds), so
+//! the individuals with the least history — the ones that most need a push and
+//! whose plateaus are cheapest to break — are the ones never challenged. The
+//! per-net clock gives every individual the same opening odds and the same decay
+//! over its own life, which is also the only curve a short-lived net can reach.
 
 use crate::utils::training::run_progress;
 
@@ -210,37 +221,40 @@ pub fn forced_action(
     }
 }
 
-/// The effective (decayed) challenge probability at `step`: the knob scaled to 0
-/// by the end of the budget (flat when unbounded). [`challenge_fires`] decides
+/// The effective (decayed) challenge probability at the net's own step: the knob
+/// scaled to 0 by the end of the budget (flat when unbounded). `net_step` is
+/// `ctx.env.net_step` — the individual's update count, NOT the run clock, so a
+/// newborn starts at the full knob. [`challenge_fires`] decides.
 pub fn effective_challenge_prob(
     prob: f32,
-    step: usize,
+    net_step: usize,
     max_steps: Option<usize>,
     shape: ChallengeDecay,
 ) -> f32 {
-    match run_progress(step, max_steps) {
+    match run_progress(net_step, max_steps) {
         None => prob,
         Some(progress) => prob * (1.0 - progress.powf(shape.exponent())),
     }
 }
 
-/// The challenge trigger: a pure function of `(run_seed, net_seed, step, prob,
-/// max_steps, shape)`, so replay re-fires the exact same challenges.
+/// The challenge trigger: a pure function of `(run_seed, net_seed, net_step,
+/// prob, max_steps, shape)`, so replay re-fires the exact same challenges.
+/// `net_step` is the net's own update count, never the run clock.
 pub fn challenge_fires(
     run_seed: u64,
     net_seed: u64,
-    step: usize,
+    net_step: usize,
     prob: f32,
     max_steps: Option<usize>,
     shape: ChallengeDecay,
 ) -> bool {
-    let eff = effective_challenge_prob(prob, step, max_steps, shape);
+    let eff = effective_challenge_prob(prob, net_step, max_steps, shape);
     if eff <= 0.0 {
         return false;
     }
     // Domain-separated seed: independent of every other per-step roll.
     let mut rng =
-        fastrand::Rng::with_seed(run_seed ^ net_seed.rotate_left(17) ^ ((step as u64) << 32));
+        fastrand::Rng::with_seed(run_seed ^ net_seed.rotate_left(17) ^ ((net_step as u64) << 32));
     rng.f32() < eff
 }
 
@@ -291,6 +305,23 @@ mod tests {
             effective_challenge_prob(0.3, 999, None, ChallengeDecay::Linear),
             0.3
         );
+    }
+
+    /// The decay clock is the NET's own step: a net standing its first step at
+    /// clock 150 still gets the full opening knob, where the run clock would have
+    /// cut it to 13% of that (`max_steps` 200, `custom:0.5`).
+    #[test]
+    fn the_decay_clock_is_the_nets_own_step_not_the_runs() {
+        let shape = ChallengeDecay::Custom { exponent: 0.5 };
+        assert_eq!(effective_challenge_prob(0.1, 0, Some(200), shape), 0.1);
+        // The run-clock reading at the same moment, for contrast.
+        let run_clock = 0.1 * (1.0 - 0.75f32.sqrt());
+        assert!(
+            (run_clock - 0.0134).abs() < 1e-4,
+            "run-clock rate {run_clock}"
+        );
+        // A net at its OWN step 150 decays exactly like any individual at 150.
+        assert!((effective_challenge_prob(0.1, 150, Some(200), shape) - run_clock).abs() < 1e-6);
     }
 
     /// Degenerate exponents clamp instead of exploding the knob: a hand-built
