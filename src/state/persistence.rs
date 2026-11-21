@@ -970,7 +970,7 @@ impl NetState {
     pub fn stamp_meta(
         &mut self,
         net: &crate::graph::network::Network,
-        run: &crate::engine::config::RunMetaCtx,
+        run: &RunMetaCtx,
     ) {
         use flodl::Module;
         let params = net.parameters();
@@ -1108,7 +1108,7 @@ impl NetState {
                 .map_err(|e| EngineError::Json(format!("net state meta backfill: {e}")))?;
             let net = crate::graph::network::Network::build(&topo, crate::Device::CPU)
                 .map_err(|e| EngineError::Json(format!("net state meta backfill build: {e}")))?;
-            to_write.stamp_meta(&net, &crate::engine::config::RunMetaCtx::default());
+            to_write.stamp_meta(&net, &RunMetaCtx::default());
         }
         Ok(serde_json::to_string_pretty(&to_write)
             .map_err(|e| EngineError::Json(format!("net state json: {e}")))?)
@@ -1603,6 +1603,29 @@ pub fn remove_net_state(dir: &Path, hash: &str) -> Result<bool> {
     }
 }
 
+/// The run-level context stamped into every net's `meta` block. Built once at engine
+/// construction; cheap to pass around.
+#[derive(Clone, Debug, Default)]
+pub struct RunMetaCtx {
+    /// Input feature dimension.
+    pub input_dim: usize,
+    /// Output dimension.
+    pub output_dim: usize,
+    /// Shared-stream batch size; `None` in modes with no shared stream (RL),
+    /// where the trainer owns the per-step volume.
+    pub batch_size: Option<usize>,
+    /// Dropout probability the run used.
+    pub dropout_prob: f32,
+    /// Ranking fitness label.
+    pub fitness_label: String,
+    /// Ranking direction, as a string.
+    pub direction: String,
+    /// Population size.
+    pub pop_size: usize,
+    /// Run seed.
+    pub run_seed: u64,
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2020,7 +2043,7 @@ mod tests {
         let topo = tiny_topology();
         let net = crate::graph::network::Network::build(&topo, crate::Device::CPU).unwrap();
         let mut state = NetState::new(&topo, 0, None).unwrap();
-        state.stamp_meta(&net, &crate::engine::config::RunMetaCtx::default());
+        state.stamp_meta(&net, &RunMetaCtx::default());
         assert_eq!(state.meta.batch_size, None);
         let net_json: serde_json::Value = serde_json::from_str(&state.to_json().unwrap()).unwrap();
         for absent in ["loss_label", "learning_rate", "grad_clip"] {
