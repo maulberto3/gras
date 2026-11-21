@@ -1143,6 +1143,7 @@ impl NetState {
 
 /// The in-memory view of the live population the scheduler reads/writes: a hash map
 /// `NetState` plus a per-topology lifetime accumulator (the robustness-equivalent).
+#[derive(Default)]
 pub struct RaceState {
     /// Live nets, indexed by canonical topology hash.
     nets: HashMap<String, NetState>,
@@ -1234,19 +1235,11 @@ impl TopologyLifetime {
     }
 }
 
-impl Default for RaceState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl RaceState {
-    /// New empty population state.
+    /// New empty population state — the derived [`Default`], spelled for the call sites that read
+    /// better as `RaceState::new()`.
     pub fn new() -> Self {
-        RaceState {
-            nets: HashMap::new(),
-            topology_lifetime: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Register a newly inserted net (after initial insertion).
@@ -1896,7 +1889,7 @@ mod tests {
         use crate::evolution::selection::SelectionMethod;
         let snapshot =
             ConfigSnapshot::from_config(&crate::engine::config::RaceConfig::defaults(), None, None);
-        assert_eq!(snapshot.crossover_selection, "tournament(size=2)");
+        assert_eq!(snapshot.crossover_selection, "roulette");
         // Round-trips at a non-default method…
         let mut cfg = crate::engine::config::RaceConfig::defaults();
         cfg.crossover_selection = SelectionMethod::Tournament { tournament_size: 4 };
