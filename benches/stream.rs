@@ -25,7 +25,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use gras::engine::population::initial_population;
+use gras::engine::founding::population::initial_population;
 use gras::prelude::*;
 use gras::utils::race_steps::{eval_one_step, train_one_step};
 use gras::utils::score;
