@@ -6,14 +6,14 @@ use crate::evolution::selection::SelectionMethod;
 use crate::graph::topology::FeatureSplitPolicy;
 use crate::utils::fitness::Metric;
 
-pub use super::cull::{CrossCullPolicy, MutationCullPolicy};
+pub use super::breed::cull::{CrossCullPolicy, MutationCullPolicy};
 pub use super::reporting::logging::LogLevel;
 pub use super::clock::lottery::{
     DEFAULT_TRAIN_MERIT_LEARN_ONLY, DEFAULT_TRAIN_MERIT_P_MAX, DEFAULT_TRAIN_MERIT_P_MIN,
     DEFAULT_TRAIN_TICKET, TrainTicket,
 };
 pub use super::diversity::novelty::{DEFAULT_MUTATION_NOVELTY_DRAWS, DEFAULT_MUTATION_NOVELTY_MIN};
-pub use super::run_spec::{ModeConfig, RunMode};
+pub use super::start::run_spec::{ModeConfig, RunMode};
 pub use super::clock::smoothing::{DEFAULT_MEAN_TYPE, MeanType, SMOOTHING_WINDOW};
 pub use super::clock::stop::{DEFAULT_MAX_STEPS, RaceSnapshot, StopFn, StopReason};
 pub use crate::evolution::crossover::CrossoverOp;
@@ -24,7 +24,7 @@ pub use crate::state::RunMetaCtx;
 
 // ── Consolidated defaults (one place for all engine constants) ────────────────────
 
-/// Default for POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): `false` = the window averages the last K READINGS, whatever weights produced them (the pre-flag…
+/// Default for POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): `true` = the window averages only readings on the weights the net holds now; `false` = the window averages the last K READINGS, whatever weights produced them (the pre-flag…
 pub const DEFAULT_POLICY_SCOPED_FITNESS: bool = true;
 
 /// Default for the ANTI-CHAMPION dump (`set_worst_save_topology`): `false` = no `worst-*.md` files. `true` writes the `champion_count` nets at the BOTTOM of the final table…
@@ -58,7 +58,7 @@ pub const DEFAULT_CROSSOVER_PROBATION_STEPS: usize = 0;
 /// Default cap on a post-update RECOVERY streak: after a real update whose reading comes in worse than the net's standing, the engine takes up to this many extra real…
 pub const DEFAULT_RECOVERY_RETRIES: usize = 0;
 
-/// Default retry DRAW for a recovery streak (`set_pop_recovery_same_seed`): `true` = a retry re-runs the SAME train draw the update fell on (same rows, same RNG stream) — a…
+/// Default retry DRAW for a recovery streak (`set_pop_recovery_same_seed`): `false` (default) = every retry draws fresh; `true` = a retry re-runs the SAME train draw the update fell on (same rows, same RNG stream) — a…
 pub const DEFAULT_RECOVERY_SAME_SEED: bool = false;
 
 /// Default recovery tolerance: the drop a new reading may take against the net's standing and
@@ -122,7 +122,7 @@ pub struct PopulationConfig {
     pub recovery_retries: usize,
     /// Recovery tolerance: how far a reading may fall below the net's standing WITHOUT earning a rescue, as a FRACTION of that standing (`0.2` = a fifth).
     pub recovery_tolerance: f32,
-    /// Recovery retry DRAW (`set_pop_recovery_same_seed`): `true` (default) = every retry repeats the clock's OWN train draw.
+    /// Recovery retry DRAW (`set_pop_recovery_same_seed`): `false` (default) = every retry draws fresh; `true` = every retry repeats the clock's OWN train draw.
     pub recovery_same_seed: bool,
 }
 
@@ -407,12 +407,12 @@ impl RaceConfig {
     /// The pool resolved to drawable policies (`empty ⇒ all three`, in the fixed order none →
     /// random → exclusive so the draw is reproducible).
     pub fn resolved_feature_split_pool(&self) -> Result<Vec<Option<FeatureSplitPolicy>>, String> {
-        super::pool::resolve::<super::pool::FeatureSplitPool>(self)
+        super::founding::pool::resolve::<super::founding::pool::FeatureSplitPool>(self)
     }
     /// The pool as wire names, in draw order — one spelling for the log, the `engine.json` record
     /// and the resume diff.
     pub fn feature_split_pool_names(&self) -> Vec<String> {
-        super::pool::names::<super::pool::FeatureSplitPool>(self)
+        super::founding::pool::names::<super::founding::pool::FeatureSplitPool>(self)
     }
 
     /// The inverse of [`crate::state::ConfigSnapshot::from_config`]: rebuild the run-level knobs
@@ -559,19 +559,19 @@ pub use builder::RaceConfigBuilder;
 impl RaceConfig {
     /// Resolve the crossover operator pool: the configured labels validated, or both when empty.
     pub fn resolved_crossover_ops(&self) -> Result<Vec<CrossoverOp>, String> {
-        super::pool::resolve::<super::pool::CrossoverOpsPool>(self)
+        super::founding::pool::resolve::<super::founding::pool::CrossoverOpsPool>(self)
     }
 
     /// Resolve the activation pool: the configured labels parsed, or all known activations
     /// when empty. Unknown labels error at run start.
     pub fn resolved_activation_pool(&self) -> Result<Vec<crate::graph::node::Activation>, String> {
-        super::pool::resolve::<super::pool::ActivationPool>(self)
+        super::founding::pool::resolve::<super::founding::pool::ActivationPool>(self)
     }
 
     /// Resolve the combine-op sampling pool — see
     /// [`RaceConfig::resolved_activation_pool`].
     pub fn resolved_combine_pool(&self) -> Result<Vec<crate::graph::node::CombineOp>, String> {
-        super::pool::resolve::<super::pool::CombineOpPool>(self)
+        super::founding::pool::resolve::<super::founding::pool::CombineOpPool>(self)
     }
 
     /// Resolve the standardize-op sampling pool — see
@@ -579,17 +579,17 @@ impl RaceConfig {
     pub fn resolved_standardize_pool(
         &self,
     ) -> Result<Vec<crate::graph::node::StandardizeOp>, String> {
-        super::pool::resolve::<super::pool::StandardizePool>(self)
+        super::founding::pool::resolve::<super::founding::pool::StandardizePool>(self)
     }
 
     /// Check every NAME-based pool once, before a single net is drawn.
     pub fn validate_search_pools(&self) -> Result<(), String> {
         let errors: Vec<String> = [
-            super::pool::error::<super::pool::CrossoverOpsPool>(self),
-            super::pool::error::<super::pool::ActivationPool>(self),
-            super::pool::error::<super::pool::CombineOpPool>(self),
-            super::pool::error::<super::pool::StandardizePool>(self),
-            super::pool::error::<super::pool::FeatureSplitPool>(self),
+            super::founding::pool::error::<super::founding::pool::CrossoverOpsPool>(self),
+            super::founding::pool::error::<super::founding::pool::ActivationPool>(self),
+            super::founding::pool::error::<super::founding::pool::CombineOpPool>(self),
+            super::founding::pool::error::<super::founding::pool::StandardizePool>(self),
+            super::founding::pool::error::<super::founding::pool::FeatureSplitPool>(self),
         ]
         .into_iter()
         .flatten()
