@@ -9,22 +9,16 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
+use common::{die, EngineArgs};
 use gras::flodl::tensor::Result as TensorResult;
 use gras::prelude::*;
 use gras::utils::race_steps::{deterministic_train_step, eval_one_step};
 use gras::utils::{score, tabular_data};
-use common::EngineArgs;
 
 // ═══ SECTION 1 — THE DATA (a gras-format dataset on disk) ═══════════════
 
 /// Dataset dir — a `{train,test}` parent (explicit split) or a single pool (seeded internal split).
 const DATA_DIR: &str = "data/mnist";
-
-/// Print `msg` as a usage error and leave with code 2 — the examples' one failure path.
-fn die(msg: impl std::fmt::Display) -> ! {
-    eprintln!("{msg}");
-    std::process::exit(2);
-}
 
 /// Random-label smoke data — nothing to download, and nothing to trust: only
 /// `--synthetic` builds it, and its fitness says nothing about MNIST.
@@ -217,10 +211,12 @@ impl TabularStep for MnistTrainer {
         let loss_fn: gras::trainer::LossFn<'_> = &*self.loss_fn;
 
         let (x, y) = ctx.data.train_batch(step as u64)?;
-        // CHALLENGE: a decayed per-input roll, stronger for weak nets, linear to 0 at the budget.
+        // CHALLENGE: a decayed per-input roll, stronger for weak nets, linear to 0
+        // over the NET's OWN step count (`net_step`) — a late-born net is not
+        // handed the dregs of the knob the run clock would have left.
         let p_eff = gras::trainer::effective_challenge_prob(
             self.challenge_prob,
-            step,
+            ctx.env.net_step,
             ctx.env.max_steps,
             ChallengeDecay::Linear,
         );
@@ -292,8 +288,6 @@ fn jitter_inputs(
 
 /// Name recorded in `engine.json` (informational only).
 const RUN_NAME: &str = "mnist";
-/// Seed a fresh run uses when `--seed` is not passed; the record still wins on `--resume`.
-const RUN_SEED: Option<u64> = Some(16);
 /// Per-(net, step) chance an anti-plateau challenge fires (see `train_step`).
 const CHALLENGE_PROB: f32 = 0.15;
 
@@ -308,7 +302,8 @@ struct Cli {
     #[command(flatten)]
     engine: EngineArgs,
 
-    /// Pin the run seed (otherwise `RUN_SEED`); it is always recorded in `engine.json`.
+    /// Pin the run seed. Omitted, a fresh one is DRAWN and printed, so the run is
+    /// still replayable; `--resume` uses the recorded seed instead.
     #[arg(long, value_name = "U64")]
     seed: Option<u64>,
 
@@ -316,7 +311,9 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = 5)]
     mutation_novelty_draws: usize,
 
-    /// Drift on a crossover child's inherited genes (`0` = exact inheritance).
+    /// Drift on a crossover child's inherited genes — mask bits, activations, combine/standardize,
+    /// port activations, hidden width, the `input_reach` wiring gene and dropout (`0` = exact
+    /// inheritance).
     #[arg(long, value_name = "P", default_value_t = 0.1)]
     drift: f32,
 
@@ -369,18 +366,9 @@ impl std::ops::Deref for Cli {
 
 /// Wire the config → run the race; prints the verdict.
 fn main() {
-    // Default reporting shape when `--log-level` is not passed.
-    const LOG_LEVEL: LogLevel = LogLevel::Summ;
-
     let cli = <Cli as clap::Parser>::parse();
-
-    // The CLI level wins over the const when passed; `debug`/`trace` add the
-    // engine's per-roll detail on top of the same reporting shape.
-    let (log_level, log_verbosity) =
-        LogLevel::parse_verbose(&cli.log_level).unwrap_or((LOG_LEVEL, None));
-    // Install the run's log sinks — without this the console stays silent and
-    // the run LOOKS hung while the race grinds.
-    gras::engine::logging::init(log_level, log_verbosity);
+    // `--log-level` wins over the default reporting shape; the sinks are installed here.
+    let log_level = common::init_logging(&cli.log_level);
 
     // STEP A — data: resolve (or generate) it first; the data owns the widths.
     let data_dir = cli
@@ -392,14 +380,6 @@ fn main() {
     // STEP B — fitness: the reported accuracy IS the ranking input, maximized.
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
     let trainer = MnistTrainer::new(LABEL_SMOOTHING);
-
-    // Parent selection: a tournament of `--tournament-size` parents, or a roulette draw.
-    let selection = match cli.crossover_selection.as_str() {
-        "roulette" => SelectionMethod::Roulette,
-        _ => SelectionMethod::Tournament {
-            tournament_size: cli.tournament_size,
-        },
-    };
 
     // Informative metric: mean top-1/runner-up logit gap — one extra history.csv column.
     // Unused while `.set_run_metrics` is commented out below; uncomment both for the column.
@@ -419,58 +399,18 @@ fn main() {
         },
     )];
 
-    let mut builder = TabularRaceConfig::builder()
-        // SETUP
+    let config = common::engine_config(TabularRaceConfig::builder(), &cli.engine, log_level)
+        // This example's own half: the flags whose default is its identity.
         .set_run_name(cli.run_name.clone())
-        .set_run_log_level(log_level)
-        .set_run_checkpoint_every(cli.checkpoint_every)
-        .set_run_save_optim(cli.save_optim)
-        .set_run_csv_export(cli.csv_export)
-        .set_run_trace_file(cli.trace_file)
-        // .set_run_metrics(_metrics)`.
-        // POP
-        .set_pop_size(cli.pop)
-        .set_pop_init_probation_steps(cli.init_probation)
-        .set_pop_recovery_retries(cli.recovery_retries)
-        .set_pop_recovery_tol(cli.recovery_tol)
-        .set_pop_recovery_same_seed(cli.recovery_same_seed)
-        // FITNESS
-        .set_fitness_smoothing_window(cli.smoothing_window)
-        .set_fitness_policy_scoped(cli.policy_scoped_fitness)
-        .set_fitness_mean_type(cli.mean_type)
-        // TRAIN
-        .set_ticket_learn_only(cli.learn_only)
-        .set_ticket_p_min(cli.ticket_p_min)
-        .set_ticket_p_max(cli.ticket_p_max)
-        .set_train_ticket(cli.train_ticket)
-        // STOP
-        .set_stop_max_steps(cli.max_steps)
-        // `best_smoothed_fitness` is the window CENTRE, so the bar is 0.85 on accuracy.
-        .set_stop_custom(|snap| snap.best_smoothed_fitness > 0.85)
-        // CROSSOVER
-        .set_crossover_share(cli.crossover_turnover)
-        .set_crossover_cull_policy(cli.crossover_cull_policy)
-        .set_crossover_selection(selection)
-        .set_crossover_fitter_base(cli.crossover_fitter_base)
-        .set_crossover_ops_pool(cli.crossover_ops_pool.clone())
-        .set_crossover_probation_steps(cli.crossover_probation)
-        // MUTATION — its own turnover knob.
-        .set_mutation_share(cli.mutation_turnover)
-        .set_mutation_cull_policy(cli.mutation_cull_policy)
-        .set_mutation_novelty_min(cli.mutation_novelty_min)
-        .set_mutation_novelty_draws(cli.mutation_novelty_draws)
-        .set_mutation_probation_steps(cli.mutation_probation)
-        // TOPOLOGY
         .set_topology_drift(cli.drift)
-        .set_topology_min_hidden_num_nodes(cli.hidden_min)
         .set_topology_max_hidden_num_nodes(cli.hidden_max)
-        .set_topology_min_inputs_per_node(cli.inputs_min)
         .set_topology_max_inputs_per_node(cli.inputs_max)
-        .set_topology_min_outputs_per_node(cli.outputs_min)
         .set_topology_max_outputs_per_node(cli.outputs_max)
-        .set_topology_hidden_dim_range(cli.hidden_dim_min, cli.hidden_dim_max)
         .set_topology_hidden_dim_stride(cli.hidden_dim_stride)
         .set_topology_dropout_prob(cli.dropout)
+        .set_mutation_novelty_draws(cli.mutation_novelty_draws)
+        // `best_smoothed_fitness` is the window CENTRE, so the bar is 0.85 on accuracy.
+        // .set_stop_custom(|snap| snap.best_smoothed_fitness > 0.85)
         // The data's own widths: 784 pixels in, 10 labels out.
         .set_topology_input_dim(d_in)
         .set_topology_output_dim(d_out)
@@ -478,34 +418,30 @@ fn main() {
         .set_topology_combine_op_pool(cli.combine_op_pool.clone())
         .set_topology_activation_pool(cli.activation_pool.clone())
         .set_topology_standardize_op_pool(cli.standardize_pool.clone())
-        // ELITES
-        .set_champion_previous_load(cli.champion_previous_load)
-        .set_champion_count(cli.champion_count)
-        .set_champion_save_topology(cli.champion_save_topology)
-        .set_worst_save_topology(cli.worst_save_topology);
-
-    if let Some(dir) = &cli.champion_previous_dir {
-        builder = builder.set_champion_previous_dir(dir.clone());
-    }
-    let config = builder.build();
+        .build();
 
     // `--resume` continues a recorded run (its record wins); `--run-dir` names where a fresh one writes.
     let engine = match &cli.resume {
         // The record supplies pop, band and search space; a `--max-steps` here EXTENDS the budget.
         Some(dir) => TabularEngine::resume_from(dir.clone(), fitness, trainer).map(|mut engine| {
             // A resume EXTENDS a budget, never shrinks it: the flag is a floor on a recorded run.
-            let recorded = engine.max_steps().unwrap_or(cli.max_steps);
-            engine.set_stop_max_steps(recorded.max(cli.max_steps));
+            let budget = common::extended_budget(engine.max_steps(), cli.max_steps);
+            engine.set_stop_max_steps(budget);
             engine
         }),
-        None => TabularEngine::from_spec(RunSpec::tabular(
-            &data_dir,
-            config,
-            fitness,
-            trainer,
-            cli.seed.or(RUN_SEED),
-            cli.run_dir.clone(), // engine picks results/<timestamp> when unset
-        )),
+        None => {
+            // A fresh run with no `--seed` draws one — and SAYS so, because a
+            // random run is only reproducible if the number reaches the reader.
+            let run_seed = common::run_seed(cli.seed);
+            TabularEngine::from_spec(RunSpec::tabular(
+                &data_dir,
+                config,
+                fitness,
+                trainer,
+                Some(run_seed),
+                cli.run_dir.clone(), // engine picks results/<timestamp> when unset
+            ))
+        }
     };
 
     let mut engine = match engine {

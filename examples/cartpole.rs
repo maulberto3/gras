@@ -8,8 +8,8 @@ mod common;
 use fastrand::Rng;
 use gras::prelude::*;
 // Typed config words and the acting-rule switch are not in the engine prelude.
-use gras::trainer::reinforce::ActionRule;
 use common::EngineArgs;
+use gras::trainer::reinforce::ActionRule;
 
 // ═══ SECTION 1 — THE ENVIRONMENT (an `Env`) ════════════════════════════
 
@@ -167,7 +167,8 @@ const CHALLENGE_PROB: f32 = 0.1;
 /// What a fired challenge forces: `Random` holds one drawn action for the whole
 /// episode, `LeastAction` re-picks the policy's least-preferred action per turn.
 const CHALLENGE_POLICY: ChallengePolicy = ChallengePolicy::LeastAction;
-/// Challenge decay shape: eff = p × (1 − progress^k).
+/// Challenge decay shape: eff = p × (1 − progress^k), where progress is the NET's
+/// own step count over the budget (`net_step`), not the run clock.
 const CHALLENGE_DECAY_EXPONENT: f32 = 0.5;
 /// Default trainer signal: `turns` ranks on episode length (integer ties), `return` on the reward total.
 const SIGNAL: Signal = Signal::Turns;
@@ -303,7 +304,8 @@ struct Cli {
     #[arg(long, value_name = "T", default_value_t = ACTING_TEMPERATURE)]
     softmax_temperature: f32,
 
-    /// Chance a slot of an inherited circuit (mask, activation, combine, standardize, dropout) is re-drawn.
+    /// Chance a slot of an inherited circuit (mask, activation, combine, standardize, dropout,
+    /// port activation, hidden width, the `input_reach` wiring gene) is re-drawn.
     #[arg(long, value_name = "P", default_value_t = 0.05)]
     drift: f32,
 
@@ -342,21 +344,11 @@ impl std::ops::Deref for Cli {
 
 /// Wire the config → run the race; prints where the artifacts landed.
 fn main() {
-    // Default reporting shape when `--log-level` is not passed.
-    const LOG_LEVEL: LogLevel = LogLevel::Summ;
-
     let cli = <Cli as clap::Parser>::parse();
-    // A fresh seed per launch unless `--seed` pins it.
-    let run_seed = cli.seed.unwrap_or_else(|| fastrand::u64(..));
-
-    // The CLI level wins over the const when passed; `debug`/`trace` add the
-    // engine's per-roll detail on top of the same reporting shape.
-    let (log_level, log_verbosity) =
-        LogLevel::parse_verbose(&cli.log_level).unwrap_or((LOG_LEVEL, None));
-
-    // Install the run's log sinks — without this the console stays silent and
-    // the run LOOKS hung while the race grinds.
-    gras::engine::logging::init(log_level, log_verbosity);
+    // A fresh seed per launch unless `--seed` pins it (shared with mnist).
+    let run_seed = common::run_seed(cli.seed);
+    // `--log-level` wins over the default reporting shape; the sinks are installed here.
+    let log_level = common::init_logging(&cli.log_level);
 
     let device = gras::auto_device();
 
@@ -374,82 +366,26 @@ fn main() {
     let baseline = random_baseline(20);
     println!("baseline: random policy survives {baseline:.1} turns (race must beat this)");
 
-    // Parent selection: a tournament of `--tournament-size` parents, or a roulette draw.
-    let selection = match cli.crossover_selection.as_str() {
-        "roulette" => SelectionMethod::Roulette,
-        _ => SelectionMethod::Tournament {
-            tournament_size: cli.tournament_size,
-        },
-    };
-
-    let mut builder = rl_race_config_builder()
-        // SETUP
+    let config = common::engine_config(rl_race_config_builder(), &cli.engine, log_level)
+        // This example's own half: the flags whose default is its identity.
         .set_run_name(cli.run_name.clone())
-        .set_run_log_level(log_level)
-        .set_run_checkpoint_every(cli.checkpoint_every)
-        .set_run_save_optim(cli.save_optim)
-        .set_run_csv_export(cli.csv_export)
-        .set_run_trace_file(cli.trace_file)
-        // .set_run_metrics(vec![…])`.
-        // POP
-        .set_pop_size(cli.pop)
-        .set_pop_init_probation_steps(cli.init_probation)
-        .set_pop_recovery_retries(cli.recovery_retries)
-        .set_pop_recovery_tol(cli.recovery_tol)
-        .set_pop_recovery_same_seed(cli.recovery_same_seed)
-        // FITNESS
-        .set_fitness_smoothing_window(cli.smoothing_window)
-        .set_fitness_policy_scoped(cli.policy_scoped_fitness)
-        .set_fitness_mean_type(cli.mean_type)
-        // TRAIN
-        .set_ticket_learn_only(cli.learn_only)
-        .set_ticket_p_min(cli.ticket_p_min)
-        .set_ticket_p_max(cli.ticket_p_max)
-        .set_train_ticket(cli.train_ticket)
-        // STOP
-        .set_stop_max_steps(cli.max_steps)
-        .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
-        // CROSSOVER
-        .set_crossover_share(cli.crossover_turnover)
-        .set_crossover_cull_policy(cli.crossover_cull_policy)
-        .set_crossover_selection(selection)
-        .set_crossover_fitter_base(cli.crossover_fitter_base)
-        .set_crossover_ops_pool(cli.crossover_ops_pool.clone())
-        .set_crossover_probation_steps(cli.crossover_probation)
-        // MUTATION — its own turnover knob.
-        .set_mutation_share(cli.mutation_turnover)
-        .set_mutation_cull_policy(cli.mutation_cull_policy)
-        .set_mutation_novelty_min(cli.mutation_novelty_min)
-        .set_mutation_novelty_draws(cli.mutation_novelty_draws)
-        .set_mutation_probation_steps(cli.mutation_probation)
-        // TOPOLOGY
         .set_topology_drift(cli.drift)
-        .set_topology_min_hidden_num_nodes(cli.hidden_min)
         .set_topology_max_hidden_num_nodes(cli.hidden_max)
-        .set_topology_min_inputs_per_node(cli.inputs_min)
         .set_topology_max_inputs_per_node(cli.inputs_max)
-        .set_topology_min_outputs_per_node(cli.outputs_min)
         .set_topology_max_outputs_per_node(cli.outputs_max)
-        .set_topology_hidden_dim_range(cli.hidden_dim_min, cli.hidden_dim_max)
         .set_topology_hidden_dim_stride(cli.hidden_dim_stride)
         .set_topology_dropout_prob(cli.dropout)
+        .set_mutation_novelty_draws(cli.mutation_novelty_draws)
+        // The solved bar: the window CENTRE above 400 of 500 turns.
+        .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
         .set_topology_input_dim(input_dim)
         .set_topology_output_dim(ACTIONS)
         // A one-entry pool pins a policy — the same call `set_topology_feature_split` makes.
-        .set_topology_feature_split_pool(cli.feature_split_pool.clone())
+        // .set_topology_feature_split_pool(cli.feature_split_pool.clone())
         // .set_topology_combine_op_pool(cli.combine_op_pool.clone())
         // .set_topology_activation_pool(cli.activation_pool.clone())
         // .set_topology_standardize_op_pool(cli.standardize_pool.clone())
-        // ELITES
-        .set_champion_previous_load(cli.champion_previous_load)
-        .set_champion_count(cli.champion_count)
-        .set_champion_save_topology(cli.champion_save_topology)
-        .set_worst_save_topology(cli.worst_save_topology);
-
-    if let Some(dir) = &cli.champion_previous_dir {
-        builder = builder.set_champion_previous_dir(dir.clone());
-    }
-    let config = builder.build();
+        .build();
 
     // The fitness metric to be reported and optimized: "match_survival" by default.
     let fitness = Fitness::reported(Direction::Maximize, "match_survival");
@@ -490,8 +426,8 @@ fn main() {
         // The record supplies pop, band and search space; a `--max-steps` here EXTENDS the budget.
         Some(dir) => RlEngine::resume_from(dir.clone(), fitness, trainer).map(|mut engine| {
             // A resume EXTENDS a budget, never shrinks it: the flag is a floor on a recorded run.
-            let recorded = engine.max_steps().unwrap_or(cli.max_steps);
-            engine.set_stop_max_steps(recorded.max(cli.max_steps));
+            let budget = common::extended_budget(engine.max_steps(), cli.max_steps);
+            engine.set_stop_max_steps(budget);
             engine
         }),
         None => RlEngine::from_spec(RunSpec::rl(
@@ -506,15 +442,11 @@ fn main() {
     let mut engine = match engine {
         Ok(engine) => engine,
         // Structural impossibilities are refused by name — print the reason as a usage error.
-        Err(e) => {
-            eprintln!("engine construction failed: {e}");
-            std::process::exit(2);
-        }
+        Err(e) => common::die(format!("engine construction failed: {e}")),
     };
 
     match engine.run() {
         Ok(reason) => println!("race stopped: {reason:?}"),
         Err(e) => eprintln!("race error: {e}"),
     }
-
 }
