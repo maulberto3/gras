@@ -133,7 +133,7 @@ fn engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::Tabular
     },
         ..RaceConfig::defaults()
     };
-    crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+    crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
         data_dir,
         config,
         fitness(),
@@ -312,7 +312,7 @@ fn select_random_victim_is_deterministic_and_alive() {
     let dir = std::env::temp_dir().join("race_random_victim");
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 42).unwrap();
-    engine.config.evolution.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::Random;
+    engine.config.evolution.crossover_cull_policy = crate::engine::breed::cull::CrossCullPolicy::Random;
     // Channel probation 0: this test pins the DRAW's determinism, not the shield
     // (see `probation_shields_*`).
     engine.config.population.mutation_probation_steps = 0;
@@ -393,7 +393,7 @@ fn step_clock_continues_past_the_recorded_clock_not_the_training_count() {
 
 #[test]
 fn a_share_deals_a_rounded_count_of_the_population_every_clock() {
-    use crate::engine::evolve::share_rolls;
+    use crate::engine::breed::evolve::share_rolls;
     // 10% of pop 100 = 10 rolls, and the SAME 10 every clock: no carry, no cursor to persist, so
     // a resumed run deals exactly the rolls its twin did.
     assert_eq!(share_rolls(0.10, 100), 10);
@@ -414,7 +414,7 @@ fn a_share_deals_a_rounded_count_of_the_population_every_clock() {
 
 #[test]
 fn the_share_is_the_only_turnover_knob_and_the_channels_are_independent() {
-    use crate::engine::evolve::RollKind;
+    use crate::engine::breed::evolve::RollKind;
     let dir = std::env::temp_dir().join("gras_roll_share_wiring");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 32).unwrap();
@@ -756,7 +756,7 @@ impl crate::trainer::RlStep for ChallengingRlTrainer {
 }
 /// RL-mode engine harness: no dataset, no stream, `RunMode::Rl`.
 fn rl_engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::RlEngine> {
-    crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
+    crate::engine::RlEngine::from_spec(crate::engine::start::run_spec::RunSpec::rl(
         rl_config(0),
         crate::utils::fitness::Fitness::reported(
             crate::utils::fitness::Direction::Maximize,
@@ -839,7 +839,7 @@ fn rl_resume_then_continue_matches_uninterrupted_twin() {
 fn reinforce_replays_identically_under_the_engine() {
     fn run(dir: &std::path::Path) -> Vec<(String, Option<crate::state::NetMetrics>)> {
         let _ = std::fs::remove_dir_all(dir);
-        let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
+        let mut eng = crate::engine::RlEngine::from_spec(crate::engine::start::run_spec::RunSpec::rl(
             rl_config(0),
             crate::utils::fitness::Fitness::reported(
                 crate::utils::fitness::Direction::Maximize,
@@ -903,7 +903,7 @@ fn trainer_owned_challenge_trigger_fires_inside_train_step() {
     let dir = std::env::temp_dir().join("gras-challenge-signal");
     let _ = std::fs::remove_dir_all(&dir);
     let cfg = rl_config(0);
-    let mut eng = crate::engine::RlEngine::from_spec(crate::engine::run_spec::RunSpec::rl(
+    let mut eng = crate::engine::RlEngine::from_spec(crate::engine::start::run_spec::RunSpec::rl(
         cfg,
         crate::utils::fitness::Fitness::reported(
             crate::utils::fitness::Direction::Maximize,
@@ -972,7 +972,7 @@ fn rl_spec_derives_rl_mode_without_declaration() {
     },
         ..RaceConfig::defaults()
     };
-    let spec = crate::engine::run_spec::RunSpec::rl(
+    let spec = crate::engine::start::run_spec::RunSpec::rl(
         config,
         crate::utils::fitness::Fitness::reported(
             crate::utils::fitness::Direction::Maximize,
@@ -983,10 +983,10 @@ fn rl_spec_derives_rl_mode_without_declaration() {
         Some(dir.clone()),
     );
     let spec = match spec {
-        crate::engine::run_spec::RunSpec::RL(mut s) => {
+        crate::engine::start::run_spec::RunSpec::RL(mut s) => {
             s.config.topology.options.input_dim = Some(1);
             s.config.topology.options.output_dim = Some(1);
-            crate::engine::run_spec::RunSpec::RL(s)
+            crate::engine::start::run_spec::RunSpec::RL(s)
         }
         other => other,
     };
@@ -1028,7 +1028,7 @@ fn rl_spec_rejects_computed_fitness() {
     },
         ..config
     };
-    let spec = crate::engine::run_spec::RunSpec::rl(
+    let spec = crate::engine::start::run_spec::RunSpec::rl(
         config,
         fitness(), // Computed — WRONG for RL
         TestRlTrainer,
@@ -1069,7 +1069,7 @@ fn a_bad_pool_name_is_refused_at_construction_not_widened() {
     },
         ..RaceConfig::defaults()
     };
-    let spec = crate::engine::run_spec::RunSpec::rl(
+    let spec = crate::engine::start::run_spec::RunSpec::rl(
         config,
         crate::utils::fitness::Fitness::reported(
             crate::utils::fitness::Direction::Maximize,
@@ -1693,7 +1693,7 @@ fn resume_keeps_the_recorded_eval_era_when_the_tick_cadence_changes() {
     // …and the recorded value is not a constant: a fresh engine uses its own cadence.
     let fresh_dir = std::env::temp_dir().join("race_eval_era_fresh");
     let _ = std::fs::remove_dir_all(&fresh_dir);
-    let fresh = crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+    let fresh = crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
         tiny_dataset_dir("fresh-era"),
         {
             let mut c = RaceConfig::defaults();
@@ -2317,7 +2317,7 @@ fn trainer_state_rides_the_net_envelope_and_continues_after_a_resume() {
 
     let restores = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut engine =
-        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+        crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
             data_dir.clone(),
             construction,
             fitness(),
@@ -2492,7 +2492,7 @@ fn a_named_lr_schedule_survives_a_resume_and_matches_the_twin() {
     let build = |dir: &std::path::Path, stop: bool| {
         let mut config = cfg(stop);
         config.population.pop_size = 0; // the test seeds its own tiny topologies
-        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+        crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
             tiny_dataset_dir("schedule"),
             config,
             fitness(),
@@ -2812,7 +2812,7 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
     // This test grades one ORDERING, so it pins it: worst-first × fewest-updates (the engine's
     // default is `most_fit_fewest_updates` now, which pays the other end of the FIT axis).
     eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
-    eng.config.evolution.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::HighestTicketChance;
+    eng.config.evolution.crossover_cull_policy = crate::engine::breed::cull::CrossCullPolicy::HighestTicketChance;
 
     // Worst-first (pinned above), so the worst net has the highest `p` and is the one evicted.
     assert_eq!(
@@ -2824,7 +2824,7 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
     // The mutation channel's `Unfed` arm runs the SAME selector: a net the lottery
     // starves loses its place to an immigrant too, not only to a crossover child.
     eng.config.evolution.mutation_cull_policy =
-        crate::engine::cull::MutationCullPolicy::HighestTicketChance;
+        crate::engine::breed::cull::MutationCullPolicy::HighestTicketChance;
     assert_eq!(
         eng.select_mutation_victim(5, 0).unwrap().as_deref(),
         Some(hashes[2].as_str())
@@ -2896,7 +2896,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     // Pinned: worst-first × fewest-updates, the ordering this test's two victims name.
     eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
     eng.config.lottery.train_merit_p_min = 0.0;
-    eng.config.evolution.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::HighestTicketChance;
+    eng.config.evolution.crossover_cull_policy = crate::engine::breed::cull::CrossCullPolicy::HighestTicketChance;
     assert_eq!(
         eng.select_highest_ticket_chance_victim()
             .unwrap()
@@ -2906,7 +2906,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     );
 
     eng.config.evolution.crossover_cull_policy =
-        crate::engine::cull::CrossCullPolicy::LowestFitnessMostUpdates;
+        crate::engine::breed::cull::CrossCullPolicy::LowestFitnessMostUpdates;
     assert_eq!(
         eng.select_lowest_fitness_most_updates_victim()
             .unwrap()
@@ -2916,7 +2916,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     );
     // The mutation channel's `Spent` arm runs the SAME selector.
     eng.config.evolution.mutation_cull_policy =
-        crate::engine::cull::MutationCullPolicy::LowestFitnessMostUpdates;
+        crate::engine::breed::cull::MutationCullPolicy::LowestFitnessMostUpdates;
     assert_eq!(
         eng.select_mutation_victim(5, 0).unwrap().as_deref(),
         Some(hashes[1].as_str())
@@ -3693,14 +3693,14 @@ fn resume_warns_on_a_cull_policy_mismatch_on_both_channels() {
     // `lowest_fitness` has no drift.
     let mut same = RaceConfig::defaults();
     same.population.pop_size = 2;
-    same.evolution.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::LowestFitness;
+    same.evolution.crossover_cull_policy = crate::engine::breed::cull::CrossCullPolicy::LowestFitness;
     let resumed = resume(same).expect("a blanked legacy policy must resume");
     assert!(resumed.behavioural_drift().is_empty());
     drop(resumed);
 
     let mut cross = RaceConfig::defaults();
     cross.population.pop_size = 2;
-    cross.evolution.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::Random;
+    cross.evolution.crossover_cull_policy = crate::engine::breed::cull::CrossCullPolicy::Random;
     let resumed = resume(cross).expect("a cull policy is behavioural: warn, never refuse");
     let drift = resumed.behavioural_drift();
     let row = drift
@@ -3717,7 +3717,7 @@ fn resume_warns_on_a_cull_policy_mismatch_on_both_channels() {
 
     let mut mutp = RaceConfig::defaults();
     mutp.population.pop_size = 2;
-    mutp.evolution.mutation_cull_policy = crate::engine::cull::MutationCullPolicy::Random;
+    mutp.evolution.mutation_cull_policy = crate::engine::breed::cull::MutationCullPolicy::Random;
     let resumed = resume(mutp).expect("the mutation channel warns on the same terms");
     let drift = resumed.behavioural_drift();
     let row = drift
@@ -3973,7 +3973,7 @@ fn explicit_train_test_dirs_build_disjoint_pools() {
         ..RaceConfig::defaults()
     };
     let mut eng =
-        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+        crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
             data_dir.clone(),
             config,
             fitness(),
@@ -4055,7 +4055,7 @@ fn founder_topology_loader_reads_netstate_json() {
         .next()
         .unwrap()
         .path();
-    let topo = crate::engine::population::run_topology_from_json_file(&state_path).unwrap();
+    let topo = crate::engine::founding::population::run_topology_from_json_file(&state_path).unwrap();
     assert_eq!(
         topo.to_json().unwrap(),
         tiny_topology(7).to_json().unwrap(),
@@ -4116,7 +4116,7 @@ fn seeded_engine(
     },
         ..RaceConfig::defaults()
     };
-    crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+    crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
         data_dir,
         config,
         fitness(),
@@ -4222,7 +4222,7 @@ fn champion_previous_load_is_on_by_default_and_can_be_turned_off() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 7).unwrap();
     eng.config.population.pop_size = 2;
-    let topos = crate::engine::population::fill_unique(
+    let topos = crate::engine::founding::population::fill_unique(
         &eng.config,
         eng.run_seed(),
         Vec::new(),
@@ -4249,7 +4249,7 @@ fn champion_previous_load_is_on_by_default_and_can_be_turned_off() {
     },
         ..RaceConfig::defaults()
     };
-    let eng = crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+    let eng = crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
         tiny_dataset_dir("seedprior-optout"),
         config,
         fitness(),
@@ -4496,7 +4496,7 @@ fn streak_engine(
     };
     tweak(&mut config);
     let mut eng =
-        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+        crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
             tiny_dataset_dir("recovery-streak"),
             config,
             fitness(),
@@ -4993,7 +4993,7 @@ fn eval_share_sizes_the_pools_and_survives_a_header_rewrite() {
         ..RaceConfig::defaults()
     };
     let mut eng =
-        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+        crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
             data_dir,
             config,
             fitness(),
@@ -5052,7 +5052,7 @@ fn a_train_val_test_layout_ranks_on_val_and_reports_on_test() {
         ..RaceConfig::defaults()
     };
     let engine =
-        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+        crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
             data_dir.clone(),
             config,
             fitness(),
@@ -5128,7 +5128,7 @@ fn exam_rows_stay_out_of_the_run_tensor_and_are_scored_once_at_stop() {
         ..RaceConfig::defaults()
     };
     let mut engine =
-        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+        crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
             data_dir.clone(),
             config,
             fitness(),
@@ -5196,7 +5196,7 @@ fn resume_refuses_a_different_exam_store() {
         ..RaceConfig::defaults()
     };
     let mut engine =
-        crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
+        crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
             data_dir.clone(),
             config,
             fitness(),

@@ -5,7 +5,7 @@ pub(crate) use flodl::tensor::Result;
 pub(crate) use std::collections::HashMap;
 pub(crate) use tracing::{debug, info};
 
-pub(crate) use crate::engine::evolve::RollKind;
+pub(crate) use crate::engine::breed::evolve::RollKind;
 pub(crate) use crate::evolution::selection::SelectionMethod;
 pub(crate) use crate::graph::network::Network;
 pub(crate) use crate::state::{
@@ -245,10 +245,10 @@ impl CoreEngine {
         &self.run_dir
     }
 
-    /// Start a race from a [`RunSpec`](crate::engine::run_spec::RunSpec) — the entire argument surface. The engine loads
+    /// Start a race from a [`RunSpec`](crate::engine::start::run_spec::RunSpec) — the entire argument surface. The engine loads
     /// data, derives the run dir, resolves a seed and writes the self-contained header.
-    pub fn from_spec(spec: crate::engine::run_spec::RunSpec) -> Result<Self> {
-        use crate::engine::run_spec::RunSpec as RS;
+    pub fn from_spec(spec: crate::engine::start::run_spec::RunSpec) -> Result<Self> {
+        use crate::engine::start::run_spec::RunSpec as RS;
         let (config, fitness, trainer, seed, run_dir, tabular_data_dir) = match spec {
             RS::Tabular(s) => (
                 s.config,
@@ -448,7 +448,7 @@ impl CoreEngine {
                 .and_then(|v| v.as_str());
             // `max_seeds = pop_size`: the WHOLE elite list comes over in rank order,
             // founders are the source's own ranking, never a reshuffle
-            match super::seed::resolve_plan(
+            match super::founding::seed::resolve_plan(
                 config.run.champion_previous_dir.as_deref(),
                 // This run's own dir already exists on disk (the header
                 // written above), so it would otherwise be "the newest run".
@@ -459,7 +459,7 @@ impl CoreEngine {
                 trainer_name,
                 config.population.pop_size,
             ) {
-                super::seed::SeedOutcome::Seeded(plan) => {
+                super::founding::seed::SeedOutcome::Seeded(plan) => {
                     let champ = plan.champion();
                     let short = &champ.champion_hash[..8.min(champ.champion_hash.len())];
                     let n = plan.picks.len();
@@ -508,7 +508,7 @@ impl CoreEngine {
                         elite_hashes,
                     });
                 }
-                super::seed::SeedOutcome::Skipped(why) => {
+                super::founding::seed::SeedOutcome::Skipped(why) => {
                     // Deliberately a plain emit: a fact about what the run INHERITED must be
                     // visible at any log level. The run continues all-random either way.
                     crate::utils::cfy::emit_always(&crate::utils::cfy::card(
@@ -523,7 +523,7 @@ impl CoreEngine {
             }
         }
         let initial_topologies =
-            super::population::fill_unique(&config, run_seed, founders, config.population.pop_size);
+            super::founding::population::fill_unique(&config, run_seed, founders, config.population.pop_size);
         // Every seeded slot is labeled by origin, so `nets/*.json` and `attempts.csv` say
         // which source elite it came from instead of a bare `founder-N`.
         let initial_topologies: Vec<(crate::graph::topology::Topology, Option<String>)> =

@@ -478,7 +478,7 @@ impl CoreEngine {
         &self,
         state: NetState,
         _clock: usize,
-    ) -> Result<crate::engine::child::RaceChild> {
+    ) -> Result<crate::engine::breed::child::RaceChild> {
         let topo = state.topology()?;
         let mut net = crate::graph::network::Network::build(&topo, self.config.device())?;
         let nets = self.run_dir.join("nets");
@@ -507,7 +507,7 @@ impl CoreEngine {
         } else {
             self.trainer.make_optimizer(&net)
         };
-        Ok(crate::engine::child::RaceChild {
+        Ok(crate::engine::breed::child::RaceChild {
             state,
             net,
             optimizer,
@@ -521,7 +521,7 @@ impl CoreEngine {
     /// recorded readings so the smoothed stats are warm on resume, not cold.
     pub(crate) fn insert_replayed(
         &mut self,
-        child: crate::engine::child::RaceChild,
+        child: crate::engine::breed::child::RaceChild,
         history: &HashMap<String, crate::engine::clock::smoothing::HistoryReplay>,
     ) -> (String, usize) {
         let hash = child.state.hash.clone();
