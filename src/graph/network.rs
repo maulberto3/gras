@@ -1053,8 +1053,8 @@ mod tests {
     #[test]
     fn same_gene_ignores_input_width_but_not_output_width() {
         let n = Node::new_hidden(1, 2, 2);
-        assert!(crate::engine::child::same_gene(&n, (4, 16), &n, (64, 16)));
-        assert!(!crate::engine::child::same_gene(&n, (4, 16), &n, (64, 32)));
+        assert!(crate::engine::breed::child::same_gene(&n, (4, 16), &n, (64, 16)));
+        assert!(!crate::engine::breed::child::same_gene(&n, (4, 16), &n, (64, 32)));
     }
 
     fn rand_input(batch: i64, input_dim: usize) -> Variable {
