@@ -32,8 +32,6 @@ use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use super::config::LogLevel;
-
 /// Target the `Minimal` vitals frame rides on: the console layer skips
 /// frame layer renders it and nothing else.
 pub const FRAME_TARGET: &str = "gras::frame";
@@ -260,5 +258,75 @@ impl Visit for FrameField {
         if field.name() == "frame" {
             self.0 = Some(format!("{value:?}"));
         }
+    }
+}
+
+/// Per-step log verbosity for the race engine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogLevel {
+    /// Silent per step: only the run start line and final stop reason print —
+    /// fastest I/O path for users who parse `engine.json`.
+    None,
+    /// One compact line per step: pop size, loss range+mean, fitness range+mean,
+    /// plus a short evolve note on the same line when crossover/mutation fires.
+    #[default]
+    Summ,
+    /// A boxed table per step (from step 2): rollup stats with deltas, evolve counters,
+    /// and the current best net. No per-net detail, no separate rollup line.
+    Minimal,
+}
+
+impl LogLevel {
+    /// Parse the engine's own level name (`none`/`summ`/`minimal`, case-insensitive) —
+    /// the vocabulary of the examples' `--log-level` flag.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "silent" => Some(LogLevel::None),
+            "summ" | "summary" => Some(LogLevel::Summ),
+            "minimal" => Some(LogLevel::Minimal),
+            _ => None,
+        }
+    }
+
+    /// Parse a CLI log level into the pair `logging::init` takes: the engine's reporting
+    /// SHAPE plus an optional tracing verbosity (`--log-level debug` keeps Summ's detail).
+    pub fn parse_verbose(raw: &str) -> Option<(Self, Option<&'static str>)> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "debug" => Some((LogLevel::Summ, Some("debug"))),
+            "trace" => Some((LogLevel::Summ, Some("trace"))),
+            other => LogLevel::parse(other).map(|level| (level, None)),
+        }
+    }
+
+    /// The `tracing` verbosity the console layer is built with: `Summ` prints the engine's `info!`
+    /// lines; `Minimal`/`None` mute them (`warn`) — the framed vitals table rides its own target,
+    pub fn env_filter(self) -> &'static str {
+        match self {
+            LogLevel::Summ => "info",
+            LogLevel::Minimal | LogLevel::None => "warn",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LogLevel;
+
+    /// The examples' `--log-level` vocabulary must parse: handed to an `EnvFilter` verbatim, `summ`
+    /// would be read as a module name and mute the whole run — this mapping is load-bearing.
+    #[test]
+    fn log_level_names_parse_to_a_visible_verbosity() {
+        assert_eq!(LogLevel::parse("summ"), Some(LogLevel::Summ));
+        assert_eq!(LogLevel::parse("SUMM"), Some(LogLevel::Summ));
+        assert_eq!(LogLevel::parse("minimal"), Some(LogLevel::Minimal));
+        assert_eq!(LogLevel::parse("none"), Some(LogLevel::None));
+        assert_eq!(
+            LogLevel::parse("debug"),
+            None,
+            "tracing levels pass through"
+        );
+        assert_eq!(LogLevel::Summ.env_filter(), "info");
+        assert_eq!(LogLevel::Minimal.env_filter(), "warn");
+        assert_eq!(LogLevel::None.env_filter(), "warn");
     }
 }

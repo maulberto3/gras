@@ -1,236 +1,28 @@
-//! The step-race knob surface: `RaceConfig`, `StopReason`, the pluggable stop closure alias,
-//! read-only `RaceSnapshot`, and the run-level context stamped into every net's `meta` block
+//! The aggregate run config: `RaceConfig` + its builder, defaults and snapshot round-trip.
+//! Family vocabulary (stop, lottery, smoothing, cull, mode) lives with its family and is
+//! re-exported here so every `engine::config::*` path keeps resolving.
 
 use crate::evolution::selection::SelectionMethod;
 use crate::graph::topology::FeatureSplitPolicy;
 use crate::utils::fitness::Metric;
 
-/// What the scheduler checks to decide whether to stop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StopReason {
-    /// The configured step budget was reached.
-    MaxSteps,
-    /// A user-supplied `custom_stop` closure returned true (Iter 5 pluggable
-    /// contract; consulted after all built-ins).
-    CustomStop,
-    /// Ctrl+C received: the step was abandoned at the loop boundary and the race shut
-    /// down through the SAME artifact path. Always
-    Interrupted,
-}
+pub use super::cull::{CrossCullPolicy, MutationCullPolicy};
+pub use super::logging::LogLevel;
+pub use super::lottery::{
+    DEFAULT_TRAIN_MERIT_LEARN_ONLY, DEFAULT_TRAIN_MERIT_P_MAX, DEFAULT_TRAIN_MERIT_P_MIN,
+    DEFAULT_TRAIN_TICKET, TrainTicket,
+};
+pub use super::novelty::{DEFAULT_MUTATION_NOVELTY_DRAWS, DEFAULT_MUTATION_NOVELTY_MIN};
+pub use super::run_spec::{ModeConfig, RunMode};
+pub use super::smoothing::{DEFAULT_MEAN_TYPE, MeanType, SMOOTHING_WINDOW};
+pub use super::stop::{DEFAULT_MAX_STEPS, RaceSnapshot, StopFn, StopReason};
+pub use crate::evolution::crossover::CrossoverOp;
+pub use crate::graph::topology::{
+    DEFAULT_HIDDEN_DIM_STRIDE, DEFAULT_HIDDEN_POOL, DEFAULT_TOPOLOGY_DRIFT,
+};
+pub use crate::state::RunMetaCtx;
 
 // ── Consolidated defaults (one place for all engine constants) ────────────────────
-
-/// Per-net smoothed-fitness rolling window (K) — the span every ranking decision averages over.
-pub const SMOOTHING_WINDOW: usize = 5;
-
-/// How the smoothing window's readings are averaged into the ranking centre (`set_fitness_mean_type`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-pub enum MeanType {
-    /// The weighted window mean — the plain average, the pre-knob ranking.
-    Arithmetic,
-    /// `g(x) = sign(x)·ln(1 + |x|)`: centre and spread are taken in that compressed space
-    /// score is mapped back, so one spike cannot dominate the window the way it does through
-    SignedLog,
-    /// The WEIGHTED MEDIAN: no single reading can move the centre at all; the spread is the medians absolute deviation scaled by `1.4826`, so a median spread stays comparable…
-    #[default]
-    Median,
-}
-
-impl MeanType {
-    /// The spelling `engine.json` records and the log prints.
-    pub fn as_str(&self) -> &'static str {
-        (*self).into()
-    }
-
-    /// Parse a recorded spelling. Unknown (and `""` from a header written before the
-    /// knob) yields `None`, which every caller reads as [`DEFAULT_MEAN_TYPE`].
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "arithmetic" | "mean" | "simple" | "average" => Some(MeanType::Arithmetic),
-            "signed_log" | "signedlog" | "signed-log" | "log1p" => Some(MeanType::SignedLog),
-            "median" => Some(MeanType::Median),
-            _ => None,
-        }
-    }
-}
-
-impl std::fmt::Display for MeanType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// The ranking family a command line names, so a flag can be a typed `MeanType` rather than a
-/// string the caller has to parse (the same contract the cull policies use).
-impl std::str::FromStr for MeanType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        MeanType::parse(s)
-            .ok_or_else(|| format!("{s}: expected one of arithmetic, signed_log, median"))
-    }
-}
-
-/// Default [`MeanType`] — the WEIGHTED MEDIAN: one spike cannot promote or demote a net on a
-/// fluke. `arithmetic` is the older plain-window ranking.
-pub const DEFAULT_MEAN_TYPE: MeanType = MeanType::Median;
-
-/// The lottery's two LEGS (`set_train_ticket`): which fit PLACE earns the most tickets, and which side of the UPDATES field the ticket multiplies in.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-pub enum TrainTicket {
-    /// The fittest net earns the most tickets; the updates leg is OFF (`Fm⁺`).
-    MostFit,
-    /// The fittest net that has trained the LEAST earns the most tickets (`Fm⁺ × Um⁻`) — the engine default ([`DEFAULT_TRAIN_TICKET`]): pay the net that grades best and has had…
-    #[default]
-    MostFitFewestUpdates,
-    /// The fittest net that has trained the MOST earns the most tickets (`Fm⁺ × Um⁺`).
-    MostFitMostUpdates,
-    /// The LEAST fit net that has trained the LEAST earns the most tickets (`Fm⁻ × Um⁻`) — the
-    /// reference run's tuned leg.
-    LeastFitFewestUpdates,
-    /// The LEAST fit net that has trained the MOST earns the most tickets (`Fm⁻ × Um⁺`).
-    LeastFitMostUpdates,
-    /// The LEAST fit net earns the most tickets; the updates leg is OFF (`Fm⁻`).
-    LeastFit,
-}
-
-impl TrainTicket {
-    /// Every leg, in the order the docs, the CLI help and the error messages list them — ONE
-    /// list, so a surface handed an unknown spelling names the real set instead of a retyped copy.
-    pub const ALL: [TrainTicket; 6] = [
-        TrainTicket::MostFit,
-        TrainTicket::MostFitFewestUpdates,
-        TrainTicket::MostFitMostUpdates,
-        TrainTicket::LeastFitFewestUpdates,
-        TrainTicket::LeastFitMostUpdates,
-        TrainTicket::LeastFit,
-    ];
-
-    /// [`Self::ALL`] as the spellings [`Self::as_str`] prints, for messages that list the choices.
-    pub const ALL_NAMES: [&str; 6] = [
-        "most_fit",
-        "most_fit_fewest_updates",
-        "most_fit_most_updates",
-        "least_fit_fewest_updates",
-        "least_fit_most_updates",
-        "least_fit",
-    ];
-
-    /// The spelling `engine.json` records, the CLI accepts and the log prints.
-    pub fn as_str(self) -> &'static str {
-        self.into()
-    }
-
-    /// Parse a recorded or typed spelling: case, spaces and hyphens fold to `_`, so `Least-Fit Fewest Updates` reads as `least_fit_fewest_updates`. `None` = not a leg, which…
-    pub fn parse(raw: &str) -> Option<Self> {
-        let key = raw.trim().to_ascii_lowercase().replace([' ', '-'], "_");
-        match key.as_str() {
-            "most_fit" | "best_fit" => Some(TrainTicket::MostFit),
-            "most_fit_most_updates" | "best_most" => Some(TrainTicket::MostFitMostUpdates),
-            "most_fit_fewest_updates" | "most_fit_least_updates" | "best_fewest" => {
-                Some(TrainTicket::MostFitFewestUpdates)
-            }
-            "least_fit" | "worst_fit" => Some(TrainTicket::LeastFit),
-            "least_fit_most_updates" | "worst_most" => Some(TrainTicket::LeastFitMostUpdates),
-            "least_fit_fewest_updates" | "least_fit_least_updates" | "worst_fewest" => {
-                Some(TrainTicket::LeastFitFewestUpdates)
-            }
-            _ => None,
-        }
-    }
-
-    /// Does the ticket pay the LEAST fit net? `true` mirrors the place (`Fm⁻`).
-    pub fn fitness_inverted(self) -> bool {
-        matches!(
-            self,
-            TrainTicket::LeastFit
-                | TrainTicket::LeastFitFewestUpdates
-                | TrainTicket::LeastFitMostUpdates
-        )
-    }
-
-    /// Does the updates leg multiply the place? `false` = place only.
-    pub fn updates_armed(self) -> bool {
-        !matches!(self, TrainTicket::MostFit | TrainTicket::LeastFit)
-    }
-
-    /// Which side of the updates field the ticket pays: `true` = the LEAST trained net
-    /// (`Um⁻`, `1` at the field's fewest updates). Only meaningful while the leg is armed.
-    pub fn updates_inverted(self) -> bool {
-        matches!(
-            self,
-            TrainTicket::MostFitFewestUpdates | TrainTicket::LeastFitFewestUpdates
-        )
-    }
-
-    /// The same legs with the fit PLACE flipped (`most_fit` ↔ `least_fit`), updates side kept.
-    pub fn with_fitness_inverted(self, inverted: bool) -> Self {
-        match (inverted, self.updates_armed(), self.updates_inverted()) {
-            (false, false, _) => TrainTicket::MostFit,
-            (true, false, _) => TrainTicket::LeastFit,
-            (false, true, true) => TrainTicket::MostFitFewestUpdates,
-            (true, true, true) => TrainTicket::LeastFitFewestUpdates,
-            (false, true, false) => TrainTicket::MostFitMostUpdates,
-            (true, true, false) => TrainTicket::LeastFitMostUpdates,
-        }
-    }
-
-    /// The same place with the UPDATES leg armed or switched off.
-    pub fn with_updates_armed(self, armed: bool) -> Self {
-        if !armed {
-            return if self.fitness_inverted() {
-                TrainTicket::LeastFit
-            } else {
-                TrainTicket::MostFit
-            };
-        }
-        match (
-            self.fitness_inverted(),
-            self.updates_armed(),
-            self.updates_inverted(),
-        ) {
-            (false, true, false) => TrainTicket::MostFitMostUpdates,
-            (true, true, false) => TrainTicket::LeastFitMostUpdates,
-            (false, _, _) => TrainTicket::MostFitFewestUpdates,
-            (true, _, _) => TrainTicket::LeastFitFewestUpdates,
-        }
-    }
-
-    /// The legs the two pre-enum booleans meant: `inverted` = which place, `updates_armed` = U
-    /// leg on or off (on means the LEAST trained net, the old `Um⁻`).
-    pub fn from_bools(inverted: bool, updates_armed: bool) -> Self {
-        // The pair named the LEGACY `Um` leg (fewest updates), not today's default, so start from
-        // the leg the booleans actually meant and let the setters move the two axes.
-        TrainTicket::MostFitFewestUpdates
-            .with_fitness_inverted(inverted)
-            .with_updates_armed(updates_armed)
-    }
-}
-
-impl std::fmt::Display for TrainTicket {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// The leg a command line names, so the flag can be a typed `TrainTicket` (the setter's own
-/// type) instead of a string parsed at the call site.
-impl std::str::FromStr for TrainTicket {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        TrainTicket::parse(s)
-            .ok_or_else(|| format!("{s}: expected one of {}", TrainTicket::ALL_NAMES.join(", ")))
-    }
-}
-
-/// Default ticket LEGS (`set_train_ticket`): the FITTEST net that has trained the FEWEST earns the most tickets (`Fm⁺ × Um⁻`) — the lottery pays the net that grades best…
-pub const DEFAULT_TRAIN_TICKET: TrainTicket = TrainTicket::MostFitFewestUpdates;
-
-/// Default for the lottery's LEARN-ONLY switch (`set_ticket_learn_only`): `false` = a lost ticket idles the net (no train, no eval, nothing measured). `true` = every net…
-pub const DEFAULT_TRAIN_MERIT_LEARN_ONLY: bool = false;
 
 /// Default for POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): `false` = the window averages the last K READINGS, whatever weights produced them (the pre-flag…
 pub const DEFAULT_POLICY_SCOPED_FITNESS: bool = true;
@@ -248,9 +40,6 @@ pub const DEFAULT_SAVE_WEIGHTS_AT_STOP: bool = false;
 
 /// Default population size: `10`, deliberately conservative.
 pub const DEFAULT_POP_SIZE: usize = 10;
-
-/// Default step budget, read at the same conservative scale as the population: `10` clocks.
-pub const DEFAULT_MAX_STEPS: usize = 10;
 
 /// Default turnover per channel: the share of the live population replaced per clock.
 pub const DEFAULT_CROSSOVER_SHARE: f32 = 0.05;
@@ -279,9 +68,6 @@ pub const DEFAULT_RECOVERY_TOLERANCE: f32 = 0.0;
 /// Default INIT PROBATION (`set_pop_init_probation_steps`): `0` = nothing is withheld beyond the born shields, which is exactly what every run before the knob did.
 pub const DEFAULT_INIT_PROBATION_STEPS: usize = 0;
 
-/// Default step between sampled hidden widths.
-pub const DEFAULT_HIDDEN_DIM_STRIDE: usize = 16;
-
 /// Default width for a `SelectionMethod::Tournament` parent draw — the examples'.
 /// `--tournament-size`. NOT the engine default draw: that is `SelectionMethod::Roulette`.
 pub const DEFAULT_TOURNAMENT_SIZE: usize = 2;
@@ -307,17 +93,6 @@ pub const DEFAULT_CHAMPION_PREVIOUS_LOAD: bool = true;
 /// Default run mode: tabular.
 pub const DEFAULT_RUN_MODE: RunMode = RunMode::Tabular;
 
-/// Default hidden-width sampling range: the cartpole reference's `16..=64`,
-/// stride [`RaceConfig::defaults`] pins.
-pub const DEFAULT_HIDDEN_POOL: std::ops::RangeInclusive<usize> = 16..=64;
-
-/// Default merit floor `p_min`: the smallest share of clocks the WORST net in the lottery's field
-/// still gets — a quarter, so even the bottom of the field keeps a ladder back up.
-pub const DEFAULT_TRAIN_MERIT_P_MIN: f32 = 0.25;
-/// Default lottery CEILING `p_max`: the largest share of clocks the best-graded net may take —
-/// three quarters, so the field's best net still leaves clocks for the rest.
-pub const DEFAULT_TRAIN_MERIT_P_MAX: f32 = 0.75;
-
 /// Default share of the dataset held out for EVAL (`eval_share`): how much of the rows the race
 /// RANKS on and never trains
 pub const DEFAULT_EVAL_SHARE: f32 = 0.2;
@@ -326,204 +101,8 @@ pub const DEFAULT_EVAL_SHARE: f32 = 0.2;
 pub const EVAL_SHARE_MIN: f32 = 0.01;
 pub const EVAL_SHARE_MAX: f32 = 0.9;
 
-/// Default chance that ONE inherited drift slot moves on a crossover child (`set_topology_drift`):
-/// a mask bit flips; a hidden node's activation / combine / standardize / width is re-drawn; a port
-/// activation moves; the wiring gene (`input_reach`) is re-drawn and its wires re-derived; or the
-/// dropout rate is re-drawn under the run's cap.
-pub const DEFAULT_TOPOLOGY_DRIFT: f32 = 0.1;
-
-/// Default novelty floor `d_min` for a mutation draw (`set_mutation_novelty_min`): the clone
-/// band — unrelated nets sit near Δ 0.67, while a net's NEAREST neighbour sits near 0.17.
-pub const DEFAULT_MUTATION_NOVELTY_MIN: f32 = 0.4;
-
-/// Default candidates ONE mutation may spend before the most novel is taken anyway.
-pub const DEFAULT_MUTATION_NOVELTY_DRAWS: usize = 10;
-
 // `DEFAULT_LR` moved to `crate::utils::training`: a training scheme reads it (the reference trainer
 // and the example both do), so it belongs below both layers rather than in the engine's config
-
-/// Per-step log verbosity for the race engine.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum LogLevel {
-    /// Silent per step: only the run start line and final stop reason print —
-    /// fastest I/O path for users who parse `engine.json`.
-    None,
-    /// One compact line per step: pop size, loss range+mean, fitness range+mean,
-    /// plus a short evolve note on the same line when crossover/mutation fires.
-    #[default]
-    Summ,
-    /// A boxed table per step (from step 2): rollup stats with deltas, evolve counters,
-    /// and the current best net. No per-net detail, no separate rollup line.
-    Minimal,
-}
-
-impl LogLevel {
-    /// Parse the engine's own level name (`none`/`summ`/`minimal`, case-insensitive) —
-    /// the vocabulary of the examples' `--log-level` flag.
-    pub fn parse(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "none" | "off" | "silent" => Some(LogLevel::None),
-            "summ" | "summary" => Some(LogLevel::Summ),
-            "minimal" => Some(LogLevel::Minimal),
-            _ => None,
-        }
-    }
-
-    /// Parse a CLI log level into the pair `logging::init` takes: the engine's reporting
-    /// SHAPE plus an optional tracing verbosity (`--log-level debug` keeps Summ's detail).
-    pub fn parse_verbose(raw: &str) -> Option<(Self, Option<&'static str>)> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "debug" => Some((LogLevel::Summ, Some("debug"))),
-            "trace" => Some((LogLevel::Summ, Some("trace"))),
-            other => LogLevel::parse(other).map(|level| (level, None)),
-        }
-    }
-
-    /// The `tracing` verbosity the console layer is built with: `Summ` prints the engine's `info!`
-    /// lines; `Minimal`/`None` mute them (`warn`) — the framed vitals table rides its own target,
-    pub fn env_filter(self) -> &'static str {
-        match self {
-            LogLevel::Summ => "info",
-            LogLevel::Minimal | LogLevel::None => "warn",
-        }
-    }
-}
-
-/// Who gets evicted when a crossover child takes a slot. **Crossover-only** — the mutation channel has its own policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-pub enum CrossCullPolicy {
-    /// **LowestFitness** — evict the net with the lowest smoothed fitness; strictly
-    /// merit-based. Risk: the population can ossify around one lineage.
-    LowestFitness,
-    /// **Random** — evict a uniformly random live net; keeps slots turning over and
-    /// prevents a long-lived leader from starving diversity. Risk: losing a strong net.
-    Random,
-    /// **HighestTicketChance** — evict the net the coin pays MOST: the highest ticket chance `p = p_min + (p_max - p_min) x f` among the graded nets, deterministic with the…
-    HighestTicketChance,
-    /// **LowestFitnessMostUpdates** — evict the net with the highest `Fm⁻ × (1 − Um⁻)`: the lowest-fitness net that has ALSO spent its updates.
-    #[default]
-    LowestFitnessMostUpdates,
-}
-
-impl std::fmt::Display for CrossCullPolicy {
-    /// The STABLE spelling recorded in `engine.json` and the run manifest (snake_case,
-    /// not the `Debug` casing): a header written today must read the same tomorrow.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str((*self).into())
-    }
-}
-
-/// The reverse of [`Display`](std::fmt::Display): the policy a `--…-cull-policy` flag names.
-impl std::str::FromStr for CrossCullPolicy {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "lowest_fitness" | "worst" => Ok(Self::LowestFitness),
-            "random" => Ok(Self::Random),
-            "highest_ticket_chance" | "unfed" => Ok(Self::HighestTicketChance),
-            "lowest_fitness_most_updates" | "spent" => Ok(Self::LowestFitnessMostUpdates),
-            _ => Err(format!(
-                "{s}: expected lowest_fitness, random, highest_ticket_chance or lowest_fitness_most_updates"
-            )),
-        }
-    }
-}
-
-/// Who gets evicted when a MUTATION roll inserts a fresh random immigrant.
-/// **Mutation-only** — the crossover channel has its own policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-pub enum MutationCullPolicy {
-    /// **LowestFitness** — evict the net with the lowest smoothed fitness, deterministically
-    /// (mirrors [`CrossCullPolicy::LowestFitness`]).
-    LowestFitness,
-    /// **Random** — evict a uniformly random live net, at the cost of occasionally
-    /// losing a good one.
-    Random,
-    /// **HighestTicketChance** — the SAME selector as [`CrossCullPolicy::HighestTicketChance`]: evict the net the train-eval lottery pays the most (the highest `p` among the…
-    HighestTicketChance,
-    /// **LowestFitnessMostUpdates** — the SAME selector as [`CrossCullPolicy::LowestFitnessMostUpdates`]: evict the net with the highest `Fm⁻ × (1 − Um⁻)`, so the slot goes to…
-    #[default]
-    LowestFitnessMostUpdates,
-}
-
-impl std::fmt::Display for MutationCullPolicy {
-    /// The STABLE spelling recorded in `engine.json` and the run manifest.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str((*self).into())
-    }
-}
-
-/// The reverse of [`Display`](std::fmt::Display) — the same spellings and the same legacy aliases as [`CrossCullPolicy`], so the mutation channel's flag parses exactly like…
-impl std::str::FromStr for MutationCullPolicy {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "lowest_fitness" | "worst" => Ok(Self::LowestFitness),
-            "random" => Ok(Self::Random),
-            "highest_ticket_chance" | "unfed" => Ok(Self::HighestTicketChance),
-            "lowest_fitness_most_updates" | "spent" => Ok(Self::LowestFitnessMostUpdates),
-            _ => Err(format!(
-                "{s}: expected lowest_fitness, random, highest_ticket_chance or lowest_fitness_most_updates"
-            )),
-        }
-    }
-}
-
-/// The two-parent crossover operators, drawn from `crossover_ops_pool` (empty ⇒ both)
-/// per attempt; parent A's post-swap body becomes the child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CrossoverOp {
-    /// Swap the hidden-node tail after a matching pivot node.
-    OnePoint,
-    /// Per-node independent swap (requires equal hidden-node counts).
-    Uniform,
-}
-
-impl CrossoverOp {
-    /// How many parent topologies this operator combines. All current operators
-    /// binary, so both return 2 (the engine derives parent count
-    pub fn required_parents(&self) -> usize {
-        match self {
-            CrossoverOp::OnePoint | CrossoverOp::Uniform => 2,
-        }
-    }
-}
-
-// `TryFrom<&str>` lives with the enum: the parse sits where the type is, gives
-// `?`-compatible conversion, and is reachable for users' own tooling.
-impl TryFrom<&str> for CrossoverOp {
-    type Error = String;
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        match s.to_lowercase().as_str() {
-            "one_point" | "onepoint" => Ok(CrossoverOp::OnePoint),
-            "uniform" => Ok(CrossoverOp::Uniform),
-            other => Err(format!(
-                "unknown crossover op '{other}' (use \"one_point\" or \"uniform\")"
-            )),
-        }
-    }
-}
-
-/// The training paradigm / problem space the run targets. Only `Tabular` and `Rl`
-/// constructible; the image/NLP arms are reserved future `RunSpec` variants.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
-pub enum RunMode {
-    #[default]
-    /// Supervised tabular runs.
-    Tabular,
-    /// Single-channel image runs (reserved).
-    OneCImage,
-    /// Three-channel image runs (reserved).
-    ThreeCImage,
-    /// NLP runs (reserved).
-    Nlp,
-    /// Environment-driven RL runs.
-    Rl,
-}
 
 /// Step-race knob surface. Size defaults are small for quick tests; evolution
 /// semantics default to the tuned cartpole reference. Mode knobs live in `mode_specific`.
@@ -587,7 +166,7 @@ pub struct RaceConfig {
     pub crossover_fitter_base: bool,
     /// Max steps before stopping (None = no limit).
     pub max_steps: Option<usize>,
-    /// Hidden-dim sampling range (`None` ⇒ default 4..=8). NOTE: batch geometry lives
+    /// Hidden-dim sampling range (`None` ⇒ default 16..=64). NOTE: batch geometry lives
     /// on the trainer's `stream_shape()`, not here.
     pub hidden_dim_pool: Option<std::ops::RangeInclusive<usize>>,
     /// Stride within the hidden-dim pool when sampling node dimensions.
@@ -666,62 +245,6 @@ pub struct RaceConfig {
 
 // `run_progress` and `DEFAULT_LR` live in `crate::utils::training` — the run
 // loop and any training scheme both need them, so they sit below both layers.
-
-/// Which mode the run is in; carried in the type, no payload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModeConfig {
-    Tabular,
-    Rl,
-}
-
-/// Type alias for the pluggable stop closure. Plain alias, so `RaceConfig` derives
-/// neither `Clone` nor `Debug`.
-pub type StopFn = Option<Box<dyn Fn(&RaceSnapshot) -> bool + Send + Sync + 'static>>;
-
-/// The run-level context stamped into every net's `meta` block. Built once at engine
-/// construction; cheap to pass around.
-#[derive(Clone, Debug, Default)]
-pub struct RunMetaCtx {
-    /// Input feature dimension.
-    pub input_dim: usize,
-    /// Output dimension.
-    pub output_dim: usize,
-    /// Shared-stream batch size; `None` in modes with no shared stream (RL),
-    /// where the trainer owns the per-step volume.
-    pub batch_size: Option<usize>,
-    /// Dropout probability the run used.
-    pub dropout_prob: f32,
-    /// Ranking fitness label.
-    pub fitness_label: String,
-    /// Ranking direction, as a string.
-    pub direction: String,
-    /// Population size.
-    pub pop_size: usize,
-    /// Run seed.
-    pub run_seed: u64,
-}
-
-/// A cheap read-only snapshot of the live race state at decision time, passed to a custom
-/// stop closure. Not a full run dump.
-#[derive(Clone)]
-pub struct RaceSnapshot {
-    /// Live nets at decision time.
-    pub live_count: usize,
-    /// Current step.
-    pub step: usize,
-    /// Best RANKING score — the window centre in the run's mean family, plus any
-    /// `selection_metrics` terms. This is what the race actually ranks on.
-    pub best_smoothed_fitness: f32,
-    /// Worst ranking score — the same number, at the other end.
-    pub worst_smoothed_fitness: f32,
-    /// Mean of the live ranking scores (a plain arithmetic mean OF the scores,
-    /// second smoothing pass).
-    pub mean_smoothed_fitness: f32,
-    /// Cumulative culls.
-    pub culls: usize,
-    /// Wall-clock seconds elapsed.
-    pub elapsed_seconds: u64,
-}
 
 impl RaceConfig {
     /// Returns the device the engine should run on (CUDA if the cuda feature
@@ -909,10 +432,11 @@ impl RaceConfig {
         // Pool: a header that recorded one (a post-pool run) wins; an older header recorded
         // single policy (or none), which becomes a one-entry pool so a resume cannot silently start
         cfg.feature_split_pool = if snap.feature_split_pool.is_empty() {
-            vec![snap
-                .feature_split
-                .clone()
-                .unwrap_or_else(|| "none".to_string())]
+            vec![
+                snap.feature_split
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string()),
+            ]
         } else {
             snap.feature_split_pool.clone()
         };
@@ -927,9 +451,7 @@ impl RaceConfig {
     /// Fluent builder for the non-CLI config surface, starting from `RaceConfig::defaults`.
     /// Starts TABULAR; for RL prefer [`RlRaceConfig::builder`].
     pub fn builder() -> RaceConfigBuilder {
-        RaceConfigBuilder {
-            cfg: RaceConfig::defaults(),
-        }
+        RaceConfigBuilder::from_config(RaceConfig::defaults())
     }
 }
 
@@ -943,47 +465,17 @@ pub type TabularRaceConfig = RaceConfig;
 /// alias can't shadow `RaceConfig::builder`.
 #[doc(hidden)]
 pub fn tabular_race_config_builder() -> RaceConfigBuilder {
-    RaceConfigBuilder {
-        cfg: RaceConfig::defaults(),
-    }
+    RaceConfigBuilder::from_config(RaceConfig::defaults())
 }
 
 /// `RlRaceConfig::builder()` — the RL front door (a free function; an inherent method
 /// the alias would collide with `RaceConfig::builder`).
 #[doc(hidden)]
 pub fn rl_race_config_builder() -> RaceConfigBuilder {
-    RaceConfigBuilder {
-        cfg: RaceConfig {
-            mode_specific: ModeConfig::Rl,
-            ..RaceConfig::defaults()
-        },
-    }
-}
-
-/// Parse a recorded (or user-given) feature-split spelling: `"random"`,
-/// `"exclusive"`, `"inherited"`, or the `"split_*"` wire form `engine.json` records.
-pub(crate) fn parse_feature_split_wire(raw: &str) -> Option<FeatureSplitPolicy> {
-    let raw = raw.to_ascii_lowercase();
-    if raw.contains("inherited") {
-        Some(FeatureSplitPolicy::Inherited)
-    } else if raw.contains("exclusive") {
-        Some(FeatureSplitPolicy::Exclusive)
-    } else if raw.contains("random") {
-        Some(FeatureSplitPolicy::Random)
-    } else {
-        None
-    }
-}
-
-/// One POOL entry: `Some(None)` is the `none` policy (no split), `Some(Some(_))` a drawable policy,
-/// `None` an unknown spelling.
-pub(crate) fn parse_feature_split_pool_entry(raw: &str) -> Option<Option<FeatureSplitPolicy>> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "none" | "off" | "split_none" => Some(None),
-        "exclusive" | "split_exclusive" => Some(Some(FeatureSplitPolicy::Exclusive)),
-        "random" | "split_random" => Some(Some(FeatureSplitPolicy::Random)),
-        _ => None,
-    }
+    RaceConfigBuilder::from_config(RaceConfig {
+        mode_specific: ModeConfig::Rl,
+        ..RaceConfig::defaults()
+    })
 }
 
 impl Default for RaceConfig {
@@ -992,456 +484,12 @@ impl Default for RaceConfig {
     }
 }
 
-/// Fluent builder over [`RaceConfig`], covering options a caller is likely to set;
-/// untouched fields keep conservative defaults.
-pub struct RaceConfigBuilder {
-    cfg: RaceConfig,
-}
+mod builder;
 
-impl RaceConfigBuilder {
-    /// Set the population size.
-    pub fn set_pop_size(mut self, n: usize) -> Self {
-        self.cfg.pop_size = n;
-        self
-    }
-    /// Set steps between checkpoints — the durability tick (frontier states + EVERY live net's
-    /// weights + `ckpt.json` + CSV flush) and the stream's eval-permutation era.
-    pub fn set_run_checkpoint_every(mut self, n: usize) -> Self {
-        self.cfg.checkpoint_every = n;
-        self
-    }
-    /// Set whether the TERMINAL stop writes every live net's weights. Default false: the stop
-    /// is a reading of the race, the checkpoint is the artifact a resume loads.
-    pub fn set_run_save_weights_at_stop(mut self, enabled: bool) -> Self {
-        self.cfg.save_weights_at_stop = enabled;
-        self
-    }
-    /// Set whether each live net's optimizer state rides its checkpoint (`nets/<hash>.optim`), so a
-    /// resume restores the Adam moments exactly. `false` = weights only. Default true.
-    pub fn set_run_save_optim(mut self, enabled: bool) -> Self {
-        self.cfg.save_optim = enabled;
-        self
-    }
-    /// Set crossover turnover as a SHARE of the live population per clock (`0.05` = 5%), dealt as `round(share · pop)` rolls each clock. `0.0` = the channel OFF.
-    pub fn set_crossover_share(mut self, share: f32) -> Self {
-        self.cfg.crossover_share = if share.is_finite() {
-            share.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        self
-    }
-    /// Set mutation turnover as a SHARE of the live population per clock, with
-    /// `set_crossover_share`'s bounds. `0.0` = the channel OFF.
-    pub fn set_mutation_share(mut self, share: f32) -> Self {
-        self.cfg.mutation_share = if share.is_finite() {
-            share.clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        self
-    }
+pub use builder::RaceConfigBuilder;
 
-    /// Crossover replacement policy (crossover-only).
-    pub fn set_crossover_cull_policy(mut self, policy: CrossCullPolicy) -> Self {
-        self.cfg.crossover_cull_policy = policy;
-        self
-    }
-    /// Mutation replacement policy: who a firing mutation roll evicts before inserting
-    /// immigrant.
-    pub fn set_mutation_cull_policy(mut self, policy: MutationCullPolicy) -> Self {
-        self.cfg.mutation_cull_policy = policy;
-        self
-    }
-    /// Champion set size: the top-k live nets saved at stop. Minimum 1; a champion is a
-    /// rank, not an identity, and it shields nothing from a cull.
-    pub fn set_champion_count(mut self, n: usize) -> Self {
-        self.cfg.champion_count = n.max(1);
-        self
-    }
-    /// Lottery floor `p_min`: the worst net's chance of a ticket each clock.
-    pub fn set_ticket_p_min(mut self, p_min: f32) -> Self {
-        self.cfg.train_merit_p_min = if p_min.is_finite() {
-            p_min.clamp(0.0, 1.0)
-        } else {
-            DEFAULT_TRAIN_MERIT_P_MIN
-        };
-        self
-    }
-    /// CEILING `p_max` on the lottery fraction: the best-graded net's share of clocks (default
-    /// `1.0` = no ceiling).
-    pub fn set_ticket_p_max(mut self, p_max: f32) -> Self {
-        self.cfg.train_merit_p_max = if p_max.is_finite() {
-            p_max.clamp(0.0, 1.0)
-        } else {
-            DEFAULT_TRAIN_MERIT_P_MAX
-        };
-        self
-    }
-    /// The lottery's LEGS (`TrainTicket`): which fit place earns the ticket, and which side of the updates field it multiplies in.
-    pub fn set_train_ticket(mut self, legs: TrainTicket) -> Self {
-        self.cfg.train_ticket = legs;
-        self
-    }
-    /// LEARN-ONLY lottery (default `false`): `true` keeps every net ACTING and MEASURING every clock and gates only the weight update on the ticket, so a net's reading never…
-    pub fn set_ticket_learn_only(mut self, yes: bool) -> Self {
-        self.cfg.train_merit_learn_only = yes;
-        self
-    }
-    /// POLICY-SCOPED FITNESS (default `false`): `true` builds the mean/spread/n ONLY from readings taken on the weights the net holds now, so the statistics describe one POLICY…
-    pub fn set_fitness_policy_scoped(mut self, yes: bool) -> Self {
-        self.cfg.policy_scoped_fitness = yes;
-        self
-    }
-    /// ANTI-CHAMPION dump (default `false`): `true` writes `worst-<hash>-<fitness>.md` for the `champion_count` nets ranked by `spent` (`Fm⁻ × (1 − Um)`, the cull's own…
-    pub fn set_worst_save_topology(mut self, enabled: bool) -> Self {
-        self.cfg.worst_save_topology = enabled;
-        self
-    }
-    /// DRIFT on a crossover child's inherited genes (default `DEFAULT_TOPOLOGY_DRIFT` = `0.1`;
-    /// `0.0` = exact inheritance).
-    pub fn set_topology_drift(mut self, p: f32) -> Self {
-        self.cfg.drift_prob = if p.is_finite() {
-            p.clamp(0.0, 1.0)
-        } else {
-            DEFAULT_TOPOLOGY_DRIFT
-        };
-        self
-    }
-    /// Per-net smoothed-fitness rolling window (K). Default [`SMOOTHING_WINDOW`] = 10.
-    /// Replay-relevant: a resumed run must use the same value or construction fails parity.
-    pub fn set_fitness_smoothing_window(mut self, k: usize) -> Self {
-        self.cfg.smoothing_window = k.max(1);
-        self
-    }
-    /// How the window's readings are averaged into the ranking centre (`mean_type`).
-    pub fn set_fitness_mean_type(mut self, mean_type: MeanType) -> Self {
-        self.cfg.mean_type = mean_type;
-        self
-    }
-    /// A user-supplied stop predicate, consulted every step alongside `max_steps`;
-    /// returning `true` ends the race with stop reason `Custom`.
-    pub fn set_stop_custom(
-        mut self,
-        f: impl Fn(&RaceSnapshot) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        self.cfg.custom_stop = Some(Box::new(f));
-        self
-    }
-    /// Crossover operator pool, drawn uniformly per attempt; empty (default) ⇒ both.
-    /// Takes owned or borrowed strings.
-    pub fn set_crossover_ops_pool<I, S>(mut self, ops: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.cfg.crossover_ops_pool = ops.into_iter().map(|s| s.as_ref().to_string()).collect();
-        self
-    }
-    /// Parent-selection method for the crossover draw (default [`SelectionMethod::Roulette`]:
-    /// fitness-proportionate, never deterministic).
-    pub fn set_crossover_selection(mut self, method: SelectionMethod) -> Self {
-        self.cfg.crossover_selection = method;
-        self
-    }
-    /// Make the FITTER of the two drawn parents the crossover BASE
-    /// ([`RaceConfig::crossover_fitter_base`]).
-    pub fn set_crossover_fitter_base(mut self, on: bool) -> Self {
-        self.cfg.crossover_fitter_base = on;
-        self
-    }
-    /// Enable the feature split and choose how the Input node's per-port masks are drawn.
-    pub fn set_topology_feature_split(mut self, policy: FeatureSplitPolicy) -> Self {
-        self.cfg.feature_split_pool = vec![policy.to_string()];
-        self
-    }
-    /// The pool a NEWBORN's split is drawn from, in draw order — `["none", "random", "exclusive"]`
-    /// gives every policy a chance, `["exclusive"]` pins one, `["none"]` turns the split off.
-    pub fn set_topology_feature_split_pool<I, S>(mut self, pool: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.cfg.feature_split_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
-        self
-    }
-    /// Explicit step budget — the only built-in stop criterion.
-    pub fn set_stop_max_steps(mut self, n: impl Into<Option<usize>>) -> Self {
-        self.cfg.max_steps = n.into();
-        self
-    }
-    /// Set the hidden-dim sampling range.
-    pub fn set_topology_hidden_dim_range(mut self, min: usize, max: usize) -> Self {
-        self.cfg.hidden_dim_pool = Some(min..=max);
-        self
-    }
-    /// Set the hidden-dim stride.
-    pub fn set_topology_hidden_dim_stride(mut self, n: usize) -> Self {
-        self.cfg.hidden_dim_stride = n;
-        self
-    }
-    /// How a node merges its incoming wires (see [`crate::graph::node::CombineOp`]).
-    pub fn set_topology_combine_op_pool<I, S>(mut self, pool: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.cfg.combine_op_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
-        self
-    }
-    /// Per-node non-linearities (see [`crate::graph::node::Activation`]).
-    /// Empty ⇒ the full default pool. Accepts owned or borrowed strings.
-    pub fn set_topology_activation_pool<I, S>(mut self, pool: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.cfg.activation_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
-        self
-    }
-    /// Per-node normalization ops (see [`crate::graph::node::StandardizeOp`]).
-    /// Empty ⇒ the full default pool. Accepts owned or borrowed strings.
-    pub fn set_topology_standardize_op_pool<I, S>(mut self, pool: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.cfg.standardize_op_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
-        self
-    }
-    /// Dropout probability applied when building this run's networks (part
-    /// `TopologyOptions`). TRAIN forwards
-    pub fn set_topology_dropout_prob(mut self, p: f32) -> Self {
-        self.cfg.topology_options.dropout_prob = p;
-        self
-    }
-    // ── individual topology fields (direct, no need to build a full TopologyOptions)
-    /// Set the min hidden nodes per individual.
-    pub fn set_topology_min_hidden_num_nodes(mut self, n: usize) -> Self {
-        self.cfg.topology_options.min_hidden_num_nodes = n;
-        self
-    }
-    /// Set the max hidden nodes per individual.
-    pub fn set_topology_max_hidden_num_nodes(mut self, n: usize) -> Self {
-        self.cfg.topology_options.max_hidden_num_nodes = n;
-        self
-    }
-    /// Set the min inputs per node.
-    pub fn set_topology_min_inputs_per_node(mut self, n: usize) -> Self {
-        self.cfg.topology_options.min_hidden_inputs_per_node = n;
-        self
-    }
-    /// Set the max inputs per node.
-    pub fn set_topology_max_inputs_per_node(mut self, n: usize) -> Self {
-        self.cfg.topology_options.max_hidden_inputs_per_node = n;
-        self
-    }
-    /// Set the min outputs per node.
-    pub fn set_topology_min_outputs_per_node(mut self, n: usize) -> Self {
-        self.cfg.topology_options.min_hidden_outputs_per_node = n;
-        self
-    }
-    /// Set the max outputs per node.
-    pub fn set_topology_max_outputs_per_node(mut self, n: usize) -> Self {
-        self.cfg.topology_options.max_hidden_outputs_per_node = n;
-        self
-    }
-    /// Sample each newborn's `input_reach` from `min..=max` (`0.0..=1.0`).
-    ///
-    /// `input_reach` is how much of the raw input the hidden layer may read directly: `1.0` sizes
-    /// the Input node at one port per hidden node (every node may read the input, the historical
-    /// wiring), lower values hand out fewer ports, so the sockets they cannot cover are fed by
-    /// other hidden nodes — the net gets DEEPER instead of wider at its first layer. `1.0, 1.0`
-    /// (the default) pins the historical wiring.
-    pub fn set_topology_input_reach_range(mut self, min: f32, max: f32) -> Self {
-        self.cfg.topology_options.min_input_reach = min.clamp(0.0, 1.0);
-        self.cfg.topology_options.max_input_reach = max.clamp(0.0, 1.0);
-        // The header's template must not keep a stale sampled value.
-        self.cfg.topology_options.input_reach = min.clamp(0.0, 1.0);
-        self
-    }
-    /// Keep at most ONE wire per (source node, target node) pair — `true` by default.
-    ///
-    /// The rule spans every kind: Input→hidden, hidden→hidden, and hidden→Output. With it on,
-    /// `finalize` will not pick
-    /// a source that already feeds the target, `validate` rejects a blueprint that does, and a
-    /// loaded graph is repaired by one seeded random cull. `false` restores the older wiring.
-    pub fn set_topology_unique_source_per_target(mut self, on: bool) -> Self {
-        self.cfg.topology_options.unique_source_per_target = on;
-        self
-    }
-    /// Set the input dimension.
-    pub fn set_topology_input_dim(mut self, n: usize) -> Self {
-        self.cfg.topology_options.input_dim = Some(n);
-        self
-    }
-    /// Set the output dimension.
-    pub fn set_topology_output_dim(mut self, n: usize) -> Self {
-        self.cfg.topology_options.output_dim = Some(n);
-        self
-    }
-    /// Extra informative (non-ranking) metrics recorded in history.csv and engine.json.
-    /// They affect selection ONLY when [`Self::set_selection_metric`] names them.
-    pub fn set_run_metrics(mut self, metrics: Vec<Metric>) -> Self {
-        self.cfg.metrics = metrics;
-        self
-    }
-
-    /// Make an informative metric count toward the RANKING: `score = fitness centre + Σ weight × metric centre`.
-    pub fn set_selection_metric(mut self, label: impl Into<String>, weight: f32) -> Self {
-        let label = label.into();
-        match self
-            .cfg
-            .selection_metrics
-            .iter_mut()
-            .find(|m| m.label == label)
-        {
-            Some(term) => term.weight = weight,
-            None => self
-                .cfg
-                .selection_metrics
-                .push(crate::utils::fitness::SelectionMetric { label, weight }),
-        }
-        self
-    }
-
-    /// Human label for the experiment, written as `"run_name"`. Informational only —
-    /// results folder name is unchanged.
-    pub fn set_run_name(mut self, name: impl Into<String>) -> Self {
-        self.cfg.run_name = Some(name.into());
-        self
-    }
-    /// Per-step log verbosity: `Summ` (compact one-line rollup) or `Full`
-    /// (also dumps every per-net detail line each step).
-    pub fn set_run_log_level(mut self, level: LogLevel) -> Self {
-        self.cfg.log_level = level;
-        self
-    }
-    /// Also write the event stream to `<run_dir>/telemetry.jsonl` (one JSON record per
-    /// event). Off by default.
-    pub fn set_run_trace_file(mut self, enabled: bool) -> Self {
-        self.cfg.trace_file = enabled;
-        self
-    }
-    /// Set whether to write the lossless event logs (`history.csv` + `attempts.csv`).
-    // NOTE: there is no `set_run_mode` — RunMode is DERIVED from the RunSpec variant.
-    pub fn set_run_csv_export(mut self, enabled: bool) -> Self {
-        self.cfg.csv_export = enabled;
-        self
-    }
-    /// Opt in/out of the automatic inheritance of the newest compatible previous experiment's
-    /// elites (topology-only).
-    pub fn set_champion_previous_load(mut self, enabled: bool) -> Self {
-        self.cfg.champion_previous_load = enabled;
-        self
-    }
-    /// Where the automatic inheritance looks: a run dir or a dir of run dirs
-    /// (newest id wins). Unset ⇒ the default `results/`.
-    pub fn set_champion_previous_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
-        self.cfg.champion_previous_dir = Some(dir.into());
-        self
-    }
-    /// Mutation novelty floor `d_min`: the minimum Δ a random immigrant must hold against the NEAREST blueprint the run already made. `0.0` turns the gate OFF entirely (no…
-    pub fn set_mutation_novelty_min(mut self, d_min: f32) -> Self {
-        self.cfg.mutation_novelty_min = d_min.max(0.0);
-        self
-    }
-    /// Candidates ONE mutation may spend clearing the novelty floor before the most novel draw
-    /// is taken anyway. Default [`DEFAULT_MUTATION_NOVELTY_DRAWS`].
-    pub fn set_mutation_novelty_draws(mut self, draws: usize) -> Self {
-        self.cfg.mutation_novelty_draws = draws.max(1);
-        self
-    }
-    /// Mutation probation steps: cull-immunity for a random immigrant's first `k` UPDATES — `U`, not clocks, so waiting does not spend it (see…
-    pub fn set_mutation_probation_steps(mut self, k: usize) -> Self {
-        self.cfg.mutation_probation_steps = k;
-        self
-    }
-    /// Crossover probation steps: cull-immunity for a crossover child's first
-    /// `k` UPDATES — `U`, not clocks (see [`RaceConfig::crossover_probation_steps`]). Default 0.
-    pub fn set_crossover_probation_steps(mut self, k: usize) -> Self {
-        self.cfg.crossover_probation_steps = k;
-        self
-    }
-    /// INIT PROBATION (default `0` = off): the opening clocks with no culls and no births — evolution starts at clock `k`.
-    pub fn set_pop_init_probation_steps(mut self, k: usize) -> Self {
-        self.cfg.init_probation_steps = k;
-        self
-    }
-    /// Recovery updates: how many EXTRA real updates a net may take in the same clock when the one it just took left its reading worse than it was (see…
-    pub fn set_pop_recovery_retries(mut self, k: usize) -> Self {
-        self.cfg.recovery_retries = k;
-        self
-    }
-    /// Recovery tolerance: the FRACTION of the net's standing a reading may lose before the streak fires (`0.2` = a fifth is tolerated, more triggers).
-    pub fn set_pop_recovery_tol(mut self, fraction: f32) -> Self {
-        self.cfg.recovery_tolerance = if fraction.is_finite() {
-            fraction.max(0.0)
-        } else {
-            0.0
-        };
-        self
-    }
-    /// Recovery retry draw: `true` (default) = a retry repeats the clock's OWN train draw, so the streak re-tests the update that fell; `false` = each retry walks one draw…
-    pub fn set_pop_recovery_same_seed(mut self, same: bool) -> Self {
-        self.cfg.recovery_same_seed = same;
-        self
-    }
-    /// At stop, save each champion's topology markdown (`champion-<hash>-<fitness>.md`).
-    /// Default true.
-    pub fn set_champion_save_topology(mut self, enabled: bool) -> Self {
-        self.cfg.champion_save_topology = enabled;
-        self
-    }
-    /// Finish and return the configured [`RaceConfig`].
-    pub fn build(self) -> RaceConfig {
-        self.cfg
-    }
-}
 
 impl RaceConfig {
-    /// Parse an activation label (the `Display` form: "relu", "gelu", …).
-    pub(crate) fn parse_activation(s: &str) -> Result<crate::graph::node::Activation, String> {
-        use crate::graph::node::Activation::*;
-        Ok(match s.to_lowercase().as_str() {
-            "identity" => Identity,
-            "relu" => ReLU,
-            "gelu" => GeLU,
-            "silu" => SiLU,
-            "selu" => SELU,
-            "tanh" => Tanh,
-            "sigmoid" => Sigmoid,
-            "mish" => Mish,
-            "leaky_relu" => LeakyReLU,
-            "elu" => ELU,
-            "gelu_tanh" => GeluTanh,
-            "softplus" => Softplus,
-            "hardswish" => HardSwish,
-            "hardsigmoid" => HardSigmoid,
-            "sin" => Sin,
-            "cos" => Cos,
-            "softmax" => Softmax,
-            "log_softmax" | "logsoftmax" => LogSoftmax,
-            other => return Err(format!("unknown activation '{other}'")),
-        })
-    }
-
-    /// Parse a combine-op label (the `Display` form: "add", "mean", …) — see
-    /// [`RaceConfig::parse_activation`] for why it is `pub(crate)`.
-    pub(crate) fn parse_combine(s: &str) -> Result<crate::graph::node::CombineOp, String> {
-        use crate::graph::node::CombineOp::*;
-        Ok(match s.to_lowercase().as_str() {
-            "add" => Add,
-            "mean" => Mean,
-            "mul" | "multiply" => Multiply,
-            "sub" | "subtract" => Subtract,
-            "div" | "divide" => Divide,
-            "max" => Max,
-            "min" => Min,
-            other => return Err(format!("unknown combine op '{other}'")),
-        })
-    }
-
     /// Resolve the crossover operator pool: the configured labels validated, or both when empty.
     pub fn resolved_crossover_ops(&self) -> Result<Vec<CrossoverOp>, String> {
         super::pool::resolve::<super::pool::CrossoverOpsPool>(self)
@@ -1489,25 +537,7 @@ impl RaceConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogLevel, RaceConfig};
-
-    /// The examples' `--log-level` vocabulary must parse: handed to an `EnvFilter` verbatim, `summ`
-    /// would be read as a module name and mute the whole run — this mapping is load-bearing.
-    #[test]
-    fn log_level_names_parse_to_a_visible_verbosity() {
-        assert_eq!(LogLevel::parse("summ"), Some(LogLevel::Summ));
-        assert_eq!(LogLevel::parse("SUMM"), Some(LogLevel::Summ));
-        assert_eq!(LogLevel::parse("minimal"), Some(LogLevel::Minimal));
-        assert_eq!(LogLevel::parse("none"), Some(LogLevel::None));
-        assert_eq!(
-            LogLevel::parse("debug"),
-            None,
-            "tracing levels pass through"
-        );
-        assert_eq!(LogLevel::Summ.env_filter(), "info");
-        assert_eq!(LogLevel::Minimal.env_filter(), "warn");
-        assert_eq!(LogLevel::None.env_filter(), "warn");
-    }
+    use super::RaceConfig;
 
     /// A pool NAME is either drawable or a refusal — never silently widened.
     #[test]
@@ -1550,7 +580,7 @@ mod tests {
     /// substring test turns names nobody offers into policies (`"nonexclusive"` → `none`, because
     #[test]
     fn feature_split_pool_entries_match_whole_names() {
-        use super::parse_feature_split_pool_entry as parse;
+        use crate::graph::topology::parse_feature_split_pool_entry as parse;
         // The drawable vocabulary plus the `split_*` spellings `engine.json` records.
         assert_eq!(parse("none"), Some(None));
         assert_eq!(parse("off"), Some(None));
@@ -1646,69 +676,5 @@ mod tests {
         // feature's deletion — only the step budget remains)
         let cfg = RaceConfig::builder().set_stop_max_steps(15).build();
         assert_eq!(cfg.max_steps, Some(15));
-    }
-}
-
-/// The recorded spellings and the alias tables, pinned in ONE place: `strum::IntoStaticStr` derives `as_str`/`Display` from `serialize_all = "snake_case"`, while `parse`…
-#[cfg(test)]
-mod spelling_pins {
-    use super::*;
-    use std::str::FromStr;
-
-    #[test]
-    fn mean_type_spellings_hold() {
-        for (v, s) in [
-            (MeanType::Arithmetic, "arithmetic"),
-            (MeanType::SignedLog, "signed_log"),
-            (MeanType::Median, "median"),
-        ] {
-            assert_eq!(v.as_str(), s);
-            assert_eq!(v.to_string(), s);
-            assert_eq!(MeanType::parse(s), Some(v));
-            assert_eq!(MeanType::from_str(s).unwrap(), v);
-        }
-        assert_eq!(MeanType::parse("average"), Some(MeanType::Arithmetic));
-        assert_eq!(MeanType::parse("signed-log"), Some(MeanType::SignedLog));
-    }
-
-    #[test]
-    fn train_ticket_spellings_hold() {
-        for (v, s) in TrainTicket::ALL.iter().copied().zip(TrainTicket::ALL_NAMES) {
-            assert_eq!(v.as_str(), s);
-            assert_eq!(v.to_string(), s);
-            assert_eq!(TrainTicket::parse(s), Some(v));
-            assert_eq!(TrainTicket::from_str(s).unwrap(), v);
-        }
-        assert_eq!(
-            TrainTicket::parse("best_fewest"),
-            Some(TrainTicket::MostFitFewestUpdates)
-        );
-        assert_eq!(
-            TrainTicket::parse("least_fit_least_updates"),
-            Some(TrainTicket::LeastFitFewestUpdates)
-        );
-    }
-
-    #[test]
-    fn cull_policy_spellings_hold() {
-        for (v, s) in [
-            (CrossCullPolicy::LowestFitness, "lowest_fitness"),
-            (CrossCullPolicy::Random, "random"),
-            (
-                CrossCullPolicy::HighestTicketChance,
-                "highest_ticket_chance",
-            ),
-            (
-                CrossCullPolicy::LowestFitnessMostUpdates,
-                "lowest_fitness_most_updates",
-            ),
-        ] {
-            assert_eq!(v.to_string(), s);
-            assert_eq!(CrossCullPolicy::from_str(s).unwrap(), v);
-            assert_eq!(MutationCullPolicy::from_str(s).unwrap().to_string(), s);
-        }
-        assert!(CrossCullPolicy::from_str("nope")
-            .unwrap_err()
-            .contains("expected lowest_fitness"));
     }
 }

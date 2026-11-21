@@ -688,7 +688,7 @@ mod base_choice_tests {
     }
 }
 
-use crate::engine::config::CrossoverOp;
+use crate::evolution::crossover::CrossoverOp;
 use crate::graph::network::Network;
 use crate::graph::node::{Activation, CombineOp, NodeKind, StandardizeOp};
 use crate::graph::topology::{CxReport, FeatureSplitPolicy, Topology};

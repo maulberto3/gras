@@ -1,7 +1,5 @@
 //! Fitness smoothing: the rolling buffer, its mean, its spread, and the window it uses.
 
-use crate::engine::config::MeanType;
-
 /// A small fixed-capacity rolling buffer — the in-memory equivalent of reading
 /// back the last K `NetMetrics` snapshots from a net's state file.
 #[derive(Clone, Debug, Default)]
@@ -286,13 +284,65 @@ fn rolling_stats_all(buf: &RollingBuffer, family: MeanType) -> Option<WindowStat
     })
 }
 
-/// The per-net smoothing window, in steps (K).
-pub use crate::engine::config::SMOOTHING_WINDOW;
+/// Per-net smoothed-fitness rolling window (K) — the span every ranking decision averages over.
+pub const SMOOTHING_WINDOW: usize = 5;
+
+/// How the smoothing window's readings are averaged into the ranking centre (`set_fitness_mean_type`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum MeanType {
+    /// The weighted window mean — the plain average, the pre-knob ranking.
+    Arithmetic,
+    /// `g(x) = sign(x)·ln(1 + |x|)`: centre and spread are taken in that compressed space
+    /// score is mapped back, so one spike cannot dominate the window the way it does through
+    SignedLog,
+    /// The WEIGHTED MEDIAN: no single reading can move the centre at all; the spread is the medians absolute deviation scaled by `1.4826`, so a median spread stays comparable…
+    #[default]
+    Median,
+}
+
+impl MeanType {
+    /// The spelling `engine.json` records and the log prints.
+    pub fn as_str(&self) -> &'static str {
+        (*self).into()
+    }
+
+    /// Parse a recorded spelling. Unknown (and `""` from a header written before the
+    /// knob) yields `None`, which every caller reads as [`DEFAULT_MEAN_TYPE`].
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "arithmetic" | "mean" | "simple" | "average" => Some(MeanType::Arithmetic),
+            "signed_log" | "signedlog" | "signed-log" | "log1p" => Some(MeanType::SignedLog),
+            "median" => Some(MeanType::Median),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for MeanType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The ranking family a command line names, so a flag can be a typed `MeanType` rather than a
+/// string the caller has to parse (the same contract the cull policies use).
+impl std::str::FromStr for MeanType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        MeanType::parse(s)
+            .ok_or_else(|| format!("{s}: expected one of arithmetic, signed_log, median"))
+    }
+}
+
+/// Default [`MeanType`] — the WEIGHTED MEDIAN: one spike cannot promote or demote a net on a
+/// fluke. `arithmetic` is the older plain-window ranking.
+pub const DEFAULT_MEAN_TYPE: MeanType = MeanType::Median;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::config::MeanType;
 
     /// The epoch window is the SAME arithmetic over a shorter tail — never a second formula.
     #[test]
@@ -456,5 +506,28 @@ mod tests {
         noisy.push(6.0);
         assert_eq!(clean.len(), noisy.len());
         assert_eq!(clean.slope(), noisy.slope());
+    }
+}
+
+#[cfg(test)]
+mod spelling_pins {
+    use super::*;
+    use std::str::FromStr;
+
+    /// The recorded spellings are a contract: `engine.json` from any run must read back.
+    #[test]
+    fn mean_type_spellings_hold() {
+        for (v, s) in [
+            (MeanType::Arithmetic, "arithmetic"),
+            (MeanType::SignedLog, "signed_log"),
+            (MeanType::Median, "median"),
+        ] {
+            assert_eq!(v.as_str(), s);
+            assert_eq!(v.to_string(), s);
+            assert_eq!(MeanType::parse(s), Some(v));
+            assert_eq!(MeanType::from_str(s).unwrap(), v);
+        }
+        assert_eq!(MeanType::parse("average"), Some(MeanType::Arithmetic));
+        assert_eq!(MeanType::parse("signed-log"), Some(MeanType::SignedLog));
     }
 }

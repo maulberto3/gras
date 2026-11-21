@@ -4,7 +4,9 @@
 use crate::graph::node::{Activation, CombineOp, StandardizeOp};
 use crate::graph::topology::FeatureSplitPolicy;
 
-use super::config::{CrossoverOp, RaceConfig};
+use crate::evolution::crossover::CrossoverOp;
+
+use super::config::RaceConfig;
 
 /// One name-addressed search pool: a list of typed strings plus the four facts needed to read them.
 pub(crate) trait SearchPool {
@@ -81,13 +83,7 @@ impl SearchPool for CrossoverOpsPool {
         CrossoverOp::try_from(entry).ok()
     }
     fn wire(choice: &CrossoverOp) -> String {
-        // `CrossoverOp` has no `Display`: the log spells these with a `crossover-`
-        // prefix and the pool record without it, so the pool's spelling is fixed here.
-        match choice {
-            CrossoverOp::OnePoint => "one_point",
-            CrossoverOp::Uniform => "uniform",
-        }
-        .to_string()
+        choice.to_string()
     }
 }
 
@@ -126,7 +122,7 @@ impl SearchPool for ActivationPool {
         crate::evolution::pools::all_activations()
     }
     fn parse(entry: &str) -> Option<Activation> {
-        RaceConfig::parse_activation(entry).ok()
+        Activation::parse(entry)
     }
     fn wire(choice: &Activation) -> String {
         choice.to_string()
@@ -153,7 +149,7 @@ impl SearchPool for CombineOpPool {
         crate::evolution::pools::all_combine_ops()
     }
     fn parse(entry: &str) -> Option<CombineOp> {
-        RaceConfig::parse_combine(entry).ok()
+        CombineOp::parse(entry)
     }
     fn wire(choice: &CombineOp) -> String {
         choice.to_string()
@@ -217,7 +213,7 @@ impl SearchPool for FeatureSplitPool {
         ]
     }
     fn parse(entry: &str) -> Option<Option<FeatureSplitPolicy>> {
-        super::config::parse_feature_split_pool_entry(entry)
+        crate::graph::topology::parse_feature_split_pool_entry(entry)
     }
     fn wire(choice: &Option<FeatureSplitPolicy>) -> String {
         choice

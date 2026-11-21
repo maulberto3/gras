@@ -1,6 +1,5 @@
 //! Stop criteria, checked once per step at the loop boundary.
 
-use super::config::{RaceSnapshot, StopReason};
 use super::core::CoreEngine;
 
 impl CoreEngine {
@@ -86,4 +85,46 @@ impl CoreEngine {
             elapsed_seconds: self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs(),
         }
     }
+}
+
+/// What the scheduler checks to decide whether to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopReason {
+    /// The configured step budget was reached.
+    MaxSteps,
+    /// A user-supplied `custom_stop` closure returned true (Iter 5 pluggable
+    /// contract; consulted after all built-ins).
+    CustomStop,
+    /// Ctrl+C received: the step was abandoned at the loop boundary and the race shut
+    /// down through the SAME artifact path. Always
+    Interrupted,
+}
+
+/// Default step budget, read at the same conservative scale as the population: `10` clocks.
+pub const DEFAULT_MAX_STEPS: usize = 10;
+
+/// Type alias for the pluggable stop closure. Plain alias, so `RaceConfig` derives
+/// neither `Clone` nor `Debug`.
+pub type StopFn = Option<Box<dyn Fn(&RaceSnapshot) -> bool + Send + Sync + 'static>>;
+
+/// A cheap read-only snapshot of the live race state at decision time, passed to a custom
+/// stop closure. Not a full run dump.
+#[derive(Clone)]
+pub struct RaceSnapshot {
+    /// Live nets at decision time.
+    pub live_count: usize,
+    /// Current step.
+    pub step: usize,
+    /// Best RANKING score — the window centre in the run's mean family, plus any
+    /// `selection_metrics` terms. This is what the race actually ranks on.
+    pub best_smoothed_fitness: f32,
+    /// Worst ranking score — the same number, at the other end.
+    pub worst_smoothed_fitness: f32,
+    /// Mean of the live ranking scores (a plain arithmetic mean OF the scores,
+    /// second smoothing pass).
+    pub mean_smoothed_fitness: f32,
+    /// Cumulative culls.
+    pub culls: usize,
+    /// Wall-clock seconds elapsed.
+    pub elapsed_seconds: u64,
 }

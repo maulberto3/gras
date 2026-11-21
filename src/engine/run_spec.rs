@@ -134,3 +134,27 @@ impl StreamShape {
         }
     }
 }
+
+/// The training paradigm / problem space the run targets. Only `Tabular` and `Rl`
+/// constructible; the image/NLP arms are reserved future `RunSpec` variants.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
+pub enum RunMode {
+    #[default]
+    /// Supervised tabular runs.
+    Tabular,
+    /// Single-channel image runs (reserved).
+    OneCImage,
+    /// Three-channel image runs (reserved).
+    ThreeCImage,
+    /// NLP runs (reserved).
+    Nlp,
+    /// Environment-driven RL runs.
+    Rl,
+}
+
+/// Which mode the run is in; carried in the type, no payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeConfig {
+    Tabular,
+    Rl,
+}

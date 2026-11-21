@@ -3,11 +3,13 @@
 pub mod child;
 pub mod config;
 pub mod core;
+pub mod cull;
 pub mod diversity;
 pub mod evolve;
 pub mod exam;
 pub mod format;
 pub mod logging;
+pub mod lottery;
 pub mod novelty;
 pub mod pool;
 pub mod population;

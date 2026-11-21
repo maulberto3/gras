@@ -5,6 +5,13 @@ use std::path::Path;
 use crate::engine::diversity::{NetShape, delta, shape_of};
 use crate::graph::topology::Topology;
 
+/// Default novelty floor `d_min` for a mutation draw (`set_mutation_novelty_min`): the clone
+/// band — unrelated nets sit near Δ 0.67, while a net's NEAREST neighbour sits near 0.17.
+pub const DEFAULT_MUTATION_NOVELTY_MIN: f32 = 0.4;
+
+/// Default candidates ONE mutation may spend before the most novel is taken anyway.
+pub const DEFAULT_MUTATION_NOVELTY_DRAWS: usize = 10;
+
 /// Every topology this run created, plus the floor a mutation draw must clear.
 pub(crate) struct Novelty {
     /// Founder slots reserved up front; children grow it past the population size.
