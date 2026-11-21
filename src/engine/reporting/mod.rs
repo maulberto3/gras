@@ -5,12 +5,86 @@ use tracing::info;
 
 use super::core::CoreEngine;
 use crate::engine::diversity::{mean_delta_to, shape_of, NetShape};
-use crate::engine::format::{fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_units, ReadingStyle};
+use crate::engine::format::{
+    fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_micros, fmt_units, ReadingStyle,
+};
 use crate::engine::smoothing::rolling_mean;
 
 mod lineage;
 
+/// Untimed eval passes before the bench's clock starts — the first forward pays for allocator
+/// and kernel selection, which is not what the cell should report.
+const EVAL_BENCH_WARMUP: usize = 3;
+/// Timed eval passes. The reading is a PRICE PER ROW, and the sweep pays it for every live net,
+/// so the sweep is `pop × (warm-up + reps)` forwards: 8 is enough to average out scheduler noise
+/// without turning the stop into the run's most expensive phase (64 reps cost 115 s at pop 500).
+const EVAL_BENCH_REPS: usize = 8;
+/// Rows in the benchmark input: the run's eval batch, capped so one huge batch cannot turn the
+/// stop sweep into a long job. The cell prints cost per ROW, so the cap changes no reading.
+const EVAL_BENCH_MAX_ROWS: usize = 256;
+
 impl CoreEngine {
+    /// Price every live net's eval forward ONCE, at the terminal stop, and stamp it into
+    /// `meta.eval` — the number the `eval time (µs)` column and `nets/<hash>.json` carry.
+    ///
+    /// Deliberately NOT a per-step timer: timing a forward inside the loop would cost the race
+    /// more than the reading is worth, and the price is a property of the blueprint + device +
+    /// batch, not of the weights, so one measurement at the end is the number the loop would
+    /// have averaged. RL has no shared batch: one pass = one TURN, a single observation.
+    pub(crate) fn stamp_eval_bench(&mut self) {
+        let hashes = self.state.live_hashes();
+        if hashes.is_empty() {
+            return;
+        }
+        let (unit, rows) = if self.trainer.is_rl() {
+            ("turn", 1usize)
+        } else {
+            (
+                "sample",
+                self.stream
+                    .as_ref()
+                    .map(|s| s.eval_batch_size())
+                    .unwrap_or(1)
+                    .clamp(1, EVAL_BENCH_MAX_ROWS),
+            )
+        };
+        let dim = self.meta_ctx.input_dim.max(1);
+        // Values never change a forward's cost, so zeros keep the sweep off the RNG and off the
+        // dataset: a timing run must not perturb the race's own streams.
+        let data = vec![0.0f32; rows * dim];
+        let shape = [rows as i64, dim as i64];
+        let input = match flodl::Tensor::from_f32(&data, &shape, self.config.device()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("eval bench input build failed: {e}");
+                return;
+            }
+        };
+        for hash in hashes {
+            let Some(net) = self.networks.get_mut(hash.as_str()) else {
+                continue;
+            };
+            match crate::utils::race_steps::bench_eval_forward(
+                net,
+                &input,
+                EVAL_BENCH_WARMUP,
+                EVAL_BENCH_REPS,
+            ) {
+                Ok(secs) => {
+                    if let Some(state) = self.state.net_mut(&hash) {
+                        state.meta.eval = crate::state::EvalBench {
+                            secs_per_pass: Some(secs),
+                            units_per_pass: Some(rows),
+                            unit: unit.to_string(),
+                            passes: EVAL_BENCH_REPS,
+                        };
+                    }
+                }
+                Err(e) => tracing::warn!("eval bench failed for {hash}: {e}"),
+            }
+        }
+    }
+
     /// One rollup line per step: pop size, train-loss mean ± std, the mode's middle
     /// column, and the fitness column. Printed LAST, so it lands at the terminal bottom.
     pub(crate) fn log_step_rollup(&mut self, clock: usize) {
@@ -373,7 +447,7 @@ impl CoreEngine {
 
     /// The stop-time summary of the WHOLE measured field: one table, every live net, ranked by FIT,
     /// with the saved elite set marked in place.
-    pub(crate) fn log_final_field(&self, clock: usize, verbose: bool) {
+    pub(crate) fn log_final_field(&self, clock: usize, verbose: bool) -> CardStats {
         // ONE ranking for the whole card.
         let ranked = self.ranked_live();
         let mut rows: Vec<(String, Option<f32>)> = ranked
@@ -395,7 +469,7 @@ impl CoreEngine {
         rows.extend(unmeasured.into_iter().map(|hash| (hash, None)));
         // No live net at all ⇒ nothing to print: an empty table says less than nothing.
         if rows.is_empty() {
-            return;
+            return CardStats::default();
         }
         let k = self.config.champion_count.max(1); // report at least the champion
         let top: Vec<(String, f32)> = self.champion_slice(&ranked);
@@ -494,11 +568,11 @@ impl CoreEngine {
                 stats.line(),
             )),
         );
-        if !verbose {
-            return;
+        if verbose {
+            // The table is the LAST thing the console prints.
+            crate::utils::cfy::emit(&field_card);
         }
-        // The table is the LAST thing the console prints.
-        crate::utils::cfy::emit(&field_card);
+        stats
     }
 
     /// The plan the ONE stop-time table renders from: one header, one champion set, one live
@@ -693,12 +767,20 @@ impl CoreEngine {
             shape
                 .map(|s| format!("{:.2}", s.reach))
                 .unwrap_or_else(dash),
+            // `D` — the longest wire path in this net's live blueprint. Report-only.
+            shape.map(|s| s.depth.to_string()).unwrap_or_else(dash),
+            // `t` — what ONE eval pass costs on this net's live blueprint, measured ONCE at
+            // stop (`meta.eval`): seconds per SAMPLE (tabular) or per TURN (RL). Report-only.
+            state
+                .and_then(|s| s.meta.eval.secs_per_unit())
+                .map(fmt_micros)
+                .unwrap_or_else(dash),
             shape.map(|s| s.nodes.to_string()).unwrap_or_else(dash),
             // The mask's DENSITY, not its policy label: a blended split has no single policy to
             // name, but how much of the input a port reads is still a comparable number.
             shape
                 .and_then(|s| s.mask)
-                .map(|d| format!("{:.0}", d * 100.0))
+                .map(|d| fmt_cell(d * 100.0))
                 .unwrap_or_else(dash),
             shape.map(|s| s.wires.to_string()).unwrap_or_else(dash),
             // Mean hidden width is a MEASURED number like every other cell, so it takes the band
@@ -1274,9 +1356,19 @@ fn updates_minmax_column(legs: crate::engine::config::TrainTicket) -> &'static s
 const COL_UPDATES: &str = "updates (U)";
 /// `E`: every time the net ran the trainer and was SCORED — `U` (the updates that stuck) plus the act-only passes the lottery denied under `train_merit_learn_only`.
 const COL_EVALS: &str = "evals (E)";
+/// `D`: the longest wire path from an Input node to any node; Input = 0, so
+/// `Input → H1 → H2 → Output` reads `3`. Report-only: no ranking, seat, ticket or cull reads it.
+const COL_DEPTH: &str = "depth (D)";
+/// `t`: the wall-clock cost of ONE eval-mode forward pass, measured once at stop — per SAMPLE
+/// in tabular mode, per TURN in RL. The unit (`µs`) is stated ONCE here, in the header, so the
+/// cells hold bare numbers; the legend's row states what one unit was priced over. The header
+/// says `time` because the cell is a DURATION: `evals (E)` right of it is a count of passes, and
+/// two adjacent columns both called "eval" read as the same quantity.
+const COL_EVAL: &str = "eval time (µs)";
 const COL_EXAM: &str = "exam (X)";
 /// `mask`: the share of the input each Input port reads, averaged over the ports. The header is
-/// WRAPPED at render time (`wrap_header`) so the CELL holds the bare number: `100` = no split
+/// WRAPPED at render time (`wrap_header`) so the CELL holds the bare number at the shared
+/// band rule (`fmt_cell`: `49.2`, `100.0`): `100.0` = no split
 /// (every port sees every feature), `1/P` = exclusive over P ports, between = an inherited
 /// crossover blend. The `%` is stated once, in the header, instead of in every row.
 const COL_MASK: &str = "feature split masks %";
@@ -1302,6 +1394,10 @@ const STOP_HEADER_FIXED: &[&str] = &[
     "origin",
     "params",
     "reach",
+    // `D` sits right of the wiring gene: how deep the net is, then what one eval pass of it
+    // COSTS — both are properties of the blueprint, and both are read before the census.
+    COL_DEPTH,
+    COL_EVAL,
     "nodes",
     COL_MASK,
     "wires",
@@ -1362,179 +1458,145 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         "Fm⁺"
     };
     let minmax = fit_minmax_column(ctx.legs.fitness_inverted());
+    let family = match ctx.mean_type {
+        crate::engine::config::MeanType::Arithmetic => "the window mean",
+        crate::engine::config::MeanType::SignedLog => {
+            "`g⁻¹` of the mean of `g(x) = sign(x)·ln(1+|x|)`"
+        }
+        crate::engine::config::MeanType::Median => "the window's weighted median",
+    };
+    let ticket = match ctx.lottery.as_ref() {
+        Some(_) => format!(
+            "`T`: the chance the coin gave this net on the last dealt clock (clock {}), paid inside the band — it trains iff `d < T`, `d` uniform on [0,1). `na` when it was not graded (born shield, no reading, lottery off)",
+            ctx.dealt_clock
+        ),
+        None => "`na` on every row: no lottery field was graded at the last clock".to_string(),
+    };
+    let band = match ctx.lottery.as_ref() {
+        // The frame is stored direction-adjusted, so convert back into the COLUMN's direction.
+        Some(f) => {
+            let (best, worst) = match ctx.direction {
+                crate::utils::fitness::Direction::Maximize => (f.best, f.worst),
+                crate::utils::fitness::Direction::Minimize => (-f.best, -f.worst),
+            };
+            format!(
+                "the last clock's lottery field: best `F = {}`, worst `F = {}` over the graded nets; band [p_min {}, p_max {}] = each clock's chance (the worst-graded net is paid `p_min`, the best `p_max`); tilt {} picks which end earns",
+                fmt_cell(best),
+                fmt_cell(worst),
+                fmt_cfg(ctx.p_min),
+                fmt_cfg(ctx.p_max),
+                ctx.tilt,
+            )
+        }
+        None => format!(
+            "no lottery field at the last clock (floor 1.0, everyone trains, or the field was never armed): band [p_min {}, p_max {}], tilt {}",
+            fmt_cfg(ctx.p_min),
+            fmt_cfg(ctx.p_max),
+            ctx.tilt,
+        ),
+    };
     let mut rows = vec![
         (
             "#".to_string(),
-            "rank by `fit (F)`, best first; `na` for a live net with no reading yet (it is listed last, unranked)"
+            "rank by `fit (F)`, best first; `na` = a live net with no reading yet (listed last, unranked)"
                 .to_string(),
         ),
         (
             "hash".to_string(),
-            "the first 8 hex of the blueprint's xxh3 — the net's identity in `nets/<hash>.json`, `champions.json` and this table"
+            "first 8 hex of the blueprint's xxh3 — its key in `nets/<hash>.json`, `champions.json` and the CSV"
                 .to_string(),
         ),
         // ── what this net IS ────────────────────────────────────────────
         (
             "origin".to_string(),
-            "where the net came from: a founder slot, or the crossover/mutation op and the clock it was born at (a newborn's first ticket is the NEXT clock)"
+            "a founder slot, or the crossover/mutation op and birth clock (a child's first ticket is the NEXT clock)"
                 .to_string(),
         ),
         (
             "params".to_string(),
-            "trainable parameters, in K/M/B units (`40.2K` = 40 200); the exact count is in `nets/<hash>.json`"
+            "trainable parameters in K/M/B units (`40.2K` = 40 200); the exact count is in `nets/<hash>.json`"
                 .to_string(),
         ),
         (
             "reach".to_string(),
-            "the wiring gene `input_reach`: the share of hidden nodes allowed a wire straight from the Input node. `1.00` = every node may read the raw input (one Input port per hidden node); lower = fewer Input ports and hidden→hidden wires instead, so the net is deeper and each Input port still carries one wire and one mask row"
+            "the `input_reach` gene: share of hidden nodes wired straight from the Input node; lower = fewer Input ports, deeper net"
                 .to_string(),
         ),
         (
+            COL_DEPTH.to_string(),
+            "`D`: the longest wire path from an Input node to any node (`Input` = 0). A chain `Input → H1 → H2 → Output` reads `3`; hidden-layer count is `D − 1`. Report-only: no ranking, seat, ticket or cull reads it"
+                .to_string(),
+        ),
+        (
+            COL_EVAL.to_string(),
+            format!(
+                "`t`: wall-clock cost of ONE eval-mode forward, per sample (tabular) or per turn (RL) — {EVAL_BENCH_WARMUP} warm-up + {EVAL_BENCH_REPS} timed passes, run once at stop and kept in `meta.eval`. Report-only: no ranking, seat, ticket or cull reads it"
+            ),
+        ),
+        (
             "nodes".to_string(),
-            "nodes in the blueprint: input + hidden + output".to_string(),
+            "blueprint size: input + hidden + output".to_string(),
         ),
         (
             COL_MASK.to_string(),
-            "share of the input each Input port reads on average: `100%` = no split (every port sees every feature), `1/P` = exclusive over P ports, ~`50%` = random masks, and between = an inherited crossover blend".to_string(),
+            "mean share of the input each Input port reads, in percent: `100.0` = no split, `1/P` = exclusive, between = a crossover blend"
+                .to_string(),
         ),
         (
             "wires".to_string(),
-            "connections in the blueprint, one per output-port → input-port wire".to_string(),
+            "blueprint connections, one per output-port → input-port wire".to_string(),
         ),
         (
             "width".to_string(),
-            "mean hidden-node width — the mean `hidden_dim` across the hidden nodes".to_string(),
+            "mean `hidden_dim` across the hidden nodes".to_string(),
         ),
         (
             COL_AGE.to_string(),
-            "`A = clock − born + 1` — clocks lived, inclusive of the birth clock. It closes the ranking run, right of the ticket: `T` is the chance the coin paid this net on a clock, `A` is how many clocks it was there to take one — and every one of those was either an eval pass or a clock the lottery withheld (the identity is spelled out in the `A = E + withheld` row)".to_string(),
+            "`A = clock − born + 1`: clocks lived, birth clock included — the clocks there were to take a ticket in"
+                .to_string(),
         ),
         // ── how it is RANKED ────────────────────────────────────────────
         (
             fit_column(ctx.mean_type).to_string(),
             format!(
-                "`F` = {} — the ranking value: the window's CENTRE in the `{}` family over the last `n = min(B, K)` readings, K = {}, with NO spread charge (risk aversion was removed 2026-11-14). Any `selection_metrics` terms are ADDED to this centre (each a labelled metric's smoothed centre times its weight), so `F` is then composite and the Summ line names the terms. This is the card's only window cell: with no charge to apply, a `mean`/`median` column beside it printed `F`'s own number a second time, and the diagnostic spread (`1.4826 × MAD` under `median`, `σ` under `arithmetic`) was a statistic no cell reads — both were dropped 2026-11-14. The header still names the family, so the row says which window the number came from. The per-clock `Summ` line keeps printing the legs it averaged (`window median` / `1.4826·MAD`), because that line charges nothing either. Geometric/harmonic averaging is not offered: their domain excludes a non-positive reading, and a reward or centred fitness can cross zero — `signed_log` is the no-cliff form of the same damping",
-                match ctx.mean_type {
-                    crate::engine::config::MeanType::Arithmetic => "the window mean",
-                    crate::engine::config::MeanType::SignedLog => {
-                        "the window average taken in `g(x) = sign(x)·ln(1+|x|)`, then mapped back with `g⁻¹`"
-                    }
-                    crate::engine::config::MeanType::Median => {
-                        "the window's weighted MEDIAN — one fluke cannot move it at all"
-                    }
-                },
-                ctx.mean_type.as_str(),
-                ctx.window,
+                "`F` = {family} over the last `n = min(B, K)` readings, K = {}; `selection_metrics` terms are added. No spread charge",
+                ctx.window
             ),
         ),
         (
             COL_SLOPE.to_string(),
-            "`S` — the LEAST-SQUARES slope of this net's own fitness through EVERY reading it ever took, in raw fitness units per READING (the sign follows `direction`: with maximize, `+` is improving). One point per eval pass (`evals (E)`), x = the reading's index 0, 1, 2… — never the clock, because a net the lottery starved has gaps and a clock x-axis would charge those gaps to its slope as if it had been getting worse. `F` is a level, `S` is a direction, and no net can be ranked by where it is going. It also ignores the `K` window on purpose — `K` is a ranking smoother, too short to call a trend — which is why `S` can disagree with `F`'s own recent move. Report-only: no ranking, champion, seat, lottery draw or cull reads it; `champions.json` carries the same number as `fitness_slope` beside `fitness_readings` (the count of readings the line was fit to). Four decimals, and a nonzero trend finer than that prints in exponent form rather than as a `0.0000` that would read as flat. `na` = fewer than two readings, so there is no line to fit".to_string(),
+            "`S`: least-squares slope of the net's own readings, per READING (not per clock); sign follows `direction`. Report-only; `na` = fewer than two readings"
+                .to_string(),
         ),
         (
             minmax.to_string(),
             format!(
-                "this net's `fit (F)` as a 0..1 position between the field's two ends on the LAST dealt clock (clock {}): `Fm⁺ = (F − F_worst) ÷ (F_best − F_worst)` over the nets the lottery GRADES (live, non-crown, out of its born shield, with a reading). The tilt is ALREADY applied, so `0.99` is the end that earns the tickets ({} this run) and `0.01` the end that earns fewest (both ends are pushed inside `[0.01, 0.99]`, so no cell and no ticket ever sits exactly on the band's `p_max`/`p_min`) — under worst-first the place is mirrored, which is what lets the coin read one ordering, and the HEADER spells that mirror out (`Fm⁻ = 1 − …`) because that factor is the one the tilt reverses. The two ends themselves are printed with their numbers in the `F field · band` row",
+                "`{place} = (F − F_worst) ÷ (F_best − F_worst)`: `F` as a 0..1 place in the last field (clock {}), tilt {} already applied — `0.99` is the end that earns. Both ends sit inside `[0.01, 0.99]`; their numbers are in the `F field · band` row",
                 ctx.dealt_clock, ctx.tilt
             ),
         ),
-        (
-            ticket_column(ctx.legs).to_string(),
-            match ctx.lottery.as_ref() {
-                Some(_) => {
-                    // The equation names EXACTLY the cell the table prints: `Um` only while the U
-                    // leg is armed, so its factor is never stated blind.
-                    let (mut names, mut cells) = (format!("{place}"), format!("`{place}`"));
-                    if ctx.legs.updates_armed() {
-                        names.push_str(if ctx.legs.updates_inverted() {
-                            " × Um⁻"
-                        } else {
-                            " × Um⁺"
-                        });
-                        cells.push_str(if ctx.legs.updates_inverted() {
-                            " × `Um⁻`"
-                        } else {
-                            " × `Um⁺`"
-                        });
-                    }
-                    let eq = format!("`T = p_min + (p_max − p_min) × {names}`");
-                    let legs = if ctx.legs.updates_armed() {
-                        format!("the product on its LEFT ({cells})")
-                    } else {
-                        format!("the single leg on its LEFT (`{place}`)")
-                    };
-                    let arm = if ctx.legs.updates_armed() {
-                        "The U leg is ARMED (`train_ticket` names an updates side), so it multiplies the place and a net that has SPENT its updates sees the cell fall under `Um⁻`"
-                    } else {
-                        "The U leg is OFF (`train_ticket` is place-only: `most_fit` / `least_fit`), so nothing multiplies the place and the cell is one step from it"
-                    };
-                    // A derived leg is only honest if the legend says which printed cell it comes
-                    // from: `Um` is computed off the `updates (U)` column.
-                    let um = if !ctx.legs.updates_armed() {
-                        ""
-                    } else if ctx.legs.updates_inverted() {
-                        " · `Um⁻ = 1 − (U − U_min) ÷ (U_max − U_min)` over the graded field: `0.99` at the fewest updates and `0.01` at the most, so a net that spent updates on rescue retries pays for them out of its own future tickets. NOT mirrored by the tilt: spending the budget spends it in either ordering"
-                    } else {
-                        " · `Um⁺ = (U − U_min) ÷ (U_max − U_min)` over the graded field: `1` at the MOST updates and `0` at the fewest, so this leg pays the net that has already trained — the opposite of `Um⁻`, and NOT mirrored by the tilt"
-                    };
-                    format!(
-                        "the chance the coin gave this net on the LAST clock it dealt (clock {}): {eq}, {legs}, paid inside the band (`p_min`, `p_max` stated with their numbers in the `F field · band` row) — and `T` is the probability ITSELF, on the coin's own line: the draw is `d = fastrand ∈ [0,1)` and the net LEARNS iff `d < T` — a lost draw still acts and measures when `train_merit_learn_only` is on, so `p_min` and `p_max` are the share of the unit interval the field's chances cover (`T = 1` trains every clock, `T = 0` never). {arm}{um}. `na` when the coin was not thrown for this net: the lottery is off or was never armed, it is inside its born shield, it has no reading yet, or the graded field had no spread to place it in. Those nets always run, but a number here would claim a draw they never took part in. Under tilt {} this column FALLS as `fit (F)` rises",
-                        ctx.dealt_clock,
-                        ctx.tilt
-                    )
-                }
-                None => "the chance the coin gave this net on the last clock: `na` on every row, because there was no field to grade (the band's floor is 1.0, so nobody is graded, or the lottery was never armed)".to_string(),
-            },
-        ),
+        (ticket_column(ctx.legs).to_string(), ticket),
         (
             updates_minmax_column(ctx.legs).to_string(),
-            match ctx.legs.updates_inverted() {
-                true => "the U leg: `Um⁻ = 1 − (U − U_min) ÷ (U_max − U_min)` over the graded field, so `0.99` at the FEWEST updates and `0.01` at the most — NOT mirrored by the tilt, since spending the budget spends it in either ordering. Printed only while the leg is ARMED (`set_train_ticket` names an updates side) and the net was graded".to_string(),
-                false => "the U leg read FORWARD: `Um⁺ = (U − U_min) ÷ (U_max − U_min)` over the graded field, so `1` at the MOST updates and `0` at the fewest — this leg pays the net that has already trained. Printed only while the leg is ARMED (`set_train_ticket` names an updates side) and the net was graded".to_string(),
-            },
+            "the U leg: `U` as a 0..1 place in the graded field (`Um⁻` pays the fewest updates, `Um⁺` the most), NOT mirrored by the tilt. Printed only while the leg is armed and the net graded"
+                .to_string(),
         ),
         // ── what its learning COST ──────────────────────────────────────
         (
             COL_EVALS.to_string(),
-            "`E` — EVAL passes: every clock the net ran the trainer and was SCORED. It is `U` (the updates that stuck, the column before it) plus the act-only passes the lottery denied under `train_merit_learn_only` (`O`, which has no column of its own because it is already inside `E`): with that flag off a denied net idles instead and `E = U`. An IDLE clock is in neither (nothing ran, nothing was scored), which is why `E` sits below `A = E + withheld` — the gap is the clocks the lottery withheld plus the birth clock a mid-run child sat out. A recovery streak scores several times inside one clock, so `E` can also run AHEAD of `A`"
+            "`E`: eval passes — `U` plus the act-only passes a withheld ticket still ran; an idle clock is in neither, so `E` can trail `A` (and a recovery streak can push it ahead)"
                 .to_string(),
         ),
-        (
-            "F field · band".to_string(),
-            match ctx.lottery.as_ref() {
-                Some(f) => {
-                    // The frame is stored direction-adjusted (`best` = the value `p = 1` earns,
-                    // either direction), so the printed pair is converted back into the COLUMN's
-                    let (best, worst) = match ctx.direction {
-                        crate::utils::fitness::Direction::Maximize => (f.best, f.worst),
-                        crate::utils::fitness::Direction::Minimize => (-f.best, -f.worst),
-                    };
-                    format!(
-                        "the lottery field the last clock drew from: best `fit (F) = {}` and worst `fit (F) = {}` over the nets it grades (crown and born-shield nets are exempt, so they never set the scale) · band [p_min {}, p_max {}] = the chance each clock: the worst-graded net is paid `p_min`, the best-graded `p_max`, and everyone between (Ω retired — the band IS the payout) · tilt {} = which END earns the tickets (worst-first: the LEAST fit net takes most of them, best-first: the fitter net does) · the column prints `fit (F)` at cell precision so the two ends these bounds name are findable in it",
-                        fmt_cell(best),
-                        fmt_cell(worst),
-                        fmt_cfg(ctx.p_min),
-                        fmt_cfg(ctx.p_max),
-                        ctx.tilt,
-                    )
-                }
-                None => format!(
-                    "no lottery field at the last clock: the band's floor is 1.0 (every net trains every clock) or the field was not armed yet — every graded net took its ticket (tilt {} · band [p_min {}, p_max {}] from the manifest)",
-                    ctx.tilt,
-                    fmt_cfg(ctx.p_min),
-                    fmt_cfg(ctx.p_max)
-                ),
-            },
-        ),
+        ("F field · band".to_string(), band),
         (
             COL_UPDATES.to_string(),
-            "`U` — real optimizer updates it applied. Normally one per clock; a RECOVERY streak (`recovery_retries`) can add up to that many more inside the SAME clock, so a rescued net's `U` can outrun the clocks it lived. The streak spends only what it NEEDS: the first update whose reading is back at the net's standing ends it, so a cap of 5 is never a budget of 5 — and it never fires inside the run's INIT PROBATION, whose clocks are judged on draws every net shares (extra updates nobody else got would outvote the draw). Two marks ride this cell: `r<n>` = the retries that net took across the run (a real update each, printed only when it took any; the live log prints one `recovery` line per streak with the whole walk) · `n` = NEVER LEARNED (`U = 0`): its first live clock has not arrived yet — a newborn's first ticket is the NEXT clock, so a net BORN ON THE RUN'S LAST CLOCK keeps `n` and never runs. No act, no eval, no fitness, so its `fit (F)`, min-max place and ticket cells stay `na` and it can neither rank nor take a seat until a clock lands"
+            "`U`: real optimizer updates applied (normally one per clock, more inside a recovery streak); `r<n>` = retries taken; `n` = never learned yet"
                 .to_string(),
         ),
         // ── the age identity, as far as the row can show it now that `idle` is not printed ──
         (
             "A = E + withheld (+1 if born mid-run)".to_string(),
-            "every clock a net lived is an EVAL pass or a clock the lottery withheld — the withheld throws have no column, so `A` can exceed `E` and this row does not say by how much (the debug card still prints `idle`). The birth clock a mid-run child sits out also explains a sum one short of `A` (a founder runs clock 0; a child's first ticket is the NEXT clock). A recovery streak breaks it the OTHER way: its retries are extra eval passes inside one clock, so `E` can run AHEAD of `A` by exactly the retries taken — the `U` legend says so beside it"
+            "each clock lived is an eval pass or a clock the lottery withheld; a mid-run child also sits out its birth clock"
                 .to_string(),
         ),
         (
@@ -1544,29 +1606,27 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         // ── what this net IS (the verdict) ────────────────────────────
         (
             COL_EXAM.to_string(),
-            "the EXAM: the same ranking scorer over rows the race NEVER read — a separate `exam/` store, not the eval pool, and not reachable from any clock. Scored once at stop for the reported nets only and written to `exam.json`; `na` = no exam supplied, or a net outside the reported set. It ranks nothing: read it against `fit (F)`, because `F` is what selection saw and `X` is what nothing saw"
+            "`X`: the same scorer over rows no clock ever read, scored once at stop into `exam.json`; ranks nothing — read it against `F`"
                 .to_string(),
         ),
         (
             "mark".to_string(),
             format!(
-                "the verdict glyph, INLINE in the console card — `★` saved as a CHAMPION (top-{} by `fit (F)`, the saved inheritable ranking) · `·` not saved. It sits inside the column that decided it (`★` on `fit (F)`, `b` on `age (A)`); `final-field.csv` carries no mark cell, its columns stay plain values",
+                "`★` = saved champion (top-{} by `F`), `·` = not saved; inline in the deciding column, and not carried by the CSV",
                 ctx.k
             ),
         ),
         (
             "mark b · j · t".to_string(),
             format!(
-                "the gate flag: b = inside its born cull shield (crossover {} / mutation {} update(s) of `U`) — it cannot be culled. The shield is served by TRAINING, so a net nobody feeds keeps it",
-                ctx.crossover_probation,
-                ctx.mutation_probation,
+                "`b` = inside its born cull shield (crossover {} / mutation {} updates of `U`): cannot be culled; serving it takes training",
+                ctx.crossover_probation, ctx.mutation_probation,
             ),
         ),
-        // ── the informative band (appended after the last fixed column) ──── ONE row stands
-        // the whole band: its cells are as dynamic as the caller's `set_run_metrics(...)` list,
+        // ── the informative band (appended after the last fixed column) ────
         (
             "m:<name>".to_string(),
-            "an informative METRIC you registered with `set_run_metrics` — `m:` marks it as measured but NEVER ranked: computed on the same eval batch as `fit (F)`, recorded in `history.csv`, and read by no ranking, champion, seat, lottery draw or cull. `<name>` is the label you gave `Metric::custom(...)`, verbatim, and the columns are appended after `exam (X)` in config order"
+            "an informative metric from `set_run_metrics`: measured on the eval batch, in `history.csv`, ranked by nothing — appended after `exam (X)` in config order"
                 .to_string(),
         ),
     ];
@@ -1620,6 +1680,23 @@ mod stop_legend_tests {
         assert!(
             rows.iter().any(|(k, _)| k == "m:<name>"),
             "the `m:` metric prefix needs a legend row"
+        );
+    }
+
+    /// Depth is read beside the wiring gene it follows, and has its own explanation.
+    #[test]
+    fn depth_sits_right_of_reach_and_has_a_legend_row() {
+        let cols = printed_columns(true, true);
+        let reach = cols
+            .iter()
+            .position(|c| *c == "reach")
+            .expect("reach is a printed column");
+        assert_eq!(cols[reach + 1], COL_DEPTH, "columns: {cols:?}");
+        let rows = stop_legend_rows(&ctx());
+        assert!(
+            rows.iter().any(|(k, _)| k == COL_DEPTH),
+            "depth has no legend row: {:?}",
+            rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()
         );
     }
 
@@ -1873,9 +1950,11 @@ struct StopRow<'a> {
 }
 
 /// One card's own structural summary: the mean `Δcrown` and `Δpop` over the rows it printed.
-struct CardStats {
-    delta_crown: Option<f32>,
-    delta_pop: Option<f32>,
+/// Returned by `log_final_field` so the stop record can persist the two numbers the card showed.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CardStats {
+    pub(crate) delta_crown: Option<f32>,
+    pub(crate) delta_pop: Option<f32>,
 }
 
 impl CardStats {
@@ -2537,6 +2616,7 @@ mod tests {
     fn shape(token: &str) -> NetShape {
         NetShape {
             reach: 1.0,
+            depth: 1,
             genome: [(token.to_string(), 1usize)].into_iter().collect(),
             nodes: 1,
             wires: 1,
@@ -2550,6 +2630,7 @@ mod tests {
     fn shape_pair() -> NetShape {
         NetShape {
             reach: 1.0,
+            depth: 2,
             genome: [("W:Tanh".to_string(), 1usize), ("W:SiLU".to_string(), 1)]
                 .into_iter()
                 .collect(),
