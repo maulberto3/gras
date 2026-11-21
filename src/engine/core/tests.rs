@@ -309,7 +309,7 @@ fn select_random_victim_is_deterministic_and_alive() {
     let dir = std::env::temp_dir().join("race_random_victim");
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 42).unwrap();
-    engine.config.crossover_cull_policy = crate::engine::config::CrossCullPolicy::Random;
+    engine.config.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::Random;
     // Channel probation 0: this test pins the DRAW's determinism, not the shield
     // (see `probation_shields_*`).
     engine.config.mutation_probation_steps = 0;
@@ -2779,7 +2779,7 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
     // This test grades one ORDERING, so it pins it: worst-first × fewest-updates (the engine's
     // default is `most_fit_fewest_updates` now, which pays the other end of the FIT axis).
     eng.config.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
-    eng.config.crossover_cull_policy = crate::engine::config::CrossCullPolicy::HighestTicketChance;
+    eng.config.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::HighestTicketChance;
 
     // Worst-first (pinned above), so the worst net has the highest `p` and is the one evicted.
     assert_eq!(
@@ -2791,7 +2791,7 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
     // The mutation channel's `Unfed` arm runs the SAME selector: a net the lottery
     // starves loses its place to an immigrant too, not only to a crossover child.
     eng.config.mutation_cull_policy =
-        crate::engine::config::MutationCullPolicy::HighestTicketChance;
+        crate::engine::cull::MutationCullPolicy::HighestTicketChance;
     assert_eq!(
         eng.select_mutation_victim(5, 0).unwrap().as_deref(),
         Some(hashes[2].as_str())
@@ -2863,7 +2863,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     // Pinned: worst-first × fewest-updates, the ordering this test's two victims name.
     eng.config.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
     eng.config.train_merit_p_min = 0.0;
-    eng.config.crossover_cull_policy = crate::engine::config::CrossCullPolicy::HighestTicketChance;
+    eng.config.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::HighestTicketChance;
     assert_eq!(
         eng.select_highest_ticket_chance_victim()
             .unwrap()
@@ -2873,7 +2873,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     );
 
     eng.config.crossover_cull_policy =
-        crate::engine::config::CrossCullPolicy::LowestFitnessMostUpdates;
+        crate::engine::cull::CrossCullPolicy::LowestFitnessMostUpdates;
     assert_eq!(
         eng.select_lowest_fitness_most_updates_victim()
             .unwrap()
@@ -2883,7 +2883,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     );
     // The mutation channel's `Spent` arm runs the SAME selector.
     eng.config.mutation_cull_policy =
-        crate::engine::config::MutationCullPolicy::LowestFitnessMostUpdates;
+        crate::engine::cull::MutationCullPolicy::LowestFitnessMostUpdates;
     assert_eq!(
         eng.select_mutation_victim(5, 0).unwrap().as_deref(),
         Some(hashes[1].as_str())
@@ -3660,14 +3660,14 @@ fn resume_warns_on_a_cull_policy_mismatch_on_both_channels() {
     // `lowest_fitness` has no drift.
     let mut same = RaceConfig::defaults();
     same.pop_size = 2;
-    same.crossover_cull_policy = crate::engine::config::CrossCullPolicy::LowestFitness;
+    same.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::LowestFitness;
     let resumed = resume(same).expect("a blanked legacy policy must resume");
     assert!(resumed.behavioural_drift().is_empty());
     drop(resumed);
 
     let mut cross = RaceConfig::defaults();
     cross.pop_size = 2;
-    cross.crossover_cull_policy = crate::engine::config::CrossCullPolicy::Random;
+    cross.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::Random;
     let resumed = resume(cross).expect("a cull policy is behavioural: warn, never refuse");
     let drift = resumed.behavioural_drift();
     let row = drift
@@ -3684,7 +3684,7 @@ fn resume_warns_on_a_cull_policy_mismatch_on_both_channels() {
 
     let mut mutp = RaceConfig::defaults();
     mutp.pop_size = 2;
-    mutp.mutation_cull_policy = crate::engine::config::MutationCullPolicy::Random;
+    mutp.mutation_cull_policy = crate::engine::cull::MutationCullPolicy::Random;
     let resumed = resume(mutp).expect("the mutation channel warns on the same terms");
     let drift = resumed.behavioural_drift();
     let row = drift

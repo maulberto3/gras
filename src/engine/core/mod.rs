@@ -784,8 +784,8 @@ impl CoreEngine {
                 .map(|ops| {
                     ops.iter()
                         .map(|o| match o {
-                            crate::engine::config::CrossoverOp::OnePoint => "one_point",
-                            crate::engine::config::CrossoverOp::Uniform => "uniform",
+                            crate::evolution::crossover::CrossoverOp::OnePoint => "one_point",
+                            crate::evolution::crossover::CrossoverOp::Uniform => "uniform",
                         })
                         .collect::<Vec<&str>>()
                         .join(",")
@@ -1612,7 +1612,7 @@ impl CoreEngine {
         if config.topology_options.feature_split.is_none() {
             if let Some(raw) = header.config.feature_split.as_deref() {
                 config.topology_options.feature_split =
-                    crate::engine::config::parse_feature_split_wire(raw);
+                    crate::graph::topology::parse_feature_split_wire(raw);
             }
         }
         if let Some(pool) = header
