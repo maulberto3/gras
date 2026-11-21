@@ -555,12 +555,13 @@ impl CoreEngine {
                     Some(test_len) => {
                         PoolSplit::explicit(dataset.len() - test_len, test_len, run_seed)
                     }
-                    None => PoolSplit::of(dataset, train_eval_split_ratio, run_seed),
+                    None => PoolSplit::stratified(dataset, train_eval_split_ratio, run_seed),
                 };
                 Some(
                     BatchStream::new(run_seed, batch_size.unwrap_or(default_batch_size), split)
                         .with_eval_batch_size(eval_batch_size.unwrap_or(default_batch_size))
-                        .with_checkpoint_every(config.run.checkpoint_every),
+                        .with_checkpoint_every(config.run.checkpoint_every)
+                        .stratified(dataset),
                 )
             }
             None => None,

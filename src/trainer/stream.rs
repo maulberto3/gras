@@ -39,6 +39,94 @@ fn seeded_split(len: usize, train_ratio: f32, eval_ratio: f32, seed: u64) -> (Ve
     }
 }
 
+
+/// The class of every row when `targets` is one-hot (classification), else `None`.
+/// Regression and soft-label targets keep the uniform window — the engine casts
+/// targets to f32 on load, so this reads the same tensor the loss sees.
+fn one_hot_labels(dataset: &Dataset) -> Option<Vec<usize>> {
+    let shape = dataset.targets.shape();
+    if shape.len() != 2 || shape[1] < 2 {
+        return None;
+    }
+    let classes = shape[1] as usize;
+    let values = dataset.targets.to_f32_vec().ok()?;
+    let mut labels = Vec::with_capacity(values.len() / classes);
+    for row in values.chunks_exact(classes) {
+        let mut best = 0usize;
+        let mut one = None;
+        for (i, &v) in row.iter().enumerate() {
+            if v > row[best] {
+                best = i;
+            }
+            if (v - 1.0).abs() <= 1e-4 {
+                if one.replace(i).is_some() {
+                    return None;
+                }
+            } else if v.abs() > 1e-4 {
+                return None;
+            }
+        }
+        if one != Some(best) {
+            return None;
+        }
+        labels.push(best);
+    }
+    Some(labels)
+}
+
+fn shuffle_rows(rows: &mut [i64], seed: u64) {
+    let mut rng = fastrand::Rng::with_seed(seed);
+    for i in (1..rows.len()).rev() {
+        let j = rng.usize(0..=i);
+        rows.swap(i, j);
+    }
+}
+
+/// Per-class seats in a batch: the floor of the proportional share, then the
+/// leftover seats go to the largest remainders (ties to the lower class index).
+fn class_quotas(counts: &[usize], batch: usize) -> Vec<usize> {
+    let total: usize = counts.iter().sum();
+    if total == 0 || batch == 0 {
+        return vec![0; counts.len()];
+    }
+    let mut quotas: Vec<usize> = counts.iter().map(|&c| batch * c / total).collect();
+    let mut left = batch - quotas.iter().sum::<usize>();
+    let mut order: Vec<usize> = (0..counts.len()).filter(|&i| counts[i] > 0).collect();
+    order.sort_by(|&a, &b| {
+        let ra = (batch * counts[a]) % total;
+        let rb = (batch * counts[b]) % total;
+        rb.cmp(&ra).then(a.cmp(&b))
+    });
+    let mut cursor = 0usize;
+    while left > 0 && !order.is_empty() {
+        quotas[order[cursor % order.len()]] += 1;
+        left -= 1;
+        cursor += 1;
+    }
+    quotas
+}
+
+/// One class-proportionate window: every class walks its own seeded permutation,
+/// advancing `quota` rows per batch, so batches are stable under replay.
+fn stratified_window(groups: &[Vec<i64>], batch: usize, ordinal: usize, seed: u64) -> Vec<i64> {
+    let counts: Vec<usize> = groups.iter().map(Vec::len).collect();
+    let quotas = class_quotas(&counts, batch);
+    let mut out = Vec::with_capacity(batch);
+    for (class, &take) in quotas.iter().enumerate() {
+        let rows = &groups[class];
+        if take == 0 || rows.is_empty() {
+            continue;
+        }
+        let mut perm = rows.clone();
+        shuffle_rows(&mut perm, derive_seed(seed, class));
+        let start = ordinal.wrapping_mul(take) % perm.len();
+        for i in 0..take {
+            out.push(perm[(start + i) % perm.len()]);
+        }
+    }
+    out
+}
+
 // ── PoolSplit (D12) ─────────────────────────────────────────────────────────
 
 /// The static train/eval pool split, fixed once at run start: every net trains
@@ -70,6 +158,48 @@ impl PoolSplit {
         Self::new(dataset.len(), train_eval_split_ratio, seed)
     }
 
+    /// Proportionate split: when the targets are one-hot, each class is split
+    /// train/eval on its own, so neither pool loses a rare class to the shuffle.
+    /// Non-classification datasets fall back to [`Self::of`].
+    pub fn stratified(dataset: &Dataset, train_eval_split_ratio: f32, seed: u64) -> Self {
+        let Some(labels) = one_hot_labels(dataset) else {
+            return Self::of(dataset, train_eval_split_ratio, seed);
+        };
+        let classes = labels.iter().copied().max().map_or(0, |c| c + 1);
+        let mut train = Vec::with_capacity(dataset.len());
+        let mut eval = Vec::new();
+        let mut every = Vec::with_capacity(dataset.len());
+        for class in 0..classes {
+            let mut rows: Vec<i64> = labels
+                .iter()
+                .enumerate()
+                .filter(|(_, label)| **label == class)
+                .map(|(row, _)| row as i64)
+                .collect();
+            shuffle_rows(&mut rows, derive_seed(seed, class));
+            let held = (rows.len() as f32 * train_eval_split_ratio).round() as usize;
+            let held = if train_eval_split_ratio > 0.0 && rows.len() >= 2 {
+                held.clamp(1, rows.len() - 1)
+            } else {
+                held.min(rows.len())
+            };
+            let cut = rows.len() - held;
+            train.extend_from_slice(&rows[..cut]);
+            eval.extend_from_slice(&rows[cut..]);
+            every.extend(rows);
+        }
+        if eval.is_empty() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "stratified split left an empty eval set — using ALL data for eval (train/eval overlap)"
+                );
+            });
+            return PoolSplit { train, eval: every };
+        }
+        PoolSplit { train, eval }
+    }
+
     /// Split from an EXPLICIT train/test layout: `train` = all train rows;
     /// `eval` = a seeded shuffle of all test rows.
     pub fn explicit(train_len: usize, test_len: usize, seed: u64) -> Self {
@@ -99,6 +229,10 @@ pub struct BatchStream {
     checkpoint_every: usize,
     train_pool: Vec<i64>,
     eval_pool: Vec<i64>,
+    /// Per-class row indices (train), when the targets are one-hot.
+    train_classes: Option<Vec<Vec<i64>>>,
+    /// Per-class row indices (eval), when the targets are one-hot.
+    eval_classes: Option<Vec<Vec<i64>>>,
 }
 
 impl BatchStream {
@@ -112,7 +246,27 @@ impl BatchStream {
             checkpoint_every: 100, // default, can be overridden via with_checkpoint_every
             train_pool: split.train,
             eval_pool: split.eval,
+            train_classes: None,
+            eval_classes: None,
         }
+    }
+
+    /// Make every later batch class-proportionate when `dataset`'s targets are
+    /// one-hot. A regression / soft target is a no-op (the uniform window stays).
+    pub fn stratified(mut self, dataset: &Dataset) -> Self {
+        if let Some(labels) = one_hot_labels(dataset) {
+            let classes = labels.iter().copied().max().map_or(0, |c| c + 1);
+            let groups = |pool: &[i64]| {
+                let mut by_class = vec![Vec::new(); classes];
+                for &row in pool {
+                    by_class[labels[row as usize]].push(row);
+                }
+                by_class
+            };
+            self.train_classes = Some(groups(&self.train_pool));
+            self.eval_classes = Some(groups(&self.eval_pool));
+        }
+        self
     }
 
     /// Override the eval batch size (trainer's `stream_shape` hook). Train and eval
@@ -189,6 +343,12 @@ impl BatchStream {
         step: u64,
         attempt: u64,
     ) -> Result<(Tensor, Tensor)> {
+        if let Some(groups) = &self.train_classes {
+            let ordinal = (step as usize).wrapping_add(attempt as usize);
+            let seed = derive_seed(self.run_seed, 0);
+            let indices = stratified_window(groups, self.batch_size, ordinal, seed);
+            return Self::gather(dataset, &indices);
+        }
         // One seeded permutation of the train pool, derived from the run
         // seed only — steps walk it round-robin via a step-derived offset.
         let perm_seed = derive_seed(self.run_seed, 0);
@@ -230,6 +390,15 @@ impl BatchStream {
     /// The **eval** batch for `step` — the held-out batch every live net is scored
     /// on. Rotated per checkpoint era; pure in `(run_seed, step)`.
     pub fn eval_batch(&self, dataset: &Dataset, step: u64) -> Result<(Tensor, Tensor)> {
+        if let Some(groups) = &self.eval_classes {
+            let base = self
+                .run_seed
+                .wrapping_add(EVAL_STREAM_OFFSET);
+            let seed = derive_seed(base, self.era_of(step) as usize);
+            let indices =
+                stratified_window(groups, self.eval_batch_size, step as usize, seed);
+            return Self::gather(dataset, &indices);
+        }
         let perm = self.eval_permutation(self.era_of(step));
         let offset = (step as usize).wrapping_mul(self.eval_batch_size);
         Self::gather(dataset, &Self::window(&perm, self.eval_batch_size, offset))
@@ -443,6 +612,109 @@ mod tests {
         assert_ne!(
             era0_rows, era1_rows,
             "eval permutation must rotate across the era boundary"
+        );
+    }
+
+    /// Build `[n, 2]` inputs and one-hot targets with the requested class counts.
+    fn labelled_dataset(counts: &[usize]) -> Dataset {
+        let mut labels = Vec::new();
+        for (class, &n) in counts.iter().enumerate() {
+            labels.extend(std::iter::repeat(class).take(n));
+        }
+        let n = labels.len();
+        let inputs = flodl::Tensor::from_f32(
+            &vec![0.0; n * 2],
+            &[n as i64, 2],
+            flodl::Device::CPU,
+        )
+        .unwrap();
+        let targets =
+            crate::utils::tabular_data::one_hot(&labels, counts.len(), flodl::Device::CPU)
+                .unwrap();
+        Dataset { inputs, targets }
+    }
+
+    fn histogram(y: &flodl::Tensor) -> Vec<usize> {
+        let cols = y.shape()[1] as usize;
+        let vals = y.to_f32_vec().unwrap();
+        let mut out = vec![0usize; cols];
+        for row in vals.chunks_exact(cols) {
+            let mut best = 0usize;
+            for (i, &v) in row.iter().enumerate() {
+                if v > row[best] {
+                    best = i;
+                }
+            }
+            out[best] += 1;
+        }
+        out
+    }
+
+    /// The claim: a 70/20/10 dataset gives 7/2/1 seats in every 10-row batch,
+    /// on BOTH streams, and the split keeps 80/20 overall.
+    #[test]
+    fn stratified_split_and_batches_keep_class_proportions() {
+        let ds = labelled_dataset(&[70, 20, 10]);
+        let split = PoolSplit::stratified(&ds, 0.2, 11);
+        assert_eq!((split.train.len(), split.eval.len()), (80, 20));
+        let stream = BatchStream::new(11, 10, split).stratified(&ds);
+        for step in 0..6u64 {
+            let (_, train_y) = stream.train_batch(&ds, step).unwrap();
+            assert_eq!(histogram(&train_y), vec![7, 2, 1], "train step {step}");
+            let (_, eval_y) = stream.eval_batch(&ds, step).unwrap();
+            assert_eq!(histogram(&eval_y), vec![7, 2, 1], "eval step {step}");
+        }
+    }
+
+    /// A rare class must survive the split: 10 rows at 20% eval keeps 2 held out,
+    /// so an eval batch can actually measure it.
+    #[test]
+    fn stratified_split_keeps_a_rare_class_on_both_sides() {
+        let ds = labelled_dataset(&[990, 10]);
+        let split = PoolSplit::stratified(&ds, 0.2, 3);
+        let targets = ds.targets.to_f32_vec().unwrap();
+        let rare = |pool: &[i64]| {
+            pool.iter()
+                .filter(|&&row| targets[row as usize * 2 + 1] > 0.5)
+                .count()
+        };
+        assert_eq!(rare(&split.train), 8);
+        assert_eq!(rare(&split.eval), 2);
+    }
+
+    /// Non-one-hot targets are regression / soft labels: the stratified entry
+    /// points must be byte-identical to the uniform stream.
+    #[test]
+    fn non_one_hot_targets_keep_the_uniform_stream() {
+        let n = 40usize;
+        let inputs = flodl::Tensor::from_f32(
+            &vec![0.0; n * 2],
+            &[n as i64, 2],
+            flodl::Device::CPU,
+        )
+        .unwrap();
+        let values: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let d = (i % 3) as f32 * 0.1;
+                [0.2 + d, 0.8 - d]
+            })
+            .collect();
+        let targets = flodl::Tensor::from_f32(&values, &[n as i64, 2], flodl::Device::CPU).unwrap();
+        let ds = Dataset { inputs, targets };
+        let split = PoolSplit::stratified(&ds, 0.25, 9);
+        let uniform = PoolSplit::of(&ds, 0.25, 9);
+        assert_eq!(split.train, uniform.train);
+        assert_eq!(split.eval, uniform.eval);
+        let stratified = BatchStream::new(9, 5, split).stratified(&ds);
+        let plain = BatchStream::new(9, 5, uniform);
+        assert_eq!(
+            stratified
+                .train_batch(&ds, 4)
+                .unwrap()
+                .0
+                .to_f32_vec()
+                .unwrap(),
+            plain.train_batch(&ds, 4).unwrap().0.to_f32_vec().unwrap()
         );
     }
 }

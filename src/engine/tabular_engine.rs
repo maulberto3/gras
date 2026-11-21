@@ -228,7 +228,7 @@ impl TabularEngine {
                 }
                 PoolSplit::explicit(dataset.len() - test_len, test_len, run_seed)
             }
-            None => PoolSplit::of(&dataset, header_stream_ratio, run_seed),
+            None => PoolSplit::stratified(&dataset, header_stream_ratio, run_seed),
         };
         // Resume is Tabular-only today (a persisted run carries a dataset); both fields are wrapped
         // in Some to satisfy the Option'd struct.
@@ -246,7 +246,8 @@ impl TabularEngine {
         let stream = Some(
             BatchStream::new(run_seed, batch_size, split)
                 .with_eval_batch_size(eval_batch_size)
-                .with_checkpoint_every(eval_era_every),
+                .with_checkpoint_every(eval_era_every)
+                .stratified(&dataset),
         );
         let dataset = Some(dataset);
 
