@@ -297,7 +297,7 @@ pub fn die(msg: impl std::fmt::Display) -> ! {
 /// the sinks the console stays silent and a live run LOOKS hung.
 pub fn init_logging(level_arg: &str) -> LogLevel {
     let (level, verbosity) = LogLevel::parse_verbose(level_arg).unwrap_or((LOG_LEVEL, None));
-    gras::engine::logging::init(level, verbosity);
+    gras::engine::reporting::logging::init(level, verbosity);
     level
 }
 
