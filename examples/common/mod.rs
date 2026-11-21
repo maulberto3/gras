@@ -182,8 +182,8 @@ pub struct EngineArgs {
         long,
         value_name = "BOOL",
         num_args = 0..=1,
-        default_missing_value = "true",
-        default_value_t = true
+        default_missing_value = "false",
+        default_value_t = false
     )]
     pub champion_previous_load: bool,
     /// Where that inheritance looks: a run dir or a dir of run dirs (unset: `results/`).
