@@ -175,7 +175,7 @@ fn resume_rl(
     // Install the sink at the RECORDED level before construction can emit — a fresh
     // process would otherwise resume silently (the subscriber is process-wide).
     LOGGING.call_once(|| {
-        gras::engine::logging::init(
+        gras::engine::reporting::logging::init(
             gras::RaceConfig::from_snapshot(&header.config).run.log_level,
             None,
         );
@@ -386,7 +386,7 @@ impl PyRaceEngine {
         inner.ranking.metrics = metrics;
         // Install the console sink before the engine can emit its start-up block: `Once` because the subscriber is process-wide (a second install is a no-op, not a panic), and the…
         LOGGING.call_once(|| {
-            gras::engine::logging::init(inner.run.log_level, log_verbosity);
+            gras::engine::reporting::logging::init(inner.run.log_level, log_verbosity);
         });
         // The SAME layout sniff the engine runs: a dir holding `train/` + `test/` is an EXPLICIT split, anything else is one pool that the engine splits by `eval_share`.
         let (in_dim, out_dim) = {
@@ -633,7 +633,7 @@ impl PyRaceEngine {
         }
         // Install the sink at the RECORDED level before construction can emit: in a fresh process a resume would otherwise be silent (the subscriber is process-wide, so an earlier…
         LOGGING.call_once(|| {
-            gras::engine::logging::init(
+            gras::engine::reporting::logging::init(
                 gras::RaceConfig::from_snapshot(&header.config).run.log_level,
                 None,
             );
@@ -737,7 +737,7 @@ impl PyRaceEngine {
         inner.topology.options.input_dim = Some(probe.len());
         inner.topology.options.output_dim = Some(world.action_count());
         LOGGING.call_once(|| {
-            gras::engine::logging::init(inner.run.log_level, log_verbosity);
+            gras::engine::reporting::logging::init(inner.run.log_level, log_verbosity);
         });
 
         let signal = match discount {
