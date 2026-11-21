@@ -74,7 +74,7 @@ impl SearchPool for CrossoverOpsPool {
     const ACCEPTED: &'static [&'static str] = &["one_point", "onepoint", "uniform"];
 
     fn entries(cfg: &RaceConfig) -> &[String] {
-        &cfg.crossover_ops_pool
+        &cfg.evolution.crossover_ops_pool
     }
     fn default_choices() -> Vec<CrossoverOp> {
         vec![CrossoverOp::OnePoint, CrossoverOp::Uniform]
@@ -116,7 +116,7 @@ impl SearchPool for ActivationPool {
     ];
 
     fn entries(cfg: &RaceConfig) -> &[String] {
-        &cfg.activation_pool
+        &cfg.topology.activation_pool
     }
     fn default_choices() -> Vec<Activation> {
         crate::evolution::pools::all_activations()
@@ -142,7 +142,7 @@ impl SearchPool for CombineOpPool {
     ];
 
     fn entries(cfg: &RaceConfig) -> &[String] {
-        &cfg.combine_op_pool
+        &cfg.topology.combine_op_pool
     }
     fn default_choices() -> Vec<CombineOp> {
         // ALL of them, not the conservative four: an empty pool means "no restriction".
@@ -174,7 +174,7 @@ impl SearchPool for StandardizePool {
     ];
 
     fn entries(cfg: &RaceConfig) -> &[String] {
-        &cfg.standardize_op_pool
+        &cfg.topology.standardize_op_pool
     }
     fn default_choices() -> Vec<StandardizeOp> {
         crate::evolution::pools::all_standardize_ops()
@@ -203,7 +203,7 @@ impl SearchPool for FeatureSplitPool {
     ];
 
     fn entries(cfg: &RaceConfig) -> &[String] {
-        &cfg.feature_split_pool
+        &cfg.topology.feature_split_pool
     }
     fn default_choices() -> Vec<Option<FeatureSplitPolicy>> {
         vec![
@@ -234,11 +234,11 @@ mod tests {
     /// per-pool knowledge, and a loud panic if a sixth pool is added without
     fn entries_mut<'a>(cfg: &'a mut RaceConfig, label: &str) -> &'a mut Vec<String> {
         match label {
-            "crossover_ops_pool" => &mut cfg.crossover_ops_pool,
-            "activation_pool" => &mut cfg.activation_pool,
-            "combine_op_pool" => &mut cfg.combine_op_pool,
-            "standardize_op_pool" => &mut cfg.standardize_op_pool,
-            "feature_split_pool" => &mut cfg.feature_split_pool,
+            "crossover_ops_pool" => &mut cfg.evolution.crossover_ops_pool,
+            "activation_pool" => &mut cfg.topology.activation_pool,
+            "combine_op_pool" => &mut cfg.topology.combine_op_pool,
+            "standardize_op_pool" => &mut cfg.topology.standardize_op_pool,
+            "feature_split_pool" => &mut cfg.topology.feature_split_pool,
             other => panic!("{other} is a new pool: add it to this match"),
         }
     }
@@ -303,7 +303,10 @@ mod tests {
     #[test]
     fn no_split_is_a_choice_not_a_parse_failure() {
         let cfg = RaceConfig {
-            feature_split_pool: vec!["none".to_string(), "split_random".to_string()],
+            topology: crate::engine::config::TopologyConfig {
+        feature_split_pool: vec!["none".to_string(), "split_random".to_string()],
+        ..Default::default()
+    },
             ..RaceConfig::defaults()
         };
         let pool = resolve::<FeatureSplitPool>(&cfg).expect("both entries parse");

@@ -458,9 +458,9 @@ impl PyRaceConfig {
         }
 
         let mut cfg = gras::RaceConfig::defaults();
-        cfg.pop_size = self.pop_size;
-        cfg.champion_count = self.champion_count;
-        cfg.max_steps = self.max_steps;
+        cfg.population.pop_size = self.pop_size;
+        cfg.population.champion_count = self.champion_count;
+        cfg.stop.max_steps = self.max_steps;
         // Same bounds the crate's setter enforces: outside them a pool can round
         // to empty (the split then hands the whole dataset to eval).
         if !(0.01..=0.9).contains(&self.eval_share) {
@@ -469,27 +469,27 @@ impl PyRaceConfig {
                 self.eval_share
             )));
         }
-        cfg.eval_share = self.eval_share;
-        cfg.smoothing_window = self.smoothing_window;
-        cfg.mean_type =
+        cfg.run.eval_share = self.eval_share;
+        cfg.ranking.smoothing_window = self.smoothing_window;
+        cfg.ranking.mean_type =
             gras::engine::config::MeanType::parse(&self.mean_type).ok_or_else(|| {
                 PyValueError::new_err(format!(
                     "mean_type {:?}: expected one of arithmetic, signed_log, median",
                     self.mean_type
                 ))
             })?;
-        cfg.train_merit_p_min = if self.train_merit_p_min.is_finite() {
+        cfg.lottery.train_merit_p_min = if self.train_merit_p_min.is_finite() {
             self.train_merit_p_min.clamp(0.0, 1.0)
         } else {
             DEFAULT_TRAIN_MERIT_P_MIN
         };
-        cfg.train_merit_p_max = if self.train_merit_p_max.is_finite() {
+        cfg.lottery.train_merit_p_max = if self.train_merit_p_max.is_finite() {
             self.train_merit_p_max.clamp(0.0, 1.0)
         } else {
             DEFAULT_TRAIN_MERIT_P_MAX
         };
         // The LEGS are the rest of the band's arithmetic, so a surface that can set the ends but not the legs still cannot reproduce a run's chances.
-        cfg.train_ticket =
+        cfg.lottery.train_ticket =
             gras::engine::config::TrainTicket::parse(&self.ticket_legs).ok_or_else(|| {
                 PyValueError::new_err(format!(
                     "ticket_legs {:?}: expected one of {}",
@@ -497,72 +497,72 @@ impl PyRaceConfig {
                     gras::engine::config::TrainTicket::ALL_NAMES.join(", ")
                 ))
             })?;
-        cfg.init_probation_steps = self.init_probation_steps;
+        cfg.population.init_probation_steps = self.init_probation_steps;
         // Clamped like the Rust setter (a stray 1.5 must not flip every bit twice); the
         // value is recorded in `engine.json` and compared by name on resume.
-        cfg.drift_prob = if self.drift_prob.is_finite() {
+        cfg.topology.drift_prob = if self.drift_prob.is_finite() {
             self.drift_prob.clamp(0.0, 1.0)
         } else {
             0.0
         };
-        cfg.champion_previous_load = self.champion_previous_load;
-        cfg.log_level = log_level;
+        cfg.run.champion_previous_load = self.champion_previous_load;
+        cfg.run.log_level = log_level;
         // The gate's two numbers take the same bounds the crate's setters enforce, so a typed
         // slip reads as "off" / "one draw" in both languages instead of a mid-race surprise.
-        cfg.mutation_novelty_min = if self.mutation_novelty_min.is_finite() {
+        cfg.evolution.mutation_novelty_min = if self.mutation_novelty_min.is_finite() {
             self.mutation_novelty_min.max(0.0)
         } else {
             0.0
         };
-        cfg.mutation_novelty_draws = self.mutation_novelty_draws.max(1);
-        cfg.crossover_cull_policy = crossover_cull_policy;
-        cfg.mutation_cull_policy = mutation_cull_policy;
-        cfg.crossover_selection = crossover_selection;
-        cfg.crossover_ops_pool = self.crossover_ops_pool;
-        cfg.checkpoint_every = self.checkpoint_every;
-        cfg.mutation_probation_steps = self.mutation_probation_steps;
-        cfg.crossover_probation_steps = self.crossover_probation_steps;
-        cfg.recovery_retries = self.recovery_retries;
-        cfg.recovery_tolerance = if self.recovery_tolerance.is_finite() {
+        cfg.evolution.mutation_novelty_draws = self.mutation_novelty_draws.max(1);
+        cfg.evolution.crossover_cull_policy = crossover_cull_policy;
+        cfg.evolution.mutation_cull_policy = mutation_cull_policy;
+        cfg.evolution.crossover_selection = crossover_selection;
+        cfg.evolution.crossover_ops_pool = self.crossover_ops_pool;
+        cfg.run.checkpoint_every = self.checkpoint_every;
+        cfg.population.mutation_probation_steps = self.mutation_probation_steps;
+        cfg.population.crossover_probation_steps = self.crossover_probation_steps;
+        cfg.population.recovery_retries = self.recovery_retries;
+        cfg.population.recovery_tolerance = if self.recovery_tolerance.is_finite() {
             self.recovery_tolerance.max(0.0)
         } else {
             0.0
         };
-        cfg.recovery_same_seed = self.recovery_same_seed;
+        cfg.population.recovery_same_seed = self.recovery_same_seed;
         if let Some(pool) = hidden_dim_pool {
-            cfg.hidden_dim_pool = Some(pool);
+            cfg.topology.hidden_dim_pool = Some(pool);
         }
-        cfg.hidden_dim_stride = self.hidden_dim_stride;
+        cfg.topology.hidden_dim_stride = self.hidden_dim_stride;
         // The node-count / fan-in / fan-out ranges live on `topology_options`, which the run header already records whole — so setting them here is enough for `engine.json` to…
         if let Some(pool) = hidden_nodes_pool {
-            cfg.topology_options.min_hidden_num_nodes = *pool.start();
-            cfg.topology_options.max_hidden_num_nodes = *pool.end();
+            cfg.topology.options.min_hidden_num_nodes = *pool.start();
+            cfg.topology.options.max_hidden_num_nodes = *pool.end();
         }
         if let Some(pool) = hidden_inputs_pool {
-            cfg.topology_options.min_hidden_inputs_per_node = *pool.start();
-            cfg.topology_options.max_hidden_inputs_per_node = *pool.end();
+            cfg.topology.options.min_hidden_inputs_per_node = *pool.start();
+            cfg.topology.options.max_hidden_inputs_per_node = *pool.end();
         }
         if let Some(pool) = hidden_outputs_pool {
-            cfg.topology_options.min_hidden_outputs_per_node = *pool.start();
-            cfg.topology_options.max_hidden_outputs_per_node = *pool.end();
+            cfg.topology.options.min_hidden_outputs_per_node = *pool.start();
+            cfg.topology.options.max_hidden_outputs_per_node = *pool.end();
         }
-        cfg.topology_options.dropout_prob = self.dropout_prob;
-        cfg.activation_pool = self.activation_pool;
-        cfg.combine_op_pool = self.combine_op_pool;
-        cfg.standardize_op_pool = self.standardize_op_pool;
+        cfg.topology.options.dropout_prob = self.dropout_prob;
+        cfg.topology.activation_pool = self.activation_pool;
+        cfg.topology.combine_op_pool = self.combine_op_pool;
+        cfg.topology.standardize_op_pool = self.standardize_op_pool;
         // The pool decides what a NEWBORN draws; `feature_split=` pins it to one entry.
-        cfg.feature_split_pool = if self.feature_split_pool.is_empty() {
+        cfg.topology.feature_split_pool = if self.feature_split_pool.is_empty() {
             feature_split.into_iter().collect()
         } else {
             self.feature_split_pool.clone()
         };
         // Name a bad pool entry here, before a single net is drawn — every name-based pool, not just the split: the crate's draw paths fall back to `all` on a typo, so this is…
         cfg.validate_search_pools().map_err(PyValueError::new_err)?;
-        cfg.csv_export = self.csv_export;
-        cfg.trace_file = self.trace_file;
-        cfg.champion_save_topology = self.champion_save_topology;
-        cfg.run_name = self.run_name;
-        cfg.champion_previous_dir = self.champion_previous_dir;
+        cfg.run.csv_export = self.csv_export;
+        cfg.run.trace_file = self.trace_file;
+        cfg.run.champion_save_topology = self.champion_save_topology;
+        cfg.run.run_name = self.run_name;
+        cfg.run.champion_previous_dir = self.champion_previous_dir;
 
         Ok((cfg, verbosity))
     }

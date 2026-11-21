@@ -34,7 +34,7 @@ impl CoreEngine {
         push(
             "smoothing_window (K)",
             recorded.smoothing_window.to_string(),
-            current.smoothing_window.to_string(),
+            current.ranking.smoothing_window.to_string(),
             format!(
                 "set_fitness_smoothing_window({})",
                 recorded.smoothing_window
@@ -43,7 +43,7 @@ impl CoreEngine {
         push(
             "policy_scoped_fitness",
             recorded.policy_scoped_fitness.to_string(),
-            current.policy_scoped_fitness.to_string(),
+            current.ranking.policy_scoped_fitness.to_string(),
             format!(
                 "set_fitness_policy_scoped({})",
                 recorded.policy_scoped_fitness
@@ -59,7 +59,7 @@ impl CoreEngine {
         push(
             "mean_type",
             rec_mean.clone(),
-            current.mean_type.to_string(),
+            current.ranking.mean_type.to_string(),
             format!("set_fitness_mean_type({rec_mean})",),
         );
         // `""` = a header written before the knob: those runs drew roulette.
@@ -71,19 +71,19 @@ impl CoreEngine {
         push(
             "crossover_selection",
             rec_selection.clone(),
-            current.crossover_selection.to_string(),
+            current.evolution.crossover_selection.to_string(),
             format!("set_crossover_selection({rec_selection})"),
         );
         push(
             "train_merit_p_min (p_min)",
             fmt_cfg(recorded.train_merit_p_min),
-            fmt_cfg(current.train_merit_p_min),
+            fmt_cfg(current.lottery.train_merit_p_min),
             format!("set_ticket_p_min({})", fmt_cfg(recorded.train_merit_p_min)),
         );
         push(
             "train_merit_p_max (p_max)",
             fmt_cfg(recorded.train_merit_p_max),
-            fmt_cfg(current.train_merit_p_max),
+            fmt_cfg(current.lottery.train_merit_p_max),
             format!("set_ticket_p_max({})", fmt_cfg(recorded.train_merit_p_max)),
         );
         let rec_legs = crate::engine::config::TrainTicket::parse(&recorded.train_ticket)
@@ -91,14 +91,14 @@ impl CoreEngine {
         push(
             "train_ticket",
             rec_legs.to_string(),
-            current.train_ticket.to_string(),
+            current.lottery.train_ticket.to_string(),
             format!("set_train_ticket(\"{rec_legs}\")"),
         );
         // The coin's CONSEQUENCE: the same draw writes a different ledger (idle clocks vs act-only spans) and a different fitness series, so a resume under the other value is not…
         push(
             "train_merit_learn_only",
             recorded.train_merit_learn_only.to_string(),
-            current.train_merit_learn_only.to_string(),
+            current.lottery.train_merit_learn_only.to_string(),
             format!("set_ticket_learn_only({})", recorded.train_merit_learn_only),
         );
         // Crossover's base choice decides WHICH child a roll yields (same draw, different
@@ -106,7 +106,7 @@ impl CoreEngine {
         push(
             "crossover_fitter_base",
             recorded.crossover_fitter_base.to_string(),
-            current.crossover_fitter_base.to_string(),
+            current.evolution.crossover_fitter_base.to_string(),
             format!(
                 "set_crossover_fitter_base({})",
                 recorded.crossover_fitter_base
@@ -127,7 +127,7 @@ impl CoreEngine {
         push(
             "drift_prob",
             fmt_cfg(recorded.drift_prob),
-            fmt_cfg(current.drift_prob),
+            fmt_cfg(current.topology.drift_prob),
             format!("set_topology_drift({})", fmt_cfg(recorded.drift_prob)),
         );
         // The novelty floor decides how many candidates a mutation may spend, so it is as
@@ -135,7 +135,7 @@ impl CoreEngine {
         push(
             "mutation_novelty_min",
             fmt_cfg(recorded.mutation_novelty_min),
-            fmt_cfg(current.mutation_novelty_min),
+            fmt_cfg(current.evolution.mutation_novelty_min),
             format!(
                 "set_mutation_novelty_min({})",
                 fmt_cfg(recorded.mutation_novelty_min)
@@ -144,7 +144,7 @@ impl CoreEngine {
         push(
             "mutation_novelty_draws",
             recorded.mutation_novelty_draws.to_string(),
-            current.mutation_novelty_draws.to_string(),
+            current.evolution.mutation_novelty_draws.to_string(),
             format!(
                 "set_mutation_novelty_draws({})",
                 recorded.mutation_novelty_draws
@@ -168,13 +168,13 @@ impl CoreEngine {
                 "crossover_cull_policy",
                 "set_crossover_cull_policy",
                 recorded.crossover_cull_policy.clone(),
-                current.crossover_cull_policy.to_string(),
+                current.evolution.crossover_cull_policy.to_string(),
             ),
             (
                 "mutation_cull_policy",
                 "set_mutation_cull_policy",
                 recorded.mutation_cull_policy.clone(),
-                current.mutation_cull_policy.to_string(),
+                current.evolution.mutation_cull_policy.to_string(),
             ),
         ] {
             // `""` = a header written before the field: those runs culled the lowest fitness.
@@ -190,25 +190,25 @@ impl CoreEngine {
                 "mutation_probation_steps",
                 "set_mutation_probation_steps",
                 recorded.mutation_probation_steps,
-                current.mutation_probation_steps,
+                current.population.mutation_probation_steps,
             ),
             (
                 "crossover_probation_steps",
                 "set_crossover_probation_steps",
                 recorded.crossover_probation_steps,
-                current.crossover_probation_steps,
+                current.population.crossover_probation_steps,
             ),
             (
                 "init_probation_steps",
                 "set_pop_init_probation_steps",
                 recorded.init_probation_steps,
-                current.init_probation_steps,
+                current.population.init_probation_steps,
             ),
             (
                 "recovery_retries",
                 "set_pop_recovery_retries",
                 recorded.recovery_retries,
-                current.recovery_retries,
+                current.population.recovery_retries,
             ),
         ] {
             push(
@@ -224,13 +224,13 @@ impl CoreEngine {
                 "crossover_share",
                 "set_crossover_share",
                 recorded.crossover_share,
-                current.crossover_share,
+                current.evolution.crossover_share,
             ),
             (
                 "mutation_share",
                 "set_mutation_share",
                 recorded.mutation_share,
-                current.mutation_share,
+                current.evolution.mutation_share,
             ),
         ] {
             push(
@@ -244,7 +244,7 @@ impl CoreEngine {
             "recovery_same_seed",
             "set_pop_recovery_same_seed",
             recorded.recovery_same_seed,
-            current.recovery_same_seed,
+            current.population.recovery_same_seed,
         )] {
             push(
                 label,
@@ -257,7 +257,7 @@ impl CoreEngine {
             "recovery_tolerance",
             "set_pop_recovery_tol",
             recorded.recovery_tolerance,
-            current.recovery_tolerance,
+            current.population.recovery_tolerance,
         )] {
             push(
                 label,
@@ -305,7 +305,7 @@ impl CoreEngine {
                 ))
                 .into());
             }
-            let history = Self::load_history_windows(&run_dir, self.config.smoothing_window);
+            let history = Self::load_history_windows(&run_dir, self.config.ranking.smoothing_window);
             let mut replayed: Vec<Vec<String>> = Vec::new();
             let loaded = self.replay_manifest_frontier(&manifest, &history, &mut replayed)?;
             self.report_resume(loaded, &replayed, &nets_dir, &run_dir)?;
@@ -321,7 +321,7 @@ impl CoreEngine {
         let mut replayed: Vec<Vec<String>> = Vec::new();
         // The smoothing windows themselves are not persisted per net (only its LAST reading
         // but `history.csv` holds every reading the run took.
-        let history = Self::load_history_windows(&run_dir, self.config.smoothing_window);
+        let history = Self::load_history_windows(&run_dir, self.config.ranking.smoothing_window);
         for entry in entries {
             let path = entry
                 .map_err(|source| crate::utils::error::EngineError::Io {
@@ -399,11 +399,11 @@ impl CoreEngine {
         let nets_dir = self.run_dir.join("nets");
         // Count first: a pop mismatch is a config error and must be reported as one,
         // not as the weight load's "incomplete checkpoint" on the first net.
-        if manifest.nets.len() != self.config.pop_size {
+        if manifest.nets.len() != self.config.population.pop_size {
             return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume: expected {} live nets in population (per config.pop_size), but found \
+                "resume: expected {} live nets in population (per config.population.pop_size), but found \
                  {} in ckpt.json — pass the pop size this run used, or start a fresh race",
-                self.config.pop_size,
+                self.config.population.pop_size,
                 manifest.nets.len()
             ))
             .into());
@@ -492,7 +492,7 @@ impl CoreEngine {
             ))
         })?;
         let optim = nets.join(format!("{}.optim", state.hash));
-        let optimizer = if self.config.save_optim && optim.exists() {
+        let optimizer = if self.config.run.save_optim && optim.exists() {
             match self.trainer.restore_optimizer(&net, &optim) {
                 Some(o) => o,
                 None => {
@@ -535,9 +535,9 @@ impl CoreEngine {
         self.state.insert(state, None);
         self.networks.insert(hash.clone(), child.net);
         self.optimizers.insert(hash.clone(), child.optimizer);
-        let mut buf = RollingBuffer::new(self.config.smoothing_window);
-        let mut train_buf = RollingBuffer::new(self.config.smoothing_window);
-        let mut eval_buf = RollingBuffer::new(self.config.smoothing_window);
+        let mut buf = RollingBuffer::new(self.config.ranking.smoothing_window);
+        let mut train_buf = RollingBuffer::new(self.config.ranking.smoothing_window);
+        let mut eval_buf = RollingBuffer::new(self.config.ranking.smoothing_window);
         // The whole-run trend: replayed from EVERY row, so a resumed twin's slope is the live
         // run's, not a line over the tail the window keeps.
         let mut trend = crate::engine::smoothing::ReadingTrend::default();
@@ -598,11 +598,11 @@ impl CoreEngine {
         _nets_dir: &std::path::Path,
         run_dir: &std::path::Path,
     ) -> Result<()> {
-        if loaded != self.config.pop_size {
+        if loaded != self.config.population.pop_size {
             return Err(crate::utils::error::EngineError::InvalidOptions(format!(
-                "resume: expected {} live nets in population (per config.pop_size), but found \
+                "resume: expected {} live nets in population (per config.population.pop_size), but found \
                  {} live nets in {}",
-                self.config.pop_size,
+                self.config.population.pop_size,
                 loaded,
                 run_dir.display()
             ))

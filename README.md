@@ -112,12 +112,34 @@ is deliberately left to you. CUDA builds need a CUDA-enabled libtorch.
   every measured clock; `nets/<hash>.json` each blueprint (genome, feature masks
   and port activations included); `nets/<hash>.safetensors` / `.optim` its
   state; `champions.json` the ranking the next run inherits; `final-field.csv` the
-  stopping table.
+  stopping table (its `eval time (µs)` column prices one eval pass per sample, or per
+  turn in RL, measured once at stop and kept in each net's `meta.eval`; the
+  header carries the unit, so each cell is a bare number).
+- **The stop reads, the checkpoint resumes.** A run stops with
+  `save_weights_at_stop` off (the default): blueprints, the final table and
+  `engine.json`'s `topologies` / `delta_crown` / `delta_pop` land, but no
+  population-wide weights — those belong to the checkpoint that exists to resume.
+  `ckpt.json` records whether its tick exported weights, so a weightless stop
+  refuses to resume rather than load an older state.
 - **The lottery ships a tuned default.** Ω = 0.75, the inverted ordering (tickets
   go to the least fit net) and the age leg (`F × Y`) are ON unless a run says
   otherwise; `Ω = 0` is the opt-out and restores the always-train path. The
   feature-split pool and the per-port genome are on the config surface and still
   finding their defaults; `TODO.md` tracks what is settled.
+
+- **Depth is a knob, not an accident.** `input_reach` — per net, drawn from
+  `--input-reach-min`/`--input-reach-max`, default `1.0` — is the share of hidden
+  nodes allowed a wire straight from the Input node. Lower values hand the rest of
+  the net to hidden→hidden wires, so a net gets deeper instead of wider at its
+  first layer; a socket nothing upstream can feed is deleted, never paid for with
+  another raw-input port.
+- **One wire per (source → target) pair.** `--unique-source-per-target` (default
+  `true`) forbids a second wire from a node into the same later node: it carries the
+  same tensor and only its per-port activation differs, so the extra wire bought
+  fan-in and parameters, not information. `finalize` will not pick such a source,
+  `validate` rejects a blueprint that carries one, and loading an older run culls the
+  repeats once in seeded random order. The rule spans every kind — Input→hidden and
+  hidden→Output as much as hidden→hidden.
 
 ## Get started
 

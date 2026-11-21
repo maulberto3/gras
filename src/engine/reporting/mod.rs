@@ -166,17 +166,15 @@ impl CoreEngine {
             }
         };
         let score_cell = if readings.is_empty() {
-            let (_, leg, _, _, _) = window_legs(self.config.mean_type);
+            let (_, leg, _, _, _) = window_legs(self.config.ranking.mean_type);
             format!(
                 "score{} avg — (no reading yet) │ {leg} —",
                 direction.arrow()
             )
-        } else if !self.config.selection_metrics.is_empty() {
+        } else if !self.config.ranking.selection_metrics.is_empty() {
             // A COMPOSITE ranking: the fitness centre plus weighted metric centres. Printing the
             // `= window avg …` identity here would be false, so the terms are named instead.
-            let terms: Vec<String> = self
-                .config
-                .selection_metrics
+            let terms: Vec<String> = self.config.ranking.selection_metrics
                 .iter()
                 .map(|t| format!("{}·{}", t.label, fmt_cfg(t.weight)))
                 .collect();
@@ -194,7 +192,7 @@ impl CoreEngine {
                 leg_center,
                 leg_spread,
                 direction,
-                self.config.mean_type,
+                self.config.ranking.mean_type,
             )
         };
         if self.log_level == crate::engine::config::LogLevel::Minimal {
@@ -366,7 +364,7 @@ impl CoreEngine {
             ("resume dir".to_string(), self.run_dir.display().to_string()),
             (
                 "smoothing_window (K)".to_string(),
-                self.config.smoothing_window.to_string(),
+                self.config.ranking.smoothing_window.to_string(),
             ),
         ];
         crate::utils::cfy::emit(&crate::utils::cfy::card(
@@ -471,7 +469,7 @@ impl CoreEngine {
         if rows.is_empty() {
             return CardStats::default();
         }
-        let k = self.config.champion_count.max(1); // report at least the champion
+        let k = self.config.population.champion_count.max(1); // report at least the champion
         let top: Vec<(String, f32)> = self.champion_slice(&ranked);
         let mut marks: std::collections::HashMap<String, &'static str> =
             std::collections::HashMap::new();
@@ -509,9 +507,9 @@ impl CoreEngine {
         // The legend is a TABLE that assigns each column its LETTER and states the relations
         // those letters: `A` is checked against the `fit`, the centre leg and `spread`
         let legend_ctx = LegendCtx {
-            window: self.config.smoothing_window,
-            mean_type: self.config.mean_type,
-            legs: self.config.train_ticket,
+            window: self.config.ranking.smoothing_window,
+            mean_type: self.config.ranking.mean_type,
+            legs: self.config.lottery.train_ticket,
             p_min: self.train_merit_p_min(),
             p_max: self.train_merit_p_max(),
             tilt: self.lottery_tilt(),
@@ -519,8 +517,8 @@ impl CoreEngine {
             lottery,
             k,
             dealt_clock: plan.dealt_clock,
-            crossover_probation: self.config.crossover_probation_steps,
-            mutation_probation: self.config.mutation_probation_steps,
+            crossover_probation: self.config.population.crossover_probation_steps,
+            mutation_probation: self.config.population.mutation_probation_steps,
         };
         // A column that is not printed has no legend row: an explanation for a cell the reader
         // cannot find is noise.
@@ -611,8 +609,8 @@ impl CoreEngine {
         }
         // The columns this run can actually fill: the U leg's cell and the exam are columns
         // only when the run supplies them.
-        let mut columns = printed_columns(self.config.train_ticket.updates_armed(), has_exam);
-        let fit = fit_column(self.config.mean_type);
+        let mut columns = printed_columns(self.config.lottery.train_ticket.updates_armed(), has_exam);
+        let fit = fit_column(self.config.ranking.mean_type);
         // The window legs are GONE from the card (2026-11-14): with the spread charge removed, `F` IS the window centre, so a `mean`/`median` column beside it printed the same…
         for c in columns.iter_mut() {
             if *c == COL_FIT {
@@ -636,7 +634,7 @@ impl CoreEngine {
     fn stop_header(&self, columns: &[&'static str]) -> Vec<String> {
         let mut header: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
         // TWO setters shape these cells, so BOTH are read here: the tilt mirrors the place, and the U leg decides whether `Um` is a factor at all.
-        let legs = self.config.train_ticket;
+        let legs = self.config.lottery.train_ticket;
         let (place, u_cell, ticket) = (
             fit_minmax_column(legs.fitness_inverted()),
             updates_minmax_column(legs),
@@ -809,8 +807,8 @@ impl CoreEngine {
             parts.map(|(f, _, _)| fmt_cell(f)).unwrap_or_else(dash),
         ];
         // `Um` is derived off `updates (U)`: `1` at the end the LEG pays and `0` at the other, so a `most_updates` leg prints the mirror of a `fewest_updates` one.
-        if self.config.train_ticket.updates_armed() {
-            let legs = self.config.train_ticket;
+        if self.config.lottery.train_ticket.updates_armed() {
+            let legs = self.config.lottery.train_ticket;
             let um = match (parts.is_some(), row.lottery, state) {
                 (true, Some(frame), Some(s)) => {
                     let fresh =
@@ -867,7 +865,7 @@ impl CoreEngine {
             seat_marks.push(seat);
         }
         if !seat_marks.is_empty() {
-            let fit = col(fit_column(self.config.mean_type));
+            let fit = col(fit_column(self.config.ranking.mean_type));
             inlined[fit].push(' ');
             inlined[fit].push_str(&seat_marks);
         }
@@ -1052,7 +1050,7 @@ impl CoreEngine {
     /// The clock's ONE-LINE lottery report, printed after the group loop: what the coin did
     /// aggregate, never who it happened to (the per-net list is DEBUG).
     pub(crate) fn log_diversity(&self, clock: usize) {
-        let every = self.config.checkpoint_every;
+        let every = self.config.run.checkpoint_every;
         if every == 0
             || self.log_level == crate::engine::config::LogLevel::None
             || clock % every != 0
@@ -1082,7 +1080,7 @@ impl CoreEngine {
     /// The uniform operator's MIXING RATE, cumulative: of every gene it compared, how many
     /// actually took from the other parent.
     pub(crate) fn log_crossover_mix(&self, clock: usize) {
-        let every = self.config.checkpoint_every;
+        let every = self.config.run.checkpoint_every;
         if every == 0
             || self.log_level == crate::engine::config::LogLevel::None
             || clock % every != 0
@@ -1108,7 +1106,7 @@ impl CoreEngine {
 
     /// The mutation gate's reading, cumulative: how DIFFERENT the immigrants that were born turned out to be (Δ to the nearest archived blueprint) and what each birth cost in…
     pub(crate) fn log_birth_draws(&self, clock: usize) {
-        let every = self.config.checkpoint_every;
+        let every = self.config.run.checkpoint_every;
         if every == 0
             || self.log_level == crate::engine::config::LogLevel::None
             || clock % every != 0
@@ -1219,7 +1217,7 @@ impl CoreEngine {
         );
         // Under learn-only the denied nets RAN and were measured: the same count is named
         // "act-only" — it is the coin's loss, not a missing row.
-        let lost = if self.config.train_merit_learn_only {
+        let lost = if self.config.lottery.train_merit_learn_only {
             "act-only"
         } else {
             "idled"

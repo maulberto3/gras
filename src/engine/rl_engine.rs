@@ -131,9 +131,9 @@ impl RlEngine {
         }
         // Same rewind as the tabular flavor: the CSV may run ahead of the checkpoint.
         CoreEngine::rewind_csvs_to_manifest(&run_dir)?;
-        let metrics = config.metrics.clone();
+        let metrics = config.ranking.metrics.clone();
         let run_seed = header.run_seed;
-        let log_level = config.log_level;
+        let log_level = config.run.log_level;
         let meta_ctx = crate::engine::config::RunMetaCtx {
             input_dim: header.input_dim,
             output_dim: header.output_dim,
@@ -141,7 +141,7 @@ impl RlEngine {
             dropout_prob: header.topology_options.dropout_prob,
             fitness_label: header.fitness_label.0.clone(),
             direction: format!("{:?}", header.fitness_direction).to_lowercase(),
-            pop_size: config.pop_size,
+            pop_size: config.population.pop_size,
             run_seed,
         };
         let mut engine = CoreEngine::assemble(CoreEngineParts {

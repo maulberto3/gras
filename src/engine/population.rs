@@ -22,7 +22,7 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     let mut rng = fastrand::Rng::with_seed(seed as u64);
     // Per-individual identity seed. `options.topology_seed` keys the whole engine;
     // sharing the template default made every founder identical.
-    let mut opts = config.topology_options;
+    let mut opts = config.topology.options;
     opts.topology_seed = seed;
     // Structure keeps the individual seed; WEIGHT creation is run-wide, so the same
     // architecture is born with the same coefficients whoever draws
@@ -35,8 +35,8 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     opts.input_reach = opts.draw_input_reach(&mut rng);
     let mut graph = Topology::new(seed, Some(opts));
     graph.create_random_hidden_nodes(n_hidden);
-    let pool = config.hidden_dim_pool.clone().unwrap_or(4..=8);
-    let stride = config.hidden_dim_stride.max(1);
+    let pool = config.topology.hidden_dim_pool.clone().unwrap_or(4..=8);
+    let stride = config.topology.hidden_dim_stride.max(1);
     for node in &mut graph.nodes {
         if node.kind == NodeKind::Hidden {
             let n = ((pool.end() - pool.start()) / stride) + 1;
@@ -80,7 +80,7 @@ pub(crate) fn draw_feature_split(
 /// The initial population: `pop_size` deterministic draws, deduped by topology hash — identical
 /// JSONs would otherwise collapse onto one `RaceState` key.
 pub fn initial_population(config: &RaceConfig, run_seed: u64) -> Vec<Topology> {
-    let pop_size = config.pop_size;
+    let pop_size = config.population.pop_size;
     let mut topos: Vec<Topology> = (0..pop_size)
         .map(|i| draw_topology(config, run_seed, i))
         .collect();
@@ -259,9 +259,9 @@ mod tests {
             ..Default::default()
         };
         let mut cfg = RaceConfig::defaults();
-        cfg.pop_size = pop;
-        cfg.topology_options = opts;
-        cfg.hidden_dim_pool = Some(4..=4);
+        cfg.population.pop_size = pop;
+        cfg.topology.options = opts;
+        cfg.topology.hidden_dim_pool = Some(4..=4);
         cfg
     }
 
@@ -280,9 +280,9 @@ mod tests {
             ..Default::default()
         };
         let mut cfg = RaceConfig::defaults();
-        cfg.pop_size = 8;
-        cfg.topology_options = opts;
-        cfg.hidden_dim_pool = Some(4..=4);
+        cfg.population.pop_size = 8;
+        cfg.topology.options = opts;
+        cfg.topology.hidden_dim_pool = Some(4..=4);
         let topos = initial_population(&cfg, 42);
         let mut nodes_checked = 0usize;
         let mut differing = 0usize;
@@ -416,9 +416,9 @@ mod tests {
         // A 1-hidden-node fixed-dim space yields ONE topology; the gate must
         // keep pop_size entries with only 1 unique hash (the warn path).
         let mut cfg = tiny_config(3);
-        cfg.activation_pool = vec!["relu".into()];
-        cfg.combine_op_pool = vec!["mean".into()];
-        cfg.standardize_op_pool = vec!["identity".into()];
+        cfg.topology.activation_pool = vec!["relu".into()];
+        cfg.topology.combine_op_pool = vec!["mean".into()];
+        cfg.topology.standardize_op_pool = vec!["identity".into()];
         let topos = initial_population(&cfg, 42);
         assert_eq!(topos.len(), 3, "pop size preserved even when trapped");
     }
@@ -451,10 +451,10 @@ mod tests {
             ..Default::default()
         };
         let mut cfg = RaceConfig::defaults();
-        cfg.pop_size = 4;
-        cfg.topology_options = opts;
-        cfg.hidden_dim_pool = Some(4..=4);
-        cfg.feature_split_pool = vec!["exclusive".to_string()];
+        cfg.population.pop_size = 4;
+        cfg.topology.options = opts;
+        cfg.topology.hidden_dim_pool = Some(4..=4);
+        cfg.topology.feature_split_pool = vec!["exclusive".to_string()];
 
         for topo in initial_population(&cfg, 42) {
             topo.validate().expect("a split topology must validate");
@@ -486,11 +486,11 @@ mod tests {
         // about an existing run's population changes.
         let cfg = tiny_config(4);
         assert!(
-            cfg.feature_split_pool.is_empty(),
+            cfg.topology.feature_split_pool.is_empty(),
             "the pool is empty by default (= none, random, exclusive)"
         );
         let mut none_only = tiny_config(4);
-        none_only.feature_split_pool = vec!["none".to_string()];
+        none_only.topology.feature_split_pool = vec!["none".to_string()];
         for topo in initial_population(&none_only, 42) {
             let input = topo
                 .nodes
@@ -513,9 +513,9 @@ mod tests {
             ..Default::default()
         };
         let mut cfg = RaceConfig::defaults();
-        cfg.pop_size = 12;
-        cfg.topology_options = opts;
-        cfg.hidden_dim_pool = Some(4..=4);
+        cfg.population.pop_size = 12;
+        cfg.topology.options = opts;
+        cfg.topology.hidden_dim_pool = Some(4..=4);
         let mut seen: Vec<Option<crate::graph::topology::FeatureSplitPolicy>> =
             initial_population(&cfg, 7)
                 .iter()

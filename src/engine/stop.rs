@@ -7,7 +7,7 @@ impl CoreEngine {
     /// to continue. `custom_stop` is independent and runs after the built-ins.
     pub(crate) fn check_stop(&mut self, step: usize) -> Option<StopReason> {
         // 1.
-        if let Some(max) = self.config.max_steps {
+        if let Some(max) = self.config.stop.max_steps {
             if step + 1 >= max {
                 return Some(StopReason::MaxSteps);
             }
@@ -17,7 +17,7 @@ impl CoreEngine {
 
     /// The same criteria at the TOP of a clock, for a RESUMED race whose clock
     pub(crate) fn check_stop_before_clock(&mut self, next: usize) -> Option<StopReason> {
-        if let Some(max) = self.config.max_steps {
+        if let Some(max) = self.config.stop.max_steps {
             if next >= max {
                 return Some(StopReason::MaxSteps);
             }
@@ -46,7 +46,7 @@ impl CoreEngine {
         }
         // 2. Custom stop: joins the race IN ADDITION to the built-ins,
         // criteria they don't model.
-        if let Some(stop) = self.config.custom_stop.as_ref() {
+        if let Some(stop) = self.config.stop.custom_stop.as_ref() {
             if stop(&self.snapshot(step)) {
                 return Some(StopReason::CustomStop);
             }

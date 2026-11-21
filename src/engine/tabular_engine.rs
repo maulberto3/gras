@@ -180,8 +180,7 @@ impl TabularEngine {
                 }
             }
         }
-        let requested: Vec<String> = config
-            .metrics
+        let requested: Vec<String> = config.ranking.metrics
             .iter()
             .map(|m| m.label().to_string())
             .collect();
@@ -199,7 +198,7 @@ impl TabularEngine {
             ))
             .into());
         }
-        config.metrics = recorded_metrics.clone();
+        config.ranking.metrics = recorded_metrics.clone();
         let metrics = recorded_metrics;
         let run_seed = header.run_seed;
         // On resume, stream shape comes from the run header (data integrity),
@@ -207,7 +206,7 @@ impl TabularEngine {
         let header_stream_ratio = header.train_eval_split_ratio.unwrap_or(0.2); // legacy default if header missing it
         // The RUN's share wins over the caller's: the pools are the ones the first half trained
         // and a resume that re-chose them would rank nets on rows they were already selected
-        config.eval_share = header_stream_ratio;
+        config.run.eval_share = header_stream_ratio;
 
         // Same rule on resume: the trainer's stream shape overrides batch sizes
         // and the split ratio comes from the header — data integrity is fixed.
@@ -233,15 +232,15 @@ impl TabularEngine {
         };
         // Resume is Tabular-only today (a persisted run carries a dataset); both fields are wrapped
         // in Some to satisfy the Option'd struct.
-        let eval_era_every = header.eval_era_every.unwrap_or(config.checkpoint_every);
+        let eval_era_every = header.eval_era_every.unwrap_or(config.run.checkpoint_every);
         if header
             .eval_era_every
-            .is_some_and(|recorded| recorded != config.checkpoint_every)
+            .is_some_and(|recorded| recorded != config.run.checkpoint_every)
         {
             tracing::info!(
                 "resume: eval-permutation era from the record = {eval_era_every} clock(s); \
                  this call's checkpoint_every is {} (the tick cadence, not the era)",
-                config.checkpoint_every
+                config.run.checkpoint_every
             );
         }
         let stream = Some(
@@ -251,7 +250,7 @@ impl TabularEngine {
         );
         let dataset = Some(dataset);
 
-        let log_level = config.log_level;
+        let log_level = config.run.log_level;
         let meta_ctx = crate::engine::config::RunMetaCtx {
             input_dim: header.input_dim,
             output_dim: header.output_dim,
@@ -259,7 +258,7 @@ impl TabularEngine {
             dropout_prob: header.topology_options.dropout_prob,
             fitness_label: header.fitness_label.0.clone(),
             direction: format!("{:?}", header.fitness_direction).to_lowercase(),
-            pop_size: config.pop_size,
+            pop_size: config.population.pop_size,
             run_seed,
         };
 

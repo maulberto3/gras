@@ -176,7 +176,7 @@ fn resume_rl(
     // process would otherwise resume silently (the subscriber is process-wide).
     LOGGING.call_once(|| {
         gras::engine::logging::init(
-            gras::RaceConfig::from_snapshot(&header.config).log_level,
+            gras::RaceConfig::from_snapshot(&header.config).run.log_level,
             None,
         );
     });
@@ -383,10 +383,10 @@ impl PyRaceEngine {
 
         // Bind the topology dims from the dataset, exactly like the Rust examples do: the engine records dims in `engine.json`, but the topologies drawn at seed time carry…
         let (mut inner, log_verbosity) = (*config).clone().into_inner()?;
-        inner.metrics = metrics;
+        inner.ranking.metrics = metrics;
         // Install the console sink before the engine can emit its start-up block: `Once` because the subscriber is process-wide (a second install is a no-op, not a panic), and the…
         LOGGING.call_once(|| {
-            gras::engine::logging::init(inner.log_level, log_verbosity);
+            gras::engine::logging::init(inner.run.log_level, log_verbosity);
         });
         // The SAME layout sniff the engine runs: a dir holding `train/` + `test/` is an EXPLICIT split, anything else is one pool that the engine splits by `eval_share`.
         let (in_dim, out_dim) = {
@@ -408,8 +408,8 @@ impl PyRaceEngine {
                 train.targets.shape()[1] as usize,
             )
         };
-        inner.topology_options.input_dim = Some(in_dim);
-        inner.topology_options.output_dim = Some(out_dim);
+        inner.topology.options.input_dim = Some(in_dim);
+        inner.topology.options.output_dim = Some(out_dim);
         let spec = RunSpec::tabular(data_dir, inner, fitness, trainer, seed, run_dir);
         let engine = TabularEngine::from_spec(spec)
             .map_err(|e| PyRuntimeError::new_err(format!("engine: {e}")))?;
@@ -634,7 +634,7 @@ impl PyRaceEngine {
         // Install the sink at the RECORDED level before construction can emit: in a fresh process a resume would otherwise be silent (the subscriber is process-wide, so an earlier…
         LOGGING.call_once(|| {
             gras::engine::logging::init(
-                gras::RaceConfig::from_snapshot(&header.config).log_level,
+                gras::RaceConfig::from_snapshot(&header.config).run.log_level,
                 None,
             );
         });
@@ -734,10 +734,10 @@ impl PyRaceEngine {
             .reset_and_observe()
             .map_err(|e| PyRuntimeError::new_err(format!("env probe reset: {e}")))?;
         let (mut inner, log_verbosity) = (*config).clone().into_inner()?;
-        inner.topology_options.input_dim = Some(probe.len());
-        inner.topology_options.output_dim = Some(world.action_count());
+        inner.topology.options.input_dim = Some(probe.len());
+        inner.topology.options.output_dim = Some(world.action_count());
         LOGGING.call_once(|| {
-            gras::engine::logging::init(inner.log_level, log_verbosity);
+            gras::engine::logging::init(inner.run.log_level, log_verbosity);
         });
 
         let signal = match discount {

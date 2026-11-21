@@ -74,7 +74,7 @@ impl CoreEngine {
             // hand — one merit read per net per clock, not two.
             if !forced && !born && !self.train_lottery_draws_at(hash, clock, p) {
                 // LEARN-ONLY: the coin withholds the UPDATE, never the STEP — the net runs its real trainer through the no-op optimizer, so it acts and is MEASURED on a fresh batch every…
-                return if self.config.train_merit_learn_only {
+                return if self.config.lottery.train_merit_learn_only {
                     self.act_only_step(hash, clock, "NO TICKET (act-only)")
                 } else {
                     self.idle_step(hash, clock)
@@ -100,11 +100,11 @@ impl CoreEngine {
         }
         let mut metrics = self.record_update(hash, clock, &report)?;
         // RECOVERY STREAK (`recovery_retries`): an update that lands WORSE than the net's standing bought a bad READING, which is not yet a bad policy — the two differ by one more…
-        let in_init_probation = clock < self.config.init_probation_steps;
+        let in_init_probation = clock < self.config.population.init_probation_steps;
         let cap = if in_init_probation {
             0
         } else {
-            self.config.recovery_retries
+            self.config.population.recovery_retries
         };
         let mut retries = 0usize;
         // The readings the streak walks: the update that fell, then every retry's verdict. Only a
@@ -168,14 +168,14 @@ impl CoreEngine {
                 fmt_line(was),
                 fmt_line(first_bad),
                 pct,
-                self.config.recovery_tolerance * 100.0,
+                self.config.population.recovery_tolerance * 100.0,
                 if steps.is_empty() {
                     "no retry".to_string()
                 } else {
                     steps
                 },
                 verdict,
-                if self.config.recovery_same_seed {
+                if self.config.population.recovery_same_seed {
                     "same draw"
                 } else {
                     "fresh draw"
@@ -295,7 +295,7 @@ impl CoreEngine {
             crate::utils::fitness::Direction::Maximize => before - after,
             crate::utils::fitness::Direction::Minimize => after - before,
         };
-        drop > self.config.recovery_tolerance * before.abs()
+        drop > self.config.population.recovery_tolerance * before.abs()
     }
 
     /// The CROWN's act-and-measure pass: the net plays a real step (fresh batch, honest standing)
@@ -518,7 +518,7 @@ impl CoreEngine {
         {
             return Err("flat");
         }
-        let legs = self.config.train_ticket;
+        let legs = self.config.lottery.train_ticket;
         let f = Self::merit_fraction_inverted(q, frame.best, frame.worst, legs.fitness_inverted());
         // The U leg: armed it multiplies the place, and WHICH SIDE it pays is the leg's own business — `fewest_updates` keeps the fresh net (`0.99` at the field's fewest updates)…
         let updates = if !legs.updates_armed() || frame.most_updates <= frame.fewest_updates {
@@ -555,7 +555,7 @@ impl CoreEngine {
         let frame = frame?;
         let (f, _, _) = self.grade_lottery_parts(hash, Some(frame), merit).ok()?;
         // The cull is about the NET, never about the payout: `Fm⁻` here is the WORST-first place whichever end the band pays. `grade_lottery_parts` hands back the TILTED `f`, so…
-        let badness = if self.config.train_ticket.fitness_inverted() {
+        let badness = if self.config.lottery.train_ticket.fitness_inverted() {
             f
         } else {
             1.0 - f
@@ -575,13 +575,12 @@ impl CoreEngine {
 
     /// The lottery's merit floor `p_min` (`set_ticket_p_min`), clamped to `[0, 1]`.
     pub(crate) fn train_merit_p_min(&self) -> f32 {
-        self.config.train_merit_p_min.clamp(0.0, 1.0)
+        self.config.lottery.train_merit_p_min.clamp(0.0, 1.0)
     }
 
     /// The lottery's ceiling `p_max` (`set_ticket_p_max`), clamped to `[p_min, 1]`.
     pub(crate) fn train_merit_p_max(&self) -> f32 {
-        self.config
-            .train_merit_p_max
+        self.config.lottery.train_merit_p_max
             .clamp(0.0, 1.0)
             .max(self.train_merit_p_min())
     }
@@ -589,7 +588,7 @@ impl CoreEngine {
     /// Which END of the field earns the tickets, in one word — the manifest, the debug card
     /// per-clock lottery line all print it, so a reader never has to translate an ordering out
     pub(crate) fn lottery_tilt(&self) -> &'static str {
-        if self.config.train_ticket.fitness_inverted() {
+        if self.config.lottery.train_ticket.fitness_inverted() {
             "worst-first"
         } else {
             "best-first"
@@ -696,7 +695,7 @@ impl CoreEngine {
             .zip(self.stream.as_ref())
             .map(|(dataset, stream)| crate::trainer::RunData { dataset, stream });
         // The retry's DRAW index: the default `recovery_same_seed` hands out `0`, so a retry is the clock's own draw again — the trainer re-derives the same seeds and the stream…
-        let attempt = if self.config.recovery_same_seed {
+        let attempt = if self.config.population.recovery_same_seed {
             0
         } else {
             call_index
@@ -708,11 +707,11 @@ impl CoreEngine {
             step: clock,
             net_step,
             run_seed: self.header.run_seed,
-            pop_size: self.config.pop_size,
+            pop_size: self.config.population.pop_size,
             live_count: self.state.live_count(),
-            checkpoint_every: self.config.checkpoint_every,
-            smoothing_window: self.config.smoothing_window,
-            max_steps: self.config.max_steps,
+            checkpoint_every: self.config.run.checkpoint_every,
+            smoothing_window: self.config.ranking.smoothing_window,
+            max_steps: self.config.stop.max_steps,
             attempt,
         };
         let net = self.networks.get_mut(hash).ok_or_else(|| {

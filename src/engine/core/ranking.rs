@@ -28,7 +28,7 @@ impl CoreEngine {
     pub(crate) fn metric_center_of(&self, hash: &str, index: usize) -> Option<f32> {
         let buf = self.rolling_metrics.get(hash)?.get(index)?;
         let take = self.policy_scoped_take(hash, buf.len());
-        rolling_stats_tail(buf, take, self.config.mean_type).map(|s| s.score())
+        rolling_stats_tail(buf, take, self.config.ranking.mean_type).map(|s| s.score())
     }
 
     /// The net's RANKING value: the fitness window centre plus every `selection_metrics` term (`weight × that metric's smoothed centre`).
@@ -49,14 +49,14 @@ impl CoreEngine {
     pub(crate) fn race_reading_of(&self, hash: &str) -> Option<WindowStats> {
         self.rolling_fitness.get(hash).and_then(|buf| {
             let take = self.policy_scoped_take(hash, buf.len());
-            rolling_stats_tail(buf, take, self.config.mean_type)
+            rolling_stats_tail(buf, take, self.config.ranking.mean_type)
         })
     }
 
     /// Readings taken on the CURRENT weights: the epoch count, or the whole buffer while no
     /// update has landed yet (every reading is still on the current weights).
     fn policy_scoped_take(&self, hash: &str, len: usize) -> usize {
-        if !self.config.policy_scoped_fitness {
+        if !self.config.ranking.policy_scoped_fitness {
             return len;
         }
         match self.rolling_epoch.get(hash).copied() {
@@ -144,7 +144,7 @@ impl CoreEngine {
             };
             // TWO ledgers answer "did the coin withhold this clock": the idle one under the default contract (nothing ran), and the act-only one under learn-only (the net ran and was…
             let denied = state.idle_clocks() > idle_before
-                || (self.config.train_merit_learn_only && state.frozen_clocks() > frozen_before);
+                || (self.config.lottery.train_merit_learn_only && state.frozen_clocks() > frozen_before);
             if denied {
                 withheld.push(h[..8.min(h.len())].to_string());
             } else {
@@ -185,7 +185,7 @@ impl CoreEngine {
             trained: would_train.saturating_sub(lottery_skips),
             // Clamped: a stray idle delta can never make the denied split exceed the denied total.
             idled_skips: idled_skips.min(lottery_skips),
-            learn_only: self.config.train_merit_learn_only,
+            learn_only: self.config.lottery.train_merit_learn_only,
             live,
             would_train,
             lottery_skips,

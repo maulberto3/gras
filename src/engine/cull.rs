@@ -126,7 +126,7 @@ impl MutationCullPolicy {
 impl CoreEngine {
     /// The crossover channel's victim, per the configured policy.
     pub(crate) fn select_crossover_victim(&self, clock: usize) -> TensorResult<Option<String>> {
-        match self.config.crossover_cull_policy {
+        match self.config.evolution.crossover_cull_policy {
             CrossCullPolicy::LowestFitness => self.select_lowest_fitness_victim(),
             CrossCullPolicy::Random => self.select_random_victim(clock),
             CrossCullPolicy::HighestTicketChance => self.select_highest_ticket_chance_victim(),
@@ -145,7 +145,7 @@ impl CoreEngine {
         clock: usize,
         roll: usize,
     ) -> TensorResult<Option<String>> {
-        let picked = match self.config.mutation_cull_policy {
+        let picked = match self.config.evolution.mutation_cull_policy {
             MutationCullPolicy::LowestFitness => self.mutation_victim_fallback(),
             // The SAME selector the crossover channel's `Unfed` arm runs: the loop that starves
             // net closes on both channels, so a net the lottery never feeds loses its place

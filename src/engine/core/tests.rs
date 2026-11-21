@@ -127,7 +127,10 @@ fn engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::Tabular
     // tiny topologies explicitly.
     let data_dir = tiny_dataset_dir("engine");
     let config = RaceConfig {
+        population: crate::engine::config::PopulationConfig {
         pop_size: 0,
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     };
     crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
@@ -169,7 +172,7 @@ fn a_selection_metric_reorders_a_fitness_tie_and_zero_weight_is_neutral() {
     );
 
     // Weight 0 = no term: the ranking is exactly the fitness-only one it was.
-    eng.config.selection_metrics = vec![SelectionMetric {
+    eng.config.ranking.selection_metrics = vec![SelectionMetric {
         label: "r2".to_string(),
         weight: 0.0,
     }];
@@ -178,7 +181,7 @@ fn a_selection_metric_reorders_a_fitness_tie_and_zero_weight_is_neutral() {
 
     // The fixture's fitness is MINIMIZE (lower is better), so a higher-is-better metric needs a
     // NEGATIVE weight: 10 − 0.8 beats 10 − 0.2, whatever the tie-break said.
-    eng.config.selection_metrics = vec![SelectionMetric {
+    eng.config.ranking.selection_metrics = vec![SelectionMetric {
         label: "r2".to_string(),
         weight: -1.0,
     }];
@@ -210,8 +213,8 @@ fn cull_tombstone_records_mean_spread_and_the_centre_it_ranked() {
     let victim = hashes[1].clone();
     // The window FAMILY is its own knob (`mean_type`, default `median`); this test is about what a
     // cull RECORDS, so it pins the arithmetic family and reads the mean that family names.
-    eng.config.mean_type = crate::engine::config::MeanType::Arithmetic;
-    let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+    eng.config.ranking.mean_type = crate::engine::config::MeanType::Arithmetic;
+    let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
     for v in [0.20_f32, 0.80, 0.20, 0.80] {
         buf.push(v);
     }
@@ -275,7 +278,7 @@ fn champion_hashes_match_ranked_elites() {
     // champions from the engine — the top-champion_count of rank_live, not file order.
     let run_dir = std::env::temp_dir().join("gras-champion-hashes");
     let mut eng = engine(&run_dir, 7).unwrap();
-    eng.config.champion_count = 2;
+    eng.config.population.champion_count = 2;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -288,7 +291,7 @@ fn champion_hashes_match_ranked_elites() {
     hashes.sort();
     assert_eq!(hashes.len(), 3);
     for (i, h) in hashes.iter().enumerate() {
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(0.5 + i as f32 * 0.1); // 0.5, 0.6, 0.7 across the three nets
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
     }
@@ -309,11 +312,11 @@ fn select_random_victim_is_deterministic_and_alive() {
     let dir = std::env::temp_dir().join("race_random_victim");
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 42).unwrap();
-    engine.config.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::Random;
+    engine.config.evolution.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::Random;
     // Channel probation 0: this test pins the DRAW's determinism, not the shield
     // (see `probation_shields_*`).
-    engine.config.mutation_probation_steps = 0;
-    engine.config.crossover_probation_steps = 0;
+    engine.config.population.mutation_probation_steps = 0;
+    engine.config.population.crossover_probation_steps = 0;
     engine
         .seed_population_internal(
             vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
@@ -418,13 +421,13 @@ fn the_share_is_the_only_turnover_knob_and_the_channels_are_independent() {
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     assert_eq!(eng.state.live_count(), 2);
-    eng.config.crossover_share = 0.0;
+    eng.config.evolution.crossover_share = 0.0;
     assert_eq!(
         eng.rolls_at(RollKind::Crossover),
         0,
         "share 0 = the channel is off"
     );
-    eng.config.crossover_share = 1.0;
+    eng.config.evolution.crossover_share = 1.0;
     assert_eq!(
         eng.rolls_at(RollKind::Crossover),
         2,
@@ -437,7 +440,7 @@ fn the_share_is_the_only_turnover_knob_and_the_channels_are_independent() {
         1,
         "the mutation channel is its own knob"
     );
-    eng.config.mutation_share = 0.0;
+    eng.config.evolution.mutation_share = 0.0;
     assert_eq!(
         eng.rolls_at(RollKind::Mutation),
         0,
@@ -453,20 +456,20 @@ fn turnover_shares_survive_the_config_snapshot_and_are_clamped() {
     snap.crossover_share = 0.05;
     snap.mutation_share = 0.25;
     let cfg = RaceConfig::from_snapshot(&snap);
-    assert_eq!((cfg.crossover_share, cfg.mutation_share), (0.05, 0.25));
+    assert_eq!((cfg.evolution.crossover_share, cfg.evolution.mutation_share), (0.05, 0.25));
     let clamped = RaceConfig::builder()
         .set_crossover_share(2.0)
         .set_mutation_share(f32::NAN)
         .build();
     assert_eq!(
-        (clamped.crossover_share, clamped.mutation_share),
+        (clamped.evolution.crossover_share, clamped.evolution.mutation_share),
         (1.0, 0.0)
     );
     // Each channel's knob touches only itself: a one-sided set leaves the other channel at the
     // crate default.
     let one_sided = RaceConfig::builder().set_mutation_share(0.02).build();
     assert_eq!(
-        (one_sided.crossover_share, one_sided.mutation_share),
+        (one_sided.evolution.crossover_share, one_sided.evolution.mutation_share),
         (crate::engine::config::DEFAULT_CROSSOVER_SHARE, 0.02),
         "the crossover default is untouched"
     );
@@ -481,7 +484,7 @@ fn newborn_immigrant_starts_fresh_without_replay() {
     let mut eng = engine(&dir, 31).unwrap();
     // Cull shield 0: this test pins the immigrant's fresh-insert bookkeeping,
     // and with the default window nobody would be cull-eligible yet.
-    eng.config.mutation_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     let hs = eng.state.live_hashes();
@@ -696,9 +699,15 @@ fn rl_config(pop: usize) -> RaceConfig {
         ..Default::default()
     };
     RaceConfig {
-        pop_size: pop,
         mode: crate::engine::config::RunMode::Rl,
-        topology_options: topo,
+        population: crate::engine::config::PopulationConfig {
+        pop_size: pop,
+        ..Default::default()
+    },
+        topology: crate::engine::config::TopologyConfig {
+        options: topo,
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     }
 }
@@ -953,8 +962,14 @@ fn rl_spec_derives_rl_mode_without_declaration() {
     let dir = std::env::temp_dir().join("gras-rl-mode-derived");
     let _ = std::fs::remove_dir_all(&dir);
     let config = RaceConfig {
+        population: crate::engine::config::PopulationConfig {
         pop_size: 2,
+        ..Default::default()
+    },
+        stop: crate::engine::config::StopConfig {
         max_steps: Some(1),
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     };
     let spec = crate::engine::run_spec::RunSpec::rl(
@@ -969,8 +984,8 @@ fn rl_spec_derives_rl_mode_without_declaration() {
     );
     let spec = match spec {
         crate::engine::run_spec::RunSpec::RL(mut s) => {
-            s.config.topology_options.input_dim = Some(1);
-            s.config.topology_options.output_dim = Some(1);
+            s.config.topology.options.input_dim = Some(1);
+            s.config.topology.options.output_dim = Some(1);
             crate::engine::run_spec::RunSpec::RL(s)
         }
         other => other,
@@ -990,8 +1005,14 @@ fn rl_spec_rejects_computed_fitness() {
     // No dataset exists in RL mode, so a (pred, target) scorer has
     // nothing to score — construction must fail loudly, not mid-run.
     let config = RaceConfig {
-        pop_size: 2,
-        max_steps: Some(1),
+        population: crate::engine::config::PopulationConfig {
+            pop_size: 2,
+            ..Default::default()
+        },
+        stop: crate::engine::config::StopConfig {
+            max_steps: Some(1),
+            ..Default::default()
+        },
         mode: crate::engine::config::RunMode::Rl, // declared correctly; the FITNESS is the bug under test
         ..RaceConfig::defaults()
     };
@@ -1001,7 +1022,10 @@ fn rl_spec_rejects_computed_fitness() {
         ..Default::default()
     };
     let config = RaceConfig {
-        topology_options: topo,
+        topology: crate::engine::config::TopologyConfig {
+        options: topo,
+        ..Default::default()
+    },
         ..config
     };
     let spec = crate::engine::run_spec::RunSpec::rl(
@@ -1026,14 +1050,23 @@ fn a_bad_pool_name_is_refused_at_construction_not_widened() {
     // Before: `feature_split_pool = ["rondom"]` drew all three policies (the draw path's `empty ⇒
     // all` fallback cannot tell a typo from an empty pool) while the header recorded a pool
     let config = RaceConfig {
+        population: crate::engine::config::PopulationConfig {
         pop_size: 2,
+        ..Default::default()
+    },
+        stop: crate::engine::config::StopConfig {
         max_steps: Some(1),
+        ..Default::default()
+    },
+        topology: crate::engine::config::TopologyConfig {
         feature_split_pool: vec!["rondom".to_string()],
-        topology_options: crate::graph::topology::TopologyOptions {
+        options: crate::graph::topology::TopologyOptions {
             input_dim: Some(1),
             output_dim: Some(1),
             ..Default::default()
         },
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     };
     let spec = crate::engine::run_spec::RunSpec::rl(
@@ -1239,7 +1272,7 @@ fn fitter_base_puts_the_better_parent_first() {
             Some(0.5),
         )
         .unwrap();
-        eng.config.crossover_fitter_base = true;
+        eng.config.evolution.crossover_fitter_base = true;
         // Minimize fixture: net 0 is the overwhelming favorite (0.01), net 2 the worst.
         let hs = eng.state.live_hashes();
         for (i, h) in hs.iter().enumerate() {
@@ -1281,11 +1314,11 @@ fn crossover_children_inherit_the_parents_feature_split() {
     let dir = std::env::temp_dir().join("gras-mask-inherit");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 11).unwrap();
-    eng.config.topology_options.feature_split =
+    eng.config.topology.options.feature_split =
         Some(crate::graph::topology::FeatureSplitPolicy::Random);
-    eng.config.crossover_ops_pool = vec!["one_point".to_string()];
+    eng.config.evolution.crossover_ops_pool = vec!["one_point".to_string()];
     // Drift flips inherited bits AFTER the cut and would hide the prefix/suffix law.
-    eng.config.drift_prob = 0.0;
+    eng.config.topology.drift_prob = 0.0;
     // Founders carry a split, installed after their finalize exactly as a real run
     // does; distinct rows per founder make the mix observable.
     let founders: Vec<crate::graph::topology::Topology> = [7usize, 8, 9]
@@ -1401,7 +1434,7 @@ fn resume_restores_run_counters() {
         tiny_dataset_dir("resume_counters"),
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 2;
+            c.population.pop_size = 2;
             c
         },
         fitness(),
@@ -1479,7 +1512,7 @@ fn engine_mode_discriminator_roundtrip() {
         tiny_dataset_dir("engine_mode_rt"),
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 1;
+            c.population.pop_size = 1;
             c
         },
         fitness(),
@@ -1496,9 +1529,9 @@ fn resume_replays_nets_with_metric_parity() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 99).unwrap();
     // One update per clock: this test pins `state.step == clocks`.
-    engine.config.recovery_retries = 0;
-    engine.config.train_merit_p_min = 1.0;
-    engine.config.train_merit_p_max = 1.0;
+    engine.config.population.recovery_retries = 0;
+    engine.config.lottery.train_merit_p_min = 1.0;
+    engine.config.lottery.train_merit_p_max = 1.0;
     engine
         .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
@@ -1528,10 +1561,10 @@ fn resume_replays_nets_with_metric_parity() {
         tiny_dataset_dir("resume"),
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 2;
+            c.population.pop_size = 2;
             // Same lottery-OFF recipe as the fixture above, so the extra clock below is a ticket.
-            c.train_merit_p_min = 1.0;
-            c.train_merit_p_max = 1.0;
+            c.lottery.train_merit_p_min = 1.0;
+            c.lottery.train_merit_p_max = 1.0;
             c
         },
         fitness(),
@@ -1577,8 +1610,8 @@ fn resume_refuses_a_changed_metric_set_and_keeps_the_recorded_one() {
         tiny_dataset_dir("resume-metrics"),
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 1;
-            c.metrics = crate::trainer::metrics_for(&["mse"]).unwrap();
+            c.population.pop_size = 1;
+            c.ranking.metrics = crate::trainer::metrics_for(&["mse"]).unwrap();
             c
         },
         fitness(),
@@ -1599,7 +1632,7 @@ fn resume_refuses_a_changed_metric_set_and_keeps_the_recorded_one() {
         tiny_dataset_dir("resume-metrics-ok"),
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 1;
+            c.population.pop_size = 1;
             c
         },
         fitness(),
@@ -1618,7 +1651,7 @@ fn resume_keeps_the_recorded_eval_era_when_the_tick_cadence_changes() {
     let dir = std::env::temp_dir().join("race_eval_era_recorded");
     let _ = std::fs::remove_dir_all(&dir);
     let mut part = engine(&dir, 4242).unwrap();
-    part.config.checkpoint_every = 10;
+    part.config.run.checkpoint_every = 10;
     part.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
         .unwrap();
     let h = part.state.live_hashes()[0].clone();
@@ -1643,8 +1676,8 @@ fn resume_keeps_the_recorded_eval_era_when_the_tick_cadence_changes() {
         tiny_dataset_dir("resume-era"),
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 1;
-            c.checkpoint_every = 7; // the caller's NEW tick cadence
+            c.population.pop_size = 1;
+            c.run.checkpoint_every = 7; // the caller's NEW tick cadence
             c
         },
         fitness(),
@@ -1664,8 +1697,8 @@ fn resume_keeps_the_recorded_eval_era_when_the_tick_cadence_changes() {
         tiny_dataset_dir("fresh-era"),
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 0;
-            c.checkpoint_every = 7;
+            c.population.pop_size = 0;
+            c.run.checkpoint_every = 7;
             c
         },
         fitness(),
@@ -1714,7 +1747,7 @@ fn resume_then_continue_matches_uninterrupted_twin() {
         tiny_dataset_dir("resume2"),
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 1;
+            c.population.pop_size = 1;
             c
         },
         fitness(),
@@ -1739,17 +1772,17 @@ fn run_culls_continue_across_a_resume_boundary() {
     // phase, on a race that stops mid-run and resumes, must leave the frontier exactly where
     let cfg = |max_steps: Option<usize>, stop_after_clock_zero: bool| {
         let mut c = RaceConfig::defaults();
-        c.pop_size = 2;
-        c.mutation_share = 0.5; // pop 2 ⇒ one immigration per clock
+        c.population.pop_size = 2;
+        c.evolution.mutation_share = 0.5; // pop 2 ⇒ one immigration per clock
                                 // defaults() shields founders for 5 clocks; the twin must be able to cull.
-        c.mutation_probation_steps = 0;
-        c.crossover_probation_steps = 0;
-        c.checkpoint_every = 1; // frontier survives the stop without a manual flush
+        c.population.mutation_probation_steps = 0;
+        c.population.crossover_probation_steps = 0;
+        c.run.checkpoint_every = 1; // frontier survives the stop without a manual flush
                                 // The split twin resumes from the STOP, so the stop must keep its weights.
-        c.save_weights_at_stop = true;
-        c.max_steps = max_steps;
+        c.run.save_weights_at_stop = true;
+        c.stop.max_steps = max_steps;
         if stop_after_clock_zero {
-            c.custom_stop = Some(Box::new(|_| true)); // fires at the FIRST check
+            c.stop.custom_stop = Some(Box::new(|_| true)); // fires at the FIRST check
         }
         c
     };
@@ -1833,14 +1866,14 @@ fn resume_tops_up_to_the_requested_budget() {
     let _ = std::fs::remove_dir_all(&dir);
     let cfg = |max_steps: usize| {
         let mut c = RaceConfig::defaults();
-        c.pop_size = 1;
-        c.max_steps = Some(max_steps);
-        c.checkpoint_every = 1; // the frontier survives the stop
-        c.save_weights_at_stop = true; // …as do the weights the resume loads
+        c.population.pop_size = 1;
+        c.stop.max_steps = Some(max_steps);
+        c.run.checkpoint_every = 1; // the frontier survives the stop
+        c.run.save_weights_at_stop = true; // …as do the weights the resume loads
                                        // A one-net field with no cull shield would be replaced by a newborn every clock (each
                                        // channel deals at least one roll), so the fixture shields it: this test is the BUDGET.
-        c.mutation_probation_steps = 100;
-        c.crossover_probation_steps = 100;
+        c.population.mutation_probation_steps = 100;
+        c.population.crossover_probation_steps = 100;
         c
     };
 
@@ -1966,7 +1999,7 @@ fn the_novelty_gate_spends_its_cap_and_never_leaves_the_slot_empty() {
     let dir = std::env::temp_dir().join("gras_novelty_cap");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 31).unwrap();
-    eng.config.mutation_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     let pop = eng.state.live_count();
@@ -2044,10 +2077,10 @@ fn resume_rebuilds_the_frontier_from_durability_states() {
     let _ = std::fs::remove_dir_all(&dir);
 
     let mut engine = engine(&dir, 42).unwrap();
-    engine.config.checkpoint_every = 2;
+    engine.config.run.checkpoint_every = 2;
     // Keep the stream's rotation cadence in sync, exactly as run() does —
     // this test steps nets manually, bypassing run().
-    let ckpt_every = engine.config.checkpoint_every;
+    let ckpt_every = engine.config.run.checkpoint_every;
     engine
         .stream
         .as_mut()
@@ -2065,7 +2098,7 @@ fn resume_rebuilds_the_frontier_from_durability_states() {
         for h in &hashes {
             engine.step_one_net(h, clock).unwrap();
         }
-        if clock > 0 && clock % engine.config.checkpoint_every == 0 {
+        if clock > 0 && clock % engine.config.run.checkpoint_every == 0 {
             engine.write_live_frontier_states().unwrap();
         }
     }
@@ -2078,8 +2111,8 @@ fn resume_rebuilds_the_frontier_from_durability_states() {
         tiny_dataset_dir("chk_parity"),
         {
             let mut c = RaceConfig::defaults();
-            c.checkpoint_every = 2;
-            c.pop_size = 2;
+            c.run.checkpoint_every = 2;
+            c.population.pop_size = 2;
             c
         },
         fitness(),
@@ -2114,7 +2147,7 @@ fn resume_validates_pop_size_mismatch() {
 
     // Resume with pop_size 3 (mismatch, expects 3, only 2 found)
     let mut config = RaceConfig::defaults();
-    config.pop_size = 3;
+    config.population.pop_size = 3;
     let resumed = crate::engine::TabularEngine::resume(
         dir.clone(),
         tiny_dataset_dir("pop_validation"),
@@ -2136,7 +2169,7 @@ fn resume_warns_on_a_crossover_selection_mismatch_and_reads_legacy_as_roulette()
     let dir = std::env::temp_dir().join("race_resume_crossover_selection");
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 99).unwrap();
-    engine.config.crossover_selection = SelectionMethod::Roulette;
+    engine.config.evolution.crossover_selection = SelectionMethod::Roulette;
     engine
         .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
@@ -2157,8 +2190,8 @@ fn resume_warns_on_a_crossover_selection_mismatch_and_reads_legacy_as_roulette()
         )
     };
     let mut tournament = RaceConfig::defaults();
-    tournament.pop_size = 2;
-    tournament.crossover_selection = SelectionMethod::Tournament { tournament_size: 3 };
+    tournament.population.pop_size = 2;
+    tournament.evolution.crossover_selection = SelectionMethod::Tournament { tournament_size: 3 };
     let resumed = resume(tournament).expect("selection is behavioural: warn, never refuse");
     let drift = resumed.behavioural_drift();
     let row = drift
@@ -2185,9 +2218,9 @@ fn resume_warns_on_a_crossover_selection_mismatch_and_reads_legacy_as_roulette()
         .remove("crossover_selection");
     std::fs::write(dir.join("engine.json"), json.to_string()).unwrap();
     let mut legacy = RaceConfig::defaults();
-    legacy.pop_size = 2;
+    legacy.population.pop_size = 2;
     // The header reads as roulette, so a resume at the draw it actually made is silent.
-    legacy.crossover_selection = SelectionMethod::Roulette;
+    legacy.evolution.crossover_selection = SelectionMethod::Roulette;
     let resumed = resume(legacy).expect("a pre-knob run resumes at roulette, its own draw");
     assert!(
         resumed.behavioural_drift().is_empty(),
@@ -2260,17 +2293,17 @@ fn trainer_state_rides_the_net_envelope_and_continues_after_a_resume() {
     let data_dir = tiny_dataset_dir("trainer_state_r9");
     let cfg = |max_steps: usize| {
         let mut c = RaceConfig::defaults();
-        c.pop_size = 2;
-        c.checkpoint_every = 1;
-        c.max_steps = Some(max_steps);
-        c.save_weights_at_stop = true; // the resume loads the stop's weights
+        c.population.pop_size = 2;
+        c.run.checkpoint_every = 1;
+        c.stop.max_steps = Some(max_steps);
+        c.run.save_weights_at_stop = true; // the resume loads the stop's weights
         c
     };
     // Construction only: `pop_size = 0` keeps `from_spec` from drawing its own
     // founders, so this test seeds exactly the two it asserts
     let construction = {
         let mut c = cfg(2);
-        c.pop_size = 0;
+        c.population.pop_size = 0;
         c
     };
     let stamped = |hash: &str| -> u64 {
@@ -2297,7 +2330,7 @@ fn trainer_state_rides_the_net_envelope_and_continues_after_a_resume() {
         .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     // The population is the two seeded nets; the race (and its resume) hold that size.
-    engine.config.pop_size = 2;
+    engine.config.population.pop_size = 2;
     assert_eq!(engine.run().unwrap(), StopReason::MaxSteps);
     let live = engine.state.live_hashes();
     let before = stamped(&live[0]);
@@ -2347,18 +2380,18 @@ fn trainer_state_rides_the_net_envelope_and_continues_after_a_resume() {
 fn interrupt_then_resume_matches_the_twin_and_never_duplicates_history_rows() {
     let cfg = |max_steps: usize, stop_after_first_clock: bool| {
         let mut c = RaceConfig::defaults();
-        c.pop_size = 2;
-        c.checkpoint_every = 1;
-        c.max_steps = Some(max_steps);
-        c.log_level = crate::engine::config::LogLevel::None;
-        c.save_weights_at_stop = true; // the split twin resumes from the stop
+        c.population.pop_size = 2;
+        c.run.checkpoint_every = 1;
+        c.stop.max_steps = Some(max_steps);
+        c.run.log_level = crate::engine::config::LogLevel::None;
+        c.run.save_weights_at_stop = true; // the split twin resumes from the stop
                                        // Hold the field still: this test measures the RESUME machinery on the same live nets, so
                                        // the founders keep their cull shield for the whole window.
-        c.mutation_probation_steps = 5;
-        c.crossover_probation_steps = 5;
+        c.population.mutation_probation_steps = 5;
+        c.population.crossover_probation_steps = 5;
         if stop_after_first_clock {
             // Fires at the top of clock 1: clock 0 has completed and its tick is on disk.
-            c.custom_stop = Some(Box::new(|snap| snap.step >= 1));
+            c.stop.custom_stop = Some(Box::new(|snap| snap.step >= 1));
         }
         c
     };
@@ -2436,18 +2469,18 @@ fn a_named_lr_schedule_survives_a_resume_and_matches_the_twin() {
     use crate::trainer::{LrSchedule, TabularTrainer};
     let cfg = |stop_after_first_clock: bool| {
         let mut c = RaceConfig::defaults();
-        c.pop_size = 2;
-        c.checkpoint_every = 1;
-        c.max_steps = Some(3);
-        c.log_level = crate::engine::config::LogLevel::None;
-        c.save_weights_at_stop = true; // the split twin resumes from the stop
+        c.population.pop_size = 2;
+        c.run.checkpoint_every = 1;
+        c.stop.max_steps = Some(3);
+        c.run.log_level = crate::engine::config::LogLevel::None;
+        c.run.save_weights_at_stop = true; // the split twin resumes from the stop
                                        // The field holds still: this test measures the LR SCHEDULE across a resume, so the two
                                        // founders keep their cull shield for the whole window.
-        c.mutation_probation_steps = 5;
-        c.crossover_probation_steps = 5;
+        c.population.mutation_probation_steps = 5;
+        c.population.crossover_probation_steps = 5;
         if stop_after_first_clock {
             // Fires at the top of clock 1: clock 0 is complete and on disk.
-            c.custom_stop = Some(Box::new(|snap| snap.step >= 1));
+            c.stop.custom_stop = Some(Box::new(|snap| snap.step >= 1));
         }
         c
     };
@@ -2458,7 +2491,7 @@ fn a_named_lr_schedule_survives_a_resume_and_matches_the_twin() {
     // swapping `engine.trainer` afterwards would leave the header describing a scheme that never
     let build = |dir: &std::path::Path, stop: bool| {
         let mut config = cfg(stop);
-        config.pop_size = 0; // the test seeds its own tiny topologies
+        config.population.pop_size = 0; // the test seeds its own tiny topologies
         crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
             tiny_dataset_dir("schedule"),
             config,
@@ -2562,8 +2595,8 @@ fn inverted_lottery_grades_the_worst_net_best() {
     let dir = std::env::temp_dir().join("gras-train-merit-inverted");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
-    eng.config.mutation_probation_steps = 0;
-    eng.config.crossover_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
+    eng.config.population.crossover_probation_steps = 0;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -2572,20 +2605,20 @@ fn inverted_lottery_grades_the_worst_net_best() {
     let hashes = eng.state.live_hashes();
     for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
         let h = &hashes[i];
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = 1;
     }
-    eng.config.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_min = 0.0;
     // This test asserts the BAND arithmetic literally, so it pins the ceiling it was written
     // against (`p_max` is `0.75` by default; the numbers below say `0.4`).
-    eng.config.train_merit_p_max = 0.4;
+    eng.config.lottery.train_merit_p_max = 0.4;
     // The MERIT ordering is the fixture on this side of the test (the engine default
     // inverted now, so the test states which ordering it is grading).
-    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.train_ticket.updates_armed(),
+        eng.config.lottery.train_ticket.updates_armed(),
     );
     let frame = eng.lottery_frame().expect("armed at clock 5");
     // The fixture fitness is Minimize: hashes[0] (100) is the best, hashes[2] the worst.
@@ -2596,32 +2629,32 @@ fn inverted_lottery_grades_the_worst_net_best() {
     );
     assert!((p(&eng, &hashes[2]) - 0.01).abs() < 1e-6);
 
-    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::from_bools(
         true,
-        eng.config.train_ticket.updates_armed(),
+        eng.config.lottery.train_ticket.updates_armed(),
     );
     assert!((p(&eng, &hashes[0]) - 0.01).abs() < 1e-6, "worst-first now");
     assert!((p(&eng, &hashes[2]) - 0.99).abs() < 1e-6);
     // The coin follows the flag: the worst net is paid the top of the band, the best the floor. `p` is compared rather than the draw — the interior clamp means neither end is…
     assert!(p(&eng, &hashes[2]) > p(&eng, &hashes[0]));
     // p_min still lifts the starved end by the same arithmetic…
-    eng.config.train_merit_p_min = 0.5;
+    eng.config.lottery.train_merit_p_min = 0.5;
     assert!((eng.train_lottery_p_eff(&hashes[0], Some(frame)) - 0.5).abs() < 1e-6);
     // …and the band is the payout, with no second dial under it. The starved end keeps 1% of the
     // band (`p_max` is the engine's 0.4 here), so the floor is 0.004, not 0.
-    eng.config.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_min = 0.0;
     assert!((eng.train_lottery_p_eff(&hashes[0], Some(frame)) - 0.004).abs() < 1e-6);
     // …and p_max caps the map: with p_min = 0 the inverted field's worst net is held at 0.45
     // instead of 1.0, which is how a bottom-heavy mirror is run at the merit ordering's ticket
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.train_merit_p_max = 0.45;
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_max = 0.45;
     // 0.45 × 0.99 at the paid end, 0.45 × 0.5 in the middle, 0.45 × 0.01 at the starved one.
     assert!((eng.train_lottery_p_eff(&hashes[2], Some(frame)) - 0.4455).abs() < 1e-6);
     assert!((eng.train_lottery_p_eff(&hashes[1], Some(frame)) - 0.225).abs() < 1e-6);
     assert!((eng.train_lottery_p_eff(&hashes[0], Some(frame)) - 0.0045).abs() < 1e-6);
     // A ceiling under the floor collapses to the floor rather than going negative.
-    eng.config.train_merit_p_min = 0.2;
-    eng.config.train_merit_p_max = 0.1;
+    eng.config.lottery.train_merit_p_min = 0.2;
+    eng.config.lottery.train_merit_p_max = 0.1;
     assert!((eng.train_lottery_p_eff(&hashes[0], Some(frame)) - 0.2).abs() < 1e-6);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -2693,8 +2726,8 @@ fn the_updates_leg_pays_the_side_it_names() {
     let dir = std::env::temp_dir().join("gras-train-ticket-updates-side");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
-    eng.config.mutation_probation_steps = 0;
-    eng.config.crossover_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
+    eng.config.population.crossover_probation_steps = 0;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -2708,19 +2741,19 @@ fn the_updates_leg_pays_the_side_it_names() {
         .enumerate()
     {
         let h = &hashes[i];
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = step;
     }
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.train_merit_p_max = 1.0;
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_max = 1.0;
     let frame = eng.lottery_frame().expect("armed at clock 5");
     let p = |eng: &CoreEngine, h: &str| eng.train_lottery_p(h, Some(frame));
 
-    eng.config.train_ticket = crate::engine::config::TrainTicket::MostFitFewestUpdates;
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::MostFitFewestUpdates;
     let fresh_paid = p(&eng, &hashes[1]);
-    eng.config.train_ticket = crate::engine::config::TrainTicket::MostFitMostUpdates;
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::MostFitMostUpdates;
     let spent_paid = p(&eng, &hashes[1]);
     assert!(
         spent_paid > fresh_paid,
@@ -2732,16 +2765,16 @@ fn the_updates_leg_pays_the_side_it_names() {
     assert!((fresh_paid - 0.01).abs() < 1e-6, "{fresh_paid}");
 
     // Disarmed: the place alone, so the updates axis cannot move the ticket.
-    eng.config.train_ticket = crate::engine::config::TrainTicket::MostFit;
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::MostFit;
     assert!((p(&eng, &hashes[0]) - 0.99).abs() < 1e-6);
     assert!((p(&eng, &hashes[1]) - 0.5).abs() < 1e-6);
 
     // The CULL's evidence does not follow the ticket's updates side: `spent` reads the raw
     // fewest-is-one fraction, so the two legs rank the same badness the same way.
     let merit = eng.merit(&hashes[1]);
-    eng.config.train_ticket = crate::engine::config::TrainTicket::MostFitFewestUpdates;
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::MostFitFewestUpdates;
     let spent_fewest = eng.train_lottery_spent_fraction(&hashes[1], Some(frame), merit);
-    eng.config.train_ticket = crate::engine::config::TrainTicket::MostFitMostUpdates;
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::MostFitMostUpdates;
     let spent_most = eng.train_lottery_spent_fraction(&hashes[1], Some(frame), merit);
     assert_eq!(
         spent_fewest, spent_most,
@@ -2756,8 +2789,8 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
     let dir = std::env::temp_dir().join("gras-unfed-cull");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
-    eng.config.mutation_probation_steps = 0;
-    eng.config.crossover_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
+    eng.config.population.crossover_probation_steps = 0;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -2766,7 +2799,7 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
     let hashes = eng.state.live_hashes();
     for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
         let h = &hashes[i];
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = 1;
@@ -2775,11 +2808,11 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
     for (h, born) in [(&hashes[0], 5usize), (&hashes[1], 4), (&hashes[2], 0)] {
         eng.state.net_mut(h).unwrap().entered_at_step = born;
     }
-    eng.config.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_min = 0.0;
     // This test grades one ORDERING, so it pins it: worst-first × fewest-updates (the engine's
     // default is `most_fit_fewest_updates` now, which pays the other end of the FIT axis).
-    eng.config.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
-    eng.config.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::HighestTicketChance;
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
+    eng.config.evolution.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::HighestTicketChance;
 
     // Worst-first (pinned above), so the worst net has the highest `p` and is the one evicted.
     assert_eq!(
@@ -2790,7 +2823,7 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
     );
     // The mutation channel's `Unfed` arm runs the SAME selector: a net the lottery
     // starves loses its place to an immigrant too, not only to a crossover child.
-    eng.config.mutation_cull_policy =
+    eng.config.evolution.mutation_cull_policy =
         crate::engine::cull::MutationCullPolicy::HighestTicketChance;
     assert_eq!(
         eng.select_mutation_victim(5, 0).unwrap().as_deref(),
@@ -2799,9 +2832,9 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
 
     // Best-first: the coin now feeds the BEST net, and the cull follows it there — the victim is
     // the highest chance, not a second, quietly different ranking.
-    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.train_ticket.updates_armed(),
+        eng.config.lottery.train_ticket.updates_armed(),
     );
     assert_eq!(
         eng.select_highest_ticket_chance_victim()
@@ -2813,14 +2846,14 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
         eng.select_mutation_victim(5, 0).unwrap().as_deref(),
         Some(hashes[0].as_str())
     );
-    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::from_bools(
         true,
-        eng.config.train_ticket.updates_armed(),
+        eng.config.lottery.train_ticket.updates_armed(),
     );
 
     // With the lottery OFF there is no merit to sort on: the policy degrades to `worst`
     // instead of inventing a ranking from an unbounded field.
-    eng.config.train_merit_p_min = 1.0;
+    eng.config.lottery.train_merit_p_min = 1.0;
     assert_eq!(
         eng.select_highest_ticket_chance_victim().unwrap(),
         eng.select_lowest_fitness_victim().unwrap()
@@ -2839,8 +2872,8 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     let dir = std::env::temp_dir().join("gras-spent-cull");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 22).unwrap();
-    eng.config.mutation_probation_steps = 0;
-    eng.config.crossover_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
+    eng.config.population.crossover_probation_steps = 0;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -2850,7 +2883,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     // Minimize fixture: 100 = best, 200 = mid, 300 = worst.
     for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
         let h = &hashes[i];
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
     }
@@ -2861,9 +2894,9 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
         state.entered_at_step = 0;
     }
     // Pinned: worst-first × fewest-updates, the ordering this test's two victims name.
-    eng.config.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::HighestTicketChance;
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.evolution.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::HighestTicketChance;
     assert_eq!(
         eng.select_highest_ticket_chance_victim()
             .unwrap()
@@ -2872,7 +2905,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
         "unfed takes the unproven worst net: highest ticket chance"
     );
 
-    eng.config.crossover_cull_policy =
+    eng.config.evolution.crossover_cull_policy =
         crate::engine::cull::CrossCullPolicy::LowestFitnessMostUpdates;
     assert_eq!(
         eng.select_lowest_fitness_most_updates_victim()
@@ -2882,7 +2915,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
         "spent takes the mid net that already burned 9 updates"
     );
     // The mutation channel's `Spent` arm runs the SAME selector.
-    eng.config.mutation_cull_policy =
+    eng.config.evolution.mutation_cull_policy =
         crate::engine::cull::MutationCullPolicy::LowestFitnessMostUpdates;
     assert_eq!(
         eng.select_mutation_victim(5, 0).unwrap().as_deref(),
@@ -2890,7 +2923,7 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     );
 
     // Disarming the ticket's U leg does not blind the cull: the ranking reads `U` on its own.
-    eng.config.train_ticket = eng.config.train_ticket.with_updates_armed(false);
+    eng.config.lottery.train_ticket = eng.config.lottery.train_ticket.with_updates_armed(false);
     assert_eq!(
         eng.select_lowest_fitness_most_updates_victim()
             .unwrap()
@@ -2898,12 +2931,12 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
         Some(hashes[1].as_str()),
         "spent still ranks on updates spent"
     );
-    eng.config.train_ticket = eng.config.train_ticket.with_updates_armed(true);
+    eng.config.lottery.train_ticket = eng.config.lottery.train_ticket.with_updates_armed(true);
 
     // THE TILT: `unfed` follows the coin, so best-first moves its victim onto the BEST net. `spent` does NOT follow it — the worst net that spent its updates is the victim…
-    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.train_ticket.updates_armed(),
+        eng.config.lottery.train_ticket.updates_armed(),
     );
     for (h, updates) in [(&hashes[0], 1usize), (&hashes[1], 9), (&hashes[2], 9)] {
         eng.state.net_mut(h).unwrap().step = updates;
@@ -2922,13 +2955,13 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
         Some(hashes[2].as_str()),
         "spent ignores the tilt: the worst net that spent its updates goes"
     );
-    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::from_bools(
         true,
-        eng.config.train_ticket.updates_armed(),
+        eng.config.lottery.train_ticket.updates_armed(),
     );
 
     // With the lottery OFF there is no field to rank: degrade to the worst-score victim.
-    eng.config.train_merit_p_min = 1.0;
+    eng.config.lottery.train_merit_p_min = 1.0;
     assert_eq!(
         eng.select_lowest_fitness_most_updates_victim().unwrap(),
         eng.select_lowest_fitness_victim().unwrap()
@@ -2955,17 +2988,17 @@ fn train_lottery_arms_after_the_born_shield_and_grades_level_per_ticket() {
     assert!(eng.lottery_frame().is_none());
     // This test asserts the RAW fractions and the p = 0 coin, so pin the miss-floor
     // the MERIT ordering (the engine default is inverted).
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.train_ticket.updates_armed(),
+        eng.config.lottery.train_ticket.updates_armed(),
     );
 
     // Means 100 / 200 / 300 over the SAME budget (each net has spent one ticket): the shared
     // divisor cannot change the ORDER, only the scale — merits are 100/1 … 300/1.
     for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
         let h = &hashes[i];
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = 1;
@@ -2973,8 +3006,8 @@ fn train_lottery_arms_after_the_born_shield_and_grades_level_per_ticket() {
 
     // ON: still disarmed while the founders are inside their born shield — which is served in
     // UPDATES, so the clock the field is asked about cannot arm it…
-    eng.config.mutation_probation_steps = 5;
-    eng.config.crossover_probation_steps = 5;
+    eng.config.population.mutation_probation_steps = 5;
+    eng.config.population.crossover_probation_steps = 5;
     assert!(
         eng.lottery_frame().is_none(),
         "founders at U = 1 are shielded"
@@ -3003,8 +3036,8 @@ fn train_lottery_arms_after_the_born_shield_and_grades_level_per_ticket() {
     );
 
     // The routing contract: a denied ticket IDLES the net — no trainer call, so no metric row, no update and no reading.
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.train_merit_p_max = 0.0;
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_max = 0.0;
     eng.step_one_net_in_frame(&hashes[2], 5, Some(frame), false)
         .expect("idle step");
     let worst = eng.state.net(&hashes[2]).unwrap();
@@ -3034,15 +3067,15 @@ fn a_newborn_always_trains_on_its_first_live_clock() {
     let mut hashes = eng.state.live_hashes();
     hashes.sort();
     // A band whose TOP is 0: `hi = lo = 0`, so no draw can sell a clock — only the born ticket can.
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.train_merit_p_max = 0.0;
-    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_max = 0.0;
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.train_ticket.updates_armed(),
+        eng.config.lottery.train_ticket.updates_armed(),
     );
     for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
         let h = &hashes[i];
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = 5;
@@ -3074,8 +3107,8 @@ fn the_ticket_is_paid_from_the_band_alone() {
     let dir = std::env::temp_dir().join("gras-train-merit-band");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
-    eng.config.mutation_probation_steps = 0;
-    eng.config.crossover_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
+    eng.config.population.crossover_probation_steps = 0;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -3084,14 +3117,14 @@ fn the_ticket_is_paid_from_the_band_alone() {
     let hashes = eng.state.live_hashes();
     for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
         let h = &hashes[i];
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = 1;
     }
 
     // A floor of 1.0 is the OFF switch now that Ω is gone: no field, every net trains.
-    eng.config.train_merit_p_min = 1.0;
+    eng.config.lottery.train_merit_p_min = 1.0;
     assert!(eng.lottery_frame().is_none(), "a band of 1.0 grades nobody");
     for h in &hashes {
         assert_eq!(eng.train_lottery_p_eff(h, None), 1.0);
@@ -3100,11 +3133,11 @@ fn the_ticket_is_paid_from_the_band_alone() {
 
     // Fixture fitness is Minimize with merits 100/200/300 per ticket: raw fractions
     // are 1, 0.5 and 0 — the best, the middle and the worst.
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.train_merit_p_max = 1.0;
-    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_max = 1.0;
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.train_ticket.updates_armed(),
+        eng.config.lottery.train_ticket.updates_armed(),
     );
     let frame = eng.lottery_frame().expect("armed at clock 5");
     let eff = |eng: &CoreEngine, i: usize| eng.train_lottery_p_eff(&hashes[i], Some(frame));
@@ -3115,8 +3148,8 @@ fn the_ticket_is_paid_from_the_band_alone() {
     assert!((eff(&eng, 2) - 0.01).abs() < 1e-6);
 
     // A genuine band: 0.2 at the worst end, 0.6 at the best, linear between.
-    eng.config.train_merit_p_min = 0.2;
-    eng.config.train_merit_p_max = 0.6;
+    eng.config.lottery.train_merit_p_min = 0.2;
+    eng.config.lottery.train_merit_p_max = 0.6;
     assert!(
         (eff(&eng, 0) - 0.596).abs() < 1e-6,
         "the best net takes 99% of the band"
@@ -3127,10 +3160,10 @@ fn the_ticket_is_paid_from_the_band_alone() {
         "the worst keeps 1% of the band above p_min"
     );
     // `p = 1` sells without consuming a draw; `p = 0` never sells.
-    eng.config.train_merit_p_min = 1.0;
+    eng.config.lottery.train_merit_p_min = 1.0;
     assert!(eng.train_lottery_draws(&hashes[0], 5, Some(frame)));
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.train_merit_p_max = 0.0;
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_max = 0.0;
     assert!(!eng.train_lottery_draws(&hashes[0], 5, Some(frame)));
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -3142,8 +3175,8 @@ fn train_merit_p_min_floors_only_the_bottom_of_the_field() {
     let dir = std::env::temp_dir().join("gras-train-merit-p-min");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
-    eng.config.mutation_probation_steps = 0;
-    eng.config.crossover_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
+    eng.config.population.crossover_probation_steps = 0;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -3152,17 +3185,17 @@ fn train_merit_p_min_floors_only_the_bottom_of_the_field() {
     let hashes = eng.state.live_hashes();
     for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
         let h = &hashes[i];
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = 1;
     }
-    eng.config.train_merit_p_min = 0.05;
-    eng.config.train_merit_p_max = 1.0;
+    eng.config.lottery.train_merit_p_min = 0.05;
+    eng.config.lottery.train_merit_p_max = 1.0;
     // The floor is a BOTTOM floor in the MERIT ordering (the engine default is inverted).
-    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.train_ticket.updates_armed(),
+        eng.config.lottery.train_ticket.updates_armed(),
     );
     let frame = eng.lottery_frame().expect("armed at clock 5");
     let eff = |eng: &CoreEngine, i: usize| eng.train_lottery_p_eff(&hashes[i], Some(frame));
@@ -3186,11 +3219,11 @@ fn train_merit_p_min_floors_only_the_bottom_of_the_field() {
         "p_min + (p_max − p_min) × f"
     );
     // A floor of 1.0 is the OFF switch now.
-    eng.config.train_merit_p_min = 1.0;
+    eng.config.lottery.train_merit_p_min = 1.0;
     assert!(eng.lottery_frame().is_none());
     assert!((eff(&eng, 2) - 1.0).abs() < 1e-6);
     // A floor of 0.0 reproduces the pre-floor numbers exactly.
-    eng.config.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_min = 0.0;
     assert!((eff(&eng, 2) - 0.01).abs() < 1e-6);
     assert!((eff(&eng, 1) - 0.5).abs() < 1e-6);
     let _ = std::fs::remove_dir_all(&dir);
@@ -3204,21 +3237,21 @@ fn lottery_merit_is_the_score_itself_not_a_rate() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
     // The MERIT ordering is the fixture (the engine default is inverted).
-    eng.config.train_ticket = crate::engine::config::TrainTicket::from_bools(
+    eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::from_bools(
         false,
-        eng.config.train_ticket.updates_armed(),
+        eng.config.lottery.train_ticket.updates_armed(),
     );
     // Fitness place alone: this test is about the divisor, so neither leg multiplies it.
-    eng.config.train_ticket = eng.config.train_ticket.with_updates_armed(false);
+    eng.config.lottery.train_ticket = eng.config.lottery.train_ticket.with_updates_armed(false);
     // No shields: this test is about the divisor, not the born gate.
-    eng.config.mutation_probation_steps = 0;
-    eng.config.crossover_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
+    eng.config.population.crossover_probation_steps = 0;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     let hashes = eng.state.live_hashes();
     // Identical score, different age AND different budget spent.
     for h in &hashes {
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(100.0);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
     }
@@ -3248,7 +3281,7 @@ fn lottery_merit_is_the_score_itself_not_a_rate() {
 
     // One reading down and the field separates on the SCORE alone — the update
     // counts (1 vs 10) play no part.
-    let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+    let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
     buf.push(50.0);
     *eng.rolling_fitness.get_mut(&hashes[1]).unwrap() = buf;
     let frame = eng.lottery_frame().expect("armed at clock 5");
@@ -3266,13 +3299,13 @@ fn an_idle_clock_leaves_the_merit_bit_identical() {
     let dir = std::env::temp_dir().join("gras-lottery-idle-invariant");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
-    eng.config.mutation_probation_steps = 0;
-    eng.config.crossover_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
+    eng.config.population.crossover_probation_steps = 0;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     let hashes = eng.state.live_hashes();
     for h in &hashes {
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(100.0);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = 5;
@@ -3309,9 +3342,9 @@ fn resume_does_not_replay_idle_clocks() {
     let mut engine = engine(&dir, 99).unwrap();
     // `step == 3` below counts TICKETS; a recovery streak would add updates inside a clock, and
     // the lottery is switched OFF (`p_min = 1.0`) so every clock is one.
-    engine.config.recovery_retries = 0;
-    engine.config.train_merit_p_min = 1.0;
-    engine.config.train_merit_p_max = 1.0;
+    engine.config.population.recovery_retries = 0;
+    engine.config.lottery.train_merit_p_min = 1.0;
+    engine.config.lottery.train_merit_p_max = 1.0;
     engine
         .seed_population_internal(vec![tiny_topology(7)], Some(0.5))
         .unwrap();
@@ -3338,9 +3371,9 @@ fn resume_does_not_replay_idle_clocks() {
         tiny_dataset_dir("resume_idle"),
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 1;
+            c.population.pop_size = 1;
             // This test pins one update per clock, so the streak must stay off on BOTH sides.
-            c.recovery_retries = 0;
+            c.population.recovery_retries = 0;
             c
         },
         fitness(),
@@ -3370,7 +3403,7 @@ fn the_whole_run_trend_is_recorded_and_reported() {
     let dir = std::env::temp_dir().join("gras-whole-run-trend");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 23).unwrap();
-    eng.config.champion_count = 1;
+    eng.config.population.champion_count = 1;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     let h = eng.state.live_hashes()[0].clone();
@@ -3406,7 +3439,7 @@ fn history_csv_writes_only_scored_clocks() {
     let dir = std::env::temp_dir().join("gras-history-idle");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
-    eng.config.csv_export = true;
+    eng.config.run.csv_export = true;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     let hashes = eng.state.live_hashes();
@@ -3499,9 +3532,9 @@ fn lottery_coin_is_seeded_by_run_seed_and_net_hash_not_net_seed() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 21).unwrap();
     // The midpoint coin is the point of this test, so no floor lifts it to 0.525.
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.mutation_probation_steps = 5;
-    eng.config.crossover_probation_steps = 5;
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.population.mutation_probation_steps = 5;
+    eng.config.population.crossover_probation_steps = 5;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -3512,7 +3545,7 @@ fn lottery_coin_is_seeded_by_run_seed_and_net_hash_not_net_seed() {
     // interesting point of the interval (0 and 1 short-circuit without a draw).
     for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
         let h = &hashes[i];
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
         eng.state.net_mut(h).unwrap().step = 10;
@@ -3588,9 +3621,9 @@ fn resume_warns_on_a_train_merit_mismatch() {
         )
     };
     let mut off = RaceConfig::defaults();
-    off.pop_size = 2;
+    off.population.pop_size = 2;
     // The recorded header says p_max 0.6; the resume runs the default 0.4.
-    off.train_merit_p_max = 0.4;
+    off.lottery.train_merit_p_max = 0.4;
     let resumed = resume(off).expect("the band is behavioural: warn, never refuse");
     let drift = resumed.behavioural_drift();
     let row = drift
@@ -3604,8 +3637,8 @@ fn resume_warns_on_a_train_merit_mismatch() {
 
     // The band's other end is drift too.
     let mut full = RaceConfig::defaults();
-    full.pop_size = 2;
-    full.train_merit_p_max = 1.0;
+    full.population.pop_size = 2;
+    full.lottery.train_merit_p_max = 1.0;
     let resumed = resume(full).expect("0.5 vs 1.0 is drift, not a refusal");
     assert!(
         resumed
@@ -3617,8 +3650,8 @@ fn resume_warns_on_a_train_merit_mismatch() {
     drop(resumed);
 
     let mut recorded = RaceConfig::defaults();
-    recorded.pop_size = 2;
-    recorded.train_merit_p_max = 0.6;
+    recorded.population.pop_size = 2;
+    recorded.lottery.train_merit_p_max = 0.6;
     let resumed = resume(recorded).expect("the recorded setting must resume");
     assert!(resumed.behavioural_drift().is_empty());
 
@@ -3659,15 +3692,15 @@ fn resume_warns_on_a_cull_policy_mismatch_on_both_channels() {
     // Legacy `""` reads `lowest_fitness`: a resume that also culls the crossover channel with
     // `lowest_fitness` has no drift.
     let mut same = RaceConfig::defaults();
-    same.pop_size = 2;
-    same.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::LowestFitness;
+    same.population.pop_size = 2;
+    same.evolution.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::LowestFitness;
     let resumed = resume(same).expect("a blanked legacy policy must resume");
     assert!(resumed.behavioural_drift().is_empty());
     drop(resumed);
 
     let mut cross = RaceConfig::defaults();
-    cross.pop_size = 2;
-    cross.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::Random;
+    cross.population.pop_size = 2;
+    cross.evolution.crossover_cull_policy = crate::engine::cull::CrossCullPolicy::Random;
     let resumed = resume(cross).expect("a cull policy is behavioural: warn, never refuse");
     let drift = resumed.behavioural_drift();
     let row = drift
@@ -3683,8 +3716,8 @@ fn resume_warns_on_a_cull_policy_mismatch_on_both_channels() {
     drop(resumed);
 
     let mut mutp = RaceConfig::defaults();
-    mutp.pop_size = 2;
-    mutp.mutation_cull_policy = crate::engine::cull::MutationCullPolicy::Random;
+    mutp.population.pop_size = 2;
+    mutp.evolution.mutation_cull_policy = crate::engine::cull::MutationCullPolicy::Random;
     let resumed = resume(mutp).expect("the mutation channel warns on the same terms");
     let drift = resumed.behavioural_drift();
     let row = drift
@@ -3726,7 +3759,7 @@ fn resume_rejects_changed_trainer_const_naming_the_key() {
         tiny_dataset_dir("blob_mismatch"),
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 1;
+            c.population.pop_size = 1;
             c
         },
         fitness(),
@@ -3766,7 +3799,7 @@ fn resume_allows_identical_trainer_blob() {
         tiny_dataset_dir("blob_match"),
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 1;
+            c.population.pop_size = 1;
             c
         },
         fitness(),
@@ -3843,7 +3876,7 @@ fn seed_raw_fitness(engine: &mut crate::engine::TabularEngine, v: f32) {
 fn single_stop_criterion_still_works() {
     let run_dir = std::env::temp_dir().join("gras-race-single");
     let mut eng = engine(&run_dir, 5).unwrap();
-    eng.config.max_steps = Some(7);
+    eng.config.stop.max_steps = Some(7);
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     seed_raw_fitness(&mut eng, 0.5);
@@ -3860,9 +3893,9 @@ fn an_all_idle_clock_still_advances_the_race() {
     let dir = std::env::temp_dir().join("gras-all-idle-clock");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 11).unwrap();
-    eng.config.max_steps = Some(3);
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.train_merit_p_max = 0.0;
+    eng.config.stop.max_steps = Some(3);
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_max = 0.0;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -3924,10 +3957,19 @@ fn explicit_train_test_dirs_build_disjoint_pools() {
     let run_dir = std::env::temp_dir().join("gras-train-test-run");
     let _ = std::fs::remove_dir_all(&run_dir);
     let config = RaceConfig {
+        population: crate::engine::config::PopulationConfig {
         pop_size: 0,
+        ..Default::default()
+    },
+        stop: crate::engine::config::StopConfig {
         max_steps: Some(2),
+        ..Default::default()
+    },
+        run: crate::engine::config::RunSettings {
         // The resume below loads this stop's weights.
         save_weights_at_stop: true,
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     };
     let mut eng =
@@ -3976,7 +4018,10 @@ fn explicit_train_test_dirs_build_disjoint_pools() {
         run_dir.clone(),
         data_dir.clone(),
         RaceConfig {
-            pop_size: 2,
+            population: crate::engine::config::PopulationConfig {
+        pop_size: 2,
+        ..Default::default()
+    },
             ..RaceConfig::defaults()
         },
         fitness(),
@@ -4060,9 +4105,15 @@ fn seeded_engine(
 ) -> Result<crate::engine::TabularEngine> {
     let data_dir = tiny_dataset_dir("seeded");
     let config = RaceConfig {
+        population: crate::engine::config::PopulationConfig {
         pop_size: 3,
+        ..Default::default()
+    },
+        run: crate::engine::config::RunSettings {
         champion_previous_load: true,
         champion_previous_dir: Some(seed_root.to_path_buf()),
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     };
     crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
@@ -4162,20 +4213,20 @@ fn champion_previous_load_failures_fall_back_to_random() {
 #[test]
 fn champion_previous_load_is_on_by_default_and_can_be_turned_off() {
     let defaults = RaceConfig::defaults();
-    assert!(defaults.champion_previous_load);
-    assert!(defaults.champion_previous_dir.is_none());
+    assert!(defaults.run.champion_previous_load);
+    assert!(defaults.run.champion_previous_dir.is_none());
 
     // On by default: this tabular run finds no compatible tabular source (only the engine's own
     // `results/`), so nothing is inherited and the batch is still full and all-random.
     let dir = std::env::temp_dir().join("gras-seedprior-on");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 7).unwrap();
-    eng.config.pop_size = 2;
+    eng.config.population.pop_size = 2;
     let topos = crate::engine::population::fill_unique(
         &eng.config,
         eng.run_seed(),
         Vec::new(),
-        eng.config.pop_size,
+        eng.config.population.pop_size,
     );
     assert_eq!(topos.len(), 2);
     assert!(crate::state::load_engine_json(&dir)
@@ -4188,8 +4239,14 @@ fn champion_previous_load_is_on_by_default_and_can_be_turned_off() {
     let dir = std::env::temp_dir().join("gras-seedprior-optout");
     let _ = std::fs::remove_dir_all(&dir);
     let config = RaceConfig {
+        population: crate::engine::config::PopulationConfig {
         pop_size: 2,
+        ..Default::default()
+    },
+        run: crate::engine::config::RunSettings {
         champion_previous_load: false,
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     };
     let eng = crate::engine::TabularEngine::from_spec(crate::engine::run_spec::RunSpec::tabular(
@@ -4224,7 +4281,7 @@ fn ranking_ties_go_to_the_smaller_net_then_the_hash() {
     let hashes = eng.state.live_hashes();
     // The solved-cartpole case: identical windows ⇒ EXACTLY equal scores.
     for h in &hashes {
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         for _ in 0..5 {
             buf.push(500.0);
         }
@@ -4241,7 +4298,7 @@ fn ranking_ties_go_to_the_smaller_net_then_the_hash() {
         vec![hashes[1].clone(), hashes[2].clone(), hashes[0].clone()],
         "equal fitness ⇒ fewest parameters first"
     );
-    eng.config.champion_count = 1;
+    eng.config.population.champion_count = 1;
     eng.record_champions();
     assert_eq!(
         eng.champions.first(),
@@ -4269,10 +4326,10 @@ fn every_live_net_gets_weights_at_every_tick_and_at_stop() {
     let dir = std::env::temp_dir().join("gras-net-weights");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 7).unwrap();
-    eng.config.checkpoint_every = 2;
-    eng.config.max_steps = Some(4);
+    eng.config.run.checkpoint_every = 2;
+    eng.config.stop.max_steps = Some(4);
     // This test is about the weight WRITERS, so it asks for the stop dump.
-    eng.config.save_weights_at_stop = true;
+    eng.config.run.save_weights_at_stop = true;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     eng.run().unwrap();
@@ -4323,8 +4380,8 @@ fn zero_checkpoint_every_skips_the_tick_but_still_finishes_the_run() {
     let dir = std::env::temp_dir().join("gras-ckpt-off");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 7).unwrap();
-    eng.config.checkpoint_every = 0;
-    eng.config.max_steps = Some(4);
+    eng.config.run.checkpoint_every = 0;
+    eng.config.stop.max_steps = Some(4);
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     assert_eq!(eng.run().unwrap(), StopReason::MaxSteps);
@@ -4419,13 +4476,22 @@ fn streak_engine(
     script: &[f32],
 ) -> (crate::engine::TabularEngine, String) {
     let mut config = RaceConfig {
+        population: crate::engine::config::PopulationConfig {
         pop_size: 0,
+        ..Default::default()
+    },
+        lottery: crate::engine::config::LotteryConfig {
         // The lottery is OFF: the band's floor at 1.0 is the switch (the retired Ω no longer
         // reaches the band), so every clock is a real update and the script lands one per clock.
         train_merit_p_min: 1.0,
         train_merit_p_max: 1.0,
+        ..Default::default()
+    },
+        run: crate::engine::config::RunSettings {
         csv_export: false,
         checkpoint_every: 0,
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     };
     tweak(&mut config);
@@ -4441,7 +4507,7 @@ fn streak_engine(
         .unwrap();
     eng.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
         .unwrap();
-    eng.config.pop_size = 1;
+    eng.config.population.pop_size = 1;
     let hash = eng.state.live_hashes()[0].clone();
     (eng, hash)
 }
@@ -4455,8 +4521,8 @@ fn recovery_streak_retries_until_the_reading_is_back() {
     let (mut eng, hash) = streak_engine(
         &dir,
         |c| {
-            c.recovery_retries = 5;
-            c.recovery_tolerance = 0.0;
+            c.population.recovery_retries = 5;
+            c.population.recovery_tolerance = 0.0;
         },
         &[1.0, 3.0, 2.5, 0.5, 1.5],
     );
@@ -4491,9 +4557,9 @@ fn recovery_never_fires_inside_the_init_probation() {
     let (mut eng, hash) = streak_engine(
         &dir,
         |c| {
-            c.recovery_retries = 5;
-            c.recovery_tolerance = 0.0;
-            c.init_probation_steps = 2;
+            c.population.recovery_retries = 5;
+            c.population.recovery_tolerance = 0.0;
+            c.population.init_probation_steps = 2;
         },
         &[1.0, 3.0, 5.0, 1.0],
     );
@@ -4532,8 +4598,8 @@ fn recovery_streak_is_capped() {
     let (mut eng, hash) = streak_engine(
         &dir,
         |c| {
-            c.recovery_retries = 2;
-            c.recovery_tolerance = 0.0;
+            c.population.recovery_retries = 2;
+            c.population.recovery_tolerance = 0.0;
         },
         &[1.0, 3.0, 4.0, 5.0],
     );
@@ -4561,8 +4627,8 @@ fn recovery_tolerance_absorbs_a_small_dip() {
     let (mut eng, hash) = streak_engine(
         &dir,
         |c| {
-            c.recovery_retries = 5;
-            c.recovery_tolerance = 0.2;
+            c.population.recovery_retries = 5;
+            c.population.recovery_tolerance = 0.2;
         },
         &[1.0, 1.1, 9.0],
     );
@@ -4584,7 +4650,7 @@ fn probation_shields_fresh_nets_until_they_have_trained() {
     let dir = std::env::temp_dir().join("gras-probation-shield");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 7).unwrap();
-    eng.config.mutation_probation_steps = 3;
+    eng.config.population.mutation_probation_steps = 3;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -4595,7 +4661,7 @@ fn probation_shields_fresh_nets_until_they_have_trained() {
     let mut hashes = eng.state.live_hashes();
     hashes.sort();
     for (i, h) in hashes.iter().enumerate() {
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(0.5 + i as f32 * 0.1);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
     }
@@ -4638,22 +4704,22 @@ fn init_probation_holds_the_rolls_then_hands_them_over() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 7).unwrap();
     // No cull shields: inside this test the ONLY thing that can defer a roll is the probation.
-    eng.config.mutation_probation_steps = 0;
-    eng.config.crossover_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
+    eng.config.population.crossover_probation_steps = 0;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
     )
     .unwrap();
     assert_eq!(
-        eng.config.init_probation_steps, 0,
+        eng.config.population.init_probation_steps, 0,
         "the default withholds nothing beyond the shields"
     );
     assert!(
         eng.evolution_allowed(1),
         "unarmed: a cull-eligible clock evolves from the first one"
     );
-    eng.config.init_probation_steps = 3;
+    eng.config.population.init_probation_steps = 3;
     assert!(!eng.evolution_allowed(1), "inside the probation");
     assert!(!eng.evolution_allowed(2), "…still inside it");
     assert!(
@@ -4670,8 +4736,8 @@ fn probation_is_never_broken_when_every_non_elite_is_fresh() {
     let dir = std::env::temp_dir().join("gras-probation-no-slot");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 7).unwrap();
-    eng.config.mutation_probation_steps = 100; // effectively everyone
-    eng.config.champion_count = 1;
+    eng.config.population.mutation_probation_steps = 100; // effectively everyone
+    eng.config.population.champion_count = 1;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -4708,8 +4774,8 @@ fn crossover_probation_shields_crossover_children_with_its_own_window() {
     let dir = std::env::temp_dir().join("gras-crossover-probation");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 7).unwrap();
-    eng.config.mutation_probation_steps = 3;
-    eng.config.crossover_probation_steps = 7;
+    eng.config.population.mutation_probation_steps = 3;
+    eng.config.population.crossover_probation_steps = 7;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -4756,15 +4822,15 @@ fn crossover_probation_shields_crossover_children_with_its_own_window() {
 /// A two-net fixture whose coin can NEVER be won: `p_min = p_max = 0` collapses BOTH ends of the Ω band to `0`, so `p_eff = 0` and every draw is lost.
 fn zero_ticket_engine(dir: &std::path::Path, learn_only: bool) -> crate::TabularEngine {
     let mut eng = engine(dir, 31).unwrap();
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.train_merit_p_max = 0.0;
-    eng.config.train_merit_learn_only = learn_only;
-    eng.config.mutation_probation_steps = 0;
-    eng.config.crossover_probation_steps = 0;
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.lottery.train_merit_p_max = 0.0;
+    eng.config.lottery.train_merit_learn_only = learn_only;
+    eng.config.population.mutation_probation_steps = 0;
+    eng.config.population.crossover_probation_steps = 0;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     for h in eng.state.live_hashes() {
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(100.0);
         *eng.rolling_fitness.get_mut(&h).unwrap() = buf;
         eng.state.net_mut(&h).unwrap().step = 1;
@@ -4827,7 +4893,7 @@ fn learn_only_off_keeps_the_idle_path() {
 #[test]
 fn learn_only_round_trips_and_legacy_headers_mean_off() {
     let mut cfg = RaceConfig::defaults();
-    cfg.train_merit_learn_only = true;
+    cfg.lottery.train_merit_learn_only = true;
     let snap = ConfigSnapshot::from_config(&cfg, None, None);
     let json = serde_json::to_string(&snap).unwrap();
     let back: ConfigSnapshot = serde_json::from_str(&json).unwrap();
@@ -4851,7 +4917,7 @@ fn learn_only_round_trips_and_legacy_headers_mean_off() {
 #[test]
 fn init_probation_round_trips_and_legacy_headers_mean_off() {
     let mut cfg = RaceConfig::defaults();
-    cfg.init_probation_steps = 3;
+    cfg.population.init_probation_steps = 3;
     let snap = ConfigSnapshot::from_config(&cfg, None, None);
     let json = serde_json::to_string(&snap).unwrap();
     let back: ConfigSnapshot = serde_json::from_str(&json).unwrap();
@@ -4874,7 +4940,7 @@ fn init_probation_round_trips_and_legacy_headers_mean_off() {
 #[test]
 fn policy_scoped_fitness_round_trips() {
     let mut cfg = RaceConfig::defaults();
-    cfg.policy_scoped_fitness = true;
+    cfg.ranking.policy_scoped_fitness = true;
     let snap = ConfigSnapshot::from_config(&cfg, None, None);
     let json = serde_json::to_string(&snap).unwrap();
     let back: ConfigSnapshot = serde_json::from_str(&json).unwrap();
@@ -4916,8 +4982,14 @@ fn eval_share_sizes_the_pools_and_survives_a_header_rewrite() {
     let _ = std::fs::remove_dir_all(&dir);
     let data_dir = tiny_dataset_dir("eval-share");
     let config = RaceConfig {
+        population: crate::engine::config::PopulationConfig {
         pop_size: 0,
+        ..Default::default()
+    },
+        run: crate::engine::config::RunSettings {
         eval_share: 0.5,
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     };
     let mut eng =
@@ -4969,8 +5041,14 @@ fn a_train_val_test_layout_ranks_on_val_and_reports_on_test() {
         crate::utils::tabular_data::save_dataset(data_dir.join(name), &ds).unwrap();
     }
     let config = RaceConfig {
+        population: crate::engine::config::PopulationConfig {
         pop_size: 0,
+        ..Default::default()
+    },
+        stop: crate::engine::config::StopConfig {
         max_steps: Some(1),
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     };
     let engine =
@@ -5035,12 +5113,18 @@ fn exam_rows_stay_out_of_the_run_tensor_and_are_scored_once_at_stop() {
 
     let run_dir = dir.join("run");
     let config = RaceConfig {
+        population: crate::engine::config::PopulationConfig {
         // 0 ⇒ no auto-seeded random population: this test seeds its own two tiny nets,
         // exactly like the shared `engine()` helper.
         pop_size: 0,
-        max_steps: Some(2),
         // Two reported nets, so the exam file and the `exam (X)` column have two rows.
         champion_count: 2,
+        ..Default::default()
+    },
+        stop: crate::engine::config::StopConfig {
+        max_steps: Some(2),
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     };
     let mut engine =
@@ -5067,7 +5151,7 @@ fn exam_rows_stay_out_of_the_run_tensor_and_are_scored_once_at_stop() {
     engine
         .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
-    engine.config.pop_size = 2;
+    engine.config.population.pop_size = 2;
     assert_eq!(engine.run().unwrap(), StopReason::MaxSteps);
     let _ = engine.write_live_net_weights();
 
@@ -5097,12 +5181,18 @@ fn resume_refuses_a_different_exam_store() {
     crate::utils::tabular_data::save_dataset(data_dir.join("exam"), &exam).unwrap();
     let run_dir = dir.join("run");
     let config = RaceConfig {
+        population: crate::engine::config::PopulationConfig {
         // 0 ⇒ no auto-seeded random population: this test seeds its own two tiny nets,
         // exactly like the shared `engine()` helper.
         pop_size: 0,
-        max_steps: Some(2),
         // Two reported nets, so the exam file and the `exam (X)` column have two rows.
         champion_count: 2,
+        ..Default::default()
+    },
+        stop: crate::engine::config::StopConfig {
+        max_steps: Some(2),
+        ..Default::default()
+    },
         ..RaceConfig::defaults()
     };
     let mut engine =
@@ -5118,7 +5208,7 @@ fn resume_refuses_a_different_exam_store() {
     engine
         .seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
-    engine.config.pop_size = 2;
+    engine.config.population.pop_size = 2;
     assert_eq!(engine.run().unwrap(), StopReason::MaxSteps);
     let _ = engine.write_live_net_weights();
     drop(engine);
@@ -5131,7 +5221,7 @@ fn resume_refuses_a_different_exam_store() {
         data_dir,
         {
             let mut c = RaceConfig::defaults();
-            c.pop_size = 2;
+            c.population.pop_size = 2;
             c
         },
         fitness(),
@@ -5154,13 +5244,13 @@ fn the_worst_dump_writes_the_lowest_fit_nets() {
     let mut eng = engine(&dir, 11).unwrap();
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
-    eng.config.worst_save_topology = true;
-    eng.config.champion_count = 1;
+    eng.config.run.worst_save_topology = true;
+    eng.config.population.champion_count = 1;
     // The lottery OFF (a band whose floor is 1.0 sells every clock to everybody): no net has a `spent` score, so this pins the FALLBACK contract — the ungraded dump is the…
-    eng.config.train_merit_p_min = 1.0;
+    eng.config.lottery.train_merit_p_min = 1.0;
     let hashes = eng.state.live_hashes();
     for (i, h) in hashes.iter().enumerate() {
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(if i == 0 { 0.1 } else { 0.9 });
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
     }
@@ -5210,7 +5300,7 @@ fn policy_scoped_fitness_reads_only_the_current_weights() {
     let dir = std::env::temp_dir().join("gras-policy-scoped-fitness");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 11).unwrap();
-    eng.config.policy_scoped_fitness = false;
+    eng.config.ranking.policy_scoped_fitness = false;
     eng.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
         .unwrap();
     let h = eng.state.live_hashes()[0].clone();
@@ -5222,7 +5312,7 @@ fn policy_scoped_fitness_reads_only_the_current_weights() {
     let off = eng.race_reading_of(&h).unwrap();
     assert_eq!(off.n, 3, "flag off: the whole buffer, exactly as before");
     assert!((off.mean - 0.5).abs() < 1e-6, "mean was {}", off.mean);
-    eng.config.policy_scoped_fitness = true;
+    eng.config.ranking.policy_scoped_fitness = true;
     let on = eng.race_reading_of(&h).unwrap();
     assert_eq!(
         (on.n, on.mean, on.std),
@@ -5243,8 +5333,8 @@ fn the_worst_dump_ranks_by_the_spent_criterion_not_by_fit_alone() {
     let dir = std::env::temp_dir().join("gras-worst-dump-spent");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 23).unwrap();
-    eng.config.mutation_probation_steps = 0;
-    eng.config.crossover_probation_steps = 0;
+    eng.config.population.mutation_probation_steps = 0;
+    eng.config.population.crossover_probation_steps = 0;
     eng.seed_population_internal(
         vec![tiny_topology(7), tiny_topology(8), tiny_topology(9)],
         Some(0.5),
@@ -5254,7 +5344,7 @@ fn the_worst_dump_ranks_by_the_spent_criterion_not_by_fit_alone() {
     // Minimize fixture: 100 = best, 200 = mid, 300 = worst.
     for (i, mean) in [100.0_f32, 200.0, 300.0].into_iter().enumerate() {
         let h = &hashes[i];
-        let mut buf = RollingBuffer::new(eng.config.smoothing_window);
+        let mut buf = RollingBuffer::new(eng.config.ranking.smoothing_window);
         buf.push(mean);
         *eng.rolling_fitness.get_mut(h).unwrap() = buf;
     }
@@ -5268,10 +5358,10 @@ fn the_worst_dump_ranks_by_the_spent_criterion_not_by_fit_alone() {
         state.step = updates;
         state.entered_at_step = 0;
     }
-    eng.config.train_ticket = eng.config.train_ticket.with_updates_armed(true);
-    eng.config.train_merit_p_min = 0.0;
-    eng.config.worst_save_topology = true;
-    eng.config.champion_count = 1;
+    eng.config.lottery.train_ticket = eng.config.lottery.train_ticket.with_updates_armed(true);
+    eng.config.lottery.train_merit_p_min = 0.0;
+    eng.config.run.worst_save_topology = true;
+    eng.config.population.champion_count = 1;
     // The OLD order this replaces reads the smallest RAW score, which is one END of this ranking —
     // never the middle net the spent criterion files.
     let old_pick = eng
@@ -5326,9 +5416,9 @@ fn depth_is_reported_in_the_champion_and_worst_markdown() {
         .unwrap();
     let h = eng.state.live_hashes()[0].clone();
     eng.rolling_fitness.get_mut(&h).unwrap().push(0.5);
-    eng.config.champion_save_topology = true;
-    eng.config.worst_save_topology = true;
-    eng.config.champion_count = 1;
+    eng.config.run.champion_save_topology = true;
+    eng.config.run.worst_save_topology = true;
+    eng.config.population.champion_count = 1;
     eng.write_champion_markdown(1).unwrap();
     eng.write_worst_markdown(1).unwrap();
     let names: Vec<String> = std::fs::read_dir(&dir)

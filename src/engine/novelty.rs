@@ -115,7 +115,7 @@ mod tests {
 
     fn topos(seed: u64) -> Vec<Topology> {
         let mut cfg = RaceConfig::defaults();
-        cfg.pop_size = 1;
+        cfg.population.pop_size = 1;
         initial_population(&cfg, seed)
     }
 

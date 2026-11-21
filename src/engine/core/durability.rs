@@ -96,7 +96,7 @@ impl CoreEngine {
     /// Append a step's metrics for the live nets that were trained and scored this clock
     /// history buffer (idle nets contribute no row: nothing happened to them).
     pub(crate) fn append_metrics_csv(&mut self, step: usize) -> Result<()> {
-        if !self.config.csv_export {
+        if !self.config.run.csv_export {
             return Ok(());
         }
         for hash in &self.state.live_hashes() {
@@ -150,7 +150,7 @@ impl CoreEngine {
     /// Flush both buffered CSV exports — `history.csv` (metric rows)
     /// `attempts.csv` (evolution events) — at checkpoints and stop, gated by `csv_export`.
     pub(crate) fn flush_csv_exports(&mut self) -> Result<()> {
-        if !self.config.csv_export {
+        if !self.config.run.csv_export {
             return Ok(());
         }
         // `net_seed` completes the individual identity: (hash, net_seed) uniquely
@@ -233,16 +233,16 @@ impl CoreEngine {
             input_dim: self.header.input_dim,
             output_dim: self.header.output_dim,
             topology_options: self.header.topology_options,
-            hidden_dim_pool: self.config.hidden_dim_pool.clone().unwrap_or(4..=8),
-            hidden_dim_stride: self.config.hidden_dim_stride,
-            combine_op_pool: self.config.combine_op_pool.clone(),
-            activation_pool: self.config.activation_pool.clone(),
-            standardize_op_pool: self.config.standardize_op_pool.clone(),
+            hidden_dim_pool: self.config.topology.hidden_dim_pool.clone().unwrap_or(4..=8),
+            hidden_dim_stride: self.config.topology.hidden_dim_stride,
+            combine_op_pool: self.config.topology.combine_op_pool.clone(),
+            activation_pool: self.config.topology.activation_pool.clone(),
+            standardize_op_pool: self.config.topology.standardize_op_pool.clone(),
             informative_metrics: self.metrics.clone(),
-            max_steps: self.config.max_steps,
+            max_steps: self.config.stop.max_steps,
             // The CONFIG's eval share, not the stream's train share: the stream accessor returns
             // `train_pool / total` (0.8 for a 20% holdout), so writing it here recorded 0.8
-            train_eval_split_ratio: Some(self.config.eval_share),
+            train_eval_split_ratio: Some(self.config.run.eval_share),
             explicit_test_rows: self.explicit_test_rows,
             // Which subdirectory ranked — a fact from birth, restated on every rewrite.
             eval_split: self.header.eval_split.clone(),

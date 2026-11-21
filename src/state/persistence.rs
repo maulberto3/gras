@@ -184,59 +184,58 @@ impl ConfigSnapshot {
             None
         };
         ConfigSnapshot {
-            pop_size: cfg.pop_size,
-            checkpoint_every: cfg.checkpoint_every,
-            crossover_share: cfg.crossover_share,
-            mutation_share: cfg.mutation_share,
-            crossover_cull_policy: cfg.crossover_cull_policy.to_string(),
-            mutation_cull_policy: cfg.mutation_cull_policy.to_string(),
-            champion_count: cfg.champion_count,
-            crossover_ops_pool: cfg.crossover_ops_pool.clone(),
-            crossover_selection: cfg.crossover_selection.to_string(),
-            mutation_novelty_min: cfg.mutation_novelty_min,
-            mutation_novelty_draws: cfg.mutation_novelty_draws,
-            max_steps: cfg.max_steps,
-            has_custom_stop: cfg.custom_stop.is_some(),
-            log_level: format!("{:?}", cfg.log_level).to_lowercase(),
-            trace_file: cfg.trace_file,
+            pop_size: cfg.population.pop_size,
+            checkpoint_every: cfg.run.checkpoint_every,
+            crossover_share: cfg.evolution.crossover_share,
+            mutation_share: cfg.evolution.mutation_share,
+            crossover_cull_policy: cfg.evolution.crossover_cull_policy.to_string(),
+            mutation_cull_policy: cfg.evolution.mutation_cull_policy.to_string(),
+            champion_count: cfg.population.champion_count,
+            crossover_ops_pool: cfg.evolution.crossover_ops_pool.clone(),
+            crossover_selection: cfg.evolution.crossover_selection.to_string(),
+            mutation_novelty_min: cfg.evolution.mutation_novelty_min,
+            mutation_novelty_draws: cfg.evolution.mutation_novelty_draws,
+            max_steps: cfg.stop.max_steps,
+            has_custom_stop: cfg.stop.custom_stop.is_some(),
+            log_level: format!("{:?}", cfg.run.log_level).to_lowercase(),
+            trace_file: cfg.run.trace_file,
             mode: format!("{:?}", cfg.mode).to_lowercase(),
             batch_size,
             eval_batch_size,
-            smoothing_window: cfg.smoothing_window,
-            mean_type: cfg.mean_type.to_string(),
-            selection_metrics: cfg.selection_metrics.clone(),
+            smoothing_window: cfg.ranking.smoothing_window,
+            mean_type: cfg.ranking.mean_type.to_string(),
+            selection_metrics: cfg.ranking.selection_metrics.clone(),
             device: if cfg!(feature = "cuda") {
                 "cuda:0"
             } else {
                 "cpu"
             }
             .to_string(),
-            csv_export: cfg.csv_export,
-            save_optim: cfg.save_optim,
-            save_weights_at_stop: cfg.save_weights_at_stop,
-            run_name: cfg.run_name.clone(),
-            train_merit_p_min: cfg.train_merit_p_min,
-            train_merit_p_max: cfg.train_merit_p_max,
-            train_ticket: cfg.train_ticket.to_string(),
-            train_merit_learn_only: cfg.train_merit_learn_only,
-            policy_scoped_fitness: cfg.policy_scoped_fitness,
-            worst_save_topology: cfg.worst_save_topology,
-            crossover_fitter_base: cfg.crossover_fitter_base,
-            champion_previous_load: cfg.champion_previous_load,
-            champion_previous_dir: cfg
-                .champion_previous_dir
+            csv_export: cfg.run.csv_export,
+            save_optim: cfg.run.save_optim,
+            save_weights_at_stop: cfg.run.save_weights_at_stop,
+            run_name: cfg.run.run_name.clone(),
+            train_merit_p_min: cfg.lottery.train_merit_p_min,
+            train_merit_p_max: cfg.lottery.train_merit_p_max,
+            train_ticket: cfg.lottery.train_ticket.to_string(),
+            train_merit_learn_only: cfg.lottery.train_merit_learn_only,
+            policy_scoped_fitness: cfg.ranking.policy_scoped_fitness,
+            worst_save_topology: cfg.run.worst_save_topology,
+            crossover_fitter_base: cfg.evolution.crossover_fitter_base,
+            champion_previous_load: cfg.run.champion_previous_load,
+            champion_previous_dir: cfg.run.champion_previous_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
-            champion_save_topology: cfg.champion_save_topology,
-            mutation_probation_steps: cfg.mutation_probation_steps,
-            crossover_probation_steps: cfg.crossover_probation_steps,
-            init_probation_steps: cfg.init_probation_steps,
-            recovery_retries: cfg.recovery_retries,
-            recovery_tolerance: cfg.recovery_tolerance,
-            recovery_same_seed: cfg.recovery_same_seed,
+            champion_save_topology: cfg.run.champion_save_topology,
+            mutation_probation_steps: cfg.population.mutation_probation_steps,
+            crossover_probation_steps: cfg.population.crossover_probation_steps,
+            init_probation_steps: cfg.population.init_probation_steps,
+            recovery_retries: cfg.population.recovery_retries,
+            recovery_tolerance: cfg.population.recovery_tolerance,
+            recovery_same_seed: cfg.population.recovery_same_seed,
             feature_split: split_single,
             feature_split_pool: split_pool,
-            drift_prob: cfg.drift_prob,
+            drift_prob: cfg.topology.drift_prob,
             build: crate::engine::format::build_stamp(),
         }
     }
@@ -1783,8 +1782,8 @@ mod tests {
     fn config_snapshot_records_both_cull_policies_in_snake_case() {
         use crate::engine::config::{CrossCullPolicy, MutationCullPolicy, RaceConfig};
         let mut cfg = RaceConfig::defaults();
-        cfg.crossover_cull_policy = CrossCullPolicy::Random;
-        cfg.mutation_cull_policy = MutationCullPolicy::LowestFitnessMostUpdates;
+        cfg.evolution.crossover_cull_policy = CrossCullPolicy::Random;
+        cfg.evolution.mutation_cull_policy = MutationCullPolicy::LowestFitnessMostUpdates;
         let snap = ConfigSnapshot::from_config(&cfg, None, None);
         assert_eq!(snap.crossover_cull_policy, "random");
         assert_eq!(snap.mutation_cull_policy, "lowest_fitness_most_updates");
@@ -1821,7 +1820,7 @@ mod tests {
     fn config_snapshot_records_artifact_flags() {
         use crate::engine::config::RaceConfig;
         let mut cfg = RaceConfig::defaults();
-        cfg.champion_save_topology = false;
+        cfg.run.champion_save_topology = false;
         let snap = ConfigSnapshot::from_config(&cfg, None, None);
         assert!(!snap.champion_save_topology);
 
@@ -1896,14 +1895,14 @@ mod tests {
     #[test]
     fn selection_metrics_round_trip() {
         let mut cfg = crate::engine::config::RaceConfig::defaults();
-        cfg.selection_metrics = vec![crate::utils::fitness::SelectionMetric {
+        cfg.ranking.selection_metrics = vec![crate::utils::fitness::SelectionMetric {
             label: "r2".to_string(),
             weight: -0.25,
         }];
         let snapshot = ConfigSnapshot::from_config(&cfg, None, None);
         let back: ConfigSnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
-        assert_eq!(back.selection_metrics, cfg.selection_metrics);
+        assert_eq!(back.selection_metrics, cfg.ranking.selection_metrics);
     }
 
     /// The parent draw is recorded as its label; a pre-knob `engine.json` (no key at all) loads as `""`, which the resume guard reads as roulette — the draw those runs actually…
@@ -1915,7 +1914,7 @@ mod tests {
         assert_eq!(snapshot.crossover_selection, "roulette");
         // Round-trips at a non-default method…
         let mut cfg = crate::engine::config::RaceConfig::defaults();
-        cfg.crossover_selection = SelectionMethod::Tournament { tournament_size: 4 };
+        cfg.evolution.crossover_selection = SelectionMethod::Tournament { tournament_size: 4 };
         let json = serde_json::to_string(&ConfigSnapshot::from_config(&cfg, None, None)).unwrap();
         assert!(
             json.contains("tournament(size=4)"),
@@ -1936,7 +1935,7 @@ mod tests {
     fn config_snapshot_records_the_feature_split_policy() {
         use crate::graph::topology::FeatureSplitPolicy;
         let mut cfg = crate::engine::config::RaceConfig::defaults();
-        cfg.feature_split_pool = Vec::new();
+        cfg.topology.feature_split_pool = Vec::new();
         let all = ConfigSnapshot::from_config(&cfg, None, None);
         assert_eq!(
             all.feature_split, None,
@@ -1951,7 +1950,7 @@ mod tests {
             (FeatureSplitPolicy::Exclusive, "split_exclusive"),
             (FeatureSplitPolicy::Random, "split_random"),
         ] {
-            cfg.feature_split_pool = vec![policy.to_string()];
+            cfg.topology.feature_split_pool = vec![policy.to_string()];
             let snap = ConfigSnapshot::from_config(&cfg, None, None);
             assert_eq!(snap.feature_split.as_deref(), Some(wire));
             // Round-trips…
@@ -2010,7 +2009,10 @@ mod tests {
         // the step budget sits beside the fitness target in `config`.
         let rl_cfg = crate::engine::RaceConfig {
             mode: crate::engine::config::RunMode::Rl,
-            max_steps: Some(25),
+            stop: crate::engine::config::StopConfig {
+        max_steps: Some(25),
+        ..Default::default()
+    },
             ..Default::default()
         };
         let rl = ConfigSnapshot::from_config(&rl_cfg, None, None);

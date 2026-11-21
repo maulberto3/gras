@@ -88,15 +88,15 @@ impl CoreEngine {
     fn pre_insert_buffer(&mut self, hash: &str) {
         self.rolling_fitness.insert(
             hash.to_string(),
-            RollingBuffer::new(self.config.smoothing_window),
+            RollingBuffer::new(self.config.ranking.smoothing_window),
         );
         self.rolling_train.insert(
             hash.to_string(),
-            RollingBuffer::new(self.config.smoothing_window),
+            RollingBuffer::new(self.config.ranking.smoothing_window),
         );
         self.rolling_eval.insert(
             hash.to_string(),
-            RollingBuffer::new(self.config.smoothing_window),
+            RollingBuffer::new(self.config.ranking.smoothing_window),
         );
         let metric_bufs = self.metric_buffers();
         self.rolling_metrics.insert(hash.to_string(), metric_bufs);
@@ -293,7 +293,7 @@ impl CoreEngine {
                 self.cull_net(
                     victim,
                     clock,
-                    self.config.crossover_cull_policy.cull_reason(),
+                    self.config.evolution.crossover_cull_policy.cull_reason(),
                 )?;
             }
             // The operator's own exchange count, tallied as the child is ADMITTED: a pairing
@@ -304,7 +304,7 @@ impl CoreEngine {
                 self.accounting.uniform_cx_pairs += rep.pairs;
             }
             self.insert_child(child, clock, "crossover-lowest-fitness");
-            let victim_note = self.config.crossover_cull_policy.victim_note(live_before);
+            let victim_note = self.config.evolution.crossover_cull_policy.victim_note(live_before);
             return Ok(RollOutcome::survived(format!(
                 "child {} ({}) │ culled {} (F {}, {victim_note}) │ first step at {clock}",
                 inserted_hash,
@@ -336,7 +336,7 @@ impl CoreEngine {
         // The culled net's score AT CULL TIME (`smoothed_fitness_of` — the risk-adjusted number the ranking reads, the same one `final-field.csv` prints), `None` when it had no…
         victim_fitness: Option<f32>,
     ) {
-        if !self.config.csv_export {
+        if !self.config.run.csv_export {
             return;
         }
         // `attempts.csv` columns (see `flush_csv_exports`) with FULL hashes +
@@ -385,9 +385,9 @@ impl CoreEngine {
     /// both channels so the log reads identically.
     pub(crate) fn no_cull_roll_detail(&self, branch: &str) -> String {
         let k = if branch == "crossover-lowest-fitness" {
-            self.config.crossover_probation_steps
+            self.config.population.crossover_probation_steps
         } else {
-            self.config.mutation_probation_steps
+            self.config.population.mutation_probation_steps
         };
         format!(
             "no cull-eligible net — every live net is inside its {branch} cull shield window (k={k} updates); roll spent, nothing culled/born"
@@ -436,7 +436,7 @@ impl CoreEngine {
         child.state.step = 0;
         child.state.last_metrics = None;
         // The same shape the crossover line prints — `culled <hash> (F <score>, <why this net>)` — so a reader can weigh what the field GAVE UP for an immigrant. `F —` is honest…
-        let victim_note = self.config.mutation_cull_policy.victim_note(live_before);
+        let victim_note = self.config.evolution.mutation_cull_policy.victim_note(live_before);
         let detail = format!(
             "culled {} (F {}, {victim_note}) │ mutation {} born (fresh, first step at {clock}){novelty_note}",
             &victim[..8.min(victim.len())],
@@ -517,15 +517,15 @@ impl CoreEngine {
     /// share of `0.0` switches the channel off.
     pub(crate) fn rolls_at(&self, kind: RollKind) -> usize {
         let share = match kind {
-            RollKind::Crossover => self.config.crossover_share,
-            RollKind::Mutation => self.config.mutation_share,
+            RollKind::Crossover => self.config.evolution.crossover_share,
+            RollKind::Mutation => self.config.evolution.mutation_share,
         };
         share_rolls(share, self.state.live_count())
     }
 
     /// Whether this clock may EVOLVE at all: the run's INIT PROBATION has passed (`clock >= init_probation_steps`) AND somebody is cull-eligible.
     pub(crate) fn evolution_allowed(&self, clock: usize) -> bool {
-        clock >= self.config.init_probation_steps && self.has_cull_eligible()
+        clock >= self.config.population.init_probation_steps && self.has_cull_eligible()
     }
 
     /// Whether `hash` is still under its **cull shield** — what the log calls `cull shield` (NOT the cull shield, which is the born/probation window): cull-IMMUNE until the net…
@@ -534,9 +534,9 @@ impl CoreEngine {
             return false;
         };
         let window = if is_crossover_origin(state.created_from.as_deref()) {
-            self.config.crossover_probation_steps
+            self.config.population.crossover_probation_steps
         } else {
-            self.config.mutation_probation_steps
+            self.config.population.mutation_probation_steps
         };
         window > 0 && state.step < window
     }

@@ -89,7 +89,7 @@ pub struct CoreEngine {
     pub(crate) rolling_fitness: HashMap<String, RollingBuffer>,
     pub(crate) rolling_train: HashMap<String, RollingBuffer>,
     pub(crate) rolling_eval: HashMap<String, RollingBuffer>,
-    /// Per-net windows for the run's informative metrics, one buffer per `config.metrics` entry (the order `StepReport::informative` arrives in).
+    /// Per-net windows for the run's informative metrics, one buffer per `config.ranking.metrics` entry (the order `StepReport::informative` arrives in).
     pub(crate) rolling_metrics: HashMap<String, Vec<RollingBuffer>>,
     /// [`crate::engine::config::RaceConfig::selection_metrics`] resolved to `(index, weight)`
     /// pairs over `metrics`. Empty = the fitness score IS the ranking value.
@@ -159,9 +159,9 @@ impl CoreEngine {
     /// field cannot be added to one engine and forgotten in the other.
     pub(crate) fn assemble(p: CoreEngineParts) -> Self {
         let novelty = crate::engine::novelty::Novelty::new(
-            p.config.pop_size,
-            p.config.mutation_novelty_min,
-            p.config.mutation_novelty_draws,
+            p.config.population.pop_size,
+            p.config.evolution.mutation_novelty_min,
+            p.config.evolution.mutation_novelty_draws,
         );
         let mut engine = Self {
             run_dir: p.run_dir,
@@ -212,7 +212,7 @@ impl CoreEngine {
         engine
     }
 
-    /// Recompute the resolved selection terms from `config.selection_metrics` + `metrics`.
+    /// Recompute the resolved selection terms from `config.ranking.selection_metrics` + `metrics`.
     pub(crate) fn apply_selection_metrics(&mut self) {
         self.selection_terms = self.config.selection_metric_terms(&self.metrics);
     }
@@ -221,7 +221,7 @@ impl CoreEngine {
     pub(crate) fn metric_buffers(&self) -> Vec<RollingBuffer> {
         self.metrics
             .iter()
-            .map(|_| RollingBuffer::new(self.config.smoothing_window))
+            .map(|_| RollingBuffer::new(self.config.ranking.smoothing_window))
             .collect()
     }
 }
@@ -312,7 +312,7 @@ impl CoreEngine {
         let run_dir = run_dir.unwrap_or_else(|| std::path::Path::new("results").join(&run_id));
         // Infer dims from data_dir when TopologyOptions leaves them unset (Tabular
         // `None` means "fill from the dataset at run start". RL specs must set them.
-        let mut topology_options = config.topology_options;
+        let mut topology_options = config.topology.options;
         let mut topology_errors: Vec<String> = Vec::new();
         if let Some(dataset) = &dataset {
             let inferred_input_dim = dataset.inputs.shape()[1] as usize;
@@ -320,7 +320,7 @@ impl CoreEngine {
             if let Some(user_in) = topology_options.input_dim {
                 if user_in != inferred_input_dim {
                     topology_errors.push(format!(
-                        "config.topology_options.input_dim = {user_in} but data_dir has {inferred_input_dim} features — set to None to infer, or fix either side"
+                        "config.topology.options.input_dim = {user_in} but data_dir has {inferred_input_dim} features — set to None to infer, or fix either side"
                     ));
                 }
             } else {
@@ -329,7 +329,7 @@ impl CoreEngine {
             if let Some(user_out) = topology_options.output_dim {
                 if user_out != inferred_output_dim {
                     topology_errors.push(format!(
-                        "config.topology_options.output_dim = {user_out} but data_dir has {inferred_output_dim} target columns — set to None to infer, or fix either side"
+                        "config.topology.options.output_dim = {user_out} but data_dir has {inferred_output_dim} target columns — set to None to infer, or fix either side"
                     ));
                 }
             } else {
@@ -355,10 +355,10 @@ impl CoreEngine {
             )
             .into());
         }
-        let metrics = config.metrics.clone();
+        let metrics = config.ranking.metrics.clone();
         // The EVAL share (`eval_share`), clamped by the same bounds the setter uses: this value
         // builds the pools (and, for a single-pool dir, decides how much of the data the race
-        let train_eval_split_ratio = config.eval_share.clamp(
+        let train_eval_split_ratio = config.run.eval_share.clamp(
             crate::engine::config::EVAL_SHARE_MIN,
             crate::engine::config::EVAL_SHARE_MAX,
         );
@@ -400,13 +400,13 @@ impl CoreEngine {
                 input_dim: header_input_dim,
                 output_dim: header_output_dim,
                 topology_options,
-                hidden_dim_pool: config.hidden_dim_pool.clone().unwrap_or(4..=8),
-                hidden_dim_stride: config.hidden_dim_stride,
-                combine_op_pool: config.combine_op_pool.clone(),
-                activation_pool: config.activation_pool.clone(),
-                standardize_op_pool: config.standardize_op_pool.clone(),
+                hidden_dim_pool: config.topology.hidden_dim_pool.clone().unwrap_or(4..=8),
+                hidden_dim_stride: config.topology.hidden_dim_stride,
+                combine_op_pool: config.topology.combine_op_pool.clone(),
+                activation_pool: config.topology.activation_pool.clone(),
+                standardize_op_pool: config.topology.standardize_op_pool.clone(),
                 informative_metrics: metrics.clone(),
-                max_steps: config.max_steps,
+                max_steps: config.stop.max_steps,
                 // Legacy key, EVAL share (see `DEFAULT_EVAL_SHARE`):
                 // value a resume reads back to rebuild the same two pools.
                 train_eval_split_ratio: Some(train_eval_split_ratio),
@@ -427,17 +427,17 @@ impl CoreEngine {
         );
         // The eval-permutation era is `checkpoint_every` at birth, and from then on it is whatever
         // THIS file says.
-        header.eval_era_every = Some(config.checkpoint_every);
+        header.eval_era_every = Some(config.run.checkpoint_every);
         write_engine_json(&run_dir, &header)?;
         // Settle the log sinks now that the run dir exists: `trace_file` opens the sidecar
         // and flushes the buffered start-up block into it; the default closes that buffer.
-        super::logging::settle_run_dir(&run_dir, config.trace_file);
+        super::logging::settle_run_dir(&run_dir, config.run.trace_file);
 
         // Seed the initial population internally — [imported elites?] + random draws —
         // deduped and re-rolled so the population always lands at `pop_size`.
         let mut founders: Vec<crate::graph::topology::Topology> = Vec::with_capacity(1);
         let mut seed_source: Option<crate::state::SeedSourceRecord> = None;
-        if config.champion_previous_load {
+        if config.run.champion_previous_load {
             // The compatibility gate reads the candidate's engine.json header,
             // so this run's own header (mode, dims, trainer name) is the input.
             let trainer_name = header
@@ -448,7 +448,7 @@ impl CoreEngine {
             // `max_seeds = pop_size`: the WHOLE elite list comes over in rank order,
             // founders are the source's own ranking, never a reshuffle
             match super::seed::resolve_plan(
-                config.champion_previous_dir.as_deref(),
+                config.run.champion_previous_dir.as_deref(),
                 // This run's own dir already exists on disk (the header
                 // written above), so it would otherwise be "the newest run".
                 Some(run_dir.as_path()),
@@ -456,7 +456,7 @@ impl CoreEngine {
                 header.input_dim,
                 header.output_dim,
                 trainer_name,
-                config.pop_size,
+                config.population.pop_size,
             ) {
                 super::seed::SeedOutcome::Seeded(plan) => {
                     let champ = plan.champion();
@@ -522,7 +522,7 @@ impl CoreEngine {
             }
         }
         let initial_topologies =
-            super::population::fill_unique(&config, run_seed, founders, config.pop_size);
+            super::population::fill_unique(&config, run_seed, founders, config.population.pop_size);
         // Every seeded slot is labeled by origin, so `nets/*.json` and `attempts.csv` say
         // which source elite it came from instead of a bare `founder-N`.
         let initial_topologies: Vec<(crate::graph::topology::Topology, Option<String>)> =
@@ -560,13 +560,13 @@ impl CoreEngine {
                 Some(
                     BatchStream::new(run_seed, batch_size.unwrap_or(default_batch_size), split)
                         .with_eval_batch_size(eval_batch_size.unwrap_or(default_batch_size))
-                        .with_checkpoint_every(config.checkpoint_every),
+                        .with_checkpoint_every(config.run.checkpoint_every),
                 )
             }
             None => None,
         };
 
-        let log_level = config.log_level;
+        let log_level = config.run.log_level;
         let meta_ctx = crate::engine::config::RunMetaCtx {
             input_dim: header.input_dim,
             output_dim: header.output_dim,
@@ -574,14 +574,14 @@ impl CoreEngine {
             dropout_prob: header.topology_options.dropout_prob,
             fitness_label: header.fitness_label.0.clone(),
             direction: format!("{:?}", header.fitness_direction).to_lowercase(),
-            pop_size: config.pop_size,
+            pop_size: config.population.pop_size,
             run_seed,
         };
 
         let novelty = crate::engine::novelty::Novelty::new(
-            config.pop_size,
-            config.mutation_novelty_min,
-            config.mutation_novelty_draws,
+            config.population.pop_size,
+            config.evolution.mutation_novelty_min,
+            config.evolution.mutation_novelty_draws,
         );
         let mut engine = CoreEngine {
             run_dir,
@@ -713,15 +713,15 @@ impl CoreEngine {
             self.optimizers.insert(hash.clone(), opt);
             self.rolling_fitness.insert(
                 hash.clone(),
-                RollingBuffer::new(self.config.smoothing_window),
+                RollingBuffer::new(self.config.ranking.smoothing_window),
             );
             self.rolling_train.insert(
                 hash.clone(),
-                RollingBuffer::new(self.config.smoothing_window),
+                RollingBuffer::new(self.config.ranking.smoothing_window),
             );
             self.rolling_eval.insert(
                 hash.clone(),
-                RollingBuffer::new(self.config.smoothing_window),
+                RollingBuffer::new(self.config.ranking.smoothing_window),
             );
             let metric_bufs = self.metric_buffers();
             self.rolling_metrics.insert(hash.clone(), metric_bufs);
@@ -764,12 +764,12 @@ impl CoreEngine {
         // post-construction config edit must not desync era numbering — but ONLY on a fresh run.
         if !self.resumed {
             if let Some(stream) = self.stream.as_mut() {
-                stream.set_run_checkpoint_every(self.config.checkpoint_every);
+                stream.set_run_checkpoint_every(self.config.run.checkpoint_every);
             }
             // The record follows the run that is actually starting: a config edit between
             // construction and `run` would otherwise leave `engine.json` naming an era this run
-            if self.header.eval_era_every != Some(self.config.checkpoint_every) {
-                self.header.eval_era_every = Some(self.config.checkpoint_every);
+            if self.header.eval_era_every != Some(self.config.run.checkpoint_every) {
+                self.header.eval_era_every = Some(self.config.run.checkpoint_every);
                 if let Err(e) = crate::state::write_engine_json(&self.run_dir, &self.header) {
                     tracing::warn!("engine.json eval-era record failed: {e}");
                 }
@@ -791,20 +791,20 @@ impl CoreEngine {
                         .join(",")
                 })
                 .unwrap_or_else(|e| format!("INVALID({e})"));
-            let acts = if self.config.activation_pool.is_empty() {
+            let acts = if self.config.topology.activation_pool.is_empty() {
                 "all".to_string()
             } else {
-                self.config.activation_pool.join(",")
+                self.config.topology.activation_pool.join(",")
             };
-            let combines = if self.config.combine_op_pool.is_empty() {
+            let combines = if self.config.topology.combine_op_pool.is_empty() {
                 "default-safe(add,mean,max,min)".to_string()
             } else {
-                self.config.combine_op_pool.join(",")
+                self.config.topology.combine_op_pool.join(",")
             };
-            let std_ops = if self.config.standardize_op_pool.is_empty() {
+            let std_ops = if self.config.topology.standardize_op_pool.is_empty() {
                 "all".to_string()
             } else {
-                self.config.standardize_op_pool.join(",")
+                self.config.topology.standardize_op_pool.join(",")
             };
             let mut manifest: Vec<(String, String)> = vec![
                 ("run_id".to_string(), self.header.run_id.clone()),
@@ -817,29 +817,28 @@ impl CoreEngine {
                         .clone()
                         .unwrap_or_else(|| crate::utils::cfy::NO_VALUE.to_string()),
                 ),
-                ("pop_size".to_string(), self.config.pop_size.to_string()),
+                ("pop_size".to_string(), self.config.population.pop_size.to_string()),
                 (
                     "max_steps".to_string(),
-                    self.config
-                        .max_steps
+                    self.config.stop.max_steps
                         .map(|m| m.to_string())
                         .unwrap_or_else(|| "unbounded".to_string()),
                 ),
                 (
                     "smoothing_window (K)".to_string(),
-                    self.config.smoothing_window.to_string(),
+                    self.config.ranking.smoothing_window.to_string(),
                 ),
-                ("mean_type".to_string(), self.config.mean_type.to_string()),
+                ("mean_type".to_string(), self.config.ranking.mean_type.to_string()),
                 (
                     "checkpoint_every".to_string(),
-                    self.config.checkpoint_every.to_string(),
+                    self.config.run.checkpoint_every.to_string(),
                 ),
                 (
                     "crossover_turnover".to_string(),
-                    if self.config.crossover_share > 0.0 {
+                    if self.config.evolution.crossover_share > 0.0 {
                         format!(
                             "{}% of pop per clock ({} roll(s))",
-                            fmt_cfg(self.config.crossover_share * 100.0),
+                            fmt_cfg(self.config.evolution.crossover_share * 100.0),
                             self.rolls_at(RollKind::Crossover)
                         )
                     } else {
@@ -848,10 +847,10 @@ impl CoreEngine {
                 ),
                 (
                     "mutate_turnover".to_string(),
-                    if self.config.mutation_share > 0.0 {
+                    if self.config.evolution.mutation_share > 0.0 {
                         format!(
                             "{}% of pop per clock ({} roll(s))",
-                            fmt_cfg(self.config.mutation_share * 100.0),
+                            fmt_cfg(self.config.evolution.mutation_share * 100.0),
                             self.rolls_at(RollKind::Mutation)
                         )
                     } else {
@@ -860,29 +859,29 @@ impl CoreEngine {
                 ),
                 (
                     "crossover_selection".to_string(),
-                    self.config.crossover_selection.to_string(),
+                    self.config.evolution.crossover_selection.to_string(),
                 ),
                 (
                     "champion_count".to_string(),
-                    self.config.champion_count.to_string(),
+                    self.config.population.champion_count.to_string(),
                 ),
                 (
                     "train_merit_learn_only".to_string(),
-                    self.config.train_merit_learn_only.to_string(),
+                    self.config.lottery.train_merit_learn_only.to_string(),
                 ),
                 (
                     "train_merit_p_min (p_min)".to_string(),
-                    fmt_cfg(self.config.train_merit_p_min),
+                    fmt_cfg(self.config.lottery.train_merit_p_min),
                 ),
                 (
                     "train_merit_p_max (p_max)".to_string(),
-                    fmt_cfg(self.config.train_merit_p_max),
+                    fmt_cfg(self.config.lottery.train_merit_p_max),
                 ),
                 // Which NET the ticket favours, on both legs, spelled out so a reader does not
                 // have to interpret a pair of booleans.
                 (
                     "train_ticket".to_string(),
-                    self.config.train_ticket.to_string(),
+                    self.config.lottery.train_ticket.to_string(),
                 ),
                 ("lottery tilt".to_string(), self.lottery_tilt().to_string()),
                 (
@@ -893,8 +892,8 @@ impl CoreEngine {
                 // activations and dropout.
                 (
                     "topology drift".to_string(),
-                    if self.config.drift_prob > 0.0 {
-                        fmt_cfg(self.config.drift_prob)
+                    if self.config.topology.drift_prob > 0.0 {
+                        fmt_cfg(self.config.topology.drift_prob)
                     } else {
                         "0 (exact inheritance)".to_string()
                     },
@@ -929,23 +928,23 @@ impl CoreEngine {
             for (k, v) in [
                 (
                     "crossover_cull_policy",
-                    self.config.crossover_cull_policy.to_string(),
+                    self.config.evolution.crossover_cull_policy.to_string(),
                 ),
                 (
                     "mutation_cull_policy",
-                    self.config.mutation_cull_policy.to_string(),
+                    self.config.evolution.mutation_cull_policy.to_string(),
                 ),
                 (
                     "champion_save",
-                    self.config.champion_save_topology.to_string(),
+                    self.config.run.champion_save_topology.to_string(),
                 ),
                 (
                     "probation_steps",
-                    self.config.mutation_probation_steps.to_string(),
+                    self.config.population.mutation_probation_steps.to_string(),
                 ),
                 (
                     "crossover_probation_steps",
-                    self.config.crossover_probation_steps.to_string(),
+                    self.config.population.crossover_probation_steps.to_string(),
                 ),
             ] {
                 manifest.push((k.to_string(), v));
@@ -965,8 +964,8 @@ impl CoreEngine {
                     "reading".to_string(),
                     format!(
                         "avg = mean of the last K={} readings{} · spread = how variable those readings are · SE = spread/√n = how well the mean is known · n = readings behind it",
-                        self.config.smoothing_window,
-                        if self.config.policy_scoped_fitness {
+                        self.config.ranking.smoothing_window,
+                        if self.config.ranking.policy_scoped_fitness {
                             " taken on the CURRENT weights (policy-scoped fitness: n resets at every real update, so `n = 1` is one datapoint of one policy, no spread)"
                         } else {
                             ""
@@ -978,7 +977,7 @@ impl CoreEngine {
                     format!(
                         "score{} = the window CENTRE in `{}`, plus any `selection_metrics` terms (each a metric's smoothed centre × its weight — `COMPOSITE` on the line when terms exist). What the ranking sorts on; the rollup's `±` is the `σ` ACROSS the live scores, not one net's window spread. A row's `spread` is printed for diagnosis, not charged",
                         self.fitness.direction().arrow(),
-                        self.config.mean_type
+                        self.config.ranking.mean_type
                     ),
                 ),
                 (
@@ -1002,7 +1001,7 @@ impl CoreEngine {
 
             // The genotype's structural bounds: without these the card names
             // pools but hides how big a net may get, which is half the search space.
-            let topo = self.config.topology_options;
+            let topo = self.config.topology.options;
             let search = crate::utils::cfy::kv(&[
                 ("crossover_ops".to_string(), ops),
                 ("activations".to_string(), acts),
@@ -1010,12 +1009,12 @@ impl CoreEngine {
                 ("standardize".to_string(), std_ops),
                 (
                     "hidden_dim_pool".to_string(),
-                    match &self.config.hidden_dim_pool {
+                    match &self.config.topology.hidden_dim_pool {
                         Some(r) => format!(
                             "{}..={} (stride {})",
                             r.start(),
                             r.end(),
-                            self.config.hidden_dim_stride
+                            self.config.topology.hidden_dim_stride
                         ),
                         None => "default 4..=8".to_string(),
                     },
@@ -1129,12 +1128,12 @@ impl CoreEngine {
                 if !evolve_allowed {
                     self.accounting.deferred_clocks += 1;
                     // THE INIT PROBATION (`set_pop_init_probation_steps`) is DECLARED, not emergent: while the clock is inside it the rolls are withheld by the run's own arithmetic, so the…
-                    if clock < self.config.init_probation_steps {
+                    if clock < self.config.population.init_probation_steps {
                         info!(
                             "step {} │ evolution deferred: init probation — the run opens with {} clock(s) of no culls or births, so evolution starts at clock {} ({} crossover + {} mutation roll(s) forgone)",
                             clock,
-                            self.config.init_probation_steps,
-                            self.config.init_probation_steps,
+                            self.config.population.init_probation_steps,
+                            self.config.population.init_probation_steps,
                             cross_total,
                             mutate_total,
                         );
@@ -1143,8 +1142,8 @@ impl CoreEngine {
                         info!(
                             "step {} │ evolution deferred: no cull-eligible net — every non-champion net is inside its cull shield window (crossover k={}, mutation k={} updates) or champion ({} crossover + {} mutation roll(s) forgone; nothing culled/born) · the shield is served by UPDATES, not clocks, so it outlasts the run only if its net never trains",
                             clock,
-                            self.config.crossover_probation_steps,
-                            self.config.mutation_probation_steps,
+                            self.config.population.crossover_probation_steps,
+                            self.config.population.mutation_probation_steps,
                             cross_total,
                             mutate_total,
                         );
@@ -1469,7 +1468,7 @@ impl CoreEngine {
                             lottery_who_line(
                                 &trained,
                                 &withheld,
-                                self.config.train_merit_learn_only,
+                                self.config.lottery.train_merit_learn_only,
                             )
                         );
                     }
@@ -1477,9 +1476,9 @@ impl CoreEngine {
             }
 
             // ── 2.
-            if self.config.checkpoint_every > 0
+            if self.config.run.checkpoint_every > 0
                 && clock > 0
-                && clock % self.config.checkpoint_every == 0
+                && clock % self.config.run.checkpoint_every == 0
             {
                 // Snapshot the live frontier.
                 if let Err(e) = self.write_live_frontier_states() {
@@ -1568,13 +1567,13 @@ impl CoreEngine {
         // …and their weights only when the run asks: the stop is a READING of the race, so the
         // default leaves a whole population's coefficients off disk. A checkpoint is the resume
         // artifact (`save_weights_at_stop`).
-        if self.config.save_weights_at_stop {
+        if self.config.run.save_weights_at_stop {
             self.write_live_net_weights()?;
         }
         self.sweep_stale_net_weights();
         // The same point-in-time set at the stop clock — its manifest and its CSV agree. The
         // `weights` flag tells a later resume whether the files under it can be loaded.
-        self.write_frontier_manifest(clock + 1, self.config.save_weights_at_stop)?;
+        self.write_frontier_manifest(clock + 1, self.config.run.save_weights_at_stop)?;
         self.flush_csv_exports()?;
         self.persist_run_counters(&final_stats);
         Ok(reason)
@@ -1606,12 +1605,12 @@ impl CoreEngine {
         config: &mut RaceConfig,
         header: &crate::state::RunHeader,
     ) {
-        config.topology_options = header.topology_options;
+        config.topology.options = header.topology_options;
         // A header written BEFORE the split moved onto `TopologyOptions` recorded
         // `config.feature_split`; restore it here so an old run keeps drawing the same masks
-        if config.topology_options.feature_split.is_none() {
+        if config.topology.options.feature_split.is_none() {
             if let Some(raw) = header.config.feature_split.as_deref() {
-                config.topology_options.feature_split =
+                config.topology.options.feature_split =
                     crate::graph::topology::parse_feature_split_wire(raw);
             }
         }
@@ -1622,15 +1621,15 @@ impl CoreEngine {
                 Some(start.trim().parse::<usize>().ok()?..=end.trim().parse::<usize>().ok()?)
             })
         {
-            config.hidden_dim_pool = Some(pool);
+            config.topology.hidden_dim_pool = Some(pool);
         }
-        config.hidden_dim_stride = header.hidden_dim_stride.max(1);
-        config.combine_op_pool = header.combine_op_pool.clone();
-        config.activation_pool = header.activation_pool.clone();
-        config.standardize_op_pool = header.standardize_op_pool.clone();
+        config.topology.hidden_dim_stride = header.hidden_dim_stride.max(1);
+        config.topology.combine_op_pool = header.combine_op_pool.clone();
+        config.topology.activation_pool = header.activation_pool.clone();
+        config.topology.standardize_op_pool = header.standardize_op_pool.clone();
         // The metric set comes from the RECORD: a resume that drops a metric appends
         // `history.csv` rows one column short of its own header.
-        config.metrics = header
+        config.ranking.metrics = header
             .informative_metrics
             .iter()
             .filter_map(|name| crate::trainer::menu::metric_for(name))
@@ -1639,7 +1638,7 @@ impl CoreEngine {
 
     /// The step budget the engine is running under (`None` = unbounded).
     pub fn max_steps(&self) -> Option<usize> {
-        self.config.max_steps
+        self.config.stop.max_steps
     }
 
     /// Change the step budget of a LIVE engine — the resume-and-extend door.
@@ -1647,7 +1646,7 @@ impl CoreEngine {
         if self.resumed && self.header.max_steps != Some(steps) {
             warn_budget_changed_under_a_budget_schedule(&self.header, Some(steps));
         }
-        self.config.max_steps = Some(steps);
+        self.config.stop.max_steps = Some(steps);
     }
 }
 

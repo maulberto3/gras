@@ -34,7 +34,7 @@ pub const DEFAULT_WORST_SAVE_TOPOLOGY: bool = false;
 /// key off.
 pub const DEFAULT_CHECKPOINT_EVERY: usize = 25;
 
-/// Default for [`RaceConfig::save_weights_at_stop`]: OFF. The stop snapshot is a RECORD of the
+/// Default for `RaceConfig::run::save_weights_at_stop`: OFF. The stop snapshot is a RECORD of the
 /// race; the checkpoint is the resume artifact that actually needs weights.
 pub const DEFAULT_SAVE_WEIGHTS_AT_STOP: bool = false;
 
@@ -104,129 +104,12 @@ pub const EVAL_SHARE_MAX: f32 = 0.9;
 // `DEFAULT_LR` moved to `crate::utils::training`: a training scheme reads it (the reference trainer
 // and the example both do), so it belongs below both layers rather than in the engine's config
 
-/// Step-race knob surface. Size defaults are small for quick tests; evolution
-/// semantics default to the tuned cartpole reference. Mode knobs live in `mode_specific`.
-pub struct RaceConfig {
+/// The people in the race: seat count, the champion set, cull shields and recovery.
+pub struct PopulationConfig {
     /// Number of live nets in the population.
     pub pop_size: usize,
-    /// Steps between population checkpoints (the stream's era rotation and the CSV flush cadence
-    /// key off
-    pub checkpoint_every: usize,
-    /// Write every live net's WEIGHTS at the terminal stop (`nets/<hash>.safetensors`).
-    /// **Off by default**: the stop is a READING of the race — what a run exists to produce is
-    /// the winning BLUEPRINT for a separate full training, not a whole population's
-    /// coefficients — while a checkpoint's weights are what a resume loads. `true` restores
-    /// the old whole-field dump.
-    pub save_weights_at_stop: bool,
-    /// CROSSOVER turnover — the channel's ONE knob — as a share of the live population per clock: `0.1` = 10%, dealt as `round(share · pop)` rolls EVERY clock (at least one…
-    pub crossover_share: f32,
-    /// MUTATION turnover — the mutation channel's own knob — as a share of the live population per
-    /// clock. Same contract as [`RaceConfig::crossover_share`]; `0.0` switches the channel off.
-    pub mutation_share: f32,
-    /// Who a surviving crossover child evicts (crossover-only; immigrants follow
-    /// `mutation_cull_policy`).
-    pub crossover_cull_policy: CrossCullPolicy,
-    /// Who a firing mutation roll evicts (mutation-only; crossover children follow
-    /// `crossover_cull_policy`).
-    pub mutation_cull_policy: MutationCullPolicy,
     /// CHAMPION set: the top-k live nets by smoothed fitness, saved and inheritable at stop (minimum 1).
     pub champion_count: usize,
-    /// Lottery floor `p_min`: the worst net's chance of a ticket each clock.
-    pub train_merit_p_min: f32,
-    /// Lottery ceiling `p_max`: the best net's chance of a ticket each clock.
-    pub train_merit_p_max: f32,
-    /// The lottery's two LEGS (`set_train_ticket`): which fit place earns the ticket and which side of the updates field it multiplies in.
-    pub train_ticket: TrainTicket,
-    /// LEARN-ONLY lottery (`set_ticket_learn_only`): `true` = a lost ticket costs the weight UPDATE, not the STEP — the net runs its trainer with a no-op optimizer, so it acts…
-    pub train_merit_learn_only: bool,
-    /// Share of the dataset held out for EVAL (`eval_share`): the rows a net is SCORED on and never
-    /// trained
-    pub eval_share: f32,
-    /// Per-net smoothed-fitness rolling window (K) — how many recent step fitnesses
-    /// ranking decision averages over. Defaults to [`SMOOTHING_WINDOW`].
-    pub smoothing_window: usize,
-    /// How the window's readings are averaged into the ranking centre (`set_fitness_mean_type`): [`MeanType::Median`] (the default — no single reading moves the centre)…
-    pub mean_type: MeanType,
-    /// POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): `true` makes the mean/spread/n describe the CURRENT weights — the readings taken since the net's last real update —…
-    pub policy_scoped_fitness: bool,
-    /// ANTI-CHAMPION dump (`set_worst_save_topology`): `true` writes `worst-<hash>-<fitness>.md` + `worst.md` at stop for the nets ranked by `spent` (`Fm⁻ × (1 − Um)`): the bad…
-    pub worst_save_topology: bool,
-    /// Mode-specific knobs (tabular vs RL) — the arm is carried in the type. The engine
-    /// core reads only the shared fields; mode branches match on this arm.
-    pub mode_specific: ModeConfig,
-    /// Crossover operator pool (`"one_point"` | `"uniform"`), drawn uniformly per attempt.
-    /// Empty ⇒ both.
-    pub crossover_ops_pool: Vec<String>,
-    /// How a crossover attempt draws its parents: [`SelectionMethod::Roulette`] (default — the
-    /// fitter a net, the likelier it is drawn, with nothing fixed), a `Tournament { k }`,
-    /// which concentrates recombination on the leaders, or [`SelectionMethod::Elite`], the
-    /// deterministic best-fitness draft.
-    pub crossover_selection: SelectionMethod,
-    /// Fitter parent as the crossover BASE (`set_crossover_fitter_base`).
-    pub crossover_fitter_base: bool,
-    /// Max steps before stopping (None = no limit).
-    pub max_steps: Option<usize>,
-    /// Hidden-dim sampling range (`None` ⇒ default 16..=64). NOTE: batch geometry lives
-    /// on the trainer's `stream_shape()`, not here.
-    pub hidden_dim_pool: Option<std::ops::RangeInclusive<usize>>,
-    /// Stride within the hidden-dim pool when sampling node dimensions.
-    pub hidden_dim_stride: usize,
-    /// Combine/activation/standardize pools actually used by the run; empty uses
-    /// known ops (`empty ⇒ all` convention).
-    pub combine_op_pool: Vec<String>,
-    /// The feature-split POOL newborns draw from: `none`, `random`, `exclusive` (the `split_*`
-    /// spellings `engine.json` writes are accepted too).
-    pub feature_split_pool: Vec<String>,
-    /// Per-SLOT drift on a crossover child's INHERITED genes (`set_topology_drift`): the chance,
-    /// for each slot below, that it moves — mask bits, a hidden node's activation / combine /
-    /// standardize / width, port activations, the wiring gene `input_reach` (whose wires are
-    /// re-derived) and the dropout rate (under the run's cap)
-    pub drift_prob: f32,
-    /// Activation pool (empty ⇒
-    pub activation_pool: Vec<String>,
-    /// Standardize-op pool (empty ⇒
-    pub standardize_op_pool: Vec<String>,
-    /// Topology template (input/output dims, hidden node ranges, dropout, etc.)
-    /// shared by every individual in the run.
-    pub topology_options: crate::graph::topology::TopologyOptions,
-    /// Novelty floor `d_min` on a mutation draw (`set_mutation_novelty_min`): the minimum Δ to
-    /// the NEAREST blueprint this run already made. `0.0` = off.
-    pub mutation_novelty_min: f32,
-    /// Candidates one mutation may spend clearing that floor (`set_mutation_novelty_draws`).
-    pub mutation_novelty_draws: usize,
-    /// Pluggable stop criterion **in addition** to the built-ins (Iter 5
-    /// contract). When `None`, only the built-ins apply.
-    pub custom_stop: StopFn,
-    /// Per-step log verbosity for the engine.
-    pub log_level: LogLevel,
-    /// Write `<run_dir>/telemetry.jsonl`: one JSON record per event at full fidelity.
-    /// Off by default — the console is the view, this is the record.
-    pub trace_file: bool,
-    /// Write each live net's OPTIMIZER state beside its weights (`nets/<hash>.optim`)
-    /// checkpoint, so a resume restores Adam's moments instead of restarting them.
-    pub save_optim: bool,
-    /// Informative (non-ranking) metrics; their labels determine the extra per-net
-    /// metric columns a reader may expect.
-    pub metrics: Vec<Metric>,
-    /// Metrics that ALSO feed the ranking (`set_selection_metric`): each adds `weight × the metric's smoothed window centre` to the fitness score, so `score = fitness centre +…
-    pub selection_metrics: Vec<crate::utils::fitness::SelectionMetric>,
-    /// The training paradigm / problem space target.
-    pub mode: RunMode,
-    /// Whether to write `history.csv` (one row per live net per clock it was TRAINED AND SCORED
-    /// — an idle lottery clock has nothing to record) and `attempts.csv` (per evolution attempt) —
-    pub csv_export: bool,
-    /// At stop, save each champion's topology markdown (`champion-<hash>-<fitness>.md`).
-    /// Default true — the ranking's blueprint is the run's headline artifact.
-    pub champion_save_topology: bool,
-    /// Human label for the experiment, recorded verbatim in `engine.json`
-    /// `"run_name"`. Informational — does not affect the results folder name.
-    pub run_name: Option<String>,
-    /// AUTOMATIC inheritance: load the newest compatible PREVIOUS experiment's CHAMPIONS into
-    /// first founder slots (topology-only).
-    pub champion_previous_load: bool,
-    /// Where `champion_previous_load` looks: a run dir or a dir of run dirs (newest run id
-    /// wins). `None` ⇒ the default `results/` folder.
-    pub champion_previous_dir: Option<std::path::PathBuf>,
     /// Mutation probation: a random immigrant is cull-IMMUNE until it has spent
     /// `mutation_probation_steps` UPDATES (`U`, real optimizer steps) — not clocks. `0` = off.
     pub mutation_probation_steps: usize,
@@ -235,12 +118,237 @@ pub struct RaceConfig {
     pub crossover_probation_steps: usize,
     /// INIT PROBATION (`set_pop_init_probation_steps`): clocks the run spends WITHOUT evolution — no culls, no births — however cull-eligible the population already is.
     pub init_probation_steps: usize,
-    /// Post-update RECOVERY streak cap: after a real update whose reading comes in WORSE than the net's standing going in, up to `recovery_retries` extra real updates are taken…
+    /// Post-update RECOVERY streak cap: after a real update whose reading comes in WORSE than the net's standing going in, up to `recovery_retries` extra real updates are taken.
     pub recovery_retries: usize,
-    /// Recovery tolerance: how far a reading may fall below the net's standing WITHOUT earning a rescue, as a FRACTION of that standing (`0.2` = a fifth, so 268 may read down…
+    /// Recovery tolerance: how far a reading may fall below the net's standing WITHOUT earning a rescue, as a FRACTION of that standing (`0.2` = a fifth).
     pub recovery_tolerance: f32,
-    /// Recovery retry DRAW (`set_pop_recovery_same_seed`): `true` (default) = every retry repeats the clock's OWN train draw — the same rows and the same RNG stream — so the…
+    /// Recovery retry DRAW (`set_pop_recovery_same_seed`): `true` (default) = every retry repeats the clock's OWN train draw.
     pub recovery_same_seed: bool,
+}
+
+impl Default for PopulationConfig {
+    fn default() -> Self {
+        Self {
+            pop_size: DEFAULT_POP_SIZE,
+            champion_count: DEFAULT_CHAMPION_COUNT,
+            mutation_probation_steps: DEFAULT_MUTATION_PROBATION_STEPS,
+            crossover_probation_steps: DEFAULT_CROSSOVER_PROBATION_STEPS,
+            init_probation_steps: DEFAULT_INIT_PROBATION_STEPS,
+            recovery_retries: DEFAULT_RECOVERY_RETRIES,
+            recovery_tolerance: DEFAULT_RECOVERY_TOLERANCE,
+            recovery_same_seed: DEFAULT_RECOVERY_SAME_SEED,
+        }
+    }
+}
+
+/// The two turnover channels — each with its own EVICTION policy — plus the novelty gate.
+pub struct EvolutionConfig {
+    /// CROSSOVER turnover as a share of the live population per clock: `0.1` = 10%, dealt as `round(share · pop)` rolls EVERY clock (at least one).
+    pub crossover_share: f32,
+    /// MUTATION turnover — the mutation channel's own knob — as a share of the live population per clock. `0.0` switches the channel off.
+    pub mutation_share: f32,
+    /// Who a surviving crossover child evicts (crossover-only; immigrants follow `mutation_cull_policy`).
+    pub crossover_cull_policy: CrossCullPolicy,
+    /// Who a firing mutation roll evicts (mutation-only; crossover children follow `crossover_cull_policy`).
+    pub mutation_cull_policy: MutationCullPolicy,
+    /// Crossover operator pool (`"one_point"` | `"uniform"`), drawn uniformly per attempt. Empty ⇒ both.
+    pub crossover_ops_pool: Vec<String>,
+    /// How a crossover attempt draws its parents: [`SelectionMethod::Roulette`] (default), a `Tournament { k }`, or [`SelectionMethod::Elite`].
+    pub crossover_selection: SelectionMethod,
+    /// Fitter parent as the crossover BASE (`set_crossover_fitter_base`).
+    pub crossover_fitter_base: bool,
+    /// Novelty floor `d_min` on a mutation draw: the minimum Δ to the NEAREST blueprint this run already made. `0.0` = off.
+    pub mutation_novelty_min: f32,
+    /// Candidates one mutation may spend clearing that floor (`set_mutation_novelty_draws`).
+    pub mutation_novelty_draws: usize,
+}
+
+impl Default for EvolutionConfig {
+    fn default() -> Self {
+        Self {
+            crossover_share: DEFAULT_CROSSOVER_SHARE,
+            mutation_share: DEFAULT_MUTATION_SHARE,
+            crossover_cull_policy: CrossCullPolicy::default(),
+            mutation_cull_policy: MutationCullPolicy::default(),
+            crossover_ops_pool: Vec::new(),
+            crossover_selection: SelectionMethod::default(),
+            crossover_fitter_base: DEFAULT_CROSSOVER_FITTER_BASE,
+            mutation_novelty_min: DEFAULT_MUTATION_NOVELTY_MIN,
+            mutation_novelty_draws: DEFAULT_MUTATION_NOVELTY_DRAWS,
+        }
+    }
+}
+
+/// How readings become a ranking: the window, its mean, and the metric terms.
+pub struct RankingConfig {
+    /// Per-net smoothed-fitness rolling window (K) — how many recent step fitnesses a ranking decision averages over.
+    pub smoothing_window: usize,
+    /// How the window's readings are averaged into the ranking centre (`set_fitness_mean_type`).
+    pub mean_type: MeanType,
+    /// POLICY-SCOPED FITNESS (`set_fitness_policy_scoped`): `true` builds the mean/spread/n ONLY from readings taken on the weights the net holds now.
+    pub policy_scoped_fitness: bool,
+    /// Informative (non-ranking) metrics; their labels determine the extra per-net metric columns a reader may expect.
+    pub metrics: Vec<Metric>,
+    /// Metrics that ALSO feed the ranking (`set_selection_metric`): each adds `weight × the metric's smoothed window centre`.
+    pub selection_metrics: Vec<crate::utils::fitness::SelectionMetric>,
+}
+
+impl Default for RankingConfig {
+    fn default() -> Self {
+        Self {
+            smoothing_window: SMOOTHING_WINDOW,
+            mean_type: DEFAULT_MEAN_TYPE,
+            policy_scoped_fitness: DEFAULT_POLICY_SCOPED_FITNESS,
+            metrics: Vec::new(),
+            selection_metrics: Vec::new(),
+        }
+    }
+}
+
+/// The training lottery: the band, its legs, and the learn-only gate.
+pub struct LotteryConfig {
+    /// Lottery floor `p_min`: the worst net's chance of a ticket each clock.
+    pub train_merit_p_min: f32,
+    /// Lottery ceiling `p_max`: the best net's chance of a ticket each clock.
+    pub train_merit_p_max: f32,
+    /// The lottery's two LEGS (`set_train_ticket`): which fit place earns the ticket and which side of the updates field it multiplies in.
+    pub train_ticket: TrainTicket,
+    /// LEARN-ONLY lottery (`set_ticket_learn_only`): `true` = a lost ticket costs the weight UPDATE, not the STEP.
+    pub train_merit_learn_only: bool,
+}
+
+impl Default for LotteryConfig {
+    fn default() -> Self {
+        Self {
+            train_merit_p_min: DEFAULT_TRAIN_MERIT_P_MIN,
+            train_merit_p_max: DEFAULT_TRAIN_MERIT_P_MAX,
+            train_ticket: DEFAULT_TRAIN_TICKET,
+            train_merit_learn_only: DEFAULT_TRAIN_MERIT_LEARN_ONLY,
+        }
+    }
+}
+
+/// The search space every newborn is drawn from.
+pub struct TopologyConfig {
+    /// Hidden-dim sampling range (`None` ⇒ default 16..=64).
+    pub hidden_dim_pool: Option<std::ops::RangeInclusive<usize>>,
+    /// Stride within the hidden-dim pool when sampling node dimensions.
+    pub hidden_dim_stride: usize,
+    /// Combine pools actually used by the run; empty uses known ops (`empty ⇒ all`).
+    pub combine_op_pool: Vec<String>,
+    /// The feature-split POOL newborns draw from: `none`, `random`, `exclusive`.
+    pub feature_split_pool: Vec<String>,
+    /// Per-SLOT drift on a crossover child's INHERITED genes (`set_topology_drift`).
+    pub drift_prob: f32,
+    /// Activation pool (empty ⇒ all known activations).
+    pub activation_pool: Vec<String>,
+    /// Standardize-op pool (empty ⇒ all known ops).
+    pub standardize_op_pool: Vec<String>,
+    /// Topology template (input/output dims, hidden node ranges, dropout, etc.) shared by every individual in the run.
+    pub options: crate::graph::topology::TopologyOptions,
+}
+
+impl Default for TopologyConfig {
+    fn default() -> Self {
+        Self {
+            hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
+            hidden_dim_stride: DEFAULT_HIDDEN_DIM_STRIDE,
+            combine_op_pool: Vec::new(),
+            feature_split_pool: Vec::new(),
+            drift_prob: DEFAULT_TOPOLOGY_DRIFT,
+            activation_pool: Vec::new(),
+            standardize_op_pool: Vec::new(),
+            options: crate::graph::topology::TopologyOptions::default(),
+        }
+    }
+}
+
+/// When the race ends.
+pub struct StopConfig {
+    /// Max steps before stopping (None = no limit).
+    pub max_steps: Option<usize>,
+    /// Pluggable stop criterion **in addition** to the built-ins. When `None`, only the built-ins apply.
+    pub custom_stop: StopFn,
+}
+
+impl Default for StopConfig {
+    fn default() -> Self {
+        Self {
+            max_steps: Some(DEFAULT_MAX_STEPS),
+            custom_stop: None,
+        }
+    }
+}
+
+/// Run plumbing: durability, reporting, artifacts and inheritance.
+pub struct RunSettings {
+    /// Steps between population checkpoints (the stream's era rotation and the CSV flush cadence).
+    pub checkpoint_every: usize,
+    /// Write every live net's WEIGHTS at the terminal stop. **Off by default**: the stop is a reading; the checkpoint is the resume artifact.
+    pub save_weights_at_stop: bool,
+    /// Write each live net's OPTIMIZER state beside its weights (`nets/<hash>.optim`).
+    pub save_optim: bool,
+    /// Whether to write `history.csv` and `attempts.csv`.
+    pub csv_export: bool,
+    /// Write `<run_dir>/telemetry.jsonl`: one JSON record per event at full fidelity.
+    pub trace_file: bool,
+    /// Per-step log verbosity for the engine.
+    pub log_level: LogLevel,
+    /// Human label for the experiment, recorded verbatim in `engine.json`.
+    pub run_name: Option<String>,
+    /// Share of the dataset held out for EVAL: the rows a net is SCORED on and never trained.
+    pub eval_share: f32,
+    /// At stop, save each champion's topology markdown. Default true.
+    pub champion_save_topology: bool,
+    /// AUTOMATIC inheritance: load the newest compatible PREVIOUS experiment's champions into first founder slots.
+    pub champion_previous_load: bool,
+    /// Where `champion_previous_load` looks: a run dir or a dir of run dirs. `None` ⇒ `results/`.
+    pub champion_previous_dir: Option<std::path::PathBuf>,
+    /// ANTI-CHAMPION dump (`set_worst_save_topology`): `true` writes `worst-*.md` files at stop.
+    pub worst_save_topology: bool,
+}
+
+impl Default for RunSettings {
+    fn default() -> Self {
+        Self {
+            checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
+            save_weights_at_stop: DEFAULT_SAVE_WEIGHTS_AT_STOP,
+            save_optim: DEFAULT_SAVE_OPTIM,
+            csv_export: DEFAULT_CSV_EXPORT,
+            trace_file: DEFAULT_TRACE_FILE,
+            log_level: LogLevel::default(),
+            run_name: None,
+            eval_share: DEFAULT_EVAL_SHARE,
+            champion_save_topology: DEFAULT_CHAMPION_SAVE_TOPOLOGY,
+            champion_previous_load: DEFAULT_CHAMPION_PREVIOUS_LOAD,
+            champion_previous_dir: None,
+            worst_save_topology: DEFAULT_WORST_SAVE_TOPOLOGY,
+        }
+    }
+}
+
+/// The aggregate run config. A knob's path says what it governs:
+/// `config.lottery.train_merit_p_min`, `config.stop.max_steps`, `config.topology.drift_prob`.
+/// Mode is the one split that stays at the top: the arm IS the mode.
+pub struct RaceConfig {
+    /// Seats, champions, cull shields and recovery.
+    pub population: PopulationConfig,
+    /// The two turnover channels and the novelty gate.
+    pub evolution: EvolutionConfig,
+    /// The smoothing window and the metric terms.
+    pub ranking: RankingConfig,
+    /// The ticket band, its legs and the learn-only gate.
+    pub lottery: LotteryConfig,
+    /// The search space every newborn is drawn from.
+    pub topology: TopologyConfig,
+    /// The step budget and the custom stop predicate.
+    pub stop: StopConfig,
+    /// Durability, reporting, artifacts and inheritance.
+    pub run: RunSettings,
+    /// The training paradigm / problem space target.
+    pub mode: RunMode,
+    /// Mode-specific knobs (tabular vs RL) — the arm is carried in the type.
+    pub mode_specific: ModeConfig,
 }
 
 // `run_progress` and `DEFAULT_LR` live in `crate::utils::training` — the run
@@ -264,62 +372,21 @@ impl RaceConfig {
     /// channel, tournament-2 crossover parents, a 5-reading window, the inverted lottery
     pub fn defaults() -> Self {
         RaceConfig {
-            pop_size: DEFAULT_POP_SIZE,
-            checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
-            save_weights_at_stop: DEFAULT_SAVE_WEIGHTS_AT_STOP,
-            crossover_share: DEFAULT_CROSSOVER_SHARE,
-            mutation_share: DEFAULT_MUTATION_SHARE,
-            crossover_cull_policy: CrossCullPolicy::default(),
-            mutation_cull_policy: MutationCullPolicy::default(),
-            champion_count: DEFAULT_CHAMPION_COUNT,
-            train_merit_p_min: DEFAULT_TRAIN_MERIT_P_MIN,
-            train_merit_p_max: DEFAULT_TRAIN_MERIT_P_MAX,
-            train_ticket: DEFAULT_TRAIN_TICKET,
-            train_merit_learn_only: DEFAULT_TRAIN_MERIT_LEARN_ONLY,
-            eval_share: DEFAULT_EVAL_SHARE,
-            smoothing_window: SMOOTHING_WINDOW,
-            mean_type: DEFAULT_MEAN_TYPE,
-            policy_scoped_fitness: DEFAULT_POLICY_SCOPED_FITNESS,
-            worst_save_topology: DEFAULT_WORST_SAVE_TOPOLOGY,
-            mode_specific: ModeConfig::Tabular,
-            crossover_ops_pool: Vec::new(),
-            crossover_selection: SelectionMethod::default(),
-            crossover_fitter_base: DEFAULT_CROSSOVER_FITTER_BASE,
-            max_steps: Some(DEFAULT_MAX_STEPS),
-            hidden_dim_pool: Some(DEFAULT_HIDDEN_POOL),
-            hidden_dim_stride: DEFAULT_HIDDEN_DIM_STRIDE,
-            combine_op_pool: Vec::new(),
-            feature_split_pool: Vec::new(),
-            drift_prob: DEFAULT_TOPOLOGY_DRIFT,
-            activation_pool: Vec::new(),
-            standardize_op_pool: Vec::new(),
-            topology_options: crate::graph::topology::TopologyOptions::default(),
-            mutation_novelty_min: DEFAULT_MUTATION_NOVELTY_MIN,
-            mutation_novelty_draws: DEFAULT_MUTATION_NOVELTY_DRAWS,
-            custom_stop: None,
-            metrics: Vec::new(),
-            selection_metrics: Vec::new(),
-            log_level: LogLevel::default(),
-            trace_file: DEFAULT_TRACE_FILE,
-            save_optim: DEFAULT_SAVE_OPTIM,
+            population: PopulationConfig::default(),
+            evolution: EvolutionConfig::default(),
+            ranking: RankingConfig::default(),
+            lottery: LotteryConfig::default(),
+            topology: TopologyConfig::default(),
+            stop: StopConfig::default(),
+            run: RunSettings::default(),
             mode: DEFAULT_RUN_MODE,
-            csv_export: DEFAULT_CSV_EXPORT,
-            champion_save_topology: DEFAULT_CHAMPION_SAVE_TOPOLOGY,
-            run_name: None,
-            champion_previous_load: DEFAULT_CHAMPION_PREVIOUS_LOAD,
-            champion_previous_dir: None,
-            mutation_probation_steps: DEFAULT_MUTATION_PROBATION_STEPS,
-            crossover_probation_steps: DEFAULT_CROSSOVER_PROBATION_STEPS,
-            init_probation_steps: DEFAULT_INIT_PROBATION_STEPS,
-            recovery_retries: DEFAULT_RECOVERY_RETRIES,
-            recovery_tolerance: DEFAULT_RECOVERY_TOLERANCE,
-            recovery_same_seed: DEFAULT_RECOVERY_SAME_SEED,
+            mode_specific: ModeConfig::Tabular,
         }
     }
 
     /// Resolve [`Self::selection_metrics`] labels to indices in `metrics`, in ranking order.
     pub fn selection_metric_terms(&self, metrics: &[Metric]) -> Vec<(usize, f32)> {
-        self.selection_metrics
+        self.ranking.selection_metrics
             .iter()
             .filter_map(
                 |term| match metrics.iter().position(|m| m.label == term.label) {
@@ -352,49 +419,49 @@ impl RaceConfig {
     /// header recorded, so a resume needs only its directory.
     pub fn from_snapshot(snap: &crate::state::ConfigSnapshot) -> Self {
         let mut cfg = RaceConfig::defaults();
-        cfg.pop_size = snap.pop_size;
-        cfg.checkpoint_every = snap.checkpoint_every;
-        cfg.save_weights_at_stop = snap.save_weights_at_stop;
-        cfg.crossover_share = snap.crossover_share;
-        cfg.mutation_share = snap.mutation_share;
+        cfg.population.pop_size = snap.pop_size;
+        cfg.run.checkpoint_every = snap.checkpoint_every;
+        cfg.run.save_weights_at_stop = snap.save_weights_at_stop;
+        cfg.evolution.crossover_share = snap.crossover_share;
+        cfg.evolution.mutation_share = snap.mutation_share;
         // A header written before the gate recorded no floor: `0.0` replays it unchanged.
-        cfg.mutation_novelty_min = snap.mutation_novelty_min;
-        cfg.mutation_novelty_draws = snap.mutation_novelty_draws.max(1);
-        cfg.champion_count = snap.champion_count;
-        cfg.crossover_ops_pool = snap.crossover_ops_pool.clone();
-        cfg.crossover_fitter_base = snap.crossover_fitter_base;
-        cfg.max_steps = snap.max_steps;
-        cfg.log_level = LogLevel::parse(&snap.log_level).unwrap_or(cfg.log_level);
-        cfg.trace_file = snap.trace_file;
-        cfg.smoothing_window = snap.smoothing_window;
+        cfg.evolution.mutation_novelty_min = snap.mutation_novelty_min;
+        cfg.evolution.mutation_novelty_draws = snap.mutation_novelty_draws.max(1);
+        cfg.population.champion_count = snap.champion_count;
+        cfg.evolution.crossover_ops_pool = snap.crossover_ops_pool.clone();
+        cfg.evolution.crossover_fitter_base = snap.crossover_fitter_base;
+        cfg.stop.max_steps = snap.max_steps;
+        cfg.run.log_level = LogLevel::parse(&snap.log_level).unwrap_or(cfg.run.log_level);
+        cfg.run.trace_file = snap.trace_file;
+        cfg.ranking.smoothing_window = snap.smoothing_window;
         // `""` = a header written before the knob, which averaged arithmetically.
-        cfg.mean_type = MeanType::parse(&snap.mean_type).unwrap_or(DEFAULT_MEAN_TYPE);
-        cfg.train_ticket = TrainTicket::parse(&snap.train_ticket).unwrap_or(cfg.train_ticket);
-        cfg.csv_export = snap.csv_export;
-        cfg.save_optim = snap.save_optim;
-        cfg.run_name = snap.run_name.clone();
-        cfg.selection_metrics = snap.selection_metrics.clone();
-        cfg.train_merit_p_min = snap.train_merit_p_min;
-        cfg.train_merit_p_max = snap.train_merit_p_max;
-        cfg.train_merit_learn_only = snap.train_merit_learn_only;
-        cfg.policy_scoped_fitness = snap.policy_scoped_fitness;
-        cfg.worst_save_topology = snap.worst_save_topology;
-        cfg.drift_prob = snap.drift_prob;
-        cfg.champion_previous_load = snap.champion_previous_load;
-        cfg.champion_previous_dir = snap
+        cfg.ranking.mean_type = MeanType::parse(&snap.mean_type).unwrap_or(DEFAULT_MEAN_TYPE);
+        cfg.lottery.train_ticket = TrainTicket::parse(&snap.train_ticket).unwrap_or(cfg.lottery.train_ticket);
+        cfg.run.csv_export = snap.csv_export;
+        cfg.run.save_optim = snap.save_optim;
+        cfg.run.run_name = snap.run_name.clone();
+        cfg.ranking.selection_metrics = snap.selection_metrics.clone();
+        cfg.lottery.train_merit_p_min = snap.train_merit_p_min;
+        cfg.lottery.train_merit_p_max = snap.train_merit_p_max;
+        cfg.lottery.train_merit_learn_only = snap.train_merit_learn_only;
+        cfg.ranking.policy_scoped_fitness = snap.policy_scoped_fitness;
+        cfg.run.worst_save_topology = snap.worst_save_topology;
+        cfg.topology.drift_prob = snap.drift_prob;
+        cfg.run.champion_previous_load = snap.champion_previous_load;
+        cfg.run.champion_previous_dir = snap
             .champion_previous_dir
             .as_ref()
             .map(std::path::PathBuf::from);
-        cfg.champion_save_topology = snap.champion_save_topology;
-        cfg.mutation_probation_steps = snap.mutation_probation_steps;
-        cfg.crossover_probation_steps = snap.crossover_probation_steps;
-        cfg.init_probation_steps = snap.init_probation_steps;
-        cfg.recovery_retries = snap.recovery_retries;
-        cfg.recovery_tolerance = snap.recovery_tolerance;
-        cfg.recovery_same_seed = snap.recovery_same_seed;
+        cfg.run.champion_save_topology = snap.champion_save_topology;
+        cfg.population.mutation_probation_steps = snap.mutation_probation_steps;
+        cfg.population.crossover_probation_steps = snap.crossover_probation_steps;
+        cfg.population.init_probation_steps = snap.init_probation_steps;
+        cfg.population.recovery_retries = snap.recovery_retries;
+        cfg.population.recovery_tolerance = snap.recovery_tolerance;
+        cfg.population.recovery_same_seed = snap.recovery_same_seed;
         // Match the recorded spelling, so a renamed display label still resumes.
         let cull = snap.crossover_cull_policy.to_ascii_lowercase();
-        cfg.crossover_cull_policy = if cull.contains("lowest_fitness_most_updates") {
+        cfg.evolution.crossover_cull_policy = if cull.contains("lowest_fitness_most_updates") {
             CrossCullPolicy::LowestFitnessMostUpdates
         } else if cull.contains("highest_ticket_chance") {
             CrossCullPolicy::HighestTicketChance
@@ -404,7 +471,7 @@ impl RaceConfig {
             CrossCullPolicy::LowestFitness
         };
         let mcull = snap.mutation_cull_policy.to_ascii_lowercase();
-        cfg.mutation_cull_policy = if mcull.contains("lowest_fitness_most_updates") {
+        cfg.evolution.mutation_cull_policy = if mcull.contains("lowest_fitness_most_updates") {
             MutationCullPolicy::LowestFitnessMostUpdates
         } else if mcull.contains("highest_ticket_chance") {
             MutationCullPolicy::HighestTicketChance
@@ -417,7 +484,7 @@ impl RaceConfig {
             MutationCullPolicy::LowestFitness
         };
         let selection = snap.crossover_selection.to_ascii_lowercase();
-        cfg.crossover_selection = if selection.contains("elite") {
+        cfg.evolution.crossover_selection = if selection.contains("elite") {
             SelectionMethod::Elite
         } else if selection.contains("tournament") {
             let k = selection
@@ -431,7 +498,7 @@ impl RaceConfig {
         };
         // Pool: a header that recorded one (a post-pool run) wins; an older header recorded
         // single policy (or none), which becomes a one-entry pool so a resume cannot silently start
-        cfg.feature_split_pool = if snap.feature_split_pool.is_empty() {
+        cfg.topology.feature_split_pool = if snap.feature_split_pool.is_empty() {
             vec![
                 snap.feature_split
                     .clone()
@@ -546,7 +613,10 @@ mod tests {
         assert_eq!(RaceConfig::defaults().validate_search_pools(), Ok(()));
 
         let cfg = RaceConfig {
-            feature_split_pool: vec!["rondom".to_string()],
+            topology: crate::engine::config::TopologyConfig {
+        feature_split_pool: vec!["rondom".to_string()],
+        ..Default::default()
+    },
             ..RaceConfig::defaults()
         };
         // The RECORD no longer invents a pool: the typed spelling is what gets written.
@@ -561,9 +631,15 @@ mod tests {
 
         // Every bad pool is reported at once, not one per run start.
         let many = RaceConfig {
-            feature_split_pool: vec!["rondom".to_string()],
-            activation_pool: vec!["reluu".to_string()],
-            crossover_ops_pool: vec!["two_point".to_string()],
+            topology: crate::engine::config::TopologyConfig {
+        feature_split_pool: vec!["rondom".to_string()],
+        activation_pool: vec!["reluu".to_string()],
+        ..Default::default()
+    },
+            evolution: crate::engine::config::EvolutionConfig {
+        crossover_ops_pool: vec!["two_point".to_string()],
+        ..Default::default()
+    },
             ..RaceConfig::defaults()
         };
         let err = many.validate_search_pools().expect_err("three typos");
@@ -611,7 +687,10 @@ mod tests {
             assert_eq!(parse(bad), None, "{bad:?} is not a pool name");
         }
         let cfg = RaceConfig {
-            feature_split_pool: vec!["nonexclusive".to_string()],
+            topology: crate::engine::config::TopologyConfig {
+        feature_split_pool: vec!["nonexclusive".to_string()],
+        ..Default::default()
+    },
             ..RaceConfig::defaults()
         };
         assert!(cfg.validate_search_pools().is_err());
@@ -627,7 +706,7 @@ mod tests {
                 5,
                 &[40.0, 500.0, 40.0, 40.0, 40.0],
             ),
-            cfg.mean_type,
+            cfg.ranking.mean_type,
         )
         .unwrap();
         let steady = crate::engine::smoothing::rolling_stats_with(
@@ -635,7 +714,7 @@ mod tests {
                 5,
                 &[40.0, 40.0, 40.0, 40.0, 40.0],
             ),
-            cfg.mean_type,
+            cfg.ranking.mean_type,
         )
         .unwrap();
         assert!(
@@ -651,7 +730,7 @@ mod tests {
     fn crossover_selection_defaults_to_roulette_and_round_trips() {
         use crate::evolution::selection::SelectionMethod;
         assert_eq!(
-            RaceConfig::defaults().crossover_selection,
+            RaceConfig::defaults().evolution.crossover_selection,
             SelectionMethod::Roulette,
             "the knob's default is the fitness-proportionate draw"
         );
@@ -659,11 +738,11 @@ mod tests {
             .set_crossover_selection(SelectionMethod::Tournament { tournament_size: 3 })
             .build();
         assert_eq!(
-            cfg.crossover_selection,
+            cfg.evolution.crossover_selection,
             SelectionMethod::Tournament { tournament_size: 3 }
         );
         // The recorded label is the Display form the snapshot stores.
-        assert_eq!(cfg.crossover_selection.to_string(), "tournament(size=3)");
+        assert_eq!(cfg.evolution.crossover_selection.to_string(), "tournament(size=3)");
         assert_eq!(SelectionMethod::Roulette.to_string(), "roulette");
         assert_eq!(SelectionMethod::Elite.to_string(), "elite");
     }
@@ -675,6 +754,6 @@ mod tests {
         // (the old max_target_fitness exclusivity test shrank
         // feature's deletion — only the step budget remains)
         let cfg = RaceConfig::builder().set_stop_max_steps(15).build();
-        assert_eq!(cfg.max_steps, Some(15));
+        assert_eq!(cfg.stop.max_steps, Some(15));
     }
 }

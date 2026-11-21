@@ -43,7 +43,7 @@ pub struct EngineArgs {
     pub max_steps: usize,
 
     /// Lottery FLOOR `p_min`: the chance the WORST-graded net is paid each clock (`p_min == p_max` pays all alike).
-    #[arg(long, value_name = "P", default_value_t = 0.75)]
+    #[arg(long, value_name = "P", default_value_t = 0.15)]
     pub ticket_p_min: f32,
     /// Lottery CEILING `p_max`: the chance the BEST-graded net is paid; everyone between is interpolated.
     #[arg(long, value_name = "P", default_value_t = 0.85)]

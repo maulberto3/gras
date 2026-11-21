@@ -793,7 +793,7 @@ impl CoreEngine {
         for _ in 0..MAX_PARENT_PAIRINGS {
             // 2. ONE call for the whole pairing: distinct parents, and the `Elite` draft reads
             // each net's real optimizer updates (`NetState::step`) to break a fitness tie.
-            let method = self.config.crossover_selection.clone();
+            let method = self.config.evolution.crossover_selection.clone();
             let updates: Vec<usize> = ranked
                 .iter()
                 .map(|(h, _)| self.state.net(h).map(|s| s.step).unwrap_or(0))
@@ -802,7 +802,7 @@ impl CoreEngine {
                 method.draw_parents(&scores, &updates, direction, rng, n_parents);
             // FITTER BASE: `ranked` is best-first (`ranked_live_impl` sorts on the direction),
             // the LOWER index is the better net.
-            if self.config.crossover_fitter_base
+            if self.config.evolution.crossover_fitter_base
                 && parent_positions.len() == 2
                 && parent_positions[1] < parent_positions[0]
             {
@@ -817,7 +817,7 @@ impl CoreEngine {
                 let mut pb = self.load_parent_topology(&attempt_parents[1])?;
                 // Snapshot the FITTER parent's genes BEFORE the operator runs: a successful cut
                 // mutates BOTH sides into two reciprocal children, so the original is gone
-                let fitter_genes = self.config.crossover_fitter_base.then(|| hidden_genes(&pa));
+                let fitter_genes = self.config.evolution.crossover_fitter_base.then(|| hidden_genes(&pa));
                 let cx = match op {
                     CrossoverOp::OnePoint => {
                         let report = Topology::cx_one_point_with_report(&mut pa, &mut pb, rng);
@@ -915,14 +915,14 @@ impl CoreEngine {
         if inherited_masks {
             drift_feature_masks(
                 &mut child_masks,
-                self.config.drift_prob,
+                self.config.topology.drift_prob,
                 self.header.run_seed,
                 clock,
                 child_idx,
             );
         }
         // GENE DRIFT: the same coin, on the genes crossover can only donate.
-        if self.config.drift_prob > 0.0 {
+        if self.config.topology.drift_prob > 0.0 {
             let activations = self
                 .config
                 .resolved_activation_pool()
@@ -935,11 +935,11 @@ impl CoreEngine {
                 .config
                 .resolved_standardize_pool()
                 .unwrap_or_else(|_| crate::evolution::pools::all_standardize_ops());
-            let topo_opts = self.config.topology_options;
-            let width_pool = self.config.hidden_dim_pool.clone().unwrap_or(4..=8);
+            let topo_opts = self.config.topology.options;
+            let width_pool = self.config.topology.hidden_dim_pool.clone().unwrap_or(4..=8);
             drift_child_genes(
                 &mut child_topo,
-                self.config.drift_prob,
+                self.config.topology.drift_prob,
                 &activations,
                 &combine,
                 &standardize,
@@ -948,7 +948,7 @@ impl CoreEngine {
                     reach_max: topo_opts.max_input_reach,
                     width_start: *width_pool.start(),
                     width_end: *width_pool.end(),
-                    width_stride: self.config.hidden_dim_stride.max(1),
+                    width_stride: self.config.topology.hidden_dim_stride.max(1),
                     dropout_cap: topo_opts.dropout_prob,
                 },
                 self.header.run_seed,
@@ -992,7 +992,7 @@ impl CoreEngine {
     pub(crate) fn random_child(&mut self, clock: usize, child_idx: usize) -> Result<RaceChild> {
         let roll_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx);
         let mut rng = fastrand::Rng::with_seed(roll_seed);
-        let topo_opts = self.config.topology_options;
+        let topo_opts = self.config.topology.options;
         let n_hidden = rng.usize(topo_opts.min_hidden_num_nodes..=topo_opts.max_hidden_num_nodes);
         // Stamp the run's dataset dims + hidden-dim pool so the child trains
         // same shared stream the rest of the population uses.
@@ -1024,8 +1024,8 @@ impl CoreEngine {
             .config
             .resolved_standardize_pool()
             .unwrap_or_else(|_| crate::evolution::pools::all_standardize_ops());
-        let hidden_dim_pool = self.config.hidden_dim_pool.clone().unwrap_or(4..=8);
-        let stride = self.config.hidden_dim_stride.max(1);
+        let hidden_dim_pool = self.config.topology.hidden_dim_pool.clone().unwrap_or(4..=8);
+        let stride = self.config.topology.hidden_dim_stride.max(1);
         for node in &mut graph.nodes {
             if node.kind == NodeKind::Hidden {
                 let n = ((hidden_dim_pool.end() - hidden_dim_pool.start()) / stride) + 1;

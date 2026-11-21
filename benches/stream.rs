@@ -69,9 +69,9 @@ fn main() {
     // One net for the whole run: the architecture mix matches a real run's
     // initial population (built by the engine's own generator).
     let mut config = RaceConfig::defaults();
-    config.topology_options.input_dim = Some(FEATURES);
-    config.topology_options.output_dim = Some(CLASSES);
-    config.hidden_dim_pool = Some(4..=16);
+    config.topology.options.input_dim = Some(FEATURES);
+    config.topology.options.output_dim = Some(CLASSES);
+    config.topology.hidden_dim_pool = Some(4..=16);
     let topo = initial_population(&config, SEED).remove(0);
 
     for rows in ROW_COUNTS {

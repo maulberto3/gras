@@ -35,7 +35,7 @@ impl CoreEngine {
                     // The WHOLE-RUN line beside the window's numbers: `fitness_samples` counts the K-reading window, `fitness_readings` every reading the net ever took, and `fitness_slope` is…
                     "fitness_readings": trend.map(|t| t.len()),
                     "fitness_slope": trend.and_then(|t| t.slope()),
-                    "mean_type": self.config.mean_type.to_string(),
+                    "mean_type": self.config.ranking.mean_type.to_string(),
                     "params": state.and_then(|s| s.meta.params),
                     "born": state.map(|s| s.entered_at_step),
                 })
@@ -66,13 +66,13 @@ impl CoreEngine {
 
     /// Write the top-k champions' topology markdown, one file per champion (`champion-<hash>-<fitness>.md`, the suffix being the risk-adjusted score the file ranked by, rounded…
     pub(crate) fn write_champion_markdown(&mut self, clock: usize) -> Result<()> {
-        if !self.config.champion_save_topology {
+        if !self.config.run.champion_save_topology {
             return Ok(());
         }
         self.record_champions();
         // The champion count is known without consuming the iterator — read
         // it from the config (the same k the iterator caps
-        let k = self.config.champion_count.max(1);
+        let k = self.config.population.champion_count.max(1);
         // CFY: rows of the written files, emitted as one table after the loop.
         let mut written: Vec<Vec<String>> = Vec::new();
         for (rank, (hash, fitness)) in self.champion_ranked().enumerate() {
@@ -103,7 +103,7 @@ impl CoreEngine {
                         (r.n > 1).then_some(r.fam_spread),
                         r.n,
                         ReadingStyle::Doc,
-                        self.config.mean_type,
+                        self.config.ranking.mean_type,
                     )
                 },
             );
@@ -233,7 +233,7 @@ impl CoreEngine {
             ),
             ("net seed", state.net_seed.to_string()),
             ("run seed", self.header.run_seed.to_string()),
-            ("mean type", self.config.mean_type.to_string()),
+            ("mean type", self.config.ranking.mean_type.to_string()),
         ]
     }
 
@@ -254,7 +254,7 @@ impl CoreEngine {
                 tracing::warn!("net weights export failed for {hash}: {e}");
             }
             // The optimizer's own state, when asked
-            if self.config.save_optim {
+            if self.config.run.save_optim {
                 let optim = dir.join(format!("{hash}.optim"));
                 match self.optimizers.get(hash.as_str()) {
                     Some(o) => {
@@ -273,7 +273,7 @@ impl CoreEngine {
 
     /// The anti-champion dump: the nets worth READING, not merely the lowest `fit (F)` — one file per net (`worst-<hash>-<fit>.md`: topology + mermaid graph + lineage) plus a…
     pub(crate) fn write_worst_markdown(&mut self, clock: usize) -> Result<()> {
-        if !self.config.worst_save_topology {
+        if !self.config.run.worst_save_topology {
             return Ok(());
         }
         // The SAME frame the coin dealt from: the ticket chance printed here is the number the
@@ -303,7 +303,7 @@ impl CoreEngine {
             })
             .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)));
         let mut rows = worst_order(rows);
-        let k = self.config.champion_count.max(1).min(rows.len());
+        let k = self.config.population.champion_count.max(1).min(rows.len());
         rows.truncate(k);
         let mut written: Vec<Vec<String>> = Vec::new();
         let mut index = String::from(
@@ -332,7 +332,7 @@ impl CoreEngine {
                         (r.n > 1).then_some(r.fam_spread),
                         r.n,
                         ReadingStyle::Doc,
-                        self.config.mean_type,
+                        self.config.ranking.mean_type,
                     )
                 },
             );
@@ -489,7 +489,7 @@ impl CoreEngine {
 
     /// [`Self::champion_ranked`] over a ranking the caller already holds.
     pub(crate) fn champion_slice(&self, ranked: &[(String, f32)]) -> Vec<(String, f32)> {
-        let k = self.config.champion_count.max(1);
+        let k = self.config.population.champion_count.max(1);
         ranked.iter().take(k).cloned().collect()
     }
 
