@@ -5,22 +5,25 @@ use serde::Serialize;
 
 /// Selection strategy used by the engine to pick parents for the next
 /// generation. Each variant wraps its own tuning knobs.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub enum SelectionMethod {
     /// Tournament selection with elitism — the best individual always
     /// survives; higher `tournament_size` pressures toward the fittest.
     Tournament { tournament_size: usize },
     /// Fitness-proportionate (roulette wheel) selection: one draw returns
-    /// one index, weighted by the (direction-adjusted, non-negative) scores.
+    /// one index, weighted by the (direction-adjusted, non-negative) scores — the fitter a net, the
+    /// larger its slice, but nothing is fixed: every net whose adjusted score is above zero keeps
+    /// its own odds, so the field keeps discovering. THE DEFAULT, by the derive like every other
+    /// knob enum.
+    #[default]
     Roulette,
-}
-
-impl Default for SelectionMethod {
-    /// The tournament's default size is 2 — the smallest tournament that is actually a tournament
-    /// (a 2-way draw already doubles the leader's odds over a uniform pick) without the extreme
-    fn default() -> Self {
-        SelectionMethod::Tournament { tournament_size: 2 }
-    }
+    /// ELITE selection — the draft: the best net under the run's `Direction`, and a fitness TIE
+    /// goes to the net with MORE optimizer updates (`NetState::step`), so the parents are the
+    /// fittest nets that also carry the most training evidence. Deterministic: it draws no RNG, so
+    /// a replayed clock crosses the same pair. Only [`SelectionMethod::draw_parents`] knows the
+    /// update counts — a bare [`SelectionMethod::draw_one`] returns the leader. Opt-in: the default
+    /// is [`SelectionMethod::Roulette`], so the draw stays stochastic.
+    Elite,
 }
 
 impl SelectionMethod {
@@ -38,6 +41,8 @@ impl SelectionMethod {
                 tournament_select(scores, direction, rng, *tournament_size, champion_count)
             }
             Self::Roulette => roulette_select(scores, direction, rng),
+            // No tie-break data here: the whole field, best-first.
+            Self::Elite => elite_rank(scores, &[], direction),
         }
     }
 
@@ -53,6 +58,7 @@ impl SelectionMethod {
         }
         match self {
             Self::Roulette => roulette_select(scores, direction, rng).into_iter().next(),
+            Self::Elite => elite_pick(scores, &[], direction, &[]),
             Self::Tournament { tournament_size } => {
                 // Same rule as `tournament_select`: k uniform entrants, the better one under
                 // run's direction wins.
@@ -71,6 +77,53 @@ impl SelectionMethod {
         }
     }
 
+    /// ONE child's parents: `n` indices, distinct while the pool allows it.
+    ///
+    /// `updates[i]` is net `i`'s real optimizer updates (`NetState::step`); it is the tie-break
+    /// key of [`Self::Elite`] and ignored by the other arms. Cost is `O(n · pool)`: every pick is
+    /// ONE linear scan that skips the parents already taken, so a 2-parent draw is two passes.
+    pub fn draw_parents(
+        &self,
+        scores: &[f32],
+        updates: &[usize],
+        direction: Direction,
+        rng: &mut fastrand::Rng,
+        n: usize,
+    ) -> Vec<usize> {
+        let mut picks: Vec<usize> = Vec::with_capacity(n);
+        if scores.is_empty() || n == 0 {
+            return picks;
+        }
+        while picks.len() < n {
+            let pick = match self {
+                Self::Elite => elite_pick(scores, updates, direction, &picks),
+                // The stochastic arms keep their own rule: draw, and a REPEAT takes an untaken
+                // slot at random (the pairing retry's rule, now in one place).
+                _ => match self.draw_one(scores, direction, rng) {
+                    Some(draw) if picks.contains(&draw) => {
+                        let free: Vec<usize> =
+                            (0..scores.len()).filter(|i| !picks.contains(i)).collect();
+                        if free.is_empty() {
+                            Some(draw)
+                        } else {
+                            Some(free[rng.usize(..free.len())])
+                        }
+                    }
+                    other => other,
+                },
+            };
+            match pick {
+                Some(i) => picks.push(i),
+                // Pool smaller than `n`: the leader stands in for the missing parent.
+                None => {
+                    let leader = *picks.first().unwrap_or(&0);
+                    picks.push(leader);
+                }
+            }
+        }
+        picks
+    }
+
     /// Short label for logging (e.g. "tournament(k=2)").
     pub fn label(&self) -> String {
         match self {
@@ -78,6 +131,60 @@ impl SelectionMethod {
                 format!("tournament(k={})", tournament_size)
             }
             Self::Roulette => "roulette".to_string(),
+            Self::Elite => "elite".to_string(),
+        }
+    }
+}
+
+/// The `k`-th best without sorting: ONE pass over `scores`, skipping `taken` — `O(n)` per pick.
+fn elite_pick(
+    scores: &[f32],
+    updates: &[usize],
+    direction: Direction,
+    taken: &[usize],
+) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for i in 0..scores.len() {
+        if taken.contains(&i) {
+            continue;
+        }
+        best = Some(match best {
+            Some(b) if !elite_beats(scores, updates, direction, i, b) => b,
+            _ => i,
+        });
+    }
+    best
+}
+
+/// The whole field best-first — the generational arm's answer, where the ORDER is the result.
+fn elite_rank(scores: &[f32], updates: &[usize], direction: Direction) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by(|&a, &b| {
+        if elite_beats(scores, updates, direction, a, b) {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    });
+    order
+}
+
+/// Is `a` the better parent? Fitness under the run's direction first, then MORE updates, then the
+/// lower index — a total order, so the draft never depends on insertion order.
+fn elite_beats(
+    scores: &[f32],
+    updates: &[usize],
+    direction: Direction,
+    a: usize,
+    b: usize,
+) -> bool {
+    match direction.cmp(scores[a], scores[b]) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            let ua = updates.get(a).copied().unwrap_or(0);
+            let ub = updates.get(b).copied().unwrap_or(0);
+            ua > ub || (ua == ub && a < b)
         }
     }
 }
@@ -169,8 +276,8 @@ mod tests {
         let picked = t.apply(&scores, Direction::Maximize, &mut rng, 1);
         assert_eq!(picked.len(), scores.len());
 
-        // Default stays 3 — the engine's documented default.
-        assert_eq!(SelectionMethod::default().label(), "tournament(k=2)");
+        // The default draw is fitness-proportionate roulette, not a tournament.
+        assert_eq!(SelectionMethod::default().label(), "roulette");
     }
 
     #[test]
@@ -235,8 +342,73 @@ mod tests {
     fn test_label() {
         let m = SelectionMethod::Tournament { tournament_size: 5 };
         assert_eq!(m.label(), "tournament(k=5)");
+    }
+
+    // ── Elite: the draft ──────────────────────────────────────────────────
+
+    #[test]
+    fn elite_breaks_a_fitness_tie_on_the_most_updates() {
+        let mut rng = fastrand::Rng::with_seed(7);
+        let picks = SelectionMethod::Elite.draw_parents(
+            &[5.0, 5.0, 1.0],
+            &[3, 40, 900],
+            Direction::Maximize,
+            &mut rng,
+            2,
+        );
+        assert_eq!(
+            picks,
+            vec![1, 0],
+            "the tie goes to the net with more updates, then the other tied net"
+        );
+        // Minimize flips the FITNESS axis only: the two 1.0 nets tie again, and the
+        // most-updated of them still leads.
+        let picks = SelectionMethod::Elite.draw_parents(
+            &[1.0, 5.0, 1.0],
+            &[3, 40, 900],
+            Direction::Minimize,
+            &mut rng,
+            2,
+        );
+        assert_eq!(picks, vec![2, 0]);
+    }
+
+    #[test]
+    fn elite_draws_distinct_parents_without_touching_the_rng() {
+        let scores = [9.0, 8.0, 7.0];
+        let mut a = fastrand::Rng::with_seed(1);
+        let mut b = fastrand::Rng::with_seed(999);
+        let one = SelectionMethod::Elite.draw_parents(&scores, &[], Direction::Maximize, &mut a, 2);
+        let two = SelectionMethod::Elite.draw_parents(&scores, &[], Direction::Maximize, &mut b, 2);
+        assert_eq!(one, vec![0, 1], "best first, then the runner-up");
+        assert_eq!(one, two, "elite is deterministic: the seed cannot move it");
+        // A pool of one still answers `n` picks (the leader stands in).
+        let solo = SelectionMethod::Elite.draw_parents(&[1.0], &[], Direction::Maximize, &mut a, 2);
+        assert_eq!(solo, vec![0, 0]);
+    }
+
+    #[test]
+    fn roulette_is_the_default_and_elite_orders_the_generational_arm() {
+        assert_eq!(SelectionMethod::default(), SelectionMethod::Roulette);
+        assert_eq!(SelectionMethod::Elite.to_string(), "elite");
+        assert_eq!(
+            SelectionMethod::Elite.draw_one(
+                &[2.0, 9.0, 3.0],
+                Direction::Maximize,
+                &mut fastrand::Rng::with_seed(3)
+            ),
+            Some(1),
+            "one draw without updates is the leader"
+        );
+        let ranked = SelectionMethod::Elite.apply(
+            &[1.0, 3.0, 2.0],
+            Direction::Maximize,
+            &mut fastrand::Rng::with_seed(3),
+            0,
+        );
+        assert_eq!(ranked, vec![1, 2, 0], "the field, best-first");
     } // Roulette sanity: the wheel must be biased toward higher-ranked nets
-    // in expectation (3:1 for weights 3,1) and deterministic under a seed.
+      // in expectation (3:1 for weights 3,1) and deterministic under a seed.
     #[test]
     fn test_roulette_biased_toward_higher_score() {
         let scores = [3.0, 1.0];
