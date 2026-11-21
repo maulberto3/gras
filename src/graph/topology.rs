@@ -1671,6 +1671,45 @@ use crate::utils::graph_utils::{
 
 /// Test-only proptest strategies, shared across the crate's test modules
 /// (topology's own tests and the serialization tests in [`crate::spec`]).
+/// Default step between sampled hidden widths.
+pub const DEFAULT_HIDDEN_DIM_STRIDE: usize = 16;
+
+/// Default hidden-width sampling range: the cartpole reference's `16..=64`,
+/// stride [`RaceConfig::defaults`] pins.
+pub const DEFAULT_HIDDEN_POOL: std::ops::RangeInclusive<usize> = 16..=64;
+
+/// Default chance that ONE inherited drift slot moves on a crossover child (`set_topology_drift`):
+/// a mask bit flips; a hidden node's activation / combine / standardize / width is re-drawn; a port
+/// activation moves; the wiring gene (`input_reach`) is re-drawn and its wires re-derived; or the
+/// dropout rate is re-drawn under the run's cap.
+pub const DEFAULT_TOPOLOGY_DRIFT: f32 = 0.1;
+
+/// Parse a recorded (or user-given) feature-split spelling: `"random"`,
+/// `"exclusive"`, `"inherited"`, or the `"split_*"` wire form `engine.json` records.
+pub(crate) fn parse_feature_split_wire(raw: &str) -> Option<FeatureSplitPolicy> {
+    let raw = raw.to_ascii_lowercase();
+    if raw.contains("inherited") {
+        Some(FeatureSplitPolicy::Inherited)
+    } else if raw.contains("exclusive") {
+        Some(FeatureSplitPolicy::Exclusive)
+    } else if raw.contains("random") {
+        Some(FeatureSplitPolicy::Random)
+    } else {
+        None
+    }
+}
+
+/// One POOL entry: `Some(None)` is the `none` policy (no split), `Some(Some(_))` a drawable policy,
+/// `None` an unknown spelling.
+pub(crate) fn parse_feature_split_pool_entry(raw: &str) -> Option<Option<FeatureSplitPolicy>> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" | "split_none" => Some(None),
+        "exclusive" | "split_exclusive" => Some(Some(FeatureSplitPolicy::Exclusive)),
+        "random" | "split_random" => Some(Some(FeatureSplitPolicy::Random)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_strategies {
     use super::*;

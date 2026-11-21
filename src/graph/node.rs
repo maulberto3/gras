@@ -419,6 +419,51 @@ impl Node {
     }
 }
 
+impl CombineOp {
+    /// Parse a label in the `Display` form ("add", "mean", …); `None` = unknown.
+    pub fn parse(s: &str) -> Option<Self> {
+        use CombineOp::*;
+        Some(match s.to_lowercase().as_str() {
+            "add" => Add,
+            "mean" => Mean,
+            "mul" | "multiply" => Multiply,
+            "sub" | "subtract" => Subtract,
+            "div" | "divide" => Divide,
+            "max" => Max,
+            "min" => Min,
+            _ => return None,
+        })
+    }
+}
+
+impl Activation {
+    /// Parse a label in the `Display` form ("relu", "gelu", …); `None` = unknown.
+    pub fn parse(s: &str) -> Option<Self> {
+        use Activation::*;
+        Some(match s.to_lowercase().as_str() {
+            "identity" => Identity,
+            "relu" => ReLU,
+            "gelu" => GeLU,
+            "silu" => SiLU,
+            "selu" => SELU,
+            "tanh" => Tanh,
+            "sigmoid" => Sigmoid,
+            "mish" => Mish,
+            "leaky_relu" => LeakyReLU,
+            "elu" => ELU,
+            "gelu_tanh" => GeluTanh,
+            "softplus" => Softplus,
+            "hardswish" => HardSwish,
+            "hardsigmoid" => HardSigmoid,
+            "sin" => Sin,
+            "cos" => Cos,
+            "softmax" => Softmax,
+            "log_softmax" | "logsoftmax" => LogSoftmax,
+            _ => return None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
