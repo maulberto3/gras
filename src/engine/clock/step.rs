@@ -63,7 +63,7 @@ impl CoreEngine {
         frame: Option<LotteryFrame>,
         forced: bool,
     ) -> Result<()> {
-        // TRAIN-EVAL LOTTERY (experimental, off by default): a net may be denied the
+        // TRAIN-EVAL LOTTERY (armed by default at 0.25..0.75; `p_min = 1.0` disables it): a net may be denied the
         // clock's ticket.
         if let Some(_frame) = frame {
             let p = self.train_lottery_p_eff(hash, frame);
