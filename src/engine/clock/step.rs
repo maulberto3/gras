@@ -24,7 +24,7 @@
 use flodl::tensor::Result;
 
 use crate::engine::core::{CoreEngine, NoopOptimizer};
-use crate::engine::format::{fmt_line, fmt_line_opt};
+use crate::engine::reporting::format::{fmt_line, fmt_line_opt};
 use crate::state::NetMetrics;
 #[cfg(debug_assertions)]
 use crate::utils::race_steps::eval_one_step;

@@ -5,7 +5,7 @@ use tracing::info;
 
 use super::child::RaceChild;
 use super::core::{CoreEngine, RollOutcome};
-use super::format::csv_field;
+use super::reporting::format::csv_field;
 use super::clock::smoothing::RollingBuffer;
 use crate::engine::diversity::shape_of;
 use crate::state::write_net_state;

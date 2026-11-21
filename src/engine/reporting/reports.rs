@@ -1,7 +1,7 @@
 //! Run artifacts: the CHAMPION ranking and the anti-champion (worst) dumps.
 
-use super::core::CoreEngine;
-use super::diversity::{shape_of, NetShape};
+use crate::engine::core::CoreEngine;
+use crate::engine::diversity::{shape_of, NetShape};
 use super::format::{fmt_cell, fmt_cfg, fmt_family_reading, fmt_micros, fmt_units, ReadingStyle};
 use flodl::tensor::Result;
 
@@ -560,7 +560,7 @@ pub(crate) fn worst_order(
 fn csv_row(cells: &[String]) -> String {
     cells
         .iter()
-        .map(|c| crate::engine::format::csv_field(c))
+        .map(|c| super::format::csv_field(c))
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -615,7 +615,7 @@ mod tests {
         // The quoted comma is FIELD TEXT: a naive split sees 6 pieces for 5 columns,
         // which is exactly why the quoting is here.
         assert_eq!(row.split(',').count(), 6);
-        assert_eq!(crate::engine::format::csv_split_line(&row).len(), 5);
+        assert_eq!(crate::engine::reporting::format::csv_split_line(&row).len(), 5);
         assert_eq!(csv_row(&["a\"b".to_string()]), "\"a\"\"b\"");
         // An empty grid cell is an empty CSV field, never a missing column.
         assert_eq!(

@@ -1,12 +1,16 @@
 //! The engine's user-facing output: the per-step rollup (`Summ`), the framed in-place table
 //! (`Minimal`), and the stop-time summary.
 
+pub mod format;
+pub mod logging;
+pub mod reports;
+
 use tracing::info;
 
 use super::core::CoreEngine;
 use crate::engine::clock::step::LotteryFrame;
 use crate::engine::diversity::{mean_delta_to, shape_of, NetShape};
-use crate::engine::format::{
+use self::format::{
     fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_micros, fmt_units, ReadingStyle,
 };
 use crate::engine::clock::smoothing::rolling_mean;
@@ -343,7 +347,7 @@ impl CoreEngine {
             frame.push(pad(row));
         }
         frame.push(rule('└', '┘'));
-        super::logging::frame(&frame.join("\n"));
+        logging::frame(&frame.join("\n"));
         // Baseline for the next step's deltas.
         self.minimal_prev_means = Some((train_m, eval_m, fit_m));
     }

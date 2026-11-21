@@ -15,7 +15,7 @@ pub(crate) use crate::trainer::stream::{BatchStream, PoolSplit};
 pub(crate) use crate::utils::fitness::{Fitness, FitnessLabel, Metric};
 
 pub(crate) use super::config::{RaceConfig, StopReason};
-pub(crate) use super::format::{build_stamp, csv_field, fmt_cfg, fmt_line};
+pub(crate) use super::reporting::format::{build_stamp, csv_field, fmt_cfg, fmt_line};
 pub(crate) use crate::engine::clock::smoothing::{rolling_stats_tail, RollingBuffer, WindowStats};
 
 // ── CoreEngine ───────────────────────────────────────────────────────────────
@@ -25,6 +25,7 @@ pub(crate) use crate::engine::clock::smoothing::{rolling_stats_tail, RollingBuff
 // One concern per file (AGENTS.md rule 19): these hold `impl CoreEngine` blocks, not new types.
 mod durability;
 mod evolution;
+pub mod exam;
 mod ranking;
 mod resume;
 pub(crate) mod roles;
@@ -431,7 +432,7 @@ impl CoreEngine {
         write_engine_json(&run_dir, &header)?;
         // Settle the log sinks now that the run dir exists: `trace_file` opens the sidecar
         // and flushes the buffered start-up block into it; the default closes that buffer.
-        super::logging::settle_run_dir(&run_dir, config.run.trace_file);
+        super::reporting::logging::settle_run_dir(&run_dir, config.run.trace_file);
 
         // Seed the initial population internally — [imported elites?] + random draws —
         // deduped and re-rolled so the population always lands at `pop_size`.

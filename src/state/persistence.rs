@@ -236,7 +236,7 @@ impl ConfigSnapshot {
             feature_split: split_single,
             feature_split_pool: split_pool,
             drift_prob: cfg.topology.drift_prob,
-            build: crate::engine::format::build_stamp(),
+            build: crate::engine::reporting::format::build_stamp(),
         }
     }
 }

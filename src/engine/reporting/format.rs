@@ -261,7 +261,7 @@ mod tests {
         csv_field, fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_line_opt, fmt_micros, fmt_reading,
         fmt_units, ReadingStyle,
     };
-    use crate::engine::format::fmt_family_reading;
+    use super::fmt_family_reading;
 
     // ── the band rule: magnitude picks the precision ──────────────────────
 

@@ -7,7 +7,7 @@ use crate::graph::topology::FeatureSplitPolicy;
 use crate::utils::fitness::Metric;
 
 pub use super::cull::{CrossCullPolicy, MutationCullPolicy};
-pub use super::logging::LogLevel;
+pub use super::reporting::logging::LogLevel;
 pub use super::clock::lottery::{
     DEFAULT_TRAIN_MERIT_LEARN_ONLY, DEFAULT_TRAIN_MERIT_P_MAX, DEFAULT_TRAIN_MERIT_P_MIN,
     DEFAULT_TRAIN_TICKET, TrainTicket,

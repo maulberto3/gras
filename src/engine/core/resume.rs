@@ -627,7 +627,7 @@ impl CoreEngine {
         };
         let mut lines = raw.lines();
         let header = lines.next().unwrap_or_default();
-        let cols = crate::engine::format::csv_split_line(header);
+        let cols = crate::engine::reporting::format::csv_split_line(header);
         let find = |name: &str| cols.iter().position(|c| *c == name);
         let (Some(hash_i), Some(train_i), Some(eval_i), Some(fit_i)) = (
             find("hash"),
@@ -659,7 +659,7 @@ impl CoreEngine {
             .collect();
         let mut out: HashMap<String, crate::engine::clock::smoothing::HistoryReplay> = HashMap::new();
         for line in lines {
-            let fields = crate::engine::format::csv_split_line(line);
+            let fields = crate::engine::reporting::format::csv_split_line(line);
             let needed = hash_i.max(train_i).max(eval_i).max(fit_i);
             if fields.len() <= needed {
                 continue;
