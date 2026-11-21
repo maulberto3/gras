@@ -62,7 +62,7 @@ impl CoreEngine {
             current.mean_type.to_string(),
             format!("set_fitness_mean_type({rec_mean})",),
         );
-        // `""` = a header written before the knob drew roulette, the default.
+        // `""` = a header written before the knob: those runs drew roulette.
         let rec_selection = if recorded.crossover_selection.is_empty() {
             SelectionMethod::Roulette.to_string()
         } else {
@@ -115,12 +115,10 @@ impl CoreEngine {
         // Pool drift changes which masks the NEXT newborn gets (the nets already live keep theirs),
         // so it is a behavioural warning like Ω.
         let rec_pool = if recorded.feature_split_pool.is_empty() {
-            vec![
-                recorded
-                    .feature_split
-                    .clone()
-                    .unwrap_or_else(|| "none".to_string()),
-            ]
+            vec![recorded
+                .feature_split
+                .clone()
+                .unwrap_or_else(|| "none".to_string())]
         } else {
             recorded.feature_split_pool.clone()
         };
@@ -294,6 +292,19 @@ impl CoreEngine {
         // The frontier as a SET, when the run recorded one (`ckpt.json`). Handled
         // returned first, so the scan below stays exactly the pre-manifest path.
         if let Some(manifest) = crate::state::load_frontier_manifest(&run_dir)? {
+            if !manifest.weights {
+                // The blueprints are at the stop clock while the weights under them are from an
+                // earlier tick (or absent): loading them would resume a DIFFERENT net.
+                return Err(crate::utils::error::EngineError::InvalidOptions(format!(
+                    "resume: the checkpoint at clock {} was written with \
+                     `save_weights_at_stop = false`, so it holds no weights of its own — the \
+                     net JSONs are that stop's record, not a loadable state; resume from an \
+                     earlier checkpoint, or rerun with `set_run_save_weights_at_stop(true)` to \
+                     keep the stop loadable",
+                    manifest.next_clock
+                ))
+                .into());
+            }
             let history = Self::load_history_windows(&run_dir, self.config.smoothing_window);
             let mut replayed: Vec<Vec<String>> = Vec::new();
             let loaded = self.replay_manifest_frontier(&manifest, &history, &mut replayed)?;

@@ -9,14 +9,14 @@ pub(crate) use crate::engine::evolve::RollKind;
 pub(crate) use crate::evolution::selection::SelectionMethod;
 pub(crate) use crate::graph::network::Network;
 pub(crate) use crate::state::{
-    ConfigSnapshot, NetState, RaceState, RunConfig, RunHeader, write_engine_json, write_net_state,
+    write_engine_json, write_net_state, ConfigSnapshot, NetState, RaceState, RunConfig, RunHeader,
 };
 pub(crate) use crate::trainer::stream::{BatchStream, PoolSplit};
 pub(crate) use crate::utils::fitness::{Fitness, FitnessLabel, Metric};
 
 pub(crate) use super::config::{RaceConfig, StopReason};
 pub(crate) use super::format::{build_stamp, csv_field, fmt_cfg, fmt_line};
-pub(crate) use super::smoothing::{RollingBuffer, WindowStats, rolling_stats_tail};
+pub(crate) use super::smoothing::{rolling_stats_tail, RollingBuffer, WindowStats};
 
 // ── CoreEngine ───────────────────────────────────────────────────────────────
 
@@ -1493,7 +1493,7 @@ impl CoreEngine {
                 self.sweep_stale_net_weights();
                 // The frontier as a SET, after the files it names: until this lands, a kill leaves
                 // `nets/` as the only record, and a net culled after the tick has already
-                if let Err(e) = self.write_frontier_manifest(clock + 1) {
+                if let Err(e) = self.write_frontier_manifest(clock + 1, true) {
                     tracing::warn!("checkpoint frontier manifest write failed: {e}");
                 }
                 // Flush metrics at the tick too, so an interrupted run keeps per-step
@@ -1538,8 +1538,11 @@ impl CoreEngine {
     fn finish_race(&mut self, reason: StopReason, clock: usize) -> Result<StopReason> {
         // The champion markdown dump is an ARTIFACT, not a log line —
         // it must land on disk at every log level, even `None`.
+        // Price every live net's eval forward ONCE, before ANY artifact reads it: the champion
+        // markdown, the `eval time (µs)` table cell and each net's `meta.eval` all come from this run.
+        self.stamp_eval_bench();
         self.write_champion_index()?;
-        self.write_champion_markdown()?;
+        self.write_champion_markdown(clock)?;
         // The mirror artifact: the nets the coin is FEEDING, not the ones it crowned.
         self.write_worst_markdown(clock)?;
         // `None` mode stays silent until the caller's final stop print.
@@ -1557,26 +1560,36 @@ impl CoreEngine {
         }
         // After the stop cards, and OUTSIDE the gate: the final-field TABLE is an artifact, written
         // at every log level — `None` included, since that is the scripted caller who wants
-        self.log_final_field(clock, self.verbose_detail());
+        let final_stats = self.log_final_field(clock, self.verbose_detail());
         // Stamp the live nets' final readings first: the frontier write below
         // then carries `final_*` on every net file, culled
         self.stamp_live_final_scores();
         self.write_live_frontier_states()?;
-        // …and their weights, so the stop-time frontier is as loadable as a tick's.
-        self.write_live_net_weights()?;
+        // …and their weights only when the run asks: the stop is a READING of the race, so the
+        // default leaves a whole population's coefficients off disk. A checkpoint is the resume
+        // artifact (`save_weights_at_stop`).
+        if self.config.save_weights_at_stop {
+            self.write_live_net_weights()?;
+        }
         self.sweep_stale_net_weights();
-        // The same point-in-time set at the stop clock, so a finished (or Ctrl+C'd)
-        // dir resumes from exactly here — its manifest and its CSV agree.
-        self.write_frontier_manifest(clock + 1)?;
+        // The same point-in-time set at the stop clock — its manifest and its CSV agree. The
+        // `weights` flag tells a later resume whether the files under it can be loaded.
+        self.write_frontier_manifest(clock + 1, self.config.save_weights_at_stop)?;
         self.flush_csv_exports()?;
-        self.persist_run_counters();
+        self.persist_run_counters(&final_stats);
         Ok(reason)
     }
 
     /// Stamp the run-level counters (`culls`, accumulated wall time,
     /// `children_born_at_clock`) into `engine.json` so resume restores them.
-    pub(crate) fn persist_run_counters(&self) {
+    pub(crate) fn persist_run_counters(&self, final_stats: &crate::engine::reporting::CardStats) {
         let mut header = self.header.clone();
+        // The two numbers the final-field card printed, and every live topology's lifetime
+        // accumulator: computed every clock (the lifetimes) or once at stop (the Δ means) and
+        // before this stamp never written anywhere.
+        header.topologies = self.state.topology_lifetimes();
+        header.delta_crown = final_stats.delta_crown;
+        header.delta_pop = final_stats.delta_pop;
         header.culls = self.culls;
         header.run_elapsed_secs = self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs();
         header.children_born_at_clock = self.children_born_at_clock.clone();

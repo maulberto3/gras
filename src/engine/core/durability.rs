@@ -20,8 +20,9 @@ impl CoreEngine {
     }
 
     /// Write `<run_dir>/ckpt.json` — the frontier as a point-in-time SET (which nets were live
-    /// this tick, and the clock each had MEASURED).
-    pub(crate) fn write_frontier_manifest(&self, next_clock: usize) -> Result<()> {
+    /// this tick, and the clock each had MEASURED). `weights` records whether the same tick also
+    /// exported `nets/*.safetensors`: a resume may only load files that were written under it.
+    pub(crate) fn write_frontier_manifest(&self, next_clock: usize, weights: bool) -> Result<()> {
         // No entry may claim the clock that has not FINISHED.
         let last_clock = next_clock.saturating_sub(1);
         let mut nets: Vec<crate::state::FrontierNet> = self
@@ -51,6 +52,7 @@ impl CoreEngine {
                 schema: crate::state::FRONTIER_MANIFEST_SCHEMA,
                 next_clock,
                 run_seed: self.header.run_seed,
+                weights,
                 nets,
             },
         )

@@ -722,8 +722,9 @@ impl crate::trainer::RlStep for ChallengingRlTrainer {
         let challenged = crate::trainer::challenge::challenge_fires(
             ctx.env.run_seed,
             ctx.net_seed,
-            step,
-            1.0, // the trainer's own knob: every step fires
+            // The NET's own clock, never the run clock (the trainer-side recipe).
+            ctx.env.net_step,
+            1.0, // the trainer's own knob: a net's first step always fires
             ctx.env.max_steps,
             crate::trainer::challenge::ChallengeDecay::Linear,
         );
@@ -885,8 +886,9 @@ fn reinforce_replays_identically_under_the_engine() {
     let _ = std::fs::remove_dir_all(&dir_b);
 }
 
-/// The trainer-owned challenge trigger: knob 1.0 fires every step,
-/// sentinel lands on every step — the engine never sees the knob.
+/// The trainer-owned challenge trigger: knob 1.0 fires on a net's first step,
+/// sentinel lands — the engine never sees the knob, and the trigger reads the
+/// NET's step (`net_step`), not the run clock.
 #[test]
 fn trainer_owned_challenge_trigger_fires_inside_train_step() {
     let dir = std::env::temp_dir().join("gras-challenge-signal");
@@ -1380,7 +1382,7 @@ fn resume_restores_run_counters() {
     engine.children_born_at_clock.insert(1, 2);
     engine.children_born_at_clock.insert(3, 5);
     // A stop stamps the counters into engine.json.
-    engine.persist_run_counters();
+    engine.persist_run_counters(&crate::engine::reporting::CardStats::default());
     for h in &hashes {
         let state = engine.state.net(h).cloned().unwrap();
         crate::state::write_net_state(&dir, &state).unwrap();
@@ -1561,7 +1563,7 @@ fn resume_refuses_a_changed_metric_set_and_keeps_the_recorded_one() {
     part.step_one_net(&h, 0).unwrap();
     let state = part.state.net(&h).cloned().unwrap();
     crate::state::write_net_state(&dir, &state).unwrap();
-    part.write_frontier_manifest(1).unwrap();
+    part.write_frontier_manifest(1, true).unwrap();
     part.write_live_net_weights().unwrap();
     drop(part);
 
@@ -1625,7 +1627,7 @@ fn resume_keeps_the_recorded_eval_era_when_the_tick_cadence_changes() {
     }
     let state = part.state.net(&h).cloned().unwrap();
     crate::state::write_net_state(&dir, &state).unwrap();
-    part.write_frontier_manifest(3).unwrap();
+    part.write_frontier_manifest(3, true).unwrap();
     part.write_live_net_weights().unwrap();
     drop(part);
 
@@ -1743,6 +1745,8 @@ fn run_culls_continue_across_a_resume_boundary() {
         c.mutation_probation_steps = 0;
         c.crossover_probation_steps = 0;
         c.checkpoint_every = 1; // frontier survives the stop without a manual flush
+                                // The split twin resumes from the STOP, so the stop must keep its weights.
+        c.save_weights_at_stop = true;
         c.max_steps = max_steps;
         if stop_after_clock_zero {
             c.custom_stop = Some(Box::new(|_| true)); // fires at the FIRST check
@@ -1832,8 +1836,9 @@ fn resume_tops_up_to_the_requested_budget() {
         c.pop_size = 1;
         c.max_steps = Some(max_steps);
         c.checkpoint_every = 1; // the frontier survives the stop
-                                // A one-net field with no cull shield would be replaced by a newborn every clock (each
-                                // channel deals at least one roll), so the fixture shields it: this test is the BUDGET.
+        c.save_weights_at_stop = true; // …as do the weights the resume loads
+                                       // A one-net field with no cull shield would be replaced by a newborn every clock (each
+                                       // channel deals at least one roll), so the fixture shields it: this test is the BUDGET.
         c.mutation_probation_steps = 100;
         c.crossover_probation_steps = 100;
         c
@@ -2160,17 +2165,13 @@ fn resume_warns_on_a_crossover_selection_mismatch_and_reads_legacy_as_roulette()
         .iter()
         .find(|d| d.label == "crossover_selection")
         .expect("the drift is named");
-    assert_eq!(
-        row.recorded, "tournament(size=2)",
-        "names the recorded draw"
-    );
+    assert_eq!(row.recorded, "roulette", "names the recorded draw");
     assert_eq!(
         row.current, "tournament(size=3)",
         "names the requested draw"
     );
     assert!(
-        row.undo
-            .contains("set_crossover_selection(tournament(size=2))"),
+        row.undo.contains("set_crossover_selection(roulette)"),
         "{drift:?}"
     );
     drop(resumed);
@@ -2262,6 +2263,7 @@ fn trainer_state_rides_the_net_envelope_and_continues_after_a_resume() {
         c.pop_size = 2;
         c.checkpoint_every = 1;
         c.max_steps = Some(max_steps);
+        c.save_weights_at_stop = true; // the resume loads the stop's weights
         c
     };
     // Construction only: `pop_size = 0` keeps `from_spec` from drawing its own
@@ -2349,8 +2351,9 @@ fn interrupt_then_resume_matches_the_twin_and_never_duplicates_history_rows() {
         c.checkpoint_every = 1;
         c.max_steps = Some(max_steps);
         c.log_level = crate::engine::config::LogLevel::None;
-        // Hold the field still: this test measures the RESUME machinery on the same live nets, so
-        // the founders keep their cull shield for the whole window.
+        c.save_weights_at_stop = true; // the split twin resumes from the stop
+                                       // Hold the field still: this test measures the RESUME machinery on the same live nets, so
+                                       // the founders keep their cull shield for the whole window.
         c.mutation_probation_steps = 5;
         c.crossover_probation_steps = 5;
         if stop_after_first_clock {
@@ -2437,8 +2440,9 @@ fn a_named_lr_schedule_survives_a_resume_and_matches_the_twin() {
         c.checkpoint_every = 1;
         c.max_steps = Some(3);
         c.log_level = crate::engine::config::LogLevel::None;
-        // The field holds still: this test measures the LR SCHEDULE across a resume, so the two
-        // founders keep their cull shield for the whole window.
+        c.save_weights_at_stop = true; // the split twin resumes from the stop
+                                       // The field holds still: this test measures the LR SCHEDULE across a resume, so the two
+                                       // founders keep their cull shield for the whole window.
         c.mutation_probation_steps = 5;
         c.crossover_probation_steps = 5;
         if stop_after_first_clock {
@@ -3471,7 +3475,19 @@ fn final_field_csv_is_written_at_log_level_none() {
         "the header is the table's: {}",
         lines[0]
     );
-    assert!(lines[1].contains(',') && lines[2].contains(','));
+    assert!(
+        lines[0].contains(",reach,depth (D),eval time (µs),"),
+        "the depth column follows reach: {}",
+        lines[0]
+    );
+    let width = lines[0].split(',').count();
+    for row in &lines[1..] {
+        assert_eq!(
+            row.split(',').count(),
+            width,
+            "every CSV row must be as wide as the header: {row}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3910,6 +3926,8 @@ fn explicit_train_test_dirs_build_disjoint_pools() {
     let config = RaceConfig {
         pop_size: 0,
         max_steps: Some(2),
+        // The resume below loads this stop's weights.
+        save_weights_at_stop: true,
         ..RaceConfig::defaults()
     };
     let mut eng =
@@ -4253,6 +4271,8 @@ fn every_live_net_gets_weights_at_every_tick_and_at_stop() {
     let mut eng = engine(&dir, 7).unwrap();
     eng.config.checkpoint_every = 2;
     eng.config.max_steps = Some(4);
+    // This test is about the weight WRITERS, so it asks for the stop dump.
+    eng.config.save_weights_at_stop = true;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     eng.run().unwrap();
@@ -4308,17 +4328,22 @@ fn zero_checkpoint_every_skips_the_tick_but_still_finishes_the_run() {
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     assert_eq!(eng.run().unwrap(), StopReason::MaxSteps);
-    // No tick ⇒ no per-tick write; the STOP writer still completes the run,
-    // live net has its weights exactly once (there is no flag to turn that off).
+    // No tick ⇒ no weights written at all, and the stop is a READING by default
+    // (`save_weights_at_stop` off): blueprints land, coefficients do not.
     let weights = std::fs::read_dir(dir.join("nets"))
         .unwrap()
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().ends_with(".safetensors"))
         .count();
     assert_eq!(
-        weights,
-        eng.state.live_count(),
-        "stop writes every live net's weights even with 0 cadence"
+        weights, 0,
+        "a tick-less run writes no weights, and the stop no longer dumps the field"
+    );
+    let manifest = crate::state::load_frontier_manifest(&dir).unwrap().unwrap();
+    assert!(
+        !manifest.weights,
+        "the stop must record that its weights are absent, so a resume refuses instead of \
+         loading a state older than the JSONs beside it"
     );
     // …and the stop-time writers still ran: the run is complete, not truncated.
     assert!(
@@ -5285,6 +5310,47 @@ fn the_worst_dump_ranks_by_the_spent_criterion_not_by_fit_alone() {
     assert!(
         index.contains("BURNED their updates"),
         "the index states the criterion too: {index}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `depth (D)` rides BOTH ends' markdown: the shared `## Facts` table in `champion-*.md` and
+/// `worst-*.md`, and the `worst.md` index row. Report-only, so it is a printed number, never a
+/// ranking input.
+#[test]
+fn depth_is_reported_in_the_champion_and_worst_markdown() {
+    let dir = std::env::temp_dir().join("gras-markdown-depth");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = engine(&dir, 11).unwrap();
+    eng.seed_population_internal(vec![tiny_topology(7)], Some(0.5))
+        .unwrap();
+    let h = eng.state.live_hashes()[0].clone();
+    eng.rolling_fitness.get_mut(&h).unwrap().push(0.5);
+    eng.config.champion_save_topology = true;
+    eng.config.worst_save_topology = true;
+    eng.config.champion_count = 1;
+    eng.write_champion_markdown(1).unwrap();
+    eng.write_worst_markdown(1).unwrap();
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    for prefix in ["champion-", "worst-"] {
+        let file = names
+            .iter()
+            .find(|n| n.starts_with(prefix) && n.ends_with(".md"))
+            .unwrap_or_else(|| panic!("no {prefix}*.md in {names:?}"));
+        let body = std::fs::read_to_string(dir.join(file)).unwrap();
+        assert!(
+            body.contains("| reach |") && body.contains("| depth (D) |"),
+            "the facts table carries depth right of reach: {body}"
+        );
+    }
+    let index = std::fs::read_to_string(dir.join("worst.md")).unwrap();
+    assert!(
+        index.contains("| age | depth (D) | file |"),
+        "the index carries the depth column: {index}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
