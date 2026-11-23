@@ -130,10 +130,11 @@ pub fn topology_mermaid(graph: &Topology) -> String {
     const MIN_WIDTH: f32 = 0.5;
     /// Thickest edge stroke (longest hop in the net).
     const MAX_WIDTH: f32 = 5.0;
+    let levels = graph.depths();
     let max_hop = graph
         .connections
         .iter()
-        .map(|c| c.to.node.saturating_sub(c.from.node))
+        .map(|c| levels[c.to.node].saturating_sub(levels[c.from.node]).max(1))
         .max()
         .unwrap_or(1)
         .max(1);
@@ -148,7 +149,9 @@ pub fn topology_mermaid(graph: &Topology) -> String {
             "    n{} -- {} --> n{}\n",
             conn.from.node, act, conn.to.node
         ));
-        let hop = conn.to.node.saturating_sub(conn.from.node).max(1);
+        let hop = levels[conn.to.node]
+            .saturating_sub(levels[conn.from.node])
+            .max(1);
         let t = (hop - 1) as f32 / (max_hop - 1).max(1) as f32;
         let width = MIN_WIDTH + (MAX_WIDTH - MIN_WIDTH) * t.clamp(0.0, 1.0);
         out.push_str(&format!(

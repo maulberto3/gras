@@ -92,6 +92,20 @@ pub(crate) fn node_depths(nodes: &[Node], connections: &[Connection]) -> Vec<usi
     depth
 }
 
+/// Mean wire hop distance in topological levels: `1.0` = every wire joins adjacent levels, a
+/// larger value = wires that skip levels. `0.0` only when the graph has no wire.
+pub(crate) fn wire_thickness(nodes: &[Node], connections: &[Connection]) -> f32 {
+    if connections.is_empty() {
+        return 0.0;
+    }
+    let depth = node_depths(nodes, connections);
+    let hops: usize = connections
+        .iter()
+        .map(|c| depth[c.to.node].saturating_sub(depth[c.from.node]).max(1))
+        .sum();
+    hops as f32 / connections.len() as f32
+}
+
 /// Node counts by kind.
 pub(crate) fn node_kind_counts(nodes: &[Node]) -> KindCounts {
     let mut counts = KindCounts::default();
