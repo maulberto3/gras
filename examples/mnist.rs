@@ -307,6 +307,14 @@ struct Cli {
     #[arg(long, value_name = "U64")]
     seed: Option<u64>,
 
+    /// Window-centre accuracy that arms the plateau stop.
+    #[arg(long, value_name = "F32", default_value_t = 0.85)]
+    stop_accuracy: f32,
+
+    /// Clocks the best score may sit still after the bar is met.
+    #[arg(long, value_name = "N", default_value_t = 40)]
+    stop_patience: usize,
+
     /// Candidates one mutation may spend clearing the floor; the most novel refusal is taken anyway.
     #[arg(long, value_name = "N", default_value_t = 5)]
     mutation_novelty_draws: usize,
@@ -399,10 +407,6 @@ fn main() {
         },
     )];
 
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::SeqCst};
-    let record = AtomicU32::new(0.0f32.to_bits());
-    let held_at = AtomicUsize::new(0);
-
     let config = common::engine_config(TabularRaceConfig::builder(), &cli.engine, log_level)
         // This example's own half: the flags whose default is its identity.
         .set_run_name(cli.run_name.clone())
@@ -414,16 +418,7 @@ fn main() {
         .set_topology_dropout_prob(cli.dropout)
         .set_mutation_novelty_draws(cli.mutation_novelty_draws)
         // `best_smoothed_fitness` is the window CENTRE, so the bar is 0.85 on accuracy.
-        // .set_stop_custom(|snap| snap.best_smoothed_fitness > 0.85)
-        .set_stop_custom(move |s| {
-            let prev = f32::from_bits(record.load(SeqCst));
-            if s.best_smoothed_fitness > prev + 1e-2 {
-                record.store(s.best_smoothed_fitness.to_bits(), SeqCst);
-                held_at.store(s.step, SeqCst);
-            }
-            // the bar is met AND no net has raised it for 40 clocks
-            s.best_smoothed_fitness > 0.85 && s.step.saturating_sub(held_at.load(SeqCst)) >= 40
-        })
+        .set_stop_plateau(cli.stop_accuracy, cli.stop_patience)
         // The data's own widths: 784 pixels in, 10 labels out.
         .set_topology_input_dim(d_in)
         .set_topology_output_dim(d_out)

@@ -241,6 +241,14 @@ struct Cli {
     #[arg(long, value_name = "U64")]
     seed: Option<u64>,
 
+    /// Window-centre survival that arms the plateau stop.
+    #[arg(long, value_name = "F32", default_value_t = 400.0)]
+    stop_score: f32,
+
+    /// Clocks the best score may sit still after the bar is met (`0` = stop on the bar).
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    stop_patience: usize,
+
     /// Candidates one mutation may spend clearing the floor; the most novel refusal is taken anyway.
     #[arg(long, value_name = "N", default_value_t = 10)]
     mutation_novelty_draws: usize,
@@ -377,7 +385,7 @@ fn main() {
         .set_topology_dropout_prob(cli.dropout)
         .set_mutation_novelty_draws(cli.mutation_novelty_draws)
         // The solved bar: the window CENTRE above 400 of 500 turns.
-        .set_stop_custom(|snap| snap.best_smoothed_fitness > 400.0)
+        .set_stop_plateau(cli.stop_score, cli.stop_patience)
         .set_topology_input_dim(input_dim)
         .set_topology_output_dim(ACTIONS)
         // A one-entry pool pins a policy — the same call `set_topology_feature_split` makes.

@@ -74,4 +74,5 @@ examples/main.rs
 !/examples/cartpole/
 !/examples/cartpole.rs
 !/examples/mnist.rs
+!/examples/parallel_scope.rs
 !/examples/python/
