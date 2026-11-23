@@ -1,6 +1,7 @@
 //! Stop criteria, checked once per step at the loop boundary.
 
 use crate::engine::core::CoreEngine;
+use crate::utils::fitness::Direction;
 
 impl CoreEngine {
     /// Check the stop criteria at this step: `Some(reason)` if one fires, `None`
@@ -25,8 +26,8 @@ impl CoreEngine {
         self.check_stop_outside_the_budget(next)
     }
 
-    /// Ctrl+C, then the user's `custom_stop` — the criteria that do not count
-    /// clocks and so read the same from either end of one.
+    /// Ctrl+C, the built-in plateau, then the user's `custom_stop` — the criteria
+    /// that do not count clocks and so read the same from either end of one.
     fn check_stop_outside_the_budget(&mut self, step: usize) -> Option<StopReason> {
         // 0. Ctrl+C first — the user's intent outranks every bar, and abandoning
         // flows through the same artifact path as a natural stop (step included).
@@ -44,10 +45,22 @@ impl CoreEngine {
                 return Some(StopReason::Interrupted);
             }
         }
+
+        // The snapshot is built ONCE: both predicates read the same numbers, and
+        // the plateau's state is a plain field because `check_stop` has `&mut self`.
+        let snap = self.snapshot(step);
+
+        // 1. The built-in plateau: no atomics, no closure, no `to_bits`.
+        if let Some(plateau) = self.config.stop.plateau.as_mut() {
+            if plateau.observe(&snap) {
+                return Some(StopReason::CustomStop);
+            }
+        }
+
         // 2. Custom stop: joins the race IN ADDITION to the built-ins,
         // criteria they don't model.
         if let Some(stop) = self.config.stop.custom_stop.as_ref() {
-            if stop(&self.snapshot(step)) {
+            if stop(&snap) {
                 return Some(StopReason::CustomStop);
             }
         }
@@ -83,6 +96,7 @@ impl CoreEngine {
             mean_smoothed_fitness: mean,
             culls: self.culls,
             elapsed_seconds: self.elapsed_base_secs + self.started_at_wall.elapsed().as_secs(),
+            direction: self.fitness.direction(),
         }
     }
 }
@@ -92,8 +106,7 @@ impl CoreEngine {
 pub enum StopReason {
     /// The configured step budget was reached.
     MaxSteps,
-    /// A user-supplied `custom_stop` closure returned true (Iter 5 pluggable
-    /// contract; consulted after all built-ins).
+    /// A stop predicate returned true (the built-in plateau or `custom_stop`).
     CustomStop,
     /// Ctrl+C received: the step was abandoned at the loop boundary and the race shut
     /// down through the SAME artifact path. Always
@@ -127,4 +140,113 @@ pub struct RaceSnapshot {
     pub culls: usize,
     /// Wall-clock seconds elapsed.
     pub elapsed_seconds: u64,
+    /// Which end of the score is better, so a predicate can read `best` with the
+    /// run's own sense of "improved".
+    pub direction: Direction,
+}
+
+/// Default tolerance for "the best score moved": a reading within `0.01` of the
+/// record does not restart the patience window.
+pub const DEFAULT_PLATEAU_EPSILON: f32 = 1e-2;
+
+/// Built-in "stop when the score stops moving" criterion.
+///
+/// The engine owns the two numbers a closure used to hide in atomics: the best
+/// score seen (`best`) and the clock it was last raised on (`held_at`). Once
+/// `best` reaches `target`, the race stops after `patience` clocks without an
+/// improvement larger than `epsilon`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Plateau {
+    target: f32,
+    patience: usize,
+    epsilon: f32,
+    best: f32,
+    held_at: usize,
+    armed: bool,
+}
+
+impl Plateau {
+    /// A plateau stop at `target`, tolerating `patience` still clocks after it is reached.
+    pub fn new(target: f32, patience: usize) -> Self {
+        Self {
+            target,
+            patience,
+            epsilon: DEFAULT_PLATEAU_EPSILON,
+            best: 0.0,
+            held_at: 0,
+            armed: false,
+        }
+    }
+
+    /// Change the "this counts as movement" tolerance (default [`DEFAULT_PLATEAU_EPSILON`]).
+    pub fn with_epsilon(mut self, epsilon: f32) -> Self {
+        self.epsilon = epsilon.max(0.0);
+        self
+    }
+
+    /// Forget the high-water mark; the next observation re-arms from its own step.
+    pub fn reset(&mut self) {
+        self.armed = false;
+    }
+
+    /// Feed one clock's snapshot; `true` means the race should stop.
+    pub fn observe(&mut self, snap: &RaceSnapshot) -> bool {
+        let best = snap.best_smoothed_fitness;
+        if !self.armed {
+            self.best = best;
+            self.held_at = snap.step;
+            self.armed = true;
+        } else {
+            let improved = match snap.direction {
+                Direction::Maximize => best > self.best + self.epsilon,
+                Direction::Minimize => best < self.best - self.epsilon,
+            };
+            if improved {
+                self.best = best;
+                self.held_at = snap.step;
+            }
+        }
+
+        let reached = match snap.direction {
+            Direction::Maximize => self.best >= self.target,
+            Direction::Minimize => self.best <= self.target,
+        };
+        reached && snap.step.saturating_sub(self.held_at) >= self.patience
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(step: usize, best: f32, direction: Direction) -> RaceSnapshot {
+        RaceSnapshot {
+            live_count: 1,
+            step,
+            best_smoothed_fitness: best,
+            worst_smoothed_fitness: best,
+            mean_smoothed_fitness: best,
+            culls: 0,
+            elapsed_seconds: 0,
+            direction,
+        }
+    }
+
+    #[test]
+    fn plateau_waits_for_patience_after_the_target() {
+        let mut p = Plateau::new(0.8, 2);
+        assert!(!p.observe(&snap(0, 0.5, Direction::Maximize)));
+        assert!(!p.observe(&snap(1, 0.81, Direction::Maximize)));
+        assert!(!p.observe(&snap(2, 0.81, Direction::Maximize)));
+        assert!(p.observe(&snap(3, 0.81, Direction::Maximize)));
+    }
+
+    #[test]
+    fn plateau_reads_minimize_runs_the_same_way() {
+        let mut p = Plateau::new(0.2, 2);
+        assert!(!p.observe(&snap(0, 0.5, Direction::Minimize)));
+        assert!(!p.observe(&snap(1, 0.19, Direction::Minimize)));
+        assert!(!p.observe(&snap(2, 0.19, Direction::Minimize)));
+        assert!(p.observe(&snap(3, 0.19, Direction::Minimize)));
+    }
 }
