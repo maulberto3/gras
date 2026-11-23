@@ -120,11 +120,11 @@ impl CoreEngine {
                 // `updates` sits beside the score, not only in the lineage box at the foot of the
                 // file: two nets can share a fitness and differ by whether it cost 2 updates or
                 // 200, and the header is what a reader sees first.
-                "**{label} · fitness {} = {:.4} · updates {} · window {} · run seed {} · net seed {}**\n\n{facts_md}{}\n\n{}",
+                "**{label} · fitness {} = {:.4} · updates {} · {} · run seed {} · net seed {}**\n\n{facts_md}{}\n\n{}",
                 self.fitness.direction().arrow(),
                 fitness,
                 state.step,
-                reading,
+                window_label(&reading),
                 self.header.run_seed,
                 state.net_seed,
                 crate::utils::markdown::topology_markdown(&topo, None),
@@ -216,6 +216,7 @@ impl CoreEngine {
             ("wires", shape.wires.to_string()),
             ("width", fmt_cell(shape.dim)),
             ("reach", format!("{:.2}", shape.reach)),
+            ("thickness (H)", fmt_cell(shape.thickness)),
             ("depth (D)", shape.depth.to_string()),
             (
                 "feature split",
@@ -307,7 +308,7 @@ impl CoreEngine {
         rows.truncate(k);
         let mut written: Vec<Vec<String>> = Vec::new();
         let mut index = String::from(
-            "| # | hash | spent | fit (F) | ticket p | merit | age | depth (D) | file |\n|---|---|---|---|---|---|---|---|---|\n",
+            "| # | hash | spent | fit (F) | ticket p | merit | age | thickness (H) | depth (D) | file |\n|---|---|---|---|---|---|---|---|---|---|\n",
         );
         for (rank, (hash, _fraction, age, spent)) in rows.iter().enumerate() {
             let Some(state) = self.state.net(hash) else {
@@ -352,7 +353,7 @@ impl CoreEngine {
                 // `updates` rides the header beside `age`: `spent` says how the net ranks, the
                 // COUNT says what the ranking is made of, and the lineage box at the foot of the
                 // file already prints it — the two must agree.
-                "**Worst #{} · spent {} · fit (F) {} · ticket p {} · merit {} · updates {} · age {} clocks · window {} · run seed {} · net seed {}**\n\n{facts_md}{}\n\n{}\n\n{}",
+                "**Worst #{} · spent {} · fit (F) {} · ticket p {} · merit {} · updates {} · age {} clocks · {} · run seed {} · net seed {}**\n\n{facts_md}{}\n\n{}\n\n{}",
                 rank + 1,
                 spent_cell,
                 fit_cell,
@@ -360,7 +361,7 @@ impl CoreEngine {
                 merit.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg),
                 state.step,
                 age,
-                reading,
+                window_label(&reading),
                 self.header.run_seed,
                 state.net_seed,
                 WORST_PICK_NOTE,
@@ -370,9 +371,10 @@ impl CoreEngine {
             match std::fs::write(self.run_dir.join(&file), &md) {
                 Ok(()) => {
                     index.push_str(&format!(
-                        "| {} | {short} | {spent_cell} | {fit_cell} | {ticket_cell} | {} | {age} | {} | [{file}]({file}) |\n",
+                        "| {} | {short} | {spent_cell} | {fit_cell} | {ticket_cell} | {} | {age} | {} | {} | [{file}]({file}) |\n",
                         rank + 1,
                         merit.map_or_else(|| crate::utils::cfy::NO_VALUE.to_string(), fmt_cfg),
+                        fmt_cell(shape.thickness),
                         shape.depth,
                     ));
                     written.push(vec![
@@ -402,7 +404,7 @@ impl CoreEngine {
                 )
             });
             let body = format!(
-                "# Anti-champion field at clock {clock}\n\nThese are the `champion_count` nets that already BURNED their updates and stayed bad — ranked by the `spent` criterion `Fm⁻ × (1 − Um⁻)`, the same number the `spent` cross/mutation cull evicts on, not by `fit (F)` alone: a weak net the lottery has not paid yet ranks BELOW a weak net that trained and stayed weak. Every row is one net's topology + mermaid graph + lineage; `spent` is the ranking value, `ticket p` is the chance the train-eval lottery gives that net on the NEXT clock (dash = not graded, so it has no chance to name), and `fit (F)` rides along for comparison, and `depth (D)` is the net's longest wire path from the Input node (`Input → H1 → H2 → Output` = `3`), report-only. A row with `na` spent was not graded and is listed after the graded ones, by `fit (F)` ascending.\n\n{favourite_line}{index}"
+                "# Anti-champion field at clock {clock}\n\nThese are the `champion_count` nets that already BURNED their updates and stayed bad — ranked by the `spent` criterion `Fm⁻ × (1 − Um⁻)`, the same number the `spent` cross/mutation cull evicts on, not by `fit (F)` alone: a weak net the lottery has not paid yet ranks BELOW a weak net that trained and stayed weak. Every row is one net's topology + mermaid graph + lineage; `spent` is the ranking value, `ticket p` is the chance the train-eval lottery gives that net on the NEXT clock (dash = not graded, so it has no chance to name), and `fit (F)` rides along for comparison; `thickness (H)` is the mean wire hop distance (report-only), and `depth (D)` is the net's longest wire path from the Input node (`Input → H1 → H2 → Output` = `3`), report-only. A row with `na` spent was not graded and is listed after the graded ones, by `fit (F)` ascending.\n\n{favourite_line}{index}"
             );
             let path = self.run_dir.join("worst.md");
             if let Err(source) = std::fs::write(&path, body) {
@@ -504,6 +506,17 @@ impl CoreEngine {
 /// Field/value pairs printed per `## Facts` row. Two keeps the card short without dragging the
 /// long cells (`origin`, `fit (F)`) across the page.
 const FACTS_PAIRS_PER_ROW: usize = 2;
+
+/// The first-line `window` leg, prefixed exactly once: the median/signed-log families already
+/// name their window in `fmt_family_reading` (`window median …`), while the arithmetic reading
+/// starts at `mean …`.
+fn window_label(reading: &str) -> String {
+    if reading.starts_with("window ") {
+        reading.to_string()
+    } else {
+        format!("window {reading}")
+    }
+}
 
 /// Render a `## Facts` table. One row list, one spelling, for both ends of the ranking.
 ///

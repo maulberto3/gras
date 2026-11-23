@@ -557,6 +557,14 @@ impl CoreEngine {
         // The FILE first, and unconditionally: `final-field.csv` is run data, written
         // from the very cells the card would print (one `StopPlan`, no second query).
         self.write_final_field_csv(&plan.header, &grid);
+        // `Summ` gets one compact digest of every column; the card below is the human table.
+        // Built from the SAME header and grid the CSV just used, so it costs no second pass.
+        if self.log_level == crate::engine::config::LogLevel::Summ {
+            info!(
+                "final-field summary │ {}",
+                final_field_summary(&plan.header, &grid)
+            );
+        }
         let field_card = crate::utils::cfy::card(
             &format!(
                 "Final field ({} nets — {} measured, ranked by F{arrow} · ★ {})",
@@ -769,6 +777,10 @@ impl CoreEngine {
             // hidden node (the historical wiring), lower = fewer raw-input wires, deeper net.
             shape
                 .map(|s| format!("{:.2}", s.reach))
+                .unwrap_or_else(dash),
+            // `H` — mean hop distance over the wires, right beside the gene that shapes them.
+            shape
+                .map(|s| fmt_cell(s.thickness))
                 .unwrap_or_else(dash),
             // `D` — the longest wire path in this net's live blueprint. Report-only.
             shape.map(|s| s.depth.to_string()).unwrap_or_else(dash),
@@ -1359,6 +1371,9 @@ fn updates_minmax_column(legs: crate::engine::config::TrainTicket) -> &'static s
 const COL_UPDATES: &str = "updates (U)";
 /// `E`: every time the net ran the trainer and was SCORED — `U` (the updates that stuck) plus the act-only passes the lottery denied under `train_merit_learn_only`.
 const COL_EVALS: &str = "evals (E)";
+/// `H`: mean wire hop distance in topological levels — the drawn thickness as a number. `1.0` =
+/// every wire joins adjacent levels; larger = skips. Report-only.
+const COL_THICKNESS: &str = "thickness (H)";
 /// `D`: the longest wire path from an Input node to any node; Input = 0, so
 /// `Input → H1 → H2 → Output` reads `3`. Report-only: no ranking, seat, ticket or cull reads it.
 const COL_DEPTH: &str = "depth (D)";
@@ -1397,8 +1412,10 @@ const STOP_HEADER_FIXED: &[&str] = &[
     "origin",
     "params",
     "reach",
-    // `D` sits right of the wiring gene: how deep the net is, then what one eval pass of it
-    // COSTS — both are properties of the blueprint, and both are read before the census.
+    // `H` and `D` sit right of the wiring gene: how thick its wires are, how deep the net is,
+    // then what one eval pass of it COSTS — all properties of the blueprint, all read before
+    // the census.
+    COL_THICKNESS,
     COL_DEPTH,
     COL_EVAL,
     "nodes",
@@ -1523,6 +1540,11 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         (
             "reach".to_string(),
             "the `input_reach` gene: share of hidden nodes wired straight from the Input node; lower = fewer Input ports, deeper net"
+                .to_string(),
+        ),
+        (
+            COL_THICKNESS.to_string(),
+            "`H`: mean wire hop distance in topological levels — `1.0` = every wire joins adjacent levels, larger = skips. Report-only: no ranking, seat, ticket or cull reads it"
                 .to_string(),
         ),
         (
@@ -1686,21 +1708,25 @@ mod stop_legend_tests {
         );
     }
 
-    /// Depth is read beside the wiring gene it follows, and has its own explanation.
+    /// Thickness and depth are read beside the wiring gene they follow, each with its own
+    /// explanation.
     #[test]
-    fn depth_sits_right_of_reach_and_has_a_legend_row() {
+    fn thickness_and_depth_sit_right_of_reach_and_have_legend_rows() {
         let cols = printed_columns(true, true);
         let reach = cols
             .iter()
             .position(|c| *c == "reach")
             .expect("reach is a printed column");
-        assert_eq!(cols[reach + 1], COL_DEPTH, "columns: {cols:?}");
+        assert_eq!(cols[reach + 1], COL_THICKNESS, "columns: {cols:?}");
+        assert_eq!(cols[reach + 2], COL_DEPTH, "columns: {cols:?}");
         let rows = stop_legend_rows(&ctx());
-        assert!(
-            rows.iter().any(|(k, _)| k == COL_DEPTH),
-            "depth has no legend row: {:?}",
-            rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()
-        );
+        for col in [COL_THICKNESS, COL_DEPTH] {
+            assert!(
+                rows.iter().any(|(k, _)| k == col),
+                "{col} has no legend row: {:?}",
+                rows.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()
+            );
+        }
     }
 
     /// The card prints NO window leg beside `F`: with the spread charge gone `F` IS the window centre, so a `mean`/`median` column held the same number twice, and the…
@@ -1891,6 +1917,46 @@ mod stop_legend_tests {
         assert_eq!(MeanType::default(), MeanType::Median);
     }
 
+    /// The `Summ` digest names every column and reduces it to a range, a distinct count, or a
+    /// mean ± spread — the same shape as the table, in one line.
+    #[test]
+    fn the_final_field_summary_reduces_every_column() {
+        let header = vec![
+            "#".to_string(),
+            "hash".to_string(),
+            "origin".to_string(),
+            "params".to_string(),
+            "thickness (H)".to_string(),
+            "depth (D)".to_string(),
+            "fit (F = mean)".to_string(),
+            "slope (S)".to_string(),
+        ];
+        let rows = vec![
+            vec![
+                "1", "aaaa", "founder@0", "1.0K", "1.0", "2", "0.50", "0.01",
+            ],
+            vec![
+                "2", "bbbb", "founder@0", "2.0K", "1.5", "3", "0.70", "na",
+            ],
+        ]
+        .into_iter()
+        .map(|row| row.into_iter().map(str::to_string).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+        let line = final_field_summary(&header, &rows);
+        assert!(line.starts_with("2 net(s) · # 1..2"), "{line}");
+        for part in [
+            "hash 2 uniq",
+            "origin 1 uniq",
+            "params 1.5K",
+            "H 1.25",
+            "D 2.50",
+            "F 0.6000",
+            "S 0.0100 (na 1)",
+        ] {
+            assert!(line.contains(part), "missing `{part}` in {line}");
+        }
+    }
+
     /// One key, one explanation — two rows for a column can disagree with each other.
     #[test]
     fn legend_keys_are_unique() {
@@ -1921,6 +1987,162 @@ struct StopPlan {
     crown_idx: std::collections::HashMap<String, Option<usize>>,
     /// Every live net's shape, by hash — what `Δpop` measures
     population: Vec<(String, NetShape)>,
+}
+
+/// How one final-field column reduces to a single summary cell.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SummaryKind {
+    /// `#`: report the range, not a mean rank.
+    Rank,
+    /// `hash` / `origin`: report how many distinct values there are.
+    Text,
+    /// `params`: values carry `K`/`M`/`B`, so parse to a base count.
+    Params,
+    /// Everything else numeric: mean ± population spread.
+    Number,
+}
+
+fn summary_kind(header: &str) -> SummaryKind {
+    let h = header.replace('\n', " ");
+    let h = h.trim();
+    if h == "#" {
+        SummaryKind::Rank
+    } else if h == "hash" || h == "origin" {
+        SummaryKind::Text
+    } else if h == "params" {
+        SummaryKind::Params
+    } else {
+        SummaryKind::Number
+    }
+}
+
+/// The short label a `Summ` digest uses for a final-field column: `D`/`H`/`F` stay the letters
+/// the card already teaches, while the long equation headers collapse to their first noun.
+fn short_column(header: &str) -> String {
+    let h = header.replace('\n', " ");
+    let h = h.trim();
+    let short = if h == "#" {
+        "#"
+    } else if h.starts_with("thickness") {
+        "H"
+    } else if h.starts_with("depth") {
+        "D"
+    } else if h.starts_with("eval time") {
+        "t"
+    } else if h.starts_with("feature split") {
+        "mask"
+    } else if h.starts_with("fit minmax") {
+        "Fm"
+    } else if h.starts_with("updates minmax") {
+        "Um"
+    } else if h.starts_with("ticket minmax") {
+        "T"
+    } else if h.starts_with("fit (") {
+        "F"
+    } else if h.starts_with("slope") {
+        "S"
+    } else if h.starts_with("age") {
+        "A"
+    } else if h.starts_with("updates (") {
+        "U"
+    } else if h.starts_with("evals (") {
+        "E"
+    } else if h.starts_with("exam") {
+        "X"
+    } else if h.starts_with("m:") {
+        h
+    } else {
+        h.split([' ', '(']).next().unwrap_or(h)
+    };
+    short.to_string()
+}
+
+fn summary_number(cell: &str, kind: SummaryKind) -> Option<f64> {
+    let cell = cell.trim();
+    if kind == SummaryKind::Params {
+        for (suffix, scale) in [("B", 1e9_f64), ("M", 1e6), ("K", 1e3)] {
+            if let Some(number) = cell.strip_suffix(suffix) {
+                return number.parse::<f64>().ok().map(|v| v * scale);
+            }
+        }
+    }
+    cell.parse::<f64>().ok()
+}
+
+/// One compact `Summ` digest of the final field: every column, reduced to a range, a distinct
+/// count, or mean ± spread. Built from the same header and plain cells as `final-field.csv`.
+fn final_field_summary(header: &[String], rows: &[Vec<String>]) -> String {
+    let mut parts = vec![format!("{} net(s)", rows.len())];
+    for (col, head) in header.iter().enumerate() {
+        let label = short_column(head);
+        let kind = summary_kind(head);
+        let values: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| row.get(col))
+            .map(|cell| cell.trim())
+            .filter(|cell| {
+                !cell.is_empty()
+                    && *cell != crate::utils::cfy::NO_VALUE
+                    && *cell != "—"
+                    && *cell != "?"
+            })
+            .collect();
+        if values.is_empty() {
+            parts.push(format!("{label} na"));
+            continue;
+        }
+        if kind == SummaryKind::Text {
+            let unique: std::collections::HashSet<&str> = values.iter().copied().collect();
+            parts.push(format!("{label} {} uniq", unique.len()));
+            continue;
+        }
+        let numbers: Vec<f64> = values
+            .iter()
+            .filter_map(|cell| summary_number(cell, kind))
+            .collect();
+        if numbers.len() != values.len() {
+            // A mixed column is still a value distribution; count its distinct spellings rather
+            // than inventing a mean from the subset that happened to parse.
+            let unique: std::collections::HashSet<&str> = values.iter().copied().collect();
+            parts.push(format!("{label} {} uniq", unique.len()));
+            continue;
+        }
+        let missing = rows.len().saturating_sub(values.len());
+        let mut text = match kind {
+            SummaryKind::Rank => {
+                let min = numbers.iter().copied().fold(f64::INFINITY, f64::min);
+                let max = numbers.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                format!("{label} {min}..{max}")
+            }
+            SummaryKind::Params => {
+                let mean = numbers.iter().sum::<f64>() / numbers.len() as f64;
+                format!("{label} {}", fmt_units(mean.round() as i64))
+            }
+            SummaryKind::Text => unreachable!("text columns return above"),
+            SummaryKind::Number => {
+                let mean = numbers.iter().sum::<f64>() / numbers.len() as f64;
+                if numbers.len() > 1 {
+                    let var = numbers
+                        .iter()
+                        .map(|v| (v - mean).powi(2))
+                        .sum::<f64>()
+                        / numbers.len() as f64;
+                    format!(
+                        "{label} {}±{}",
+                        fmt_line(mean as f32),
+                        fmt_line(var.sqrt() as f32)
+                    )
+                } else {
+                    format!("{label} {}", fmt_line(mean as f32))
+                }
+            }
+        };
+        if missing > 0 {
+            text.push_str(&format!(" (na {missing})"));
+        }
+        parts.push(text);
+    }
+    parts.join(" · ")
 }
 
 /// One row of a stop-time card.
@@ -2620,6 +2842,7 @@ mod tests {
         NetShape {
             reach: 1.0,
             depth: 1,
+            thickness: 1.0,
             genome: [(token.to_string(), 1usize)].into_iter().collect(),
             nodes: 1,
             wires: 1,
@@ -2634,6 +2857,7 @@ mod tests {
         NetShape {
             reach: 1.0,
             depth: 2,
+            thickness: 1.5,
             genome: [("W:Tanh".to_string(), 1usize), ("W:SiLU".to_string(), 1)]
                 .into_iter()
                 .collect(),
