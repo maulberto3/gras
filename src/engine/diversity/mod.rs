@@ -117,6 +117,8 @@ pub(crate) struct NetShape {
     /// The longest wire path from an Input node to any node: `Topology::depths` max. Input = 0,
     /// so `Input → H1 → H2 → Output` reads `3`. Report-only.
     pub depth: usize,
+    /// Mean wire hop distance in topological levels: `1.0` = adjacent levels, larger = skips.
+    pub thickness: f32,
 }
 
 /// Read one net's structure: the pair metric's genes plus the census legs.
@@ -144,6 +146,7 @@ pub(crate) fn shape_of(topo: &Topology) -> NetShape {
     NetShape {
         reach: topo.options.input_reach,
         depth: topo.depths().into_iter().max().unwrap_or(0),
+        thickness: topo.wire_thickness(),
         genome: genes(topo),
         nodes: topo.nodes.len(),
         wires: topo.connections.len(),
@@ -443,6 +446,7 @@ mod tests {
         let shape = |tokens: &[(&str, usize)]| NetShape {
             reach: 1.0,
             depth: 1,
+            thickness: 1.0,
             genome: genome(tokens),
             nodes: 1,
             wires: 1,
@@ -552,7 +556,7 @@ mod tests {
         topo.nodes.push(node(0, NodeKind::Input, 0, 2));
         topo.nodes.push(node(1, NodeKind::Hidden, 1, 1));
         topo.nodes.push(node(2, NodeKind::Hidden, 1, 1));
-        topo.nodes.push(node(3, NodeKind::Output, 2, 0));
+        topo.nodes.push(node(3, NodeKind::Output, 3, 0));
         topo.connections.push(Connection {
             from: Port { node: 0, index: 0 },
             to: Port { node: 1, index: 0 },
@@ -569,10 +573,23 @@ mod tests {
             from: Port { node: 2, index: 0 },
             to: Port { node: 3, index: 1 },
         });
+        // A SKIP over the whole hidden chain: H1 is level 1, Output is level 3, so this wire
+        // is two hops even though its node-id gap is also small.
+        topo.connections.push(Connection {
+            from: Port { node: 1, index: 0 },
+            to: Port { node: 3, index: 2 },
+        });
+        // The raw Input → Output wire is one hop even though its node-id gap is 3: thickness
+        // reads LEVEL hops, not id distance. Hops: 1, 1, 1, 1, 2 ⇒ mean 1.2.
+        let shape = shape_of(&topo);
+        assert_eq!(shape.depth, 3, "H1 → H2 → Output is three levels deep");
+        // Hops: Input→H1 = 1, H1→H2 = 1, Input→Output = 3 (a genuine skip across the whole
+        // net), H2→Output = 1, H1→Output = 2 ⇒ mean 1.6. The Input→Output wire has a node-id
+        // gap of 3 and a level hop of 3 here; the H2→Output wire has one of each. The test's
+        // point is that BOTH numbers must follow levels, never width.
         assert_eq!(
-            shape_of(&topo).depth,
-            3,
-            "Input → H1 → H2 → Output is three wires deep"
+            shape.thickness, 1.6,
+            "thickness is the mean level hop, not the mean node-id gap"
         );
     }
 
