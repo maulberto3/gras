@@ -69,6 +69,15 @@ impl RaceConfigBuilder {
         self
     }
 
+    /// Built-in plateau stop: stop once the best ranking score reaches `target`
+    /// and no net has improved it for `patience` clocks. `0` patience stops on
+    /// the clock the bar is reached.
+    pub fn set_stop_plateau(mut self, target: f32, patience: usize) -> Self {
+        self.cfg.stop.plateau =
+            Some(crate::engine::clock::stop::Plateau::new(target, patience));
+        self
+    }
+
     /// Opt in/out of the automatic inheritance of the newest compatible previous experiment's
     /// elites (topology-only).
     pub fn set_champion_previous_load(mut self, enabled: bool) -> Self {
