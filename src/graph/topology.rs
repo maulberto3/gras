@@ -1191,6 +1191,12 @@ impl Topology {
         node_depths(&self.nodes, &self.connections)
     }
 
+    /// Mean wire hop distance in topological levels — the drawn wire thickness, as a number.
+    /// `1.0` = every wire joins adjacent levels; larger = skips. `0.0` only with no wires.
+    pub fn wire_thickness(&self) -> f32 {
+        crate::utils::graph_utils::wire_thickness(&self.nodes, &self.connections)
+    }
+
     /// Estimated total learnable elements (weights + biases) without building —
     /// input projection plus every node's `in·out + out`. Matches a built `Network`.
     pub fn param_estimate(&self) -> usize {
