@@ -3509,8 +3509,8 @@ fn final_field_csv_is_written_at_log_level_none() {
         lines[0]
     );
     assert!(
-        lines[0].contains(",reach,depth (D),eval time (µs),"),
-        "the depth column follows reach: {}",
+        lines[0].contains(",reach,thickness (H),depth (D),eval time (µs),"),
+        "thickness and depth follow reach: {}",
         lines[0]
     );
     let width = lines[0].split(',').count();
@@ -5404,11 +5404,11 @@ fn the_worst_dump_ranks_by_the_spent_criterion_not_by_fit_alone() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `depth (D)` rides BOTH ends' markdown: the shared `## Facts` table in `champion-*.md` and
-/// `worst-*.md`, and the `worst.md` index row. Report-only, so it is a printed number, never a
-/// ranking input.
+/// `thickness (H)` and `depth (D)` ride BOTH ends' markdown: the shared `## Facts` table in
+/// `champion-*.md` and `worst-*.md`, and the `worst.md` index row. Report-only, so they are printed
+/// numbers, never ranking inputs.
 #[test]
-fn depth_is_reported_in_the_champion_and_worst_markdown() {
+fn thickness_and_depth_are_reported_in_the_champion_and_worst_markdown() {
     let dir = std::env::temp_dir().join("gras-markdown-depth");
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 11).unwrap();
@@ -5433,14 +5433,20 @@ fn depth_is_reported_in_the_champion_and_worst_markdown() {
             .unwrap_or_else(|| panic!("no {prefix}*.md in {names:?}"));
         let body = std::fs::read_to_string(dir.join(file)).unwrap();
         assert!(
-            body.contains("| reach |") && body.contains("| depth (D) |"),
-            "the facts table carries depth right of reach: {body}"
+            body.contains("| reach |")
+                && body.contains("| thickness (H) |")
+                && body.contains("| depth (D) |"),
+            "the facts table carries thickness and depth right of reach: {body}"
+        );
+        assert!(
+            !body.contains("window window"),
+            "the header must not repeat the reading's window noun: {body}"
         );
     }
     let index = std::fs::read_to_string(dir.join("worst.md")).unwrap();
     assert!(
-        index.contains("| age | depth (D) | file |"),
-        "the index carries the depth column: {index}"
+        index.contains("| age | thickness (H) | depth (D) | file |"),
+        "the index carries the thickness and depth columns: {index}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

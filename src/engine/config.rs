@@ -269,6 +269,9 @@ pub struct StopConfig {
     pub max_steps: Option<usize>,
     /// Pluggable stop criterion **in addition** to the built-ins. When `None`, only the built-ins apply.
     pub custom_stop: StopFn,
+    /// Built-in plateau: stop after `patience` clocks without a better score once
+    /// `target` is reached. `None` = off.
+    pub plateau: Option<crate::engine::clock::stop::Plateau>,
 }
 
 impl Default for StopConfig {
@@ -276,6 +279,7 @@ impl Default for StopConfig {
         Self {
             max_steps: Some(DEFAULT_MAX_STEPS),
             custom_stop: None,
+            plateau: None,
         }
     }
 }
