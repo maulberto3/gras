@@ -128,9 +128,9 @@ fn engine(run_dir: &std::path::Path, seed: u64) -> Result<crate::engine::Tabular
     let data_dir = tiny_dataset_dir("engine");
     let config = RaceConfig {
         population: crate::engine::config::PopulationConfig {
-        pop_size: 0,
-        ..Default::default()
-    },
+            pop_size: 0,
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     };
     crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
@@ -312,7 +312,8 @@ fn select_random_victim_is_deterministic_and_alive() {
     let dir = std::env::temp_dir().join("race_random_victim");
     let _ = std::fs::remove_dir_all(&dir);
     let mut engine = engine(&dir, 42).unwrap();
-    engine.config.evolution.crossover_cull_policy = crate::engine::breed::cull::CrossCullPolicy::Random;
+    engine.config.evolution.crossover_cull_policy =
+        crate::engine::breed::cull::CrossCullPolicy::Random;
     // Channel probation 0: this test pins the DRAW's determinism, not the shield
     // (see `probation_shields_*`).
     engine.config.population.mutation_probation_steps = 0;
@@ -456,20 +457,29 @@ fn turnover_shares_survive_the_config_snapshot_and_are_clamped() {
     snap.crossover_share = 0.05;
     snap.mutation_share = 0.25;
     let cfg = RaceConfig::from_snapshot(&snap);
-    assert_eq!((cfg.evolution.crossover_share, cfg.evolution.mutation_share), (0.05, 0.25));
+    assert_eq!(
+        (cfg.evolution.crossover_share, cfg.evolution.mutation_share),
+        (0.05, 0.25)
+    );
     let clamped = RaceConfig::builder()
         .set_crossover_share(2.0)
         .set_mutation_share(f32::NAN)
         .build();
     assert_eq!(
-        (clamped.evolution.crossover_share, clamped.evolution.mutation_share),
+        (
+            clamped.evolution.crossover_share,
+            clamped.evolution.mutation_share
+        ),
         (1.0, 0.0)
     );
     // Each channel's knob touches only itself: a one-sided set leaves the other channel at the
     // crate default.
     let one_sided = RaceConfig::builder().set_mutation_share(0.02).build();
     assert_eq!(
-        (one_sided.evolution.crossover_share, one_sided.evolution.mutation_share),
+        (
+            one_sided.evolution.crossover_share,
+            one_sided.evolution.mutation_share
+        ),
         (crate::engine::config::DEFAULT_CROSSOVER_SHARE, 0.02),
         "the crossover default is untouched"
     );
@@ -701,13 +711,13 @@ fn rl_config(pop: usize) -> RaceConfig {
     RaceConfig {
         mode: crate::engine::config::RunMode::Rl,
         population: crate::engine::config::PopulationConfig {
-        pop_size: pop,
-        ..Default::default()
-    },
+            pop_size: pop,
+            ..Default::default()
+        },
         topology: crate::engine::config::TopologyConfig {
-        options: topo,
-        ..Default::default()
-    },
+            options: topo,
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     }
 }
@@ -839,22 +849,23 @@ fn rl_resume_then_continue_matches_uninterrupted_twin() {
 fn reinforce_replays_identically_under_the_engine() {
     fn run(dir: &std::path::Path) -> Vec<(String, Option<crate::state::NetMetrics>)> {
         let _ = std::fs::remove_dir_all(dir);
-        let mut eng = crate::engine::RlEngine::from_spec(crate::engine::start::run_spec::RunSpec::rl(
-            rl_config(0),
-            crate::utils::fitness::Fitness::reported(
-                crate::utils::fitness::Direction::Maximize,
-                "turns",
-            ),
-            // The world contract's toy world: 2 actions, 5-turn cap,
-            // draw derived from the seed it is handed.
-            crate::trainer::Reinforce::new(
-                crate::trainer::env::toy::ToyEnv::new(2, 5),
-                crate::auto_device(),
-            ),
-            Some(2026),
-            Some(dir.to_path_buf()),
-        ))
-        .unwrap();
+        let mut eng =
+            crate::engine::RlEngine::from_spec(crate::engine::start::run_spec::RunSpec::rl(
+                rl_config(0),
+                crate::utils::fitness::Fitness::reported(
+                    crate::utils::fitness::Direction::Maximize,
+                    "turns",
+                ),
+                // The world contract's toy world: 2 actions, 5-turn cap,
+                // draw derived from the seed it is handed.
+                crate::trainer::Reinforce::new(
+                    crate::trainer::env::toy::ToyEnv::new(2, 5),
+                    crate::auto_device(),
+                ),
+                Some(2026),
+                Some(dir.to_path_buf()),
+            ))
+            .unwrap();
         eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
             .unwrap();
         let hashes = eng.state.live_hashes();
@@ -963,13 +974,13 @@ fn rl_spec_derives_rl_mode_without_declaration() {
     let _ = std::fs::remove_dir_all(&dir);
     let config = RaceConfig {
         population: crate::engine::config::PopulationConfig {
-        pop_size: 2,
-        ..Default::default()
-    },
+            pop_size: 2,
+            ..Default::default()
+        },
         stop: crate::engine::config::StopConfig {
-        max_steps: Some(1),
-        ..Default::default()
-    },
+            max_steps: Some(1),
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     };
     let spec = crate::engine::start::run_spec::RunSpec::rl(
@@ -1023,9 +1034,9 @@ fn rl_spec_rejects_computed_fitness() {
     };
     let config = RaceConfig {
         topology: crate::engine::config::TopologyConfig {
-        options: topo,
-        ..Default::default()
-    },
+            options: topo,
+            ..Default::default()
+        },
         ..config
     };
     let spec = crate::engine::start::run_spec::RunSpec::rl(
@@ -1051,22 +1062,22 @@ fn a_bad_pool_name_is_refused_at_construction_not_widened() {
     // all` fallback cannot tell a typo from an empty pool) while the header recorded a pool
     let config = RaceConfig {
         population: crate::engine::config::PopulationConfig {
-        pop_size: 2,
-        ..Default::default()
-    },
-        stop: crate::engine::config::StopConfig {
-        max_steps: Some(1),
-        ..Default::default()
-    },
-        topology: crate::engine::config::TopologyConfig {
-        feature_split_pool: vec!["rondom".to_string()],
-        options: crate::graph::topology::TopologyOptions {
-            input_dim: Some(1),
-            output_dim: Some(1),
+            pop_size: 2,
             ..Default::default()
         },
-        ..Default::default()
-    },
+        stop: crate::engine::config::StopConfig {
+            max_steps: Some(1),
+            ..Default::default()
+        },
+        topology: crate::engine::config::TopologyConfig {
+            feature_split_pool: vec!["rondom".to_string()],
+            options: crate::graph::topology::TopologyOptions {
+                input_dim: Some(1),
+                output_dim: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     };
     let spec = crate::engine::start::run_spec::RunSpec::rl(
@@ -1693,20 +1704,21 @@ fn resume_keeps_the_recorded_eval_era_when_the_tick_cadence_changes() {
     // …and the recorded value is not a constant: a fresh engine uses its own cadence.
     let fresh_dir = std::env::temp_dir().join("race_eval_era_fresh");
     let _ = std::fs::remove_dir_all(&fresh_dir);
-    let fresh = crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
-        tiny_dataset_dir("fresh-era"),
-        {
-            let mut c = RaceConfig::defaults();
-            c.population.pop_size = 0;
-            c.run.checkpoint_every = 7;
-            c
-        },
-        fitness(),
-        crate::trainer::TabularTrainer::new(loss_fn()),
-        Some(4242),
-        Some(fresh_dir.clone()),
-    ))
-    .unwrap();
+    let fresh =
+        crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
+            tiny_dataset_dir("fresh-era"),
+            {
+                let mut c = RaceConfig::defaults();
+                c.population.pop_size = 0;
+                c.run.checkpoint_every = 7;
+                c
+            },
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+            Some(4242),
+            Some(fresh_dir.clone()),
+        ))
+        .unwrap();
     assert_eq!(fresh.eval_era_every(), 7);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&fresh_dir);
@@ -1774,11 +1786,11 @@ fn run_culls_continue_across_a_resume_boundary() {
         let mut c = RaceConfig::defaults();
         c.population.pop_size = 2;
         c.evolution.mutation_share = 0.5; // pop 2 ⇒ one immigration per clock
-                                // defaults() shields founders for 5 clocks; the twin must be able to cull.
+        // defaults() shields founders for 5 clocks; the twin must be able to cull.
         c.population.mutation_probation_steps = 0;
         c.population.crossover_probation_steps = 0;
         c.run.checkpoint_every = 1; // frontier survives the stop without a manual flush
-                                // The split twin resumes from the STOP, so the stop must keep its weights.
+        // The split twin resumes from the STOP, so the stop must keep its weights.
         c.run.save_weights_at_stop = true;
         c.stop.max_steps = max_steps;
         if stop_after_clock_zero {
@@ -1870,8 +1882,8 @@ fn resume_tops_up_to_the_requested_budget() {
         c.stop.max_steps = Some(max_steps);
         c.run.checkpoint_every = 1; // the frontier survives the stop
         c.run.save_weights_at_stop = true; // …as do the weights the resume loads
-                                       // A one-net field with no cull shield would be replaced by a newborn every clock (each
-                                       // channel deals at least one roll), so the fixture shields it: this test is the BUDGET.
+        // A one-net field with no cull shield would be replaced by a newborn every clock (each
+        // channel deals at least one roll), so the fixture shields it: this test is the BUDGET.
         c.population.mutation_probation_steps = 100;
         c.population.crossover_probation_steps = 100;
         c
@@ -1985,7 +1997,8 @@ fn reseed_gate(eng: &mut CoreEngine, d_min: f32) {
         .iter()
         .filter_map(|h| eng.state.net(h).and_then(|s| s.topology().ok()))
         .collect();
-    let mut gate = crate::engine::diversity::novelty::Novelty::new(eng.state.live_count(), d_min, 5);
+    let mut gate =
+        crate::engine::diversity::novelty::Novelty::new(eng.state.live_count(), d_min, 5);
     for topo in &topos {
         gate.push(topo);
     }
@@ -2385,8 +2398,8 @@ fn interrupt_then_resume_matches_the_twin_and_never_duplicates_history_rows() {
         c.stop.max_steps = Some(max_steps);
         c.run.log_level = crate::engine::config::LogLevel::None;
         c.run.save_weights_at_stop = true; // the split twin resumes from the stop
-                                       // Hold the field still: this test measures the RESUME machinery on the same live nets, so
-                                       // the founders keep their cull shield for the whole window.
+        // Hold the field still: this test measures the RESUME machinery on the same live nets, so
+        // the founders keep their cull shield for the whole window.
         c.population.mutation_probation_steps = 5;
         c.population.crossover_probation_steps = 5;
         if stop_after_first_clock {
@@ -2474,8 +2487,8 @@ fn a_named_lr_schedule_survives_a_resume_and_matches_the_twin() {
         c.stop.max_steps = Some(3);
         c.run.log_level = crate::engine::config::LogLevel::None;
         c.run.save_weights_at_stop = true; // the split twin resumes from the stop
-                                       // The field holds still: this test measures the LR SCHEDULE across a resume, so the two
-                                       // founders keep their cull shield for the whole window.
+        // The field holds still: this test measures the LR SCHEDULE across a resume, so the two
+        // founders keep their cull shield for the whole window.
         c.population.mutation_probation_steps = 5;
         c.population.crossover_probation_steps = 5;
         if stop_after_first_clock {
@@ -2679,7 +2692,7 @@ fn the_updates_fraction_grades_the_fewest_updates_one() {
 /// maps onto the spelling it meant.
 #[test]
 fn ticket_leg_spellings_round_trip() {
-    use crate::engine::config::{TrainTicket, DEFAULT_TRAIN_TICKET};
+    use crate::engine::config::{DEFAULT_TRAIN_TICKET, TrainTicket};
     for legs in [
         TrainTicket::MostFit,
         TrainTicket::MostFitFewestUpdates,
@@ -2812,7 +2825,8 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
     // This test grades one ORDERING, so it pins it: worst-first × fewest-updates (the engine's
     // default is `most_fit_fewest_updates` now, which pays the other end of the FIT axis).
     eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
-    eng.config.evolution.crossover_cull_policy = crate::engine::breed::cull::CrossCullPolicy::HighestTicketChance;
+    eng.config.evolution.crossover_cull_policy =
+        crate::engine::breed::cull::CrossCullPolicy::HighestTicketChance;
 
     // Worst-first (pinned above), so the worst net has the highest `p` and is the one evicted.
     assert_eq!(
@@ -2896,7 +2910,8 @@ fn spent_cull_evicts_the_bad_net_that_already_spent_its_updates() {
     // Pinned: worst-first × fewest-updates, the ordering this test's two victims name.
     eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
     eng.config.lottery.train_merit_p_min = 0.0;
-    eng.config.evolution.crossover_cull_policy = crate::engine::breed::cull::CrossCullPolicy::HighestTicketChance;
+    eng.config.evolution.crossover_cull_policy =
+        crate::engine::breed::cull::CrossCullPolicy::HighestTicketChance;
     assert_eq!(
         eng.select_highest_ticket_chance_victim()
             .unwrap()
@@ -3693,7 +3708,8 @@ fn resume_warns_on_a_cull_policy_mismatch_on_both_channels() {
     // `lowest_fitness` has no drift.
     let mut same = RaceConfig::defaults();
     same.population.pop_size = 2;
-    same.evolution.crossover_cull_policy = crate::engine::breed::cull::CrossCullPolicy::LowestFitness;
+    same.evolution.crossover_cull_policy =
+        crate::engine::breed::cull::CrossCullPolicy::LowestFitness;
     let resumed = resume(same).expect("a blanked legacy policy must resume");
     assert!(resumed.behavioural_drift().is_empty());
     drop(resumed);
@@ -3958,18 +3974,18 @@ fn explicit_train_test_dirs_build_disjoint_pools() {
     let _ = std::fs::remove_dir_all(&run_dir);
     let config = RaceConfig {
         population: crate::engine::config::PopulationConfig {
-        pop_size: 0,
-        ..Default::default()
-    },
+            pop_size: 0,
+            ..Default::default()
+        },
         stop: crate::engine::config::StopConfig {
-        max_steps: Some(2),
-        ..Default::default()
-    },
+            max_steps: Some(2),
+            ..Default::default()
+        },
         run: crate::engine::config::RunSettings {
-        // The resume below loads this stop's weights.
-        save_weights_at_stop: true,
-        ..Default::default()
-    },
+            // The resume below loads this stop's weights.
+            save_weights_at_stop: true,
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     };
     let mut eng =
@@ -4019,9 +4035,9 @@ fn explicit_train_test_dirs_build_disjoint_pools() {
         data_dir.clone(),
         RaceConfig {
             population: crate::engine::config::PopulationConfig {
-        pop_size: 2,
-        ..Default::default()
-    },
+                pop_size: 2,
+                ..Default::default()
+            },
             ..RaceConfig::defaults()
         },
         fitness(),
@@ -4055,7 +4071,8 @@ fn founder_topology_loader_reads_netstate_json() {
         .next()
         .unwrap()
         .path();
-    let topo = crate::engine::founding::population::run_topology_from_json_file(&state_path).unwrap();
+    let topo =
+        crate::engine::founding::population::run_topology_from_json_file(&state_path).unwrap();
     assert_eq!(
         topo.to_json().unwrap(),
         tiny_topology(7).to_json().unwrap(),
@@ -4106,14 +4123,14 @@ fn seeded_engine(
     let data_dir = tiny_dataset_dir("seeded");
     let config = RaceConfig {
         population: crate::engine::config::PopulationConfig {
-        pop_size: 3,
-        ..Default::default()
-    },
+            pop_size: 3,
+            ..Default::default()
+        },
         run: crate::engine::config::RunSettings {
-        champion_previous_load: true,
-        champion_previous_dir: Some(seed_root.to_path_buf()),
-        ..Default::default()
-    },
+            champion_previous_load: true,
+            champion_previous_dir: Some(seed_root.to_path_buf()),
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     };
     crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
@@ -4229,10 +4246,12 @@ fn champion_previous_load_is_on_by_default_and_can_be_turned_off() {
         eng.config.population.pop_size,
     );
     assert_eq!(topos.len(), 2);
-    assert!(crate::state::load_engine_json(&dir)
-        .unwrap()
-        .run_topology_source
-        .is_none());
+    assert!(
+        crate::state::load_engine_json(&dir)
+            .unwrap()
+            .run_topology_source
+            .is_none()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 
     // Explicit opt-out: no lookup, no receipt, still a full random population.
@@ -4240,29 +4259,32 @@ fn champion_previous_load_is_on_by_default_and_can_be_turned_off() {
     let _ = std::fs::remove_dir_all(&dir);
     let config = RaceConfig {
         population: crate::engine::config::PopulationConfig {
-        pop_size: 2,
-        ..Default::default()
-    },
+            pop_size: 2,
+            ..Default::default()
+        },
         run: crate::engine::config::RunSettings {
-        champion_previous_load: false,
-        ..Default::default()
-    },
+            champion_previous_load: false,
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     };
-    let eng = crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
-        tiny_dataset_dir("seedprior-optout"),
-        config,
-        fitness(),
-        crate::trainer::TabularTrainer::new(loss_fn()),
-        Some(7),
-        Some(dir.clone()),
-    ))
-    .unwrap();
+    let eng =
+        crate::engine::TabularEngine::from_spec(crate::engine::start::run_spec::RunSpec::tabular(
+            tiny_dataset_dir("seedprior-optout"),
+            config,
+            fitness(),
+            crate::trainer::TabularTrainer::new(loss_fn()),
+            Some(7),
+            Some(dir.clone()),
+        ))
+        .unwrap();
     assert_eq!(eng.state.live_count(), 2, "opt-out still fills the pop");
-    assert!(crate::state::load_engine_json(&dir)
-        .unwrap()
-        .run_topology_source
-        .is_none());
+    assert!(
+        crate::state::load_engine_json(&dir)
+            .unwrap()
+            .run_topology_source
+            .is_none()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4477,21 +4499,21 @@ fn streak_engine(
 ) -> (crate::engine::TabularEngine, String) {
     let mut config = RaceConfig {
         population: crate::engine::config::PopulationConfig {
-        pop_size: 0,
-        ..Default::default()
-    },
+            pop_size: 0,
+            ..Default::default()
+        },
         lottery: crate::engine::config::LotteryConfig {
-        // The lottery is OFF: the band's floor at 1.0 is the switch (the retired Ω no longer
-        // reaches the band), so every clock is a real update and the script lands one per clock.
-        train_merit_p_min: 1.0,
-        train_merit_p_max: 1.0,
-        ..Default::default()
-    },
+            // The lottery is OFF: the band's floor at 1.0 is the switch (the retired Ω no longer
+            // reaches the band), so every clock is a real update and the script lands one per clock.
+            train_merit_p_min: 1.0,
+            train_merit_p_max: 1.0,
+            ..Default::default()
+        },
         run: crate::engine::config::RunSettings {
-        csv_export: false,
-        checkpoint_every: 0,
-        ..Default::default()
-    },
+            csv_export: false,
+            checkpoint_every: 0,
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     };
     tweak(&mut config);
@@ -4983,13 +5005,13 @@ fn eval_share_sizes_the_pools_and_survives_a_header_rewrite() {
     let data_dir = tiny_dataset_dir("eval-share");
     let config = RaceConfig {
         population: crate::engine::config::PopulationConfig {
-        pop_size: 0,
-        ..Default::default()
-    },
+            pop_size: 0,
+            ..Default::default()
+        },
         run: crate::engine::config::RunSettings {
-        eval_share: 0.5,
-        ..Default::default()
-    },
+            eval_share: 0.5,
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     };
     let mut eng =
@@ -5042,13 +5064,13 @@ fn a_train_val_test_layout_ranks_on_val_and_reports_on_test() {
     }
     let config = RaceConfig {
         population: crate::engine::config::PopulationConfig {
-        pop_size: 0,
-        ..Default::default()
-    },
+            pop_size: 0,
+            ..Default::default()
+        },
         stop: crate::engine::config::StopConfig {
-        max_steps: Some(1),
-        ..Default::default()
-    },
+            max_steps: Some(1),
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     };
     let engine =
@@ -5114,17 +5136,17 @@ fn exam_rows_stay_out_of_the_run_tensor_and_are_scored_once_at_stop() {
     let run_dir = dir.join("run");
     let config = RaceConfig {
         population: crate::engine::config::PopulationConfig {
-        // 0 ⇒ no auto-seeded random population: this test seeds its own two tiny nets,
-        // exactly like the shared `engine()` helper.
-        pop_size: 0,
-        // Two reported nets, so the exam file and the `exam (X)` column have two rows.
-        champion_count: 2,
-        ..Default::default()
-    },
+            // 0 ⇒ no auto-seeded random population: this test seeds its own two tiny nets,
+            // exactly like the shared `engine()` helper.
+            pop_size: 0,
+            // Two reported nets, so the exam file and the `exam (X)` column have two rows.
+            champion_count: 2,
+            ..Default::default()
+        },
         stop: crate::engine::config::StopConfig {
-        max_steps: Some(2),
-        ..Default::default()
-    },
+            max_steps: Some(2),
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     };
     let mut engine =
@@ -5182,17 +5204,17 @@ fn resume_refuses_a_different_exam_store() {
     let run_dir = dir.join("run");
     let config = RaceConfig {
         population: crate::engine::config::PopulationConfig {
-        // 0 ⇒ no auto-seeded random population: this test seeds its own two tiny nets,
-        // exactly like the shared `engine()` helper.
-        pop_size: 0,
-        // Two reported nets, so the exam file and the `exam (X)` column have two rows.
-        champion_count: 2,
-        ..Default::default()
-    },
+            // 0 ⇒ no auto-seeded random population: this test seeds its own two tiny nets,
+            // exactly like the shared `engine()` helper.
+            pop_size: 0,
+            // Two reported nets, so the exam file and the `exam (X)` column have two rows.
+            champion_count: 2,
+            ..Default::default()
+        },
         stop: crate::engine::config::StopConfig {
-        max_steps: Some(2),
-        ..Default::default()
-    },
+            max_steps: Some(2),
+            ..Default::default()
+        },
         ..RaceConfig::defaults()
     };
     let mut engine =

@@ -180,7 +180,9 @@ impl TabularEngine {
                 }
             }
         }
-        let requested: Vec<String> = config.ranking.metrics
+        let requested: Vec<String> = config
+            .ranking
+            .metrics
             .iter()
             .map(|m| m.label().to_string())
             .collect();

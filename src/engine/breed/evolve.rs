@@ -4,10 +4,10 @@ use flodl::tensor::{Result, TensorError};
 use tracing::info;
 
 use super::child::RaceChild;
-use crate::engine::core::{CoreEngine, RollOutcome};
-use crate::engine::reporting::format::csv_field;
 use crate::engine::clock::smoothing::RollingBuffer;
+use crate::engine::core::{CoreEngine, RollOutcome};
 use crate::engine::diversity::shape_of;
+use crate::engine::reporting::format::csv_field;
 use crate::state::write_net_state;
 
 /// Whether a lineage string names a crossover-born net (`crossover-one-point`,
@@ -304,7 +304,11 @@ impl CoreEngine {
                 self.accounting.uniform_cx_pairs += rep.pairs;
             }
             self.insert_child(child, clock, "crossover-lowest-fitness");
-            let victim_note = self.config.evolution.crossover_cull_policy.victim_note(live_before);
+            let victim_note = self
+                .config
+                .evolution
+                .crossover_cull_policy
+                .victim_note(live_before);
             return Ok(RollOutcome::survived(format!(
                 "child {} ({}) │ culled {} (F {}, {victim_note}) │ first step at {clock}",
                 inserted_hash,
@@ -436,7 +440,11 @@ impl CoreEngine {
         child.state.step = 0;
         child.state.last_metrics = None;
         // The same shape the crossover line prints — `culled <hash> (F <score>, <why this net>)` — so a reader can weigh what the field GAVE UP for an immigrant. `F —` is honest…
-        let victim_note = self.config.evolution.mutation_cull_policy.victim_note(live_before);
+        let victim_note = self
+            .config
+            .evolution
+            .mutation_cull_policy
+            .victim_note(live_before);
         let detail = format!(
             "culled {} (F {}, {victim_note}) │ mutation {} born (fresh, first step at {clock}){novelty_note}",
             &victim[..8.min(victim.len())],

@@ -73,13 +73,13 @@ fn mix_feature_masks(
         }
     };
     // The LABEL follows the CONTENT: rows taken verbatim from one parent inherit that parent's
-    // policy, anything actually mixed is `Inherited` — a per-port blend of two partitions
+    // policy, anything actually mixed is `Crossover` — a per-port blend of two partitions.
     let policy = if mixed == a {
         a_policy
     } else if mixed == b {
         b_policy
     } else {
-        Some(FeatureSplitPolicy::Inherited)
+        Some(FeatureSplitPolicy::Crossover)
     };
     (mixed, policy)
 }
@@ -765,7 +765,7 @@ impl CoreEngine {
         // 3. Crossover: up to 3 attempts; a no-op (incompatible dims) retries
         // FRESH roulette-drawn parents.
         let mut child_topo = None;
-        // Inherited feature-mask rows for the child (empty = neither parent carried a split).
+        // Crossover-inherited feature-mask rows for the child (empty = neither parent carried a split).
         let mut child_masks: Vec<Vec<u8>> = Vec::new();
         // Provenance of `child_masks`, stamped onto the child's blueprint
         // policy it declares is the one its rows actually came
@@ -817,7 +817,11 @@ impl CoreEngine {
                 let mut pb = self.load_parent_topology(&attempt_parents[1])?;
                 // Snapshot the FITTER parent's genes BEFORE the operator runs: a successful cut
                 // mutates BOTH sides into two reciprocal children, so the original is gone
-                let fitter_genes = self.config.evolution.crossover_fitter_base.then(|| hidden_genes(&pa));
+                let fitter_genes = self
+                    .config
+                    .evolution
+                    .crossover_fitter_base
+                    .then(|| hidden_genes(&pa));
                 let cx = match op {
                     CrossoverOp::OnePoint => {
                         let report = Topology::cx_one_point_with_report(&mut pa, &mut pb, rng);
@@ -936,7 +940,12 @@ impl CoreEngine {
                 .resolved_standardize_pool()
                 .unwrap_or_else(|_| crate::evolution::pools::all_standardize_ops());
             let topo_opts = self.config.topology.options;
-            let width_pool = self.config.topology.hidden_dim_pool.clone().unwrap_or(4..=8);
+            let width_pool = self
+                .config
+                .topology
+                .hidden_dim_pool
+                .clone()
+                .unwrap_or(4..=8);
             drift_child_genes(
                 &mut child_topo,
                 self.config.topology.drift_prob,
@@ -1001,7 +1010,8 @@ impl CoreEngine {
         opts.output_dim = Some(self.header.output_dim);
         // Immigrants draw their split from the same pool the founders did,
         // population keeps every policy reachable, not just the ones it started
-        opts.feature_split = crate::engine::founding::population::draw_feature_split(&self.config, &mut rng);
+        opts.feature_split =
+            crate::engine::founding::population::draw_feature_split(&self.config, &mut rng);
         // The topology's internal rng must also derive from the run seed,
         // random child with the same n_hidden is structurally identical.
         let topo_seed = derive_seed(self.header.run_seed, clock * 1024 + child_idx) as usize;
@@ -1024,7 +1034,12 @@ impl CoreEngine {
             .config
             .resolved_standardize_pool()
             .unwrap_or_else(|_| crate::evolution::pools::all_standardize_ops());
-        let hidden_dim_pool = self.config.topology.hidden_dim_pool.clone().unwrap_or(4..=8);
+        let hidden_dim_pool = self
+            .config
+            .topology
+            .hidden_dim_pool
+            .clone()
+            .unwrap_or(4..=8);
         let stride = self.config.topology.hidden_dim_stride.max(1);
         for node in &mut graph.nodes {
             if node.kind == NodeKind::Hidden {
@@ -1198,9 +1213,9 @@ mod tests {
     }
 
     /// Both parents masked: the rows are RE-combined, so the honest label
-    /// `Inherited` — a per-port blend of two partitions is not itself a partition.
+    /// `Crossover` — a per-port blend of two partitions is not itself a partition.
     #[test]
-    fn mixing_two_parents_labels_the_child_inherited() {
+    fn mixing_two_parents_labels_the_child_crossover() {
         let a = vec![row([1, 0]), row([0, 1]), row([1, 0])];
         let b = vec![row([0, 1]), row([1, 0]), row([0, 1])];
         let (rows, policy) = mix_feature_masks(
@@ -1212,7 +1227,7 @@ mod tests {
             &mut rng(9),
         );
         assert_eq!(rows.len(), 3);
-        assert_eq!(policy, Some(FeatureSplitPolicy::Inherited));
+        assert_eq!(policy, Some(FeatureSplitPolicy::Crossover));
 
         // Rows that happen to equal ONE parent verbatim inherit THAT parent's label
         // (a one-point cut can land entirely on one side of the donor's rows).
@@ -1227,7 +1242,7 @@ mod tests {
         if rows == a {
             assert_eq!(policy, Some(FeatureSplitPolicy::Exclusive));
         } else {
-            assert_eq!(policy, Some(FeatureSplitPolicy::Inherited));
+            assert_eq!(policy, Some(FeatureSplitPolicy::Crossover));
         }
     }
 

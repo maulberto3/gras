@@ -9,14 +9,14 @@ pub(crate) use crate::engine::breed::evolve::RollKind;
 pub(crate) use crate::evolution::selection::SelectionMethod;
 pub(crate) use crate::graph::network::Network;
 pub(crate) use crate::state::{
-    write_engine_json, write_net_state, ConfigSnapshot, NetState, RaceState, RunConfig, RunHeader,
+    ConfigSnapshot, NetState, RaceState, RunConfig, RunHeader, write_engine_json, write_net_state,
 };
 pub(crate) use crate::trainer::stream::{BatchStream, PoolSplit};
 pub(crate) use crate::utils::fitness::{Fitness, FitnessLabel, Metric};
 
 pub(crate) use super::config::{RaceConfig, StopReason};
 pub(crate) use super::reporting::format::{build_stamp, csv_field, fmt_cfg, fmt_line};
-pub(crate) use crate::engine::clock::smoothing::{rolling_stats_tail, RollingBuffer, WindowStats};
+pub(crate) use crate::engine::clock::smoothing::{RollingBuffer, WindowStats, rolling_stats_tail};
 
 // ── CoreEngine ───────────────────────────────────────────────────────────────
 
@@ -522,8 +522,12 @@ impl CoreEngine {
                 }
             }
         }
-        let initial_topologies =
-            super::founding::population::fill_unique(&config, run_seed, founders, config.population.pop_size);
+        let initial_topologies = super::founding::population::fill_unique(
+            &config,
+            run_seed,
+            founders,
+            config.population.pop_size,
+        );
         // Every seeded slot is labeled by origin, so `nets/*.json` and `attempts.csv` say
         // which source elite it came from instead of a bare `founder-N`.
         let initial_topologies: Vec<(crate::graph::topology::Topology, Option<String>)> =
@@ -819,10 +823,15 @@ impl CoreEngine {
                         .clone()
                         .unwrap_or_else(|| crate::utils::cfy::NO_VALUE.to_string()),
                 ),
-                ("pop_size".to_string(), self.config.population.pop_size.to_string()),
+                (
+                    "pop_size".to_string(),
+                    self.config.population.pop_size.to_string(),
+                ),
                 (
                     "max_steps".to_string(),
-                    self.config.stop.max_steps
+                    self.config
+                        .stop
+                        .max_steps
                         .map(|m| m.to_string())
                         .unwrap_or_else(|| "unbounded".to_string()),
                 ),
@@ -830,7 +839,10 @@ impl CoreEngine {
                     "smoothing_window (K)".to_string(),
                     self.config.ranking.smoothing_window.to_string(),
                 ),
-                ("mean_type".to_string(), self.config.ranking.mean_type.to_string()),
+                (
+                    "mean_type".to_string(),
+                    self.config.ranking.mean_type.to_string(),
+                ),
                 (
                     "checkpoint_every".to_string(),
                     self.config.run.checkpoint_every.to_string(),

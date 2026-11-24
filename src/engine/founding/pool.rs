@@ -194,12 +194,17 @@ impl SearchPool for FeatureSplitPool {
     type Choice = Option<FeatureSplitPolicy>;
     const LABEL: &'static str = "feature_split_pool";
     const ACCEPTED: &'static [&'static str] = &[
+        "full",
         "none",
         "off",
+        "split_full",
+        "split_none",
         "random",
         "split_random",
         "exclusive",
         "split_exclusive",
+        "chunks",
+        "split_chunks",
     ];
 
     fn entries(cfg: &RaceConfig) -> &[String] {
@@ -210,6 +215,7 @@ impl SearchPool for FeatureSplitPool {
             None,
             Some(FeatureSplitPolicy::Random),
             Some(FeatureSplitPolicy::Exclusive),
+            Some(FeatureSplitPolicy::Chunks),
         ]
     }
     fn parse(entry: &str) -> Option<Option<FeatureSplitPolicy>> {
@@ -218,7 +224,7 @@ impl SearchPool for FeatureSplitPool {
     fn wire(choice: &Option<FeatureSplitPolicy>) -> String {
         choice
             .map(|p| p.to_string())
-            .unwrap_or_else(|| "none".to_string())
+            .unwrap_or_else(|| "full".to_string())
     }
 }
 
@@ -304,9 +310,9 @@ mod tests {
     fn no_split_is_a_choice_not_a_parse_failure() {
         let cfg = RaceConfig {
             topology: crate::engine::config::TopologyConfig {
-        feature_split_pool: vec!["none".to_string(), "split_random".to_string()],
-        ..Default::default()
-    },
+                feature_split_pool: vec!["full".to_string(), "split_random".to_string()],
+                ..Default::default()
+            },
             ..RaceConfig::defaults()
         };
         let pool = resolve::<FeatureSplitPool>(&cfg).expect("both entries parse");
@@ -318,9 +324,10 @@ mod tests {
         );
         assert_eq!(
             names::<FeatureSplitPool>(&cfg),
-            vec!["none", "split_random"]
+            vec!["full", "split_random"]
         );
-        // `Inherited` is provenance, not a drawable policy.
+        // `Crossover` is provenance, not a drawable policy.
+        assert!(FeatureSplitPool::parse("split_crossover").is_none());
         assert!(FeatureSplitPool::parse("split_inherited").is_none());
     }
 }

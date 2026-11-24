@@ -46,7 +46,8 @@ impl RaceConfigBuilder {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.cfg.evolution.crossover_ops_pool = ops.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self.cfg.evolution.crossover_ops_pool =
+            ops.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
 

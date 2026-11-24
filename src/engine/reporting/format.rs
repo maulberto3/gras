@@ -257,11 +257,11 @@ pub(crate) fn csv_split_line(line: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        csv_field, fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_line_opt, fmt_micros, fmt_reading,
-        fmt_units, ReadingStyle,
-    };
     use super::fmt_family_reading;
+    use super::{
+        ReadingStyle, csv_field, fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_line_opt, fmt_micros,
+        fmt_reading, fmt_units,
+    };
 
     // ── the band rule: magnitude picks the precision ──────────────────────
 

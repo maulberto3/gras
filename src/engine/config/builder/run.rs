@@ -73,8 +73,7 @@ impl RaceConfigBuilder {
     /// and no net has improved it for `patience` clocks. `0` patience stops on
     /// the clock the bar is reached.
     pub fn set_stop_plateau(mut self, target: f32, patience: usize) -> Self {
-        self.cfg.stop.plateau =
-            Some(crate::engine::clock::stop::Plateau::new(target, patience));
+        self.cfg.stop.plateau = Some(crate::engine::clock::stop::Plateau::new(target, patience));
         self
     }
 

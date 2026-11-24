@@ -105,7 +105,8 @@ impl RaceConfigBuilder {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.cfg.topology.combine_op_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self.cfg.topology.combine_op_pool =
+            pool.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
 
@@ -116,7 +117,8 @@ impl RaceConfigBuilder {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.cfg.topology.activation_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self.cfg.topology.activation_pool =
+            pool.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
 
@@ -127,7 +129,8 @@ impl RaceConfigBuilder {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.cfg.topology.standardize_op_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self.cfg.topology.standardize_op_pool =
+            pool.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
 
@@ -137,14 +140,15 @@ impl RaceConfigBuilder {
         self
     }
 
-    /// The pool a NEWBORN's split is drawn from, in draw order — `["none", "random", "exclusive"]`
-    /// gives every policy a chance, `["exclusive"]` pins one, `["none"]` turns the split off.
+    /// The pool a NEWBORN's split is drawn from, in draw order — `["full", "random", "exclusive", "chunks"]`
+    /// gives every policy a chance, `["exclusive"]` pins one, `["full"]` turns the split off.
     pub fn set_topology_feature_split_pool<I, S>(mut self, pool: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.cfg.topology.feature_split_pool = pool.into_iter().map(|s| s.as_ref().to_string()).collect();
+        self.cfg.topology.feature_split_pool =
+            pool.into_iter().map(|s| s.as_ref().to_string()).collect();
         self
     }
 

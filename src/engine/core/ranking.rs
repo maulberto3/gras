@@ -144,7 +144,8 @@ impl CoreEngine {
             };
             // TWO ledgers answer "did the coin withhold this clock": the idle one under the default contract (nothing ran), and the act-only one under learn-only (the net ran and was…
             let denied = state.idle_clocks() > idle_before
-                || (self.config.lottery.train_merit_learn_only && state.frozen_clocks() > frozen_before);
+                || (self.config.lottery.train_merit_learn_only
+                    && state.frozen_clocks() > frozen_before);
             if denied {
                 withheld.push(h[..8.min(h.len())].to_string());
             } else {

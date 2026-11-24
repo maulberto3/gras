@@ -7,15 +7,15 @@ use crate::graph::topology::FeatureSplitPolicy;
 use crate::utils::fitness::Metric;
 
 pub use super::breed::cull::{CrossCullPolicy, MutationCullPolicy};
-pub use super::reporting::logging::LogLevel;
 pub use super::clock::lottery::{
     DEFAULT_TRAIN_MERIT_LEARN_ONLY, DEFAULT_TRAIN_MERIT_P_MAX, DEFAULT_TRAIN_MERIT_P_MIN,
     DEFAULT_TRAIN_TICKET, TrainTicket,
 };
-pub use super::diversity::novelty::{DEFAULT_MUTATION_NOVELTY_DRAWS, DEFAULT_MUTATION_NOVELTY_MIN};
-pub use super::start::run_spec::{ModeConfig, RunMode};
 pub use super::clock::smoothing::{DEFAULT_MEAN_TYPE, MeanType, SMOOTHING_WINDOW};
 pub use super::clock::stop::{DEFAULT_MAX_STEPS, RaceSnapshot, StopFn, StopReason};
+pub use super::diversity::novelty::{DEFAULT_MUTATION_NOVELTY_DRAWS, DEFAULT_MUTATION_NOVELTY_MIN};
+pub use super::reporting::logging::LogLevel;
+pub use super::start::run_spec::{ModeConfig, RunMode};
 pub use crate::evolution::crossover::CrossoverOp;
 pub use crate::graph::topology::{
     DEFAULT_HIDDEN_DIM_STRIDE, DEFAULT_HIDDEN_POOL, DEFAULT_TOPOLOGY_DRIFT,
@@ -390,7 +390,8 @@ impl RaceConfig {
 
     /// Resolve [`Self::selection_metrics`] labels to indices in `metrics`, in ranking order.
     pub fn selection_metric_terms(&self, metrics: &[Metric]) -> Vec<(usize, f32)> {
-        self.ranking.selection_metrics
+        self.ranking
+            .selection_metrics
             .iter()
             .filter_map(
                 |term| match metrics.iter().position(|m| m.label == term.label) {
@@ -408,8 +409,8 @@ impl RaceConfig {
             .collect()
     }
 
-    /// The pool resolved to drawable policies (`empty ⇒ all three`, in the fixed order none →
-    /// random → exclusive so the draw is reproducible).
+    /// The pool resolved to drawable policies (`empty ⇒ all four`, in the fixed order full →
+    /// random → exclusive → chunks so the draw is reproducible).
     pub fn resolved_feature_split_pool(&self) -> Result<Vec<Option<FeatureSplitPolicy>>, String> {
         super::founding::pool::resolve::<super::founding::pool::FeatureSplitPool>(self)
     }
@@ -440,7 +441,8 @@ impl RaceConfig {
         cfg.ranking.smoothing_window = snap.smoothing_window;
         // `""` = a header written before the knob, which averaged arithmetically.
         cfg.ranking.mean_type = MeanType::parse(&snap.mean_type).unwrap_or(DEFAULT_MEAN_TYPE);
-        cfg.lottery.train_ticket = TrainTicket::parse(&snap.train_ticket).unwrap_or(cfg.lottery.train_ticket);
+        cfg.lottery.train_ticket =
+            TrainTicket::parse(&snap.train_ticket).unwrap_or(cfg.lottery.train_ticket);
         cfg.run.csv_export = snap.csv_export;
         cfg.run.save_optim = snap.save_optim;
         cfg.run.run_name = snap.run_name.clone();
@@ -559,7 +561,6 @@ mod builder;
 
 pub use builder::RaceConfigBuilder;
 
-
 impl RaceConfig {
     /// Resolve the crossover operator pool: the configured labels validated, or both when empty.
     pub fn resolved_crossover_ops(&self) -> Result<Vec<CrossoverOp>, String> {
@@ -618,9 +619,9 @@ mod tests {
 
         let cfg = RaceConfig {
             topology: crate::engine::config::TopologyConfig {
-        feature_split_pool: vec!["rondom".to_string()],
-        ..Default::default()
-    },
+                feature_split_pool: vec!["rondom".to_string()],
+                ..Default::default()
+            },
             ..RaceConfig::defaults()
         };
         // The RECORD no longer invents a pool: the typed spelling is what gets written.
@@ -636,14 +637,14 @@ mod tests {
         // Every bad pool is reported at once, not one per run start.
         let many = RaceConfig {
             topology: crate::engine::config::TopologyConfig {
-        feature_split_pool: vec!["rondom".to_string()],
-        activation_pool: vec!["reluu".to_string()],
-        ..Default::default()
-    },
+                feature_split_pool: vec!["rondom".to_string()],
+                activation_pool: vec!["reluu".to_string()],
+                ..Default::default()
+            },
             evolution: crate::engine::config::EvolutionConfig {
-        crossover_ops_pool: vec!["two_point".to_string()],
-        ..Default::default()
-    },
+                crossover_ops_pool: vec!["two_point".to_string()],
+                ..Default::default()
+            },
             ..RaceConfig::defaults()
         };
         let err = many.validate_search_pools().expect_err("three typos");
@@ -662,6 +663,7 @@ mod tests {
     fn feature_split_pool_entries_match_whole_names() {
         use crate::graph::topology::parse_feature_split_pool_entry as parse;
         // The drawable vocabulary plus the `split_*` spellings `engine.json` records.
+        assert_eq!(parse("full"), Some(None));
         assert_eq!(parse("none"), Some(None));
         assert_eq!(parse("off"), Some(None));
         assert_eq!(
@@ -680,11 +682,20 @@ mod tests {
             parse("split_exclusive"),
             Some(Some(super::FeatureSplitPolicy::Exclusive))
         );
+        assert_eq!(
+            parse("chunks"),
+            Some(Some(super::FeatureSplitPolicy::Chunks))
+        );
+        assert_eq!(
+            parse("split_chunks"),
+            Some(Some(super::FeatureSplitPolicy::Chunks))
+        );
         // Near-misses that the substring test used to accept.
         for bad in [
             "nonexclusive",
             "random_only",
             "exclusive_",
+            "split_crossover",
             "split_inherited",
             "",
         ] {
@@ -692,9 +703,9 @@ mod tests {
         }
         let cfg = RaceConfig {
             topology: crate::engine::config::TopologyConfig {
-        feature_split_pool: vec!["nonexclusive".to_string()],
-        ..Default::default()
-    },
+                feature_split_pool: vec!["nonexclusive".to_string()],
+                ..Default::default()
+            },
             ..RaceConfig::defaults()
         };
         assert!(cfg.validate_search_pools().is_err());
@@ -746,7 +757,10 @@ mod tests {
             SelectionMethod::Tournament { tournament_size: 3 }
         );
         // The recorded label is the Display form the snapshot stores.
-        assert_eq!(cfg.evolution.crossover_selection.to_string(), "tournament(size=3)");
+        assert_eq!(
+            cfg.evolution.crossover_selection.to_string(),
+            "tournament(size=3)"
+        );
         assert_eq!(SelectionMethod::Roulette.to_string(), "roulette");
         assert_eq!(SelectionMethod::Elite.to_string(), "elite");
     }

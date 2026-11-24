@@ -52,6 +52,32 @@ static ARMED: AtomicBool = AtomicBool::new(false);
 /// be able to grow it without bound.
 const MAX_STARTUP_BYTES: usize = 1 << 20;
 
+/// Optional embedder sink. The Python extension points this at `sys.stdout`,
+/// so Jupyter decodes one Python-owned UTF-8 stream instead of capturing a
+/// second file-descriptor stream and interleaving it with cell prints.
+static CONSOLE_SINK: OnceLock<fn(&str) -> bool> = OnceLock::new();
+
+/// Install the console sink used instead of STDOUT. Returns false if one was
+/// already installed.
+pub fn set_console_sink(sink: fn(&str) -> bool) -> bool {
+    CONSOLE_SINK.set(sink).is_ok()
+}
+
+/// Write one complete console line through the embedder sink, else STDOUT.
+pub(crate) fn console_line(text: &str) {
+    if let Some(sink) = CONSOLE_SINK.get() {
+        let mut line = String::with_capacity(text.len() + 1);
+        line.push_str(text);
+        line.push('\n');
+        if sink(&line) {
+            return;
+        }
+    }
+    let mut out = io::stdout().lock();
+    let _ = writeln!(out, "{text}");
+    let _ = out.flush();
+}
+
 /// Install the subscriber for a run: console + frame, plus the telemetry sink
 /// (inert until [`settle_run_dir`] decides). Returns false if already installed.
 pub fn init(level: LogLevel, filter_override: Option<&str>) -> bool {
@@ -63,7 +89,9 @@ pub fn init(level: LogLevel, filter_override: Option<&str>) -> bool {
     {
         // Same stream as every other line (see the module header): a redirected run
         // captures the notice too, instead of losing it to an empty stderr.
-        println!("log: RUST_LOG={env} ignored (the configured log level, `{base}`, wins)");
+        console_line(&format!(
+            "log: RUST_LOG={env} ignored (the configured log level, `{base}`, wins)"
+        ));
     }
     let filter = base.to_string();
 
@@ -72,7 +100,7 @@ pub fn init(level: LogLevel, filter_override: Option<&str>) -> bool {
     // `Minimal` mutes info lines (its `env_filter` is `warn`); the frame rides
     // a different target, so it still gets through.
     let console = fmt::layer()
-        .with_writer(io::stdout)
+        .with_writer(FlushStdout)
         .with_ansi(false)
         .without_time()
         .with_target(false)
@@ -207,6 +235,42 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
     }
 }
 
+/// Console writer that flushes every record. `std::io::stdout` is block-buffered
+/// when stdout is a pipe (Jupyter, editors, subprocess capture), which would hold
+/// every log line until the race returns instead of streaming it.
+struct FlushStdout;
+
+struct FlushStdoutWriter;
+
+impl Write for FlushStdoutWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // A formatting layer hands us complete UTF-8 strings; send them through
+        // the embedder before falling back to the process stdout.
+        if let Some(sink) = CONSOLE_SINK.get()
+            && let Ok(text) = std::str::from_utf8(buf)
+            && sink(text)
+        {
+            return Ok(buf.len());
+        }
+        let mut stdout = io::stdout().lock();
+        let written = stdout.write(buf)?;
+        stdout.flush()?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FlushStdout {
+    type Writer = FlushStdoutWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        FlushStdoutWriter
+    }
+}
+
 /// Renders `Minimal` frames: erased and redrawn in place on a terminal,
 /// printed plainly off one.
 struct FrameLayer {
@@ -231,14 +295,14 @@ impl<S: Subscriber> Layer<S> for FrameLayer {
             return;
         };
 
-        let mut out = io::stdout().lock();
         let mut drawn = self.drawn.lock().unwrap_or_else(|e| e.into_inner());
-        if *drawn > 0 && out.is_terminal() {
+        if *drawn > 0 && CONSOLE_SINK.get().is_none() && io::stdout().is_terminal() {
             // Cursor up over the previous frame, then clear everything below.
+            let mut out = io::stdout().lock();
             let _ = write!(out, "\x1b[{}A\x1b[0J", *drawn);
+            let _ = out.flush();
         }
-        let _ = writeln!(out, "{text}");
-        let _ = out.flush();
+        console_line(&text);
         *drawn = text.lines().count();
     }
 }

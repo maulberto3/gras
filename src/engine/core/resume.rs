@@ -115,10 +115,12 @@ impl CoreEngine {
         // Pool drift changes which masks the NEXT newborn gets (the nets already live keep theirs),
         // so it is a behavioural warning like Ω.
         let rec_pool = if recorded.feature_split_pool.is_empty() {
-            vec![recorded
-                .feature_split
-                .clone()
-                .unwrap_or_else(|| "none".to_string())]
+            vec![
+                recorded
+                    .feature_split
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string()),
+            ]
         } else {
             recorded.feature_split_pool.clone()
         };
@@ -305,7 +307,8 @@ impl CoreEngine {
                 ))
                 .into());
             }
-            let history = Self::load_history_windows(&run_dir, self.config.ranking.smoothing_window);
+            let history =
+                Self::load_history_windows(&run_dir, self.config.ranking.smoothing_window);
             let mut replayed: Vec<Vec<String>> = Vec::new();
             let loaded = self.replay_manifest_frontier(&manifest, &history, &mut replayed)?;
             self.report_resume(loaded, &replayed, &nets_dir, &run_dir)?;
@@ -657,7 +660,8 @@ impl CoreEngine {
             .filter(|(_, c)| !FIXED.iter().any(|f| **c == *f))
             .map(|(i, c)| (i, c.trim_start_matches("m:").to_string()))
             .collect();
-        let mut out: HashMap<String, crate::engine::clock::smoothing::HistoryReplay> = HashMap::new();
+        let mut out: HashMap<String, crate::engine::clock::smoothing::HistoryReplay> =
+            HashMap::new();
         for line in lines {
             let fields = crate::engine::reporting::format::csv_split_line(line);
             let needed = hash_i.max(train_i).max(eval_i).max(fit_i);

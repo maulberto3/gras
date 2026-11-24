@@ -233,7 +233,12 @@ impl CoreEngine {
             input_dim: self.header.input_dim,
             output_dim: self.header.output_dim,
             topology_options: self.header.topology_options,
-            hidden_dim_pool: self.config.topology.hidden_dim_pool.clone().unwrap_or(4..=8),
+            hidden_dim_pool: self
+                .config
+                .topology
+                .hidden_dim_pool
+                .clone()
+                .unwrap_or(4..=8),
             hidden_dim_stride: self.config.topology.hidden_dim_stride,
             combine_op_pool: self.config.topology.combine_op_pool.clone(),
             activation_pool: self.config.topology.activation_pool.clone(),

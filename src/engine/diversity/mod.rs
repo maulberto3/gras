@@ -39,7 +39,7 @@
 pub mod novelty;
 
 use crate::graph::node::{CombineOp, NodeKind, StandardizeOp};
-use crate::graph::topology::Topology;
+use crate::graph::topology::{FeatureSplitPolicy, Topology};
 use crate::state::RaceState;
 use std::collections::{HashMap, HashSet};
 
@@ -119,6 +119,28 @@ pub(crate) struct NetShape {
     pub depth: usize,
     /// Mean wire hop distance in topological levels: `1.0` = adjacent levels, larger = skips.
     pub thickness: f32,
+    /// The Input split's policy label; `None` means the full vector (no masks).
+    pub split: Option<FeatureSplitPolicy>,
+}
+
+impl NetShape {
+    /// The report label for this net's split: `Full` when no masks are carried, otherwise the
+    /// policy that produced or last described the rows.
+    pub fn split_label(&self) -> &'static str {
+        match self.split {
+            Some(FeatureSplitPolicy::Exclusive) => "Exclusive",
+            Some(FeatureSplitPolicy::Random) => "Random",
+            Some(FeatureSplitPolicy::Chunks) => "Chunks",
+            Some(FeatureSplitPolicy::Crossover) => "Crossover",
+            None => "Full",
+        }
+    }
+
+    /// `Exclusive · 50.0` — policy and mean kept share in one cell, in percent.
+    pub fn split_cell(&self) -> Option<String> {
+        self.mask
+            .map(|share| format!("{} · {:.1}", self.split_label(), share * 100.0))
+    }
 }
 
 /// Read one net's structure: the pair metric's genes plus the census legs.
@@ -147,6 +169,7 @@ pub(crate) fn shape_of(topo: &Topology) -> NetShape {
         reach: topo.options.input_reach,
         depth: topo.depths().into_iter().max().unwrap_or(0),
         thickness: topo.wire_thickness(),
+        split: topo.options.feature_split,
         genome: genes(topo),
         nodes: topo.nodes.len(),
         wires: topo.connections.len(),
@@ -447,6 +470,7 @@ mod tests {
             reach: 1.0,
             depth: 1,
             thickness: 1.0,
+            split: None,
             genome: genome(tokens),
             nodes: 1,
             wires: 1,

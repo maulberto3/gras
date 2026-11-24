@@ -159,18 +159,19 @@ pub fn resolve_plan(
     for (rank, hash) in ranked.into_iter().take(cap) {
         let short = &hash[..8.min(hash.len())];
         let state_path = dir.join("nets").join(format!("{hash}.json"));
-        let topology = match crate::engine::founding::population::run_topology_from_json_file(&state_path) {
-            Ok(t) => t,
-            Err(e) => {
-                let why = if rank == 1 {
-                    format!("champion {short} of run {source_run_id}: {e}")
-                } else {
-                    format!("champion #{rank} {short} of run {source_run_id}: {e}")
-                };
-                first_failure.get_or_insert(why);
-                continue;
-            }
-        };
+        let topology =
+            match crate::engine::founding::population::run_topology_from_json_file(&state_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    let why = if rank == 1 {
+                        format!("champion {short} of run {source_run_id}: {e}")
+                    } else {
+                        format!("champion #{rank} {short} of run {source_run_id}: {e}")
+                    };
+                    first_failure.get_or_insert(why);
+                    continue;
+                }
+            };
         // The header gate proved the RUN matched; this proves the BLUEPRINT did
         // (a legacy one may carry disagreeing dims). A mismatch is dropped.
         let opts = &topology.options;
@@ -425,22 +426,30 @@ mod tests {
         let root = tmp("incompat");
         write_run(&root.join("1000"), "1000", "tabular", "toy", true);
         // mode
-        assert!(resolve(Some(&root), None, "rl", 2, 2, Some("toy"))
-            .seeded()
-            .is_none());
+        assert!(
+            resolve(Some(&root), None, "rl", 2, 2, Some("toy"))
+                .seeded()
+                .is_none()
+        );
         // dims
-        assert!(resolve(Some(&root), None, "tabular", 4, 2, Some("toy"))
-            .seeded()
-            .is_none());
+        assert!(
+            resolve(Some(&root), None, "tabular", 4, 2, Some("toy"))
+                .seeded()
+                .is_none()
+        );
         // trainer name (two environments can share dims)
-        assert!(resolve(Some(&root), None, "tabular", 2, 2, Some("other"))
-            .seeded()
-            .is_none());
+        assert!(
+            resolve(Some(&root), None, "tabular", 2, 2, Some("other"))
+                .seeded()
+                .is_none()
+        );
         // …and the compatible call still works, proving the gate isn't just
         // refusing everything.
-        assert!(resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
-            .seeded()
-            .is_some());
+        assert!(
+            resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
+                .seeded()
+                .is_some()
+        );
     }
 
     #[test]
@@ -449,9 +458,11 @@ mod tests {
         write_run(&root.join("1000"), "1000", "tabular", "toy", true);
         // This run declares no trainer name → the check cannot be applied,
         // it must not reject the candidate.
-        assert!(resolve(Some(&root), None, "tabular", 2, 2, None)
-            .seeded()
-            .is_some());
+        assert!(
+            resolve(Some(&root), None, "tabular", 2, 2, None)
+                .seeded()
+                .is_some()
+        );
     }
 
     #[test]
@@ -480,13 +491,17 @@ mod tests {
     #[test]
     fn empty_root_and_missing_root_are_skipped_not_panicked() {
         let root = tmp("empty");
-        assert!(resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
-            .seeded()
-            .is_none());
+        assert!(
+            resolve(Some(&root), None, "tabular", 2, 2, Some("toy"))
+                .seeded()
+                .is_none()
+        );
         let missing = root.join("does-not-exist");
-        assert!(resolve(Some(&missing), None, "tabular", 2, 2, Some("toy"))
-            .seeded()
-            .is_none());
+        assert!(
+            resolve(Some(&missing), None, "tabular", 2, 2, Some("toy"))
+                .seeded()
+                .is_none()
+        );
     }
 
     /// The run's OWN directory is written before the lookup,
@@ -510,16 +525,18 @@ mod tests {
         // Pointed straight at itself ⇒ nothing to inherit.
         let self_only = tmp("self-only");
         write_run(&self_only, "3000", "tabular", "toy", true);
-        assert!(resolve(
-            Some(&self_only),
-            Some(&self_only),
-            "tabular",
-            2,
-            2,
-            Some("toy")
-        )
-        .seeded()
-        .is_none());
+        assert!(
+            resolve(
+                Some(&self_only),
+                Some(&self_only),
+                "tabular",
+                2,
+                2,
+                Some("toy")
+            )
+            .seeded()
+            .is_none()
+        );
     }
 
     #[test]

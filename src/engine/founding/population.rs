@@ -61,7 +61,7 @@ fn draw_topology(config: &RaceConfig, run_seed: u64, ordinal: usize) -> Topology
     graph
 }
 
-/// Draw one policy from the run's feature-split pool (`empty ⇒ all three`) with the caller's own
+/// Draw one policy from the run's feature-split pool (`empty ⇒ all four`) with the caller's own
 /// deterministic RNG.
 pub(crate) fn draw_feature_split(
     config: &RaceConfig,
@@ -72,6 +72,7 @@ pub(crate) fn draw_feature_split(
             None,
             Some(crate::graph::topology::FeatureSplitPolicy::Random),
             Some(crate::graph::topology::FeatureSplitPolicy::Exclusive),
+            Some(crate::graph::topology::FeatureSplitPolicy::Chunks),
         ]
     });
     pool[rng.usize(..pool.len())]
@@ -487,7 +488,7 @@ mod tests {
         let cfg = tiny_config(4);
         assert!(
             cfg.topology.feature_split_pool.is_empty(),
-            "the pool is empty by default (= none, random, exclusive)"
+            "the pool is empty by default (= full, random, exclusive, chunks)"
         );
         let mut none_only = tiny_config(4);
         none_only.topology.feature_split_pool = vec!["none".to_string()];
@@ -501,10 +502,10 @@ mod tests {
         }
     }
 
-    /// The default pool is all three policies, so a population holds unsplit and split
+    /// The default pool is all four policies, so a population holds unsplit and split
     /// nets at once — the split is a selectable gene, not a run-wide switch.
     #[test]
-    fn the_default_pool_puts_all_three_policies_in_one_population() {
+    fn the_default_pool_puts_all_four_policies_in_one_population() {
         let opts = crate::graph::topology::TopologyOptions {
             min_hidden_num_nodes: 4,
             max_hidden_num_nodes: 4,
@@ -525,7 +526,7 @@ mod tests {
         seen.dedup();
         assert!(
             seen.len() >= 2,
-            "12 draws from {{none, random, exclusive}} produced {seen:?}"
+            "12 draws from {{full, random, exclusive, chunks}} produced {seen:?}"
         );
         for topo in initial_population(&cfg, 7) {
             topo.validate().expect("every drawn split must validate");

@@ -1,9 +1,7 @@
 //! Builder setters for the training lottery: band, legs and learn-only gate.
 
 use super::RaceConfigBuilder;
-use crate::engine::config::{
-    DEFAULT_TRAIN_MERIT_P_MAX, DEFAULT_TRAIN_MERIT_P_MIN, TrainTicket,
-};
+use crate::engine::config::{DEFAULT_TRAIN_MERIT_P_MAX, DEFAULT_TRAIN_MERIT_P_MIN, TrainTicket};
 
 impl RaceConfigBuilder {
     /// Lottery floor `p_min`: the worst net's chance of a ticket each clock.

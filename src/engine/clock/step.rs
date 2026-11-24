@@ -580,7 +580,9 @@ impl CoreEngine {
 
     /// The lottery's ceiling `p_max` (`set_ticket_p_max`), clamped to `[p_min, 1]`.
     pub(crate) fn train_merit_p_max(&self) -> f32 {
-        self.config.lottery.train_merit_p_max
+        self.config
+            .lottery
+            .train_merit_p_max
             .clamp(0.0, 1.0)
             .max(self.train_merit_p_min())
     }

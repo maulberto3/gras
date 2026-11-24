@@ -7,13 +7,11 @@ pub mod reports;
 
 use tracing::info;
 
+use self::format::{ReadingStyle, fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_micros, fmt_units};
 use super::core::CoreEngine;
-use crate::engine::clock::step::LotteryFrame;
-use crate::engine::diversity::{mean_delta_to, shape_of, NetShape};
-use self::format::{
-    fmt_cell, fmt_census, fmt_cfg, fmt_line, fmt_micros, fmt_units, ReadingStyle,
-};
 use crate::engine::clock::smoothing::rolling_mean;
+use crate::engine::clock::step::LotteryFrame;
+use crate::engine::diversity::{NetShape, mean_delta_to, shape_of};
 
 mod lineage;
 
@@ -179,7 +177,10 @@ impl CoreEngine {
         } else if !self.config.ranking.selection_metrics.is_empty() {
             // A COMPOSITE ranking: the fitness centre plus weighted metric centres. Printing the
             // `= window avg …` identity here would be false, so the terms are named instead.
-            let terms: Vec<String> = self.config.ranking.selection_metrics
+            let terms: Vec<String> = self
+                .config
+                .ranking
+                .selection_metrics
                 .iter()
                 .map(|t| format!("{}·{}", t.label, fmt_cfg(t.weight)))
                 .collect();
@@ -622,7 +623,8 @@ impl CoreEngine {
         }
         // The columns this run can actually fill: the U leg's cell and the exam are columns
         // only when the run supplies them.
-        let mut columns = printed_columns(self.config.lottery.train_ticket.updates_armed(), has_exam);
+        let mut columns =
+            printed_columns(self.config.lottery.train_ticket.updates_armed(), has_exam);
         let fit = fit_column(self.config.ranking.mean_type);
         // The window legs are GONE from the card (2026-11-14): with the spread charge removed, `F` IS the window centre, so a `mean`/`median` column beside it printed the same…
         for c in columns.iter_mut() {
@@ -779,9 +781,7 @@ impl CoreEngine {
                 .map(|s| format!("{:.2}", s.reach))
                 .unwrap_or_else(dash),
             // `H` — mean hop distance over the wires, right beside the gene that shapes them.
-            shape
-                .map(|s| fmt_cell(s.thickness))
-                .unwrap_or_else(dash),
+            shape.map(|s| fmt_cell(s.thickness)).unwrap_or_else(dash),
             // `D` — the longest wire path in this net's live blueprint. Report-only.
             shape.map(|s| s.depth.to_string()).unwrap_or_else(dash),
             // `t` — what ONE eval pass costs on this net's live blueprint, measured ONCE at
@@ -791,12 +791,9 @@ impl CoreEngine {
                 .map(fmt_micros)
                 .unwrap_or_else(dash),
             shape.map(|s| s.nodes.to_string()).unwrap_or_else(dash),
-            // The mask's DENSITY, not its policy label: a blended split has no single policy to
-            // name, but how much of the input a port reads is still a comparable number.
-            shape
-                .and_then(|s| s.mask)
-                .map(|d| fmt_cell(d * 100.0))
-                .unwrap_or_else(dash),
+            // The split's POLICY and mean kept share: the label alone cannot tell a fresh
+            // `Random` draw from `Exclusive`, and the number alone cannot tell either.
+            shape.and_then(|s| s.split_cell()).unwrap_or_else(dash),
             shape.map(|s| s.wires.to_string()).unwrap_or_else(dash),
             // Mean hidden width is a MEASURED number like every other cell, so it takes the band
             // rule (`fmt_cell`) instead of a hand-picked `{:.1}` — a 3.5-wide net used to print
@@ -1347,16 +1344,15 @@ fn ticket_column(legs: crate::engine::config::TrainTicket) -> &'static str {
 }
 
 /// BREAK a header over lines at its joints — after `=`, before `minmax`, before a `(`, between
-/// `feature`/`split`/`masks`/`%`. A column is as wide as its longest LINE, not as wide as the
-/// label was on one line, so the header's height is what buys every ROW its width.
+/// `split`/`keep`/`%`. A column is as wide as its longest LINE, not as wide as the label was on
+/// one line, so the header's height is what buys every ROW its width.
 fn wrap_header(cell: &str) -> String {
     cell.replace(" = ", " =\n")
         .replace(" minmax", "\nminmax")
         .replace(" + (", " +\n(")
         .replace(" × ", "\n× ")
         .replace(" (", "\n(")
-        .replace("feature split", "feature\nsplit")
-        .replace("split masks", "split\nmasks")
+        .replace("split · keep", "split\nkeep")
 }
 
 /// The U leg's cell under the leg's own polarity — `Um⁻` pays the fewest updates, `Um⁺` the most.
@@ -1384,12 +1380,10 @@ const COL_DEPTH: &str = "depth (D)";
 /// two adjacent columns both called "eval" read as the same quantity.
 const COL_EVAL: &str = "eval time (µs)";
 const COL_EXAM: &str = "exam (X)";
-/// `mask`: the share of the input each Input port reads, averaged over the ports. The header is
-/// WRAPPED at render time (`wrap_header`) so the CELL holds the bare number at the shared
-/// band rule (`fmt_cell`: `49.2`, `100.0`): `100.0` = no split
-/// (every port sees every feature), `1/P` = exclusive over P ports, between = an inherited
-/// crossover blend. The `%` is stated once, in the header, instead of in every row.
-const COL_MASK: &str = "feature split masks %";
+/// `split · keep %`: the policy plus the mean share of the input each Input port reads. `Full`
+/// carries no masks (`100.0`), `Exclusive`/`Chunks` are partitions (`1/P × 100`), `Random` is a
+/// repaired coin flip, and `Crossover` is a blended split. The `%` is stated once, in the header.
+const COL_MASK: &str = "split · keep %";
 
 /// The columns the card actually PRINTS, in reading order — `STOP_HEADER_FIXED` minus the cells
 /// this run cannot fill.
@@ -1564,7 +1558,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         ),
         (
             COL_MASK.to_string(),
-            "mean share of the input each Input port reads, in percent: `100.0` = no split, `1/P` = exclusive, between = a crossover blend"
+            "the split policy plus the mean share of the input each Input port reads, in percent: `Full · 100.0` = no masks, `Exclusive · 1/P×100` = a partition, `Chunks · 100/P` = an ordered partition, `Random`/`Crossover` = a coin-flipped or blended split"
                 .to_string(),
         ),
         (
@@ -1732,8 +1726,8 @@ mod stop_legend_tests {
     /// The card prints NO window leg beside `F`: with the spread charge gone `F` IS the window centre, so a `mean`/`median` column held the same number twice, and the…
     #[test]
     fn the_card_prints_no_window_leg_beside_the_score() {
+        use crate::engine::clock::smoothing::{RollingBuffer, rolling_stats_with};
         use crate::engine::config::MeanType;
-        use crate::engine::clock::smoothing::{rolling_stats_with, RollingBuffer};
         // The window that started it: two good readings and one low one.
         let buf = RollingBuffer::from_values(10, &[0.828125, 0.859375, 0.859375]);
         let stats = rolling_stats_with(&buf, MeanType::Median).unwrap();
@@ -1928,15 +1922,32 @@ mod stop_legend_tests {
             "params".to_string(),
             "thickness (H)".to_string(),
             "depth (D)".to_string(),
+            "split · keep %".to_string(),
             "fit (F = mean)".to_string(),
             "slope (S)".to_string(),
         ];
         let rows = vec![
             vec![
-                "1", "aaaa", "founder@0", "1.0K", "1.0", "2", "0.50", "0.01",
+                "1",
+                "aaaa",
+                "founder@0",
+                "1.0K",
+                "1.0",
+                "2",
+                "Exclusive · 50.0",
+                "0.50",
+                "0.01",
             ],
             vec![
-                "2", "bbbb", "founder@0", "2.0K", "1.5", "3", "0.70", "na",
+                "2",
+                "bbbb",
+                "founder@0",
+                "2.0K",
+                "1.5",
+                "3",
+                "Random · 75.0",
+                "0.70",
+                "na",
             ],
         ]
         .into_iter()
@@ -1950,6 +1961,7 @@ mod stop_legend_tests {
             "params 1.5K",
             "H 1.25",
             "D 2.50",
+            "split 2 policy · keep 62.5",
             "F 0.6000",
             "S 0.0100 (na 1)",
         ] {
@@ -1998,6 +2010,8 @@ enum SummaryKind {
     Text,
     /// `params`: values carry `K`/`M`/`B`, so parse to a base count.
     Params,
+    /// `split`: policy label + numeric keep share, so summarize both halves.
+    Split,
     /// Everything else numeric: mean ± population spread.
     Number,
 }
@@ -2011,6 +2025,8 @@ fn summary_kind(header: &str) -> SummaryKind {
         SummaryKind::Text
     } else if h == "params" {
         SummaryKind::Params
+    } else if h.starts_with("split") {
+        SummaryKind::Split
     } else {
         SummaryKind::Number
     }
@@ -2029,8 +2045,8 @@ fn short_column(header: &str) -> String {
         "D"
     } else if h.starts_with("eval time") {
         "t"
-    } else if h.starts_with("feature split") {
-        "mask"
+    } else if h.starts_with("split") {
+        "split"
     } else if h.starts_with("fit minmax") {
         "Fm"
     } else if h.starts_with("updates minmax") {
@@ -2096,10 +2112,19 @@ fn final_field_summary(header: &[String], rows: &[Vec<String>]) -> String {
             parts.push(format!("{label} {} uniq", unique.len()));
             continue;
         }
-        let numbers: Vec<f64> = values
-            .iter()
-            .filter_map(|cell| summary_number(cell, kind))
-            .collect();
+        let numbers: Vec<f64> = match kind {
+            SummaryKind::Split => values
+                .iter()
+                .filter_map(|cell| {
+                    cell.rsplit_once(" · ")
+                        .and_then(|(_, keep)| keep.parse().ok())
+                })
+                .collect(),
+            _ => values
+                .iter()
+                .filter_map(|cell| summary_number(cell, kind))
+                .collect(),
+        };
         if numbers.len() != values.len() {
             // A mixed column is still a value distribution; count its distinct spellings rather
             // than inventing a mean from the subset that happened to parse.
@@ -2118,14 +2143,26 @@ fn final_field_summary(header: &[String], rows: &[Vec<String>]) -> String {
                 let mean = numbers.iter().sum::<f64>() / numbers.len() as f64;
                 format!("{label} {}", fmt_units(mean.round() as i64))
             }
+            SummaryKind::Split => {
+                let policies: std::collections::HashSet<&str> = values
+                    .iter()
+                    .filter_map(|cell| cell.split_once(" · ").map(|(policy, _)| policy))
+                    .collect();
+                let mean = numbers.iter().sum::<f64>() / numbers.len() as f64;
+                let var =
+                    numbers.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / numbers.len() as f64;
+                format!(
+                    "{label} {} policy · keep {}±{}",
+                    policies.len(),
+                    fmt_line(mean as f32),
+                    fmt_line(var.sqrt() as f32)
+                )
+            }
             SummaryKind::Text => unreachable!("text columns return above"),
             SummaryKind::Number => {
                 let mean = numbers.iter().sum::<f64>() / numbers.len() as f64;
                 if numbers.len() > 1 {
-                    let var = numbers
-                        .iter()
-                        .map(|v| (v - mean).powi(2))
-                        .sum::<f64>()
+                    let var = numbers.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
                         / numbers.len() as f64;
                     format!(
                         "{label} {}±{}",
@@ -2507,8 +2544,8 @@ fn minimal_score_cell(
 mod tests {
     use super::lineage::*;
     use super::{
-        delta_crown, delta_pop, mean_of, minimal_score_cell, origin_cell, step_score_cell,
-        CardStats, NetShape, StopPlan,
+        CardStats, NetShape, StopPlan, delta_crown, delta_pop, mean_of, minimal_score_cell,
+        origin_cell, step_score_cell,
     };
     use crate::utils::fitness::Direction;
 
@@ -2580,8 +2617,8 @@ mod tests {
     /// and the spread it prints beside it must be the MAD (diagnostic, never charged).
     #[test]
     fn the_median_step_cell_closes_on_the_median_not_the_mean() {
+        use crate::engine::clock::smoothing::{RollingBuffer, rolling_stats_with};
         use crate::engine::config::MeanType;
-        use crate::engine::clock::smoothing::{rolling_stats_with, RollingBuffer};
         // One net, four readings: mean 25.75 / σ 14.77, but median 12 and MAD 2.
         let stats = rolling_stats_with(
             &RollingBuffer::from_values(4, &[10.0, 12.0, 40.0, 41.0]),
@@ -2843,12 +2880,27 @@ mod tests {
             reach: 1.0,
             depth: 1,
             thickness: 1.0,
+            split: None,
             genome: [(token.to_string(), 1usize)].into_iter().collect(),
             nodes: 1,
             wires: 1,
             dim: 4.0,
             mask: Some(1.0),
         }
+    }
+
+    #[test]
+    fn split_cell_carries_both_the_policy_and_the_share() {
+        use crate::graph::topology::FeatureSplitPolicy;
+        let mut shape = shape("W:Tanh");
+        shape.split = Some(FeatureSplitPolicy::Random);
+        shape.mask = Some(0.75);
+        assert_eq!(shape.split_cell().as_deref(), Some("Random · 75.0"));
+        shape.split = Some(FeatureSplitPolicy::Crossover);
+        assert_eq!(shape.split_cell().as_deref(), Some("Crossover · 75.0"));
+        shape.split = None;
+        shape.mask = Some(1.0);
+        assert_eq!(shape.split_cell().as_deref(), Some("Full · 100.0"));
     }
 
     /// A shape with two gene tokens, ONE of them `W:Tanh` — so its Δ to [`shape`]
@@ -2858,6 +2910,7 @@ mod tests {
             reach: 1.0,
             depth: 2,
             thickness: 1.5,
+            split: None,
             genome: [("W:Tanh".to_string(), 1usize), ("W:SiLU".to_string(), 1)]
                 .into_iter()
                 .collect(),

@@ -1,8 +1,8 @@
 //! Run artifacts: the CHAMPION ranking and the anti-champion (worst) dumps.
 
+use super::format::{ReadingStyle, fmt_cell, fmt_cfg, fmt_family_reading, fmt_micros, fmt_units};
 use crate::engine::core::CoreEngine;
-use crate::engine::diversity::{shape_of, NetShape};
-use super::format::{fmt_cell, fmt_cfg, fmt_family_reading, fmt_micros, fmt_units, ReadingStyle};
+use crate::engine::diversity::{NetShape, shape_of};
 use flodl::tensor::Result;
 
 /// Why the list is not simply the bottom of `fit (F)`, stamped into every `worst-*.md`: the file
@@ -219,10 +219,8 @@ impl CoreEngine {
             ("thickness (H)", fmt_cell(shape.thickness)),
             ("depth (D)", shape.depth.to_string()),
             (
-                "feature split",
-                shape
-                    .mask
-                    .map_or_else(|| na.clone(), |m| format!("{}%", fmt_cell(m * 100.0))),
+                "split · keep %",
+                shape.split_cell().unwrap_or_else(|| na.clone()),
             ),
             ("eval time (t)", eval_cell),
             ("updates (U)", state.step.to_string()),
@@ -628,7 +626,10 @@ mod tests {
         // The quoted comma is FIELD TEXT: a naive split sees 6 pieces for 5 columns,
         // which is exactly why the quoting is here.
         assert_eq!(row.split(',').count(), 6);
-        assert_eq!(crate::engine::reporting::format::csv_split_line(&row).len(), 5);
+        assert_eq!(
+            crate::engine::reporting::format::csv_split_line(&row).len(),
+            5
+        );
         assert_eq!(csv_row(&["a\"b".to_string()]), "\"a\"\"b\"");
         // An empty grid cell is an empty CSV field, never a missing column.
         assert_eq!(

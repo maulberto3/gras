@@ -27,12 +27,18 @@ impl RaceConfigBuilder {
     /// Make an informative metric count toward the RANKING: `score = fitness centre + Σ weight × metric centre`.
     pub fn set_selection_metric(mut self, label: impl Into<String>, weight: f32) -> Self {
         let label = label.into();
-        match self.cfg.ranking.selection_metrics
+        match self
+            .cfg
+            .ranking
+            .selection_metrics
             .iter_mut()
             .find(|m| m.label == label)
         {
             Some(term) => term.weight = weight,
-            None => self.cfg.ranking.selection_metrics
+            None => self
+                .cfg
+                .ranking
+                .selection_metrics
                 .push(crate::utils::fitness::SelectionMetric { label, weight }),
         }
         self
