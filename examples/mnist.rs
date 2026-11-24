@@ -9,7 +9,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::{die, EngineArgs};
+use common::{EngineArgs, die};
 use gras::flodl::tensor::Result as TensorResult;
 use gras::prelude::*;
 use gras::utils::race_steps::{deterministic_train_step, eval_one_step};
@@ -122,12 +122,12 @@ struct MnistTrainer {
     smoothing: f32,
     /// Last eval accuracy (from the previous step's report) — the metric that scales challenge jitter.
     last_accuracy: f32,
-    /// Anti-plateau knob (see `CHALLENGE_PROB`): every input value rolls at the decayed rate.
+    /// Anti-plateau knob (see `DEFAULT_CHALLENGE_PROB`): every input value rolls at the decayed rate.
     challenge_prob: f32,
 }
 
 impl MnistTrainer {
-    fn new(smoothing: f32) -> Self {
+    fn new(smoothing: f32, challenge_prob: f32) -> Self {
         Self {
             loss_fn: Box::new(move |pred: &Variable, y: &Variable| {
                 score::label_smoothing_cross_entropy_loss(pred, y, smoothing)
@@ -138,7 +138,7 @@ impl MnistTrainer {
             eval_batch: EVAL_BATCH_SIZE,
             smoothing,
             last_accuracy: 0.0,
-            challenge_prob: CHALLENGE_PROB,
+            challenge_prob,
         }
     }
 }
@@ -205,12 +205,17 @@ impl TabularStep for MnistTrainer {
         step: usize,
         ctx: &TabularContext<'_>,
     ) -> TensorResult<TabularStepReport> {
-        // Determinism: seed per (net, step) so dropout/jitter replay exactly
-        // across a resume.
-        gras::seed_step_randomness(ctx.net_seed, step as u64, 0);
         let loss_fn: gras::trainer::LossFn<'_> = &*self.loss_fn;
 
-        let (x, y) = ctx.data.train_batch(step as u64)?;
+        // Match `TabularTrainer`: the per-net call index drives dropout, and the
+        // attempt picks the batch. With the challenge at 0 this makes the custom
+        // trainer replay through the same path as Python's generic tabular trainer.
+        let h: u64 = ctx
+            .net_hash
+            .bytes()
+            .fold(0u64, |a, b| a.wrapping_add(b as u64))
+            .wrapping_add(ctx.env.attempt);
+        let (x, y) = ctx.data.train_batch_at(step as u64, ctx.env.attempt)?;
         // CHALLENGE: a decayed per-input roll, stronger for weak nets, linear to 0
         // over the NET's OWN step count (`net_step`) — a late-born net is not
         // handed the dregs of the knob the run clock would have left.
@@ -229,7 +234,7 @@ impl TabularStep for MnistTrainer {
         let train_loss = deterministic_train_step(
             ctx.net_seed,
             step as u64,
-            0,
+            h,
             net,
             optimizer,
             loss_fn,
@@ -289,7 +294,11 @@ fn jitter_inputs(
 /// Name recorded in `engine.json` (informational only).
 const RUN_NAME: &str = "mnist";
 /// Per-(net, step) chance an anti-plateau challenge fires (see `train_step`).
-const CHALLENGE_PROB: f32 = 0.15;
+///
+/// The default is OFF so the example follows the same deterministic training path
+/// as the generic `TabularTrainer` (and the Python binding). Raise it only when
+/// deliberately exploring the anti-plateau jitter.
+const DEFAULT_CHALLENGE_PROB: f32 = 0.0;
 
 /// Every knob the run has; each flag carries its own default, and `--help` lists them all.
 #[derive(clap::Parser, Debug)]
@@ -332,6 +341,10 @@ struct Cli {
     /// Name recorded in `engine.json` (informational only).
     #[arg(long, value_name = "NAME", default_value = RUN_NAME)]
     run_name: String,
+
+    /// Per-(net, step) chance the anti-plateau input challenge fires; `0` disables it.
+    #[arg(long, value_name = "P", default_value_t = DEFAULT_CHALLENGE_PROB)]
+    challenge_prob: f32,
 
     /// Hidden nodes per net: the upper sampling bound.
     #[arg(long, value_name = "N", default_value_t = 15)]
@@ -387,7 +400,7 @@ fn main() {
 
     // STEP B — fitness: the reported accuracy IS the ranking input, maximized.
     let fitness = Fitness::new(score::accuracy_score, Direction::Maximize, "accuracy");
-    let trainer = MnistTrainer::new(LABEL_SMOOTHING);
+    let trainer = MnistTrainer::new(LABEL_SMOOTHING, cli.challenge_prob);
 
     // Informative metric: mean top-1/runner-up logit gap — one extra history.csv column.
     // Unused while `.set_run_metrics` is commented out below; uncomment both for the column.

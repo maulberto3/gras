@@ -7,11 +7,11 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use gras::engine::config::{
-    CrossCullPolicy, LogLevel, MeanType, MutationCullPolicy, RaceConfigBuilder, TrainTicket,
-    DEFAULT_TOURNAMENT_SIZE,
-};
 use gras::SelectionMethod;
+use gras::engine::config::{
+    CrossCullPolicy, DEFAULT_TOURNAMENT_SIZE, LogLevel, MeanType, MutationCullPolicy,
+    RaceConfigBuilder, TrainTicket,
+};
 
 /// Live nets in the race (default; `--pop` overrides).
 pub const POP: usize = 20;

@@ -106,6 +106,7 @@ mod tests {
             SIGNAL,
             (ActionRule::Argmax, ACTING_TEMPERATURE),
             ActionRule::Argmax,
+            DEFAULT_CHALLENGE_PROB,
         );
         let blob = t.describe().expect("Reinforce describes itself");
         assert_eq!(blob["trainer"], "reinforce");
@@ -126,13 +127,14 @@ mod tests {
             SIGNAL,
             (ActionRule::Argmax, ACTING_TEMPERATURE),
             ActionRule::Argmax,
+            DEFAULT_CHALLENGE_PROB,
         )
         .describe()
         .expect("Reinforce describes itself");
         assert_eq!(era["exam"], "era");
         assert_eq!(blob["learning_rate"], LEARNING_RATE);
         assert_eq!(blob["grad_clip"], GRAD_CLIP);
-        assert_eq!(blob["challenge_prob"], CHALLENGE_PROB);
+        assert_eq!(blob["challenge_prob"], DEFAULT_CHALLENGE_PROB);
         assert_eq!(blob["challenge_policy"], "least_action");
         assert_eq!(
             blob["challenge_decay"],
@@ -187,6 +189,9 @@ mod tests {
     #[test]
     fn per_clock_exam_flag_parses_both_ways() {
         let parse = |args: &[&str]| <Cli as clap::Parser>::parse_from(args).per_clock_exam;
+        let challenge = |args: &[&str]| <Cli as clap::Parser>::parse_from(args).challenge_prob;
+        assert_eq!(challenge(&["cartpole"]), DEFAULT_CHALLENGE_PROB);
+        assert_eq!(challenge(&["cartpole", "--challenge-prob", "0.1"]), 0.1);
         assert!(
             parse(&["cartpole"]),
             "no flag ⇒ the flag's own default (the per-clock exam)"

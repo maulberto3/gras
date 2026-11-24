@@ -163,7 +163,10 @@ const GRAD_CLIP: f32 = 2.0;
 /// Actions the env accepts: 0 = push left, 1 = push right.
 const ACTIONS: usize = 2;
 /// Peak probability that a step fires a challenge (forced action).
-const CHALLENGE_PROB: f32 = 0.1;
+///
+/// `0.0` (the default, matching `Reinforce` and the Python binding) disables it;
+/// raise it only when deliberately exploring the anti-plateau forced action.
+const DEFAULT_CHALLENGE_PROB: f32 = 0.0;
 /// What a fired challenge forces: `Random` holds one drawn action for the whole
 /// episode, `LeastAction` re-picks the policy's least-preferred action per turn.
 const CHALLENGE_POLICY: ChallengePolicy = ChallengePolicy::LeastAction;
@@ -186,6 +189,7 @@ fn trainer(
     signal: Signal,
     acting: (ActionRule, f32),
     eval_acting: ActionRule,
+    challenge_prob: f32,
 ) -> Reinforce<CartPole> {
     Reinforce::new(CartPole::new(0.0, 0.0), device)
         .with_learning_rate(LEARNING_RATE)
@@ -203,7 +207,7 @@ fn trainer(
         // EXPERIMENTAL obs memory: `none`, or `delta`/`ema` appending a second observation width.
         .with_obs_memory(memory)
         .with_challenge(
-            CHALLENGE_PROB,
+            challenge_prob,
             CHALLENGE_POLICY,
             ChallengeDecay::Custom {
                 exponent: CHALLENGE_DECAY_EXPONENT,
@@ -321,6 +325,10 @@ struct Cli {
     #[arg(long, value_name = "NAME", default_value = "cartpole")]
     run_name: String,
 
+    /// Peak probability that a step fires the anti-plateau challenge; `0` disables it.
+    #[arg(long, value_name = "P", default_value_t = DEFAULT_CHALLENGE_PROB)]
+    challenge_prob: f32,
+
     /// Hidden nodes per net: the upper sampling bound.
     #[arg(long, value_name = "N", default_value_t = 20)]
     hidden_max: usize,
@@ -427,6 +435,7 @@ fn main() {
         signal,
         acting,
         eval_acting,
+        cli.challenge_prob,
     );
 
     // `--resume` continues a recorded run (its record wins); `--run-dir` names where a fresh one writes.
