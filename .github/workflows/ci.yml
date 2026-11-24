@@ -1,0 +1,119 @@
+name: CI
+
+# Builds the distributable artifacts that used to be made by hand with
+# `rm -rf dist && maturin build && maturin sdist`. Runs on every merge/push to
+# `dev`, and on demand from the Actions tab (Re-run jobs / Run workflow).
+on:
+  push:
+    branches: [dev]
+
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the gras crate to crates.io"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned so the wheel is linked against the same libtorch major/minor that
+  # `python/gras/__init__.py` and README.md document. The CPU distribution is
+  # ~200 MB; the cache below keeps it off the wire on most runs.
+  LIBTORCH_VERSION: "2.10.0+cpu"
+  LIBTORCH_URL: "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-2.10.0%2Bcpu.zip"
+  # Must be the directory that contains lib/ — `gras`'s build and the Python
+  # package both read this (env_setup.sh's local ~/.flodl path does not exist
+  # on a fresh runner).
+  LIBTORCH_PATH: ${{ github.workspace }}/libtorch
+  # Tests and examples link libtorch dynamically; LIBTORCH_PATH tells the build
+  # where it is, this tells the loader.
+  LD_LIBRARY_PATH: ${{ github.workspace }}/libtorch/lib
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Test, build wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache libtorch (CPU)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LIBTORCH_PATH }}
+          key: libtorch-${{ runner.os }}-${{ env.LIBTORCH_VERSION }}
+
+      - name: Install libtorch (CPU)
+        run: |
+          set -euo pipefail
+          if [ -f "$LIBTORCH_PATH/lib/libtorch_cpu.so" ]; then
+            echo "libtorch restored from cache: $LIBTORCH_PATH"
+            exit 0
+          fi
+          curl --fail --location --retry 3 --output /tmp/libtorch.zip "$LIBTORCH_URL"
+          rm -rf /tmp/libtorch-extract
+          unzip -q /tmp/libtorch.zip -d /tmp/libtorch-extract
+          mkdir -p "$(dirname "$LIBTORCH_PATH")"
+          mv /tmp/libtorch-extract/libtorch "$LIBTORCH_PATH"
+          test -f "$LIBTORCH_PATH/lib/libtorch_cpu.so"
+
+      # The crate declares rust-version = 1.91; pin the toolchain here so a
+      # breakage is never mistaken for a newer compiler regression.
+      - uses: dtolnay/rust-toolchain@1.91.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test (Rust)
+        run: cargo test -p gras --locked
+
+      # Packaging rehearsal only: builds the crate exactly as crates.io would
+      # receive it, then stops before upload. The real `cargo publish` is
+      # commented out below and stays manual until versions are bumped
+      # deliberately; it needs CARGO_REGISTRY_TOKEN, this step needs no secret.
+      - name: Verify crate packaging (dry run)
+        if: ${{ github.event_name == 'push' || inputs.publish != true }}
+        run: cargo publish -p gras --dry-run --locked
+
+      # - name: Publish to crates.io
+      #   if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == true }}
+      #   run: cargo publish -p gras --locked
+      #   env:
+      #     CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Set up Python 3.12 + uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Build wheel
+        run: uvx maturin@1.15.0 build --release --out dist
+
+      - name: Build sdist
+        run: uvx maturin@1.15.0 sdist --out dist
+
+      - name: Validate package metadata
+        run: uvx twine check dist/*
+
+      # Proves the wheel and its dynamic libtorch link actually work on a clean
+      # interpreter, not just that maturin produced a file.
+      - name: Smoke-test the wheel
+        run: |
+          set -euo pipefail
+          uv venv /tmp/smoke --python 3.12
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          /tmp/smoke/bin/python -c "import gras; print('gras', gras.__version__)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gras-engine-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

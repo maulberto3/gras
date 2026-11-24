@@ -1,3 +1,11 @@
+# ── Secrets ──────────────────────────────────────────────────────────────────
+# Local secrets stay local. CI never reads `.env` — it uses repository secrets
+# (currently none: the crates.io publish step is commented out, and PyPI
+# publishing is not part of CI at all).
+/.env
+/.env.*
+!/.env.example
+
 # ── Build output ────────────────────────────────────────────────────────────
 /target
 /target_cpu
