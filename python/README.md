@@ -1,4 +1,4 @@
-# gras-py — evolve and train neural networks from Python
+# gras-engine — evolve and train neural networks from Python
 
 `gras` does not hand-design the network: it searches. A population of small
 graphs is born, trained and ranked on one seeded stream, and the race ends with
@@ -9,11 +9,11 @@ to end, and the same seed gives the same run back.
 The Rust crate is [`gras`](https://crates.io/crates/gras); this package is its
 Python binding.
 
-**Distribution:** `gras-py` · **import:** `gras` (the PyPI name `gras` belongs to
-an unrelated package, so only the install name differs).
+**Distribution:** `gras-engine` · **import:** `gras` (the PyPI names `gras` and
+`gras-py` are unavailable, so only the install name differs).
 
 ```bash
-pip install gras-py
+pip install gras-engine
 ```
 
 ```python

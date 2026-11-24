@@ -1,7 +1,8 @@
 [project]
-# Distribution name only: `import gras` stays (see module-name below), because
-# the PyPI name "gras" belongs to an unrelated package (GRAScanning).
-name = "gras-py"
+# Distribution name only: `import gras` stays (see module-name below).
+# `gras-py` is unavailable: PyPI normalizes it to the existing `graspy` project.
+# `gras` itself belongs to an unrelated package (GRAScanning).
+name = "gras-engine"
 # Single source of truth: maturin reads `package.version` from
 # gras-py/Cargo.toml, which is also what `gras.__version__` reports
 # (`env!("CARGO_PKG_VERSION")`). Bump one file, not two.

@@ -11,7 +11,7 @@ resolution-markers = [
 ]
 
 [[package]]
-name = "gras-py"
+name = "gras-engine"
 source = { editable = "." }
 
 [package.optional-dependencies]
