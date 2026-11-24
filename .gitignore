@@ -84,3 +84,6 @@ examples/main.rs
 !/examples/mnist.rs
 !/examples/parallel_scope.rs
 !/examples/python/
+
+# ── Test artifacts ─────────────────────────────────
+tarpaulin-report.html
