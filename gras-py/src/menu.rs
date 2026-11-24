@@ -71,7 +71,7 @@ pub(crate) const MUTATION_CULLS: [&str; 4] = [
 pub(crate) const SELECTION_METHODS: [&str; 2] = ["roulette", "tournament"];
 
 /// `feature_split`: how the Input node's per-port feature masks are drawn.
-pub(crate) const FEATURE_SPLITS: [&str; 2] = ["random", "exclusive"];
+pub(crate) const FEATURE_SPLITS: [&str; 4] = ["full", "random", "exclusive", "chunks"];
 
 /// `log_level` — the card vocabulary, most to least talkative.
 pub(crate) const LOG_LEVELS: [&str; 5] = ["none", "summ", "minimal", "debug", "trace"];
@@ -219,6 +219,13 @@ pub(crate) fn menus() -> BTreeMap<&'static str, Vec<String>> {
     out.insert("crossover_cull_policy", crossover_cull_policies());
     out.insert("mutation_cull_policy", mutation_cull_policies());
     out.insert("crossover_selection", selection_methods());
+    out.insert(
+        "train_ticket",
+        gras::engine::config::TrainTicket::ALL_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    );
     out.insert("feature_split", feature_splits());
     out.insert("log_level", log_levels());
     out.insert("lr_schedule", lr_schedules());

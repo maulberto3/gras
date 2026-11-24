@@ -1,7 +1,7 @@
 [project]
 # Distribution name only: `import gras` stays (see module-name below), because
 # the PyPI name "gras" belongs to an unrelated package (GRAScanning).
-name = "gras-nn"
+name = "gras-py"
 # Single source of truth: maturin reads `package.version` from
 # gras-py/Cargo.toml, which is also what `gras.__version__` reports
 # (`env!("CARGO_PKG_VERSION")`). Bump one file, not two.
@@ -64,5 +64,8 @@ build-backend = "maturin"
 python-source = "python"
 module-name = "gras._core"
 manifest-path = "gras-py/Cargo.toml"
+# libtorch is a runtime dependency, not part of the wheel. Without this, maturin
+# auditwheel-repairs the wheel and copies ~480 MB of libtorch into it.
+compatibility = "linux"
 # Debug symbols are useless in a wheel and dominate its size.
 strip = true

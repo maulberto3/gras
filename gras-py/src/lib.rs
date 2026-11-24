@@ -24,6 +24,9 @@ use crate::topology::PyTopology;
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Before any engine can log: keep Rust output on Python's stdout so Jupyter
+    // does not decode it as a separate fd stream.
+    crate::logging::install_console_sink();
     m.add_function(wrap_pyfunction!(menus, m)?)?;
     m.add_function(wrap_pyfunction!(defaults::defaults, m)?)?;
     m.add_function(wrap_pyfunction!(losses, m)?)?;

@@ -104,6 +104,35 @@ def check_trainer_knobs() -> None:
         assert abs(recorded["learning_rate"] - 2e-3) < 1e-6, recorded
 
 
+def check_label_smoothing() -> None:
+    """The Rust label-smoothed CE is reachable from Python by name."""
+    assert "label_smoothing_ce" in losses(), losses()
+    with tempfile.TemporaryDirectory(prefix="gras-py-smooth-") as tmp:
+        cfg = RaceConfig(pop_size=4, champion_count=1, max_steps=1, log_level="none")
+        engine = RaceEngine(
+            DATA_DIR,
+            cfg,
+            seed=17,
+            run_dir=tmp,
+            loss="label_smoothing_ce(0.1)",
+        )
+        assert engine.run() == "MaxSteps"
+        meta = json.loads((Path(tmp) / "engine.json").read_text())
+        assert meta["trainer"]["loss"] == "label_smoothing_ce(0.1)", meta["trainer"]
+
+    try:
+        RaceEngine(
+            DATA_DIR,
+            RaceConfig(log_level="none"),
+            seed=0,
+            loss="label_smoothing_ce(1.5)",
+        )
+    except ValueError as exc:
+        assert "label_smoothing_ce" in str(exc), exc
+    else:
+        raise AssertionError("an out-of-range label smoothing must be refused")
+
+
 def check_engine_knobs() -> None:
     """The engine's own families reach the run, and start neutral.
 
@@ -234,19 +263,26 @@ def check_defaults_agree() -> None:
         "pop_size": cfg.pop_size,
         "champion_count": cfg.champion_count,
         "max_steps": cfg.max_steps,
+        "stop_plateau": cfg.stop_plateau,
         "checkpoint_every": cfg.checkpoint_every,
         "eval_share": cfg.eval_share,
         "smoothing_window": cfg.smoothing_window,
         "mean_type": cfg.mean_type,
+        "policy_scoped_fitness": cfg.policy_scoped_fitness,
+        "selection_metrics": cfg.selection_metrics,
         "train_merit_p_min": cfg.train_merit_p_min,
         "train_merit_p_max": cfg.train_merit_p_max,
-        "ticket_legs": cfg.ticket_legs,
+        "train_ticket": cfg.train_ticket,
+        "train_merit_learn_only": cfg.train_merit_learn_only,
         "init_probation_steps": cfg.init_probation_steps,
         "drift_prob": cfg.drift_prob,
         "log_level": cfg.log_level,
         "crossover_cull_policy": cfg.crossover_cull_policy,
         "mutation_cull_policy": cfg.mutation_cull_policy,
         "crossover_ops_pool": cfg.crossover_ops_pool,
+        "crossover_share": cfg.crossover_share,
+        "mutation_share": cfg.mutation_share,
+        "crossover_fitter_base": cfg.crossover_fitter_base,
         "mutation_probation_steps": cfg.mutation_probation_steps,
         "crossover_probation_steps": cfg.crossover_probation_steps,
         "hidden_dim_stride": cfg.hidden_dim_stride,
@@ -255,6 +291,9 @@ def check_defaults_agree() -> None:
         "standardize_op_pool": cfg.standardize_op_pool,
         "csv_export": cfg.csv_export,
         "trace_file": cfg.trace_file,
+        "save_weights_at_stop": cfg.save_weights_at_stop,
+        "save_optim": cfg.save_optim,
+        "worst_save_topology": cfg.worst_save_topology,
         "champion_save_topology": cfg.champion_save_topology,
         "run_name": cfg.run_name,
         "champion_previous_load": cfg.champion_previous_load,
@@ -264,8 +303,9 @@ def check_defaults_agree() -> None:
         want = d[key]
         same = abs(got - want) <= 1e-6 if isinstance(want, float) else got == want
         assert same, f"{key}: RaceConfig()={got!r} but defaults() reports {want!r}"
-    # The parents' draw is recorded with its K: `tournament(size=2)`.
-    assert d["crossover_selection"] == f"tournament(size={cfg.tournament_size})", d
+    # The crate default is fitness-proportionate roulette, not a tournament.
+    assert d["crossover_selection"] == "roulette", d
+    assert cfg.crossover_selection == "roulette", cfg
     # A `None` pool means the crate's range, not "no nodes"; `[]` means every member.
     assert d["hidden_dim_pool"] == "16..=64", d["hidden_dim_pool"]
     topo = d["topology_options"]
@@ -274,8 +314,10 @@ def check_defaults_agree() -> None:
     assert (topo["min_hidden_inputs_per_node"], topo["max_hidden_inputs_per_node"]) == (2, 15), topo
     assert (topo["min_hidden_outputs_per_node"], topo["max_hidden_outputs_per_node"]) == (2, 15), topo
     assert topo["feature_split"] is None, topo
+    assert topo["input_reach"] == (1.0, 1.0), topo
+    assert topo["unique_source_per_target"] is True, topo
     assert cfg.hidden_dim_pool is None and cfg.feature_split_pool == [], cfg
-    assert d["feature_split_pool"] == ["none", "split_random", "split_exclusive"], d
+    assert d["feature_split_pool"] == ["full", "split_random", "split_exclusive", "split_chunks"], d
 
 
 def check_unknown_names_are_refused() -> None:
@@ -578,6 +620,7 @@ def check_menu_entries() -> None:
 def main() -> None:
     check_log_level_knob()
     check_trainer_knobs()
+    check_label_smoothing()
     check_engine_knobs()
     check_defaults_agree()
     check_unknown_names_are_refused()

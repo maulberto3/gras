@@ -176,7 +176,9 @@ fn resume_rl(
     // process would otherwise resume silently (the subscriber is process-wide).
     LOGGING.call_once(|| {
         gras::engine::reporting::logging::init(
-            gras::RaceConfig::from_snapshot(&header.config).run.log_level,
+            gras::RaceConfig::from_snapshot(&header.config)
+                .run
+                .log_level,
             None,
         );
     });
@@ -634,7 +636,9 @@ impl PyRaceEngine {
         // Install the sink at the RECORDED level before construction can emit: in a fresh process a resume would otherwise be silent (the subscriber is process-wide, so an earlier…
         LOGGING.call_once(|| {
             gras::engine::reporting::logging::init(
-                gras::RaceConfig::from_snapshot(&header.config).run.log_level,
+                gras::RaceConfig::from_snapshot(&header.config)
+                    .run
+                    .log_level,
                 None,
             );
         });
