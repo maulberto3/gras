@@ -5,6 +5,8 @@ use comfy_table::presets::{UTF8_FULL, UTF8_FULL_CONDENSED};
 use comfy_table::{Cell, Table};
 use tracing::info;
 
+use crate::engine::reporting::logging::console_line;
+
 /// The shared renderer: a condensed table with an OPTIONAL column-header row.
 fn render(header: Option<&[&str]>, rows: &[Vec<String>]) -> String {
     let mut t = Table::new();
@@ -145,12 +147,12 @@ pub(crate) fn emit(text: &str) {
 /// but through `println!` rather than the level-filtered `tracing` console.
 pub(crate) fn emit_always(text: &str) {
     for line in text.lines() {
-        println!("{line}");
+        console_line(line);
     }
 }
 #[cfg(test)]
 mod tests {
-    use super::{card, kv, table, table_wrapped, wrap, PROSE_WIDTH};
+    use super::{PROSE_WIDTH, card, kv, table, table_wrapped, wrap};
 
     /// The ONE decision in these wrappers worth pinning: a key/value block has no header row
     /// banner names it), while a named table keeps the header that says what it holds.

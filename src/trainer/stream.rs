@@ -39,7 +39,6 @@ fn seeded_split(len: usize, train_ratio: f32, eval_ratio: f32, seed: u64) -> (Ve
     }
 }
 
-
 /// The class of every row when `targets` is one-hot (classification), else `None`.
 /// Regression and soft-label targets keep the uniform window — the engine casts
 /// targets to f32 on load, so this reads the same tensor the loss sees.
@@ -391,12 +390,9 @@ impl BatchStream {
     /// on. Rotated per checkpoint era; pure in `(run_seed, step)`.
     pub fn eval_batch(&self, dataset: &Dataset, step: u64) -> Result<(Tensor, Tensor)> {
         if let Some(groups) = &self.eval_classes {
-            let base = self
-                .run_seed
-                .wrapping_add(EVAL_STREAM_OFFSET);
+            let base = self.run_seed.wrapping_add(EVAL_STREAM_OFFSET);
             let seed = derive_seed(base, self.era_of(step) as usize);
-            let indices =
-                stratified_window(groups, self.eval_batch_size, step as usize, seed);
+            let indices = stratified_window(groups, self.eval_batch_size, step as usize, seed);
             return Self::gather(dataset, &indices);
         }
         let perm = self.eval_permutation(self.era_of(step));
@@ -622,15 +618,10 @@ mod tests {
             labels.extend(std::iter::repeat(class).take(n));
         }
         let n = labels.len();
-        let inputs = flodl::Tensor::from_f32(
-            &vec![0.0; n * 2],
-            &[n as i64, 2],
-            flodl::Device::CPU,
-        )
-        .unwrap();
+        let inputs =
+            flodl::Tensor::from_f32(&vec![0.0; n * 2], &[n as i64, 2], flodl::Device::CPU).unwrap();
         let targets =
-            crate::utils::tabular_data::one_hot(&labels, counts.len(), flodl::Device::CPU)
-                .unwrap();
+            crate::utils::tabular_data::one_hot(&labels, counts.len(), flodl::Device::CPU).unwrap();
         Dataset { inputs, targets }
     }
 
@@ -687,12 +678,8 @@ mod tests {
     #[test]
     fn non_one_hot_targets_keep_the_uniform_stream() {
         let n = 40usize;
-        let inputs = flodl::Tensor::from_f32(
-            &vec![0.0; n * 2],
-            &[n as i64, 2],
-            flodl::Device::CPU,
-        )
-        .unwrap();
+        let inputs =
+            flodl::Tensor::from_f32(&vec![0.0; n * 2], &[n as i64, 2], flodl::Device::CPU).unwrap();
         let values: Vec<f32> = (0..n)
             .flat_map(|i| {
                 let d = (i % 3) as f32 * 0.1;

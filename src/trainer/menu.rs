@@ -162,9 +162,14 @@ impl Loss {
         if let Some((head, rest)) = name.split_once('(') {
             let arg = rest.strip_suffix(')')?.trim();
             return match head.trim() {
-                "label_smoothing_ce" => Some(Self::LabelSmoothingCe {
-                    smoothing: arg.parse().ok()?,
-                }),
+                "label_smoothing_ce" => {
+                    let smoothing: f32 = arg.parse().ok()?;
+                    // ε outside [0, 1] makes the softened target stop being a
+                    // distribution; refuse the typo instead of training on it.
+                    (0.0..=1.0)
+                        .contains(&smoothing)
+                        .then_some(Self::LabelSmoothingCe { smoothing })
+                }
                 "smooth_l1" => Some(Self::SmoothL1 {
                     beta: arg.parse().ok()?,
                 }),
@@ -464,6 +469,21 @@ mod tests {
         // A focal `α` is not accepted, because it would do nothing: a two-arg form
         // is a typo that has to be caught, not silently halved.
         assert!(Loss::parse("focal(0.25,2)").is_none());
+    }
+
+    #[test]
+    fn label_smoothing_is_bounded() {
+        assert_eq!(
+            Loss::parse("label_smoothing_ce(0)"),
+            Some(Loss::LabelSmoothingCe { smoothing: 0.0 })
+        );
+        assert_eq!(
+            Loss::parse("label_smoothing_ce(1)"),
+            Some(Loss::LabelSmoothingCe { smoothing: 1.0 })
+        );
+        assert!(Loss::parse("label_smoothing_ce(-0.1)").is_none());
+        assert!(Loss::parse("label_smoothing_ce(1.1)").is_none());
+        assert!(Loss::parse("label_smoothing_ce(NaN)").is_none());
     }
 
     #[test]

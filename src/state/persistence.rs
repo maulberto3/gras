@@ -223,7 +223,9 @@ impl ConfigSnapshot {
             worst_save_topology: cfg.run.worst_save_topology,
             crossover_fitter_base: cfg.evolution.crossover_fitter_base,
             champion_previous_load: cfg.run.champion_previous_load,
-            champion_previous_dir: cfg.run.champion_previous_dir
+            champion_previous_dir: cfg
+                .run
+                .champion_previous_dir
                 .as_ref()
                 .map(|p| p.display().to_string()),
             champion_save_topology: cfg.run.champion_save_topology,
@@ -966,11 +968,7 @@ impl NetState {
 
     /// Stamp the `meta` block from the materialized network + run context — once per net
     /// right after its `Network` is built, never per step.
-    pub fn stamp_meta(
-        &mut self,
-        net: &crate::graph::network::Network,
-        run: &RunMetaCtx,
-    ) {
+    pub fn stamp_meta(&mut self, net: &crate::graph::network::Network, run: &RunMetaCtx) {
         use flodl::Module;
         let params = net.parameters();
         self.meta.param_tensors = Some(params.len());
@@ -1939,16 +1937,17 @@ mod tests {
         let all = ConfigSnapshot::from_config(&cfg, None, None);
         assert_eq!(
             all.feature_split, None,
-            "an all-three pool is not one policy"
+            "an all-four pool is not one policy"
         );
         assert_eq!(
             all.feature_split_pool,
-            vec!["none", "split_random", "split_exclusive"],
+            vec!["full", "split_random", "split_exclusive", "split_chunks"],
             "the record names the resolved pool, in draw order"
         );
         for (policy, wire) in [
             (FeatureSplitPolicy::Exclusive, "split_exclusive"),
             (FeatureSplitPolicy::Random, "split_random"),
+            (FeatureSplitPolicy::Chunks, "split_chunks"),
         ] {
             cfg.topology.feature_split_pool = vec![policy.to_string()];
             let snap = ConfigSnapshot::from_config(&cfg, None, None);
@@ -2010,9 +2009,9 @@ mod tests {
         let rl_cfg = crate::engine::RaceConfig {
             mode: crate::engine::config::RunMode::Rl,
             stop: crate::engine::config::StopConfig {
-        max_steps: Some(25),
-        ..Default::default()
-    },
+                max_steps: Some(25),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let rl = ConfigSnapshot::from_config(&rl_cfg, None, None);
@@ -2156,15 +2155,17 @@ mod tests {
         let topo = tiny_topology();
         let state = NetState::new(&topo, 0, None).unwrap();
         write_net_state(&dir, &state).unwrap();
-        assert!(dir
-            .join("nets")
-            .join(format!("{}.json", state.hash))
-            .exists());
+        assert!(
+            dir.join("nets")
+                .join(format!("{}.json", state.hash))
+                .exists()
+        );
         remove_net_state(&dir, &state.hash).unwrap();
-        assert!(!dir
-            .join("nets")
-            .join(format!("{}.json", state.hash))
-            .exists());
+        assert!(
+            !dir.join("nets")
+                .join(format!("{}.json", state.hash))
+                .exists()
+        );
     }
 
     #[test]

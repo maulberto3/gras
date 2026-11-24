@@ -135,19 +135,23 @@ pub enum FeatureSplitPolicy {
     /// **Exclusive** — every feature lands in exactly one port (a true partition): drawn as "each
     /// feature picks one random port".
     Exclusive,
-    /// **Random** — every port flips an independent `p = 0.5` coin per feature.
-    /// A feature can land in several ports, and some features may go unused.
+    /// **Random** — every port flips an independent `p = 0.5` coin per feature. Fresh draws repair
+    /// any feature that no port picked, so every input is seen at least once; overlap is allowed.
     Random,
-    /// **Inherited** — the rows were RECOMBINED from two parents, so they are neither a fresh
-    /// partition (`Exclusive`) nor a fresh coin flip (`Random`): a per-port mix of two partitions
-    Inherited,
+    /// **Chunks** — the features are split into balanced, contiguous, ordered blocks: port 0 owns
+    /// the first block, port 1 the next, and so on. Earlier ports take any remainder.
+    Chunks,
+    /// **Crossover** — the rows were RECOMBINED from two parents, so they are neither a fresh
+    /// partition (`Exclusive`) nor a fresh coin flip (`Random`): a per-port mix of two partitions.
+    #[serde(rename = "crossover", alias = "inherited")]
+    Crossover,
 }
 
 impl FeatureSplitPolicy {
-    /// Whether a run's pool may DRAW this policy for a newborn. `Inherited` describes
-    /// provenance, so it can only arrive through crossover.
+    /// Whether a run's pool may DRAW this policy for a newborn. `Crossover` describes provenance,
+    /// so it can only arrive through crossover.
     pub fn is_drawable(self) -> bool {
-        !matches!(self, FeatureSplitPolicy::Inherited)
+        !matches!(self, FeatureSplitPolicy::Crossover)
     }
 }
 
@@ -159,6 +163,30 @@ fn split_rows_are_partition(rows: &[Vec<u8>], input_dim: usize) -> bool {
             .count()
             == 1
     })
+}
+
+/// Whether `rows` are ordered, contiguous CHUNKS: a partition whose non-empty rows each own a
+/// contiguous run of feature indices, in strictly increasing port order.
+fn split_rows_are_chunks(rows: &[Vec<u8>], input_dim: usize) -> bool {
+    if !split_rows_are_partition(rows, input_dim) {
+        return false;
+    }
+    let mut next = 0usize;
+    for row in rows {
+        let owned: Vec<usize> = row
+            .iter()
+            .enumerate()
+            .filter_map(|(feat, bit)| (*bit != 0).then_some(feat))
+            .collect();
+        if owned.is_empty() {
+            continue;
+        }
+        if owned[0] < next || owned.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+            return false;
+        }
+        next = owned[owned.len() - 1] + 1;
+    }
+    true
 }
 
 /// `1.0` — the historical wiring: one Input port per hidden node, every node may read the input.
@@ -392,7 +420,7 @@ impl Topology {
         match policy {
             // Provenance, not a draw rule: the only way to get these rows is to inherit
             // them, so drawing is a no-op rather than a guess at what they ''should'' be.
-            FeatureSplitPolicy::Inherited => return,
+            FeatureSplitPolicy::Crossover => return,
             FeatureSplitPolicy::Exclusive => {
                 // Each feature picks one random port: by construction every feature is placed
                 // exactly once and none is shared.
@@ -402,13 +430,40 @@ impl Topology {
                     masks[port][feat] = 1;
                 }
             }
+            FeatureSplitPolicy::Chunks => {
+                // Balanced contiguous blocks, in feature order: earlier ports take the remainder.
+                let base = input_dim / n_ports;
+                let extra = input_dim % n_ports;
+                let mut start = 0usize;
+                for (port, mask) in masks.iter_mut().enumerate() {
+                    let len = base + usize::from(port < extra);
+                    for bit in mask.iter_mut().skip(start).take(len) {
+                        *bit = 1;
+                    }
+                    start += len;
+                }
+            }
             FeatureSplitPolicy::Random => {
-                // Independent coin flip per (port, feature): overlaps allowed, and some
-                // features may go unused.
+                // Independent coin flip per (port, feature): overlaps allowed. A fresh draw then
+                // repairs every feature nobody picked, so the policy still uses ALL inputs.
                 for mask in masks.iter_mut() {
                     for slot in mask.iter_mut() {
                         *slot = u8::from(self.rng.f32() < 0.5);
                     }
+                }
+                let mut load: Vec<usize> = masks
+                    .iter()
+                    .map(|mask| mask.iter().filter(|bit| **bit != 0).count())
+                    .collect();
+                for feat in 0..input_dim {
+                    if masks.iter().any(|mask| mask[feat] != 0) {
+                        continue;
+                    }
+                    let port = (0..n_ports)
+                        .min_by_key(|p| load[*p])
+                        .expect("n_ports is at least one");
+                    masks[port][feat] = 1;
+                    load[port] += 1;
                 }
             }
         }
@@ -458,17 +513,20 @@ impl Topology {
                     .unwrap_or_else(|| rows[i % rows.len()].clone())
             })
             .collect();
-        // PADDING BREAKS AN `Exclusive` CLAIM.
+        // PADDING (AND DRIFT) CAN BREAK A STRUCTURAL CLAIM. The rows still stay as genome; only
+        // the label follows their content.
         let partition = split_rows_are_partition(&masks, input_dim);
+        let chunks = split_rows_are_chunks(&masks, input_dim);
         self.nodes[input].feature_masks = Some(masks);
-        self.options.feature_split = Some(match policy.unwrap_or(FeatureSplitPolicy::Inherited) {
-            FeatureSplitPolicy::Exclusive if !partition => FeatureSplitPolicy::Inherited,
+        self.options.feature_split = Some(match policy.unwrap_or(FeatureSplitPolicy::Crossover) {
+            FeatureSplitPolicy::Exclusive if !partition => FeatureSplitPolicy::Crossover,
+            FeatureSplitPolicy::Chunks if !chunks => FeatureSplitPolicy::Crossover,
             kept => kept,
         });
     }
 
     /// Reconcile a LOADED blueprint with the rule "rows present ⇒ policy present": a record written
-    /// before `Inherited` existed (or by the crossover bug it fixes) can carry masks under
+    /// before `Crossover` existed (or by the crossover bug it fixes) can carry masks under
     pub fn reconcile_split_policy(&mut self) {
         if self.options.feature_split.is_none()
             && self
@@ -476,16 +534,26 @@ impl Topology {
                 .iter()
                 .any(|n| n.kind == NodeKind::Input && n.feature_masks.is_some())
         {
-            self.options.feature_split = Some(FeatureSplitPolicy::Inherited);
+            self.options.feature_split = Some(FeatureSplitPolicy::Crossover);
             return;
         }
-        // And the other direction: a record can STATE `Exclusive` while carrying rows
-        // a partition (a port the rebuild added, or one an older build padded).
-        if self.options.feature_split == Some(FeatureSplitPolicy::Exclusive) {
+        // And the other direction: a record can STATE `Exclusive` or `Chunks` while carrying rows
+        // that no longer keep that promise (a port the rebuild added, drift, or an older padding).
+        if matches!(
+            self.options.feature_split,
+            Some(FeatureSplitPolicy::Exclusive | FeatureSplitPolicy::Chunks)
+        ) {
             let input_dim = self.options.input_dim.unwrap_or(1);
             if let Some(masks) = self.input_feature_masks() {
-                if !split_rows_are_partition(&masks, input_dim) {
-                    self.options.feature_split = Some(FeatureSplitPolicy::Inherited);
+                let valid = match self.options.feature_split {
+                    Some(FeatureSplitPolicy::Exclusive) => {
+                        split_rows_are_partition(&masks, input_dim)
+                    }
+                    Some(FeatureSplitPolicy::Chunks) => split_rows_are_chunks(&masks, input_dim),
+                    _ => true,
+                };
+                if !valid {
+                    self.options.feature_split = Some(FeatureSplitPolicy::Crossover);
                 }
             }
         }
@@ -1471,11 +1539,21 @@ impl Topology {
         }
         // The rebuild can ADD an Input port, and a port the rebuild added keeps every feature —
         // a partition plus a cover-all port is no longer "each feature in exactly one port".
-        if self.options.feature_split == Some(FeatureSplitPolicy::Exclusive) {
+        if matches!(
+            self.options.feature_split,
+            Some(FeatureSplitPolicy::Exclusive | FeatureSplitPolicy::Chunks)
+        ) {
             let input_dim = self.options.input_dim.unwrap_or(1);
             if let Some(masks) = self.input_feature_masks() {
-                if !split_rows_are_partition(&masks, input_dim) {
-                    self.options.feature_split = Some(FeatureSplitPolicy::Inherited);
+                let valid = match self.options.feature_split {
+                    Some(FeatureSplitPolicy::Exclusive) => {
+                        split_rows_are_partition(&masks, input_dim)
+                    }
+                    Some(FeatureSplitPolicy::Chunks) => split_rows_are_chunks(&masks, input_dim),
+                    _ => true,
+                };
+                if !valid {
+                    self.options.feature_split = Some(FeatureSplitPolicy::Crossover);
                 }
             }
         }
@@ -1690,12 +1768,15 @@ pub const DEFAULT_HIDDEN_POOL: std::ops::RangeInclusive<usize> = 16..=64;
 /// dropout rate is re-drawn under the run's cap.
 pub const DEFAULT_TOPOLOGY_DRIFT: f32 = 0.1;
 
-/// Parse a recorded (or user-given) feature-split spelling: `"random"`,
-/// `"exclusive"`, `"inherited"`, or the `"split_*"` wire form `engine.json` records.
+/// Parse a recorded (or user-given) feature-split spelling: `"random"`, `"exclusive"`,
+/// `"chunks"`, `"crossover"` (with `"inherited"` kept for old records), or the `"split_*"` wire
+/// form `engine.json` records.
 pub(crate) fn parse_feature_split_wire(raw: &str) -> Option<FeatureSplitPolicy> {
     let raw = raw.to_ascii_lowercase();
-    if raw.contains("inherited") {
-        Some(FeatureSplitPolicy::Inherited)
+    if raw.contains("crossover") || raw.contains("inherited") {
+        Some(FeatureSplitPolicy::Crossover)
+    } else if raw.contains("chunks") {
+        Some(FeatureSplitPolicy::Chunks)
     } else if raw.contains("exclusive") {
         Some(FeatureSplitPolicy::Exclusive)
     } else if raw.contains("random") {
@@ -1705,13 +1786,15 @@ pub(crate) fn parse_feature_split_wire(raw: &str) -> Option<FeatureSplitPolicy> 
     }
 }
 
-/// One POOL entry: `Some(None)` is the `none` policy (no split), `Some(Some(_))` a drawable policy,
-/// `None` an unknown spelling.
+/// One POOL entry: `Some(None)` is the full-vector policy (no split), `Some(Some(_))` a drawable
+/// policy, `None` an unknown spelling. `none`/`off` stay accepted for old run records; new records
+/// spell the no-split choice `full`.
 pub(crate) fn parse_feature_split_pool_entry(raw: &str) -> Option<Option<FeatureSplitPolicy>> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "none" | "off" | "split_none" => Some(None),
+        "full" | "none" | "off" | "split_full" | "split_none" => Some(None),
         "exclusive" | "split_exclusive" => Some(Some(FeatureSplitPolicy::Exclusive)),
         "random" | "split_random" => Some(Some(FeatureSplitPolicy::Random)),
+        "chunks" | "split_chunks" => Some(Some(FeatureSplitPolicy::Chunks)),
         _ => None,
     }
 }
@@ -3192,9 +3275,9 @@ mod fanout_bounds_tests {
     }
 
     #[test]
-    fn random_feature_masks_are_per_port_and_may_overlap() {
-        // Random flips an independent coin per (port, feature): no exclusivity,
-        // only guarantees are the shape and that it is not degenerate.
+    fn random_feature_masks_are_per_port_and_cover_every_input() {
+        // Random flips an independent coin per (port, feature), then repairs every feature
+        // nobody picked: overlap stays allowed, but no input may be invisible.
         let opts = TopologyOptions {
             input_dim: Some(8),
             output_dim: Some(1),
@@ -3213,6 +3296,12 @@ mod fanout_bounds_tests {
             "every mask spans input_dim"
         );
         assert!(masks.iter().flatten().all(|b| *b <= 1), "masks are 0/1");
+        for feat in 0..8 {
+            assert!(
+                masks.iter().any(|m| m[feat] == 1),
+                "fresh Random must cover feature {feat}"
+            );
+        }
         let ones: usize = masks
             .iter()
             .map(|m| m.iter().filter(|b| **b == 1).count())
@@ -3221,6 +3310,59 @@ mod fanout_bounds_tests {
             ones > 0 && ones < masks.len() * 8,
             "random masks should be mixed, got {ones} ones"
         );
+    }
+
+    #[test]
+    fn chunks_are_balanced_contiguous_and_ordered() {
+        let opts = TopologyOptions {
+            input_dim: Some(7),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let mut g = Topology::new(12, Some(opts));
+        g.nodes.push(Node::new_input(0, 3));
+        g.assign_feature_masks(FeatureSplitPolicy::Chunks);
+
+        let masks = g.input_feature_masks().expect("chunks assigned");
+        assert_eq!(
+            masks,
+            vec![
+                vec![1, 1, 1, 0, 0, 0, 0],
+                vec![0, 0, 0, 1, 1, 0, 0],
+                vec![0, 0, 0, 0, 0, 1, 1],
+            ],
+            "earlier ports take the remainder, blocks stay contiguous"
+        );
+    }
+
+    #[test]
+    fn a_broken_chunks_claim_is_relabelled_crossover() {
+        let opts = TopologyOptions {
+            input_dim: Some(4),
+            output_dim: Some(1),
+            ..Default::default()
+        };
+        let mut g = Topology::new(13, Some(opts));
+        g.nodes.push(Node::new_input(0, 3));
+        g.install_input_feature_masks(
+            &[vec![0, 1, 0, 0], vec![1, 0, 0, 0], vec![0, 0, 1, 1]],
+            Some(FeatureSplitPolicy::Chunks),
+        );
+        assert_eq!(
+            g.options.feature_split,
+            Some(FeatureSplitPolicy::Crossover),
+            "out-of-order rows cannot keep the chunks label"
+        );
+    }
+
+    #[test]
+    fn crossover_serde_accepts_the_old_inherited_spelling() {
+        assert_eq!(
+            serde_json::to_string(&FeatureSplitPolicy::Crossover).unwrap(),
+            "\"crossover\""
+        );
+        let old: FeatureSplitPolicy = serde_json::from_str("\"inherited\"").unwrap();
+        assert_eq!(old, FeatureSplitPolicy::Crossover);
     }
 
     #[test]
@@ -3397,7 +3539,7 @@ mod fanout_bounds_tests {
     }
 
     /// The LABEL follows the CONTENT, in the one place rows are installed: an inherited row set
-    /// with no stated provenance is `Inherited`, never `None`.
+    /// with no stated provenance is `Crossover`, never `None`.
     #[test]
     fn installing_inherited_rows_stamps_a_matching_policy() {
         let opts = TopologyOptions {
@@ -3412,10 +3554,10 @@ mod fanout_bounds_tests {
             g
         };
 
-        // No provenance supplied → `Inherited` (the only true statement).
+        // No provenance supplied → `Crossover` (the only true statement).
         let mut g = build();
         g.install_input_feature_masks(&[vec![0, 1, 0, 0]], None);
-        assert_eq!(g.options.feature_split, Some(FeatureSplitPolicy::Inherited));
+        assert_eq!(g.options.feature_split, Some(FeatureSplitPolicy::Crossover));
         assert!(g.input_feature_masks().is_some());
 
         // Stated provenance is kept verbatim.
@@ -3428,15 +3570,15 @@ mod fanout_bounds_tests {
         g.assign_feature_masks(FeatureSplitPolicy::Exclusive);
         assert_eq!(g.options.feature_split, Some(FeatureSplitPolicy::Exclusive));
 
-        // And `Inherited` is never drawable: it does not invent rows.
+        // And `Crossover` is never drawable: it does not invent rows.
         let mut g = build();
-        g.assign_feature_masks(FeatureSplitPolicy::Inherited);
+        g.assign_feature_masks(FeatureSplitPolicy::Crossover);
         assert!(
             g.input_feature_masks().is_none(),
-            "Inherited is provenance, not a draw rule"
+            "Crossover is provenance, not a draw rule"
         );
         assert_eq!(g.options.feature_split, None);
-        assert!(!FeatureSplitPolicy::Inherited.is_drawable());
+        assert!(!FeatureSplitPolicy::Crossover.is_drawable());
     }
 
     /// `Exclusive` is the one checkable claim a split makes — every feature owned EXACTLY once —
@@ -3485,7 +3627,7 @@ mod fanout_bounds_tests {
         g.reconcile_split_policy();
         assert_eq!(
             g.options.feature_split,
-            Some(FeatureSplitPolicy::Inherited),
+            Some(FeatureSplitPolicy::Crossover),
             "a cover-all port breaks the partition, so the label follows the rows"
         );
     }
@@ -3510,7 +3652,7 @@ mod fanout_bounds_tests {
         let loaded = Topology::from_json(&json.to_string()).unwrap();
         assert_eq!(
             loaded.options.feature_split,
-            Some(FeatureSplitPolicy::Inherited)
+            Some(FeatureSplitPolicy::Crossover)
         );
         assert!(loaded.input_feature_masks().is_some());
 

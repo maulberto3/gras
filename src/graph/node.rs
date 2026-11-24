@@ -592,7 +592,7 @@ mod tests {
         );
         let g10d = g10.data().to_f32_vec().unwrap();
         let r10 = &g10d[0..10]; // row 0: [1..=10]
-                                // Group 0 = {1, 2, 3} → z-score [-1.22, 0, 1.22].
+        // Group 0 = {1, 2, 3} → z-score [-1.22, 0, 1.22].
         assert!((r10[0] + 1.2247).abs() < 1e-3, "uneven group 0 start");
         assert!(r10[1].abs() < 1e-4, "uneven group 0 middle");
         assert!((r10[2] - 1.2247).abs() < 1e-3, "uneven group 0 end");

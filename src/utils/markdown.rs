@@ -1,7 +1,7 @@
 //! Markdown rendering for topologies — includes nodes table, edge list,
 //! ASCII wiring diagram, and Mermaid flowchart.
 
-use super::ascii::{edge_list, render_wire_diagram, AsciiNode};
+use super::ascii::{AsciiNode, edge_list, render_wire_diagram};
 use super::mermaid::{split_policy_name, topology_mermaid};
 use crate::graph::network::Network;
 use crate::graph::node::NodeKind;
@@ -239,7 +239,19 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
             Some(FeatureSplitPolicy::Random) => format!(
                 "`random` flips a coin per (port, feature), so sharing is normal — {seen} of {input_dim} features are seen by some port."
             ),
-            Some(FeatureSplitPolicy::Inherited) => "`inherited` rows are a per-port crossover blend, not the run's draw policy: a blend of partitions need not be one."
+            Some(FeatureSplitPolicy::Chunks) => {
+                if shared.is_empty() && unowned.is_empty() {
+                    "`chunks` is an ordered, contiguous partition: every feature is owned by exactly one block."
+                        .to_string()
+                } else {
+                    format!(
+                        "`chunks` claims an ordered contiguous partition, but {} feature(s) are shared and {} feature(s) reach no port.",
+                        shared.len(),
+                        unowned.len()
+                    )
+                }
+            }
+            Some(FeatureSplitPolicy::Crossover) => "`crossover` rows are a per-port crossover blend, not the run's draw policy: a blend of partitions need not be one."
                 .to_string(),
             None => "No policy recorded — read the rows.".to_string(),
         };
@@ -377,7 +389,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("\n| **Arrow label (Graph)** | the wire's own activation — per-port, so one node can emit `mish` to one neighbor and `tanh` to another. Equal labels from the same node = same signal; duplicates are impossible (dedup collapses them). |");
     out.push_str("\n| **Dashed stub `selu (input)` / `mish (orphan)`** | orphaned port — an input nothing feeds / an output nothing reads (mermaid's counterpart of the ASCII `*`). |");
     out.push_str("\n| **`in <n>` / `out <n>`** | dataset shape (fixed by the problem). |");
-    out.push_str("\n| **Input box → second line** | the feature split when the net has one: `split <policy> · <ports>p · <seen>/<n> seen`. Present for ANY policy that carries rows (`exclusive`, `random`, `inherited`); absent for `none`, where every port already carries the full mixed vector — that is the common case, and why the box is usually one line. Per-port rows are in *Feature split* above. |");
+    out.push_str("\n| **Input box → second line** | the feature split when the net has one: `split <policy> · <ports>p · <seen>/<n> seen`. Present for ANY policy that carries rows (`exclusive`, `random`, `chunks`, `crossover`); absent for `full`, where every port already carries the full mixed vector — that is the common case, and why the box is usually one line. Per-port rows are in *Feature split* above. |");
     out.push_str("\n| **`na` in `Combine` / `Std`** | no per-node override, so the forward pass uses `Add` / no standardisation. `na` is not a missing gene: it is the gene spelled as its default (the diversity metric folds `None` and `Identity` into one token for the same reason). |");
     out.push_str("\n| **Nodes table → `Sources`** | which output port feeds each input port (`n1_o2` = output 2 of node 1), one entry per port in port order — the `k`-th entry feeds `i<k>`; `*` = an unwired port (never left behind by `finalize`). |");
     out.push_str("\n| **Nodes table → `In` / `Out` with `(Nw)`** | PORT counts; a parenthesised wire count appears only where the two differ (`Out 2 (3w)` = 2 ports, 3 wires). A graph built now is one-wire-per-socket, so a `(Nw)` cell can only come from a legacy blueprint — the wiring diagram draws one slot per WIRE, which is why its `Out` slots can outnumber its ports. |");
@@ -675,9 +687,10 @@ mod tests {
         );
     }
 
-    /// A BLENDED child names itself `inherited`, not `crossover`: crossover is the MECHANISM, and the run's `feature_split` pool never contains it…
+    /// A BLENDED child names itself `crossover` — the provenance of rows the run's draw pool
+    /// never contains.
     #[test]
-    fn a_blended_split_is_labelled_inherited_not_crossover() {
+    fn a_blended_split_is_labelled_crossover() {
         let mut g = Topology::new(
             0,
             Some(TopologyOptions {
@@ -706,12 +719,12 @@ mod tests {
         // Two rows that share feature 1 and leave feature 2 unowned: exactly what a per-port
         // blend of two partitions looks like, and why its total can pass 100%.
         g.nodes[0].feature_masks = Some(vec![vec![1, 1, 0], vec![0, 1, 0]]);
-        g.options.feature_split = Some(FeatureSplitPolicy::Inherited);
+        g.options.feature_split = Some(FeatureSplitPolicy::Crossover);
         let md = topology_markdown(&g, None);
-        assert!(md.contains("`inherited` over"), "{md}");
+        assert!(md.contains("`crossover` over"), "{md}");
         assert!(
-            !md.contains("`crossover` over"),
-            "`crossover` is the mechanism, never the label:\n{md}"
+            !md.contains("`inherited` over"),
+            "the old provenance spelling is gone from new records:\n{md}"
         );
         assert!(
             md.contains("crossover blend"),

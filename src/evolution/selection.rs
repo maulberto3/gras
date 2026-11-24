@@ -408,7 +408,7 @@ mod tests {
         );
         assert_eq!(ranked, vec![1, 2, 0], "the field, best-first");
     } // Roulette sanity: the wheel must be biased toward higher-ranked nets
-      // in expectation (3:1 for weights 3,1) and deterministic under a seed.
+    // in expectation (3:1 for weights 3,1) and deterministic under a seed.
     #[test]
     fn test_roulette_biased_toward_higher_score() {
         let scores = [3.0, 1.0];

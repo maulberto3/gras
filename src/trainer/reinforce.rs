@@ -2,14 +2,14 @@
 
 use crate::graph::network::Network;
 use crate::trainer::challenge::{
-    challenge_fires, forced_action, ChallengeDecay, ChallengePolicy, ForcedAction,
+    ChallengeDecay, ChallengePolicy, ForcedAction, challenge_fires, forced_action,
 };
 use crate::trainer::core::{RlContext, RlStep, RlStepMeta, RlStepReport};
 use crate::trainer::env::Env;
 use crate::utils::fitness::Metric;
 use crate::utils::race_steps::train_one_step_pred_only;
-use flodl::nn::optim::Optimizer;
 use flodl::nn::Module;
+use flodl::nn::optim::Optimizer;
 use flodl::tensor::Result;
 use flodl::{Device, Tensor, Variable};
 use std::cmp::Ordering;
@@ -28,7 +28,8 @@ const DEFAULT_EVAL_MATCHES_PER_STEP: usize = 5;
 /// Peak probability that a net's step fires a challenge. OFF by default: a
 /// challenge rewrites what the update sees, so it is an explicit opt-in
 /// ([`Reinforce::with_challenge`]), never something a `Reinforce::new` run does
-/// behind the caller's back. The cartpole recipe passes `0.1`.
+/// behind the caller's back. The cartpole example also leaves it at `0.0` by
+/// default so the Rust and Python runs share the same training path.
 const DEFAULT_CHALLENGE_PROB: f32 = 0.0;
 
 /// Challenge decay shape (default: the cartpole recipe's `custom:0.5`, i.e.
@@ -649,11 +650,7 @@ fn eval_seed_base(run_seed: u64) -> u64 {
 
 /// The ERA a clock sits: `era_len` clocks share one — the opt-in axis (`with_per_clock_exam(false)`), where a net read at clock 118 and a newborn read at 121 are graded on…
 fn eval_era_of(step: usize, era_len: usize) -> usize {
-    if era_len == 0 {
-        step
-    } else {
-        step / era_len
-    }
+    if era_len == 0 { step } else { step / era_len }
 }
 
 /// The policy's preferred action: the argmax over its action values, ties to the lowest index.

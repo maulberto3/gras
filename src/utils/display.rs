@@ -162,7 +162,7 @@ impl Display for MutationMethod {
 variant_names!(FeatureSplitPolicy {
     FeatureSplitPolicy::Exclusive => "split_exclusive",
     FeatureSplitPolicy::Random => "split_random",
-    // The enum is `Inherited` because that is the PROVENANCE kind (rows from a parent, not a fresh
-    // draw); every reader calls it `crossover`, which is the operator that produces mixed rows.
-    FeatureSplitPolicy::Inherited => "split_crossover",
+    FeatureSplitPolicy::Chunks => "split_chunks",
+    // PROVENANCE, not a fresh draw: the operator that produces these rows is crossover.
+    FeatureSplitPolicy::Crossover => "split_crossover",
 });

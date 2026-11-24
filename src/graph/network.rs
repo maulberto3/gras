@@ -1053,8 +1053,18 @@ mod tests {
     #[test]
     fn same_gene_ignores_input_width_but_not_output_width() {
         let n = Node::new_hidden(1, 2, 2);
-        assert!(crate::engine::breed::child::same_gene(&n, (4, 16), &n, (64, 16)));
-        assert!(!crate::engine::breed::child::same_gene(&n, (4, 16), &n, (64, 32)));
+        assert!(crate::engine::breed::child::same_gene(
+            &n,
+            (4, 16),
+            &n,
+            (64, 16)
+        ));
+        assert!(!crate::engine::breed::child::same_gene(
+            &n,
+            (4, 16),
+            &n,
+            (64, 32)
+        ));
     }
 
     fn rand_input(batch: i64, input_dim: usize) -> Variable {
@@ -1308,7 +1318,7 @@ mod tests {
         assert_eq!(v["kind_counts"][0], 1); // one Input
         assert_eq!(v["kind_counts"][1], 1); // one Hidden
         assert_eq!(v["kind_counts"][2], 1); // one Output
-                                            // input (Identity) + output (Identity) + the widened hidden (ReLU)
+        // input (Identity) + output (Identity) + the widened hidden (ReLU)
         let acts = v["activation_counts"].as_array().unwrap();
         assert!(acts.contains(&serde_json::json!(["ReLU", 1])));
         assert!(acts.contains(&serde_json::json!(["Identity", 2])));
@@ -1451,8 +1461,8 @@ mod tests {
         // finalize trims ports BEFORE we stamp per-port activations
         // port count is only final after trim) — mirrors the engine flow.
         g.finalize(); // Force the 2-port wiring deterministically: random finalize may orphan a
-                      // port and trim it, so re-stamp both ports and wire n2's inputs by hand —
-                      // one wire per input port, so n2's own wires go first.
+        // port and trim it, so re-stamp both ports and wire n2's inputs by hand —
+        // one wire per input port, so n2's own wires go first.
         g.nodes[1].num_outputs = 2;
         g.connections.retain(|c| c.to.node != 2);
         g.connections.push(Connection {

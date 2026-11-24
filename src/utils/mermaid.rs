@@ -9,9 +9,11 @@ pub(crate) fn split_policy_name(policy: Option<FeatureSplitPolicy>) -> &'static 
     match policy {
         Some(FeatureSplitPolicy::Exclusive) => "exclusive",
         Some(FeatureSplitPolicy::Random) => "random",
-        // PROVENANCE, not a policy: the run's pool can only draw `exclusive` or `random` (`FeatureSplitPolicy::is_drawable`), so calling this `crossover` read like a third…
-        Some(FeatureSplitPolicy::Inherited) => "inherited",
-        None => "rows",
+        Some(FeatureSplitPolicy::Chunks) => "chunks",
+        // PROVENANCE: mixed rows came from crossover, which is not a drawable pool entry.
+        Some(FeatureSplitPolicy::Crossover) => "crossover",
+        // No policy + no rows is `full`; old rows with no recorded label are still just rows.
+        None => "full",
     }
 }
 

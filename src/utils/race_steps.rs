@@ -1,7 +1,7 @@
 //! Per-step training/eval primitives for the step-race engine.
 
-use flodl::nn::optim::Optimizer;
 use flodl::nn::Module;
+use flodl::nn::optim::Optimizer;
 use flodl::tensor::Result;
 use flodl::{Tensor, Variable};
 
