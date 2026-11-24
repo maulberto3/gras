@@ -75,8 +75,7 @@ fn main() {
     let topo = initial_population(&config, SEED).remove(0);
 
     for rows in ROW_COUNTS {
-        let ds =
-            support::synthetic_classification(rows, FEATURES, CLASSES, SEED, device);
+        let ds = support::synthetic_classification(rows, FEATURES, CLASSES, SEED, device);
         let stream = BatchStream::new(SEED, BATCH, PoolSplit::of(&ds, 0.2, SEED));
 
         // The stream: one train + one eval batch materialization per net per

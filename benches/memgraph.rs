@@ -64,8 +64,7 @@ fn main() {
     let data_dir = root.join("data/flamegraph");
     let run_dir = root.join("benches/memgraph/run");
     if !data_dir.exists() {
-        let ds =
-            support::synthetic_classification(1024, 64, 4, SEED, gras::auto_device());
+        let ds = support::synthetic_classification(1024, 64, 4, SEED, gras::auto_device());
         tabular_data::save_dataset(&data_dir, &ds).unwrap();
     }
     let peeked = tabular_data::resolve_dataset(&data_dir).unwrap();
