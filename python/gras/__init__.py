@@ -118,6 +118,7 @@ try:
         selection_methods,
         standardize_ops,
         tasks,
+        train_tickets,
     )
 except ImportError as exc:
     if _PRELOADED_LIBTORCH is not None:
@@ -154,4 +155,5 @@ __all__ = [
     "selection_methods",
     "standardize_ops",
     "tasks",
+    "train_tickets",
 ]

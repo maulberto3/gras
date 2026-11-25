@@ -16,7 +16,7 @@ use crate::engine::PyRaceEngine;
 use crate::menu::{
     activations, algos, combine_ops, crossover_cull_policies, crossover_ops, feature_splits,
     fitnesses, log_levels, losses, lr_schedules, menus, metrics, mutation_cull_policies,
-    optimizers, selection_methods, standardize_ops, tasks,
+    optimizers, selection_methods, standardize_ops, tasks, train_tickets,
 };
 use crate::topology::PyTopology;
 
@@ -41,6 +41,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crossover_cull_policies, m)?)?;
     m.add_function(wrap_pyfunction!(mutation_cull_policies, m)?)?;
     m.add_function(wrap_pyfunction!(selection_methods, m)?)?;
+    m.add_function(wrap_pyfunction!(train_tickets, m)?)?;
     m.add_function(wrap_pyfunction!(feature_splits, m)?)?;
     m.add_function(wrap_pyfunction!(log_levels, m)?)?;
     m.add_function(wrap_pyfunction!(lr_schedules, m)?)?;

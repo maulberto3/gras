@@ -181,6 +181,15 @@ pub(crate) fn selection_methods() -> Vec<String> {
     SELECTION_METHODS.iter().map(|s| s.to_string()).collect()
 }
 
+/// The lottery names `RaceConfig(train_ticket=...)` accepts.
+#[pyfunction]
+pub(crate) fn train_tickets() -> Vec<String> {
+    gras::engine::config::TrainTicket::ALL_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// The feature-mask draws `RaceConfig(feature_split=...)` accepts.
 #[pyfunction]
 pub(crate) fn feature_splits() -> Vec<String> {
@@ -219,13 +228,7 @@ pub(crate) fn menus() -> BTreeMap<&'static str, Vec<String>> {
     out.insert("crossover_cull_policy", crossover_cull_policies());
     out.insert("mutation_cull_policy", mutation_cull_policies());
     out.insert("crossover_selection", selection_methods());
-    out.insert(
-        "train_ticket",
-        gras::engine::config::TrainTicket::ALL_NAMES
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-    );
+    out.insert("train_ticket", train_tickets());
     out.insert("feature_split", feature_splits());
     out.insert("log_level", log_levels());
     out.insert("lr_schedule", lr_schedules());
