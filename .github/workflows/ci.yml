@@ -1,9 +1,9 @@
 name: CI
 
 # Every push to every branch runs the full check-and-package pipeline. A push
-# to `main` additionally DEPLOYS from the end of that same job: crates.io (token)
-# and PyPI (trusted publishing over OIDC), both skipped when that version is
-# already published, so a main push without a version bump is a no-op, not a red
+# to `main` additionally DEPLOYS from the end of that same job: crates.io and
+# PyPI, both authenticated with repository secrets, both skipped when that version
+# is already published, so a main push without a version bump is a no-op, not a red
 # build. `workflow_dispatch` allows a manual re-run from the Actions tab.
 on:
   push:
@@ -13,9 +13,6 @@ on:
 
 permissions:
   contents: read
-  # PyPI trusted publishing: the deploy step exchanges this for a short-lived
-  # upload token, so no long-lived PyPI secret is stored in the repo.
-  id-token: write
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -185,10 +182,16 @@ jobs:
           fi
           cargo publish -p gras --locked
 
+      # API-token auth (works regardless of the PyPI account's username), so it
+      # needs repository secret PYPI_API_TOKEN: a token scoped to `gras-engine`.
+      # To switch to trusted publishing instead, delete `password:` and add
+      # `id-token: write` under `permissions:` (then configure the publisher on
+      # PyPI: owner maulberto3, repo gras, workflow ci.yml).
       - name: Publish wheel + sdist to PyPI
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+          password: ${{ secrets.PYPI_API_TOKEN }}
           # Same rule as the crate: a repeated version is a no-op, not a failure.
           skip-existing: true
