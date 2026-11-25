@@ -202,6 +202,18 @@ jobs:
           fi
           exit "$status"
 
+      # Fail with a readable message when the secret is missing, instead of letting
+      # the publish action report an opaque 403. The value is never printed.
+      - name: Check PyPI token is present
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [ -z "$PYPI_API_TOKEN" ]; then
+            echo "::error::PYPI_API_TOKEN is empty — add a repository secret with exactly that name."
+            exit 1
+          fi
+
       # API-token auth (works regardless of the PyPI account's username), so it
       # needs repository secret PYPI_API_TOKEN: a token scoped to `gras-engine`.
       # To switch to trusted publishing instead, delete `password:` and add
@@ -213,5 +225,9 @@ jobs:
         with:
           packages-dir: dist/
           password: ${{ secrets.PYPI_API_TOKEN }}
+          # Token auth disables trusted-publishing attestations anyway; say so,
+          # and keep the upload log detailed enough to name a rejected token.
+          attestations: false
+          verbose: true
           # Same rule as the crate: a repeated version is a no-op, not a failure.
           skip-existing: true
