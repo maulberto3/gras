@@ -40,6 +40,7 @@ from gras import (
     selection_methods,
     standardize_ops,
     tasks,
+    train_tickets,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -136,20 +137,25 @@ def check_label_smoothing() -> None:
 def check_engine_knobs() -> None:
     """The engine's own families reach the run, and start neutral.
 
-    Neutral means the values that change NOTHING about a ranking: λ = 0 (plain
-    window mean) and the retired Ω at its identity, plus no elite inheritance.
+    Neutral means the values that change NOTHING about a ranking: no spread
+    charge and the retired Ω at its identity, plus no elite inheritance.
     Everything else starts at the crate's `RaceConfig::defaults()`.
     """
     cfg = RaceConfig()
     assert cfg.champion_previous_load is False, cfg
     assert (cfg.pop_size, cfg.champion_count, cfg.max_steps) == (10, 1, 10), cfg
     assert (cfg.pop_size, cfg.champion_count, cfg.smoothing_window) == (10, 1, 5), cfg
-    assert cfg.mean_type == "arithmetic", cfg
+    # The crate's default ranking family is the weighted MEDIAN (smoothing.rs:
+    # `DEFAULT_MEAN_TYPE`), not the older plain-window mean.
+    assert cfg.mean_type == "median", cfg
+    # The shipped pair: evict by `lowest_fitness_most_updates` and breed by
+    # `roulette` — the crate's `#[default]` variants, not the older
+    # ticket/tournament scheme these checks used to name.
     assert (cfg.crossover_cull_policy, cfg.mutation_cull_policy) == (
-        "highest_ticket_chance",
-        "highest_ticket_chance",
+        "lowest_fitness_most_updates",
+        "lowest_fitness_most_updates",
     ), cfg
-    assert cfg.crossover_selection == "tournament", cfg
+    assert cfg.crossover_selection == "roulette", cfg
     assert cfg.activation_pool == [] and cfg.feature_split is None, cfg
     # The topology shape behind the width range: `None` means the crate's range
     # (2..=15 for node count and both fans), and dropout is the crate's 0.25.
@@ -159,11 +165,11 @@ def check_engine_knobs() -> None:
         cfg.hidden_outputs_pool,
         cfg.dropout_prob,
     ) == (None, None, None, 0.25), cfg
-    # Durability + probation are NOT neutral-at-zero: `0` removes a protection, so
-    # these inherit the crate's shipped values instead of starting bare.
-    assert cfg.checkpoint_every == 20, cfg
+    # Durability still inherits the crate's shipped cadence; probation now ships
+    # OFF (0 = no probation window), so both mirror `RaceConfig::defaults()`.
+    assert cfg.checkpoint_every == 25, cfg
     assert cfg.crossover_ops_pool == [], cfg
-    assert (cfg.mutation_probation_steps, cfg.crossover_probation_steps) == (5, 5), cfg
+    assert (cfg.mutation_probation_steps, cfg.crossover_probation_steps) == (0, 0), cfg
 
     with tempfile.TemporaryDirectory(prefix="gras-py-engine-knobs-") as tmp:
         cfg = RaceConfig(
@@ -521,6 +527,7 @@ def check_menus_are_published_once() -> None:
         "crossover_cull_policy": crossover_cull_policies(),
         "mutation_cull_policy": mutation_cull_policies(),
         "crossover_selection": selection_methods(),
+        "train_ticket": train_tickets(),
         "feature_split": feature_splits(),
         "log_level": log_levels(),
         "lr_schedule": lr_schedules(),
