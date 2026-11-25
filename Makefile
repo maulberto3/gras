@@ -6,7 +6,7 @@ SHELL := /bin/bash
 ENV := source env_setup.sh &&
 
 .DEFAULT_GOAL := help
-.PHONY: help all prep docu clean lint test cove ci benc prof mem samp dry_publ publ
+.PHONY: help all prep docu clean fmt fmt_check lint test cove ci benc prof mem samp dry_publ publ
 
 ################################################################################
 # 🔨 Build, docs & tests
@@ -24,6 +24,14 @@ prep: ## compile lib + bins + examples + benches + tests
 docu: ## build the Rust docs
 	$(ENV) cargo doc
 
+fmt: ## rewrite formatting with rustfmt (the fixer)
+	$(ENV) cargo fmt --all
+
+# What CI enforces: fails instead of rewriting, so it can never "pass" by
+# leaving the tree dirty and then be undone by the next checkout.
+fmt_check: ## verify formatting the way CI does (no rewrite)
+	$(ENV) cargo fmt --all -- --check
+
 
 test: ## run the Rust test suite
 	$(ENV) cargo test
@@ -31,13 +39,15 @@ test: ## run the Rust test suite
 cove: ## HTML coverage report (cargo tarpaulin)
 	$(ENV) cargo tarpaulin --out Html
 
-lint: clean prep docu ## rustfmt + clippy (warnings reported, not fatal)
-	$(ENV) cargo fmt && cargo clippy --all-targets
+lint: clean prep docu fmt ## rustfmt + clippy (warnings reported, not fatal)
+	$(ENV) cargo clippy --all-targets
 
 # Local mirror of .github/workflows/ci.yml. `lint` + `test` are prerequisites,
-# so this one command covers the workflow's quality gate and packaging.
+# so this one command covers the workflow's quality gate and packaging. `lint`
+# runs the rustfmt FIXER (`make fmt`) and `fmt_check` then verifies the result
+# the way CI does — a locally green `make ci` leaves a tree Actions accepts.
 # CI checks out clean; a local tree usually is not, hence --allow-dirty.
-ci: lint test cove ## CI rehearsal: lint+test+cove, packaging dry run, wheel/sdist, py tests
+ci: lint fmt_check test cove ## CI rehearsal: fmt+lint+test+cove, packaging dry run, wheel/sdist, py tests
 	$(ENV) cargo publish -p gras --dry-run --locked --allow-dirty
 	$(ENV) rm -rf dist && uvx maturin@1.15.0 build --release --out dist && \
 		uvx maturin@1.15.0 sdist --out dist
