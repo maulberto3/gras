@@ -62,8 +62,13 @@ jobs:
           test -f "$LIBTORCH_PATH/lib/libtorch_cpu.so"
 
       # The crate declares rust-version = 1.91; pin the toolchain here so a
-      # breakage is never mistaken for a newer compiler regression.
+      # breakage is never mistaken for a newer compiler regression. The action
+      # installs a minimal profile, so rustfmt and clippy are NOT present unless
+      # named here — without `components`, `cargo fmt --check` dies instantly
+      # with "'cargo-fmt' is not installed".
       - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
