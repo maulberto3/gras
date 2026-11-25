@@ -1,20 +1,26 @@
 name: CI
 
-# Builds the distributable artifacts that used to be made by hand with
-# `rm -rf dist && maturin build && maturin sdist`. Runs on every merge/push to
-# `dev`, and on demand from the Actions tab (Re-run jobs / Run workflow).
+# Every push to every branch runs the full check-and-package pipeline. A push
+# to `main` additionally DEPLOYS from the end of that same job: crates.io (token)
+# and PyPI (trusted publishing over OIDC), both skipped when that version is
+# already published, so a main push without a version bump is a no-op, not a red
+# build. `workflow_dispatch` allows a manual re-run from the Actions tab.
 on:
   push:
-    branches: [dev]
+    branches: ["**"]
 
   workflow_dispatch:
 
 permissions:
   contents: read
+  # PyPI trusted publishing: the deploy step exchanges this for a short-lived
+  # upload token, so no long-lived PyPI secret is stored in the repo.
+  id-token: write
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a `main` run halfway through a publish; PR/branch runs may be.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # Pinned so the wheel is linked against the same libtorch major/minor that
@@ -67,9 +73,34 @@ jobs:
       - name: Test (Rust)
         run: cargo test -p gras --locked
 
-      # Packaging rehearsal only: builds the crate exactly as crates.io would
-      # receive it, then stops before upload. Publishing stays a manual step,
-      # so CI needs no crates.io token.
+      # `make lint` runs the fixer; CI checks instead, so a dirty tree is caught.
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # Warnings are reported, not fatal — same policy as `make lint`.
+      - name: Lint (clippy)
+        run: cargo clippy --all-targets
+
+      - name: Build docs
+        run: cargo doc --no-deps
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+
+      - name: Coverage (cargo tarpaulin)
+        run: cargo tarpaulin --out Html
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: tarpaulin-report.html
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Rehearsal on every branch: builds the crate exactly as crates.io would
+      # receive it, then stops before upload. The real upload only happens in the
+      # deploy steps at the end of this job, and only on `main`.
       - name: Verify crate packaging (dry run)
         run: cargo publish -p gras --dry-run --locked
 
@@ -97,6 +128,38 @@ jobs:
           uv pip install --python /tmp/smoke/bin/python dist/*.whl
           /tmp/smoke/bin/python -c "import gras; print('gras', gras.__version__)"
 
+      # `data/` is gitignored, so the fixtures these tests read do not exist on a
+      # fresh checkout: build them with the wheel's own `from_arrays` on-ramp.
+      - name: Generate the test dataset
+        run: |
+          set -euo pipefail
+          uv pip install --python /tmp/smoke/bin/python numpy
+          mkdir -p data
+          /tmp/smoke/bin/python - <<'PY'
+          import tempfile
+          from pathlib import Path
+
+          import numpy as np
+          from gras import RaceConfig, RaceEngine
+
+          rng = np.random.default_rng(0)
+          x = rng.normal(size=(256, 2)).astype(np.float32)
+          y = np.zeros((256, 3), dtype=np.float32)
+          y[np.arange(256), rng.integers(0, 3, 256)] = 1.0
+          data = Path("data/blobs")
+          with tempfile.TemporaryDirectory() as tmp:
+              RaceEngine.from_arrays(x, y, data, RaceConfig(log_level="none"), seed=0, run_dir=tmp)
+          print("wrote", sorted(p.name for p in data.iterdir()))
+          PY
+
+      - name: Test the Python bindings
+        run: |
+          set -euo pipefail
+          uv pip install --python /tmp/smoke/bin/python pytest pandas
+          # test_determinism exposes `main()`, not `test_*` functions.
+          /tmp/smoke/bin/python python/tests/test_determinism.py
+          /tmp/smoke/bin/python -m pytest python/tests -q
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -104,3 +167,28 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 14
+
+      # ── Deploy: push to main only, and only after every check above passed ──
+      # The version comes from Cargo.toml, so publishing a version that already
+      # exists is skipped instead of failing the run.
+      - name: Publish crate to crates.io
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "gras"))')
+          if cargo search gras --limit 1 | grep -q "^gras = \"$version\""; then
+            echo "gras $version is already on crates.io — nothing to publish"
+            exit 0
+          fi
+          cargo publish -p gras --locked
+
+      - name: Publish wheel + sdist to PyPI
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          # Same rule as the crate: a repeated version is a no-op, not a failure.
+          skip-existing: true

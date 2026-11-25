@@ -11,10 +11,12 @@ ENV := source env_setup.sh &&
 ################################################################################
 # 🔨 Build, docs & tests
 ################################################################################
-clean: ## prune the cargo registry cache and remove all target dirs
+# Only the stray `target/` is removed: it appears when a build runs without
+# env_setup.sh (which pins CARGO_TARGET_DIR=target_cpu). target_cpu/ and
+# target_cuda/ are deliberately kept so builds stay incremental.
+clean: ## prune the cargo cache and remove the stray target/ dir
 	cargo cache --autoclean
-	rm -rf target 
-# 	target_cpu target_cuda
+	rm -rf target
 
 prep: ## compile lib + bins + examples + benches + tests
 	$(ENV) cargo build
@@ -35,7 +37,7 @@ lint: clean prep docu ## rustfmt + clippy (warnings reported, not fatal)
 # Local mirror of .github/workflows/ci.yml. `lint` + `test` are prerequisites,
 # so this one command covers the workflow's quality gate and packaging.
 # CI checks out clean; a local tree usually is not, hence --allow-dirty.
-ci: lint test cove ## CI rehearsal: lint+test, packaging dry run, wheel/sdist, smoke test
+ci: lint test cove ## CI rehearsal: lint+test+cove, packaging dry run, wheel/sdist, py tests
 	$(ENV) cargo publish -p gras --dry-run --locked --allow-dirty
 	$(ENV) rm -rf dist && uvx maturin@1.15.0 build --release --out dist && \
 		uvx maturin@1.15.0 sdist --out dist
@@ -43,6 +45,9 @@ ci: lint test cove ## CI rehearsal: lint+test, packaging dry run, wheel/sdist, s
 	rm -rf /tmp/gras-ci-smoke && uv venv /tmp/gras-ci-smoke --python 3.12 && \
 		uv pip install --python /tmp/gras-ci-smoke/bin/python dist/*.whl && \
 		/tmp/gras-ci-smoke/bin/python -c "import gras; print('gras', gras.__version__)"
+	uv pip install --python /tmp/gras-ci-smoke/bin/python pytest pandas
+	/tmp/gras-ci-smoke/bin/python python/tests/test_determinism.py
+	/tmp/gras-ci-smoke/bin/python -m pytest python/tests -q
 
 ################################################################################
 # ⚡ Performance & profiling
@@ -62,7 +67,7 @@ samp: ## record a sampled profile of the ask_tell binary
 	$(ENV) samply record cargo run --release --bin ask_tell
 
 ################################################################################
-# 🚀 Release (manual — CI only dry-runs packaging)
+# 🚀 Release (local by default; CI also deploys on a push to main)
 #
 # LEVEL is required: cargo-release's default level is `release`, which only
 # strips a pre-release suffix and keeps the current version — it would try to

@@ -1,7 +1,7 @@
 # ── Secrets ──────────────────────────────────────────────────────────────────
-# Local secrets stay local. CI never reads `.env` — it uses repository secrets
-# (currently none: the crates.io publish step is commented out, and PyPI
-# publishing is not part of CI at all).
+# Local secrets stay local. CI never reads `.env` — deploys use a repository
+# secret (`CARGO_REGISTRY_TOKEN`) and PyPI trusted publishing over OIDC (no
+# PyPI secret is stored anywhere).
 /.env
 /.env.*
 !/.env.example
