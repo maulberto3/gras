@@ -181,11 +181,26 @@ jobs:
           set -euo pipefail
           version=$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import json, sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "gras"))')
-          if cargo search gras --limit 1 | grep -q "^gras = \"$version\""; then
+          # The sparse index is one plain GET; `cargo search` goes through
+          # crates.io's rate-limited search API, which a shared runner IP can get
+          # throttled on — and a throttled guard means a doomed publish.
+          if curl -fsS "https://index.crates.io/gr/as/gras" | grep -q "\"vers\":\"$version\""; then
             echo "gras $version is already on crates.io — nothing to publish"
             exit 0
           fi
-          cargo publish -p gras --locked
+          # Belt and braces: a race between the guard and the upload must not fail
+          # the run, but any other publish error (bad token, failed verify) still
+          # does — it is not swallowed.
+          set +e
+          output=$(cargo publish -p gras --locked 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -ne 0 ] && printf '%s' "$output" | grep -qE "already (uploaded|exists)"; then
+            echo "crates.io already has gras $version — treating as published"
+            exit 0
+          fi
+          exit "$status"
 
       # API-token auth (works regardless of the PyPI account's username), so it
       # needs repository secret PYPI_API_TOKEN: a token scoped to `gras-engine`.

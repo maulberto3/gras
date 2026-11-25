@@ -21,7 +21,10 @@ clean: ## prune the cargo cache and remove the stray target/ dir
 prep: ## compile lib + bins + examples + benches + tests
 	$(ENV) cargo build
 
-docu: ## build the Rust docs
+# Rustdoc for the crate itself. Kept OFF the local `lint`/`ci` path: rustdoc
+# recompiles the dependency graph in doc mode, which is minutes of laptop time for
+# a check CI already runs (and docs.rs regenerates on publish). Run it on demand.
+docu: ## build the Rust docs (CI runs this; slow locally)
 	$(ENV) cargo doc
 
 fmt: ## rewrite formatting with rustfmt (the fixer)
@@ -39,13 +42,14 @@ test: ## run the Rust test suite
 cove: ## HTML coverage report (cargo tarpaulin)
 	$(ENV) cargo tarpaulin --out Html
 
-lint: clean prep docu fmt ## rustfmt + clippy (warnings reported, not fatal)
+lint: clean prep fmt ## rustfmt + clippy (warnings reported, not fatal)
 	$(ENV) cargo clippy --all-targets
 
 # Local mirror of .github/workflows/ci.yml. `lint` + `test` are prerequisites,
 # so this one command covers the workflow's quality gate and packaging. `lint`
 # runs the rustfmt FIXER (`make fmt`) and `fmt_check` then verifies the result
 # the way CI does — a locally green `make ci` leaves a tree Actions accepts.
+# `docu` is NOT here: CI runs `cargo doc`, and rustdoc is slow on a laptop.
 # CI checks out clean; a local tree usually is not, hence --allow-dirty.
 ci: lint fmt_check test cove ## CI rehearsal: fmt+lint+test+cove, packaging dry run, wheel/sdist, py tests
 	$(ENV) cargo publish -p gras --dry-run --locked --allow-dirty
