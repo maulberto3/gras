@@ -214,6 +214,18 @@ jobs:
             exit 1
           fi
 
+      # PyPI accepts only manylinux/musllinux platform tags, and this wheel is a
+      # deliberate plain `linux` build (pyproject `compatibility = "linux"`) so it
+      # does not carry ~480 MB of libtorch. It stays a CI artifact and a smoke
+      # test; the publishable artifact is the sdist, which builds against the
+      # libtorch already on the user's machine.
+      - name: Stage the sdist for PyPI
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p dist/pypi
+          cp dist/*.tar.gz dist/pypi/
+          ls -l dist/pypi
+
       # API-token auth (works regardless of the PyPI account's username), so it
       # needs repository secret PYPI_API_TOKEN: a token scoped to `gras-engine`.
       # To switch to trusted publishing instead, delete `password:` and add
@@ -223,7 +235,7 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist/
+          packages-dir: dist/pypi
           password: ${{ secrets.PYPI_API_TOKEN }}
           # Token auth disables trusted-publishing attestations anyway; say so,
           # and keep the upload log detailed enough to name a rejected token.

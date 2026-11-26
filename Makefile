@@ -56,6 +56,10 @@ ci: lint fmt_check test cove ## CI rehearsal: fmt+lint+test+cove, packaging dry 
 	$(ENV) rm -rf dist && uvx maturin@1.15.0 build --release --out dist && \
 		uvx maturin@1.15.0 sdist --out dist
 	uvx twine check dist/*
+	# Only the sdist is PyPI-acceptable: the wheel is a plain `linux` tag (it does
+	# not bundle libtorch), and PyPI requires manylinux/musllinux. Same split the
+	# workflow uses, so a local `make ci` stages exactly what a push would upload.
+	rm -rf dist/pypi && mkdir -p dist/pypi && cp dist/*.tar.gz dist/pypi/
 	rm -rf /tmp/gras-ci-smoke && uv venv /tmp/gras-ci-smoke --python 3.12 && \
 		uv pip install --python /tmp/gras-ci-smoke/bin/python dist/*.whl && \
 		/tmp/gras-ci-smoke/bin/python -c "import gras; print('gras', gras.__version__)"

@@ -67,6 +67,9 @@ module-name = "gras._core"
 manifest-path = "gras-py/Cargo.toml"
 # libtorch is a runtime dependency, not part of the wheel. Without this, maturin
 # auditwheel-repairs the wheel and copies ~480 MB of libtorch into it.
+# The plain `linux` tag is also why PyPI refuses this wheel (it wants
+# manylinux/musllinux), so CI publishes the sdist only; the wheel stays a build
+# artifact that gets imported once before anyone relies on it.
 compatibility = "linux"
 # Debug symbols are useless in a wheel and dominate its size.
 strip = true
