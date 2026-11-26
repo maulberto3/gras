@@ -17,6 +17,9 @@ pub(crate) struct AsciiNode {
     pub num_outputs: usize,
     /// Output dimension (from node_dims), shown in parentheses.
     pub out_dim: Option<usize>,
+    /// Recurrence: this hidden node runs its own layer twice (widths match, gene on).
+    /// Rendered as the `x2` label suffix — a label fact, never a wire.
+    pub loops: bool,
     /// Wires ARRIVING at this node — equals `num_inputs` on a finalized graph
     /// (one wire per input port; a port is a socket, not a bucket).
     pub in_wires: usize,
@@ -45,7 +48,7 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
             // one wire per port); the output side can fan out (`1o→5w`).
             let in_part = format!("{}w→{}i", n.in_wires.max(n.num_inputs), n.num_inputs);
             let out_part = format!("{}o→{}w", n.num_outputs, n.out_wires.max(n.num_outputs));
-            match n.out_dim {
+            let label = match n.out_dim {
                 Some(dim) => format!(
                     "n{} {} {}/{} ->{}",
                     n.id,
@@ -55,6 +58,11 @@ pub(crate) fn render_wire_diagram(nodes: &[AsciiNode], connections: &[Connection
                     dim
                 ),
                 None => format!("n{} {} {}/{}", n.id, kind_name(n.kind), in_part, out_part),
+            };
+            if n.loops {
+                format!("{label} x2")
+            } else {
+                label
             }
         })
         .collect();
@@ -396,6 +404,17 @@ pub(crate) fn edge_list(graph: &Topology) -> String {
     let mut out = String::new();
     let n = graph.connections.len();
     out.push_str(&format!("edges ({n} wires):\n"));
+    // The loop is NOT a wire, so it gets its own header line rather than a `(0)` hop
+    // pseudo-edge (which would break the forward-only invariant the markers rely on).
+    let loops = crate::utils::graph_utils::looping_nodes(graph);
+    if !loops.is_empty() {
+        let list = loops
+            .iter()
+            .map(|(i, d)| format!("n{i} x2 ({d}→{d})"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        out.push_str(&format!("  loops ({}): {list}\n", loops.len()));
+    }
 
     // Sort by (from.node, from.index, to.node, to.index) for scannability.
     let mut sorted: Vec<&Connection> = graph.connections.iter().collect();
@@ -418,7 +437,13 @@ pub(crate) fn edge_list(graph: &Topology) -> String {
         } else {
             String::new()
         };
-        out.push_str(&format!("  {label}{marker}({dist}){tag}\n"));
+        // The signal this wire carries already went through the source's second pass.
+        let loop_tag = if loops.iter().any(|(i, _)| *i == conn.from.node) {
+            "  [x2 source]"
+        } else {
+            ""
+        };
+        out.push_str(&format!("  {label}{marker}({dist}){tag}{loop_tag}\n"));
     }
     out
 }
@@ -442,6 +467,7 @@ mod tests {
             num_inputs,
             num_outputs,
             out_dim: Some(2),
+            loops: false,
             in_wires,
             out_wires,
         }

@@ -59,6 +59,12 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     // ALWAYS printed, even at 0.00: a gene that vanishes at its own default cannot be diffed
     // between two files, and dropout is a real gene on every net (an elite at 0.00 and one at 0.25
     knobs.push(format!("dropout {:.2}", graph.options.dropout_prob));
+    // Same rule for the loop gene: `on`/`off` is a gene, so a champion file that hides it
+    // at its default cannot be diffed against a sibling that recurs.
+    knobs.push(format!(
+        "recurrence {}",
+        if graph.options.recur { "on" } else { "off" }
+    ));
     // Seed PLUS the bounds it was drawn from: a seed alone reproduces a blueprint
     // ranges that constrained the draw travel with it, and this file is meant to outlive the run
     let o = &graph.options;
@@ -76,12 +82,93 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
         o.max_input_reach,
     ));
 
+    // ── Recurrence — the loop gene, ALWAYS printed so on / off / inert are diffable ──
+    let in_dim = graph.options.input_dim;
+    let out_dim = graph.options.output_dim;
+    let qualifies = matches!((in_dim, out_dim), (Some(i), Some(o)) if i == o);
+    // Hidden nodes whose OWN widths match: each hands its pre-activation back through its own
+    // layer once. This is the loop that can fire on a 784 → 10 net.
+    let node_loops = super::graph_utils::looping_nodes(graph);
+    let dims = format!(
+        "input {} · output {}",
+        in_dim.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+        out_dim.map(|d| d.to_string()).unwrap_or_else(|| "?".into()),
+    );
+    out.push_str("## Recurrence\n\n");
+    if !graph.options.recur {
+        out.push_str(
+            "**Off — one sweep.** No feedback edge: the output is the graph's own answer. The gene is inherited like any other, and a crossover child may drift it on.\n\n",
+        );
+    } else if !node_loops.is_empty() {
+        let n = node_loops.len();
+        let list = node_loops
+            .iter()
+            .map(|(i, d)| format!("n{i} {d} → {d}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "**On — {n} hidden node loop{}** ({dims}): {list}. Each hands its PRE-activation back through the SAME layer once — shared weights, no extra parameters, and the gradients unroll over both passes. The gate is `in_dim == out_dim` on the node itself, so this fires inside nets whose outer widths could never match.\n\n",
+            if n == 1 { "" } else { "s" }
+        ));
+        if qualifies {
+            out.push_str("The network-level loop runs too: the input and output widths match, so the Output node's pre-activation also comes back in as the network input, doubling the whole sweep.\n\n");
+        } else {
+            out.push_str("The network-level loop stays off — the input and output widths differ — so the graph itself runs ONE sweep; the loops live inside the hidden nodes above.\n\n");
+        }
+    } else if qualifies {
+        out.push_str(&format!(
+            "**On — one loop, two sweeps** ({dims}). The Output node's PRE-activation is fed back as the network input, so the output takes the same hidden path twice through the SAME layers — shared weights, no extra parameters, and the gradients unroll over both sweeps. The widths match, so the feedback fits the first layer.\n\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "**On, but inert** ({dims}). The gene is inherited, but no width qualifies: the feedback neither fits the first layer nor any hidden node's own input, so this net runs ONE sweep. Drift can flip the gene either way.\n\n"
+        ));
+    }
+    // The NETWORK-level loop's curve — only a LIVE net can measure it; the champion files render
+    // the blueprint alone (weights are a separate artifact), so they get the gene above.
+    if let Some(net) = net.filter(|n| n.recur_outer) {
+        if let Ok(curve) = net.recurrence_curve() {
+            out.push_str("Zero probe, batch 1 — the loop's own trajectory:\n\n");
+            out.push_str(
+                "| sweep | mean \\|y\\| | max \\|y\\| | mean \\|Δ\\| |\n|---:|---:|---:|---:|\n",
+            );
+            for (i, (mean, max, delta)) in curve.iter().enumerate() {
+                out.push_str(&format!(
+                    "| {} | {mean:.4} | {max:.4} | {delta:.4} |\n",
+                    i + 1
+                ));
+            }
+            if curve.len() > 1 {
+                let (before, after) = (curve[0].0, curve[curve.len() - 1].0);
+                let trend = if after > before {
+                    "grows"
+                } else if after < before {
+                    "shrinks"
+                } else {
+                    "holds"
+                };
+                out.push_str(&format!(
+                    "\nThe loop {trend} the output's magnitude between sweeps ({before:.4} → {after:.4}) and moved it by **{:.4}** on average.\n\n",
+                    curve[curve.len() - 1].2
+                ));
+            }
+        }
+    }
+
     // ── Nodes table (merged topology + network layer info) ──
     out.push_str("## Nodes\n\n");
     if let Some(net) = net {
         // Full table: ID, Kind, In, Out, Linear, Activation, Combine, Std, Sources
-        out.push_str("| ID | Kind | In | Out | Linear | Activation | Combine | Std | Sources |\n");
-        out.push_str("|----|------|----|-----|--------|------------|---------|-----|---------|\n");
+        out.push_str(
+            "| ID | Kind | In | Out | Recur | Linear | Activation | Combine | Std | Sources |\n",
+        );
+        out.push_str(
+            "|----|------|----|-----|-------|--------|------------|---------|-----|---------|\n",
+        );
+        let looping: Vec<usize> = super::graph_utils::looping_nodes(graph)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
         let node_sources = super::graph_utils::build_node_sources(
             &net.connections,
             &net.nodes.iter().map(|n| n.num_inputs).collect::<Vec<_>>(),
@@ -108,6 +195,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
                 .standardize
                 .map_or(crate::utils::cfy::NO_VALUE.into(), |s| format!("{s}"));
             let (in_dim, out_dim) = graph.node_dims().get(i).copied().unwrap_or((0, 0));
+            let recur = if looping.contains(&i) { "yes" } else { "no" };
             let marker = if i == net.output_node { " " } else { "" };
             let sources: Vec<String> = node_sources[i]
                 .iter()
@@ -130,7 +218,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
                 .filter(|c| c.from.node == node.id)
                 .count();
             out.push_str(&format!(
-                "| {id} {kind}{marker} | {kind} | {ni} | {no} | {in_dim} → {out_dim} | {act} | {combine} | {std} | {src_str} |\n",
+                "| {id} {kind}{marker} | {kind} | {ni} | {no} | {recur} | {in_dim} → {out_dim} | {act} | {combine} | {std} | {src_str} |\n",
                 id = i,
                 ni = ports_cell(node.num_inputs, in_wires),
                 no = ports_cell(node.num_outputs, out_wires),
@@ -138,8 +226,12 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
         }
     } else {
         // Topology-only table: no linear dims or sources
-        out.push_str("| ID | Kind | In | Out | Activation | Combine | Std | Dims |\n");
-        out.push_str("|----|------|----|-----|------------|---------|-----|------|\n");
+        out.push_str("| ID | Kind | In | Out | Recur | Activation | Combine | Std | Dims |\n");
+        out.push_str("|----|------|----|-----|-------|------------|---------|-----|------|\n");
+        let looping: Vec<usize> = super::graph_utils::looping_nodes(graph)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
         for (node_id, node) in graph.nodes.iter().enumerate() {
             let kind = match node.kind {
                 NodeKind::Input => "Input",
@@ -164,8 +256,13 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
                 .iter()
                 .filter(|c| c.from.node == node.id)
                 .count();
+            let recur = if looping.contains(&node_id) {
+                "yes"
+            } else {
+                "no"
+            };
             out.push_str(&format!(
-                "| {id} | {kind} | {ni} | {no} | {act} | {combine} | {std} | {in_dim}→{out_dim} |\n",
+                "| {id} | {kind} | {ni} | {no} | {recur} | {act} | {combine} | {std} | {in_dim}→{out_dim} |\n",
                 id = node.id,
                 ni = ports_cell(node.num_inputs, in_wires),
                 no = ports_cell(node.num_outputs, out_wires),
@@ -339,6 +436,10 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("## Wiring diagram\n\n");
     out.push_str("```text\n");
     let node_dims = graph.node_dims();
+    let looping: Vec<usize> = super::graph_utils::looping_nodes(graph)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect();
     let nodes: Vec<AsciiNode> = graph
         .nodes
         .iter()
@@ -360,6 +461,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
                 num_inputs: n.num_inputs,
                 num_outputs: n.num_outputs,
                 out_dim: node_dims.get(i).map(|&(_, out)| out),
+                loops: looping.contains(&i),
                 in_wires,
                 out_wires,
             }
@@ -371,6 +473,7 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("> - I=input  H=hidden  O=output\n");
     out.push_str("> - `2w→2i/1o→5w` = wires→input ports / output ports→wires. A port is a SOCKET: on a graph built now every port carries exactly ONE wire, so `w == i` and `o == w`. A label repeats (`o1 o1`) only in a legacy blueprint saved before one-wire-per-socket. Every marker maps to exactly one wire\n");
     out.push_str("> - ->dim = output dimension\n");
+    out.push_str("> - `x2` = recurrence: this hidden node runs its own layer a SECOND time (its pre-activation goes back through it). A label fact, not a wire — no wire count or hop marker includes it\n");
     out.push_str("> - ▶ connected output  ◀ connected input  * orphaned port\n");
 
     // Mermaid flowchart
@@ -389,13 +492,16 @@ pub fn topology_markdown(graph: &Topology, net: Option<&Network>) -> String {
     out.push_str("\n| **Arrow label (Graph)** | the wire's own activation — per-port, so one node can emit `mish` to one neighbor and `tanh` to another. Equal labels from the same node = same signal; duplicates are impossible (dedup collapses them). |");
     out.push_str("\n| **Dashed stub `selu (input)` / `mish (orphan)`** | orphaned port — an input nothing feeds / an output nothing reads (mermaid's counterpart of the ASCII `*`). |");
     out.push_str("\n| **`in <n>` / `out <n>`** | dataset shape (fixed by the problem). |");
-    out.push_str("\n| **Input box → second line** | the feature split when the net has one: `split <policy> · <ports>p · <seen>/<n> seen`. Present for ANY policy that carries rows (`exclusive`, `random`, `chunks`, `crossover`); absent for `full`, where every port already carries the full mixed vector — that is the common case, and why the box is usually one line. Per-port rows are in *Feature split* above. |");
+    out.push_str("\n| **Input box → second line** | the Input node's fan-out and projection width — `<ports>p → <out dim>`, the same numbers the wiring diagram prints as `4o ->64` and every hidden box carries as its trailing width. The dataset width stays on the first line, so `in 784` is the raw vector, not the node's width. |");
+    out.push_str("\n| **Input box → third line** | the feature split, when the net has one: `split <policy> · <ports>p · <seen>/<n> seen`. Present for ANY policy that carries rows (`exclusive`, `random`, `chunks`, `crossover`); absent for `full`, where every port already carries the full mixed vector — that is the common case, and why the box is usually two lines. Per-port rows are in *Feature split* above. |");
     out.push_str("\n| **`na` in `Combine` / `Std`** | no per-node override, so the forward pass uses `Add` / no standardisation. `na` is not a missing gene: it is the gene spelled as its default (the diversity metric folds `None` and `Identity` into one token for the same reason). |");
     out.push_str("\n| **Nodes table → `Sources`** | which output port feeds each input port (`n1_o2` = output 2 of node 1), one entry per port in port order — the `k`-th entry feeds `i<k>`; `*` = an unwired port (never left behind by `finalize`). |");
     out.push_str("\n| **Nodes table → `In` / `Out` with `(Nw)`** | PORT counts; a parenthesised wire count appears only where the two differ (`Out 2 (3w)` = 2 ports, 3 wires). A graph built now is one-wire-per-socket, so a `(Nw)` cell can only come from a legacy blueprint — the wiring diagram draws one slot per WIRE, which is why its `Out` slots can outnumber its ports. |");
     out.push_str("\n| **Nodes table → `In` / `Out`** | PORT counts. Only a legacy blueprint can read `2 (3w)` — two ports carrying three wires, the same numbers the wiring diagram labels `2o→3w` and the edge list shows as a repeated port (`n0_o0` twice). A hidden/output row reads plain numbers because an input port carries exactly one wire. |");
     out.push_str("\n| **Nodes table → `Combine` / `Std`** | how multiple inputs are merged / whether they're normalized first. |");
-    out.push_str("\n| **Edge list & wiring diagram** | one line per wire, exact ports (`n0_o1 → n2_i0`); `<<<<` = long jump; `▶ ◀ *` = wired out / wired in / orphaned. |");
+    out.push_str("\n| **Nodes table → `Recur`** | `yes` = this hidden node runs its own layer a SECOND time (its pre-activation goes back through it, shared weights); `no` = one pass — the gene is off, the node is Input/Output, or its widths differ (`64 → 48`). |");
+    out.push_str("\n| **`x2` / `↻` (Wiring diagram, Graph)** | recurrence: the node loops once. `x2` is the ASCII label suffix; `↻` the mermaid label suffix and the dashed self-loop `n2 -.- n2`. Not a wire — wire counts and hop markers do not include it. |");
+    out.push_str("\n| **Edge list & wiring diagram** | one line per wire, exact ports (`n0_o1 → n2_i0`); `<<<<` = long jump; `▶ ◀ *` = wired out / wired in / orphaned; a `loops (N):` header names the hidden nodes that loop (`x2`), and `[x2 source]` marks a wire leaving one. |");
     out.push('\n');
 
     out
@@ -454,6 +560,92 @@ mod tests {
     use super::*;
     use crate::graph::node::Node;
     use crate::graph::topology::{Connection, Port, TopologyOptions};
+
+    /// The Input box says what the ASCII node says: how many ports fan out of it and how wide
+    /// each projection is, so `in 3` alone is never read as a single-wire input.
+    #[test]
+    fn the_topology_mermaid_names_the_input_fanout() {
+        let mut g = Topology::new(0, None);
+        g.options.input_dim = Some(3);
+        g.options.output_dim = Some(2);
+        g.nodes.push(Node::new_input(0, 2));
+        let mut hidden = Node::new_hidden(1, 2, 1);
+        hidden.hidden_dim = Some(8);
+        g.nodes.push(hidden);
+        g.nodes.push(Node::new_output(2, 1, 1));
+        g.finalize();
+        let m = crate::utils::mermaid::topology_mermaid(&g);
+        assert!(m.contains("n0[\"in 3<br/>2p → 8\"]"), "{m}");
+    }
+
+    /// The loop gene is about HIDDEN nodes: a 784 → 10 net cannot sweep itself, but its 64 → 64
+    /// hidden nodes each loop, and the section says so instead of calling the gene inert.
+    #[test]
+    fn hidden_node_loops_are_named_when_the_net_cannot_sweep() {
+        let mut g = Topology::new(0, None);
+        g.options.input_dim = Some(784);
+        g.options.output_dim = Some(10);
+        g.options.recur = true;
+        let mut input = Node::new_input(0, 2);
+        input.hidden_dim = Some(64);
+        g.nodes.push(input);
+        let mut hidden = Node::new_hidden(1, 2, 2);
+        hidden.hidden_dim = Some(64);
+        g.nodes.push(hidden);
+        let mut out = Node::new_output(2, 2, 1);
+        out.hidden_dim = Some(10);
+        g.nodes.push(out);
+        g.finalize();
+        let md = topology_markdown(&g, None);
+        assert!(md.contains("1 hidden node loop"), "{md}");
+        assert!(md.contains("n1 64 → 64"), "{md}");
+        assert!(md.contains("network-level loop stays off"), "{md}");
+        assert!(!md.contains("on, inert"), "{md}");
+    }
+
+    /// The loop is a GENE in the file: on / off / inert all print, and a live net's zero-probe
+    /// curve shows how far the second sweep moved the output.
+    #[test]
+    fn recurrence_is_printed_and_measured() {
+        let mut g = Topology::new(0, None);
+        g.options.input_dim = Some(4);
+        g.options.output_dim = Some(4);
+        g.options.recur = true;
+        g.nodes.push(Node::new_input(0, 2));
+        let mut hidden = Node::new_hidden(1, 2, 2);
+        hidden.hidden_dim = Some(4);
+        g.nodes.push(hidden);
+        let mut out = Node::new_output(2, 1, 1);
+        out.hidden_dim = Some(4);
+        g.nodes.push(out);
+        g.refresh_labels();
+        g.finalize();
+        let net = Network::build(&g, flodl::Device::CPU).unwrap();
+        let md = topology_markdown(&g, Some(&net));
+        assert!(md.contains("recurrence on"), "{md}");
+        assert!(
+            md.contains("## Recurrence") && md.contains("one loop, two sweeps"),
+            "{md}"
+        );
+        assert!(md.contains("| sweep | mean \\|y\\|"), "{md}");
+        assert_eq!(net.recurrence_curve().unwrap().len(), 2);
+
+        // Off: the same section says one sweep.
+        let mut off = g.clone();
+        off.options.recur = false;
+        let md = topology_markdown(&off, None);
+        assert!(
+            md.contains("recurrence off") && md.contains("one sweep"),
+            "{md}"
+        );
+
+        // Inert: on with mismatched widths names the gate.
+        let mut narrow = g.clone();
+        narrow.options.output_dim = Some(2);
+        narrow.nodes[2].hidden_dim = Some(2);
+        let md = topology_markdown(&narrow, None);
+        assert!(md.contains("On, but inert"), "{md}");
+    }
 
     /// The topology graph curves its wires like the lineage graph does.
     #[test]
@@ -807,5 +999,67 @@ mod tests {
             !md.contains("(1w)") && !md.contains("(0w)"),
             "no annotation where wires do not exceed ports:\n{md}"
         );
+    }
+
+    /// The loop is a PER-NODE fact, so every surface has to carry it: the Nodes table's `Recur`
+    /// column, the wiring label (`x2`), the edge-list header, and the mermaid self-loop.
+    #[test]
+    fn recurrence_is_visible_in_the_tables_and_the_diagrams() {
+        use crate::graph::node::Node;
+        let mut g = Topology::new(
+            21,
+            Some(TopologyOptions {
+                input_dim: Some(4),
+                output_dim: Some(1),
+                dropout_prob: 0.0,
+                recur: true,
+                ..Default::default()
+            }),
+        );
+        g.nodes.push(Node::new_input(0, 1));
+        g.nodes.push(Node::new_hidden(1, 1, 1));
+        g.nodes.push(Node::new_hidden(2, 1, 1));
+        g.nodes.push(Node::new_output(3, 1, 1));
+        g.nodes[0].hidden_dim = Some(4); // Input projects 4 → 4
+        g.nodes[1].hidden_dim = Some(4); // in 4, out 4: QUALIFIES
+        g.nodes[2].hidden_dim = Some(2); // in 4, out 2: does not
+        g.finalize();
+
+        let md = topology_markdown(&g, None);
+        assert!(md.contains("| ID | Kind | In | Out | Recur |"), "{md}");
+        assert!(
+            md.contains("| 1 | Hidden | 1 | 1 | yes |"),
+            "the looping node says yes:\n{md}"
+        );
+        assert!(
+            md.contains("| 2 | Hidden | 1 | 1 | no |"),
+            "a mismatched node says no:\n{md}"
+        );
+        assert!(
+            md.contains("| 0 | Input | 0 | 2 | no |"),
+            "Input never loops, even with matching widths:\n{md}"
+        );
+        assert!(md.contains("->4 x2"), "the wiring label marks it:\n{md}");
+        assert!(
+            md.contains("loops (1): n1 x2 (4→4)"),
+            "the edge list names it:\n{md}"
+        );
+        assert!(
+            md.contains("[x2 source]"),
+            "wires out of a looping node say so:\n{md}"
+        );
+        assert!(
+            md.contains("n1 -.- n1"),
+            "the graph draws the self-loop:\n{md}"
+        );
+
+        // Gene off: no cell says yes and no diagram carries a marker.
+        let mut off = g.clone();
+        off.options.recur = false;
+        let md = topology_markdown(&off, None);
+        assert!(!md.contains("| yes |"), "{md}");
+        assert!(!md.contains("->4 x2"), "no wiring suffix:\n{md}");
+        assert!(!md.contains("  loops ("), "no edge-list header:\n{md}");
+        assert!(!md.contains("n1 -.- n1"), "no self-loop:\n{md}");
     }
 }

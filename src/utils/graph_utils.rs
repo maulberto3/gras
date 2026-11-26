@@ -1,7 +1,26 @@
 //! Graph diagnostic utilities — shared helpers over raw node/connection data.
 
 use crate::graph::node::{Activation, Node, NodeKind};
-use crate::graph::topology::{Connection, KindCounts, Port};
+use crate::graph::topology::{Connection, KindCounts, Port, Topology};
+
+/// Hidden nodes that take a recurrence pass: the gene must be ON and the node's own input
+/// width must equal its output width, so the feedback fits its own layer. Input/Output never
+/// loop, and a mismatched hidden node (`64 → 48`) has nothing to feed back into itself.
+///
+/// This is the single definition the diagrams and the tables read, so the `Recur` column, the
+/// `x2` / `↻` markers and the prose can never disagree.
+pub(crate) fn looping_nodes(graph: &Topology) -> Vec<(usize, usize)> {
+    if !graph.options.recur {
+        return Vec::new();
+    }
+    graph
+        .node_dims()
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| d.0 == d.1 && graph.nodes[*i].kind == NodeKind::Hidden)
+        .map(|(i, d)| (i, d.1))
+        .collect()
+}
 
 /// Per node, per input port, the ONE source port feeding it — the wiring model is one wire per
 /// port, so a port without a wire reads `None`.

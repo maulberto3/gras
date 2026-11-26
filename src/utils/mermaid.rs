@@ -51,24 +51,35 @@ pub fn topology_mermaid(graph: &Topology) -> String {
     );
     let dim_range = (max_dim.saturating_sub(min_dim)).max(1);
 
+    // Per-node `(in, out)` so the Input box can name its PROJECTION width, the number the
+    // ASCII diagram prints as `4o ->64` and every other box already carries.
+    let node_dims = graph.node_dims();
+    let looping: Vec<usize> = crate::utils::graph_utils::looping_nodes(graph)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect();
+
     // Node definitions — COMPACT one-line labels; Mermaid auto-sizes boxes,
     // multi-line labels balloon every box.
     for node in &graph.nodes {
         let label = match node.kind {
             NodeKind::Input => {
-                // The Input box is where the feature split belongs: it is Genome on the INPUT's
-                // ports, so a reader who wants to know whether this net partitions its columns sees
+                // The Input box carries three facts, one per line: the DATASET width (`in 784`),
+                // the fan-out and projection width (`4p → 64`) — without it a box with four
+                // outgoing wires read as a single 784-wide vector, and its width was the only
+                // one missing from the diagram — and, when the net has one, the feature split
+                // (the split is genome on the INPUT's ports, so this is its home).
+                let raw = graph.options.input_dim.unwrap_or(1);
+                let ports = node.num_outputs.max(1);
+                let projected = node_dims.get(node.id).map(|&(_, out)| out).unwrap_or(raw);
                 match feature_split_cell(graph) {
                     Some(split) => format!(
-                        "n{}[\"in {}<br/>{}\"]",
-                        node.id,
-                        graph.options.input_dim.unwrap_or(1),
-                        split
+                        "n{}[\"in {}<br/>{}p → {}<br/>{}\"]",
+                        node.id, raw, ports, projected, split
                     ),
                     None => format!(
-                        "n{}[\"in {}\"]",
-                        node.id,
-                        graph.options.input_dim.unwrap_or(1)
+                        "n{}[\"in {}<br/>{}p → {}\"]",
+                        node.id, raw, ports, projected
                     ),
                 }
             }
@@ -84,8 +95,14 @@ pub fn topology_mermaid(graph: &Topology) -> String {
                     .standardize
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "identity".into());
+                // `↻` on the box, the same fact the Nodes table's `Recur` column states.
+                let loop_mark = if looping.contains(&node.id) {
+                    " ↻"
+                } else {
+                    ""
+                };
                 format!(
-                    "n{}[\"H{} {}→lin→{} {}\"]",
+                    "n{}[\"H{} {}→lin→{} {}{loop_mark}\"]",
                     node.id, node.id, combine, std, dim
                 )
             }
@@ -121,6 +138,7 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         let dim = node.hidden_dim.unwrap_or(min_dim);
         let t = dim.saturating_sub(min_dim) as f32 / dim_range as f32;
         let width = MIN_BORDER + (MAX_BORDER - MIN_BORDER) * t.clamp(0.0, 1.0);
+        // One border shape for every box: the loop is drawn by the self-link alone.
         out.push_str(&format!(
             "    style n{} stroke-width:{:.1}px\n",
             node.id, width
@@ -162,9 +180,23 @@ pub fn topology_mermaid(graph: &Topology) -> String {
         ));
     }
 
+    // Recurrence — a dashed self-link per looping node, emitted AFTER every real wire so
+    // the `linkStyle` indices above keep pointing at their edges. It is not a wire: edge
+    // counts, hop widths and orphan detection all ignore it. No arrowhead: a loop has no
+    // direction to point at, and the box already carries the `↻`.
+    let mut extra_idx = graph.connections.len();
+    for id in &looping {
+        out.push_str(&format!("    n{} -.- n{}\n", id, id));
+        out.push_str(&format!(
+            "    linkStyle {} stroke-dasharray:4 2,stroke:#888\n",
+            extra_idx
+        ));
+        extra_idx += 1;
+    }
+
     // Orphaned ports — the mermaid counterpart of the ASCII `*` marks;
     // markers styled invisible (bare dashed whiskers).
-    let mut orphan_idx = graph.connections.len();
+    let mut orphan_idx = extra_idx;
     let output_id = graph
         .nodes
         .iter()
