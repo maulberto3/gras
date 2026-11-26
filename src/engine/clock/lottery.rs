@@ -4,13 +4,15 @@
 pub enum TrainTicket {
     /// The fittest net earns the most tickets; the updates leg is OFF (`Fm⁺`).
     MostFit,
-    /// The fittest net that has trained the LEAST earns the most tickets (`Fm⁺ × Um⁻`) — the engine default ([`DEFAULT_TRAIN_TICKET`]): pay the net that grades best and has had…
-    #[default]
+    /// The fittest net that has trained the LEAST earns the most tickets (`Fm⁺ × Um⁻`): pay the
+    /// net that grades best and has had the fewest updates.
     MostFitFewestUpdates,
     /// The fittest net that has trained the MOST earns the most tickets (`Fm⁺ × Um⁺`).
     MostFitMostUpdates,
     /// The LEAST fit net that has trained the LEAST earns the most tickets (`Fm⁻ × Um⁻`) — the
-    /// reference run's tuned leg.
+    /// engine default ([`DEFAULT_TRAIN_TICKET`]): pay the bottom of the field that has had the
+    /// fewest updates, so the ladder back up is funded from below.
+    #[default]
     LeastFitFewestUpdates,
     /// The LEAST fit net that has trained the MOST earns the most tickets (`Fm⁻ × Um⁺`).
     LeastFitMostUpdates,
@@ -148,8 +150,10 @@ impl std::str::FromStr for TrainTicket {
     }
 }
 
-/// Default ticket LEGS (`set_train_ticket`): the FITTEST net that has trained the FEWEST earns the most tickets (`Fm⁺ × Um⁻`) — the lottery pays the net that grades best…
-pub const DEFAULT_TRAIN_TICKET: TrainTicket = TrainTicket::MostFitFewestUpdates;
+/// Default ticket LEGS (`set_train_ticket`): the LEAST fit net that has trained the FEWEST earns
+/// the most tickets (`Fm⁻ × Um⁻`) — the lottery pays the bottom of the field that has had the
+/// fewest updates, so the net with the most room to improve is funded first.
+pub const DEFAULT_TRAIN_TICKET: TrainTicket = TrainTicket::LeastFitFewestUpdates;
 
 /// Default for the lottery's LEARN-ONLY switch (`set_ticket_learn_only`): `false` = a lost ticket idles the net (no train, no eval, nothing measured). `true` = every net…
 pub const DEFAULT_TRAIN_MERIT_LEARN_ONLY: bool = false;
