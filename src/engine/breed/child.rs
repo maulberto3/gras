@@ -116,6 +116,7 @@ const GENE_SALT_COMBINE: u64 = 0x0AC7_0000_0000_0002;
 const GENE_SALT_STANDARDIZE: u64 = 0x0AC7_0000_0000_0003;
 const GENE_SALT_PORT: u64 = 0x0AC7_0000_0000_0004;
 const GENE_SALT_DROPOUT: u64 = 0x0AC7_0000_0000_0005;
+const GENE_SALT_RECUR: u64 = 0x0AC7_0000_0000_0008;
 const GENE_SALT_REACH: u64 = 0x0AC7_0000_0000_0006;
 const GENE_SALT_WIDTH: u64 = 0x0AC7_0000_0000_0007;
 
@@ -233,6 +234,14 @@ pub(crate) fn drift_child_genes(
         if drop.f32() < p {
             topo.options.dropout_prob = drop.f32() * limits.dropout_cap;
         }
+    }
+
+    // PER-NET GENE: recurrence (one extra sweep of the same graph). Crossover can only
+    // DONATE it, so the coin flips the inherited allele: a child may acquire the loop from a
+    // parent that did not have it, and lose one it did. The build still gates it on the dims.
+    let mut recur = stream(GENE_SALT_RECUR);
+    if recur.f32() < p {
+        topo.options.recur = !topo.options.recur;
     }
 }
 
@@ -391,6 +400,16 @@ mod gene_drift_tests {
             after.1 != before.1,
             "p=1 must re-draw dropout when a cap is given"
         );
+    }
+
+    #[test]
+    fn the_recurrence_gene_is_a_coin_drift_flips() {
+        let mut t = topo(7);
+        t.options.recur = true;
+        drift_child_genes(&mut t, 0.0, &acts(), &combs(), &stds(), limits(), 7, 3, 1);
+        assert!(t.options.recur, "p=0 inherits the gene exactly");
+        drift_child_genes(&mut t, 1.0, &acts(), &combs(), &stds(), limits(), 7, 3, 1);
+        assert!(!t.options.recur, "p=1 must flip the inherited allele");
     }
 
     #[test]
