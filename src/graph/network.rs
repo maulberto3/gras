@@ -99,6 +99,18 @@ pub struct Network {
     /// Per-node, per-port feature masks (the feature split), as constant 0/1 `[1, input_dim]`
     /// tensors shaped for broadcasting over the input batch.
     pub(crate) port_masks: Vec<Vec<Option<Tensor>>>,
+    /// RECURRENCE GENE: the blueprint carries the loop. Every HIDDEN node whose own input
+    /// width equals its own output width then hands its pre-activation back through its own
+    /// layer once, and — when the net's input width also equals its output width — the whole
+    /// graph sweeps twice. Shared weights throughout: no parameter is added.
+    pub recur: bool,
+    /// The NETWORK-level sweep: the gene on AND the input width fits the output width, so the
+    /// Output node's pre-activation can come back in as the input. Hidden-node loops do not
+    /// need this — `4 → 2` cannot sweep itself, but its `4 → 4` nodes still loop.
+    pub recur_outer: bool,
+    /// Per-node: does this HIDDEN node loop its own pre-activation? Settled at build from
+    /// `node_dims[i].0 == node_dims[i].1`; Input/Output nodes are always `false`.
+    pub(crate) recur_nodes: Vec<bool>,
 }
 
 /// Intermediate build state from `prepare_build`: the seeded RNG plus
@@ -389,6 +401,22 @@ impl Network {
     ) -> flodl::tensor::Result<Network> {
         let topo = &graph.options;
         let output_node = graph.nodes.len() - 1;
+        // The gene turns loops on. A HIDDEN node loops when its OWN output width fits its own
+        // input width, so its pre-activation can go back through the SAME layer — the loop that
+        // fires on 784 → 10 nets, where most hidden nodes are 64 → 64.
+        let recur_nodes: Vec<bool> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                topo.recur
+                    && node.kind == crate::graph::node::NodeKind::Hidden
+                    && node_dims[i].0 == node_dims[i].1
+            })
+            .collect();
+        // The NETWORK-level sweep is the wider loop and still needs the input width to fit the
+        // output width, or the feedback would not fit the first layer.
+        let recur_outer = topo.recur && node_dims[0].0 == node_dims[output_node].1;
         let name = format!("network_{}_{}", graph.id, fastrand::u64(..));
         debug!(
             "Network::build -- {} port_proj_levels, dims={:?}",
@@ -411,6 +439,9 @@ impl Network {
             port_projections,
             dropout_layers,
             port_masks,
+            recur: topo.recur,
+            recur_outer,
+            recur_nodes,
         })
     }
 
@@ -606,6 +637,48 @@ impl Network {
     /// wiring stats, depths, orphan counts, real parameter counts. Delegates to `NetworkFacts`.
     pub fn to_json(&self) -> flodl::tensor::Result<String> {
         crate::spec::NetworkFacts::from_network(self).to_json()
+    }
+
+    /// The loop's own curve: per sweep `(mean |y|, max |y|, mean |Δ| vs the previous
+    /// sweep)` on a batch-1 ZERO probe. One row for a single-sweep net, two for a
+    /// recurrent one — `Δ` is how far the loop moved the output, `mean |y|` whether it is
+    /// contracting (`<` the last sweep) or growing. Deterministic: eval mode, no masks.
+    pub fn recurrence_curve(&self) -> flodl::tensor::Result<Vec<(f32, f32, f32)>> {
+        let device = self
+            .layers
+            .first()
+            .map(|l| l.weight.variable.data().device())
+            .unwrap_or(Device::CPU);
+        let opts = flodl::TensorOptions {
+            dtype: DType::Float32,
+            device,
+        };
+        let mut probe = Variable::new(Tensor::zeros(&[1, self.input_dim as i64], opts)?, false);
+        let sweeps = 1 + usize::from(self.recur_outer);
+        let mut prev: Option<Vec<f32>> = None;
+        let mut curve = Vec::with_capacity(sweeps);
+        for _ in 0..sweeps {
+            let (ports, feedback) = self.forward_pass(&probe)?;
+            let y = ports
+                .get(&(self.output_node, 0))
+                .cloned()
+                .expect("output node port 0 must exist");
+            let vals = y.data().to_f32_vec()?;
+            let n = vals.len().max(1) as f32;
+            let mean = vals.iter().map(|v| v.abs()).sum::<f32>() / n;
+            let max = vals.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let delta = prev.as_ref().map_or(0.0, |p| {
+                vals.iter()
+                    .zip(p.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .sum::<f32>()
+                    / n
+            });
+            curve.push((mean, max, delta));
+            prev = Some(vals);
+            probe = feedback;
+        }
+        Ok(curve)
     }
 
     /// Reconstruct the graph blueprint this network was built from — same nodes,
@@ -873,22 +946,28 @@ impl Network {
     }
 }
 
-// ── Module impl — forward, parameters, name ───────────────────────────────
+// ── Forward pass — one sweep, plus the recurrence wrapper ─────────────────
 
-impl Module for Network {
-    /// Execute the graph on an input tensor: input → project → [gather → combine →
-    /// per-port activate] × N nodes → output.
-    fn forward(&self, input: &Variable) -> flodl::tensor::Result<Variable> {
+/// One sweep's answer: every port's tensor plus the OUTPUT node's pre-activation base.
+type PassOutputs = (HashMap<(usize, usize), Variable>, Variable);
+
+impl Network {
+    /// ONE sweep of the graph: input → project → [gather → combine → per-port activate]
+    /// × N nodes → output. Returns every port's tensor plus the OUTPUT node's
+    /// **pre-activation** base — the signal for recurrence, taken before its port activation
+    /// so a `softmax`/`log_softmax` head is not fed back already saturated.
+    fn forward_pass(&self, input: &Variable) -> flodl::tensor::Result<PassOutputs> {
         // Per-port outputs, keyed by (node_id, port_index); consumers look up
         // exact port they are wired
         // The batch the zero-input fallback must carry: an unwired node invents no batch of its
         // own, or its output loses the batch every wired sibling has.
         let batch = input.data().shape()[0];
         let mut port_outputs: HashMap<(usize, usize), Variable> = HashMap::new();
+        let mut output_base: Option<Variable> = None;
 
         // Pass 1: compute all node outputs normally.
         for node_id in 0..self.layers.len() {
-            let base = if self.nodes[node_id].kind == crate::graph::node::NodeKind::Input {
+            let mut base = if self.nodes[node_id].kind == crate::graph::node::NodeKind::Input {
                 // Input node: one Linear over the raw input; the base tensor fans out
                 // through every port (Identity — Input ports stay raw).
                 self.layers[node_id].forward(input)?
@@ -901,6 +980,22 @@ impl Module for Network {
                 let standardized = self.standardize(node_id, projected)?;
                 self.apply_dropout(node_id, standardized)?
             };
+
+            // HIDDEN-NODE RECURRENCE: one extra pass of this node's OWN layer — its
+            // pre-activation (`base`, width = the node's input width) fed back through the same
+            // weights. The `in_dim == out_dim` gate was settled at build, so no shape check is
+            // needed here; Input/Output nodes never carry it.
+            if self.recur_nodes[node_id] {
+                let looped = self.layers[node_id].forward(&base)?;
+                let looped = self.standardize(node_id, looped)?;
+                base = self.apply_dropout(node_id, looped)?;
+            }
+
+            // The OUTPUT node's base is the recurrence feedback: keep it before the port
+            // activation rewrites the tensor.
+            if node_id == self.output_node {
+                output_base = Some(base.clone());
+            }
 
             // Per-port activation: port i applies its own non-linearity to the shared
             // base; port 0 conventionally mirrors the node-level activation.
@@ -929,6 +1024,22 @@ impl Module for Network {
             }
         }
 
+        let base = output_base.expect("the output node is one of the layers");
+        Ok((port_outputs, base))
+    }
+}
+
+impl Module for Network {
+    /// Execute the graph on an input tensor. `recur_outer` makes the sweep run a SECOND time,
+    /// the output node's pre-activation handed back in as the network input — the same layers,
+    /// so autograd unrolls both sweeps. Hidden-node loops are inside each sweep (`forward_pass`).
+    fn forward(&self, input: &Variable) -> flodl::tensor::Result<Variable> {
+        let (mut port_outputs, feedback) = self.forward_pass(input)?;
+        if self.recur_outer {
+            // ONE loop. The widths match by construction (`recur_outer` is only set when the
+            // output width equals the input width), so the feedback fits the first layer.
+            port_outputs = self.forward_pass(&feedback)?.0;
+        }
         let out_node = self.output_node;
         Ok(port_outputs
             .get(&(out_node, 0))
@@ -1133,6 +1244,115 @@ mod tests {
         // One Linear (weight + bias) per node, plus orphan projections
         // for nodes with orphaned ports (at least the input node).
         assert!(module.parameters().len() >= graph.nodes.len() * 2);
+    }
+
+    /// RECURRENCE: the gene adds ONE extra sweep of the same graph, feeding the output
+    /// node's pre-activation back in. No parameters are added (the loop shares them), and a
+    /// net whose input and output widths differ carries the gene but never runs it.
+    #[test]
+    fn recurrence_runs_one_extra_sweep_of_the_same_graph() {
+        let graph = |recur: bool| {
+            let mut g = Topology::new(0, None);
+            g.options.input_dim = Some(4);
+            g.options.output_dim = Some(4);
+            g.options.recur = recur;
+            g.nodes.push(Node::new_input(0, 2));
+            let mut hidden = Node::new_hidden(1, 2, 2);
+            hidden.hidden_dim = Some(4);
+            g.nodes.push(hidden);
+            let mut out = Node::new_output(2, 1, 1);
+            out.hidden_dim = Some(4);
+            g.nodes.push(out);
+            g.refresh_labels();
+            g.finalize();
+            g
+        };
+        let plain = Network::build(&graph(false), Device::CPU).unwrap();
+        let rec = Network::build(&graph(true), Device::CPU).unwrap();
+        assert!(rec.recur && !plain.recur);
+        assert_eq!(
+            plain.export_weights().unwrap(),
+            rec.export_weights().unwrap(),
+            "the loop adds no parameters — it shares the layers"
+        );
+
+        let input = rand_input(3, 4);
+        let once = plain.forward(&input).unwrap();
+        let twice = rec.forward(&input).unwrap();
+        assert_eq!(twice.data().shape(), &[3, 4]);
+        assert_ne!(
+            once.data().to_f32_vec().unwrap(),
+            twice.data().to_f32_vec().unwrap(),
+            "the second sweep must move the output"
+        );
+        // The exact answer: the second sweep is the plain net run on the first sweep's
+        // pre-activation feedback.
+        let (_, feedback) = rec.forward_pass(&input).unwrap();
+        let expected = plain.forward(&feedback).unwrap();
+        assert_eq!(
+            expected.data().to_f32_vec().unwrap(),
+            twice.data().to_f32_vec().unwrap()
+        );
+
+        // Dimension gate: 4 in → 2 out cannot loop, so the gene stays inert.
+        let mut narrow = graph(true);
+        narrow.options.output_dim = Some(2);
+        narrow.nodes[2].hidden_dim = Some(2);
+        let net = Network::build(&narrow, Device::CPU).unwrap();
+        assert!(
+            !net.recur_outer,
+            "input_dim != output_dim must switch the NETWORK-level loop off"
+        );
+        assert_eq!(
+            net.forward(&rand_input(2, 4)).unwrap().data().shape(),
+            &[2, 2]
+        );
+    }
+
+    /// RECURRENCE INSIDE A HIDDEN NODE: a node whose input width equals its output width feeds
+    /// its own pre-activation back through the SAME layer once, even when the net's outer widths
+    /// (784 → 10) can never match. No parameters are added, and neither Input nor Output loops.
+    #[test]
+    fn a_hidden_node_with_matching_widths_loops_its_own_layer() {
+        let graph = |recur: bool| {
+            let mut g = Topology::new(0, None);
+            g.options.input_dim = Some(4);
+            g.options.output_dim = Some(2);
+            g.options.recur = recur;
+            let mut input = Node::new_input(0, 1);
+            input.hidden_dim = Some(4);
+            g.nodes.push(input);
+            let mut hidden = Node::new_hidden(1, 1, 1);
+            hidden.hidden_dim = Some(4); // 4 → 4: the loop fits
+            g.nodes.push(hidden);
+            let mut out = Node::new_output(2, 1, 1);
+            out.hidden_dim = Some(2);
+            g.nodes.push(out);
+            g.refresh_labels();
+            g.finalize();
+            g
+        };
+        let plain = Network::build(&graph(false), Device::CPU).unwrap();
+        let rec = Network::build(&graph(true), Device::CPU).unwrap();
+        assert!(rec.recur, "the gene is carried");
+        assert!(
+            !rec.recur_outer,
+            "4 → 2 cannot sweep the net, yet the hidden 4 → 4 node loops"
+        );
+        assert_eq!(rec.recur_nodes, vec![false, true, false]);
+        assert_eq!(
+            plain.export_weights().unwrap(),
+            rec.export_weights().unwrap(),
+            "the node loop shares the layer's weights"
+        );
+        let input = rand_input(3, 4);
+        let looped = rec.forward(&input).unwrap();
+        assert_eq!(looped.data().shape(), &[3, 2]);
+        assert_ne!(
+            plain.forward(&input).unwrap().data().to_f32_vec().unwrap(),
+            looped.data().to_f32_vec().unwrap(),
+            "the hidden loop must move the output"
+        );
     }
 
     #[test]

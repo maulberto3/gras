@@ -729,6 +729,7 @@ mod tests {
                 input_dim: Some(4),
                 output_dim: Some(2),
                 dropout_prob: 0.0,
+                recur: false,
                 input_reach: 1.0,
                 min_input_reach: 1.0,
                 max_input_reach: 1.0,

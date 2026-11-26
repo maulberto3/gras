@@ -54,6 +54,15 @@ pub struct TopologyOptions {
     /// Output dimension of the network (set on the Output node's layer).
     /// `None` = infer from the dataset at run start.
     pub output_dim: Option<usize>,
+    /// RECURRENCE: every HIDDEN node whose input width equals its output width feeds its
+    /// PRE-activation back through its OWN layer once (shared weights, no new parameters), and
+    /// a net whose input width also equals its output width sweeps the whole graph twice. The
+    /// build gates each loop on the node's dims, so a `784 → 10` net still loops its `64 → 64`
+    /// hidden nodes; the gene is carried in the blueprint so a newborn inherits it, a crossover
+    /// child can drift it, and a replay rebuilds the same net. `false` (the default) is the
+    /// ordinary single pass.
+    #[serde(default)]
+    pub recur: bool,
     /// Dropout probability the engine used when building this topology's network —
     /// part of the blueprint so replays don't diverge; defaults to 0.0.
     #[serde(default)]
@@ -98,6 +107,7 @@ impl PartialEq for TopologyOptions {
             && self.input_dim == other.input_dim
             && self.output_dim == other.output_dim
             && self.dropout_prob.to_bits() == other.dropout_prob.to_bits()
+            && self.recur == other.recur
             && self.input_reach.to_bits() == other.input_reach.to_bits()
             && self.min_input_reach.to_bits() == other.min_input_reach.to_bits()
             && self.max_input_reach.to_bits() == other.max_input_reach.to_bits()
@@ -120,6 +130,7 @@ impl std::hash::Hash for TopologyOptions {
         self.input_dim.hash(state);
         self.output_dim.hash(state);
         self.dropout_prob.to_bits().hash(state);
+        self.recur.hash(state);
         self.input_reach.to_bits().hash(state);
         self.min_input_reach.to_bits().hash(state);
         self.max_input_reach.to_bits().hash(state);
@@ -232,6 +243,9 @@ impl Default for TopologyOptions {
             output_dim: None,
             // `0.25` — the cartpole reference's dropout, promoted to the engine default.
             dropout_prob: 0.25,
+            // Opt-in: the loop changes what `forward` means, so nothing turns it on by
+            // accident (a run asks for it, or drift gives it to a crossover child).
+            recur: false,
             input_reach: 1.0,
             min_input_reach: 1.0,
             max_input_reach: 1.0,
@@ -1830,6 +1844,7 @@ pub(crate) mod test_strategies {
                     input_dim: Some(input_dim),
                     output_dim: Some(output_dim),
                     dropout_prob: 0.0,
+                    recur: false,
                     feature_split: None,
                     weight_seed: None,
                 },
@@ -1905,6 +1920,7 @@ mod tests {
             input_dim: Some(4),
             output_dim: Some(10),
             dropout_prob: 0.0,
+            recur: false,
             input_reach: 1.0,
             min_input_reach: 1.0,
             max_input_reach: 1.0,
