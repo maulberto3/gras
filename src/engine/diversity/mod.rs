@@ -106,6 +106,11 @@ pub(crate) struct NetShape {
     pub nodes: usize,
     /// Wires in the blueprint.
     pub wires: usize,
+    /// The Input node's fan-out: the wires leaving it. A wire is one edge and an Input output
+    /// port is used at most once, so this is exactly the number of Input ports the feature split
+    /// laid down — the number the `%` share alone cannot name outside a partition. `0` when the
+    /// net has no readable Input node.
+    pub input_wires: usize,
     /// Mean hidden-node width; `0.0` for a net with no hidden node.
     pub dim: f32,
     /// Share of the input each Input port reads on average: `1.0` = no split, `1/ports` = a
@@ -136,10 +141,19 @@ impl NetShape {
         }
     }
 
-    /// `Exclusive · 50.0` — policy and mean kept share in one cell, in percent.
+    /// `Exclusive · 4 · 50.0` — policy, the Input node's fan-out (wires leaving it) and the mean
+    /// kept share in one cell, in percent. The share alone names a partition's port count (`1/P`),
+    /// but not a `Random`/`Crossover` one's: the middle number is how many wires the split laid
+    /// into the next layer.
     pub fn split_cell(&self) -> Option<String> {
-        self.mask
-            .map(|share| format!("{} · {:.1}", self.split_label(), share * 100.0))
+        self.mask.map(|share| {
+            format!(
+                "{} · {} · {:.1}",
+                self.split_label(),
+                self.input_wires,
+                share * 100.0
+            )
+        })
     }
 }
 
@@ -151,6 +165,16 @@ pub(crate) fn shape_of(topo: &Topology) -> NetShape {
         .filter(|n| n.kind == NodeKind::Hidden)
         .filter_map(|n| n.hidden_dim.map(|d| d as f32))
         .collect();
+    let input_wires = topo
+        .nodes
+        .iter()
+        .find(|n| n.kind == NodeKind::Input)
+        .map_or(0, |input| {
+            topo.connections
+                .iter()
+                .filter(|c| c.from.node == input.id)
+                .count()
+        });
     let mask = match topo.nodes.iter().find(|n| n.kind == NodeKind::Input) {
         None => None,
         Some(input) => match input.feature_masks.as_ref() {
@@ -173,6 +197,7 @@ pub(crate) fn shape_of(topo: &Topology) -> NetShape {
         genome: genes(topo),
         nodes: topo.nodes.len(),
         wires: topo.connections.len(),
+        input_wires,
         dim: trait_of(&hidden).mean,
         mask,
     }
@@ -474,6 +499,7 @@ mod tests {
             genome: genome(tokens),
             nodes: 1,
             wires: 1,
+            input_wires: 1,
             dim: 4.0,
             mask: None,
         };

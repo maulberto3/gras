@@ -1347,7 +1347,8 @@ fn ticket_column(legs: crate::engine::config::TrainTicket) -> &'static str {
 /// `split`/`keep`/`%`. A column is as wide as its longest LINE, not as wide as the label was on
 /// one line, so the header's height is what buys every ROW its width.
 fn wrap_header(cell: &str) -> String {
-    cell.replace(" = ", " =\n")
+    cell.replace("split (wires) · keep", "split\n(wires)\nkeep")
+        .replace(" = ", " =\n")
         .replace(" minmax", "\nminmax")
         .replace(" + (", " +\n(")
         .replace(" × ", "\n× ")
@@ -1380,10 +1381,12 @@ const COL_DEPTH: &str = "depth (D)";
 /// two adjacent columns both called "eval" read as the same quantity.
 const COL_EVAL: &str = "eval time (µs)";
 const COL_EXAM: &str = "exam (X)";
-/// `split · keep %`: the policy plus the mean share of the input each Input port reads. `Full`
-/// carries no masks (`100.0`), `Exclusive`/`Chunks` are partitions (`1/P × 100`), `Random` is a
-/// repaired coin flip, and `Crossover` is a blended split. The `%` is stated once, in the header.
-const COL_MASK: &str = "split · keep %";
+/// `split (wires) · keep %`: the policy, how many wires leave the Input node, then the mean share
+/// of the input each Input port reads. `Full` carries no masks (`100.0`), `Exclusive`/`Chunks` are
+/// partitions (`1/P × 100`), `Random` is a repaired coin flip, and `Crossover` is a blended split.
+/// The `%` is stated once, in the header; the parenthetical names the middle value, because the
+/// share alone only names a partition's wire count.
+const COL_MASK: &str = "split (wires) · keep %";
 
 /// The columns the card actually PRINTS, in reading order — `STOP_HEADER_FIXED` minus the cells
 /// this run cannot fill.
@@ -1558,7 +1561,7 @@ fn stop_legend_rows(ctx: &LegendCtx<'_>) -> Vec<(String, String)> {
         ),
         (
             COL_MASK.to_string(),
-            "the split policy plus the mean share of the input each Input port reads, in percent: `Full · 100.0` = no masks, `Exclusive · 1/P×100` = a partition, `Chunks · 100/P` = an ordered partition, `Random`/`Crossover` = a coin-flipped or blended split"
+            "the split policy, the wires leaving the Input node and the mean share of the input each Input port reads, in percent: `Full · 1 · 100.0` = no masks, `Exclusive · P · 1/P×100` = a partition (the middle number is the wire count), `Chunks · 100/P` = an ordered partition, `Random`/`Crossover` = a coin-flipped or blended split, where the share alone would not name the wire count"
                 .to_string(),
         ),
         (
@@ -1922,7 +1925,7 @@ mod stop_legend_tests {
             "params".to_string(),
             "thickness (H)".to_string(),
             "depth (D)".to_string(),
-            "split · keep %".to_string(),
+            "split (wires) · keep %".to_string(),
             "fit (F = mean)".to_string(),
             "slope (S)".to_string(),
         ];
@@ -1934,7 +1937,7 @@ mod stop_legend_tests {
                 "1.0K",
                 "1.0",
                 "2",
-                "Exclusive · 50.0",
+                "Exclusive · 4 · 50.0",
                 "0.50",
                 "0.01",
             ],
@@ -1945,7 +1948,7 @@ mod stop_legend_tests {
                 "2.0K",
                 "1.5",
                 "3",
-                "Random · 75.0",
+                "Random · 2 · 75.0",
                 "0.70",
                 "na",
             ],
@@ -2884,6 +2887,7 @@ mod tests {
             genome: [(token.to_string(), 1usize)].into_iter().collect(),
             nodes: 1,
             wires: 1,
+            input_wires: 1,
             dim: 4.0,
             mask: Some(1.0),
         }
@@ -2893,14 +2897,15 @@ mod tests {
     fn split_cell_carries_both_the_policy_and_the_share() {
         use crate::graph::topology::FeatureSplitPolicy;
         let mut shape = shape("W:Tanh");
+        shape.input_wires = 4;
         shape.split = Some(FeatureSplitPolicy::Random);
         shape.mask = Some(0.75);
-        assert_eq!(shape.split_cell().as_deref(), Some("Random · 75.0"));
+        assert_eq!(shape.split_cell().as_deref(), Some("Random · 4 · 75.0"));
         shape.split = Some(FeatureSplitPolicy::Crossover);
-        assert_eq!(shape.split_cell().as_deref(), Some("Crossover · 75.0"));
+        assert_eq!(shape.split_cell().as_deref(), Some("Crossover · 4 · 75.0"));
         shape.split = None;
         shape.mask = Some(1.0);
-        assert_eq!(shape.split_cell().as_deref(), Some("Full · 100.0"));
+        assert_eq!(shape.split_cell().as_deref(), Some("Full · 4 · 100.0"));
     }
 
     /// A shape with two gene tokens, ONE of them `W:Tanh` — so its Δ to [`shape`]
@@ -2916,6 +2921,7 @@ mod tests {
                 .collect(),
             nodes: 1,
             wires: 2,
+            input_wires: 2,
             dim: 8.0,
             mask: Some(0.5),
         }

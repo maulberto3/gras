@@ -65,6 +65,7 @@ fn tiny_topology(seed: usize) -> Topology {
             input_dim: Some(2),
             output_dim: Some(2),
             dropout_prob: 0.0,
+            recur: false,
             feature_split: None,
             weight_seed: None,
         }),
@@ -1191,6 +1192,7 @@ fn flat_topology(seed: usize) -> Topology {
             input_dim: Some(2),
             output_dim: Some(2),
             dropout_prob: 0.0,
+            recur: false,
             feature_split: None,
             weight_seed: None,
         }),
@@ -2722,7 +2724,7 @@ fn ticket_leg_spellings_round_trip() {
     );
     assert_eq!(TrainTicket::from_bools(false, false), TrainTicket::MostFit);
     assert_eq!(TrainTicket::from_bools(true, false), TrainTicket::LeastFit);
-    assert_eq!(DEFAULT_TRAIN_TICKET, TrainTicket::MostFitFewestUpdates);
+    assert_eq!(DEFAULT_TRAIN_TICKET, TrainTicket::LeastFitFewestUpdates);
     // ONE list backs the help text and the error messages: the names are the spellings, in order,
     // and every one of them parses back to its own leg.
     assert_eq!(TrainTicket::ALL.len(), TrainTicket::ALL_NAMES.len());
@@ -2822,8 +2824,8 @@ fn unfed_cull_evicts_the_highest_ticket_chance() {
         eng.state.net_mut(h).unwrap().entered_at_step = born;
     }
     eng.config.lottery.train_merit_p_min = 0.0;
-    // This test grades one ORDERING, so it pins it: worst-first × fewest-updates (the engine's
-    // default is `most_fit_fewest_updates` now, which pays the other end of the FIT axis).
+    // This test grades one ORDERING, so it pins it: worst-first × fewest-updates — the engine's
+    // default (`least_fit_fewest_updates`) — so the victim below is the highest-ticket net.
     eng.config.lottery.train_ticket = crate::engine::config::TrainTicket::LeastFitFewestUpdates;
     eng.config.evolution.crossover_cull_policy =
         crate::engine::breed::cull::CrossCullPolicy::HighestTicketChance;
@@ -3419,6 +3421,10 @@ fn the_whole_run_trend_is_recorded_and_reported() {
     let _ = std::fs::remove_dir_all(&dir);
     let mut eng = engine(&dir, 23).unwrap();
     eng.config.population.champion_count = 1;
+    // Pin the lottery to pay EVERY net: this test grades the trend buffer, not the ticket, and
+    // the default leg (`least_fit_fewest_updates`) can leave a net idle for a whole clock.
+    eng.config.lottery.train_merit_p_min = 1.0;
+    eng.config.lottery.train_merit_p_max = 1.0;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], Some(0.5))
         .unwrap();
     let h = eng.state.live_hashes()[0].clone();

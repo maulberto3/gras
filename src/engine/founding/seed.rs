@@ -320,6 +320,7 @@ mod tests {
             input_dim: Some(2),
             output_dim: Some(2),
             dropout_prob: 0.0,
+            recur: false,
             feature_split: None,
             weight_seed: None,
         };

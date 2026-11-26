@@ -127,7 +127,9 @@ impl CoreEngine {
                 window_label(&reading),
                 self.header.run_seed,
                 state.net_seed,
-                crate::utils::markdown::topology_markdown(&topo, None),
+                // The LIVE net, when it is still in memory: without it the file can only
+                // name the loop gene, with it the Recurrence section measures the sweeps.
+                crate::utils::markdown::topology_markdown(&topo, self.networks.get(hash.as_str()),),
                 // The net's own birth, as a mermaid graph: a founder is one box,
                 // crossover draws its parents above and converges down to this net.
                 self.lineage_markdown(&hash, "CHAMPION"),
@@ -219,8 +221,17 @@ impl CoreEngine {
             ("thickness (H)", fmt_cell(shape.thickness)),
             ("depth (D)", shape.depth.to_string()),
             (
-                "split · keep %",
+                "split (wires) · keep %",
                 shape.split_cell().unwrap_or_else(|| na.clone()),
+            ),
+            // The loop gene rides the TOP table too, not only the Blueprint line deeper in the
+            // file: a champion card is diffed by these rows first.
+            (
+                "recurrence",
+                state
+                    .topology()
+                    .ok()
+                    .map_or_else(|| na.clone(), |t| recurrence_cell(&t)),
             ),
             ("eval time (t)", eval_cell),
             ("updates (U)", state.step.to_string()),
@@ -363,7 +374,9 @@ impl CoreEngine {
                 self.header.run_seed,
                 state.net_seed,
                 WORST_PICK_NOTE,
-                crate::utils::markdown::topology_markdown(&topo, None),
+                // The LIVE net, when it is still in memory: without it the file can only
+                // name the loop gene, with it the Recurrence section measures the sweeps.
+                crate::utils::markdown::topology_markdown(&topo, self.networks.get(hash.as_str()),),
                 self.lineage_markdown(hash, "WORST"),
             );
             match std::fs::write(self.run_dir.join(&file), &md) {
@@ -521,6 +534,38 @@ fn window_label(reading: &str) -> String {
 /// The list is laid out as a GRID — `FACTS_PAIRS_PER_ROW` pairs per row — because the card is read
 /// beside the mermaid graph, and eighteen single-pair lines pushed the numbers off the screen.
 /// A short final row is padded with blank cells so the table stays a rectangle.
+/// The loop gene spelled for the `## Facts` table: `on`/`off`, HOW MANY hidden nodes loop, and
+/// whether the whole net sweeps twice. A net whose input and output widths differ still carries
+/// the gene and still loops its matching hidden nodes, so only a net with no qualifying width at
+/// all is spelled `inert`.
+fn recurrence_cell(topo: &crate::graph::topology::Topology) -> String {
+    let dims = |d: Option<usize>| d.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string());
+    if !topo.options.recur {
+        return "off — 1 sweep".to_string();
+    }
+    let node_loops = topo
+        .node_dims()
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| d.0 == d.1 && topo.nodes[*i].kind == crate::graph::node::NodeKind::Hidden)
+        .count();
+    let outer = matches!(
+        (topo.options.input_dim, topo.options.output_dim),
+        (Some(i), Some(o)) if i == o
+    );
+    let loops = match (node_loops, outer) {
+        (0, true) => "net loop (2 sweeps)".to_string(),
+        (0, false) => format!(
+            "inert — {} ≠ {}",
+            dims(topo.options.input_dim),
+            dims(topo.options.output_dim)
+        ),
+        (n, false) => format!("{n} node loop{}, 1 sweep", if n == 1 { "" } else { "s" }),
+        (n, true) => format!("{n} node loop{} + net loop", if n == 1 { "" } else { "s" }),
+    };
+    format!("on — {loops}")
+}
+
 fn facts_markdown(facts: &[(&str, String)]) -> String {
     let cols = FACTS_PAIRS_PER_ROW * 2;
     let mut out = String::from("## Facts\n\n|");
