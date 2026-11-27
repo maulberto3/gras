@@ -16,6 +16,29 @@ Python binding.
 pip install gras-engine
 ```
 
+### CPU or CUDA — chosen at build time
+
+PyPI publishes only the sdist (the wheel is a plain `linux` tag, not
+manylinux, and carries no libtorch), so `pip install` compiles the extension on
+your machine and the backend is baked into that binary. There is no runtime
+switch: the default is CPU, and CUDA is one extra build argument.
+
+```bash
+# CUDA build — needs the CUDA libtorch at build AND import time
+export LIBTORCH_PATH=~/.flodl/libtorch/precompiled/cu128
+pip install gras-engine --config-settings="build-args=--features cuda"
+# or, on older tooling: MATURIN_PEP517_ARGS="--features cuda" pip install gras-engine
+```
+
+Environment variables never select the backend — `LIBTORCH_PATH` only says
+*where* libtorch is, while the feature says *which device the compiled code
+uses*. `gras.built_with_cuda` reports which one you got, so a notebook or a test
+can refuse to assume a GPU it was not built for. A CPU build still works against
+a CUDA libtorch — it simply stays on CPU. The reverse (a CUDA build with a
+CPU-only libtorch) imports fine, because `libtorch_cuda.so` is loaded at run
+time rather than linked, and fails on the first clock when the engine creates
+its CUDA device.
+
 ```python
 import gras
 
@@ -27,11 +50,15 @@ print(engine.run_dir)       # results/<timestamp>/ — history.csv, nets/, champ
 
 ## Requirements
 
-- **CPython ≥ 3.12.** 0.1 ships one `abi3` wheel (`cp312-abi3`), so the same
-  file installs on 3.12, 3.13 and 3.14.
-- **Linux x86_64** for the prebuilt wheel. Other platforms (and any interpreter
-  a wheel does not cover) build from source, which needs Rust, a C++ toolchain
-  and libtorch.
+- **CPython ≥ 3.12.** 0.1 builds one `abi3` extension (`cp312-abi3`), so the
+  same compiled module works on 3.12, 3.13 and 3.14.
+- **A build toolchain, because PyPI has only the sdist.** `pip install` runs
+  cargo on your machine, so the Rust toolchain is needed to build the binding
+  and a C++ toolchain (linker + libstdc++, e.g. `build-essential`) to link
+  libtorch. Rust and C++ are install-time requirements only — a wheel built
+  elsewhere needs neither at run time.
+- **Linux x86_64.** The wheel the CI builds carries a plain `linux` tag, which
+  PyPI refuses, so nothing prebuilt is ever installed.
 - **libtorch, which is not bundled.** The extension links `libtorch_cpu.so` and
   `libc10.so` at run time, so the machine needs a libtorch distribution whose
   ABI matches the build (libtorch 2.x).
@@ -42,8 +69,16 @@ Point the package at libtorch with one environment variable:
 export LIBTORCH_PATH=/path/to/libtorch    # the directory that contains lib/
 ```
 
-On import, `gras` looks for `libtorch_cpu.so` in `LIBTORCH_PATH`, then in
-`$FLODL_VARIANT` and `{cpu, cuda}` under `~/.flodl/libtorch/precompiled`, and
+**Where to put it:** `fdl libtorch download` writes `./libtorch` in the project
+it runs from — the import (below) finds it there, and `fdl setup` points the
+build at it. Otherwise any directory containing `lib/` works with
+`LIBTORCH_PATH` pointing at it while the extension is built; the shared
+convention is `~/.flodl/libtorch/precompiled/{cpu,cu128}` side by side, so one
+machine holds both backends.
+
+On import, `gras` looks for `libtorch_cpu.so` in `LIBTORCH_PATH`, then
+`./libtorch`, then `$FLODL_VARIANT` and `{cpu, cuda, cu128}` under
+`~/.flodl/libtorch/precompiled`, and
 loads it with `ctypes` before the extension imports — so `LD_LIBRARY_PATH` is
 not required. If nothing is found you get an ImportError naming libtorch, not
 the loader's message. A CUDA build also loads `libtorch_cuda.so` from the same

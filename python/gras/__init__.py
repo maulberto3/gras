@@ -39,16 +39,19 @@ _LIBTORCH_CUDA_NAME = "libtorch_cuda.so"
 def _libtorch_roots() -> list[Path]:
     """Where libtorch may live, in the order the crate's tooling points at it.
 
-    ``env_setup.sh`` exports ``LIBTORCH_PATH`` and ``FLODL_VARIANT``; fdl's
-    shared precompiled dir is the fallback for kernels started without them.
+    ``env_setup.sh`` exports ``LIBTORCH_PATH`` and ``FLODL_VARIANT``; before
+    those come the project-local ``./libtorch`` that ``fdl libtorch download``
+    writes, then fdl's shared precompiled dir for kernels started without env.
     """
     roots: list[Path] = []
     if configured := os.environ.get("LIBTORCH_PATH"):
         roots.append(Path(configured))
+    roots.append(Path.cwd() / "libtorch")
     base = Path.home() / ".flodl" / "libtorch" / "precompiled"
     if variant := os.environ.get("FLODL_VARIANT"):
         roots.append(base / variant)
-    roots.extend(base / name for name in ("cpu", "cuda"))
+    # `cu128` is the directory env_setup.sh exports; `cuda` is the generic name.
+    roots.extend(base / name for name in ("cpu", "cuda", "cu128"))
     return roots
 
 
