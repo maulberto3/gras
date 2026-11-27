@@ -338,6 +338,20 @@ struct Cli {
     #[arg(long, value_name = "P", default_value_t = 0.20)]
     dropout: f32,
 
+    /// Recurrence: every hidden node whose input width equals its output width (64 → 64 is
+    /// common) feeds its pre-activation back through its OWN layer once — the same weights,
+    /// twice. A net whose input width also equals its output width sweeps its whole graph
+    /// twice; 784 → 10 MNIST nets only get the hidden-node loops. A crossover child can
+    /// drift the gene either way.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = true
+    )]
+    recur: bool,
+
     /// Name recorded in `engine.json` (informational only).
     #[arg(long, value_name = "NAME", default_value = RUN_NAME)]
     run_name: String,
@@ -420,7 +434,7 @@ fn main() {
         },
     )];
 
-    let config = common::engine_config(TabularRaceConfig::builder(), &cli.engine, log_level)
+    let mut config = common::engine_config(TabularRaceConfig::builder(), &cli.engine, log_level)
         // This example's own half: the flags whose default is its identity.
         .set_run_name(cli.run_name.clone())
         .set_topology_drift(cli.drift)
@@ -440,6 +454,9 @@ fn main() {
         .set_topology_activation_pool(cli.activation_pool.clone())
         .set_topology_standardize_op_pool(cli.standardize_pool.clone())
         .build();
+    // Recurrence is a per-net gene carried in the blueprint, not a run measured from the
+    // header: stamp the flag on the search space so founders and immigrants are born with it.
+    config.topology.options.recur = cli.recur;
 
     // `--resume` continues a recorded run (its record wins); `--run-dir` names where a fresh one writes.
     let engine = match &cli.resume {
