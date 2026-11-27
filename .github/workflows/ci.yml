@@ -130,6 +130,18 @@ jobs:
           uv pip install --python /tmp/smoke/bin/python dist/*.whl
           /tmp/smoke/bin/python -c "import gras; print('gras', gras.__version__)"
 
+      # The wheel stays a CI artifact (plain `linux` tag, refused by PyPI); the
+      # sdist is the artifact that gets published. Installing it here makes pip
+      # compile from source against the libtorch above, exactly as
+      # `pip install gras-engine` does, so a packaging mistake fails this run
+      # instead of the user's.
+      - name: Smoke-test the sdist (the artifact PyPI receives)
+        run: |
+          set -euo pipefail
+          uv venv /tmp/sdist-smoke --python 3.12
+          uv pip install --python /tmp/sdist-smoke/bin/python dist/*.tar.gz
+          /tmp/sdist-smoke/bin/python -c "import gras; print('sdist gras', gras.__version__)"
+
       # `data/` is gitignored, so the fixtures these tests read do not exist on a
       # fresh checkout: build them with the wheel's own `from_arrays` on-ramp.
       - name: Generate the test dataset
