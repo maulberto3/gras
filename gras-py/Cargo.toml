@@ -1,6 +1,6 @@
 [package]
 name = "gras-py"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Python bindings for gras (PyO3 extension module `gras._core`)"
 license = "MIT"

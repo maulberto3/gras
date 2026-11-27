@@ -50,7 +50,7 @@ print(engine.run_dir)       # results/<timestamp>/ — history.csv, nets/, champ
 
 ## Requirements
 
-- **CPython ≥ 3.12.** 0.1 builds one `abi3` extension (`cp312-abi3`), so the
+- **CPython ≥ 3.12.** 0.2 builds one `abi3` extension (`cp312-abi3`), so the
   same compiled module works on 3.12, 3.13 and 3.14.
 - **A build toolchain, because PyPI has only the sdist.** `pip install` runs
   cargo on your machine, so the Rust toolchain is needed to build the binding
@@ -167,19 +167,19 @@ language, and the parity guard says so.
 - A Python loss or fitness closure is not accepted: the loss *is* the autograd
   graph, and rankings must be re-derivable. The compiled name menus are the
   contract; Rust is the door for anything custom.
-- The 0.1 wheel is Linux x86_64. It is `linux_x86_64`, not `manylinux`: the
+- The wheel is Linux x86_64. It is `linux_x86_64`, not `manylinux`: the
   wheel needs the system's libtorch, so it cannot claim to be self-contained.
 
 ## Versions
 
-`gras.__version__` is the **binding's** version (0.1.x) and moves independently
-of the Rust crate (`gras` on crates.io, 1.2.0 pending publication). A binding release that
-needs a newer crate says so in its release notes.
+`gras.__version__` is the **binding's** version (0.2.x) and moves independently
+of the Rust crate (`gras` on crates.io, 2.2.0). A binding release that needs a
+newer crate says so in its release notes.
 
 ## More
 
-- Tour notebook: `python/notebooks/python_bindings_tour.ipynb` — six
-  self-contained arms, from a directory run to gym, arrays and resume.
+- Tour notebook: `python/notebooks/python_bindings_tour.ipynb` — self-contained
+  cells, from a directory run to gym, arrays and the CPU/CUDA check.
 - Rust crate: https://crates.io/crates/gras · docs: https://docs.rs/gras
 - Source, issues and the publishing notes:
   https://github.com/maulberto3/gras
