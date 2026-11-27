@@ -205,12 +205,25 @@ cargo add gras
 cargo add gras --features cuda
 ```
 
-`gras` links libtorch dynamically and does not vendor it. A build needs a
-libtorch distribution your toolchain can find — headers and libraries at compile
-time, shared objects at run time. We point our own harness at one with the
-conventional `LIBTORCH_PATH` / linker-path arrangement; any setup that puts
-libtorch in your workspace and your loader's path works, and choosing that setup
-is deliberately left to you. CUDA builds need a CUDA-enabled libtorch.
+`gras` links libtorch dynamically and does not vendor it: headers and libraries
+at compile time, shared objects at run time. `flodl-sys` reads `LIBTORCH_PATH`
+(falling back to `/usr/local/libtorch`), so any arrangement that exports that
+variable works, and CUDA builds need a CUDA-enabled libtorch.
+
+`fdl setup` — from `cargo install flodl-cli` — detects the hardware, downloads
+the matching libtorch and points the variable at it. This repository's
+`env_setup.sh` does the same for local development, searching in order:
+
+1. `./libtorch`, or `./libtorch/{cpu,cuda,cu128}` — where `fdl libtorch download`
+   puts a build by default;
+2. `~/.flodl/libtorch/precompiled/{cpu,cu128,cuda}` — fdl's shared copy, so
+   every project on a machine reuses one download per backend;
+3. `/usr/local/libtorch`.
+
+```bash
+source env_setup.sh         # CPU
+source env_setup.sh cuda    # CUDA: skips directories without libtorch_cuda.so
+```
 
 ## Get started
 
