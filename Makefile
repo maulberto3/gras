@@ -118,6 +118,13 @@ ci: notebook ## py rebuild, clean+build+fmt+clippy, tests+cove, packaging, py te
 	$(ENV) rm -rf /tmp/gras-ci-smoke && uv venv -q /tmp/gras-ci-smoke --python 3.12 && \
 		uv pip install -q --python /tmp/gras-ci-smoke/bin/python dist/*.whl && \
 		/tmp/gras-ci-smoke/bin/python -c "import gras; print('gras', gras.__version__)"
+		
+	# The wheel above is a CI artifact (plain `linux` tag, which PyPI refuses); the
+	# sdist is what users install. Prove it compiles from source the way
+	# `pip install gras-engine` does, instead of trusting the wheel alone.
+	$(ENV) rm -rf /tmp/gras-sdist-smoke && uv venv -q /tmp/gras-sdist-smoke --python 3.12 && \
+		uv pip install -q --python /tmp/gras-sdist-smoke/bin/python dist/*.tar.gz && \
+		/tmp/gras-sdist-smoke/bin/python -c "import gras; print('sdist', gras.__version__, 'cuda=', gras.built_with_cuda)"
 	uv pip install -q --python /tmp/gras-ci-smoke/bin/python pytest pandas
 	$(ENV) /tmp/gras-ci-smoke/bin/python python/tests/test_determinism.py
 	$(ENV) /tmp/gras-ci-smoke/bin/python -m pytest python/tests -q
