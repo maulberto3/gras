@@ -304,38 +304,90 @@ const DEFAULT_CHALLENGE_PROB: f32 = 0.0;
 #[derive(clap::Parser, Debug)]
 #[command(
     name = "mnist",
-    about = "MNIST tabular race: every engine knob is a flag, each one carrying the value the run uses."
+    about = "MNIST tabular race: every engine knob is a flag, each one carrying the value the run uses.",
+    // Help starts on the flag's own row (`next_line_help = false`) and wraps at a MEDIUM
+    // width — about the `--drift` row — instead of running to whatever the terminal is.
+    term_width = 200,
+    next_line_help = false
 )]
 struct Cli {
+    /// Pin the run seed. Omitted, a fresh one is DRAWN and printed, so the run is
+    /// still replayable; `--resume` uses the recorded seed instead.
+    #[arg(long, value_name = "U64", help_heading = "Run")]
+    seed: Option<u64>,
+
+    /// Name recorded in `engine.json` (informational only).
+    #[arg(long, value_name = "NAME", default_value = RUN_NAME, help_heading = "Run")]
+    run_name: String,
+
+    /// Accuracy bar (window centre): ENDS the race the clock the field reaches it. Read in the
+    /// run's own direction, so it also works on a minimize metric; a bar nothing reaches never fires.
+    #[arg(long, value_name = "F32", default_value_t = 0.85, help_heading = "Stop")]
+    stop_accuracy: f32,
+
+    /// Clocks the best score may sit still (no gain over 0.01) before the race stops — no bar of
+    /// its own, so it also fires below the bar above; `0` = no-change stop off.
+    #[arg(long, value_name = "N", default_value_t = 40, help_heading = "Stop")]
+    stop_patience: usize,
+
+    /// Per-(net, step) chance the anti-plateau input challenge fires; `0` disables it.
+    #[arg(
+        long,
+        value_name = "P",
+        default_value_t = DEFAULT_CHALLENGE_PROB,
+        help_heading = "Challenge"
+    )]
+    challenge_prob: f32,
+
+    // Flattened HERE, not first: clap orders help sections by first appearance, so the
+    // example's own "Run" / "Stop" / "Challenge" flags have to come before the shared
+    // block, while the shared sections (Tickets → Elites) keep their own order.
     /// Every engine knob shared with the other example (`examples/common/mod.rs`).
     #[command(flatten)]
     engine: EngineArgs,
 
-    /// Pin the run seed. Omitted, a fresh one is DRAWN and printed, so the run is
-    /// still replayable; `--resume` uses the recorded seed instead.
-    #[arg(long, value_name = "U64")]
-    seed: Option<u64>,
-
-    /// Window-centre accuracy that arms the plateau stop.
-    #[arg(long, value_name = "F32", default_value_t = 0.85)]
-    stop_accuracy: f32,
-
-    /// Clocks the best score may sit still after the bar is met.
-    #[arg(long, value_name = "N", default_value_t = 40)]
-    stop_patience: usize,
-
     /// Candidates one mutation may spend clearing the floor; the most novel refusal is taken anyway.
-    #[arg(long, value_name = "N", default_value_t = 5)]
+    #[arg(long, value_name = "N", default_value_t = 5, help_heading = "Mutation")]
     mutation_novelty_draws: usize,
+
+    // The node-count bounds live here, MIN then MAX, because their upper bound is this
+    // example's own number (15) — split across `EngineArgs` the pair printed far apart.
+    /// Hidden nodes per net: the lower sampling bound.
+    #[arg(long, value_name = "N", default_value_t = 2, help_heading = "Search space")]
+    hidden_min: usize,
+
+    /// Hidden nodes per net: the upper sampling bound.
+    #[arg(long, value_name = "N", default_value_t = 15, help_heading = "Search space")]
+    hidden_max: usize,
+
+    /// Inputs per node: the lower sampling bound.
+    #[arg(long, value_name = "N", default_value_t = 2, help_heading = "Search space")]
+    inputs_min: usize,
+
+    /// Inputs per node: the upper sampling bound.
+    #[arg(long, value_name = "N", default_value_t = 15, help_heading = "Search space")]
+    inputs_max: usize,
+
+    /// Outputs per node: the lower sampling bound.
+    #[arg(long, value_name = "N", default_value_t = 2, help_heading = "Search space")]
+    outputs_min: usize,
+
+    /// Outputs per node: the upper sampling bound.
+    #[arg(long, value_name = "N", default_value_t = 15, help_heading = "Search space")]
+    outputs_max: usize,
+
+    /// Counter stride of the hidden-width range (`16` = 16, 32, 48, …).
+    #[arg(long, value_name = "N", default_value_t = 16, help_heading = "Search space")]
+    hidden_dim_stride: usize,
 
     /// Drift on a crossover child's inherited genes — mask bits, activations, combine/standardize,
     /// port activations, hidden width, the `input_reach` wiring gene and dropout (`0` = exact
     /// inheritance).
-    #[arg(long, value_name = "P", default_value_t = 0.1)]
+    #[arg(long, value_name = "P", default_value_t = 0.1, help_heading = "Search space")]
     drift: f32,
 
     /// Dropout probability applied when building the run's networks.
-    #[arg(long, value_name = "P", default_value_t = 0.20)]
+    #[arg(long, value_name = "P", default_value_t = 0.20, help_heading = "Search space")]
     dropout: f32,
 
     /// Recurrence: every hidden node whose input width equals its output width (64 → 64 is
@@ -348,36 +400,13 @@ struct Cli {
         value_name = "BOOL",
         num_args = 0..=1,
         default_missing_value = "true",
-        default_value_t = true
+        default_value_t = true,
+        help_heading = "Search space"
     )]
     recur: bool,
 
-    /// Name recorded in `engine.json` (informational only).
-    #[arg(long, value_name = "NAME", default_value = RUN_NAME)]
-    run_name: String,
-
-    /// Per-(net, step) chance the anti-plateau input challenge fires; `0` disables it.
-    #[arg(long, value_name = "P", default_value_t = DEFAULT_CHALLENGE_PROB)]
-    challenge_prob: f32,
-
-    /// Hidden nodes per net: the upper sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 15)]
-    hidden_max: usize,
-
-    /// Inputs per node: the upper sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 15)]
-    inputs_max: usize,
-
-    /// Outputs per node: the upper sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 15)]
-    outputs_max: usize,
-
-    /// Counter stride of the hidden-width range (`16` = 16, 32, 48, …).
-    #[arg(long, value_name = "N", default_value_t = 16)]
-    hidden_dim_stride: usize,
-
     /// Dataset directory (any gras-format dataset works; unset: the `DATA_DIR` const).
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", help_heading = "Data")]
     data_dir: Option<PathBuf>,
 
     /// Generate random-label data when the dataset is missing — SMOKE TEST only, never a real race.
@@ -386,7 +415,8 @@ struct Cli {
         value_name = "BOOL",
         num_args = 0..=1,
         default_missing_value = "true",
-        default_value_t = false
+        default_value_t = false,
+        help_heading = "Data"
     )]
     synthetic: bool,
 }
@@ -434,26 +464,37 @@ fn main() {
         },
     )];
 
-    let mut config = common::engine_config(TabularRaceConfig::builder(), &cli.engine, log_level)
+    // STOP 2 of 3: the bar. `best_smoothed_fitness` is the window CENTRE, compared in the run's
+    // direction (`common::bar_reached`) so the flag survives a switch to a minimize metric — the
+    // step budget and the no-change stop below are the other two criteria.
+    let bar = cli.stop_accuracy;
+    let direction = fitness.direction();
+    let builder = common::engine_config(TabularRaceConfig::builder(), &cli.engine, log_level)
         // This example's own half: the flags whose default is its identity.
         .set_run_name(cli.run_name.clone())
         .set_topology_drift(cli.drift)
+        .set_topology_min_hidden_num_nodes(cli.hidden_min)
         .set_topology_max_hidden_num_nodes(cli.hidden_max)
+        .set_topology_min_inputs_per_node(cli.inputs_min)
         .set_topology_max_inputs_per_node(cli.inputs_max)
+        .set_topology_min_outputs_per_node(cli.outputs_min)
         .set_topology_max_outputs_per_node(cli.outputs_max)
         .set_topology_hidden_dim_stride(cli.hidden_dim_stride)
         .set_topology_dropout_prob(cli.dropout)
         .set_mutation_novelty_draws(cli.mutation_novelty_draws)
-        // `best_smoothed_fitness` is the window CENTRE, so the bar is 0.85 on accuracy.
-        .set_stop_plateau(cli.stop_accuracy, cli.stop_patience)
+        .set_stop_custom(move |snap: &RaceSnapshot| common::bar_reached(bar, snap))
         // The data's own widths: 784 pixels in, 10 labels out.
         .set_topology_input_dim(d_in)
-        .set_topology_output_dim(d_out)
-        .set_topology_feature_split_pool(cli.feature_split_pool.clone())
-        .set_topology_combine_op_pool(cli.combine_op_pool.clone())
-        .set_topology_activation_pool(cli.activation_pool.clone())
-        .set_topology_standardize_op_pool(cli.standardize_pool.clone())
-        .build();
+        .set_topology_output_dim(d_out);
+    // STOP 3 of 3: the no-change stop, with NO bar of its own — `common::no_bar` parks the
+    // plateau's target on the hopeless end of this run's direction, so its target gate is always
+    // open and only the patience window decides. `0` turns it off (a `0` patience would stop at
+    // clock 0 instead).
+    let mut builder = builder;
+    if cli.stop_patience > 0 {
+        builder = builder.set_stop_plateau(common::no_bar(direction), cli.stop_patience);
+    }
+    let mut config = builder.build();
     // Recurrence is a per-net gene carried in the blueprint, not a run measured from the
     // header: stamp the flag on the search space so founders and immigrants are born with it.
     config.topology.options.recur = cli.recur;
