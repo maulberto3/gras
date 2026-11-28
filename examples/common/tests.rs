@@ -146,7 +146,10 @@ fn every_engine_flag_reaches_the_built_config() {
     assert_eq!(cfg.topology.feature_split_pool, vec!["full".to_string()]);
     assert_eq!(cfg.topology.combine_op_pool, vec!["add".to_string()]);
     assert_eq!(cfg.topology.activation_pool, vec!["relu".to_string()]);
-    assert_eq!(cfg.topology.standardize_op_pool, vec!["identity".to_string()]);
+    assert_eq!(
+        cfg.topology.standardize_op_pool,
+        vec!["identity".to_string()]
+    );
 
     // Inheritance — the fields the hard-coded `false` used to swallow.
     assert!(
@@ -171,13 +174,11 @@ fn a_bare_bool_flag_means_on_and_still_takes_false() {
     assert!(on.run.champion_previous_load, "bare flag must turn it ON");
     assert!(on.lottery.train_merit_learn_only);
 
-    let off = config_from(&[
-        "--champion-previous-load",
-        "false",
-        "--learn-only",
-        "false",
-    ]);
-    assert!(!off.run.champion_previous_load, "an explicit false must win");
+    let off = config_from(&["--champion-previous-load", "false", "--learn-only", "false"]);
+    assert!(
+        !off.run.champion_previous_load,
+        "an explicit false must win"
+    );
     assert!(!off.lottery.train_merit_learn_only);
 }
 
@@ -216,7 +217,10 @@ fn the_bar_stop_reads_the_runs_own_direction() {
 fn the_no_change_stop_is_armed_in_either_direction() {
     for direction in [Direction::Maximize, Direction::Minimize] {
         let target = no_bar(direction);
-        assert!(target.is_infinite(), "{direction:?}: no bar ⇒ an infinite target");
+        assert!(
+            target.is_infinite(),
+            "{direction:?}: no bar ⇒ an infinite target"
+        );
         let mut plateau = Plateau::new(target, 2);
         // Armed on the first reading, then two flat clocks with no gain over epsilon.
         assert!(!plateau.observe(&snap(0.5, 0, direction)), "{direction:?}");

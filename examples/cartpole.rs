@@ -246,12 +246,22 @@ struct Cli {
     seed: Option<u64>,
 
     /// Name recorded in `engine.json` (informational only).
-    #[arg(long, value_name = "NAME", default_value = "cartpole", help_heading = "Run")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_value = "cartpole",
+        help_heading = "Run"
+    )]
     run_name: String,
 
     /// Survival bar (window centre): ENDS the race the clock the field reaches it. Read in the
     /// run's own direction, so it also works on a minimize metric; a bar nothing reaches never fires.
-    #[arg(long, value_name = "F32", default_value_t = 400.0, help_heading = "Stop")]
+    #[arg(
+        long,
+        value_name = "F32",
+        default_value_t = 400.0,
+        help_heading = "Stop"
+    )]
     stop_score: f32,
 
     /// Clocks the best score may sit still (no gain over 0.01) before the race stops — no bar of
@@ -276,42 +286,87 @@ struct Cli {
     engine: EngineArgs,
 
     /// Candidates one mutation may spend clearing the floor; the most novel refusal is taken anyway.
-    #[arg(long, value_name = "N", default_value_t = 10, help_heading = "Mutation")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 10,
+        help_heading = "Mutation"
+    )]
     mutation_novelty_draws: usize,
 
     // The node-count bounds live here, MIN then MAX, because their upper bound is this
     // example's own number (20) — split across `EngineArgs` the pair printed far apart.
     /// Hidden nodes per net: the lower sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 2, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 2,
+        help_heading = "Search space"
+    )]
     hidden_min: usize,
 
     /// Hidden nodes per net: the upper sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 20, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 20,
+        help_heading = "Search space"
+    )]
     hidden_max: usize,
 
     /// Inputs per node: the lower sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 2, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 2,
+        help_heading = "Search space"
+    )]
     inputs_min: usize,
 
     /// Inputs per node: the upper sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 20, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 20,
+        help_heading = "Search space"
+    )]
     inputs_max: usize,
 
     /// Outputs per node: the lower sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 2, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 2,
+        help_heading = "Search space"
+    )]
     outputs_min: usize,
 
     /// Outputs per node: the upper sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 20, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 20,
+        help_heading = "Search space"
+    )]
     outputs_max: usize,
 
     /// Counter stride of the hidden-width range (`2` = 16, 18, 20, …).
-    #[arg(long, value_name = "N", default_value_t = 2, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 2,
+        help_heading = "Search space"
+    )]
     hidden_dim_stride: usize,
 
     /// Chance a slot of an inherited circuit (mask, activation, combine, standardize, dropout,
     /// port activation, hidden width, the `input_reach` wiring gene) is re-drawn.
-    #[arg(long, value_name = "P", default_value_t = 0.05, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "P",
+        default_value_t = 0.05,
+        help_heading = "Search space"
+    )]
     drift: f32,
 
     /// Dropout probability applied when building the run's networks.
@@ -348,7 +403,12 @@ struct Cli {
     obs_memory: String,
 
     /// EMA β for `--obs-memory ema` (default 0.9). Clamped to `0.0 …= 1.0`.
-    #[arg(long, value_name = "F32", default_value_t = 0.9, help_heading = "Policy (RL)")]
+    #[arg(
+        long,
+        value_name = "F32",
+        default_value_t = 0.9,
+        help_heading = "Policy (RL)"
+    )]
     obs_memory_beta: f32,
 
     /// Exam axis: `true` (default) draws fresh shared starts every CLOCK, `false` restores the ERA exam.

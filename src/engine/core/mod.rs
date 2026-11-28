@@ -1946,15 +1946,8 @@ fn semantic_rows(config: &crate::engine::config::RaceConfig) -> Vec<(String, Str
         // A ±infinity target is the "no bar" spelling (`Plateau` still needs a number, and the
         // examples park it on the hopeless end of the metric's direction): print the intent,
         // not `target -inf`.
-        Some(p) if p.target().is_infinite() => format!(
-            "no bar · patience {}",
-            p.patience()
-        ),
-        Some(p) => format!(
-            "target {} · patience {}",
-            fmt_cfg(p.target()),
-            p.patience()
-        ),
+        Some(p) if p.target().is_infinite() => format!("no bar · patience {}", p.patience()),
+        Some(p) => format!("target {} · patience {}", fmt_cfg(p.target()), p.patience()),
         None => "off".to_string(),
     };
     let recovery = format!(

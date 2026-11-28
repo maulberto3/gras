@@ -5548,10 +5548,7 @@ fn semantic_and_genotype_rows_name_every_unreported_knob() {
     );
     let mut no_novelty = RaceConfig::default();
     no_novelty.evolution.mutation_novelty_min = 0.0;
-    assert_eq!(
-        row(&semantic_rows(&no_novelty), "mutation_novelty"),
-        "off"
-    );
+    assert_eq!(row(&semantic_rows(&no_novelty), "mutation_novelty"), "off");
     assert_eq!(
         row(&rows, "policy_scoped_fitness"),
         default.ranking.policy_scoped_fitness.to_string()
@@ -5591,7 +5588,10 @@ fn semantic_and_genotype_rows_name_every_unreported_knob() {
     assert_eq!(row(&tuned_rows, "run_name"), "smoke");
     assert!(row(&tuned_rows, "recovery").ends_with("same clock"));
     assert!(row(&tuned_rows, "mutation_novelty").contains("draws 3"));
-    assert_eq!(row(&tuned_rows, "crossover_fitter_base"), "either parent is the base");
+    assert_eq!(
+        row(&tuned_rows, "crossover_fitter_base"),
+        "either parent is the base"
+    );
     assert_eq!(row(&tuned_rows, "policy_scoped_fitness"), "true");
     assert!(row(&tuned_rows, "selection metrics").contains("rmse×"));
     let plateau = row(&tuned_rows, "plateau stop");
@@ -5606,7 +5606,11 @@ fn semantic_and_genotype_rows_name_every_unreported_knob() {
     assert!(row(&genotype, "input_reach").contains("per-net draw"));
     assert_eq!(
         row(&genotype, "unique_source_per_target"),
-        default.topology.options.unique_source_per_target.to_string()
+        default
+            .topology
+            .options
+            .unique_source_per_target
+            .to_string()
     );
     let mut seeded = RaceConfig::default();
     seeded.topology.options.recur = true;

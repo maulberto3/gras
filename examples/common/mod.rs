@@ -13,11 +13,11 @@ use std::path::PathBuf;
 
 use clap::Args;
 use gras::SelectionMethod;
-use gras::prelude::{Direction, RaceSnapshot};
 use gras::engine::config::{
     CrossCullPolicy, DEFAULT_TOURNAMENT_SIZE, LogLevel, MeanType, MutationCullPolicy,
     RaceConfigBuilder, TrainTicket,
 };
+use gras::prelude::{Direction, RaceSnapshot};
 
 /// Live nets in the race (default; `--pop` overrides).
 pub const POP: usize = 20;
@@ -76,11 +76,21 @@ pub struct EngineArgs {
 
     // ── Tickets (the train-eval lottery) ─────────────────────────────────────
     /// Lottery FLOOR `p_min`: the chance the WORST-graded net is paid each clock (`p_min == p_max` pays all alike).
-    #[arg(long, value_name = "P", default_value_t = 0.15, help_heading = "Tickets (lottery)")]
+    #[arg(
+        long,
+        value_name = "P",
+        default_value_t = 0.15,
+        help_heading = "Tickets (lottery)"
+    )]
     pub ticket_p_min: f32,
 
     /// Lottery CEILING `p_max`: the chance the BEST-graded net is paid; everyone between is interpolated.
-    #[arg(long, value_name = "P", default_value_t = 0.85, help_heading = "Tickets (lottery)")]
+    #[arg(
+        long,
+        value_name = "P",
+        default_value_t = 0.85,
+        help_heading = "Tickets (lottery)"
+    )]
     pub ticket_p_max: f32,
 
     /// Lottery legs: which fit place pays the most and which updates side it multiplies in; a typo is a CLI error.
@@ -125,23 +135,48 @@ pub struct EngineArgs {
     pub mutation_cull_policy: MutationCullPolicy,
 
     /// Opening clocks with NO culls, no births and no recovery streak: evolution starts at clock N.
-    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "Culling & probation")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        help_heading = "Culling & probation"
+    )]
     pub init_probation: usize,
 
     /// Mutation probation: cull immunity for an immigrant's first N updates (`U`, not clocks).
-    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "Culling & probation")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        help_heading = "Culling & probation"
+    )]
     pub mutation_probation: usize,
 
     /// Crossover probation: the same shield for a crossover child's first N updates.
-    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "Culling & probation")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        help_heading = "Culling & probation"
+    )]
     pub crossover_probation: usize,
 
     /// Recovery updates: extra real updates inside one clock after a worse reading (`0` = off).
-    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "Culling & probation")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        help_heading = "Culling & probation"
+    )]
     pub recovery_retries: usize,
 
     /// Recovery tolerance: the fraction of its standing a reading may lose before the streak fires.
-    #[arg(long, value_name = "F", default_value_t = 0.0, help_heading = "Culling & probation")]
+    #[arg(
+        long,
+        value_name = "F",
+        default_value_t = 0.0,
+        help_heading = "Culling & probation"
+    )]
     pub recovery_tol: f32,
 
     /// Recovery draw: `true` retries the clock's own draw, `false` walks one draw further.
@@ -228,7 +263,12 @@ pub struct EngineArgs {
     pub crossover_fitter_base: bool,
 
     /// Crossover operator pool, drawn per attempt: `one_point` and/or `uniform`; empty = both.
-    #[arg(long, value_name = "LIST", value_delimiter = ',', help_heading = "Crossover")]
+    #[arg(
+        long,
+        value_name = "LIST",
+        value_delimiter = ',',
+        help_heading = "Crossover"
+    )]
     pub crossover_ops_pool: Vec<String>,
 
     // ── Mutation ─────────────────────────────────────────────────────────────
@@ -242,7 +282,12 @@ pub struct EngineArgs {
     pub mutation_turnover: f32,
 
     /// Mutation novelty floor Δ: a new immigrant must sit this far (Jaccard) from the nearest blueprint; `0` = off.
-    #[arg(long, value_name = "DELTA", default_value_t = 0.3, help_heading = "Mutation")]
+    #[arg(
+        long,
+        value_name = "DELTA",
+        default_value_t = 0.3,
+        help_heading = "Mutation"
+    )]
     pub mutation_novelty_min: f32,
 
     // ── Search space (what a newborn may be) ─────────────────────────────────
@@ -251,21 +296,41 @@ pub struct EngineArgs {
     // live where that default lives — a `--hidden-min` here and a `--hidden-max` there print
     // a dozen rows apart. What stays shared is what both examples agree on.
     /// Hidden width for a newborn: the lower bound of the sampled range.
-    #[arg(long, value_name = "N", default_value_t = 16, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 16,
+        help_heading = "Search space"
+    )]
     pub hidden_dim_min: usize,
 
     /// Hidden width for a newborn: the upper bound of the sampled range.
-    #[arg(long, value_name = "N", default_value_t = 64, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 64,
+        help_heading = "Search space"
+    )]
     pub hidden_dim_max: usize,
 
     /// Raw-input reach for a newborn, lower bound: the share of hidden nodes allowed their own
     /// wire straight from the Input node (`1.0` = one port each). Lower values force the rest of
     /// the net to be fed by other hidden nodes, which is what makes it DEEPER.
-    #[arg(long, value_name = "P", default_value_t = 0.05, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "P",
+        default_value_t = 0.05,
+        help_heading = "Search space"
+    )]
     pub input_reach_min: f32,
 
     /// Raw-input reach for a newborn, upper bound (`1.0` = every node may read the input).
-    #[arg(long, value_name = "P", default_value_t = 0.95, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "P",
+        default_value_t = 0.95,
+        help_heading = "Search space"
+    )]
     pub input_reach_max: f32,
 
     /// One wire per (source node → target node) pair, for every kind. A second wire from the same
@@ -285,23 +350,43 @@ pub struct EngineArgs {
     /// `split_chunks`; empty = all four. `full` gives a node every input feature, the other
     /// three hand it a partition (random disjoint masks, exclusive disjoint masks, or
     /// contiguous chunks) — so the split is drawn per net, not per run.
-    #[arg(long, value_name = "LIST", value_delimiter = ',', help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "LIST",
+        value_delimiter = ',',
+        help_heading = "Search space"
+    )]
     pub feature_split_pool: Vec<String>,
 
     /// Combine-op pool: `add`, `mean`, `max`, `min`, `mul`, `sub`, `div`; empty = every combine op.
-    #[arg(long, value_name = "LIST", value_delimiter = ',', help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "LIST",
+        value_delimiter = ',',
+        help_heading = "Search space"
+    )]
     pub combine_op_pool: Vec<String>,
 
     /// Activation pool, from: `identity`, `relu`, `gelu`, `silu`, `selu`, `tanh`, `sigmoid`,
     /// `mish`, `leaky_relu`, `elu`, `gelu_tanh`, `softplus`, `hardswish`, `hardsigmoid`, `sin`,
     /// `cos`, `softmax`, `log_softmax`; empty = every one of them.
-    #[arg(long, value_name = "LIST", value_delimiter = ',', help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "LIST",
+        value_delimiter = ',',
+        help_heading = "Search space"
+    )]
     pub activation_pool: Vec<String>,
 
     /// Standardize-op pool: `identity`, `layernorm`, `rmsnorm`, `instancenorm`, `groupnorm`;
     /// empty = the full default pool. (`instance_norm` / `group_norm` / `rms_norm` are
     /// accepted spellings of the same ops.)
-    #[arg(long, value_name = "LIST", value_delimiter = ',', help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "LIST",
+        value_delimiter = ',',
+        help_heading = "Search space"
+    )]
     pub standardize_pool: Vec<String>,
 
     // ── Elites & artifacts ───────────────────────────────────────────────────

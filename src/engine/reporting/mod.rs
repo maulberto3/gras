@@ -453,7 +453,12 @@ impl CoreEngine {
     /// saved elite set marked in place. `final_table` says which MOMENT this is: the stop (artifacts
     /// written, footer says "stopped") or a checkpoint tick of a long race (a reading only — the
     /// table's cells are the same either way, but `final-field.csv`/`exam.json` stay stop-time).
-    pub(crate) fn log_final_field(&self, clock: usize, verbose: bool, final_table: bool) -> CardStats {
+    pub(crate) fn log_final_field(
+        &self,
+        clock: usize,
+        verbose: bool,
+        final_table: bool,
+    ) -> CardStats {
         // ONE ranking for the whole card.
         let ranked = self.ranked_live();
         let mut rows: Vec<(String, Option<f32>)> = ranked

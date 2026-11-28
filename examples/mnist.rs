@@ -322,7 +322,12 @@ struct Cli {
 
     /// Accuracy bar (window centre): ENDS the race the clock the field reaches it. Read in the
     /// run's own direction, so it also works on a minimize metric; a bar nothing reaches never fires.
-    #[arg(long, value_name = "F32", default_value_t = 0.85, help_heading = "Stop")]
+    #[arg(
+        long,
+        value_name = "F32",
+        default_value_t = 0.85,
+        help_heading = "Stop"
+    )]
     stop_accuracy: f32,
 
     /// Clocks the best score may sit still (no gain over 0.01) before the race stops — no bar of
@@ -353,41 +358,86 @@ struct Cli {
     // The node-count bounds live here, MIN then MAX, because their upper bound is this
     // example's own number (15) — split across `EngineArgs` the pair printed far apart.
     /// Hidden nodes per net: the lower sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 2, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 2,
+        help_heading = "Search space"
+    )]
     hidden_min: usize,
 
     /// Hidden nodes per net: the upper sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 15, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 15,
+        help_heading = "Search space"
+    )]
     hidden_max: usize,
 
     /// Inputs per node: the lower sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 2, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 2,
+        help_heading = "Search space"
+    )]
     inputs_min: usize,
 
     /// Inputs per node: the upper sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 15, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 15,
+        help_heading = "Search space"
+    )]
     inputs_max: usize,
 
     /// Outputs per node: the lower sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 2, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 2,
+        help_heading = "Search space"
+    )]
     outputs_min: usize,
 
     /// Outputs per node: the upper sampling bound.
-    #[arg(long, value_name = "N", default_value_t = 15, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 15,
+        help_heading = "Search space"
+    )]
     outputs_max: usize,
 
     /// Counter stride of the hidden-width range (`16` = 16, 32, 48, …).
-    #[arg(long, value_name = "N", default_value_t = 16, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 16,
+        help_heading = "Search space"
+    )]
     hidden_dim_stride: usize,
 
     /// Drift on a crossover child's inherited genes — mask bits, activations, combine/standardize,
     /// port activations, hidden width, the `input_reach` wiring gene and dropout (`0` = exact
     /// inheritance).
-    #[arg(long, value_name = "P", default_value_t = 0.1, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "P",
+        default_value_t = 0.1,
+        help_heading = "Search space"
+    )]
     drift: f32,
 
     /// Dropout probability applied when building the run's networks.
-    #[arg(long, value_name = "P", default_value_t = 0.20, help_heading = "Search space")]
+    #[arg(
+        long,
+        value_name = "P",
+        default_value_t = 0.20,
+        help_heading = "Search space"
+    )]
     dropout: f32,
 
     /// Recurrence: every hidden node whose input width equals its output width (64 → 64 is
