@@ -170,11 +170,6 @@ language, and the parity guard says so.
 - The wheel is Linux x86_64. It is `linux_x86_64`, not `manylinux`: the
   wheel needs the system's libtorch, so it cannot claim to be self-contained.
 
-## Versions
-
-`gras.__version__` is the **binding's** version (0.2.x) and moves independently
-of the Rust crate (`gras` on crates.io, 2.2.0). A binding release that needs a
-newer crate says so in its release notes.
 
 ## More
 
