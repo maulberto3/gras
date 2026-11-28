@@ -80,6 +80,7 @@ examples/main.rs
 # `git status`, so they must stay AFTER `/examples/*`.
 /examples/*
 !/examples/cartpole/
+!/examples/common/
 !/examples/cartpole.rs
 !/examples/mnist.rs
 !/examples/parallel_scope.rs
