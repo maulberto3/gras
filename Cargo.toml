@@ -6,7 +6,7 @@ resolver = "2"
 
 [package]
 name = "gras"
-version = "2.2.0"
+version = "2.2.1"
 edition = "2024"
 description = "Neuroevolutionary architecture search: evolve the graph while its weights train, in Rust"
 license = "MIT"
@@ -50,7 +50,7 @@ comfy-table = { version = "7.2", default-features = false }
 [dev-dependencies]
 proptest = "1.11.0"
 dhat = "0.3"
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 
 [profile.dev]
 opt-level = 0
