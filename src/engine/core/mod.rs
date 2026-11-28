@@ -963,6 +963,10 @@ impl CoreEngine {
             ] {
                 manifest.push((k.to_string(), v));
             }
+            // The rest of what a reader needs to describe the run without opening
+            // `engine.json`: the split, recovery, breeding gates, ranking terms, stop
+            // conditions, artifacts and inheritance.
+            manifest.extend(semantic_rows(&self.config));
             crate::utils::cfy::emit(&crate::utils::cfy::card(
                 "Run manifest",
                 &crate::utils::cfy::kv(&manifest),
@@ -1016,7 +1020,7 @@ impl CoreEngine {
             // The genotype's structural bounds: without these the card names
             // pools but hides how big a net may get, which is half the search space.
             let topo = self.config.topology.options;
-            let search = crate::utils::cfy::kv(&[
+            let mut search_rows = vec![
                 ("crossover_ops".to_string(), ops),
                 ("activations".to_string(), acts),
                 ("combine".to_string(), combines),
@@ -1054,7 +1058,10 @@ impl CoreEngine {
                         topo.min_hidden_outputs_per_node, topo.max_hidden_outputs_per_node
                     ),
                 ),
-            ]);
+            ];
+            // The gene a newborn starts with, beside the bounds it is drawn inside.
+            search_rows.extend(genotype_rows(&self.config));
+            let search = crate::utils::cfy::kv(&search_rows);
             crate::utils::cfy::emit(&crate::utils::cfy::card("Search space", &search, None));
 
             // The trainer's own self-description: the only visible record of trainer-side
@@ -1522,6 +1529,12 @@ impl CoreEngine {
                         clock
                     );
                 }
+                // The field table is the reading a LONG race needs while it runs: same card, same
+                // cells as the stop-time one, but a checkpoint prints it without claiming the race
+                // stopped and without overwriting `final-field.csv`/`exam.json` (see the flag).
+                if self.verbose_detail() {
+                    self.log_final_field(clock, true, false);
+                }
             }
 
             // ── 3c. per-step rollup — LAST line of the step ─────────────────
@@ -1573,7 +1586,7 @@ impl CoreEngine {
         }
         // After the stop cards, and OUTSIDE the gate: the final-field TABLE is an artifact, written
         // at every log level — `None` included, since that is the scripted caller who wants
-        let final_stats = self.log_final_field(clock, self.verbose_detail());
+        let final_stats = self.log_final_field(clock, self.verbose_detail(), true);
         // Stamp the live nets' final readings first: the frontier write below
         // then carries `final_*` on every net file, culled
         self.stamp_live_final_scores();
@@ -1891,6 +1904,176 @@ fn diff_json(path: &str, a: &serde_json::Value, b: &serde_json::Value, out: &mut
 }
 
 // ── Optimizer construction ───────────────────────────────────────────────────
+
+// ── Manifest rows ────────────────────────────────────────────────────────────
+
+/// `on` / `off`, the manifest's spelling for a boolean knob.
+fn on_off(v: bool) -> &'static str {
+    if v { "on" } else { "off" }
+}
+
+/// Run-level rows the identity block does not carry but which change what a run
+/// MEANS: how the rows are split, how a bad reading is rescued, which breeding
+/// gates fired, what the score is made of, when the race stops, and which
+/// artifacts a reader can expect on disk.
+fn semantic_rows(config: &crate::engine::config::RaceConfig) -> Vec<(String, String)> {
+    let population = &config.population;
+    let evolution = &config.evolution;
+    let ranking = &config.ranking;
+    let run = &config.run;
+
+    let selection = if ranking.selection_metrics.is_empty() {
+        "(none — fitness alone)".to_string()
+    } else {
+        ranking
+            .selection_metrics
+            .iter()
+            .map(|m| format!("{}×{}", m.label, fmt_cfg(m.weight)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let metrics = if ranking.metrics.is_empty() {
+        "(none)".to_string()
+    } else {
+        ranking
+            .metrics
+            .iter()
+            .map(|m| m.label())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let plateau = match &config.stop.plateau {
+        // A ±infinity target is the "no bar" spelling (`Plateau` still needs a number, and the
+        // examples park it on the hopeless end of the metric's direction): print the intent,
+        // not `target -inf`.
+        Some(p) if p.target().is_infinite() => format!(
+            "no bar · patience {}",
+            p.patience()
+        ),
+        Some(p) => format!(
+            "target {} · patience {}",
+            fmt_cfg(p.target()),
+            p.patience()
+        ),
+        None => "off".to_string(),
+    };
+    let recovery = format!(
+        "retries {} · tolerance {} · retry draw {}",
+        population.recovery_retries,
+        fmt_cfg(population.recovery_tolerance),
+        if population.recovery_same_seed {
+            "same clock"
+        } else {
+            "fresh"
+        }
+    );
+    let novelty = if evolution.mutation_novelty_min > 0.0 {
+        format!(
+            "d_min {} · draws {}",
+            fmt_cfg(evolution.mutation_novelty_min),
+            evolution.mutation_novelty_draws
+        )
+    } else {
+        "off".to_string()
+    };
+    let artifacts = format!(
+        "csv {} · telemetry {} · weights at stop {} · optimizer state {} · log {}",
+        on_off(run.csv_export),
+        on_off(run.trace_file),
+        on_off(run.save_weights_at_stop),
+        on_off(run.save_optim),
+        format!("{:?}", run.log_level).to_lowercase()
+    );
+    let inheritance = format!(
+        "previous champions {} · from {} · champion topology {} · anti-champion dump {}",
+        on_off(run.champion_previous_load),
+        run.champion_previous_dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "results/".to_string()),
+        on_off(run.champion_save_topology),
+        on_off(run.worst_save_topology)
+    );
+
+    vec![
+        (
+            "eval_share".to_string(),
+            format!(
+                "{} ({}% of rows held out)",
+                fmt_cfg(run.eval_share),
+                fmt_cfg(run.eval_share * 100.0)
+            ),
+        ),
+        (
+            "init_probation_steps".to_string(),
+            population.init_probation_steps.to_string(),
+        ),
+        ("recovery".to_string(), recovery),
+        (
+            "crossover_fitter_base".to_string(),
+            if evolution.crossover_fitter_base {
+                "fitter parent is the base"
+            } else {
+                "either parent is the base"
+            }
+            .to_string(),
+        ),
+        ("mutation_novelty".to_string(), novelty),
+        (
+            "policy_scoped_fitness".to_string(),
+            ranking.policy_scoped_fitness.to_string(),
+        ),
+        ("selection metrics".to_string(), selection),
+        ("informative metrics".to_string(), metrics),
+        ("plateau stop".to_string(), plateau),
+        (
+            "custom stop".to_string(),
+            if config.stop.custom_stop.is_some() {
+                "set (closure, not introspectable)".to_string()
+            } else {
+                "none".to_string()
+            },
+        ),
+        ("artifacts".to_string(), artifacts),
+        ("inheritance".to_string(), inheritance),
+        (
+            "run_name".to_string(),
+            run.run_name
+                .clone()
+                .unwrap_or_else(|| crate::utils::cfy::NO_VALUE.to_string()),
+        ),
+    ]
+}
+
+/// Genotype rows for the search-space card: the recurrence gene a newborn starts
+/// with, the per-net input-reach draw, and the wiring invariant. A net's own gene
+/// still prints per row in the tables; this is the seed the population was drawn from.
+fn genotype_rows(config: &crate::engine::config::RaceConfig) -> Vec<(String, String)> {
+    let topo = &config.topology.options;
+    vec![
+        (
+            "recur".to_string(),
+            if topo.recur {
+                "on (initial gene)"
+            } else {
+                "off (initial gene)"
+            }
+            .to_string(),
+        ),
+        (
+            "input_reach".to_string(),
+            format!(
+                "{}..={} (per-net draw)",
+                fmt_cfg(topo.min_input_reach),
+                fmt_cfg(topo.max_input_reach)
+            ),
+        ),
+        (
+            "unique_source_per_target".to_string(),
+            topo.unique_source_per_target.to_string(),
+        ),
+    ]
+}
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 

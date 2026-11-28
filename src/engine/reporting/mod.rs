@@ -449,9 +449,11 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// The stop-time summary of the WHOLE measured field: one table, every live net, ranked by FIT,
-    /// with the saved elite set marked in place.
-    pub(crate) fn log_final_field(&self, clock: usize, verbose: bool) -> CardStats {
+    /// The summary of the WHOLE measured field: one table, every live net, ranked by FIT, with the
+    /// saved elite set marked in place. `final_table` says which MOMENT this is: the stop (artifacts
+    /// written, footer says "stopped") or a checkpoint tick of a long race (a reading only — the
+    /// table's cells are the same either way, but `final-field.csv`/`exam.json` stay stop-time).
+    pub(crate) fn log_final_field(&self, clock: usize, verbose: bool, final_table: bool) -> CardStats {
         // ONE ranking for the whole card.
         let ranked = self.ranked_live();
         let mut rows: Vec<(String, Option<f32>)> = ranked
@@ -499,8 +501,10 @@ impl CoreEngine {
             .as_ref()
             .map(|r| r.scores.clone())
             .unwrap_or_default();
-        if let Some(report) = &exam_report {
-            self.write_exam_json(report, &top);
+        if final_table {
+            if let Some(report) = &exam_report {
+                self.write_exam_json(report, &top);
+            }
         }
         // The plan comes AFTER the exam: whether `exam (X)` is a column is a fact the exam
         // pass decides, and the header, the rows and the legend all read it here.
@@ -555,9 +559,12 @@ impl CoreEngine {
             },
             None => "exam: none supplied (`exam/` next to the dataset turns this column on — or a `test/` beside a ranking `val/`, which is the row set no clock read)".to_string(),
         };
-        // The FILE first, and unconditionally: `final-field.csv` is run data, written
-        // from the very cells the card would print (one `StopPlan`, no second query).
-        self.write_final_field_csv(&plan.header, &grid);
+        // The FILE first, and unconditionally at the STOP: `final-field.csv` is run data, written
+        // from the very cells the card would print (one `StopPlan`, no second query). A checkpoint
+        // card leaves it alone — `final-field.csv` names the end of the race, not one tick of it.
+        if final_table {
+            self.write_final_field_csv(&plan.header, &grid);
+        }
         // `Summ` gets one compact digest of every column; the card below is the human table.
         // Built from the SAME header and grid the CSV just used, so it costs no second pass.
         if self.log_level == crate::engine::config::LogLevel::Summ {
@@ -566,16 +573,37 @@ impl CoreEngine {
                 final_field_summary(&plan.header, &grid)
             );
         }
-        let field_card = crate::utils::cfy::card(
-            &format!(
+        // The title and the tail name the MOMENT: a checkpoint card must not claim the race
+        // stopped, nor point at a file it did not write.
+        let title = if final_table {
+            format!(
                 "Final field ({} nets — {} measured, ranked by F{arrow} · ★ {})",
                 rows.len(),
                 measured,
                 top.len(),
-            ),
+            )
+        } else {
+            format!(
+                "Field at checkpoint {clock} ({} nets — {} measured, ranked by F{arrow} · ★ {})",
+                rows.len(),
+                measured,
+                top.len(),
+            )
+        };
+        let moment = if final_table {
+            format!(
+                "stopped at clock {clock} · run seed {run_seed} (`--seed {run_seed}` replays this run bit-for-bit) · the same table is written to `final-field.csv` under this header"
+            )
+        } else {
+            format!(
+                "still running at clock {clock} · run seed {run_seed} · a reading of the field as it stands; `final-field.csv` is written when the race stops"
+            )
+        };
+        let field_card = crate::utils::cfy::card(
+            &title,
             &format!("{legend}\n{table}"),
             Some(&format!(
-                "Δcrown = mean multiset-Jaccard distance to the {} reported champion(s): 0.00 = structurally identical to one of them, 1.00 = shares no gene with any · Δpop = mean distance to every other live net: 0.00 = a clone of the crowd, 1.00 = unlike everything alive · read the two AGAINST the baseline: Δcrown ≈ Δpop means the champion is structurally ordinary (selection is ranking numbers, not designs), Δcrown below it means the champions are a structural cluster · {} · {baseline} · stopped at clock {clock} · run seed {run_seed} (`--seed {run_seed}` replays this run bit-for-bit) · the same table is written to `final-field.csv` under this header · {exam_note}",
+                "Δcrown = mean multiset-Jaccard distance to the {} reported champion(s): 0.00 = structurally identical to one of them, 1.00 = shares no gene with any · Δpop = mean distance to every other live net: 0.00 = a clone of the crowd, 1.00 = unlike everything alive · read the two AGAINST the baseline: Δcrown ≈ Δpop means the champion is structurally ordinary (selection is ranking numbers, not designs), Δcrown below it means the champions are a structural cluster · {} · {baseline} · {moment} · {exam_note}",
                 plan.crown.len(),
                 stats.line(),
             )),

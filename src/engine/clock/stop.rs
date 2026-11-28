@@ -178,6 +178,17 @@ impl Plateau {
         }
     }
 
+    /// The score this stop waits for — read by the run manifest, which has to report the
+    /// condition a run ended on, not only `max_steps`.
+    pub fn target(&self) -> f32 {
+        self.target
+    }
+
+    /// Clocks tolerated without movement once the target is reached.
+    pub fn patience(&self) -> usize {
+        self.patience
+    }
+
     /// Change the "this counts as movement" tolerance (default [`DEFAULT_PLATEAU_EPSILON`]).
     pub fn with_epsilon(mut self, epsilon: f32) -> Self {
         self.epsilon = epsilon.max(0.0);

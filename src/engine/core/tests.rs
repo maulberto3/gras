@@ -3509,6 +3509,27 @@ fn history_csv_writes_only_scored_clocks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A CHECKPOINT card is a reading, not the run's record: printing the field mid-race must leave
+/// `final-field.csv` to the stop, which is the file that names the end of the race.
+#[test]
+fn checkpoint_field_card_leaves_the_final_artifact_to_the_stop() {
+    let dir = std::env::temp_dir().join("gras-field-checkpoint-no-artifact");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut eng = engine(&dir, 17).unwrap();
+    eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], None)
+        .unwrap();
+    eng.log_final_field(3, true, false);
+    assert!(
+        !dir.join("final-field.csv").exists(),
+        "a checkpoint card must not write the stop-time table"
+    );
+    eng.log_final_field(4, false, true);
+    assert!(
+        dir.join("final-field.csv").exists(),
+        "the stop still writes it"
+    );
+}
+
 /// The final-field TABLE is an artifact: `final-field.csv` lands at `None` too.
 #[test]
 fn final_field_csv_is_written_at_log_level_none() {
@@ -3518,8 +3539,9 @@ fn final_field_csv_is_written_at_log_level_none() {
     eng.log_level = crate::engine::config::LogLevel::None;
     eng.seed_population_internal(vec![tiny_topology(7), tiny_topology(8)], None)
         .unwrap();
-    // `false` = the log level's verdict for the CARD; the file is unconditional.
-    eng.log_final_field(0, false);
+    // `false` = the log level's verdict for the CARD; the file is unconditional. `true` = the
+    // stop-time call (a checkpoint call leaves `final-field.csv` to the stop).
+    eng.log_final_field(0, false, true);
     let csv = std::fs::read_to_string(dir.join("final-field.csv"))
         .expect("a `none` run still writes the final-field table");
     let lines: Vec<&str> = csv.lines().collect();
@@ -5477,4 +5499,116 @@ fn thickness_and_depth_are_reported_in_the_champion_and_worst_markdown() {
         "the index carries the thickness and depth columns: {index}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The manifest has to describe a run on its own: without these rows a log names
+/// `max_steps` but not the stop it really used, and shows no split, recovery,
+/// breeding gates, ranking terms, artifacts or the gene the founders started with.
+#[test]
+fn semantic_and_genotype_rows_name_every_unreported_knob() {
+    fn row(rows: &[(String, String)], key: &str) -> String {
+        rows.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("missing row {key:?} in {rows:?}"))
+    }
+
+    let default = RaceConfig::default();
+    let rows = semantic_rows(&default);
+
+    // Every knobs key appears once; a repeat would silently overwrite a reading.
+    let mut keys: Vec<&String> = rows.iter().map(|(k, _)| k).collect();
+    let total = keys.len();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys.len(), total, "manifest rows repeat a key: {rows:?}");
+
+    assert!(
+        row(&rows, "eval_share").contains("% of rows held out"),
+        "{}",
+        row(&rows, "eval_share")
+    );
+    assert_eq!(
+        row(&rows, "init_probation_steps"),
+        default.population.init_probation_steps.to_string()
+    );
+    assert!(row(&rows, "recovery").starts_with("retries "));
+    assert_eq!(
+        row(&rows, "crossover_fitter_base"),
+        if default.evolution.crossover_fitter_base {
+            "fitter parent is the base"
+        } else {
+            "either parent is the base"
+        }
+    );
+    assert!(
+        row(&rows, "mutation_novelty").starts_with("d_min "),
+        "the default novelty floor is ON, so the row has to name it: {}",
+        row(&rows, "mutation_novelty")
+    );
+    let mut no_novelty = RaceConfig::default();
+    no_novelty.evolution.mutation_novelty_min = 0.0;
+    assert_eq!(
+        row(&semantic_rows(&no_novelty), "mutation_novelty"),
+        "off"
+    );
+    assert_eq!(
+        row(&rows, "policy_scoped_fitness"),
+        default.ranking.policy_scoped_fitness.to_string()
+    );
+    assert_eq!(row(&rows, "selection metrics"), "(none — fitness alone)");
+    assert_eq!(row(&rows, "informative metrics"), "(none)");
+    assert_eq!(row(&rows, "plateau stop"), "off");
+    assert_eq!(row(&rows, "custom stop"), "none");
+    assert!(row(&rows, "artifacts").contains("log "));
+    assert!(row(&rows, "inheritance").contains("from results/"));
+    assert_eq!(
+        row(&rows, "run_name"),
+        crate::utils::cfy::NO_VALUE,
+        "an unnamed run still gets the row, so the absence is visible"
+    );
+
+    // Configured values, not just defaults: the rows report what the run IS.
+    let mut tuned = RaceConfig::default();
+    tuned.run.eval_share = 0.3;
+    tuned.run.run_name = Some("smoke".to_string());
+    tuned.population.recovery_same_seed = true;
+    tuned.evolution.mutation_novelty_min = 0.05;
+    tuned.evolution.mutation_novelty_draws = 3;
+    tuned.evolution.crossover_fitter_base = false;
+    tuned.ranking.policy_scoped_fitness = true;
+    tuned.ranking.selection_metrics = vec![crate::utils::fitness::SelectionMetric {
+        label: "rmse".to_string(),
+        weight: 0.3,
+    }];
+    tuned.stop.plateau = Some(crate::engine::clock::stop::Plateau::new(0.9, 5));
+    let tuned_rows = semantic_rows(&tuned);
+    let share = row(&tuned_rows, "eval_share");
+    assert!(
+        share.contains("30.0") && share.contains("% of rows held out"),
+        "{share}"
+    );
+    assert_eq!(row(&tuned_rows, "run_name"), "smoke");
+    assert!(row(&tuned_rows, "recovery").ends_with("same clock"));
+    assert!(row(&tuned_rows, "mutation_novelty").contains("draws 3"));
+    assert_eq!(row(&tuned_rows, "crossover_fitter_base"), "either parent is the base");
+    assert_eq!(row(&tuned_rows, "policy_scoped_fitness"), "true");
+    assert!(row(&tuned_rows, "selection metrics").contains("rmse×"));
+    let plateau = row(&tuned_rows, "plateau stop");
+    assert!(
+        plateau.contains("target ") && plateau.ends_with("patience 5"),
+        "{plateau}"
+    );
+
+    // The genotype card: the recurrence gene is per-net, but the SEED value is a run knob.
+    let genotype = genotype_rows(&default);
+    assert_eq!(row(&genotype, "recur"), "off (initial gene)");
+    assert!(row(&genotype, "input_reach").contains("per-net draw"));
+    assert_eq!(
+        row(&genotype, "unique_source_per_target"),
+        default.topology.options.unique_source_per_target.to_string()
+    );
+    let mut seeded = RaceConfig::default();
+    seeded.topology.options.recur = true;
+    assert_eq!(row(&genotype_rows(&seeded), "recur"), "on (initial gene)");
 }
